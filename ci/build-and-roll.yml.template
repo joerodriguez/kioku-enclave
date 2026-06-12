@@ -1,0 +1,229 @@
+# ── kioku-enclave standalone CI template ──────────────────────────────────────
+#
+# This file is a TEMPLATE for the kioku-enclave CI workflow. It is kept as
+# `ci/build-and-roll.yml.template` (not under .github/workflows) so it stays
+# inert until an operator wires up their own deployment.
+#
+# To activate it:
+#   1. Copy this file to .github/workflows/build-and-roll.yml.
+#   2. Remove the .template suffix.
+#   3. Set the repository variables and secrets it references.
+#
+# ── What this workflow does ───────────────────────────────────────────────────
+#
+# Job 1 (build-push): build the enclave image and push to Artifact Registry.
+#   - Keyless Workload Identity Federation auth (no long-lived SA key stored in
+#     GitHub secrets).
+#   - Builds with all required --build-arg values from repository variables.
+#   - Retrieves and publishes the sha256 image digest prominently.
+#
+# Job 2 (roll-vm): targeted Terraform apply to replace the enclave VM.
+#   - Gated by the 'production' environment (required reviewer configured in
+#     repo Settings → Environments → production).
+#   - Reviewer sees the image digest in the Job 1 summary before approving.
+#   - Uses -replace to force VM replacement (Confidential Space reads the image
+#     reference at boot only; a metadata-only update leaves the old binary
+#     running).
+#   - This environment gate is FREE on public repositories.
+#
+# ── Repository variables and secrets required ─────────────────────────────────
+# (set in repo Settings → Variables/Secrets)
+#
+# Variables (non-secret, visible in logs):
+#   GCP_WIF_PROVIDER      Full WIF provider resource name for this repo's
+#                         keyless auth, e.g.:
+#                         projects/123.../locations/global/workloadIdentityPools/
+#                         github-pool/providers/github
+#   GCP_DEPLOYER_SA       Deployer service account email
+#   GCP_PROJECT_ID        GCP project ID
+#   GCP_REGION            GCP region (e.g. us-central1)
+#   AR_REPOSITORY         Artifact Registry repository name (e.g. kioku)
+#   IMAGE_NAME            Docker image name (e.g. kioku-enclave)
+#   TF_VAR_*              Terraform non-secret variables (see roll-vm job)
+#
+#   Build-arg variables (baked into the attested image digest):
+#   ENCLAVE_KMS_PROJECT       GCP project containing the KMS key ring
+#   ENCLAVE_KMS_LOCATION      KMS key location
+#   ENCLAVE_KMS_KEY_RING      KMS key ring name
+#   ENCLAVE_KMS_KEY           KMS crypto key name
+#   ENCLAVE_GCS_BUCKET        GCS bucket for encrypted index blobs
+#   ENCLAVE_RUN_SA_EMAIL      Control-plane service account email
+#   ENCLAVE_AUDIENCE          Enclave's own URL (used for ID-token aud validation)
+#   ENCLAVE_ATTEST_STS_AUDIENCE  Full WIF provider resource name for attestation STS
+#
+# Secrets (masked in logs):
+#   GOOGLE_WEB_CLIENT_SECRET  OAuth web client secret (for terraform)
+
+name: Build & push enclave image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      skip_roll:
+        description: "Build only, skip VM roll"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: enclave-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION:     ${{ vars.GCP_REGION }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build and push. No approval gate — pushing an image to AR is not
+  # destructive. The digest output feeds the gated roll-vm job below.
+  # ---------------------------------------------------------------------------
+  build-push:
+    name: Build + push enclave image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      digest:    ${{ steps.digest.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (keyless WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        id: build
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TIMESTAMP="$(date +%s)"
+          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+          IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+
+          echo "Building image: ${IMAGE_URI}"
+
+          # All security-sensitive config is baked in at build time so it is
+          # part of the attested image digest and cannot be overridden at launch.
+          docker build --platform linux/amd64 \
+            --build-arg KMS_PROJECT="${{ vars.ENCLAVE_KMS_PROJECT }}" \
+            --build-arg KMS_LOCATION="${{ vars.ENCLAVE_KMS_LOCATION }}" \
+            --build-arg KMS_KEY_RING="${{ vars.ENCLAVE_KMS_KEY_RING }}" \
+            --build-arg KMS_KEY="${{ vars.ENCLAVE_KMS_KEY }}" \
+            --build-arg GCS_BUCKET="${{ vars.ENCLAVE_GCS_BUCKET }}" \
+            --build-arg RUN_SA_EMAIL="${{ vars.ENCLAVE_RUN_SA_EMAIL }}" \
+            --build-arg ENCLAVE_AUDIENCE="${{ vars.ENCLAVE_AUDIENCE }}" \
+            --build-arg ATTEST_STS_AUDIENCE="${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}" \
+            -t "${IMAGE_URI}" .
+
+          docker push "${IMAGE_URI}"
+
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}"  >> "$GITHUB_OUTPUT"
+
+      - name: Retrieve image digest
+        id: digest
+        run: |
+          IMAGE_URI="${{ steps.build.outputs.image_uri }}"
+          DIGEST="$(gcloud artifacts docker images describe "${IMAGE_URI}" \
+            --format='value(image_summary.digest)' 2>/dev/null || echo 'unknown')"
+          if [ "$DIGEST" = "unknown" ]; then
+            echo "::error::Failed to retrieve digest for ${IMAGE_URI}"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "### Image built" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image tag | \`${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image URI | \`${IMAGE_URI}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Image digest** | \`${DIGEST}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${GITHUB_SHA}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Built at | $(date -u '+%Y-%m-%dT%H:%M:%SZ') |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Roll the enclave VM. Gated by the 'production' environment, which
+  # must have a required reviewer configured in repo Settings → Environments.
+  # GitHub pauses here until a human approves, with the image digest visible.
+  # On a PUBLIC repository this environment gate is free.
+  # ---------------------------------------------------------------------------
+  roll-vm:
+    name: Roll enclave VM (gated apply)
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: ${{ github.event.inputs.skip_roll != 'true' }}
+    # Required reviewer configured in: repo Settings → Environments → production
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (keyless WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.5"
+
+      # NOTE: Adjust -chdir=infra to wherever your Terraform root lives, or
+      # remove this step entirely if your infrastructure is managed separately.
+      - name: Terraform init
+        run: terraform -chdir=infra init
+
+      - name: Terraform targeted apply — roll enclave VM
+        run: |
+          terraform -chdir=infra apply -auto-approve \
+            -replace='google_compute_instance.kioku_enclave[0]' \
+            -target=google_compute_instance.kioku_enclave \
+            -target=google_kms_crypto_key_iam_member.enclave_attest_kms \
+            -var="project_id=${{ env.PROJECT_ID }}" \
+            -var="region=${{ env.REGION }}" \
+            -var="enclave_image=${{ needs.build-push.outputs.image_uri }}" \
+            -var="enclave_image_digest=${{ needs.build-push.outputs.digest }}"
+            # Add further -var flags for any other variables your infra requires.
+
+      - name: Write job summary
+        run: |
+          DIGEST="${{ needs.build-push.outputs.digest }}"
+          {
+            echo "## VM rolled"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Image URI | \`${{ needs.build-push.outputs.image_uri }}\` |"
+            echo "| **Image digest** | \`${DIGEST}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo ""
+            echo "The attestation-gated KMS binding for digest \`${DIGEST}\` is now active."
+            echo "The VM was replaced (~2 min data-plane downtime for single-instance posture)."
+          } >> "$GITHUB_STEP_SUMMARY"

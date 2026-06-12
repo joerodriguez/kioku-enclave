@@ -1,0 +1,22 @@
+/target
+Cargo.lock.bak
+
+# Claude Code local settings (IDE tooling, not project source)
+.claude/
+
+# Temporary SQLite files that might appear during development
+*.db
+*.db-shm
+*.db-wal
+
+# macOS metadata
+.DS_Store
+
+# Editor temp files
+*.swp
+*.swo
+*~
+
+# Local env overrides (never commit real values)
+.env
+.env.local

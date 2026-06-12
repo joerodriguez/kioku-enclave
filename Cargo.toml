@@ -1,0 +1,87 @@
+[package]
+name = "kioku-enclave"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Kioku data-plane: the only code that touches user plaintext"
+license = "Apache-2.0"
+
+# Vector search: sqlite-vec (C extension, compiled via cc::Build).
+# The enclave does NOT embed queries — the control plane computes the
+# all-MiniLM-L6-v2 query embedding and passes the 384-dim float32 vector to
+# the enclave. This keeps the enclave free of any ML runtime and keeps the
+# auditable binary small.
+
+[[bin]]
+name = "kioku-enclave"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server — axum on tokio
+axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tower = { version = "0.5.2", default-features = false }
+
+# SQLite, bundled so the binary carries its own libsqlite3 with FTS5 compiled in.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
+# Serialisation
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+# Crypto: AES-256-GCM
+aes-gcm = { version = "0.10.3", features = ["std"] }
+rand = "0.8.5"
+
+# Typed errors
+thiserror = "2.0.12"
+
+# Logging
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }
+
+# HTTP client for KMS / GCS REST — rustls only, NO openssl.
+# webpki-roots bundles Mozilla's CA roots into the binary so the FROM-scratch
+# container image needs no /etc/ssl/certs on the filesystem.
+reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+
+# Async trait support (used by KmsClient and GcsClient traits)
+async-trait = "0.1.88"
+
+# Base64 encoding/decoding for KMS payloads and DEK storage
+base64 = "0.22.1"
+
+# URL-encoding for GCS object names
+urlencoding = "2.1.3"
+
+# Temporary files for per-user SQLite blobs
+tempfile = "3.20.0"
+
+# JWT verification for caller ID-token auth (Google RS256 tokens).
+# "use-pem" / "use-native-tls" excluded; we use the rustls path everywhere.
+# rsa feature pulls in the rsa crate for RS256 verify; we exclude pem (not needed at runtime).
+# rust_crypto = pure-Rust CryptoProvider (no C/system deps — required for the
+# musl static FROM-scratch build). WITHOUT a provider feature, jsonwebtoken 10
+# PANICS at signature-verify time ("Could not determine CryptoProvider"), which
+# crashed the enclave on every real ID token. "rsa" alone is NOT a provider.
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
+
+# URL-form encoding for STS token exchange (RFC 8693 form body).
+# Already an indirect dep via reqwest but we need it directly for tests.
+serde_urlencoded = "0.7.1"
+# sqlite-vec: C-based SQLite vector extension. build.rs compiles sqlite-vec.c
+# with SQLITE_CORE defined so it uses rusqlite's bundled libsqlite3 headers
+# rather than a system sqlite3. The cc crate picks up the musl cross-toolchain
+# automatically when CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER is set in CI
+# (set by apt-get install musl-tools + rustup target add x86_64-unknown-linux-musl).
+sqlite-vec = "0.1.9"
+
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["rt", "macros"] }
+tempfile = "3.20.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
