@@ -1,0 +1,178 @@
+name: Build & push enclave image
+
+# ── REQUIRED INFRA STEP (before this workflow can succeed) ───────────────────
+#
+# This workflow authenticates to GCP using Workload Identity Federation (WIF).
+# The existing WIF provider in the monorepo (github.com/joerodriguez/kioku)
+# does NOT trust this repository (github.com/joerodriguez/kioku-enclave) —
+# each WIF provider trust relationship is bound to a specific GitHub repo
+# (attribute.repository == '<org>/<repo>').
+#
+# REQUIRED: A human must add a new WIF pool attribute condition (or a new
+# provider binding) that trusts 'joerodriguez/kioku-enclave' and allows it to
+# impersonate the same GCP_DEPLOYER_SA. Concretely, in infra/cicd.tf (monorepo):
+#
+#   resource "google_iam_workload_identity_pool_provider" "github_enclave" {
+#     workload_identity_pool_id          = google_iam_workload_identity_pool.github.id
+#     workload_identity_pool_provider_id = "github-enclave"
+#     attribute_mapping = { ... }   # same as the existing provider
+#     oidc { issuer_uri = "https://token.actions.githubusercontent.com" }
+#     attribute_condition = "assertion.repository == 'joerodriguez/kioku-enclave'"
+#   }
+#
+#   resource "google_service_account_iam_member" "wif_enclave_sa" {
+#     service_account_id = google_service_account.deployer.name
+#     role               = "roles/iam.workloadIdentityUser"
+#     member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/joerodriguez/kioku-enclave"
+#   }
+#
+# After applying, update the GCP_WIF_PROVIDER repo variable in Settings →
+# Variables to point at this repo's new provider resource name.
+#
+# The GCP_DEPLOYER_SA, Artifact Registry repo, and image name can stay the same
+# as in the monorepo — they reference the monorepo's GCP project/AR repo.
+#
+# ── What this workflow does ──────────────────────────────────────────────────
+#
+# Builds the enclave Docker image and pushes it to the monorepo's Artifact
+# Registry (us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave).
+# All security-sensitive config is baked in via --build-arg so it is part of
+# the attested image digest and cannot be overridden at VM launch time.
+#
+# The image digest output is what matters: it is pinned in the monorepo's
+# infra/terraform.tfvars (var.enclave_image_digest) to activate the
+# attestation-gated KMS binding. Rolling the enclave VM is a separate step
+# triggered manually in the monorepo's enclave-roll.yml workflow.
+#
+# ── Repository variables required ───────────────────────────────────────────
+# (set in repo Settings → Variables/Secrets)
+#
+# Variables (non-secret, visible in logs):
+#   GCP_WIF_PROVIDER          WIF provider resource name for THIS repo
+#                             (see REQUIRED INFRA STEP above)
+#   GCP_DEPLOYER_SA           Deployer SA email (from the monorepo GCP project)
+#
+#   Build-arg variables (baked into the attested image digest):
+#   ENCLAVE_KMS_PROJECT       GCP project containing the KMS key ring
+#   ENCLAVE_KMS_LOCATION      KMS key location (e.g. global)
+#   ENCLAVE_KMS_KEY_RING      KMS key ring name
+#   ENCLAVE_KMS_KEY           KMS crypto key name
+#   ENCLAVE_GCS_BUCKET        GCS bucket for encrypted index blobs
+#   ENCLAVE_RUN_SA_EMAIL      Control-plane service account email
+#   ENCLAVE_AUDIENCE          Enclave's own URL (for ID-token aud validation)
+#   ENCLAVE_ATTEST_STS_AUDIENCE  WIF provider resource name for attestation STS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: enclave-build
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PROJECT_ID: kioku-joerodriguez
+  REGION: us-central1
+  IMAGE_NAME: kioku-enclave
+
+jobs:
+  # ── Build and push the enclave image to Artifact Registry ─────────────────
+  # No approval gate here: pushing an image to AR is non-destructive.
+  # The content-addressable digest is published in the job summary so it can
+  # be pinned in the monorepo's terraform to roll the VM.
+  build-push:
+    name: Build + push enclave image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      digest:    ${{ steps.digest.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (keyless WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # Configure Docker credential helper for Artifact Registry.
+      # We build on the runner and push directly — we do NOT use
+      # `gcloud builds submit` because its pre-flight bucket check fails
+      # under WIF federated credentials even with storage.admin on the bucket.
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        id: build
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TIMESTAMP="$(date +%s)"
+          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+          IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/kioku/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+
+          echo "Building image: ${IMAGE_URI}"
+
+          # All security-sensitive config is baked in at build time so it is
+          # part of the attested image digest and cannot be overridden at VM
+          # launch time via tee-env-* metadata.
+          docker build --platform linux/amd64 \
+            --build-arg KMS_PROJECT="${{ vars.ENCLAVE_KMS_PROJECT }}" \
+            --build-arg KMS_LOCATION="${{ vars.ENCLAVE_KMS_LOCATION }}" \
+            --build-arg KMS_KEY_RING="${{ vars.ENCLAVE_KMS_KEY_RING }}" \
+            --build-arg KMS_KEY="${{ vars.ENCLAVE_KMS_KEY }}" \
+            --build-arg GCS_BUCKET="${{ vars.ENCLAVE_GCS_BUCKET }}" \
+            --build-arg RUN_SA_EMAIL="${{ vars.ENCLAVE_RUN_SA_EMAIL }}" \
+            --build-arg ENCLAVE_AUDIENCE="${{ vars.ENCLAVE_AUDIENCE }}" \
+            --build-arg ATTEST_STS_AUDIENCE="${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}" \
+            -t "${IMAGE_URI}" .
+
+          docker push "${IMAGE_URI}"
+
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      # Retrieve the content-addressable sha256 digest for the pushed image.
+      # This digest is what gets pinned in the monorepo's terraform
+      # (var.enclave_image_digest) to activate the attestation-gated KMS
+      # binding. The VM roll is triggered separately in the monorepo.
+      - name: Retrieve image digest
+        id: digest
+        run: |
+          IMAGE_URI="${{ steps.build.outputs.image_uri }}"
+          DIGEST="$(gcloud artifacts docker images describe "${IMAGE_URI}" \
+            --format='value(image_summary.digest)' 2>/dev/null || echo 'unknown')"
+          if [ "$DIGEST" = "unknown" ]; then
+            echo "::error::Failed to retrieve digest for ${IMAGE_URI}"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Enclave image built"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Image tag | \`${{ steps.build.outputs.image_tag }}\` |"
+            echo "| Image URI | \`${IMAGE_URI}\` |"
+            echo "| **Image digest** | \`${DIGEST}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Built at | $(date -u '+%Y-%m-%dT%H:%M:%SZ') |"
+            echo ""
+            echo "### Next step: roll the VM"
+            echo ""
+            echo "Pin this digest in \`infra/terraform.tfvars\` in the monorepo and"
+            echo "trigger the \`enclave-roll.yml\` workflow manually to replace the VM."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -178,6 +178,53 @@ docker build \
 
 ---
 
+## CI/CD — image build pipeline
+
+The enclave image is built automatically by this repository's GitHub Actions
+workflow (`.github/workflows/build.yml`). On every push to `main`, the
+workflow:
+
+1. Authenticates to GCP using Workload Identity Federation (keyless — no
+   long-lived SA key stored in GitHub secrets).
+2. Builds the Docker image with `docker build --platform linux/amd64` and
+   passes all security-sensitive config via `--build-arg` so that every build
+   parameter is part of the attested image digest.
+3. Pushes the image to the monorepo's Artifact Registry:
+   `us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave:<tag>`
+4. Retrieves and publishes the content-addressable `sha256:` digest in the
+   job summary.
+
+**Rolling the VM is a separate step.** The digest from step 4 is pinned in the
+monorepo's `infra/terraform.tfvars` (`enclave_image_digest`) and the
+`enclave-roll.yml` workflow in the monorepo is triggered manually to replace
+the running Confidential Space VM with the new image. Terraform uses
+`-replace=google_compute_instance.kioku_enclave` to force VM replacement —
+a metadata-only update would not reboot and would leave the old binary running.
+
+### Required infra prerequisite
+
+Before this workflow can authenticate to GCP, a Workload Identity Federation
+binding must be created in the monorepo's terraform that trusts
+`joerodriguez/kioku-enclave` (the existing binding only trusts
+`joerodriguez/kioku`). See the comment at the top of `.github/workflows/build.yml`
+for the exact terraform resources required.
+
+### Digest pinning and attestation
+
+The KMS attestation condition in `infra/enclave.tf` pins the exact image
+digest:
+
+```
+attribute.image_digest == <enclave_image_digest>
+```
+
+Only a VM running that exact digest can unwrap user DEKs via KMS. Changing a
+single byte of the image — source, dependencies, or build args — produces a
+different digest and voids the KMS grant. The digest pinning is therefore the
+cryptographic root of the privacy claim.
+
+---
+
 ## Environment variables
 
 All security-sensitive variables are baked into the image at `docker build`
