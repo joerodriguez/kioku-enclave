@@ -11,15 +11,16 @@ name: Build & push enclave image
 #
 # ── What this workflow does ──────────────────────────────────────────────────
 #
-# Builds the enclave Docker image and pushes it to the monorepo's Artifact
+# Builds the enclave Docker image and pushes it to the deployment's Artifact
 # Registry (us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave).
 # All security-sensitive config is baked in via --build-arg so it is part of
 # the attested image digest and cannot be overridden at VM launch time.
 #
-# The image digest output is what matters: it is pinned in the monorepo's
-# infra/terraform.tfvars (var.enclave_image_digest) to activate the
-# attestation-gated KMS binding. Rolling the enclave VM is a separate step
-# triggered manually in the monorepo's enclave-roll.yml workflow.
+# The image digest output is what matters: the operator pins it in their
+# deployment terraform (var.enclave_image_digest) to activate the
+# attestation-gated KMS binding. Rolling the enclave VM is a separate,
+# manually-triggered step in the deployment repo (for the canonical Kioku
+# deployment: the `enclave.yml` workflow in the kioku repo).
 #
 # ── Repository variables required ───────────────────────────────────────────
 # (set in repo Settings → Variables/Secrets)
@@ -61,8 +62,8 @@ env:
 jobs:
   # ── Build and push the enclave image to Artifact Registry ─────────────────
   # No approval gate here: pushing an image to AR is non-destructive.
-  # The content-addressable digest is published in the job summary so it can
-  # be pinned in the monorepo's terraform to roll the VM.
+  # The content-addressable digest is published in the job summary so the
+  # operator can pin it in their deployment terraform to roll the VM.
   build-push:
     name: Build + push enclave image
     runs-on: ubuntu-latest
@@ -123,9 +124,9 @@ jobs:
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
       # Retrieve the content-addressable sha256 digest for the pushed image.
-      # This digest is what gets pinned in the monorepo's terraform
+      # This digest is what the operator pins in their deployment terraform
       # (var.enclave_image_digest) to activate the attestation-gated KMS
-      # binding. The VM roll is triggered separately in the monorepo.
+      # binding. The VM roll is triggered separately in the deployment repo.
       - name: Retrieve image digest
         id: digest
         run: |
@@ -150,6 +151,6 @@ jobs:
             echo ""
             echo "### Next step: roll the VM"
             echo ""
-            echo "Pin this digest in \`infra/terraform.tfvars\` in the monorepo and"
-            echo "trigger the \`enclave-roll.yml\` workflow manually to replace the VM."
+            echo "Pin this digest as \`enclave_image_digest\` in the deployment terraform"
+            echo "and trigger the deployment repo's VM-roll workflow to replace the VM."
           } >> "$GITHUB_STEP_SUMMARY"

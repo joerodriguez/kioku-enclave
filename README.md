@@ -189,25 +189,26 @@ workflow:
 2. Builds the Docker image with `docker build --platform linux/amd64` and
    passes all security-sensitive config via `--build-arg` so that every build
    parameter is part of the attested image digest.
-3. Pushes the image to the monorepo's Artifact Registry:
+3. Pushes the image to the deployment's Artifact Registry:
    `us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave:<tag>`
 4. Retrieves and publishes the content-addressable `sha256:` digest in the
    job summary.
 
-**Rolling the VM is a separate step.** The digest from step 4 is pinned in the
-monorepo's `infra/terraform.tfvars` (`enclave_image_digest`) and the
-`enclave-roll.yml` workflow in the monorepo is triggered manually to replace
-the running Confidential Space VM with the new image. Terraform uses
-`-replace=google_compute_instance.kioku_enclave` to force VM replacement —
-a metadata-only update would not reboot and would leave the old binary running.
+**Rolling the VM is a separate step.** The operator pins the digest from
+step 4 in their deployment terraform (`enclave_image_digest`), which (a) moves
+the attestation-gated KMS decrypt binding to the new digest and (b) produces a
+new instance template for the managed instance group. The MIG then performs a
+zero-downtime create-before-destroy roll: the new VM must boot, attest as the
+new image, and pass health checks before the old VM is drained and deleted.
 
 ### Required infra prerequisite
 
-Before this workflow can authenticate to GCP, a Workload Identity Federation
-binding must be created in the monorepo's terraform that trusts
-`joerodriguez/kioku-enclave` (the existing binding only trusts
-`joerodriguez/kioku`). See the comment at the top of `.github/workflows/build.yml`
-for the exact terraform resources required.
+Before this workflow can authenticate to GCP, the operator's deployment
+terraform must contain a Workload Identity Federation binding that trusts this
+repository and maps it to a push-only service account
+(`roles/artifactregistry.writer` on the target registry — deliberately NOT a
+deployer identity). See the comment at the top of
+`.github/workflows/build.yml` for the exact terraform resources required.
 
 ### Digest pinning and attestation
 
