@@ -1,36 +1,13 @@
 name: Build & push enclave image
 
-# ── REQUIRED INFRA STEP (before this workflow can succeed) ───────────────────
+# ── Authentication (keyless WIF) ─────────────────────────────────────────────
 #
-# This workflow authenticates to GCP using Workload Identity Federation (WIF).
-# The existing WIF provider in the monorepo (github.com/joerodriguez/kioku)
-# does NOT trust this repository (github.com/joerodriguez/kioku-enclave) —
-# each WIF provider trust relationship is bound to a specific GitHub repo
-# (attribute.repository == '<org>/<repo>').
-#
-# REQUIRED: A human must add a new WIF pool attribute condition (or a new
-# provider binding) that trusts 'joerodriguez/kioku-enclave' and allows it to
-# impersonate the same GCP_DEPLOYER_SA. Concretely, in infra/cicd.tf (monorepo):
-#
-#   resource "google_iam_workload_identity_pool_provider" "github_enclave" {
-#     workload_identity_pool_id          = google_iam_workload_identity_pool.github.id
-#     workload_identity_pool_provider_id = "github-enclave"
-#     attribute_mapping = { ... }   # same as the existing provider
-#     oidc { issuer_uri = "https://token.actions.githubusercontent.com" }
-#     attribute_condition = "assertion.repository == 'joerodriguez/kioku-enclave'"
-#   }
-#
-#   resource "google_service_account_iam_member" "wif_enclave_sa" {
-#     service_account_id = google_service_account.deployer.name
-#     role               = "roles/iam.workloadIdentityUser"
-#     member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/joerodriguez/kioku-enclave"
-#   }
-#
-# After applying, update the GCP_WIF_PROVIDER repo variable in Settings →
-# Variables to point at this repo's new provider resource name.
-#
-# The GCP_DEPLOYER_SA, Artifact Registry repo, and image name can stay the same
-# as in the monorepo — they reference the monorepo's GCP project/AR repo.
+# This workflow authenticates to GCP using Workload Identity Federation — no
+# stored keys. The operator's WIF provider trusts this repository and lets it
+# impersonate a PUSH-ONLY service account that can only write to the Artifact
+# Registry repo (no deploy, IAM, secrets, or KMS access). The provider name and
+# that SA email are supplied as the GCP_WIF_PROVIDER and GCP_SERVICE_ACCOUNT
+# repo variables. See README "CI/CD" for the operator setup.
 #
 # ── What this workflow does ──────────────────────────────────────────────────
 #
@@ -48,9 +25,9 @@ name: Build & push enclave image
 # (set in repo Settings → Variables/Secrets)
 #
 # Variables (non-secret, visible in logs):
-#   GCP_WIF_PROVIDER          WIF provider resource name for THIS repo
-#                             (see REQUIRED INFRA STEP above)
-#   GCP_DEPLOYER_SA           Deployer SA email (from the monorepo GCP project)
+#   GCP_WIF_PROVIDER          WIF provider resource name (from the operator infra)
+#   GCP_SERVICE_ACCOUNT       Push-only SA email this repo impersonates
+#                             (artifactregistry.writer only — NOT a deployer)
 #
 #   Build-arg variables (baked into the attested image digest):
 #   ENCLAVE_KMS_PROJECT       GCP project containing the KMS key ring
@@ -102,7 +79,7 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
