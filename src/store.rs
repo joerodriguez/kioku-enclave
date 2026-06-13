@@ -393,10 +393,14 @@ CREATE TABLE IF NOT EXISTS screenshots (
 CREATE VIRTUAL TABLE IF NOT EXISTS screenshots_fts
     USING fts5(ocr_text, content='screenshots', content_rowid='id');
 
--- Summarised episodes (unique per started_at; upserted by the summariser)
+-- Summarised episodes (v2). Identity is the autoincrement `id` (stable across
+-- summariser runs, round-tripped by the control plane as episode_ref);
+-- started_at / ended_at are DERIVED metadata (min/max of member timestamps) and
+-- are NOT unique. Membership lives in episode_members. `id` stays INTEGER
+-- because episodes_fts is an external-content FTS5 table keyed on its rowid.
 CREATE TABLE IF NOT EXISTS episodes (
-    id            INTEGER PRIMARY KEY,
-    started_at    TEXT NOT NULL UNIQUE,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at    TEXT NOT NULL,
     ended_at      TEXT NOT NULL,
     type          TEXT,
     title         TEXT,
@@ -407,8 +411,23 @@ CREATE TABLE IF NOT EXISTS episodes (
     model         TEXT,
     topics        TEXT,  -- JSON array (legacy)
     people        TEXT,  -- JSON array (legacy)
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at    TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_episodes_started_at ON episodes(started_at);
+
+-- Explicit episode membership (FK join). record_type ∈ {utterance, screenshot};
+-- record_id references utterances(id) / screenshots(id). Enables both
+-- "records of an episode" and the reverse "episode of a record" lookup, and
+-- expresses nesting (the innermost episode claims a record).
+CREATE TABLE IF NOT EXISTS episode_members (
+    episode_id   INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    record_type  TEXT NOT NULL CHECK (record_type IN ('utterance','screenshot')),
+    record_id    INTEGER NOT NULL,
+    PRIMARY KEY (episode_id, record_type, record_id)
+);
+CREATE INDEX IF NOT EXISTS idx_episode_members_record
+    ON episode_members(record_type, record_id);
 
 -- FTS5 over episode summary + title
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
@@ -445,15 +464,23 @@ CREATE TRIGGER IF NOT EXISTS screenshots_update_fts AFTER UPDATE ON screenshots 
     UPDATE screenshots_fts SET ocr_text = new.ocr_text WHERE rowid = new.id;
 END;
 
--- FTS sync triggers: episodes
+-- FTS sync triggers: episodes. external-content FTS5 must be maintained with
+-- the special 'delete' command (passing the OLD column values so the right
+-- terms are removed) — a plain DELETE/UPDATE on the FTS shadow corrupts the
+-- index ("database disk image is malformed") because FTS can't recover the old
+-- terms once the content row has changed. The v2 id-keyed upsert UPDATEs rows
+-- in place, so the update trigger MUST use this form.
 CREATE TRIGGER IF NOT EXISTS episodes_insert_fts AFTER INSERT ON episodes BEGIN
     INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
 END;
 CREATE TRIGGER IF NOT EXISTS episodes_delete_fts AFTER DELETE ON episodes BEGIN
-    DELETE FROM episodes_fts WHERE rowid = old.id;
+    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary)
+        VALUES ('delete', old.id, old.title, old.summary);
 END;
 CREATE TRIGGER IF NOT EXISTS episodes_update_fts AFTER UPDATE ON episodes BEGIN
-    UPDATE episodes_fts SET title = new.title, summary = new.summary WHERE rowid = new.id;
+    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary)
+        VALUES ('delete', old.id, old.title, old.summary);
+    INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
 END;
 "#;
 
@@ -490,12 +517,76 @@ fn run_migrations(conn: &Connection) -> Result<()> {
              ON screenshots(source_key) WHERE source_key IS NOT NULL;",
     )?;
 
-    // episodes.started_at already declared UNIQUE in the new schema; for blobs
-    // created before that change we add the index explicitly.
-    conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_started_at
-             ON episodes(started_at);",
-    )?;
+    // ── v2 episodes migration: id-keyed episodes + explicit membership ──────────
+    //
+    // v1 keyed episodes by `started_at` (UNIQUE) and had no membership. v2 makes
+    // identity the autoincrement `id` and adds the `episode_members` join table.
+    // We detect the v1 schema by the ABSENCE of the `updated_at` column (added in
+    // v2): new blobs already have the v2 schema from SCHEMA_SQL and skip this
+    // block; old blobs drop the v1 `episodes` (+ its FTS) and recreate. The v1
+    // episode rows are intentionally discarded — the summariser backfills them
+    // under v2 (utterances/screenshots are untouched).
+    let episodes_is_v1: bool = {
+        let has_updated_at: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('episodes') WHERE name = 'updated_at'",
+            [],
+            |r| r.get(0),
+        )?;
+        has_updated_at == 0
+    };
+    if episodes_is_v1 {
+        conn.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS episodes_insert_fts;
+            DROP TRIGGER IF EXISTS episodes_delete_fts;
+            DROP TRIGGER IF EXISTS episodes_update_fts;
+            DROP TABLE IF EXISTS episodes_fts;
+            DROP TABLE IF EXISTS episode_members;
+            DROP TABLE IF EXISTS episodes;
+
+            CREATE TABLE episodes (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at    TEXT NOT NULL,
+                ended_at      TEXT NOT NULL,
+                type          TEXT,
+                title         TEXT,
+                summary       TEXT,
+                participants  TEXT,
+                languages     TEXT,
+                action_items  TEXT,
+                model         TEXT,
+                topics        TEXT,
+                people        TEXT,
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_episodes_started_at ON episodes(started_at);
+            CREATE VIRTUAL TABLE episodes_fts
+                USING fts5(title, summary, content='episodes', content_rowid='id');
+            CREATE TRIGGER episodes_insert_fts AFTER INSERT ON episodes BEGIN
+                INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
+            END;
+            CREATE TRIGGER episodes_delete_fts AFTER DELETE ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, title, summary)
+                    VALUES ('delete', old.id, old.title, old.summary);
+            END;
+            CREATE TRIGGER episodes_update_fts AFTER UPDATE ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, title, summary)
+                    VALUES ('delete', old.id, old.title, old.summary);
+                INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
+            END;
+
+            CREATE TABLE episode_members (
+                episode_id   INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+                record_type  TEXT NOT NULL CHECK (record_type IN ('utterance','screenshot')),
+                record_id    INTEGER NOT NULL,
+                PRIMARY KEY (episode_id, record_type, record_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_episode_members_record
+                ON episode_members(record_type, record_id);
+            "#,
+        )?;
+    }
 
     // New episodes columns added in this pass (type / participants / languages /
     // action_items / model).  Ignore "duplicate column name" as above.
@@ -809,6 +900,96 @@ pub(crate) mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use std::sync::Mutex as StdMutex;
+
+    // ── v1 → v2 episodes migration ────────────────────────────────────────────
+
+    /// A blob created under the v1 schema (started_at UNIQUE, no updated_at, no
+    /// episode_members) must self-upgrade to v2 on first open, discarding the v1
+    /// episode rows (the summariser backfills them) and gaining membership.
+    #[test]
+    fn v1_episodes_blob_migrates_to_v2() {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal v1 schema covering only what run_migrations touches.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE audio_segments (id INTEGER PRIMARY KEY, started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL, duration_seconds REAL NOT NULL DEFAULT 0,
+                source_type TEXT NOT NULL DEFAULT 'mic');
+            CREATE TABLE utterances (id INTEGER PRIMARY KEY, audio_segment_id INTEGER NOT NULL,
+                start_offset_seconds REAL NOT NULL DEFAULT 0, end_offset_seconds REAL NOT NULL DEFAULT 0,
+                text TEXT NOT NULL, speaker_label TEXT NOT NULL DEFAULT 'Me');
+            CREATE TABLE screenshots (id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL, ocr_text TEXT);
+            CREATE TABLE episodes (
+                id INTEGER PRIMARY KEY,
+                started_at TEXT NOT NULL UNIQUE,
+                ended_at TEXT NOT NULL,
+                type TEXT, title TEXT, summary TEXT,
+                participants TEXT, languages TEXT, action_items TEXT,
+                model TEXT, topics TEXT, people TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE VIRTUAL TABLE episodes_fts USING fts5(title, summary, content='episodes', content_rowid='id');
+            CREATE TRIGGER episodes_insert_fts AFTER INSERT ON episodes BEGIN
+                INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
+            END;
+            INSERT INTO episodes (started_at, ended_at, title, summary)
+                VALUES ('2026-01-01T09:00:00Z','2026-01-01T10:00:00Z','v1 episode','old');
+            "#,
+        )
+        .unwrap();
+
+        let pre: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('episodes') WHERE name='updated_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 0, "precondition: v1 has no updated_at");
+
+        run_migrations(&conn).unwrap();
+
+        let has_updated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('episodes') WHERE name='updated_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_updated, 1, "updated_at column added");
+        let ep_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ep_count, 0, "v1 episode rows discarded on migrate");
+        let mem_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='episode_members'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mem_exists, 1, "episode_members created");
+
+        // started_at is no longer UNIQUE in v2.
+        conn.execute(
+            "INSERT INTO episodes (started_at, ended_at, title) VALUES ('2026-02-01T09:00:00Z','2026-02-01T09:30:00Z','a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episodes (started_at, ended_at, title) VALUES ('2026-02-01T09:00:00Z','2026-02-01T09:10:00Z','b')",
+            [],
+        )
+        .unwrap();
+
+        // Second run is a no-op (idempotent) — must NOT wipe v2 data.
+        run_migrations(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "re-running migrations must not re-drop v2 episodes");
+    }
 
     // ── Fake KMS ──────────────────────────────────────────────────────────────
 

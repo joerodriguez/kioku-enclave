@@ -69,7 +69,10 @@ mod store;
 mod timeline;
 
 use crate::{
-    episodes::{handle_episodes_delete_range, handle_episodes_list, handle_episodes_upsert},
+    episodes::{
+        handle_episodes_delete_range, handle_episodes_list, handle_episodes_members,
+        handle_episodes_upsert,
+    },
     ingest::handle_ingest,
     search::handle_search,
     store::{GcpGcsClient, Store},
@@ -294,6 +297,7 @@ async fn main() {
         .route("/v1/range", post(handle_range))
         .route("/v1/episodes/upsert", post(handle_episodes_upsert))
         .route("/v1/episodes/list", post(handle_episodes_list))
+        .route("/v1/episodes/members", post(handle_episodes_members))
         .route(
             "/v1/episodes/delete_range",
             post(handle_episodes_delete_range),

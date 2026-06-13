@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tracing::info;
 
 use crate::{error::Result, AppState};
@@ -37,12 +37,23 @@ pub struct EpisodeRow {
     pub action_items: Value,
     pub model: Option<String>,
     pub created_at: String,
+    /// Member counts (v2) — number of utterances / screenshots bound to this
+    /// episode via episode_members. Lets the debugger and list_episodes show
+    /// "N utterances, M screenshots" without a second round-trip.
+    pub utterance_count: i64,
+    pub screenshot_count: i64,
 }
 
 // ── Upsert ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct EpisodeInput {
+    /// Stable episode id (v2). When present and the row exists, the episode is
+    /// UPDATED in place (id preserved). When absent (or stale), a new row is
+    /// INSERTed and its id returned in the response — the control plane reuses
+    /// that id as `episode_ref` on the next run to extend rather than duplicate.
+    #[serde(default)]
+    pub id: Option<i64>,
     pub started_at: String,
     pub ended_at: String,
     #[serde(rename = "type")]
@@ -57,6 +68,12 @@ pub struct EpisodeInput {
     pub action_items: Option<Vec<String>>,
     /// Model identifier used to produce this episode.
     pub model: Option<String>,
+    /// Member utterance ids to bind to this episode (additive: INSERT OR IGNORE).
+    #[serde(default)]
+    pub member_utterance_ids: Vec<i64>,
+    /// Member screenshot ids to bind to this episode (additive: INSERT OR IGNORE).
+    #[serde(default)]
+    pub member_screenshot_ids: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +85,9 @@ pub struct EpisodesUpsertRequest {
 #[derive(Debug, Serialize)]
 pub struct EpisodesUpsertResponse {
     pub upserted: usize,
+    /// Resulting episode ids, in the same order as the request's `episodes`.
+    /// New episodes carry their freshly-assigned id; updated ones echo theirs.
+    pub ids: Vec<i64>,
 }
 
 pub async fn handle_episodes_upsert(
@@ -78,17 +98,30 @@ pub async fn handle_episodes_upsert(
     crate::store::validate_user_id(&user_id)?;
     info!(user_id = %user_id, count = req.episodes.len(), "episodes upsert request");
 
-    let upserted = state
+    let ids = state
         .store
         .with_user(&user_id, |conn| upsert_episodes(conn, &req.episodes))
         .await?;
 
     state.store.save_user(&user_id).await?;
-    Ok(Json(EpisodesUpsertResponse { upserted }))
+    Ok(Json(EpisodesUpsertResponse {
+        upserted: ids.len(),
+        ids,
+    }))
 }
 
-fn upsert_episodes(conn: &rusqlite::Connection, items: &[EpisodeInput]) -> Result<usize> {
-    let mut count = 0usize;
+/// Upsert episodes by id and (additively) bind their members.
+///
+/// Per episode:
+///   - `id` present and the row exists → UPDATE in place (id preserved). The
+///     AFTER UPDATE trigger keeps episodes_fts in sync.
+///   - `id` absent (or stale/not-found) → INSERT; the new rowid is the id.
+///   - then INSERT OR IGNORE each member (utterance/screenshot) — additive, so
+///     extending an episode across runs accumulates members idempotently.
+///
+/// Returns the resulting id for each input episode, in order.
+fn upsert_episodes(conn: &rusqlite::Connection, items: &[EpisodeInput]) -> Result<Vec<i64>> {
+    let mut ids = Vec::with_capacity(items.len());
     for ep in items {
         let participants_json = ep
             .participants
@@ -103,35 +136,78 @@ fn upsert_episodes(conn: &rusqlite::Connection, items: &[EpisodeInput]) -> Resul
             .as_deref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()));
 
-        // FTS5 content tables do not update correctly via the UPDATE trigger when
-        // `ON CONFLICT … DO UPDATE` fires (the FTS shadow tables can diverge).
-        // Instead we: (1) delete the existing row if present (DELETE trigger keeps
-        // FTS clean), then (2) do a plain INSERT (INSERT trigger re-indexes it).
-        conn.execute(
-            "DELETE FROM episodes WHERE started_at = ?1",
-            [&ep.started_at],
-        )?;
+        // Decide UPDATE vs INSERT. We avoid INSERT … ON CONFLICT DO UPDATE for
+        // the FTS-divergence reasons noted historically; a plain UPDATE fires the
+        // AFTER UPDATE trigger which re-indexes episodes_fts correctly.
+        let existing_id: Option<i64> = match ep.id {
+            Some(id) => conn
+                .query_row("SELECT id FROM episodes WHERE id = ?1", [id], |r| r.get(0))
+                .ok(),
+            None => None,
+        };
 
-        conn.execute(
-            r#"INSERT INTO episodes
-               (started_at, ended_at, type, title, summary, participants, languages,
-                action_items, model)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-            rusqlite::params![
-                ep.started_at,
-                ep.ended_at,
-                ep.episode_type,
-                ep.title,
-                ep.summary,
-                participants_json,
-                languages_json,
-                action_items_json,
-                ep.model,
-            ],
-        )?;
-        count += 1;
+        let episode_id = if let Some(id) = existing_id {
+            conn.execute(
+                r#"UPDATE episodes SET
+                       started_at = ?2, ended_at = ?3, type = ?4, title = ?5,
+                       summary = ?6, participants = ?7, languages = ?8,
+                       action_items = ?9, model = ?10,
+                       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   WHERE id = ?1"#,
+                rusqlite::params![
+                    id,
+                    ep.started_at,
+                    ep.ended_at,
+                    ep.episode_type,
+                    ep.title,
+                    ep.summary,
+                    participants_json,
+                    languages_json,
+                    action_items_json,
+                    ep.model,
+                ],
+            )?;
+            id
+        } else {
+            conn.execute(
+                r#"INSERT INTO episodes
+                   (started_at, ended_at, type, title, summary, participants,
+                    languages, action_items, model, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                           strftime('%Y-%m-%dT%H:%M:%fZ','now'))"#,
+                rusqlite::params![
+                    ep.started_at,
+                    ep.ended_at,
+                    ep.episode_type,
+                    ep.title,
+                    ep.summary,
+                    participants_json,
+                    languages_json,
+                    action_items_json,
+                    ep.model,
+                ],
+            )?;
+            conn.last_insert_rowid()
+        };
+
+        // Bind members (additive). INSERT OR IGNORE makes re-runs idempotent and
+        // tolerates a record already claimed by this episode.
+        {
+            let mut stmt = conn.prepare_cached(
+                "INSERT OR IGNORE INTO episode_members (episode_id, record_type, record_id)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for uid in &ep.member_utterance_ids {
+                stmt.execute(rusqlite::params![episode_id, "utterance", uid])?;
+            }
+            for sid in &ep.member_screenshot_ids {
+                stmt.execute(rusqlite::params![episode_id, "screenshot", sid])?;
+            }
+        }
+
+        ids.push(episode_id);
     }
-    Ok(count)
+    Ok(ids)
 }
 
 // ── List ───────────────────────────────────────────────────────────────────────
@@ -177,12 +253,16 @@ fn list_episodes(
     req: &EpisodesListRequest,
 ) -> Result<Vec<EpisodeRow>> {
     let mut stmt = conn.prepare(
-        r#"SELECT id, started_at, ended_at, type, title, summary,
-                  participants, languages, action_items, model, created_at
-           FROM episodes
-           WHERE (?1 IS NULL OR started_at >= ?1)
-             AND (?2 IS NULL OR started_at < ?2)
-           ORDER BY started_at DESC
+        r#"SELECT e.id, e.started_at, e.ended_at, e.type, e.title, e.summary,
+                  e.participants, e.languages, e.action_items, e.model, e.created_at,
+                  (SELECT COUNT(*) FROM episode_members m
+                     WHERE m.episode_id = e.id AND m.record_type = 'utterance')  AS utterance_count,
+                  (SELECT COUNT(*) FROM episode_members m
+                     WHERE m.episode_id = e.id AND m.record_type = 'screenshot') AS screenshot_count
+           FROM episodes e
+           WHERE (?1 IS NULL OR e.started_at >= ?1)
+             AND (?2 IS NULL OR e.started_at < ?2)
+           ORDER BY e.started_at DESC
            LIMIT ?3 OFFSET ?4"#,
     )?;
 
@@ -237,6 +317,77 @@ pub async fn handle_episodes_delete_range(
     Ok(Json(EpisodesDeleteRangeResponse { deleted }))
 }
 
+// ── Members (drill-in) ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct EpisodesMembersRequest {
+    pub user_id: String,
+    pub episode_id: i64,
+}
+
+/// Return the records bound to one episode (debugger drill-in). Utterances are
+/// joined to audio_segments for their absolute timestamp; both lists come back
+/// time-ascending.
+pub async fn handle_episodes_members(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EpisodesMembersRequest>,
+) -> Result<Json<Value>> {
+    let user_id = req.user_id.clone();
+    crate::store::validate_user_id(&user_id)?;
+    info!(user_id = %user_id, episode_id = req.episode_id, "episodes members request");
+
+    let result = state
+        .store
+        .with_user(&user_id, |conn| fetch_members(conn, req.episode_id))
+        .await?;
+
+    Ok(Json(result))
+}
+
+fn fetch_members(conn: &rusqlite::Connection, episode_id: i64) -> Result<Value> {
+    let mut ustmt = conn.prepare(
+        r#"SELECT u.id, u.text, u.language, u.speaker_label, s.started_at
+           FROM episode_members m
+           JOIN utterances u     ON u.id = m.record_id
+           JOIN audio_segments s ON s.id = u.audio_segment_id
+           WHERE m.episode_id = ?1 AND m.record_type = 'utterance'
+           ORDER BY s.started_at ASC, u.start_offset_seconds ASC"#,
+    )?;
+    let utterances: Vec<Value> = ustmt
+        .query_map([episode_id], |row| {
+            Ok(json!({
+                "id":            row.get::<_, i64>(0)?,
+                "text":          row.get::<_, String>(1)?,
+                "language":      row.get::<_, Option<String>>(2)?,
+                "speaker_label": row.get::<_, String>(3)?,
+                "started_at":    row.get::<_, String>(4)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut sstmt = conn.prepare(
+        r#"SELECT sc.id, sc.captured_at, sc.active_app, sc.window_title, sc.url, sc.ocr_text
+           FROM episode_members m
+           JOIN screenshots sc ON sc.id = m.record_id
+           WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'
+           ORDER BY sc.captured_at ASC"#,
+    )?;
+    let screenshots: Vec<Value> = sstmt
+        .query_map([episode_id], |row| {
+            Ok(json!({
+                "id":           row.get::<_, i64>(0)?,
+                "captured_at":  row.get::<_, String>(1)?,
+                "active_app":   row.get::<_, Option<String>>(2)?,
+                "window_title": row.get::<_, Option<String>>(3)?,
+                "url":          row.get::<_, Option<String>>(4)?,
+                "ocr_text":     row.get::<_, Option<String>>(5)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(json!({ "utterances": utterances, "screenshots": screenshots }))
+}
+
 // ── Shared helpers ─────────────────────────────────────────────────────────────
 
 /// Parse a JSON-text column into a [`serde_json::Value`] array.
@@ -260,6 +411,8 @@ fn parse_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRow> {
         action_items: parse_json_array(row.get(8)?),
         model: row.get(9)?,
         created_at: row.get(10)?,
+        utterance_count: row.get(11)?,
+        screenshot_count: row.get(12)?,
     })
 }
 
@@ -278,6 +431,7 @@ mod tests {
 
     fn sample_episode(started_at: &str, ended_at: &str) -> EpisodeInput {
         EpisodeInput {
+            id: None,
             started_at: started_at.to_string(),
             ended_at: ended_at.to_string(),
             episode_type: Some("work".to_string()),
@@ -287,31 +441,37 @@ mod tests {
             languages: Some(vec!["en".to_string()]),
             action_items: Some(vec!["Ship it".to_string()]),
             model: Some("claude-3".to_string()),
+            member_utterance_ids: vec![],
+            member_screenshot_ids: vec![],
         }
     }
 
     #[tokio::test]
-    async fn upsert_same_started_at_does_not_duplicate() {
+    async fn upsert_by_id_updates_in_place() {
         let store = make_store();
         let ep1 = sample_episode("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z");
-        let ep2 = EpisodeInput {
-            title: "Stand-up updated".to_string(),
-            ..sample_episode("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z")
-        };
 
-        // First upsert
-        store
+        // First upsert (no id) → INSERT, returns the new id
+        let ids = store
             .with_user("ep_user", |conn| upsert_episodes(conn, &[ep1]))
             .await
             .unwrap();
+        assert_eq!(ids.len(), 1);
+        let id = ids[0];
 
-        // Second upsert with same started_at but different title
-        store
+        // Second upsert WITH that id and a different title → UPDATE in place
+        let ep2 = EpisodeInput {
+            id: Some(id),
+            title: "Stand-up updated".to_string(),
+            ..sample_episode("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z")
+        };
+        let ids2 = store
             .with_user("ep_user", |conn| upsert_episodes(conn, &[ep2]))
             .await
             .unwrap();
+        assert_eq!(ids2, vec![id], "same id echoed back on update");
 
-        // Should be exactly 1 row, with the updated title
+        // Exactly 1 row, id preserved, title updated.
         let (count, title): (i64, String) = store
             .with_user("ep_user", |conn| {
                 Ok(
@@ -322,9 +482,208 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(count, 1, "id-keyed upsert must not duplicate");
+        assert_eq!(title, "Stand-up updated");
+    }
 
-        assert_eq!(count, 1, "expected exactly 1 episode row");
-        assert_eq!(title, "Stand-up updated", "title should reflect the update");
+    #[tokio::test]
+    async fn upsert_without_id_inserts_distinct_rows() {
+        // v2: started_at is no longer unique — two no-id upserts at the same
+        // start are two distinct episodes (e.g. nesting), keyed by id.
+        let store = make_store();
+        let a = sample_episode("2026-01-01T09:00:00Z", "2026-01-01T09:30:00Z");
+        let b = sample_episode("2026-01-01T09:00:00Z", "2026-01-01T09:10:00Z");
+        let ids = store
+            .with_user("ep_distinct", |conn| upsert_episodes(conn, &[a, b]))
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "distinct ids");
+    }
+
+    #[tokio::test]
+    async fn update_keeps_fts_in_sync() {
+        // The id-keyed UPDATE path relies on the AFTER UPDATE trigger to keep the
+        // external-content episodes_fts table correct. Verify a renamed episode
+        // is found by its NEW title and not its old one.
+        let store = make_store();
+        let ids = store
+            .with_user("fts_user", |conn| {
+                upsert_episodes(conn, &[sample_episode("2026-03-01T09:00:00Z", "2026-03-01T09:30:00Z")])
+            })
+            .await
+            .unwrap();
+        let ep = EpisodeInput {
+            id: Some(ids[0]),
+            title: "Zebra synchronization meeting".to_string(),
+            ..sample_episode("2026-03-01T09:00:00Z", "2026-03-01T09:30:00Z")
+        };
+        store
+            .with_user("fts_user", |conn| upsert_episodes(conn, &[ep]))
+            .await
+            .unwrap();
+
+        let (hits_new, hits_old): (i64, i64) = store
+            .with_user("fts_user", |conn| {
+                let n: i64 = conn.query_row(
+                    "SELECT count(*) FROM episodes_fts WHERE episodes_fts MATCH 'Zebra'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let o: i64 = conn.query_row(
+                    "SELECT count(*) FROM episodes_fts WHERE episodes_fts MATCH 'Standup'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((n, o))
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits_new, 1, "new title must be searchable after UPDATE");
+        assert_eq!(hits_old, 0, "old title must be gone from FTS after UPDATE");
+    }
+
+    #[tokio::test]
+    async fn members_bound_and_counted_and_listed() {
+        let store = make_store();
+        // Seed an audio segment + utterance and a screenshot so the FK targets exist.
+        let (utt_id, scr_id) = store
+            .with_user("mem_user", |conn| {
+                conn.execute(
+                    r#"INSERT INTO audio_segments (started_at, ended_at, duration_seconds, source_type)
+                       VALUES ('2026-04-01T09:00:00Z', '2026-04-01T09:01:00Z', 60.0, 'mic')"#,
+                    [],
+                )?;
+                let seg_id = conn.last_insert_rowid();
+                conn.execute(
+                    r#"INSERT INTO utterances (audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label)
+                       VALUES (?1, 0.0, 5.0, 'hello world', 'Me')"#,
+                    [seg_id],
+                )?;
+                let utt_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-04-01T09:00:30Z', 'screen')",
+                    [],
+                )?;
+                let scr_id = conn.last_insert_rowid();
+                Ok((utt_id, scr_id))
+            })
+            .await
+            .unwrap();
+
+        let ep = EpisodeInput {
+            member_utterance_ids: vec![utt_id],
+            member_screenshot_ids: vec![scr_id],
+            ..sample_episode("2026-04-01T09:00:00Z", "2026-04-01T09:30:00Z")
+        };
+        let ids = store
+            .with_user("mem_user", |conn| upsert_episodes(conn, &[ep]))
+            .await
+            .unwrap();
+        let ep_id = ids[0];
+
+        // List returns the member counts.
+        let req = EpisodesListRequest {
+            user_id: "mem_user".to_string(),
+            time_start: None,
+            time_end: None,
+            limit: 10,
+            offset: 0,
+        };
+        let rows = store
+            .with_user("mem_user", |conn| list_episodes(conn, &req))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].utterance_count, 1);
+        assert_eq!(rows[0].screenshot_count, 1);
+
+        // Members drill-in returns the records.
+        let members = store
+            .with_user("mem_user", |conn| fetch_members(conn, ep_id))
+            .await
+            .unwrap();
+        assert_eq!(members["utterances"].as_array().unwrap().len(), 1);
+        assert_eq!(members["screenshots"].as_array().unwrap().len(), 1);
+        assert_eq!(members["utterances"][0]["text"], "hello world");
+
+        // Re-binding the same members is idempotent (INSERT OR IGNORE).
+        let ep_again = EpisodeInput {
+            id: Some(ep_id),
+            member_utterance_ids: vec![utt_id],
+            member_screenshot_ids: vec![scr_id],
+            ..sample_episode("2026-04-01T09:00:00Z", "2026-04-01T09:30:00Z")
+        };
+        store
+            .with_user("mem_user", |conn| upsert_episodes(conn, &[ep_again]))
+            .await
+            .unwrap();
+        let count: i64 = store
+            .with_user("mem_user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM episode_members", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "re-binding same members must not duplicate");
+    }
+
+    #[tokio::test]
+    async fn delete_episode_cascades_members() {
+        let store = make_store();
+        let ep_id = store
+            .with_user("cascade_user", |conn| {
+                conn.execute(
+                    r#"INSERT INTO audio_segments (started_at, ended_at, duration_seconds, source_type)
+                       VALUES ('2026-05-01T09:00:00Z', '2026-05-01T09:01:00Z', 60.0, 'mic')"#,
+                    [],
+                )?;
+                let seg_id = conn.last_insert_rowid();
+                conn.execute(
+                    r#"INSERT INTO utterances (audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label)
+                       VALUES (?1, 0.0, 5.0, 'x', 'Me')"#,
+                    [seg_id],
+                )?;
+                let utt_id = conn.last_insert_rowid();
+                let ids = upsert_episodes(
+                    conn,
+                    &[EpisodeInput {
+                        member_utterance_ids: vec![utt_id],
+                        ..sample_episode("2026-05-01T09:00:00Z", "2026-05-01T09:30:00Z")
+                    }],
+                )?;
+                Ok(ids[0])
+            })
+            .await
+            .unwrap();
+
+        // delete_range over the episode's started_at should remove it AND cascade
+        // its episode_members rows (FK ON DELETE CASCADE, foreign_keys=ON).
+        store
+            .with_user("cascade_user", |conn| {
+                conn.execute(
+                    "DELETE FROM episodes WHERE started_at >= ?1 AND started_at < ?2",
+                    rusqlite::params!["2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (eps, mems): (i64, i64) = store
+            .with_user("cascade_user", |conn| {
+                Ok((
+                    conn.query_row("SELECT count(*) FROM episodes", [], |r| r.get(0))?,
+                    conn.query_row(
+                        "SELECT count(*) FROM episode_members WHERE episode_id = ?1",
+                        [ep_id],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(eps, 0);
+        assert_eq!(mems, 0, "members must cascade-delete with their episode");
     }
 
     #[tokio::test]
