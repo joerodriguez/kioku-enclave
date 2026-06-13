@@ -1,0 +1,633 @@
+//! LLM episode summarizer (ports `cloud/src/summarizer.js`, v2 incremental
+//! upsert + explicit membership). Runs IN the enclave now; the cursor lives in
+//! the control DB (`users.summarized_until`) and content I/O is in-process.
+//!
+//! Faithful to v2: incremental window since the cursor, open-episode refs the
+//! model extends, membership by innermost-containing span, significance floor,
+//! window cap. **Simplification vs Node:** the OCR term/name-extraction
+//! heuristics (`blockScreenTerms`/`blockNameCandidates`, which needed Unicode
+//! regex) are dropped — the model still receives the raw OCR excerpts, just
+//! without the pre-computed `[screen-terms]`/`[likely names]` hints. Re-add with
+//! a regex pass if name recall regresses.
+//!
+//! The Vertex call sends text outside the TEE (documented caveat — see
+//! [`super::vertex`]).
+
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+use crate::episodes::{upsert_episodes, EpisodeInput};
+use crate::error::Result;
+
+use super::isotime::{format_epoch_millis, parse_epoch_millis};
+use super::CpState;
+
+const LOOKBACK_DAYS: i64 = 7;
+const TAIL_MINUTES: i64 = 5;
+const OPEN_WINDOW_MS: i64 = 4 * 60 * 60 * 1000;
+const MAX_WINDOW_HOURS: i64 = 6;
+const UTT_CAP: usize = 4000;
+const SCR_CAP: usize = 2000;
+const SIG_MIN_SUBSTANTIVE_UTT: i64 = 3;
+const SIG_MIN_SCREEN_MS: i64 = 2 * 60 * 1000;
+const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
+const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
+const TRIGGER_COOLDOWN_MS: i64 = 3 * 60 * 1000;
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn ms(ts: &str) -> i64 {
+    parse_epoch_millis(ts).unwrap_or(0)
+}
+
+#[derive(Clone)]
+struct UttRow {
+    id: i64,
+    started_at: String,
+    speaker_label: String,
+    language: Option<String>,
+    text: String,
+}
+
+#[derive(Clone)]
+struct ScrRow {
+    id: i64,
+    captured_at: String,
+    active_app: Option<String>,
+    window_title: Option<String>,
+    ocr_text: Option<String>,
+    url: Option<String>,
+}
+
+struct OpenEp {
+    id: i64,
+    started_at: String,
+    ended_at: String,
+    title: String,
+    summary: Option<String>,
+    utt_count: i64,
+    scr_count: i64,
+}
+
+fn fmt_time(ts: &str) -> String {
+    // HH:MM:SS slice of an ISO-8601 string.
+    ts.get(11..19).unwrap_or(ts).to_string()
+}
+
+/// Substantive = not empty and not a single-glyph hallucination run.
+fn is_substantive(text: &str) -> bool {
+    let t = text.trim();
+    if t.chars().count() < 2 {
+        return false;
+    }
+    let letters = t.chars().filter(|c| c.is_alphabetic()).count();
+    if letters < 2 {
+        return false;
+    }
+    let non_space: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if !non_space.is_empty() {
+        let mut counts: HashMap<char, usize> = HashMap::new();
+        for c in &non_space {
+            *counts.entry(*c).or_default() += 1;
+        }
+        let top = counts.values().copied().max().unwrap_or(0);
+        if top as f64 / non_space.len() as f64 > 0.7 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Chronological text block for the prompt (utterances + screenshot lines).
+fn render_capture_text(utterances: &[UttRow], screenshots: &[ScrRow]) -> String {
+    enum Ev<'a> {
+        Utt(&'a UttRow),
+        Scr(&'a ScrRow),
+    }
+    let mut events: Vec<(i64, Ev)> = Vec::new();
+    for u in utterances {
+        events.push((ms(&u.started_at), Ev::Utt(u)));
+    }
+    for s in screenshots {
+        events.push((ms(&s.captured_at), Ev::Scr(s)));
+    }
+    events.sort_by_key(|(t, _)| *t);
+
+    let mut ocr_budget: i64 = 30_000;
+    let mut lines = Vec::new();
+    for (_, ev) in events {
+        match ev {
+            Ev::Utt(r) => {
+                let label = match &r.language {
+                    Some(l) if !l.is_empty() => format!("{}|{}", r.speaker_label, l),
+                    _ => r.speaker_label.clone(),
+                };
+                lines.push(format!(
+                    "{} [{}] {}",
+                    fmt_time(&r.started_at),
+                    label,
+                    r.text
+                ));
+            }
+            Ev::Scr(s) => {
+                let app = s.active_app.clone().unwrap_or_default();
+                let title = s
+                    .window_title
+                    .as_ref()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| format!(" — {t}"))
+                    .unwrap_or_default();
+                let url = s
+                    .url
+                    .as_ref()
+                    .map(|u| format!(" <{}>", &u[..u.len().min(120)]))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "{} [screen] {}{}{}",
+                    fmt_time(&s.captured_at),
+                    app,
+                    title,
+                    url
+                ));
+                if let Some(ocr) = &s.ocr_text {
+                    if ocr_budget > 0 {
+                        let collapsed: String =
+                            ocr.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let excerpt: String = collapsed
+                            .chars()
+                            .take(250.min(ocr_budget as usize))
+                            .collect();
+                        if !excerpt.is_empty() {
+                            ocr_budget -= excerpt.len() as i64;
+                            lines.push(format!("         [screen-text] {excerpt}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Extract the first JSON object (Gemini JSON mode usually returns it bare).
+fn extract_json(text: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        return Some(v);
+    }
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for i in start..bytes.len() {
+        let ch = bytes[i] as char;
+        if esc {
+            esc = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_str => esc = true,
+            '"' => in_str = !in_str,
+            '{' if !in_str => depth += 1,
+            '}' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return serde_json::from_str(&text[start..=i]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Membership by innermost-containing span. Returns, per episode index, the
+/// member utterance ids and screenshot ids.
+fn derive_membership(
+    utterances: &[UttRow],
+    screenshots: &[ScrRow],
+    spans: &[(i64, i64)], // (started_ms, ended_ms) per episode
+) -> Vec<(Vec<i64>, Vec<i64>)> {
+    let mut out: Vec<(Vec<i64>, Vec<i64>)> =
+        spans.iter().map(|_| (Vec::new(), Vec::new())).collect();
+    let assign = |t: i64| -> Option<usize> {
+        let mut best: Option<usize> = None;
+        let mut best_span = i64::MAX;
+        for (i, (s, e)) in spans.iter().enumerate() {
+            if t < *s || t > *e {
+                continue;
+            }
+            let span = e - s;
+            if span < best_span {
+                best_span = span;
+                best = Some(i);
+            }
+        }
+        best
+    };
+    for u in utterances {
+        if let Some(i) = assign(ms(&u.started_at)) {
+            out[i].0.push(u.id);
+        }
+    }
+    for s in screenshots {
+        if let Some(i) = assign(ms(&s.captured_at)) {
+            out[i].1.push(s.id);
+        }
+    }
+    out
+}
+
+/// Summarize one user's recent capture into episodes. Returns a short status.
+pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
+    let summarized_until = state.control.summarized_until(user_id).await?;
+    let now = now_ms();
+    let tail_cutoff = now - TAIL_MINUTES * 60 * 1000;
+    let max_lookback = now - LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
+    let new_from = match &summarized_until {
+        Some(c) => ms(c).max(max_lookback),
+        None => max_lookback,
+    };
+    if new_from >= tail_cutoff {
+        return Ok(serde_json::json!({ "skipped": true }));
+    }
+    let new_to = tail_cutoff.min(new_from + MAX_WINDOW_HOURS * 60 * 60 * 1000);
+    let new_from_iso = format_epoch_millis(new_from);
+    let new_to_iso = format_epoch_millis(new_to);
+
+    // Fetch range records (with ids) from the user's index.
+    let (utterances, screenshots) = fetch_range(state, user_id, &new_from_iso, &new_to_iso).await?;
+
+    if utterances.is_empty() && screenshots.is_empty() {
+        state
+            .control
+            .set_summarized_until(user_id, &new_to_iso)
+            .await?;
+        return Ok(serde_json::json!({ "skipped": true, "reason": "no_new_records" }));
+    }
+
+    let last_utt = utterances.last().map(|u| ms(&u.started_at));
+    let last_scr = screenshots.last().map(|s| ms(&s.captured_at));
+    let effective_cutoff = [last_utt, last_scr]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(new_from);
+    if effective_cutoff <= new_from {
+        state
+            .control
+            .set_summarized_until(user_id, &new_to_iso)
+            .await?;
+        return Ok(serde_json::json!({ "skipped": true, "reason": "no_new_records" }));
+    }
+
+    // Open episodes (digests the model can extend by ref).
+    let open_cutoff = new_from - OPEN_WINDOW_MS;
+    let list_start = format_epoch_millis(new_from - OPEN_WINDOW_MS - 4 * 60 * 60 * 1000);
+    let open_episodes =
+        fetch_open_episodes(state, user_id, &list_start, &new_to_iso, open_cutoff).await?;
+
+    let capture_text = render_capture_text(&utterances, &screenshots);
+    let open_text = render_open_episodes(&open_episodes);
+
+    let range_from = utterances
+        .first()
+        .map(|u| u.started_at.clone())
+        .unwrap_or_else(|| screenshots[0].captured_at.clone());
+    let range_to = format_epoch_millis(effective_cutoff);
+
+    let user_message = format!(
+        "Range: {range_from} → {range_to}\n\n{}NEW CAPTURE LOG:\n{capture_text}",
+        if open_text.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "OPEN EPISODES (extend by ref when the new log continues one):\n{open_text}\n\n"
+            )
+        }
+    );
+
+    // Call Vertex.
+    let response = match super::vertex::generate(&state.config, SYSTEM_PROMPT, &user_message).await
+    {
+        Ok(t) => t,
+        Err(e) if e.to_string().contains("quota") => {
+            return Ok(serde_json::json!({ "skipped": true, "reason": "quota" }));
+        }
+        Err(e) => {
+            warn!(error = %e, "summarizer LLM call failed");
+            return Ok(serde_json::json!({ "error": e.to_string() }));
+        }
+    };
+    let Some(parsed) = extract_json(&response) else {
+        return Ok(serde_json::json!({ "error": "unparseable LLM response" }));
+    };
+    let episodes_json = parsed
+        .get("episodes")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Resolve refs, merge spans, build spans list for membership.
+    struct Ep {
+        existing_id: Option<i64>,
+        started: i64,
+        ended: i64,
+        type_: Option<String>,
+        title: String,
+        summary: Option<String>,
+        participants: Option<Vec<String>>,
+        languages: Option<Vec<String>>,
+        action_items: Option<Vec<String>>,
+    }
+    let str_arr = |v: Option<&Value>| -> Option<Vec<String>> {
+        v.and_then(|x| x.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+    };
+    let mut eps: Vec<Ep> = Vec::new();
+    for e in &episodes_json {
+        let (Some(started), Some(ended), Some(title)) = (
+            e.get("started_at").and_then(|v| v.as_str()),
+            e.get("ended_at").and_then(|v| v.as_str()),
+            e.get("title").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let (mut s_ms, mut e_ms) = (ms(started), ms(ended));
+        let mut existing_id = None;
+        if let Some(r) = e.get("episode_ref").and_then(|v| v.as_str()) {
+            if let Some(open) = open_episodes.get(parse_ref(r)) {
+                existing_id = Some(open.id);
+                s_ms = s_ms.min(ms(&open.started_at));
+                e_ms = e_ms.max(ms(&open.ended_at));
+            }
+        }
+        eps.push(Ep {
+            existing_id,
+            started: s_ms,
+            ended: e_ms,
+            type_: e.get("type").and_then(|v| v.as_str()).map(String::from),
+            title: title.to_string(),
+            summary: e.get("summary").and_then(|v| v.as_str()).map(String::from),
+            participants: str_arr(e.get("participants")),
+            languages: str_arr(e.get("languages")),
+            action_items: str_arr(e.get("action_items")),
+        });
+    }
+
+    let spans: Vec<(i64, i64)> = eps.iter().map(|e| (e.started, e.ended)).collect();
+    let membership = derive_membership(&utterances, &screenshots, &spans);
+    let utt_by_id: HashMap<i64, &UttRow> = utterances.iter().map(|u| (u.id, u)).collect();
+
+    // Significance floor (new episodes only) + build upsert payload.
+    let mut to_upsert: Vec<EpisodeInput> = Vec::new();
+    let mut dropped = 0;
+    for (i, ep) in eps.iter().enumerate() {
+        let (utt_ids, scr_ids) = &membership[i];
+        if ep.existing_id.is_none() {
+            let substantive = utt_ids
+                .iter()
+                .filter(|id| utt_by_id.get(id).is_some_and(|u| is_substantive(&u.text)))
+                .count() as i64;
+            let scr_times: Vec<i64> = scr_ids
+                .iter()
+                .filter_map(|id| screenshots.iter().find(|s| s.id == *id))
+                .map(|s| ms(&s.captured_at))
+                .collect();
+            let screen_span = match (scr_times.iter().min(), scr_times.iter().max()) {
+                (Some(a), Some(b)) => b - a,
+                _ => 0,
+            };
+            let span_min = (((ep.ended - ep.started) as f64) / 60000.0).max(1.0);
+            let dense = substantive >= SIG_MIN_SUBSTANTIVE_UTT
+                && (substantive as f64) >= span_min * SIG_MIN_UTT_PER_MIN;
+            if !(dense || screen_span >= SIG_MIN_SCREEN_MS) {
+                dropped += 1;
+                continue;
+            }
+        }
+        to_upsert.push(EpisodeInput {
+            id: ep.existing_id,
+            started_at: format_epoch_millis(ep.started),
+            ended_at: format_epoch_millis(ep.ended),
+            episode_type: ep.type_.clone(),
+            title: ep.title.clone(),
+            summary: ep.summary.clone(),
+            participants: ep.participants.clone(),
+            languages: ep.languages.clone(),
+            action_items: ep.action_items.clone(),
+            model: Some(state.config.vertex_model.clone()),
+            member_utterance_ids: utt_ids.clone(),
+            member_screenshot_ids: scr_ids.clone(),
+        });
+    }
+
+    let mut upserted = 0;
+    if !to_upsert.is_empty() {
+        let user = user_id.to_string();
+        let ids = state
+            .store
+            .with_user(&user, move |conn| upsert_episodes(conn, &to_upsert))
+            .await?;
+        state.store.save_user(&user).await?;
+        upserted = ids.len();
+    }
+
+    let cutoff_iso = format_epoch_millis(effective_cutoff);
+    state
+        .control
+        .set_summarized_until(user_id, &cutoff_iso)
+        .await?;
+    info!(user_id, upserted, dropped, "summarized");
+    Ok(serde_json::json!({ "episodes": upserted, "dropped": dropped, "to": cutoff_iso }))
+}
+
+fn parse_ref(r: &str) -> usize {
+    r.trim()
+        .trim_start_matches('E')
+        .parse()
+        .unwrap_or(usize::MAX)
+}
+
+fn render_open_episodes(open: &[OpenEp]) -> String {
+    open.iter()
+        .enumerate()
+        .map(|(i, ep)| {
+            let s1 = ep
+                .summary
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("");
+            let s1 = &s1[..s1.len().min(120)];
+            format!(
+                "[E{i}] \"{}\" ({} → {}, {} utt/{} scr): {}",
+                ep.title, ep.started_at, ep.ended_at, ep.utt_count, ep.scr_count, s1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn fetch_range(
+    state: &CpState,
+    user_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<(Vec<UttRow>, Vec<ScrRow>)> {
+    let (f, t) = (from.to_string(), to.to_string());
+    state
+        .store
+        .with_user(user_id, move |conn| {
+            let mut us = conn.prepare(
+                "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text \
+                 FROM utterances u JOIN audio_segments s ON s.id = u.audio_segment_id \
+                 WHERE s.started_at >= ?1 AND s.started_at < ?2 \
+                 ORDER BY s.started_at ASC LIMIT ?3",
+            )?;
+            let utterances: Vec<UttRow> = us
+                .query_map(rusqlite::params![f, t, UTT_CAP as i64], |r| {
+                    Ok(UttRow {
+                        id: r.get(0)?,
+                        started_at: r.get(1)?,
+                        speaker_label: r.get(2)?,
+                        language: r.get(3)?,
+                        text: r.get(4)?,
+                    })
+                })?
+                .filter_map(|x| x.ok())
+                .collect();
+            let mut ss = conn.prepare(
+                "SELECT id, captured_at, active_app, window_title, substr(ocr_text,1,4000), url \
+                 FROM screenshots WHERE captured_at >= ?1 AND captured_at < ?2 \
+                 ORDER BY captured_at ASC LIMIT ?3",
+            )?;
+            let screenshots: Vec<ScrRow> = ss
+                .query_map(rusqlite::params![f, t, SCR_CAP as i64], |r| {
+                    Ok(ScrRow {
+                        id: r.get(0)?,
+                        captured_at: r.get(1)?,
+                        active_app: r.get(2)?,
+                        window_title: r.get(3)?,
+                        ocr_text: r.get(4)?,
+                        url: r.get(5)?,
+                    })
+                })?
+                .filter_map(|x| x.ok())
+                .collect();
+            Ok((utterances, screenshots))
+        })
+        .await
+}
+
+async fn fetch_open_episodes(
+    state: &CpState,
+    user_id: &str,
+    list_start: &str,
+    list_end: &str,
+    open_cutoff_ms: i64,
+) -> Result<Vec<OpenEp>> {
+    let (ls, le) = (list_start.to_string(), list_end.to_string());
+    let mut eps = state
+        .store
+        .with_user(user_id, move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.started_at, e.ended_at, e.title, e.summary, \
+                        (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='utterance'), \
+                        (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='screenshot') \
+                 FROM episodes e WHERE e.started_at >= ?1 AND e.started_at <= ?2 \
+                 ORDER BY e.started_at ASC LIMIT 100",
+            )?;
+            let rows: Vec<OpenEp> = stmt
+                .query_map(rusqlite::params![ls, le], |r| {
+                    Ok(OpenEp {
+                        id: r.get(0)?,
+                        started_at: r.get(1)?,
+                        ended_at: r.get(2)?,
+                        title: r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "untitled".into()),
+                        summary: r.get(4)?,
+                        utt_count: r.get(5)?,
+                        scr_count: r.get(6)?,
+                    })
+                })?
+                .filter_map(|x| x.ok())
+                .collect();
+            Ok(rows)
+        })
+        .await?;
+    // Keep only those still "open" (ended within the window), newest 30.
+    eps.retain(|e| ms(&e.ended_at) >= open_cutoff_ms);
+    let n = eps.len();
+    if n > 30 {
+        eps.drain(0..n - 30);
+    }
+    Ok(eps)
+}
+
+/// Sweep all users (internal cron). Sequential to avoid Vertex rate-limit storms.
+pub async fn summarize_all(state: &CpState) {
+    let ids = match state.control.all_user_ids().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(error = %e, "summarize_all: list users failed");
+            return;
+        }
+    };
+    for id in ids {
+        if let Err(e) = summarize_user(state, &id).await {
+            warn!(user_id = %id, error = %e, "summarize_user failed");
+        }
+    }
+}
+
+/// Spawn the internal summarizer cron (replaces Cloud Scheduler). Sweeps every
+/// [`SCHEDULER_INTERVAL_SECS`].
+pub fn spawn_scheduler(state: Arc<CpState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(SCHEDULER_INTERVAL_SECS));
+        loop {
+            tick.tick().await;
+            summarize_all(&state).await;
+        }
+    });
+}
+
+/// Fire-and-forget freshness trigger from `list_episodes` (3-min cooldown).
+pub fn maybe_trigger(state: Arc<CpState>, user_id: String) {
+    static LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    tokio::spawn(async move {
+        {
+            let mut guard = map.lock().await;
+            let last = guard.get(&user_id).copied().unwrap_or(0);
+            if now_ms() - last < TRIGGER_COOLDOWN_MS {
+                return;
+            }
+            guard.insert(user_id.clone(), now_ms());
+        }
+        // Only run if stale (>10 min since cursor).
+        let stale = match state.control.summarized_until(&user_id).await {
+            Ok(Some(c)) => now_ms() - ms(&c) > 10 * 60 * 1000,
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if stale {
+            let _ = summarize_user(&state, &user_id).await;
+        }
+    });
+}
+
+const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[]}]}";

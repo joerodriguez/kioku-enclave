@@ -110,24 +110,29 @@ pub async fn handle_ingest(
         "ingest request"
     );
 
-    let (utterances_inserted, screenshots_inserted) = state
-        .store
-        .with_user(&user_id, |conn| {
+    let resp = ingest_batch(&state.store, &req).await?;
+    Ok((StatusCode::OK, Json(resp)))
+}
+
+/// In-process ingest used by both the legacy `/v1/ingest` handler and the
+/// in-enclave sync path (ADR-0001). Idempotent on `source_key`.
+pub(crate) async fn ingest_batch(
+    store: &crate::store::Store,
+    req: &IngestRequest,
+) -> Result<IngestResponse> {
+    crate::store::validate_user_id(&req.user_id)?;
+    let (utterances_inserted, screenshots_inserted) = store
+        .with_user(&req.user_id, |conn| {
             let u = ingest_utterances(conn, &req.utterances)?;
             let s = ingest_screenshots(conn, &req.screenshots)?;
             Ok((u, s))
         })
         .await?;
-
-    state.store.save_user(&user_id).await?;
-
-    Ok((
-        StatusCode::OK,
-        Json(IngestResponse {
-            utterances_inserted,
-            screenshots_inserted,
-        }),
-    ))
+    store.save_user(&req.user_id).await?;
+    Ok(IngestResponse {
+        utterances_inserted,
+        screenshots_inserted,
+    })
 }
 
 // ── Insertion helpers ─────────────────────────────────────────────────────────
@@ -254,7 +259,10 @@ fn insert_embedding(conn: &rusqlite::Connection, utterance_id: i64, emb_b64: &st
 }
 
 /// Insert screenshots and return the count of rows actually written.
-fn ingest_screenshots(conn: &rusqlite::Connection, items: &[ScreenshotInput]) -> Result<usize> {
+pub(crate) fn ingest_screenshots(
+    conn: &rusqlite::Connection,
+    items: &[ScreenshotInput],
+) -> Result<usize> {
     let mut inserted = 0usize;
     for s in items {
         if let Some(ref sk) = s.source_key {

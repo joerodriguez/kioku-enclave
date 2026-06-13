@@ -62,7 +62,7 @@ pub async fn handle_context(
     Ok(Json(result))
 }
 
-fn fetch_context(conn: &rusqlite::Connection, req: &ContextRequest) -> Result<Value> {
+pub(crate) fn fetch_context(conn: &rusqlite::Connection, req: &ContextRequest) -> Result<Value> {
     // Compute window bounds using SQLite datetime arithmetic so we don't need
     // a Rust date library.  `strftime('%Y-%m-%dT%H:%M:%fZ', ...)` produces the
     // same ISO-8601 format used throughout the codebase.

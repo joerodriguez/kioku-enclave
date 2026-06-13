@@ -38,6 +38,9 @@ pub enum EnclaveError {
     #[error("auth error: {0}")]
     Auth(String),
 
+    #[error("config error: {0}")]
+    Config(String),
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 

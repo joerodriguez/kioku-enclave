@@ -247,6 +247,18 @@ only allows `PORT` and `RUST_LOG` to be set by the operator).
 | `PORT`                 | Operator / default `8080` | Listen port                                          |
 | `RUST_LOG`             | Operator / default `info` | Log filter, e.g. `kioku_enclave=debug`               |
 | `STORE_MAX_OPEN`       | Optional     | Max concurrently open user indexes (default `16`)                   |
+| `ENCLAVE_TLS`          | Build ARG (default off) | `1`/`true` → terminate TLS inside the enclave (ADR-0001). Off → plain HTTP behind the VPC firewall |
+| `ENCLAVE_TLS_CERT_DER_B64` | Build ARG | Base64-encoded DER of the leaf certificate (required when `ENCLAVE_TLS` is on) |
+| `ENCLAVE_TLS_KEY_DER_B64`  | Build ARG | Base64-encoded DER (PKCS#8) of the private key (required when `ENCLAVE_TLS` is on) |
+
+> **In-enclave TLS (ADR-0001):** when enabled, the attested binary itself terminates TLS,
+> so it is the first code to see request plaintext (rather than an upstream proxy). The
+> cert is supplied at deploy time today; a later step generates the keypair *inside* the
+> TEE at boot and binds its fingerprint into the attestation token so a client can verify
+> the channel belongs to the attested image (RA-TLS). The fingerprint is logged at
+> startup. These vars must be baked in / pinned, not operator-overridable, before the move
+> can carry a security guarantee — see the ADR. Add `ENCLAVE_TLS*` to the launch policy
+> `allow_env_override` list **only** for local testing, never in production.
 
 ---
 

@@ -19,12 +19,16 @@
 //! This is the ONLY authentication path — there is no shared-secret
 //! fallback and no flag to disable ID-token verification.
 //!
-//! The listener binds `0.0.0.0` and is not itself access-controlled; the
-//! network boundary is the private VPC firewall plus this per-request
-//! ID-token check. See SECURITY.md.
+//! By default the listener binds `0.0.0.0` over plain HTTP and is not itself
+//! access-controlled; the network boundary is the private VPC firewall plus
+//! this per-request ID-token check. See SECURITY.md.
 //!
-//! **Future end state**: mTLS between control plane and enclave, with the
-//! enclave's certificate bound to its attested identity. See SECURITY.md.
+//! **In-enclave TLS termination (ADR-0001):** when `ENCLAVE_TLS` is set, the
+//! enclave terminates TLS itself (see `tls.rs` and `serve_tls` below) so the
+//! attested binary is the first code to see request plaintext, rather than an
+//! upstream proxy. The cert fingerprint is the channel-binding value a later
+//! step binds into the attestation token (RA-TLS). See
+//! `docs/adr/0001-enclave-as-sole-backend.md` in the monorepo.
 //!
 //! ## Routes
 //!
@@ -60,6 +64,7 @@ use tracing_subscriber::EnvFilter;
 
 mod attestation;
 mod auth;
+mod cp;
 mod crypto;
 mod episodes;
 mod error;
@@ -67,6 +72,7 @@ mod ingest;
 mod search;
 mod store;
 mod timeline;
+mod tls;
 
 use crate::{
     episodes::{
@@ -82,9 +88,31 @@ use crate::{
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct AppState {
-    pub store: Store,
+    pub store: Arc<Store>,
     /// JWKS verifier for Google ID tokens — the only authentication path.
     id_token_verifier: Arc<auth::IdTokenVerifier>,
+}
+
+/// In-process full export of a user's index as JSON (utterances, screenshots,
+/// episodes). Shared by the legacy `/v1/export` handler and the control-plane
+/// `/api/export` route (ADR-0001).
+pub(crate) async fn dump_user_export(
+    store: &Store,
+    user_id: &str,
+) -> error::Result<serde_json::Value> {
+    store::validate_user_id(user_id)?;
+    store
+        .with_user(user_id, |conn| {
+            let utterances = dump_table(conn, "SELECT * FROM utterances ORDER BY id")?;
+            let screenshots = dump_table(conn, "SELECT * FROM screenshots ORDER BY id")?;
+            let episodes = dump_table(conn, "SELECT * FROM episodes ORDER BY id")?;
+            Ok(json!({
+                "utterances": utterances,
+                "screenshots": screenshots,
+                "episodes": episodes,
+            }))
+        })
+        .await
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -147,25 +175,8 @@ async fn handle_export(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ExportQuery>,
 ) -> error::Result<Json<serde_json::Value>> {
-    let user_id = q.user_id;
-    store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, "export request");
-
-    let data = state
-        .store
-        .with_user(&user_id, |conn| {
-            // Export all tables as JSON arrays
-            let utterances = dump_table(conn, "SELECT * FROM utterances ORDER BY id")?;
-            let screenshots = dump_table(conn, "SELECT * FROM screenshots ORDER BY id")?;
-            let episodes = dump_table(conn, "SELECT * FROM episodes ORDER BY id")?;
-            Ok(json!({
-                "utterances": utterances,
-                "screenshots": screenshots,
-                "episodes": episodes,
-            }))
-        })
-        .await?;
-
+    info!(user_id = %q.user_id, "export request");
+    let data = dump_user_export(&state.store, &q.user_id).await?;
     Ok(Json(data))
 }
 
@@ -285,11 +296,15 @@ async fn main() {
     let gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_env().expect("GCS_BUCKET must be set"));
 
+    let store = Arc::new(Store::new(Arc::clone(&kms), Arc::clone(&gcs)));
+
     let state = Arc::new(AppState {
-        store: Store::new(kms, gcs),
+        store: Arc::clone(&store),
         id_token_verifier,
     });
 
+    // ── Legacy data-plane routes (SA-ID-token authed). Kept for compatibility;
+    // the live path now uses the in-enclave control plane below (ADR-0001).
     let authenticated = Router::new()
         .route("/v1/ingest", post(handle_ingest))
         .route("/v1/search", post(handle_search))
@@ -311,9 +326,38 @@ async fn main() {
         ))
         .with_state(Arc::clone(&state));
 
+    // ── In-enclave control plane (ADR-0001): OAuth, sync, account, MCP. ─────────
+    let cp_config = Arc::new(cp::CpConfig::from_env().expect("control-plane config"));
+    let cp_state = Arc::new(cp::CpState {
+        store: Arc::clone(&store),
+        control: Arc::new(cp::control_store::ControlStore::new(kms, gcs)),
+        user_verifier: Arc::new(cp::auth::UserIdTokenVerifier::new(
+            cp_config.user_audiences(),
+        )),
+        sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
+        mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
+        config: cp_config,
+    });
+
+    // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
+    cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
+
+    // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
+    let cp_authed =
+        cp::sync::router()
+            .merge(cp::query::router())
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&cp_state),
+                cp::auth::require_auth,
+            ));
+    let control_plane = cp::oauth::router()
+        .merge(cp_authed)
+        .with_state(Arc::clone(&cp_state));
+
     let app = Router::new()
         .route("/health", get(handle_health))
-        .merge(authenticated);
+        .merge(authenticated)
+        .merge(control_plane);
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -321,11 +365,67 @@ async fn main() {
         .unwrap_or(8080);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!(addr = %addr, "listening");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind failed");
 
-    axum::serve(listener, app).await.expect("server error");
+    // ADR-0001: when ENCLAVE_TLS is set, terminate TLS inside the enclave so the attested
+    // binary is the first code to see plaintext. Otherwise serve plain HTTP behind the
+    // VPC firewall (the existing default).
+    match tls::from_env().expect("TLS config") {
+        Some(keystone) => {
+            info!(addr = %addr, tls = true, "listening (in-enclave TLS termination)");
+            serve_tls(listener, app, keystone).await;
+        }
+        None => {
+            info!(addr = %addr, tls = false, "listening (plain HTTP behind VPC firewall)");
+            axum::serve(listener, app).await.expect("server error");
+        }
+    }
+}
+
+/// Serve `app` over TLS terminated inside the enclave (ADR-0001).
+///
+/// `axum::serve` has no TLS path, so we run the accept loop by hand: accept TCP, complete
+/// the rustls handshake, then hand the connection to hyper with the axum router wrapped as
+/// a hyper service. One task per connection; a handshake or connection error drops only
+/// that connection.
+async fn serve_tls(listener: tokio::net::TcpListener, app: Router, keystone: tls::TlsKeystone) {
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use hyper_util::service::TowerToHyperService;
+    use tokio_rustls::TlsAcceptor;
+
+    let acceptor = TlsAcceptor::from(keystone.server_config);
+
+    loop {
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(error = %e, "TCP accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+            let service = TowerToHyperService::new(app);
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!(error = %e, "connection closed with error");
+            }
+        });
+    }
 }

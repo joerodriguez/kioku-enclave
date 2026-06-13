@@ -19,8 +19,19 @@ path = "src/main.rs"
 [dependencies]
 # HTTP server — axum on tokio
 axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"] }
-tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net"] }
 tower = { version = "0.5.2", default-features = false }
+
+# Optional TLS termination inside the enclave (ADR-0001). When ENCLAVE_TLS is set the
+# enclave terminates TLS itself instead of relying on an upstream proxy, so the attested
+# binary is the first code to see plaintext. rustls only (ring provider) — no OpenSSL,
+# keeps the musl FROM-scratch build pure-Rust. hyper + hyper-util drive the TLS accept
+# loop (axum::serve has no TLS path); sha2 computes the cert fingerprint that a later
+# step binds into the attestation token (RA-TLS).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+hyper = { version = "1.10", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
+sha2 = "0.10"
 
 # SQLite, bundled so the binary carries its own libsqlite3 with FTS5 compiled in.
 rusqlite = { version = "0.32.1", features = ["bundled"] }

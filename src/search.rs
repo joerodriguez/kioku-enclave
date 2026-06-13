@@ -139,7 +139,10 @@ pub async fn handle_search(
 
 // ── Core search logic ─────────────────────────────────────────────────────────
 
-fn search_all(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<Vec<SearchHit>> {
+pub(crate) fn search_all(
+    conn: &rusqlite::Connection,
+    req: &SearchRequest,
+) -> Result<Vec<SearchHit>> {
     let mut hits = Vec::new();
 
     // When `kinds` is empty, search everything; otherwise honour the filter.

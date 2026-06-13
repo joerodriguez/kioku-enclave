@@ -120,7 +120,10 @@ pub async fn handle_episodes_upsert(
 ///     extending an episode across runs accumulates members idempotently.
 ///
 /// Returns the resulting id for each input episode, in order.
-fn upsert_episodes(conn: &rusqlite::Connection, items: &[EpisodeInput]) -> Result<Vec<i64>> {
+pub(crate) fn upsert_episodes(
+    conn: &rusqlite::Connection,
+    items: &[EpisodeInput],
+) -> Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(items.len());
     for ep in items {
         let participants_json = ep
@@ -509,7 +512,13 @@ mod tests {
         let store = make_store();
         let ids = store
             .with_user("fts_user", |conn| {
-                upsert_episodes(conn, &[sample_episode("2026-03-01T09:00:00Z", "2026-03-01T09:30:00Z")])
+                upsert_episodes(
+                    conn,
+                    &[sample_episode(
+                        "2026-03-01T09:00:00Z",
+                        "2026-03-01T09:30:00Z",
+                    )],
+                )
             })
             .await
             .unwrap();
