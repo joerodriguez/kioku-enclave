@@ -158,6 +158,41 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
     ENCLAVE_AUDIENCE=${ENCLAVE_AUDIENCE} \
     ATTEST_STS_AUDIENCE=${ATTEST_STS_AUDIENCE}
 
+# ── Control-plane config (ADR-0001) — baked into the attested digest ──────────
+#
+# The enclave is now the whole backend (OAuth/sync/MCP/summarizer + TLS). These
+# are security-relevant (JWT signing, the trusted OAuth audiences, the public
+# base URL that is the access-token issuer, the in-enclave TLS keypair) so they
+# are baked, not operator-overridable — same rationale as the KMS config above.
+# Single-user note: secrets baked into a private-AR image are acceptable here and
+# satisfy ROADMAP Phase 7 gap #1 (caller creds pinned in-image, not injectable).
+ARG JWT_SECRET
+ARG JWT_SECRET_PREVIOUS
+ARG GOOGLE_DESKTOP_CLIENT_ID
+ARG GOOGLE_WEB_CLIENT_ID
+ARG GOOGLE_WEB_CLIENT_SECRET
+ARG ALLOWED_EMAILS
+ARG BASE_URL
+ARG VERTEX_PROJECT
+ARG VERTEX_LOCATION
+ARG VERTEX_MODEL
+ARG ENCLAVE_TLS
+ARG ENCLAVE_TLS_CERT_PEM_B64
+ARG ENCLAVE_TLS_KEY_PEM_B64
+ENV JWT_SECRET=${JWT_SECRET} \
+    JWT_SECRET_PREVIOUS=${JWT_SECRET_PREVIOUS} \
+    GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
+    GOOGLE_WEB_CLIENT_ID=${GOOGLE_WEB_CLIENT_ID} \
+    GOOGLE_WEB_CLIENT_SECRET=${GOOGLE_WEB_CLIENT_SECRET} \
+    ALLOWED_EMAILS=${ALLOWED_EMAILS} \
+    BASE_URL=${BASE_URL} \
+    VERTEX_PROJECT=${VERTEX_PROJECT} \
+    VERTEX_LOCATION=${VERTEX_LOCATION} \
+    VERTEX_MODEL=${VERTEX_MODEL} \
+    ENCLAVE_TLS=${ENCLAVE_TLS} \
+    ENCLAVE_TLS_CERT_PEM_B64=${ENCLAVE_TLS_CERT_PEM_B64} \
+    ENCLAVE_TLS_KEY_PEM_B64=${ENCLAVE_TLS_KEY_PEM_B64}
+
 # ── Security flags — hardcoded, not operator-supplied ─────────────────────────
 #
 # These are NOT deployment-specific; they are the hardened-by-default security
@@ -178,6 +213,12 @@ COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/kioku-enclav
 # single static binary, no shell, no package manager, hardened TEE, and the
 # data the process touches is the data it owns.
 
+# Confidential Space publishes ONLY the EXPOSEd container ports to the host
+# (observed: the launcher logs "Exposed Ports: map[...]" and forwards just those).
+# The enclave now terminates TLS on 443 (ADR-0001), so 443 MUST be exposed or the
+# port is unreachable from the VM's external interface. 8080 kept for the legacy
+# VPC-internal path.
+EXPOSE 443
 EXPOSE 8080
 
 ENTRYPOINT ["/kioku-enclave"]

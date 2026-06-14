@@ -48,10 +48,12 @@ pub struct TlsKeystone {
 
 /// Env var that gates in-enclave TLS termination. `1` / `true` (case-insensitive) → on.
 const ENV_ENABLE: &str = "ENCLAVE_TLS";
-/// Base64-encoded DER of the leaf certificate.
-const ENV_CERT: &str = "ENCLAVE_TLS_CERT_DER_B64";
-/// Base64-encoded DER (PKCS#8) of the private key.
-const ENV_KEY: &str = "ENCLAVE_TLS_KEY_DER_B64";
+/// Base64-encoded PEM of the certificate **chain** (leaf first, then intermediates —
+/// e.g. Let's Encrypt `fullchain.pem`). The full chain is required or clients that
+/// don't already cache the issuing intermediate fail chain verification.
+const ENV_CERT: &str = "ENCLAVE_TLS_CERT_PEM_B64";
+/// Base64-encoded PEM of the private key (PKCS#8 / PKCS#1 / SEC1).
+const ENV_KEY: &str = "ENCLAVE_TLS_KEY_PEM_B64";
 
 fn is_enabled() -> bool {
     matches!(
@@ -67,34 +69,80 @@ pub fn from_env() -> Result<Option<TlsKeystone>> {
         return Ok(None);
     }
 
-    let cert_b64 = std::env::var(ENV_CERT)
-        .map_err(|_| Error::Config(format!("{ENV_ENABLE} set but {ENV_CERT} missing")))?;
-    let key_b64 = std::env::var(ENV_KEY)
-        .map_err(|_| Error::Config(format!("{ENV_ENABLE} set but {ENV_KEY} missing")))?;
+    let cert_pem = decode_b64_env(ENV_CERT)?;
+    let key_pem = decode_b64_env(ENV_KEY)?;
 
-    let cert_der = base64::engine::general_purpose::STANDARD
-        .decode(cert_b64.trim())
-        .map_err(|e| Error::Config(format!("{ENV_CERT} is not valid base64: {e}")))?;
-    let key_der = base64::engine::general_purpose::STANDARD
-        .decode(key_b64.trim())
-        .map_err(|e| Error::Config(format!("{ENV_KEY} is not valid base64: {e}")))?;
+    let chain = parse_pem_blocks(&cert_pem, "CERTIFICATE");
+    if chain.is_empty() {
+        return Err(Error::Config(format!("{ENV_CERT} contains no CERTIFICATE blocks")));
+    }
+    let key = parse_pem_private_key(&key_pem)
+        .ok_or_else(|| Error::Config(format!("{ENV_KEY} contains no usable PRIVATE KEY block")))?;
 
-    let keystone = build(cert_der, key_der)?;
+    let keystone = build_chain(chain, key)?;
     info!(
         cert_fingerprint = %keystone.cert_fingerprint_hex,
+        chain_len = keystone_chain_note(),
         "in-enclave TLS termination enabled (ADR-0001)"
     );
     Ok(Some(keystone))
 }
 
-/// Build a [`TlsKeystone`] from raw DER cert + PKCS#8 key bytes.
-///
-/// Separated from [`from_env`] so it can be unit-tested with fixed fixtures.
-fn build(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<TlsKeystone> {
-    let fingerprint = hex_lower(&Sha256::digest(&cert_der));
+fn keystone_chain_note() -> &'static str {
+    "leaf+intermediates"
+}
 
-    let certs = vec![CertificateDer::from(cert_der)];
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+fn decode_b64_env(var: &str) -> Result<Vec<u8>> {
+    let b64 = std::env::var(var)
+        .map_err(|_| Error::Config(format!("{ENV_ENABLE} set but {var} missing")))?;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| Error::Config(format!("{var} is not valid base64: {e}")))
+}
+
+/// Extract every `-----BEGIN <tag>----- … -----END <tag>-----` block from PEM text
+/// and base64-decode its body to DER. Avoids a `rustls-pemfile` dependency.
+fn parse_pem_blocks(pem: &[u8], tag: &str) -> Vec<Vec<u8>> {
+    let text = String::from_utf8_lossy(pem);
+    let begin = format!("-----BEGIN {tag}-----");
+    let end = format!("-----END {tag}-----");
+    let mut out = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(b) = rest.find(&begin) {
+        let after = &rest[b + begin.len()..];
+        let Some(e) = after.find(&end) else { break };
+        let body: String = after[..e].split_whitespace().collect();
+        if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(body) {
+            out.push(der);
+        }
+        rest = &after[e + end.len()..];
+    }
+    out
+}
+
+/// Parse the first private key found, trying PKCS#8, then PKCS#1 (RSA), then SEC1 (EC).
+fn parse_pem_private_key(pem: &[u8]) -> Option<PrivateKeyDer<'static>> {
+    if let Some(d) = parse_pem_blocks(pem, "PRIVATE KEY").into_iter().next() {
+        return Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(d)));
+    }
+    if let Some(d) = parse_pem_blocks(pem, "RSA PRIVATE KEY").into_iter().next() {
+        return Some(PrivateKeyDer::Pkcs1(
+            tokio_rustls::rustls::pki_types::PrivatePkcs1KeyDer::from(d),
+        ));
+    }
+    if let Some(d) = parse_pem_blocks(pem, "EC PRIVATE KEY").into_iter().next() {
+        return Some(PrivateKeyDer::Sec1(
+            tokio_rustls::rustls::pki_types::PrivateSec1KeyDer::from(d),
+        ));
+    }
+    None
+}
+
+/// Build a [`TlsKeystone`] from a DER cert chain (leaf first) + a parsed private key.
+fn build_chain(chain_der: Vec<Vec<u8>>, key: PrivateKeyDer<'static>) -> Result<TlsKeystone> {
+    let fingerprint = hex_lower(&Sha256::digest(&chain_der[0]));
+    let certs: Vec<CertificateDer<'static>> =
+        chain_der.into_iter().map(CertificateDer::from).collect();
 
     // Explicit ring provider so we never depend on a process-default being installed,
     // and never link aws-lc / OpenSSL (musl FROM-scratch must stay pure-Rust-friendly).
@@ -109,6 +157,15 @@ fn build(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<TlsKeystone> {
         server_config: Arc::new(server_config),
         cert_fingerprint_hex: fingerprint,
     })
+}
+
+/// Test helper: build from a single DER cert + PKCS#8 key.
+#[cfg(test)]
+fn build(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<TlsKeystone> {
+    build_chain(
+        vec![cert_der],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+    )
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
