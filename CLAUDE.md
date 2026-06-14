@@ -1,9 +1,11 @@
 # Working in this repo (agent guide)
 
-`kioku-enclave` is the **Kioku data plane** — the only process that ever holds user
-plaintext. It runs inside a GCP Confidential Space VM (AMD SEV) and is open source so
-the running instance can be attested against this exact code. Treat every change as
-security-sensitive by default.
+`kioku-enclave` is the **entire Kioku backend** (as of ADR-0001) — the only process that
+ever holds user plaintext. It terminates TLS and serves OAuth, sync, the MCP server,
+account export/delete, quotas, and the episode summarizer (`src/cp/`), alongside the
+data-plane query/storage code. It runs inside a GCP Confidential Space VM (AMD SEV) and is
+open source so the running instance can be attested against this exact code. Treat every
+change as security-sensitive by default.
 
 ## `map.md` files — read them first, keep them current
 
@@ -22,9 +24,14 @@ get a `map.md` linked from their parent. Treat a stale `map.md` like stale docs.
 - `SECURITY.md` — full threat model and known gaps. Read before changing anything in
   auth, crypto, attestation, or key handling.
 - `CONTRIBUTING.md` — contribution + PR rules (summarized below).
-- The control plane and product live in the **separate `kioku-monorepo` repo**. The
-  interface between them is documented there in `docs/CONTRACTS.md` — keep this repo's
-  `/v1/*` endpoints in sync with it.
+- **Product + security ground truth: `docs/PRODUCT-SPEC.md` in the sibling
+  `kioku-monorepo` repo.** It states what Kioku is for and the **security invariants** that
+  govern this repo above all (raw media never leaves the Mac; plaintext only in this
+  attested process; per-user encryption; key access bound to the attested digest; no new
+  plaintext sink; export/delete always complete). Resolve decisions in its favor; a change
+  that weakens an invariant is wrong by default.
+- The Mac app, capture pipeline, and infra live in the **separate `kioku-monorepo` repo**;
+  interface contracts are in its `docs/CONTRACTS.md` and `docs/CLOUD.md`.
 
 ## Before you commit — all three must pass
 
