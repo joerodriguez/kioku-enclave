@@ -524,19 +524,68 @@ async fn rest_episode_members(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    // Returns the episode's member records WITH their content (utterance text,
+    // screenshot app/title/URL + OCR excerpt), chronological — the debugger's
+    // expanded episode view renders this as the raw evidence behind the
+    // summary. The caller is the authenticated owner of the data; these same
+    // rows are already reachable via /api/search and /v1/context.
     let result = s
         .store
         .with_user(&user.0, move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT m.record_type, m.record_id FROM episode_members m WHERE m.episode_id = ?1",
+            let mut us = conn.prepare(
+                "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text \
+                 FROM episode_members m \
+                 JOIN utterances u ON u.id = m.record_id \
+                 JOIN audio_segments s ON s.id = u.audio_segment_id \
+                 WHERE m.episode_id = ?1 AND m.record_type = 'utterance'",
             )?;
-            let members: Vec<Value> = stmt
+            let mut members: Vec<(String, Value)> = us
                 .query_map([id], |r| {
-                    Ok(json!({ "record_type": r.get::<_, String>(0)?, "record_id": r.get::<_, i64>(1)? }))
+                    let ts: String = r.get(1)?;
+                    Ok((
+                        ts.clone(),
+                        json!({
+                            "record_type": "utterance",
+                            "record_id": r.get::<_, i64>(0)?,
+                            "started_at": ts,
+                            "speaker_label": r.get::<_, String>(2)?,
+                            "language": r.get::<_, Option<String>>(3)?,
+                            "text": r.get::<_, String>(4)?,
+                        }),
+                    ))
                 })?
                 .filter_map(|x| x.ok())
                 .collect();
-            Ok(json!({ "episode_id": id, "members": members }))
+
+            let mut ss = conn.prepare(
+                "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
+                        substr(c.ocr_text,1,2000) \
+                 FROM episode_members m \
+                 JOIN screenshots c ON c.id = m.record_id \
+                 WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'",
+            )?;
+            members.extend(
+                ss.query_map([id], |r| {
+                    let ts: String = r.get(1)?;
+                    Ok((
+                        ts.clone(),
+                        json!({
+                            "record_type": "screenshot",
+                            "record_id": r.get::<_, i64>(0)?,
+                            "captured_at": ts,
+                            "active_app": r.get::<_, Option<String>>(2)?,
+                            "window_title": r.get::<_, Option<String>>(3)?,
+                            "url": r.get::<_, Option<String>>(4)?,
+                            "ocr_excerpt": r.get::<_, Option<String>>(5)?,
+                        }),
+                    ))
+                })?
+                .filter_map(|x| x.ok()),
+            );
+
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            let members: Vec<Value> = members.into_iter().map(|(_, v)| v).collect();
+            Ok(json!({ "episode_id": id, "member_count": members.len(), "members": members }))
         })
         .await;
     match result {
