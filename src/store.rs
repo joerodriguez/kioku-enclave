@@ -887,8 +887,23 @@ impl GcsClient for GcpGcsClient {
             self.bucket, src_encoded, self.bucket, dest_encoded
         );
 
-        let resp = self.http.post(&url).bearer_auth(&token).send().await?;
+        // copyTo is a bodiless POST: without an explicit empty body, GCS
+        // rejects the request with 411 Length Required (observed live 2026-07-05
+        // — it broke every sign-in via the stable-id migration path).
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_LENGTH, 0)
+            .body(Vec::new())
+            .send()
+            .await?;
 
+        // Callers treat a missing source as "nothing to rename" (idempotent
+        // migration), so surface 404 as NotFound rather than a generic error.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(EnclaveError::NotFound);
+        }
         resp.error_for_status()?;
 
         // Copy succeeded; now delete source
