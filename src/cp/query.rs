@@ -255,10 +255,14 @@ async fn list_episodes_value(
                 })?
                 .filter_map(|x| x.ok())
                 .collect();
-            Ok(json!({ "episodes": episodes }))
+            // episode_count is part of the debugger contract: the Episodes tab
+            // header renders `${data.episode_count} episodes` (the local
+            // heuristic endpoint provides it too — omitting it renders
+            // "undefined episodes").
+            Ok(json!({ "episode_count": episodes.len(), "episodes": episodes }))
         })
         .await
-        .unwrap_or_else(|_| json!({ "episodes": [] }))
+        .unwrap_or_else(|_| json!({ "episode_count": 0, "episodes": [] }))
 }
 
 async fn tool_get_capture_status(s: &CpState, user_id: &str) -> Value {

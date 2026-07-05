@@ -10,6 +10,19 @@
 //! without the pre-computed `[screen-terms]`/`[likely names]` hints. Re-add with
 //! a regex pass if name recall regresses.
 //!
+//! **Divergence from the Node port — live-tail cursor semantics (2026-07-05):**
+//! Node advanced `summarized_until` to the window end even when the model
+//! returned zero episodes. At the caught-up live tail that is a ratchet bug:
+//! every 10-min tick fed the model ~10 min of capture (which the prompt rightly
+//! refuses to fragment into an episode), got `[]` back, and *consumed the
+//! content forever* — no episode was ever created after the initial backfill
+//! (observed in production 06-14 → 07-05: zero new episodes). Two rules fix it:
+//! (1) don't call the LLM until the tail window is at least
+//! [`MIN_WINDOW_MINUTES`] long; (2) when a *tail-bounded* window yields no
+//! upserts, hold the cursor so the window keeps growing and the episode can
+//! form — a window that reached the 6-h cap still advances unconditionally, so
+//! backfill always marches forward through sparse spans.
+//!
 //! The Vertex call sends text outside the TEE (documented caveat — see
 //! [`super::vertex`]).
 
@@ -31,6 +44,10 @@ const LOOKBACK_DAYS: i64 = 7;
 const TAIL_MINUTES: i64 = 5;
 const OPEN_WINDOW_MS: i64 = 4 * 60 * 60 * 1000;
 const MAX_WINDOW_HOURS: i64 = 6;
+/// Don't call the LLM on a live-tail window shorter than this — a fragment
+/// this small can't form an episode (the prompt forbids <10-min episodes), so
+/// calling earlier only burns Vertex quota and risks consuming the content.
+const MIN_WINDOW_MINUTES: i64 = 20;
 const UTT_CAP: usize = 4000;
 const SCR_CAP: usize = 2000;
 const SIG_MIN_SUBSTANTIVE_UTT: i64 = 3;
@@ -38,6 +55,23 @@ const SIG_MIN_SCREEN_MS: i64 = 2 * 60 * 1000;
 const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
 const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
 const TRIGGER_COOLDOWN_MS: i64 = 3 * 60 * 1000;
+
+/// Compute the summarization window ending bound for a run starting at
+/// `new_from` with the live tail at `tail_cutoff` (both epoch ms).
+///
+/// Returns `None` when the window is shorter than [`MIN_WINDOW_MINUTES`]
+/// (don't call the LLM, don't advance). Otherwise `Some((new_to,
+/// tail_bounded))` where `tail_bounded` means the window was cut short by the
+/// live tail rather than the [`MAX_WINDOW_HOURS`] cap — only tail-bounded
+/// windows may hold the cursor on empty output (the ratchet fix; module docs).
+fn window_bounds(new_from: i64, tail_cutoff: i64) -> Option<(i64, bool)> {
+    if new_from >= tail_cutoff - MIN_WINDOW_MINUTES * 60 * 1000 {
+        return None;
+    }
+    let cap = MAX_WINDOW_HOURS * 60 * 60 * 1000;
+    let new_to = tail_cutoff.min(new_from + cap);
+    Some((new_to, new_to == tail_cutoff && new_to - new_from < cap))
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -257,10 +291,12 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         Some(c) => ms(c).max(max_lookback),
         None => max_lookback,
     };
-    if new_from >= tail_cutoff {
+    let Some(win) = window_bounds(new_from, tail_cutoff) else {
+        // Live tail too short to possibly hold an episode — wait for it to
+        // grow (see module docs). Cursor is NOT advanced.
         return Ok(serde_json::json!({ "skipped": true }));
-    }
-    let new_to = tail_cutoff.min(new_from + MAX_WINDOW_HOURS * 60 * 60 * 1000);
+    };
+    let (new_to, tail_bounded) = win;
     let new_from_iso = format_epoch_millis(new_from);
     let new_to_iso = format_epoch_millis(new_to);
 
@@ -445,6 +481,18 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         upserted = ids.len();
     }
 
+    // Nothing upserted from a tail-bounded window: HOLD the cursor so the tail
+    // keeps growing until an episode can form (the ratchet fix — see module
+    // docs). Once the window hits the 6-h cap it stops being tail-bounded and
+    // the else-branch advances past genuinely insignificant content.
+    if upserted == 0 && tail_bounded {
+        info!(
+            user_id,
+            dropped, "summarized nothing; holding cursor for tail to grow"
+        );
+        return Ok(serde_json::json!({ "waiting": true, "dropped": dropped }));
+    }
+
     let cutoff_iso = format_epoch_millis(effective_cutoff);
     state
         .control
@@ -578,7 +626,12 @@ async fn fetch_open_episodes(
 }
 
 /// Sweep all users (internal cron). Sequential to avoid Vertex rate-limit storms.
+///
+/// Per user, keeps running windows while the cursor is making forward progress
+/// (bounded) so a cold-start backfill — up to 7 d ÷ 6 h = 28 windows — catches
+/// up within one tick instead of one window per 10-min tick (~5 h).
 pub async fn summarize_all(state: &CpState) {
+    const MAX_WINDOWS_PER_SWEEP: u32 = 32;
     let ids = match state.control.all_user_ids().await {
         Ok(ids) => ids,
         Err(e) => {
@@ -587,8 +640,25 @@ pub async fn summarize_all(state: &CpState) {
         }
     };
     for id in ids {
-        if let Err(e) = summarize_user(state, &id).await {
-            warn!(user_id = %id, error = %e, "summarize_user failed");
+        for _ in 0..MAX_WINDOWS_PER_SWEEP {
+            match summarize_user(state, &id).await {
+                // Cursor advanced (episodes emitted or empty span consumed) —
+                // there may be more backlog; keep going. NOT on "quota": that
+                // skip does not advance and retrying would hammer Vertex.
+                Ok(v)
+                    if v.get("to").is_some()
+                        || v.get("reason").and_then(|r| r.as_str()) == Some("no_new_records") =>
+                {
+                    continue
+                }
+                // Caught up ("skipped"), holding for the tail ("waiting"), or
+                // a non-advancing result — done with this user for now.
+                Ok(_) => break,
+                Err(e) => {
+                    warn!(user_id = %id, error = %e, "summarize_user failed");
+                    break;
+                }
+            }
         }
     }
 }
@@ -631,3 +701,39 @@ pub fn maybe_trigger(state: Arc<CpState>, user_id: String) {
 }
 
 const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[]}]}";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: i64 = 60 * 1000;
+    const HOUR: i64 = 60 * MIN;
+
+    /// The live-tail ratchet fix (module docs): short tails wait, medium tails
+    /// are tail-bounded (may hold the cursor), capped windows always advance.
+    #[test]
+    fn window_bounds_semantics() {
+        let tail = 1_000_000 * MIN; // arbitrary "now - 5min" reference
+
+        // Tail shorter than MIN_WINDOW: don't run at all.
+        assert_eq!(window_bounds(tail - 10 * MIN, tail), None);
+        assert_eq!(window_bounds(tail, tail), None, "caught up exactly");
+        assert_eq!(window_bounds(tail + MIN, tail), None, "cursor past tail");
+
+        // Tail-bounded window: ends at the tail, below the 6-h cap.
+        let (to, tail_bounded) = window_bounds(tail - 30 * MIN, tail).unwrap();
+        assert_eq!(to, tail);
+        assert!(tail_bounded, "30-min live window may hold the cursor");
+
+        // Window at the cap: advances unconditionally (backfill marches).
+        let (to, tail_bounded) = window_bounds(tail - 26 * HOUR, tail).unwrap();
+        assert_eq!(to, tail - 26 * HOUR + MAX_WINDOW_HOURS * HOUR);
+        assert!(!tail_bounded, "capped window must not hold the cursor");
+
+        // Window exactly 6 h to the tail: treated as capped (advance) so a
+        // pathological always-insignificant span can't hold forever.
+        let (to, tail_bounded) = window_bounds(tail - MAX_WINDOW_HOURS * HOUR, tail).unwrap();
+        assert_eq!(to, tail);
+        assert!(!tail_bounded);
+    }
+}

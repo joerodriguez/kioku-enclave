@@ -14,7 +14,7 @@ of this runs in the one attested binary; handlers call the data-plane query/stor
 | `oauth.rs` | OAuth 2.1 facade + DCR: discovery, `/register`, `/authorize`, Google `/callback`, `/token` |
 | `sync.rs` | `/api/sync/batch` (utterance→segment join), `/status`, `/api/export`, `/api/account` |
 | `query.rs` | MCP server `/mcp` (JSON-RPC, 6 tools) + REST mirrors `/api/search`, `/api/episodes`, `/.../members` |
-| `summarizer.rs` | v2 incremental episode summarizer + internal tokio cron (replaces Cloud Scheduler) |
+| `summarizer.rs` | v2 incremental episode summarizer + internal tokio cron (replaces Cloud Scheduler). Live-tail cursor semantics deliberately diverge from the Node port: ≥20-min window before calling the LLM, cursor HELD when a tail-bounded window yields no episodes (Node's ratchet consumed content forever — module docs), capped windows always advance, scheduler loops so backfill catches up in one tick |
 | `vertex.rs` | Vertex Gemini client (`generateContent`, constrained schema). Sends text outside the TEE — documented caveat |
 | `limits.rs` | Token-bucket rate limiter + daily quotas + query-log accounting |
 | `isotime.rs` | RFC3339-UTC parse/format/add (no `chrono`; musl-friendly) |
