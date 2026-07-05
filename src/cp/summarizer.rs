@@ -282,6 +282,15 @@ fn derive_membership(
 
 /// Summarize one user's recent capture into episodes. Returns a short status.
 pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
+    // Serialize runs: the scheduler's catch-up loop and the list_episodes
+    // freshness trigger can fire concurrently for the same user, and two
+    // racing runs would summarize the same window and double-create episodes
+    // (the cursor is only re-read here, under the lock). Global rather than
+    // per-user is fine at current scale — runs are deliberately sequential
+    // anyway to avoid Vertex rate-limit storms.
+    static SUMMARIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = SUMMARIZE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
     let summarized_until = state.control.summarized_until(user_id).await?;
     let now = now_ms();
     let tail_cutoff = now - TAIL_MINUTES * 60 * 1000;
