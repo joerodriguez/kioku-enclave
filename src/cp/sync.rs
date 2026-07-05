@@ -66,11 +66,17 @@ struct Screenshot {
     window_title: Option<String>,
     ocr_text: Option<String>,
     url: Option<String>,
+    /// Optional 384-dim OCR-text embedding (see `crate::embedding::MODEL_ID`).
+    embedding_b64: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Batch {
     device_id: String,
+    /// Embedding-space id for every embedding_b64 in this batch. Old clients
+    /// omit it (and send no embeddings); the ingest model gate handles both.
+    #[serde(default)]
+    embedding_model: Option<String>,
     #[serde(default)]
     segments: Vec<Segment>,
     #[serde(default)]
@@ -202,11 +208,13 @@ fn build_ingest(user_id: &str, batch: &Batch) -> IngestRequest {
             url: sc.url.clone(),
             image_hash: None,
             source_key: Some(format!("{}:{}", batch.device_id, sc.local_id)),
+            embedding_b64: sc.embedding_b64.clone(),
         })
         .collect();
 
     IngestRequest {
         user_id: user_id.to_string(),
+        embedding_model: batch.embedding_model.clone(),
         utterances,
         screenshots,
     }

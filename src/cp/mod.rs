@@ -129,6 +129,9 @@ pub struct CpState {
     pub mcp_limiter: limits::RateLimiter,
     pub attestation_cache: Option<Arc<crate::attestation::AttestationCache>>,
     pub cert_fingerprint: Option<String>,
+    /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
+    /// (model not baked/downloaded, or failed to load — never fatal).
+    pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,
 }
 
 /// Helper to fetch a secret from GCP Secret Manager at runtime, using the GCE metadata server token.

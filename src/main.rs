@@ -73,6 +73,7 @@ mod attestation;
 mod auth;
 mod cp;
 mod crypto;
+mod embedding;
 mod episodes;
 mod error;
 mod ingest;
@@ -449,6 +450,11 @@ async fn main() {
         cert_fingerprint: cert_fingerprint.clone(),
     });
 
+    // In-enclave query embedder for hybrid search. Loading is eager (boot
+    // warm-up: ~470 MB of weights, seconds) so the first MCP query doesn't
+    // eat the cold start; absence is non-fatal (FTS-only mode).
+    let embedding_engine = embedding::EmbeddingEngine::from_env();
+
     let cp_state = Arc::new(cp::CpState {
         store: Arc::clone(&store),
         control: control_store,
@@ -460,6 +466,7 @@ async fn main() {
         config: cp_config,
         attestation_cache,
         cert_fingerprint,
+        embedding: embedding_engine,
     });
 
     // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).

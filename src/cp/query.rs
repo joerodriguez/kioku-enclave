@@ -34,6 +34,29 @@ pub fn router() -> Router<Arc<CpState>> {
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
 
+/// Embed the query text in-enclave for hybrid search. Returns `None` when the
+/// engine is absent (FTS-only build) or on any embed error — search degrades
+/// to FTS rather than failing. Inference is CPU-bound (~10–50 ms), so it runs
+/// on the blocking pool instead of stalling the async worker.
+async fn embed_query(s: &CpState, query: &str) -> Option<Vec<f32>> {
+    let engine = s.embedding.as_ref()?.clone();
+    let text = query.to_string();
+    if text.trim().is_empty() {
+        return None;
+    }
+    match tokio::task::spawn_blocking(move || engine.embed(&text)).await {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
+            tracing::warn!("query embed failed ({e}) — falling back to FTS-only");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("query embed task panicked ({e}) — falling back to FTS-only");
+            None
+        }
+    }
+}
+
 async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Value {
     let query = args
         .get("query")
@@ -44,6 +67,7 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
     let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
     let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
 
+    let query_embedding = embed_query(s, &query).await;
     let req = SearchRequest {
         user_id: user_id.to_string(),
         query,
@@ -52,7 +76,7 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
         limit,
         offset: 0,
         kinds: vec!["utterance".into(), "episode".into()],
-        query_embedding: None,
+        query_embedding,
     };
     let hits = s
         .store
@@ -70,6 +94,7 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
         .unwrap_or("")
         .to_string();
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let query_embedding = embed_query(s, &query).await;
     let req = SearchRequest {
         user_id: user_id.to_string(),
         query,
@@ -78,7 +103,7 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
         limit,
         offset: 0,
         kinds: vec!["screenshot".into()],
-        query_embedding: None,
+        query_embedding,
     };
     let hits = s
         .store

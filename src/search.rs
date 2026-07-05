@@ -6,10 +6,12 @@
 //! **FTS-only** (default when `query_embedding` is absent): SQLite FTS5 MATCH
 //! with optional time-range filters.  Scores from `fts_score()` (bm25 negated).
 //!
-//! **Hybrid** (when `query_embedding` is present — a 384-dim float32 array from
-//! all-MiniLM-L6-v2, computed by the control plane): runs vector KNN on the
-//! `vec_utterances` vec0 table for utterances, then merges FTS + vector scores
-//! using **Reciprocal Rank Fusion (RRF)**.
+//! **Hybrid** (when `query_embedding` is present — a 384-dim float32 array in
+//! the model space pinned by `crate::embedding::MODEL_ID`, computed in-enclave
+//! at query time): runs vector KNN on the `vec_utterances` / `vec_screenshots`
+//! vec0 tables, then merges FTS + vector scores per kind using **Reciprocal
+//! Rank Fusion (RRF)**. Episodes remain FTS-only (their searchable text is an
+//! LLM summary that FTS already matches well).
 //!
 //! ## Why RRF
 //!
@@ -31,7 +33,7 @@
 //! # `kinds` filter
 //!
 //! When `kinds` is empty, all content types are searched; vector search applies
-//! only to the utterance kind (screenshots and episodes have no embeddings yet).
+//! to utterances and screenshots (episodes have no embeddings).
 //!
 //! # Backward compatibility
 //!
@@ -65,9 +67,10 @@ pub struct SearchRequest {
     /// combination.  Absent (or empty) means search all kinds.
     #[serde(default)]
     pub kinds: Vec<String>,
-    /// Optional 384-dim all-MiniLM-L6-v2 query embedding (float32, unit-length,
-    /// cosine space), sent by the control plane.  When present, utterance search
-    /// uses RRF-fused FTS + vector KNN.  When absent, FTS-only.
+    /// Optional 384-dim query embedding (float32, unit-length, cosine space —
+    /// model pinned by `crate::embedding::MODEL_ID`, computed in-enclave at
+    /// query time).  When present, utterance and screenshot search use
+    /// RRF-fused FTS + vector KNN.  When absent, FTS-only.
     pub query_embedding: Option<Vec<f32>>,
 }
 
@@ -97,6 +100,11 @@ pub enum SearchHit {
         window_title: Option<String>,
         ocr_text: Option<String>,
         url: Option<String>,
+        /// Combined RRF score (hybrid). Absent in FTS-only mode — older
+        /// clients never see the field (skip_serializing_if), so the response
+        /// shape is backward compatible.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score: Option<f64>,
     },
     Episode {
         id: i64,
@@ -177,6 +185,24 @@ fn hit_timestamp(h: &SearchHit) -> &str {
     }
 }
 
+/// Merge two ranked candidate lists with Reciprocal Rank Fusion:
+/// `RRF(d) = Σ 1/(k + rank_i(d))`, k=60. Input lists are already in rank
+/// order (best first); output is (rowid, rrf_score) sorted descending.
+fn rrf_merge(fts_rows: &[i64], knn_rows: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    const RRF_K: f64 = 60.0;
+    use std::collections::HashMap;
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for (rank0, &rowid) in fts_rows.iter().enumerate() {
+        *scores.entry(rowid).or_default() += 1.0 / (RRF_K + rank0 as f64 + 1.0);
+    }
+    for (rank0, &(rowid, _distance)) in knn_rows.iter().enumerate() {
+        *scores.entry(rowid).or_default() += 1.0 / (RRF_K + rank0 as f64 + 1.0);
+    }
+    let mut out: Vec<(i64, f64)> = scores.into_iter().collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 // ── Utterance search (FTS-only or Hybrid RRF) ────────────────────────────────
 
 fn search_utterances(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<Vec<SearchHit>> {
@@ -245,7 +271,6 @@ fn search_utterances_hybrid(
     req: &SearchRequest,
     query_emb: &[f32],
 ) -> Result<Vec<SearchHit>> {
-    const RRF_K: f64 = 60.0;
     // Fetch a wider candidate set from each signal; RRF re-ranks them.
     let candidate_limit = (req.limit * 3).max(60) as i64;
 
@@ -286,21 +311,7 @@ fn search_utterances_hybrid(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // ── Step 3: RRF merge ───────────────────────────────────────────────────
-    use std::collections::HashMap;
-    let mut rrf_scores: HashMap<i64, f64> = HashMap::new();
-
-    for (rank0, &rowid) in fts_rows.iter().enumerate() {
-        let rank = rank0 as f64 + 1.0;
-        *rrf_scores.entry(rowid).or_default() += 1.0 / (RRF_K + rank);
-    }
-    for (rank0, &(uid, _distance)) in knn_rows.iter().enumerate() {
-        let rank = rank0 as f64 + 1.0;
-        *rrf_scores.entry(uid).or_default() += 1.0 / (RRF_K + rank);
-    }
-
-    // Sort candidates by RRF score descending
-    let mut candidates: Vec<(i64, f64)> = rrf_scores.into_iter().collect();
-    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let candidates = rrf_merge(&fts_rows, &knn_rows);
 
     // Apply offset and limit before the join
     let candidates_page: Vec<(i64, f64)> = candidates
@@ -354,9 +365,19 @@ fn search_utterances_hybrid(
         .map_err(Into::into)
 }
 
-// ── Screenshot search (FTS-only — no embeddings on screenshots) ───────────────
+// ── Screenshot search (FTS-only or Hybrid RRF over OCR text) ──────────────────
 
 fn search_screenshots(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<Vec<SearchHit>> {
+    match &req.query_embedding {
+        Some(qemb) => search_screenshots_hybrid(conn, req, qemb),
+        None => search_screenshots_fts(conn, req),
+    }
+}
+
+fn search_screenshots_fts(
+    conn: &rusqlite::Connection,
+    req: &SearchRequest,
+) -> Result<Vec<SearchHit>> {
     let sql = r#"
         SELECT id, captured_at, active_app, window_title, ocr_text, url
         FROM screenshots
@@ -386,9 +407,94 @@ fn search_screenshots(conn: &rusqlite::Connection, req: &SearchRequest) -> Resul
                 window_title: r.get(3)?,
                 ocr_text: r.get(4)?,
                 url: r.get(5)?,
+                score: None,
             })
         },
     )?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Hybrid screenshot search — same shape as [`search_utterances_hybrid`]:
+/// FTS candidates + standalone vec0 KNN (sqlite-vec: MATCH must not mix with
+/// JOINs), RRF merge, then join back for full rows.
+fn search_screenshots_hybrid(
+    conn: &rusqlite::Connection,
+    req: &SearchRequest,
+    query_emb: &[f32],
+) -> Result<Vec<SearchHit>> {
+    let candidate_limit = (req.limit * 3).max(60) as i64;
+
+    let fts_sql = r#"
+        SELECT rowid
+        FROM screenshots_fts
+        WHERE screenshots_fts MATCH ?1
+        ORDER BY rank
+        LIMIT ?2
+    "#;
+    let mut fts_stmt = conn.prepare(fts_sql)?;
+    let fts_rows: Vec<i64> = fts_stmt
+        .query_map(rusqlite::params![req.query, candidate_limit], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let query_bytes: Vec<u8> = query_emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let knn_sql = r#"
+        SELECT screenshot_id, distance
+        FROM vec_screenshots
+        WHERE embedding MATCH ?1
+        ORDER BY distance
+        LIMIT ?2
+    "#;
+    let mut knn_stmt = conn.prepare(knn_sql)?;
+    let knn_rows: Vec<(i64, f64)> = knn_stmt
+        .query_map(
+            rusqlite::params![query_bytes.as_slice(), candidate_limit],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let candidates_page: Vec<(i64, f64)> = rrf_merge(&fts_rows, &knn_rows)
+        .into_iter()
+        .skip(req.offset)
+        .take(req.limit)
+        .collect();
+
+    if candidates_page.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let values_clause: String = candidates_page
+        .iter()
+        .map(|(id, score)| format!("({id},{score})"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let join_sql = format!(
+        r#"
+        WITH ranked(screenshot_id, rrf_score) AS (VALUES {values_clause})
+        SELECT sc.id, sc.captured_at, sc.active_app, sc.window_title,
+               sc.ocr_text, sc.url, r.rrf_score
+        FROM ranked r
+        JOIN screenshots sc ON sc.id = r.screenshot_id
+        WHERE (?1 IS NULL OR sc.captured_at >= ?1)
+          AND (?2 IS NULL OR sc.captured_at <= ?2)
+        ORDER BY r.rrf_score DESC
+        "#
+    );
+
+    let mut stmt = conn.prepare(&join_sql)?;
+    let rows = stmt.query_map(rusqlite::params![req.time_start, req.time_end], |r| {
+        Ok(SearchHit::Screenshot {
+            id: r.get(0)?,
+            captured_at: r.get(1)?,
+            active_app: r.get(2)?,
+            window_title: r.get(3)?,
+            ocr_text: r.get(4)?,
+            url: r.get(5)?,
+            score: Some(r.get::<_, f64>(6)?),
+        })
+    })?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -655,6 +761,7 @@ mod tests {
                 ingest_utterances(
                     conn,
                     &[utt_with_emb("k:1:1", "semantic memory test", Some(1.0))],
+                    true,
                 )
             })
             .await
@@ -691,11 +798,13 @@ mod tests {
                 ingest_utterances(
                     conn,
                     &[utt_with_emb("k:1:1", "unique_fts_term alpha", None)],
+                    true,
                 )?;
                 // Utterance B: matches vector (similar direction to query), text not matching FTS
                 ingest_utterances(
                     conn,
                     &[utt_with_emb("k:1:2", "vector match candidate", Some(1.0))],
+                    true,
                 )?;
                 Ok(())
             })
@@ -737,6 +846,7 @@ mod tests {
                 ingest_utterances(
                     conn,
                     &[utt_with_emb("k:1:1", "kioku recall test", Some(0.5))],
+                    true,
                 )
             })
             .await
@@ -782,5 +892,65 @@ mod tests {
             })
             .await
             .expect("reload should not error on existing vec0 table");
+    }
+
+    /// Hybrid screenshot search: a screenshot whose OCR text does NOT match
+    /// the FTS query is still found via vector KNN, with a score attached;
+    /// FTS-only mode leaves score None.
+    #[tokio::test]
+    async fn screenshot_hybrid_finds_vector_match() {
+        use crate::ingest::{ingest_screenshots, ScreenshotInput};
+        let store = make_store();
+
+        store
+            .with_user("scr_hybrid_u", |conn| {
+                ingest_screenshots(
+                    conn,
+                    &[ScreenshotInput {
+                        captured_at: "2026-01-01T09:05:00Z".to_string(),
+                        active_app: Some("zoom.us".to_string()),
+                        window_title: None,
+                        ocr_text: Some("participant panel names list".to_string()),
+                        url: None,
+                        image_hash: None,
+                        source_key: Some("dev:9".to_string()),
+                        embedding_b64: Some(make_embedding_b64(1.0)),
+                    }],
+                    true,
+                )
+            })
+            .await
+            .expect("ingest screenshot");
+
+        // Hybrid query whose text matches nothing in FTS but whose vector is
+        // aligned with the stored embedding.
+        let req = req_hybrid("scr_hybrid_u", "nomatchterm", 1.0);
+        let hits = store
+            .with_user("scr_hybrid_u", |conn| search_all(conn, &req))
+            .await
+            .expect("search");
+
+        let scr_hit = hits.iter().find_map(|h| match h {
+            SearchHit::Screenshot { id, score, .. } => Some((*id, *score)),
+            _ => None,
+        });
+        let (_, score) = scr_hit.expect("vector KNN should surface the screenshot");
+        assert!(score.is_some(), "hybrid hit must carry an RRF score");
+
+        // FTS-only search for a term that DOES match keeps score None.
+        let req = req_fts("scr_hybrid_u", "participant", vec!["screenshot".into()]);
+        let hits = store
+            .with_user("scr_hybrid_u", |conn| search_all(conn, &req))
+            .await
+            .expect("fts search");
+        match hits.first() {
+            Some(SearchHit::Screenshot { score, .. }) => {
+                assert!(
+                    score.is_none(),
+                    "FTS-only screenshot hit must have no score"
+                )
+            }
+            other => panic!("expected screenshot hit, got {other:?}"),
+        }
     }
 }

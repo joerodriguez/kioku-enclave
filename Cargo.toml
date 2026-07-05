@@ -6,11 +6,15 @@ rust-version = "1.75"
 description = "Kioku data-plane: the only code that touches user plaintext"
 license = "Apache-2.0"
 
-# Vector search: sqlite-vec (C extension, compiled via cc::Build).
-# The enclave does NOT embed queries — the control plane computes the
-# all-MiniLM-L6-v2 query embedding and passes the 384-dim float32 vector to
-# the enclave. This keeps the enclave free of any ML runtime and keeps the
-# auditable binary small.
+# Vector search: sqlite-vec (C extension, compiled via cc::Build) for KNN
+# storage, plus an in-enclave candle BERT encoder for query embeddings.
+# Design decision (2026-07-05, supersedes the earlier no-ML-runtime stance):
+# MCP queries from Claude/ChatGPT arrive at the enclave as raw text with no
+# Mac in the loop, so query embedding must happen server-side. Running the
+# model INSIDE the attested enclave is the only option that keeps query text
+# within the TEE boundary (sending it to a Vertex embedding API would add a
+# second plaintext egress). Document embeddings are computed on the Mac and
+# arrive via sync; both sides pin the same model (see src/embedding.rs).
 
 [[bin]]
 name = "kioku-enclave"
@@ -104,6 +108,19 @@ serde_urlencoded = "0.7.1"
 # automatically when CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER is set in CI
 # (set by apt-get install musl-tools + rustup target add x86_64-unknown-linux-musl).
 sqlite-vec = "0.1.9"
+
+# In-enclave query embedding (hybrid search): candle runs the
+# paraphrase-multilingual-MiniLM-L12-v2 BERT encoder on CPU. Pure-Rust
+# compute (gemm), no ONNX runtime, no dynamic libs — musl/FROM-scratch safe.
+# tokenizers with default features OFF drops the onig C regex dependency
+# (falls back to fancy-regex, pure Rust). Model weights are NOT vendored in
+# this repo: the Docker build downloads them with a pinned SHA-256 and bakes
+# them into the attested image; local dev/tests point EMBED_MODEL_DIR at a
+# downloaded copy and skip gracefully when it is absent.
+candle-core = { version = "0.11", default-features = false }
+candle-nn = { version = "0.11", default-features = false }
+candle-transformers = { version = "0.11", default-features = false }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 [dev-dependencies]
 tokio = { version = "1.45.1", features = ["rt", "macros"] }

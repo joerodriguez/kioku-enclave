@@ -61,11 +61,32 @@ FROM rust:1.96.0-slim AS builder
 
 WORKDIR /build
 
-# Install musl toolchain
+# Install musl toolchain (+ curl for the embedding-model download below)
 RUN rustup target add x86_64-unknown-linux-musl \
     && apt-get update -qq \
-    && apt-get install -y --no-install-recommends musl-tools \
+    && apt-get install -y --no-install-recommends musl-tools curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Embedding model (hybrid search) ────────────────────────────────────────────
+#
+# paraphrase-multilingual-MiniLM-L12-v2 — the pinned query/document embedding
+# model (see src/embedding.rs MODEL_ID; the Mac client MUST ship the same
+# files). Downloaded here with pinned SHA-256 hashes so the model content is
+# a deterministic build input: the weights are baked into the image and are
+# therefore covered by the attested digest, same as the binary. ~470 MB.
+#
+# Bumping the model = new hashes here + MODEL_ID bump in src/embedding.rs on
+# BOTH sides (enclave + kioku-monorepo server-rs) + a vec-table migration.
+RUN mkdir -p /models \
+    && curl -fsSL -o /models/config.json \
+       "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/config.json" \
+    && curl -fsSL -o /models/tokenizer.json \
+       "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/tokenizer.json" \
+    && curl -fsSL -o /models/model.safetensors \
+       "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/model.safetensors" \
+    && echo "6300193cb75e01cf80c96decef7187dfb33094d97cc1490b7ead6ff134476e4e  /models/config.json" | sha256sum -c - \
+    && echo "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8  /models/tokenizer.json" | sha256sum -c - \
+    && echo "eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b  /models/model.safetensors" | sha256sum -c -
 
 # musl does not define the BSD-style u_int*_t aliases that sqlite-vec.c's
 # bundled C uses (typedef u_int8_t uint8_t; ...). glibc/macOS provide them, musl
@@ -208,6 +229,12 @@ ENV ENCLAVE_KMS_VIA_ATTESTATION=1
 
 # Copy the static binary
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/kioku-enclave /kioku-enclave
+
+# Embedding model for in-enclave query embedding (hybrid search). Baked into
+# the image → covered by the attested digest. EMBED_MODEL_DIR is read at boot;
+# if the model fails to load the enclave serves FTS-only (never fatal).
+COPY --from=builder /models /models
+ENV EMBED_MODEL_DIR=/models
 
 # Root, deliberately: the Confidential Space launcher mounts the /tmp tmpfs
 # root-owned with no mode/uid knobs in the tee-mount spec, and a FROM-scratch

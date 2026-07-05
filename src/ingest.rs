@@ -14,15 +14,24 @@
 //! response counts only rows that were actually written (`changes()`).
 //!
 //! # Embedding handling
-//! When an utterance carries `embedding_b64` (base64 of 384 × f32 LE, produced
-//! by all-MiniLM-L6-v2 on the Mac), the handler decodes it and inserts the raw
-//! bytes into the `vec_utterances` vec0 virtual table keyed by the utterance's
-//! rowid.  Rows without an embedding are silently skipped — they are still found
-//! by FTS but not by vector KNN.
+//! When an utterance or screenshot carries `embedding_b64` (base64 of 384 ×
+//! f32 LE, computed on the Mac — see `src/embedding.rs` for the pinned model),
+//! the handler decodes it and writes the raw bytes into the matching vec0
+//! virtual table (`vec_utterances` / `vec_screenshots`) keyed by the row's id.
+//! Rows without an embedding are silently skipped — they are still found by
+//! FTS but not by vector KNN.
 //!
-//! Screenshots do not currently carry embeddings (the Mac does not send them),
-//! so there is no `vec_screenshots` table.  Add one here when the Mac client
-//! starts sending screenshot embeddings.
+//! **Backfill path:** when a `source_key` row already exists (INSERT OR IGNORE
+//! dedup) and the payload carries an embedding, the embedding is still
+//! upserted against the existing rowid. This is how the Mac retrofits vectors
+//! onto historical rows: it re-sends already-synced rows with embeddings
+//! attached, the text dedups, the vector lands.
+//!
+//! **Model gate:** batches carry `embedding_model` naming the embedding space.
+//! If it doesn't match this build's [`crate::embedding::MODEL_ID`] (or is
+//! absent while embeddings are present), vectors are dropped with a warning —
+//! text still ingests. Mixing embedding spaces silently corrupts KNN ranking,
+//! which is strictly worse than FTS-only.
 //!
 //! # Not done here (TODOs for later passes)
 //! - Deduplication of screenshots by image_hash.
@@ -43,6 +52,11 @@ use crate::{error::Result, AppState};
 #[derive(Debug, Deserialize)]
 pub struct IngestRequest {
     pub user_id: String,
+    /// Names the embedding space of every `embedding_b64` in this batch
+    /// (the sender's `embedding::MODEL_ID`). Vectors are dropped unless this
+    /// matches the enclave's own model id — see module docs.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
     #[serde(default)]
     pub utterances: Vec<UtteranceInput>,
     #[serde(default)]
@@ -66,9 +80,10 @@ pub struct UtteranceInput {
     /// Idempotency key: `device_id:segment_local_id:utterance_local_id`.
     /// When present, `INSERT OR IGNORE` is used so re-sent batches are no-ops.
     pub source_key: Option<String>,
-    /// Optional 384-dim all-MiniLM-L6-v2 embedding, base64-encoded float32 LE.
-    /// Computed on the Mac; the enclave stores it but never computes embeddings
-    /// itself — query embeddings arrive from the control plane.
+    /// Optional 384-dim embedding (model pinned in `src/embedding.rs`),
+    /// base64-encoded float32 LE. Computed on the Mac. The enclave computes
+    /// only QUERY embeddings itself (in-TEE, at search time) — document
+    /// vectors always arrive through sync.
     pub embedding_b64: Option<String>,
 }
 
@@ -87,6 +102,9 @@ pub struct ScreenshotInput {
     /// Idempotency key: `device_id:screenshot_local_id`.
     /// When present, `INSERT OR IGNORE` is used so re-sent batches are no-ops.
     pub source_key: Option<String>,
+    /// Optional 384-dim embedding of `ocr_text` (capped at 10k chars on the
+    /// Mac; chunked + mean-pooled). Same model/space rules as utterances.
+    pub embedding_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,10 +139,27 @@ pub(crate) async fn ingest_batch(
     req: &IngestRequest,
 ) -> Result<IngestResponse> {
     crate::store::validate_user_id(&req.user_id)?;
+
+    // Model gate: only accept vectors from OUR embedding space. A batch with
+    // embeddings but a missing/mismatched model id still ingests its text —
+    // the vectors are dropped (mixing spaces corrupts KNN ranking).
+    let accept_embeddings = req.embedding_model.as_deref() == Some(crate::embedding::MODEL_ID);
+    if !accept_embeddings {
+        let has_embeddings = req.utterances.iter().any(|u| u.embedding_b64.is_some())
+            || req.screenshots.iter().any(|s| s.embedding_b64.is_some());
+        if has_embeddings {
+            warn!(
+                batch_model = req.embedding_model.as_deref().unwrap_or("<absent>"),
+                enclave_model = crate::embedding::MODEL_ID,
+                "embedding model mismatch — dropping batch vectors, ingesting text only"
+            );
+        }
+    }
+
     let (utterances_inserted, screenshots_inserted) = store
         .with_user(&req.user_id, |conn| {
-            let u = ingest_utterances(conn, &req.utterances)?;
-            let s = ingest_screenshots(conn, &req.screenshots)?;
+            let u = ingest_utterances(conn, &req.utterances, accept_embeddings)?;
+            let s = ingest_screenshots(conn, &req.screenshots, accept_embeddings)?;
             Ok((u, s))
         })
         .await?;
@@ -138,9 +173,11 @@ pub(crate) async fn ingest_batch(
 // ── Insertion helpers ─────────────────────────────────────────────────────────
 
 /// Insert utterances and return the count of rows actually written.
+/// `accept_embeddings` is the model-gate verdict from [`ingest_batch`].
 pub(crate) fn ingest_utterances(
     conn: &rusqlite::Connection,
     items: &[UtteranceInput],
+    accept_embeddings: bool,
 ) -> Result<usize> {
     let mut inserted = 0usize;
     for u in items {
@@ -204,64 +241,127 @@ pub(crate) fn ingest_utterances(
         let row_inserted = conn.changes() as usize;
         inserted += row_inserted;
 
-        // When this utterance was actually inserted (not a dedup ignore) and
-        // carries an embedding, store it in the vec0 table.
-        // We only do this when changes() == 1 — if the row was already there
-        // (INSERT OR IGNORE no-op), skip to avoid a rowid lookup race.
-        if row_inserted > 0 {
-            if let Some(ref emb_b64) = u.embedding_b64 {
-                let utterance_id: i64 = conn.last_insert_rowid();
-                insert_embedding(conn, utterance_id, emb_b64);
+        if !accept_embeddings {
+            continue;
+        }
+        if let Some(ref emb_b64) = u.embedding_b64 {
+            if row_inserted > 0 {
+                // Fresh row: last_insert_rowid is trustworthy.
+                let utterance_id = conn.last_insert_rowid();
+                write_embedding(conn, VecTable::Utterances, utterance_id, emb_b64, false);
+            } else if let Some(ref sk) = u.source_key {
+                // Backfill: the text row already exists (dedup no-op) but the
+                // sender attached a vector — look the row up by source_key and
+                // upsert. This is how historical rows gain embeddings.
+                match conn.query_row(
+                    "SELECT id FROM utterances WHERE source_key = ?1",
+                    [sk],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    Ok(utterance_id) => {
+                        write_embedding(conn, VecTable::Utterances, utterance_id, emb_b64, true)
+                    }
+                    Err(e) => warn!(source_key = %sk, "backfill rowid lookup failed: {e}"),
+                }
             }
         }
     }
     Ok(inserted)
 }
 
-/// Decode an all-MiniLM-L6-v2 embedding (base64 of 384 × f32 LE) and insert
-/// it into vec_utterances.  Errors here are non-fatal — a bad or truncated
-/// embedding silently falls back to FTS-only for this utterance; we log a
-/// warning rather than aborting the whole batch.
+/// Which vec0 table an embedding targets.
+#[derive(Clone, Copy)]
+enum VecTable {
+    Utterances,
+    Screenshots,
+}
+
+impl VecTable {
+    fn table(self) -> &'static str {
+        match self {
+            VecTable::Utterances => "vec_utterances",
+            VecTable::Screenshots => "vec_screenshots",
+        }
+    }
+    fn key_col(self) -> &'static str {
+        match self {
+            VecTable::Utterances => "utterance_id",
+            VecTable::Screenshots => "screenshot_id",
+        }
+    }
+}
+
+/// Decode a 384-dim embedding (base64 of f32 LE) and write it into the given
+/// vec0 table.  Errors here are non-fatal — a bad or truncated embedding
+/// silently falls back to FTS-only for this row; we log a warning rather than
+/// aborting the whole batch.
+///
+/// `replace` distinguishes the two call sites: fresh inserts use
+/// INSERT OR IGNORE (retry-idempotent); the backfill path DELETEs first so a
+/// re-sent vector overwrites (vec0 does not honour ON CONFLICT clauses, so
+/// upsert must be spelled DELETE + INSERT).
 ///
 /// sqlite-vec gotcha: the vec0 rowid MUST be bound as an INTEGER (i64) and
 /// the embedding as a blob (&[u8] of the raw float32 bytes).  Passing the
 /// rowid as TEXT or the vector as a JSON array will fail or silently corrupt
 /// the index.
-fn insert_embedding(conn: &rusqlite::Connection, utterance_id: i64, emb_b64: &str) {
+fn write_embedding(
+    conn: &rusqlite::Connection,
+    target: VecTable,
+    row_id: i64,
+    emb_b64: &str,
+    replace: bool,
+) {
     const EXPECTED_BYTES: usize = 384 * 4; // 384 f32 × 4 bytes each
 
     let bytes = match B64.decode(emb_b64) {
         Ok(b) => b,
         Err(e) => {
-            warn!(utterance_id, "embedding_b64 decode failed: {e}");
+            warn!(
+                row_id,
+                table = target.table(),
+                "embedding_b64 decode failed: {e}"
+            );
             return;
         }
     };
 
     if bytes.len() != EXPECTED_BYTES {
         warn!(
-            utterance_id,
+            row_id,
+            table = target.table(),
             "embedding has {} bytes, expected {EXPECTED_BYTES} — skipping",
             bytes.len()
         );
         return;
     }
 
-    // Insert into vec0.  utterance_id bound as INTEGER; embedding as BLOB.
-    // INSERT OR IGNORE: idempotent — if a retry already stored this embedding
-    // (unlikely because row_inserted guard above), we silently skip.
-    if let Err(e) = conn.execute(
-        "INSERT OR IGNORE INTO vec_utterances (utterance_id, embedding) VALUES (?1, ?2)",
-        rusqlite::params![utterance_id, bytes.as_slice()],
-    ) {
-        warn!(utterance_id, "vec_utterances insert failed: {e}");
+    let (table, key) = (target.table(), target.key_col());
+    if replace {
+        if let Err(e) = conn.execute(
+            &format!("DELETE FROM {table} WHERE {key} = ?1"),
+            rusqlite::params![row_id],
+        ) {
+            warn!(row_id, table, "vec delete-before-upsert failed: {e}");
+            return;
+        }
+    }
+    let sql = if replace {
+        format!("INSERT INTO {table} ({key}, embedding) VALUES (?1, ?2)")
+    } else {
+        format!("INSERT OR IGNORE INTO {table} ({key}, embedding) VALUES (?1, ?2)")
+    };
+    if let Err(e) = conn.execute(&sql, rusqlite::params![row_id, bytes.as_slice()]) {
+        warn!(row_id, table, "vec insert failed: {e}");
     }
 }
 
 /// Insert screenshots and return the count of rows actually written.
+/// `accept_embeddings` is the model-gate verdict from [`ingest_batch`].
 pub(crate) fn ingest_screenshots(
     conn: &rusqlite::Connection,
     items: &[ScreenshotInput],
+    accept_embeddings: bool,
 ) -> Result<usize> {
     let mut inserted = 0usize;
     for s in items {
@@ -295,7 +395,31 @@ pub(crate) fn ingest_screenshots(
                 ],
             )?;
         }
-        inserted += conn.changes() as usize;
+        let row_inserted = conn.changes() as usize;
+        inserted += row_inserted;
+
+        if !accept_embeddings {
+            continue;
+        }
+        if let Some(ref emb_b64) = s.embedding_b64 {
+            if row_inserted > 0 {
+                let screenshot_id = conn.last_insert_rowid();
+                write_embedding(conn, VecTable::Screenshots, screenshot_id, emb_b64, false);
+            } else if let Some(ref sk) = s.source_key {
+                // Backfill for existing screenshot rows — same pattern as
+                // utterances above.
+                match conn.query_row(
+                    "SELECT id FROM screenshots WHERE source_key = ?1",
+                    [sk],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    Ok(screenshot_id) => {
+                        write_embedding(conn, VecTable::Screenshots, screenshot_id, emb_b64, true)
+                    }
+                    Err(e) => warn!(source_key = %sk, "screenshot backfill lookup failed: {e}"),
+                }
+            }
+        }
     }
     Ok(inserted)
 }
@@ -357,6 +481,7 @@ mod tests {
             url: None,
             image_hash: None,
             source_key: source_key.map(|s| s.to_string()),
+            embedding_b64: None,
         }
     }
 
@@ -367,7 +492,7 @@ mod tests {
 
         let first = store
             .with_user("dedup_u", |conn| {
-                ingest_utterances(conn, &[utt(Some("dev:1:1"), "first send")])
+                ingest_utterances(conn, &[utt(Some("dev:1:1"), "first send")], true)
             })
             .await
             .unwrap();
@@ -375,7 +500,7 @@ mod tests {
 
         let second = store
             .with_user("dedup_u", |conn| {
-                ingest_utterances(conn, &[utt(Some("dev:1:1"), "second send")])
+                ingest_utterances(conn, &[utt(Some("dev:1:1"), "second send")], true)
             })
             .await
             .unwrap();
@@ -400,7 +525,7 @@ mod tests {
 
         let first = store
             .with_user("dedup_s", |conn| {
-                ingest_screenshots(conn, &[scr(Some("dev:42"))])
+                ingest_screenshots(conn, &[scr(Some("dev:42"))], true)
             })
             .await
             .unwrap();
@@ -408,7 +533,7 @@ mod tests {
 
         let second = store
             .with_user("dedup_s", |conn| {
-                ingest_screenshots(conn, &[scr(Some("dev:42"))])
+                ingest_screenshots(conn, &[scr(Some("dev:42"))], true)
             })
             .await
             .unwrap();
@@ -450,8 +575,8 @@ mod tests {
         let store = make_store();
         store
             .with_user("nokey_u", |conn| {
-                ingest_utterances(conn, &[utt(None, "no key")])?;
-                ingest_utterances(conn, &[utt(None, "no key")])?;
+                ingest_utterances(conn, &[utt(None, "no key")], true)?;
+                ingest_utterances(conn, &[utt(None, "no key")], true)?;
                 Ok(())
             })
             .await
@@ -476,7 +601,7 @@ mod tests {
             .with_user("vec_insert_u", |conn| {
                 let mut u = utt(Some("dev:1:1"), "vector test utterance");
                 u.embedding_b64 = Some(emb.clone());
-                ingest_utterances(conn, &[u])
+                ingest_utterances(conn, &[u], true)
             })
             .await
             .expect("ingest");
@@ -499,7 +624,7 @@ mod tests {
 
         store
             .with_user("no_vec_u", |conn| {
-                ingest_utterances(conn, &[utt(Some("dev:1:1"), "fts only utterance")])
+                ingest_utterances(conn, &[utt(Some("dev:1:1"), "fts only utterance")], true)
             })
             .await
             .expect("ingest");
@@ -528,7 +653,7 @@ mod tests {
                 .with_user("vec_dedup_u", |conn| {
                     let mut u = utt(Some("dev:1:1"), "dedup embedding test");
                     u.embedding_b64 = Some(emb.clone());
-                    ingest_utterances(conn, &[u])
+                    ingest_utterances(conn, &[u], true)
                 })
                 .await
                 .expect("ingest");
@@ -544,5 +669,127 @@ mod tests {
             vec_count, 1,
             "duplicate source_key must not produce two vec rows"
         );
+    }
+
+    /// THE backfill scenario: a row synced long ago WITHOUT an embedding gets
+    /// re-sent with one attached — the vector must land on the existing row.
+    #[tokio::test]
+    async fn embedding_backfill_upserts_existing_row() {
+        let store = make_store();
+
+        // Day 1: text-only sync (pre-vector client).
+        store
+            .with_user("backfill_u", |conn| {
+                ingest_utterances(conn, &[utt(Some("dev:1:1"), "historical row")], true)
+            })
+            .await
+            .expect("initial ingest");
+
+        // Day 2: backfill re-sends the same source_key WITH an embedding.
+        let emb = make_embedding_b64(1.0);
+        let inserted = store
+            .with_user("backfill_u", |conn| {
+                let mut u = utt(Some("dev:1:1"), "historical row");
+                u.embedding_b64 = Some(emb);
+                ingest_utterances(conn, &[u], true)
+            })
+            .await
+            .expect("backfill ingest");
+        assert_eq!(inserted, 0, "text row must dedup (no new row)");
+
+        let (rows, vecs): (i64, i64) = store
+            .with_user("backfill_u", |conn| {
+                let rows = conn.query_row("SELECT count(*) FROM utterances", [], |r| r.get(0))?;
+                let vecs =
+                    conn.query_row("SELECT count(*) FROM vec_utterances", [], |r| r.get(0))?;
+                Ok((rows, vecs))
+            })
+            .await
+            .expect("counts");
+        assert_eq!(rows, 1, "still exactly one text row");
+        assert_eq!(
+            vecs, 1,
+            "backfill must attach the vector to the existing row"
+        );
+    }
+
+    /// Screenshot embeddings: fresh insert AND backfill both land in vec_screenshots.
+    #[tokio::test]
+    async fn screenshot_embedding_insert_and_backfill() {
+        let store = make_store();
+        let emb = make_embedding_b64(1.0);
+
+        // Fresh insert with embedding.
+        store
+            .with_user("scr_vec_u", |conn| {
+                let mut s = scr(Some("dev:1"));
+                s.embedding_b64 = Some(emb.clone());
+                ingest_screenshots(conn, &[s], true)
+            })
+            .await
+            .expect("ingest");
+
+        // Backfill onto a pre-existing text-only screenshot.
+        store
+            .with_user("scr_vec_u", |conn| {
+                ingest_screenshots(conn, &[scr(Some("dev:2"))], true)?;
+                let mut s = scr(Some("dev:2"));
+                s.embedding_b64 = Some(emb.clone());
+                ingest_screenshots(conn, &[s], true)
+            })
+            .await
+            .expect("backfill");
+
+        let vecs: i64 = store
+            .with_user("scr_vec_u", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM vec_screenshots", [], |r| r.get(0))?)
+            })
+            .await
+            .expect("count");
+        assert_eq!(vecs, 2, "both screenshots should have vectors");
+    }
+
+    /// Model gate: a batch whose embedding_model doesn't match MODEL_ID keeps
+    /// its text but drops its vectors; a matching batch keeps both.
+    #[tokio::test]
+    async fn model_gate_drops_foreign_vectors() {
+        let store = make_store();
+        let emb = make_embedding_b64(1.0);
+
+        let mk_req = |model: Option<&str>, sk: &str| {
+            let mut u = utt(Some(sk), "gated text");
+            u.embedding_b64 = Some(emb.clone());
+            IngestRequest {
+                user_id: "gate_u".to_string(),
+                embedding_model: model.map(String::from),
+                utterances: vec![u],
+                screenshots: vec![],
+            }
+        };
+
+        // Foreign space → text lands, vector dropped.
+        ingest_batch(&store, &mk_req(Some("some-other-model/9"), "dev:1:1"))
+            .await
+            .expect("foreign-model ingest");
+        // Absent model id with embeddings present → also dropped.
+        ingest_batch(&store, &mk_req(None, "dev:1:2"))
+            .await
+            .expect("absent-model ingest");
+        // Matching space → vector lands.
+        ingest_batch(&store, &mk_req(Some(crate::embedding::MODEL_ID), "dev:1:3"))
+            .await
+            .expect("matching-model ingest");
+
+        let (rows, vecs): (i64, i64) = store
+            .with_user("gate_u", |conn| {
+                let rows = conn.query_row("SELECT count(*) FROM utterances", [], |r| r.get(0))?;
+                let vecs =
+                    conn.query_row("SELECT count(*) FROM vec_utterances", [], |r| r.get(0))?;
+                Ok((rows, vecs))
+            })
+            .await
+            .expect("counts");
+        assert_eq!(rows, 3, "all three texts ingest regardless of model gate");
+        assert_eq!(vecs, 1, "only the matching-model vector survives");
     }
 }

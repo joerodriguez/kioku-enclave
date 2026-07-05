@@ -15,8 +15,9 @@ Plaintext exists only here (and SEV tmpfs), never on disk.
 | `auth.rs` | Legacy caller auth — verifies the control-plane SA ID token for the `/v1/*` routes |
 | `crypto.rs` | AES-256-GCM encrypt/decrypt of per-user (and control) SQLite blobs; key handling |
 | `store.rs` | Per-user encrypted SQLite blob storage in GCS (load → decrypt → mutate → encrypt → persist) |
-| `ingest.rs` | Ingest transcripts + OCR text; `ingest_batch` is the in-process entry the `cp::sync` path calls |
-| `search.rs` | Full-text search (SQLite FTS5); `search_all` is called in-process by `cp::query` |
+| `ingest.rs` | Ingest transcripts + OCR text (+ their Mac-computed embeddings into vec0 tables, with a `source_key` backfill-upsert path and an embedding-model gate); `ingest_batch` is the in-process entry the `cp::sync` path calls |
+| `search.rs` | Search (SQLite FTS5 + hybrid RRF with vec0 KNN over utterances and screenshots when a query embedding is present); `search_all` is called in-process by `cp::query` |
+| `embedding.rs` | **In-enclave query embedding (hybrid search).** candle BERT encoder (`paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, pinned `MODEL_ID`) loaded from `EMBED_MODEL_DIR` (baked into the image). Chunked mean-pooling for long text (10k-char cap). Absent/failed engine → FTS-only, never fatal. The Mac client (`kioku-monorepo` `server-rs/src/embedder.rs`) MUST ship the identical model |
 | `timeline.rs` | Context / time-range queries; `fetch_context` called in-process by MCP `get_context` |
 | `episodes.rs` | v2 episode storage; `upsert_episodes` called in-process by `cp::summarizer` |
 | `error.rs` | Error types + HTTP mapping |

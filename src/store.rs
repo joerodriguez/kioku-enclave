@@ -442,6 +442,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_utterances USING vec0(
     embedding float[384] distance_metric=cosine
 );
 
+-- Vector index for screenshot OCR embeddings (same model/space as
+-- vec_utterances — see src/embedding.rs MODEL_ID). Keyed by screenshot rowid.
+-- The Mac embeds ocr_text capped at 10k chars (chunked + mean-pooled);
+-- screenshots without OCR or embeddings simply have no row here.
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_screenshots USING vec0(
+    screenshot_id INTEGER PRIMARY KEY,
+    embedding float[384] distance_metric=cosine
+);
+
 -- FTS sync triggers: utterances
 CREATE TRIGGER IF NOT EXISTS utterances_insert_fts AFTER INSERT ON utterances BEGIN
     INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
@@ -623,6 +632,20 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         let msg = e.to_string();
         // sqlite-vec returns "table vec_utterances already exists" when the table
         // is already present, even with IF NOT EXISTS on some builds.
+        if !msg.contains("already exists") {
+            return Err(e.into());
+        }
+    }
+
+    // vec0 table for screenshot OCR embeddings — added with hybrid screenshot
+    // search. Same replay-safety notes as vec_utterances above.
+    if let Err(e) = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_screenshots USING vec0(
+             screenshot_id INTEGER PRIMARY KEY,
+             embedding float[384] distance_metric=cosine
+         );",
+    ) {
+        let msg = e.to_string();
         if !msg.contains("already exists") {
             return Err(e.into());
         }
