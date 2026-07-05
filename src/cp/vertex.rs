@@ -72,7 +72,12 @@ pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Re
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }
-    let http = reqwest::Client::new();
+    // Explicit timeout: reqwest has NONE by default, and a hung generateContent
+    // call would wedge the summarizer (and, since runs are serialized, every
+    // future run) forever. 3 min is generous for a 6-h window.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
     let token = access_token(&http).await?;
 
     let url = format!(
@@ -83,7 +88,10 @@ pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Re
         "contents": [{ "role": "user", "parts": [{ "text": user_message }] }],
         "systemInstruction": { "parts": [{ "text": system }] },
         "generationConfig": {
-            "maxOutputTokens": 32768,
+            // Model max (Gemini 2.5 Flash): a JSON response truncated by the
+            // output cap is unparseable and deterministically stalls that
+            // summarizer window, so leave no headroom to waste.
+            "maxOutputTokens": 65535,
             "responseMimeType": "application/json",
             "responseSchema": response_schema(),
             "thinkingConfig": { "thinkingBudget": 0 }
@@ -116,9 +124,18 @@ pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Re
         })
         .unwrap_or_default();
     if text.is_empty() {
-        return Err(EnclaveError::Config(
-            "unexpected Vertex response shape".into(),
-        ));
+        // Surface the finishReason (SAFETY / MAX_TOKENS / RECITATION / …) —
+        // it's the difference between a transient blip and a window that will
+        // deterministically fail forever. Metadata only, never content.
+        let finish = data
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finishReason"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("<no candidates>");
+        return Err(EnclaveError::Config(format!(
+            "unexpected Vertex response shape (finishReason: {finish})"
+        )));
     }
     Ok(text)
 }

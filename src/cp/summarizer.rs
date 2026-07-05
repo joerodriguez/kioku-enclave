@@ -361,7 +361,9 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         }
     );
 
-    // Call Vertex.
+    // Call Vertex. Failed windows return an `error` status carrying
+    // `window_to` so the sweep can skip past a window that fails
+    // deterministically (see summarize_all) instead of stalling forever.
     let response = match super::vertex::generate(&state.config, SYSTEM_PROMPT, &user_message).await
     {
         Ok(t) => t,
@@ -370,11 +372,18 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         }
         Err(e) => {
             warn!(error = %e, "summarizer LLM call failed");
-            return Ok(serde_json::json!({ "error": e.to_string() }));
+            return Ok(serde_json::json!({ "error": e.to_string(), "window_to": new_to_iso }));
         }
     };
     let Some(parsed) = extract_json(&response) else {
-        return Ok(serde_json::json!({ "error": "unparseable LLM response" }));
+        // Length only — the response paraphrases user content, never log it.
+        warn!(
+            response_len = response.len(),
+            "summarizer LLM response unparseable"
+        );
+        return Ok(
+            serde_json::json!({ "error": "unparseable LLM response", "window_to": new_to_iso }),
+        );
     };
     let episodes_json = parsed
         .get("episodes")
@@ -648,6 +657,16 @@ pub async fn summarize_all(state: &CpState) {
             return;
         }
     };
+    // (window_to, consecutive failures) per user: a window whose LLM response
+    // fails deterministically (e.g. unparseable every attempt) would otherwise
+    // stall the cursor forever — observed live 2026-07-05 (backfill froze
+    // silently after 3 windows). After MAX_WINDOW_FAILURES consecutive
+    // failures on the SAME window, skip past it (losing that one window's
+    // episodes, loudly) so the sweep keeps moving.
+    const MAX_WINDOW_FAILURES: u32 = 3;
+    static FAILING: OnceLock<Mutex<HashMap<String, (String, u32)>>> = OnceLock::new();
+    let failing = FAILING.get_or_init(|| Mutex::new(HashMap::new()));
+
     for id in ids {
         for _ in 0..MAX_WINDOWS_PER_SWEEP {
             match summarize_user(state, &id).await {
@@ -658,6 +677,7 @@ pub async fn summarize_all(state: &CpState) {
                     if v.get("to").is_some()
                         || v.get("reason").and_then(|r| r.as_str()) == Some("no_new_records") =>
                 {
+                    failing.lock().await.remove(&id);
                     // Every advanced window PUTs control.db.enc, and GCS
                     // rate-limits writes to one object to ~1/sec. Windows with
                     // records pace themselves via the LLM call, but empty
@@ -666,8 +686,42 @@ pub async fn summarize_all(state: &CpState) {
                     tokio::time::sleep(Duration::from_millis(1200)).await;
                     continue;
                 }
+                // A failed window that did not advance: count consecutive
+                // failures of the SAME window; skip past it once it's clearly
+                // deterministic. Otherwise leave it for the next tick.
+                Ok(v) if v.get("error").is_some() => {
+                    let Some(window_to) = v.get("window_to").and_then(|w| w.as_str()) else {
+                        break;
+                    };
+                    let mut guard = failing.lock().await;
+                    let entry = guard
+                        .entry(id.clone())
+                        .or_insert((window_to.to_string(), 0));
+                    if entry.0 == window_to {
+                        entry.1 += 1;
+                    } else {
+                        *entry = (window_to.to_string(), 1);
+                    }
+                    if entry.1 < MAX_WINDOW_FAILURES {
+                        break;
+                    }
+                    tracing::error!(
+                        user_id = %id,
+                        window_to,
+                        failures = entry.1,
+                        "summarizer window failing deterministically; skipping past it"
+                    );
+                    guard.remove(&id);
+                    drop(guard);
+                    if let Err(e) = state.control.set_summarized_until(&id, window_to).await {
+                        warn!(user_id = %id, error = %e, "failed to skip stuck window");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    continue;
+                }
                 // Caught up ("skipped"), holding for the tail ("waiting"), or
-                // a non-advancing result — done with this user for now.
+                // quota — done with this user for now.
                 Ok(_) => break,
                 Err(e) => {
                     warn!(user_id = %id, error = %e, "summarize_user failed");
