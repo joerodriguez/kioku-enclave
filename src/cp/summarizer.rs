@@ -658,7 +658,13 @@ pub async fn summarize_all(state: &CpState) {
                     if v.get("to").is_some()
                         || v.get("reason").and_then(|r| r.as_str()) == Some("no_new_records") =>
                 {
-                    continue
+                    // Every advanced window PUTs control.db.enc, and GCS
+                    // rate-limits writes to one object to ~1/sec. Windows with
+                    // records pace themselves via the LLM call, but empty
+                    // (no_new_records) windows complete in ms — observed live
+                    // as 429 Too Many Requests killing the sweep. Pace them.
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    continue;
                 }
                 // Caught up ("skipped"), holding for the tail ("waiting"), or
                 // a non-advancing result — done with this user for now.
