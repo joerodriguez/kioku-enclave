@@ -224,6 +224,20 @@ async fn tool_list_episodes(s: &Arc<CpState>, user_id: &str, args: &Value) -> Va
     list_episodes_value(s, user_id, from, to, max).await
 }
 
+/// Parse a stored JSON-array column (participants/languages/action_items)
+/// into a Value, defaulting to an empty array.
+fn json_array_column(raw: Option<String>) -> Value {
+    raw.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_array)
+        .unwrap_or_else(|| json!([]))
+}
+
+/// Registrable host of a URL for the "top domains" chips (strips `www.`).
+fn url_domain(url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_lowercase();
+    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
+}
+
 async fn list_episodes_value(
     s: &CpState,
     user_id: &str,
@@ -233,15 +247,26 @@ async fn list_episodes_value(
 ) -> Value {
     s.store
         .with_user(user_id, move |conn| {
+            // Episodes are the ONLY mode (the Mac's local heuristic grouping is
+            // gone) — this response carries everything the debugger card needs:
+            // LLM fields (participants/languages/action_items) plus per-type
+            // member counts and top apps/domains derived from member
+            // screenshots.
             let mut stmt = conn.prepare(
                 "SELECT e.id, e.started_at, e.ended_at, e.title, e.summary, e.type, \
-                        (SELECT count(*) FROM episode_members m WHERE m.episode_id = e.id) \
+                        e.participants, e.languages, e.action_items, \
+                        (SELECT count(*) FROM episode_members m \
+                          WHERE m.episode_id = e.id AND m.record_type = 'utterance'), \
+                        (SELECT count(*) FROM episode_members m \
+                          WHERE m.episode_id = e.id AND m.record_type = 'screenshot') \
                  FROM episodes e \
                  WHERE (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
                  ORDER BY e.started_at DESC LIMIT ?3",
             )?;
-            let episodes: Vec<Value> = stmt
+            let mut episodes: Vec<Value> = stmt
                 .query_map(rusqlite::params![from, to, max], |r| {
+                    let utt: i64 = r.get(9)?;
+                    let scr: i64 = r.get(10)?;
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?,
                         "started_at": r.get::<_, String>(1)?,
@@ -249,16 +274,62 @@ async fn list_episodes_value(
                         "title": r.get::<_, Option<String>>(3)?,
                         "summary": r.get::<_, Option<String>>(4)?,
                         "type": r.get::<_, Option<String>>(5)?,
-                        "member_count": r.get::<_, i64>(6)?,
+                        "participants": json_array_column(r.get::<_, Option<String>>(6)?),
+                        "languages": json_array_column(r.get::<_, Option<String>>(7)?),
+                        "action_items": json_array_column(r.get::<_, Option<String>>(8)?),
+                        "utterance_count": utt,
+                        "screenshot_count": scr,
+                        "member_count": utt + scr,
                         "source": "summarized",
                     }))
                 })?
                 .filter_map(|x| x.ok())
                 .collect();
+
+            // Top apps + domains per episode from member screenshots (top 3
+            // each, by frequency). One grouped query, merged in memory.
+            {
+                let mut apps = conn.prepare(
+                    "SELECT m.episode_id, c.active_app, c.url, count(*) AS n \
+                     FROM episode_members m JOIN screenshots c ON c.id = m.record_id \
+                     WHERE m.record_type = 'screenshot' \
+                     GROUP BY m.episode_id, c.active_app, c.url",
+                )?;
+                use std::collections::HashMap;
+                let mut app_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
+                let mut dom_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
+                let rows = apps.query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?;
+                for row in rows.filter_map(|x| x.ok()) {
+                    let (ep_id, app, url, n) = row;
+                    if let Some(app) = app.filter(|a| !a.is_empty()) {
+                        *app_counts.entry(ep_id).or_default().entry(app).or_insert(0) += n;
+                    }
+                    if let Some(dom) = url.as_deref().and_then(url_domain) {
+                        *dom_counts.entry(ep_id).or_default().entry(dom).or_insert(0) += n;
+                    }
+                }
+                let top3 = |m: Option<&HashMap<String, i64>>| -> Vec<String> {
+                    let mut v: Vec<(&String, &i64)> =
+                        m.map(|m| m.iter().collect()).unwrap_or_default();
+                    v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                    v.into_iter().take(3).map(|(k, _)| k.clone()).collect()
+                };
+                for ep in &mut episodes {
+                    let id = ep.get("id").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    ep["top_apps"] = json!(top3(app_counts.get(&id)));
+                    ep["top_domains"] = json!(top3(dom_counts.get(&id)));
+                }
+            }
+
             // episode_count is part of the debugger contract: the Episodes tab
-            // header renders `${data.episode_count} episodes` (the local
-            // heuristic endpoint provides it too — omitting it renders
-            // "undefined episodes").
+            // header renders `${data.episode_count} episodes`.
             Ok(json!({ "episode_count": episodes.len(), "episodes": episodes }))
         })
         .await
