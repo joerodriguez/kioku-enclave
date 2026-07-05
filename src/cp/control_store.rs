@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS query_log (
     result_count INTEGER,
     duration_ms INTEGER
 );
+CREATE TABLE IF NOT EXISTS config (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 struct BlobMeta {
@@ -197,38 +201,182 @@ impl ControlStore {
         Ok(())
     }
 
+    // ── Configuration / JWT secrets ─────────────────────────────────────────────
+
+    /// Load or generate the JWT signing secrets. Generates a random one on first boot
+    /// and persists it in the control DB's `config` table.
+    pub async fn get_or_generate_jwt_secrets(&self) -> Result<Vec<String>> {
+        self.write(|conn| {
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM config WHERE key = 'jwt_secret_current'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            let secrets = match current {
+                Some(curr) => {
+                    let mut list = vec![curr];
+                    let prev: Option<String> = conn
+                        .query_row(
+                            "SELECT value FROM config WHERE key = 'jwt_secret_previous'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if let Some(p) = prev {
+                        list.push(p);
+                    }
+                    list
+                }
+                None => {
+                    let new_secret = super::tokens::random_token_hex();
+                    conn.execute(
+                        "INSERT INTO config (key, value) VALUES ('jwt_secret_current', ?1)",
+                        [&new_secret],
+                    )?;
+                    vec![new_secret]
+                }
+            };
+            Ok(secrets)
+        })
+        .await
+    }
+
+    /// Rotate the JWT signing secret: current moves to previous, and a new one is generated.
+    #[allow(dead_code)]
+    pub async fn rotate_jwt_secret(&self) -> Result<Vec<String>> {
+        self.write(|conn| {
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM config WHERE key = 'jwt_secret_current'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            let new_secret = super::tokens::random_token_hex();
+            if let Some(curr) = current {
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (key, value) VALUES ('jwt_secret_previous', ?1)",
+                    [&curr],
+                )?;
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES ('jwt_secret_current', ?1)",
+                [&new_secret],
+            )?;
+
+            let mut list = vec![new_secret];
+            if let Some(curr) = conn
+                .query_row(
+                    "SELECT value FROM config WHERE key = 'jwt_secret_previous'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?
+            {
+                list.push(curr);
+            }
+            Ok(list)
+        })
+        .await
+    }
+
     // ── Identity ────────────────────────────────────────────────────────────────
 
     /// Upsert a user by `google_sub`; returns id + email.
     pub async fn upsert_user(&self, google_sub: &str, email: &str) -> Result<User> {
         let google_sub = google_sub.to_string();
         let email = email.to_string();
-        self.write(move |conn| {
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM users WHERE google_sub = ?1",
-                    [&google_sub],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let id = match existing {
-                Some(id) => {
-                    conn.execute(
-                        "UPDATE users SET email = ?1 WHERE google_sub = ?2",
-                        rusqlite::params![email, google_sub],
-                    )?;
-                    id
+        let stable_id = super::tokens::derive_stable_uuid(&google_sub);
+
+        // 1. Check if user already exists
+        let existing = self
+            .read({
+                let google_sub = google_sub.clone();
+                move |conn| {
+                    Ok(conn
+                        .query_row(
+                            "SELECT id FROM users WHERE google_sub = ?1",
+                            [&google_sub],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?)
                 }
-                None => {
-                    let id = super::tokens::new_uuid();
+            })
+            .await?;
+
+        // 2. If exists and has old ID, perform GCS rename before updating database
+        if let Some(ref old_id) = existing {
+            if old_id != &stable_id {
+                let old_gcs = format!("indexes/{old_id}.db.enc");
+                let new_gcs = format!("indexes/{stable_id}.db.enc");
+                info!(
+                    old_id = %old_id,
+                    stable_id = %stable_id,
+                    "renaming GCS index blob to stable ID"
+                );
+                match self.gcs.rename_object(&old_gcs, &new_gcs).await {
+                    Ok(_) => {}
+                    Err(EnclaveError::NotFound) => {
+                        info!("no existing GCS index blob found, skipping GCS rename");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // 3. Perform database transaction to insert or update user ID
+        let existing_cloned = existing.clone();
+        self.write(move |conn| {
+            conn.execute("BEGIN TRANSACTION", [])?;
+            let res = (|| -> Result<()> {
+                if let Some(ref old_id) = existing_cloned {
+                    if old_id != &stable_id {
+                        conn.execute(
+                            "UPDATE users SET id = ?1, email = ?2 WHERE google_sub = ?3",
+                            rusqlite::params![stable_id, email, google_sub],
+                        )?;
+                        conn.execute(
+                            "UPDATE usage_daily SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE refresh_tokens SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE query_log SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                    } else {
+                        conn.execute(
+                            "UPDATE users SET email = ?1 WHERE google_sub = ?2",
+                            rusqlite::params![email, google_sub],
+                        )?;
+                    }
+                } else {
                     conn.execute(
                         "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![id, google_sub, email],
+                        rusqlite::params![stable_id, google_sub, email],
                     )?;
-                    id
                 }
-            };
-            Ok(User { id, email })
+                Ok(())
+            })();
+
+            if res.is_ok() {
+                conn.execute("COMMIT", [])?;
+            } else {
+                let _ = conn.execute("ROLLBACK", []);
+            }
+            res?;
+
+            Ok(User {
+                id: stable_id,
+                email,
+            })
         })
         .await
     }

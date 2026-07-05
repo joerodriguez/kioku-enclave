@@ -33,6 +33,18 @@ hyper = { version = "1.10", default-features = false, features = ["server", "htt
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 sha2 = "0.10"
 
+# ACME (RFC 8555) client for in-enclave TLS certificate issuance/renewal
+# (ADR-0003): the enclave answers HTTP-01 itself and generates the key inside
+# the TEE. default-features OFF is load-bearing: the crate's default HTTP
+# client verifies TLS via the *platform* certificate store, which does not
+# exist in the FROM-scratch image — src/acme.rs plugs in our reqwest
+# (webpki-roots) client instead. "ring" (never aws-lc) keeps the musl build
+# pure-Rust and transitively enables rcgen/ring for in-enclave key+CSR
+# generation (Order::finalize). bytes is needed for the HttpClient adapter.
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring"] }
+bytes = "1"
+http-body = "1"
+
 # SQLite, bundled so the binary carries its own libsqlite3 with FTS5 compiled in.
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 
@@ -76,6 +88,12 @@ tempfile = "3.20.0"
 # PANICS at signature-verify time ("Could not determine CryptoProvider"), which
 # crashed the enclave on every real ID token. "rsa" alone is NOT a provider.
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
+
+# Self-signed certificate generation at boot for RA-TLS (ADR-0001).
+# Pinned to the same version instant-acme's ACME path uses (ADR-0003) so the
+# auditable binary carries exactly one rcgen; default-features off to skip the
+# aws_lc_rs default and stay on ring.
+rcgen = { version = "0.14.2", default-features = false, features = ["pem", "ring"] }
 
 # URL-form encoding for STS token exchange (RFC 8693 form body).
 # Already an indirect dep via reqwest but we need it directly for tests.

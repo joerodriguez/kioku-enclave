@@ -106,7 +106,7 @@ impl AttestationCredentials {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     async fn fetch_fresh_token(&self) -> Result<CachedToken> {
-        let attestation_jwt = fetch_attestation_token(&self.sts_audience).await?;
+        let attestation_jwt = fetch_attestation_token(&self.sts_audience, None).await?;
         let (access_token, expires_in_secs) =
             exchange_at_sts(&self.http, &attestation_jwt, &self.sts_audience).await?;
 
@@ -121,6 +121,36 @@ impl AttestationCredentials {
     }
 }
 
+/// A cache for the Confidential Space OIDC attestation token.
+/// Fetches on demand and caches for up to 5 minutes to avoid overloading the launcher.
+pub struct AttestationCache {
+    sts_audience: String,
+    cached: Mutex<Option<(String, Instant)>>,
+}
+
+impl AttestationCache {
+    pub fn new(sts_audience: String) -> Self {
+        Self {
+            sts_audience,
+            cached: Mutex::new(None),
+        }
+    }
+
+    pub async fn get_token(&self, nonce: &str) -> Result<String> {
+        let mut guard = self.cached.lock().await;
+        if let Some((ref token, expiry)) = *guard {
+            if Instant::now() < expiry {
+                return Ok(token.clone());
+            }
+        }
+        // Fetch fresh
+        let token = fetch_attestation_token(&self.sts_audience, Some(nonce)).await?;
+        let expiry = Instant::now() + Duration::from_secs(300); // 5-minute TTL cache
+        *guard = Some((token.clone(), expiry));
+        Ok(token)
+    }
+}
+
 // ── Step 1: fetch attestation OIDC token from launcher ───────────────────────
 
 /// Fetch a Confidential Space OIDC token from the launcher's unix socket.
@@ -130,8 +160,15 @@ impl AttestationCredentials {
 /// and read the full response body.
 ///
 /// Expected response: a JSON-quoted string, e.g. `"eyJ…"` (the raw JWT).
-async fn fetch_attestation_token(audience: &str) -> Result<String> {
-    let request_body = serde_json::json!({"audience": audience, "token_type": "OIDC"}).to_string();
+pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Result<String> {
+    let mut body_json = serde_json::json!({
+        "audience": audience,
+        "token_type": "OIDC",
+    });
+    if let Some(n) = nonce {
+        body_json["nonce"] = serde_json::json!(n);
+    }
+    let request_body = body_json.to_string();
 
     let request = format!(
         "POST /v1/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

@@ -7,8 +7,9 @@ Plaintext exists only here (and SEV tmpfs), never on disk.
 
 | File | Role |
 |---|---|
-| `main.rs` | Entry point; wires the legacy `/v1/*` data-plane routes **and** the `cp` control-plane routes; `serve_tls` accept loop when TLS is on; `dump_user_export` |
-| `tls.rs` | **In-enclave TLS termination (ADR-0001).** Loads a deploy-provided cert/key, builds a rustls config (ring), computes the cert SHA-256 fingerprint (RA-TLS channel-binding value). Gated by `ENCLAVE_TLS` |
+| `main.rs` | Entry point; wires the legacy `/v1/*` data-plane routes **and** the `cp` control-plane routes; `serve_tls` accept loop when TLS is on; spawns the ACME :80 listener + renewal loop; `dump_user_export` |
+| `tls.rs` | **In-enclave TLS termination (ADR-0001).** Parses cert/key PEM (`CertKeyPair`), builds a rustls config (ring) with a **swappable cert resolver** so renewals hot-swap live (`TlsKeystone::swap`), computes the cert SHA-256 fingerprint (RA-TLS channel-binding value). Env-cert path gated by `ENCLAVE_TLS` |
+| `acme.rs` | **ACME auto-renewal (ADR-0003).** Gated by `ENCLAVE_ACME`: answers Let's Encrypt HTTP-01 on :80, generates the TLS key in-TEE (instant-acme/rcgen, ring), persists account+cert+key AES-encrypted in GCS under a KMS-wrapped DEK (`acme/tls.json.enc`), renews at 60 d and swaps via `tls.rs`. The TLS key never exists outside the TEE in plaintext |
 | [`cp/`](cp/map.md) | **Control plane (ADR-0001):** OAuth/DCR, sync, account, MCP + REST, quotas, summarizer, identity control store. Replaces the deleted Node `cloud/` |
 | `attestation.rs` | Confidential Space attestation: VM OIDC token, KMS-gated key release |
 | `auth.rs` | Legacy caller auth — verifies the control-plane SA ID token for the `/v1/*` routes |

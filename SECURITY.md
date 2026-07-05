@@ -104,6 +104,9 @@ it is used to derive the decrypted database's temp-file path or the GCS object
 name, so a compromised control plane cannot use path metacharacters to steer
 plaintext to an attacker-chosen location.
 
+**User ID linkability (stable user-id derivation):** User IDs are derived deterministically from their Google Subject ID (`google_sub`) using a UUIDv5 pattern (with SHA-256). While this prevents data loss across control DB resets, it makes GCS index object names (`indexes/{user_id}.db.enc`) linkable to a Google account for anyone who already knows the user's `google_sub`. This is an accepted design trade-off for single-user deployment.
+
+
 ### T3 — GCS compromise
 
 **Threat:** Attacker reads GCS bucket contents.

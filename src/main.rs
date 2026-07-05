@@ -30,6 +30,12 @@
 //! step binds into the attestation token (RA-TLS). See
 //! `docs/adr/0001-enclave-as-sole-backend.md` in the monorepo.
 //!
+//! **ACME auto-renewal (ADR-0003):** when `ENCLAVE_ACME` is set, the enclave
+//! obtains and renews that certificate itself from Let's Encrypt — HTTP-01
+//! answered on :80, key generated in-TEE, state persisted KMS-encrypted in GCS,
+//! live cert hot-swapped on renewal. See `acme.rs`. `ENCLAVE_TLS_*` env certs
+//! then serve only as a bootstrap fallback while issuance retries.
+//!
 //! ## Routes
 //!
 //! | Method | Path                       | Description                                  |
@@ -62,6 +68,7 @@ use serde_json::json;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod acme;
 mod attestation;
 mod auth;
 mod cp;
@@ -91,6 +98,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// JWKS verifier for Google ID tokens — the only authentication path.
     id_token_verifier: Arc<auth::IdTokenVerifier>,
+    pub attestation_cache: Option<Arc<attestation::AttestationCache>>,
+    pub cert_fingerprint: Option<String>,
 }
 
 /// In-process full export of a user's index as JSON (utterances, screenshots,
@@ -246,6 +255,37 @@ async fn handle_health() -> Json<serde_json::Value> {
     Json(json!({"ok": true, "service": "kioku-enclave"}))
 }
 
+// ── Attestation handler ───────────────────────────────────────────────────────
+
+async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match (&state.attestation_cache, &state.cert_fingerprint) {
+        (Some(cache), Some(fingerprint)) => match cache.get_token(fingerprint).await {
+            Ok(token) => (
+                StatusCode::OK,
+                Json(json!({
+                    "token": token,
+                    "fingerprint": fingerprint,
+                })),
+            ),
+            Err(e) => {
+                warn!(error = %e, "failed to fetch attestation token on demand");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!("failed to fetch attestation token: {e}")
+                    })),
+                )
+            }
+        },
+        _ => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "attestation not available (enclave not running in TEE or TLS disabled)"
+            })),
+        ),
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -285,7 +325,10 @@ async fn main() {
         }
     });
 
-    let id_token_verifier = Arc::new(auth::IdTokenVerifier::new(enclave_audience, run_sa_email));
+    let id_token_verifier = Arc::new(auth::IdTokenVerifier::new(
+        enclave_audience.clone(),
+        run_sa_email,
+    ));
 
     // ── KMS + GCS ─────────────────────────────────────────────────────────────
 
@@ -298,13 +341,131 @@ async fn main() {
 
     let store = Arc::new(Store::new(Arc::clone(&kms), Arc::clone(&gcs)));
 
+    // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
+    // control store consumes the originals.
+    let acme_kms = Arc::clone(&kms);
+    let acme_gcs = Arc::clone(&gcs);
+
+    // ── In-enclave control plane (ADR-0001): OAuth, sync, account, MCP. ─────────
+    let control_store = Arc::new(cp::control_store::ControlStore::new(kms, gcs));
+
+    let (jwt_secrets, google_web_client_secret) = if std::env::var("ENCLAVE_TEST_MODE").is_ok() {
+        let jwt_secret =
+            std::env::var("JWT_SECRET").unwrap_or_else(|_| "test-jwt-secret".to_string());
+        let mut secrets = vec![jwt_secret];
+        if let Ok(prev) = std::env::var("JWT_SECRET_PREVIOUS") {
+            if !prev.is_empty() {
+                secrets.push(prev);
+            }
+        }
+        (
+            secrets,
+            std::env::var("GOOGLE_WEB_CLIENT_SECRET").unwrap_or_default(),
+        )
+    } else {
+        info!("fetching runtime configuration from Secret Manager");
+        let client_secret =
+            cp::fetch_secret_from_manager("kioku-google-web-client-secret", "latest")
+                .await
+                .unwrap_or_else(|e| panic!("Failed to fetch web client secret: {}", e));
+
+        let jwt_secrets = control_store
+            .get_or_generate_jwt_secrets()
+            .await
+            .unwrap_or_else(|e| panic!("Failed to load/generate JWT secrets: {}", e));
+
+        (jwt_secrets, client_secret)
+    };
+
+    let cp_config = Arc::new(
+        cp::CpConfig::from_env(jwt_secrets, google_web_client_secret)
+            .expect("control-plane config"),
+    );
+
+    // ── TLS & Attestation setup ───────────────────────────────────────────────
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind failed");
+
+    let acme_opt = acme::AcmeConfig::from_env().expect("ACME config");
+    let (keystone, cert_fingerprint) = match acme_opt {
+        Some(acme_config) => {
+            // ADR-0003: in-enclave ACME. The :80 HTTP-01 listener must be up
+            // before any issuance attempt (Let's Encrypt validates against it).
+            let challenges = Arc::new(acme::ChallengeMap::default());
+            let http_addr = SocketAddr::from(([0, 0, 0, 0], acme_config.http_port));
+            let http_listener = tokio::net::TcpListener::bind(http_addr)
+                .await
+                .expect("bind ACME HTTP-01 port failed");
+            info!(addr = %http_addr, "ACME HTTP-01 challenge listener up");
+            let challenge_app = acme::challenge_router(Arc::clone(&challenges));
+            tokio::spawn(async move {
+                axum::serve(http_listener, challenge_app)
+                    .await
+                    .expect("ACME HTTP-01 server error");
+            });
+
+            let renewer = Arc::new(acme::Renewer::new(
+                acme_config,
+                acme_kms,
+                acme_gcs,
+                challenges,
+            ));
+            let ks = Arc::new(
+                acme_boot_keystone(&renewer, &cp_config.base_url, &enclave_audience).await,
+            );
+            Arc::clone(&renewer).spawn(Arc::clone(&ks));
+            let fp = ks.cert_fingerprint_hex.clone();
+            (Some(ks), Some(fp))
+        }
+        None => match tls::from_env(&cp_config.base_url, &enclave_audience)
+            .await
+            .expect("TLS config")
+        {
+            Some(ks) => {
+                let fp = ks.cert_fingerprint_hex.clone();
+                (Some(Arc::new(ks)), Some(fp))
+            }
+            None => (None, None),
+        },
+    };
+
+    let attestation_cache = cert_fingerprint.as_ref().map(|_| {
+        Arc::new(attestation::AttestationCache::new(
+            std::env::var("ATTEST_STS_AUDIENCE").unwrap_or_default(),
+        ))
+    });
+
     let state = Arc::new(AppState {
         store: Arc::clone(&store),
         id_token_verifier,
+        attestation_cache: attestation_cache.clone(),
+        cert_fingerprint: cert_fingerprint.clone(),
     });
 
-    // ── Legacy data-plane routes (SA-ID-token authed). Kept for compatibility;
-    // the live path now uses the in-enclave control plane below (ADR-0001).
+    let cp_state = Arc::new(cp::CpState {
+        store: Arc::clone(&store),
+        control: control_store,
+        user_verifier: Arc::new(cp::auth::UserIdTokenVerifier::new(
+            cp_config.user_audiences(),
+        )),
+        sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
+        mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
+        config: cp_config,
+        attestation_cache,
+        cert_fingerprint,
+    });
+
+    // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
+    cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
+
+    // ── Legacy data-plane routes ──────────────────────────────────────────────
     let authenticated = Router::new()
         .route("/v1/ingest", post(handle_ingest))
         .route("/v1/search", post(handle_search))
@@ -326,22 +487,6 @@ async fn main() {
         ))
         .with_state(Arc::clone(&state));
 
-    // ── In-enclave control plane (ADR-0001): OAuth, sync, account, MCP. ─────────
-    let cp_config = Arc::new(cp::CpConfig::from_env().expect("control-plane config"));
-    let cp_state = Arc::new(cp::CpState {
-        store: Arc::clone(&store),
-        control: Arc::new(cp::control_store::ControlStore::new(kms, gcs)),
-        user_verifier: Arc::new(cp::auth::UserIdTokenVerifier::new(
-            cp_config.user_audiences(),
-        )),
-        sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
-        mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
-        config: cp_config,
-    });
-
-    // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
-    cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
-
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
     let cp_authed =
         cp::sync::router()
@@ -356,31 +501,57 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/v1/attestation", get(handle_attestation))
         .merge(authenticated)
-        .merge(control_plane);
+        .merge(control_plane)
+        .with_state(Arc::clone(&state));
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("bind failed");
-
-    // ADR-0001: when ENCLAVE_TLS is set, terminate TLS inside the enclave so the attested
-    // binary is the first code to see plaintext. Otherwise serve plain HTTP behind the
-    // VPC firewall (the existing default).
-    match tls::from_env().expect("TLS config") {
-        Some(keystone) => {
+    // Listen
+    match keystone {
+        Some(ks) => {
             info!(addr = %addr, tls = true, "listening (in-enclave TLS termination)");
-            serve_tls(listener, app, keystone).await;
+            serve_tls(listener, app, ks).await;
         }
         None => {
             info!(addr = %addr, tls = false, "listening (plain HTTP behind VPC firewall)");
             axum::serve(listener, app).await.expect("server error");
+        }
+    }
+}
+
+/// Get a serving-ready keystone at boot in ACME mode (ADR-0003), in order of
+/// preference: persisted/fresh ACME cert → baked `ENCLAVE_TLS_*` fallback cert
+/// (the renewal cron then replaces it) → keep retrying issuance. The enclave
+/// never gives up: with no cert there is nothing useful to serve anyway.
+async fn acme_boot_keystone(
+    renewer: &acme::Renewer,
+    base_url: &str,
+    enclave_audience: &str,
+) -> tls::TlsKeystone {
+    let first_err = match renewer.initial_pair().await {
+        Ok(pair) => match tls::TlsKeystone::new(pair) {
+            Ok(keystone) => return keystone,
+            Err(e) => e,
+        },
+        Err(e) => e,
+    };
+    tracing::error!(error = %first_err, "boot ACME issuance failed");
+
+    if let Ok(Some(keystone)) = tls::from_env(base_url, enclave_audience).await {
+        warn!("serving baked fallback certificate; ACME renewal will keep retrying");
+        return keystone;
+    }
+
+    let mut attempt = 1u32;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        attempt += 1;
+        match renewer.initial_pair().await {
+            Ok(pair) => match tls::TlsKeystone::new(pair) {
+                Ok(keystone) => return keystone,
+                Err(e) => tracing::error!(error = %e, attempt, "ACME cert unusable"),
+            },
+            Err(e) => tracing::error!(error = %e, attempt, "boot ACME issuance retry failed"),
         }
     }
 }
@@ -391,13 +562,17 @@ async fn main() {
 /// the rustls handshake, then hand the connection to hyper with the axum router wrapped as
 /// a hyper service. One task per connection; a handshake or connection error drops only
 /// that connection.
-async fn serve_tls(listener: tokio::net::TcpListener, app: Router, keystone: tls::TlsKeystone) {
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    keystone: Arc<tls::TlsKeystone>,
+) {
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
     use hyper_util::service::TowerToHyperService;
     use tokio_rustls::TlsAcceptor;
 
-    let acceptor = TlsAcceptor::from(keystone.server_config);
+    let acceptor = TlsAcceptor::from(Arc::clone(&keystone.server_config));
 
     loop {
         let (tcp, _peer) = match listener.accept().await {

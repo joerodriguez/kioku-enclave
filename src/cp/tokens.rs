@@ -70,6 +70,29 @@ pub fn new_uuid() -> String {
     )
 }
 
+/// Derive a stable, deterministic UUIDv5-like string from google_sub using SHA-256.
+/// This prevents orphaning user index GCS blobs on control DB resets.
+pub fn derive_stable_uuid(google_sub: &str) -> String {
+    // Fixed namespace UUID for Kioku user IDs (randomly generated once)
+    const NAMESPACE_KIOKU_USER: [u8; 16] = [
+        0xa7, 0x4f, 0x6e, 0x9c, 0xc4, 0x76, 0x4b, 0x8f, 0x83, 0x8e, 0x92, 0xd3, 0xf6, 0x04, 0x2e,
+        0x9a,
+    ];
+    let mut hasher = Sha256::new();
+    hasher.update(NAMESPACE_KIOKU_USER);
+    hasher.update(google_sub.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    b[6] = (b[6] & 0x0f) | 0x50; // version 5 (name-based)
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 1
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
 // ── Access token (our own HS256 JWT) ────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -264,5 +287,26 @@ mod tests {
         let u = new_uuid();
         assert_eq!(u.len(), 36);
         assert_eq!(u.as_bytes()[14], b'4'); // version nibble
+    }
+
+    #[test]
+    fn derive_stable_uuid_determinism_and_shape() {
+        let sub = "12345678901234567890";
+        let u1 = derive_stable_uuid(sub);
+        let u2 = derive_stable_uuid(sub);
+        assert_eq!(u1, u2, "must be deterministic");
+
+        assert_eq!(u1.len(), 36);
+        assert_eq!(u1.as_bytes()[14], b'5', "must be version 5");
+        assert!(
+            u1.as_bytes()[19] == b'8'
+                || u1.as_bytes()[19] == b'9'
+                || u1.as_bytes()[19] == b'a'
+                || u1.as_bytes()[19] == b'b',
+            "must be variant 1 (8, 9, a, b)"
+        );
+
+        let u3 = derive_stable_uuid("different_sub");
+        assert_ne!(u1, u3);
     }
 }

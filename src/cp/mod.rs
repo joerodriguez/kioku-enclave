@@ -21,7 +21,9 @@ pub mod sync;
 pub mod tokens;
 pub mod vertex;
 
+use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::store::Store;
 
@@ -52,22 +54,10 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 impl CpConfig {
-    pub fn from_env() -> crate::error::Result<Self> {
-        let test_mode = std::env::var("ENCLAVE_TEST_MODE").is_ok();
-        let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
-            if test_mode {
-                "test-jwt-secret".to_string()
-            } else {
-                panic!("JWT_SECRET must be set")
-            }
-        });
-        let mut jwt_secrets = vec![jwt_secret];
-        if let Ok(prev) = std::env::var("JWT_SECRET_PREVIOUS") {
-            if !prev.is_empty() {
-                jwt_secrets.push(prev);
-            }
-        }
-
+    pub fn from_env(
+        jwt_secrets: Vec<String>,
+        google_web_client_secret: String,
+    ) -> crate::error::Result<Self> {
         let allowed_emails = std::env::var("ALLOWED_EMAILS").ok().and_then(|raw| {
             let list: Vec<String> = raw
                 .split(',')
@@ -95,7 +85,7 @@ impl CpConfig {
             jwt_secrets,
             google_desktop_client_id: env_or("GOOGLE_DESKTOP_CLIENT_ID", ""),
             google_web_client_id: env_or("GOOGLE_WEB_CLIENT_ID", ""),
-            google_web_client_secret: env_or("GOOGLE_WEB_CLIENT_SECRET", ""),
+            google_web_client_secret,
             allowed_emails,
             scheduler_sa_email: std::env::var("SCHEDULER_SA_EMAIL")
                 .ok()
@@ -137,4 +127,111 @@ pub struct CpState {
     pub user_verifier: Arc<auth::UserIdTokenVerifier>,
     pub sync_limiter: limits::RateLimiter,
     pub mcp_limiter: limits::RateLimiter,
+    pub attestation_cache: Option<Arc<crate::attestation::AttestationCache>>,
+    pub cert_fingerprint: Option<String>,
+}
+
+/// Helper to fetch a secret from GCP Secret Manager at runtime, using the GCE metadata server token.
+/// Retries with exponential backoff on failure to handle startup network flakes.
+pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result<String, String> {
+    let http = reqwest::Client::new();
+    let project = std::env::var("KMS_PROJECT").map_err(|_| {
+        "KMS_PROJECT environment variable must be set to locate GCP secrets".to_string()
+    })?;
+
+    // Try fetching the metadata server token with retry/backoff
+    let mut token = None;
+    let mut backoff = Duration::from_millis(100);
+    for attempt in 1..=5 {
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+        }
+        match http
+            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if let Ok(tok_resp) = resp.error_for_status() {
+                    if let Ok(parsed) = tok_resp.json::<TokenResponse>().await {
+                        token = Some(parsed.access_token);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Metadata token fetch attempt {} failed: {}", attempt, e);
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff *= 2;
+    }
+
+    let token = token.ok_or_else(|| {
+        "Failed to fetch VM service account metadata token after retries".to_string()
+    })?;
+
+    // Try fetching the secret from Secret Manager with retry/backoff
+    let url = format!(
+        "https://secretmanager.googleapis.com/v1/projects/{}/secrets/{}/versions/{}:access",
+        project, secret_id, version
+    );
+
+    #[derive(Deserialize)]
+    struct SecretPayload {
+        data: String,
+    }
+    #[derive(Deserialize)]
+    struct SecretAccessResponse {
+        payload: SecretPayload,
+    }
+
+    let mut secret_data = None;
+    let mut backoff = Duration::from_millis(100);
+    for attempt in 1..=5 {
+        match http.get(&url).bearer_auth(&token).send().await {
+            Ok(resp) => {
+                if let Ok(sec_resp) = resp.error_for_status() {
+                    if let Ok(parsed) = sec_resp.json::<SecretAccessResponse>().await {
+                        secret_data = Some(parsed.payload.data);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Secret Manager fetch attempt {} for {} failed: {}",
+                    attempt,
+                    secret_id,
+                    e
+                );
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff *= 2;
+    }
+
+    let raw_b64 = secret_data.ok_or_else(|| {
+        format!(
+            "Failed to fetch secret {} from Secret Manager after retries",
+            secret_id
+        )
+    })?;
+
+    use base64::Engine as _;
+    let decoded_bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw_b64.trim())
+        .map_err(|e| {
+            format!(
+                "Failed to decode base64 payload for secret {}: {}",
+                secret_id, e
+            )
+        })?;
+
+    let decoded_str = String::from_utf8(decoded_bytes)
+        .map_err(|e| format!("Secret {} payload is not valid UTF-8: {}", secret_id, e))?;
+
+    Ok(decoded_str)
 }

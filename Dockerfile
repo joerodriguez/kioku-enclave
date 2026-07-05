@@ -162,36 +162,39 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
 #
 # The enclave is now the whole backend (OAuth/sync/MCP/summarizer + TLS). These
 # are security-relevant (JWT signing, the trusted OAuth audiences, the public
-# base URL that is the access-token issuer, the in-enclave TLS keypair) so they
-# are baked, not operator-overridable — same rationale as the KMS config above.
+# base URL that is the access-token issuer) so they are baked, not
+# operator-overridable — same rationale as the KMS config above.
 # Single-user note: secrets baked into a private-AR image are acceptable here and
 # satisfy ROADMAP Phase 7 gap #1 (caller creds pinned in-image, not injectable).
-ARG JWT_SECRET
-ARG JWT_SECRET_PREVIOUS
+#
+# TLS (ADR-0003): the certificate is NOT baked. ENCLAVE_ACME=1 makes the enclave
+# obtain + renew it from Let's Encrypt itself (HTTP-01 on :80), generating the
+# private key inside the TEE and persisting it only KMS-encrypted in GCS. This
+# keeps the TLS key out of the container env — Confidential Space publishes the
+# env in the attestation token (serial console / Cloud Logging), which is how
+# the old baked ENCLAVE_TLS_*_PEM_B64 args leaked the key to operator-visible
+# logs. Those env vars remain honored at runtime only as a bootstrap fallback
+# and for local testing; do not reintroduce them as build args.
 ARG GOOGLE_DESKTOP_CLIENT_ID
 ARG GOOGLE_WEB_CLIENT_ID
-ARG GOOGLE_WEB_CLIENT_SECRET
 ARG ALLOWED_EMAILS
 ARG BASE_URL
 ARG VERTEX_PROJECT
 ARG VERTEX_LOCATION
 ARG VERTEX_MODEL
-ARG ENCLAVE_TLS
-ARG ENCLAVE_TLS_CERT_PEM_B64
-ARG ENCLAVE_TLS_KEY_PEM_B64
-ENV JWT_SECRET=${JWT_SECRET} \
-    JWT_SECRET_PREVIOUS=${JWT_SECRET_PREVIOUS} \
-    GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
+ARG ENCLAVE_ACME
+ARG ENCLAVE_ACME_DIRECTORY
+ARG ENCLAVE_ACME_CONTACT
+ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     GOOGLE_WEB_CLIENT_ID=${GOOGLE_WEB_CLIENT_ID} \
-    GOOGLE_WEB_CLIENT_SECRET=${GOOGLE_WEB_CLIENT_SECRET} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
     BASE_URL=${BASE_URL} \
     VERTEX_PROJECT=${VERTEX_PROJECT} \
     VERTEX_LOCATION=${VERTEX_LOCATION} \
     VERTEX_MODEL=${VERTEX_MODEL} \
-    ENCLAVE_TLS=${ENCLAVE_TLS} \
-    ENCLAVE_TLS_CERT_PEM_B64=${ENCLAVE_TLS_CERT_PEM_B64} \
-    ENCLAVE_TLS_KEY_PEM_B64=${ENCLAVE_TLS_KEY_PEM_B64}
+    ENCLAVE_ACME=${ENCLAVE_ACME} \
+    ENCLAVE_ACME_DIRECTORY=${ENCLAVE_ACME_DIRECTORY} \
+    ENCLAVE_ACME_CONTACT=${ENCLAVE_ACME_CONTACT}
 
 # ── Security flags — hardcoded, not operator-supplied ─────────────────────────
 #
@@ -216,9 +219,11 @@ COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/kioku-enclav
 # Confidential Space publishes ONLY the EXPOSEd container ports to the host
 # (observed: the launcher logs "Exposed Ports: map[...]" and forwards just those).
 # The enclave now terminates TLS on 443 (ADR-0001), so 443 MUST be exposed or the
-# port is unreachable from the VM's external interface. 8080 kept for the legacy
-# VPC-internal path.
+# port is unreachable from the VM's external interface. 80 is the ACME HTTP-01
+# challenge listener (ADR-0003) — without it Let's Encrypt cannot validate and
+# issuance/renewal fails. 8080 kept for the legacy VPC-internal path.
 EXPOSE 443
+EXPOSE 80
 EXPOSE 8080
 
 ENTRYPOINT ["/kioku-enclave"]

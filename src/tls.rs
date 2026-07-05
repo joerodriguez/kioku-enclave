@@ -9,8 +9,8 @@
 //!
 //! ## What this module does today (ADR step A)
 //!
-//! - Loads a **deploy-provided** cert + key (base64-encoded DER, via env). Using DER
-//!   avoids pulling a PEM parser and keeps the dependency set minimal.
+//! - Loads a **deploy-provided** cert chain + key (base64-encoded PEM, via env), parsed
+//!   with the minimal in-house PEM-block scanner below (no `rustls-pemfile` dependency).
 //! - Builds a rustls [`ServerConfig`] using the ring provider (pure-Rust-friendly, no
 //!   OpenSSL — required for the musl FROM-scratch image).
 //! - Computes the leaf certificate's **SHA-256 fingerprint**. This is the channel-binding
@@ -18,32 +18,135 @@
 //!   binds this fingerprint into the Confidential Space attestation token, so a client
 //!   can verify "the TLS key I'm talking to belongs to the attested image" (RA-TLS).
 //!
+//! ## ACME renewal (ADR-0003)
+//!
+//! The live deployment no longer bakes a cert: [`crate::acme`] obtains and renews it
+//! from Let's Encrypt with the private key generated **inside** the enclave, and swaps
+//! it into the running server via [`TlsKeystone::swap`] (a swappable rustls cert
+//! resolver — no restart). The env-var path below remains as the static/bootstrap
+//! fallback and for local testing.
+//!
 //! ## What this module does NOT do yet
 //!
-//! - It does not *generate* the keypair in-enclave (needs a vetted cert-gen dep under the
-//!   musl/pure-Rust constraint — ADR step C). Until then the cert is supplied at deploy
-//!   time, which already moves TLS termination into the attested binary.
 //! - It does not put the fingerprint into the attestation token (ADR step C) or have the
-//!   client verify it (ADR step D).
+//!   client verify it (ADR step D). Note the ACME path already satisfies step C's key
+//!   precondition: the key is generated in-TEE and never exists in operator-visible form.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::{
     crypto::ring,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
     ServerConfig,
 };
 use tracing::info;
 
 use crate::error::{EnclaveError as Error, Result};
 
+/// A parsed certificate chain (leaf first) + private key, the unit the keystone
+/// serves and the ACME renewal path swaps in (ADR-0003).
+pub struct CertKeyPair {
+    chain_der: Vec<Vec<u8>>,
+    key: PrivateKeyDer<'static>,
+}
+
+impl CertKeyPair {
+    /// Parse from PEM text: a `CERTIFICATE` chain (leaf first — e.g. Let's Encrypt
+    /// `fullchain.pem`) and a `PRIVATE KEY` (PKCS#8 / PKCS#1 / SEC1).
+    pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
+        let chain = parse_pem_blocks(cert_pem, "CERTIFICATE");
+        if chain.is_empty() {
+            return Err(Error::Config(
+                "cert PEM contains no CERTIFICATE blocks".into(),
+            ));
+        }
+        let key = parse_pem_private_key(key_pem)
+            .ok_or_else(|| Error::Config("key PEM contains no usable PRIVATE KEY block".into()))?;
+        Ok(Self {
+            chain_der: chain,
+            key,
+        })
+    }
+
+    /// Lowercase hex SHA-256 of the leaf certificate DER (the RA-TLS channel-binding value).
+    pub fn fingerprint_hex(&self) -> String {
+        hex_lower(&Sha256::digest(&self.chain_der[0]))
+    }
+
+    /// Build the rustls [`CertifiedKey`] (validates the key is usable by ring).
+    fn into_certified_key(self) -> Result<CertifiedKey> {
+        let signing_key = ring::sign::any_supported_type(&self.key)
+            .map_err(|e| Error::Config(format!("unsupported TLS private key: {e}")))?;
+        let certs: Vec<CertificateDer<'static>> = self
+            .chain_der
+            .into_iter()
+            .map(CertificateDer::from)
+            .collect();
+        Ok(CertifiedKey::new(certs, signing_key))
+    }
+}
+
+/// Cert resolver whose [`CertifiedKey`] can be replaced at runtime, so an ACME
+/// renewal swaps the served certificate without dropping connections or
+/// restarting the accept loop. Handshakes read the current key atomically.
+#[derive(Debug)]
+struct SwappableCertResolver(RwLock<Arc<CertifiedKey>>);
+
+impl ResolvesServerCert for SwappableCertResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.read().expect("cert resolver lock poisoned").clone())
+    }
+}
+
 /// A built TLS server config plus the leaf cert fingerprint used for attestation binding.
 pub struct TlsKeystone {
     pub server_config: Arc<ServerConfig>,
-    /// Lowercase hex SHA-256 of the leaf certificate DER (the RA-TLS channel-binding value).
+    /// Lowercase hex SHA-256 of the leaf certificate DER (the RA-TLS channel-binding
+    /// value) as of the last build/swap.
     pub cert_fingerprint_hex: String,
+    resolver: Arc<SwappableCertResolver>,
+}
+
+impl TlsKeystone {
+    /// Build a keystone serving `pair`, with a resolver that supports live swaps.
+    pub fn new(pair: CertKeyPair) -> Result<Self> {
+        let fingerprint = pair.fingerprint_hex();
+        let resolver = Arc::new(SwappableCertResolver(RwLock::new(Arc::new(
+            pair.into_certified_key()?,
+        ))));
+
+        // Explicit ring provider so we never depend on a process-default being installed,
+        // and never link aws-lc / OpenSSL (musl FROM-scratch must stay pure-Rust-friendly).
+        let server_config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Config(format!("rustls provider/protocol setup failed: {e}")))?
+            .with_no_client_auth()
+            .with_cert_resolver(resolver.clone());
+
+        Ok(TlsKeystone {
+            server_config: Arc::new(server_config),
+            cert_fingerprint_hex: fingerprint,
+            resolver,
+        })
+    }
+
+    /// Replace the served certificate (ACME renewal). In-flight and future
+    /// handshakes atomically pick up the new chain. Returns the new leaf
+    /// fingerprint (logged by the caller — never key material).
+    pub fn swap(&self, pair: CertKeyPair) -> Result<String> {
+        let fingerprint = pair.fingerprint_hex();
+        let certified = Arc::new(pair.into_certified_key()?);
+        *self
+            .resolver
+            .0
+            .write()
+            .expect("cert resolver lock poisoned") = certified;
+        Ok(fingerprint)
+    }
 }
 
 /// Env var that gates in-enclave TLS termination. `1` / `true` (case-insensitive) → on.
@@ -62,42 +165,108 @@ fn is_enabled() -> bool {
     )
 }
 
+/// Generate a self-signed certificate and PKCS#8 key DER using rcgen.
+/// Extracts Subject Alternative Names (SANs) from the provided base URL and enclave audience.
+pub fn generate_self_signed(base_url: &str, enclave_audience: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut subject_alt_names = vec!["localhost".to_string()];
+
+    // Parse hosts from base_url
+    if let Ok(url) = reqwest::Url::parse(base_url) {
+        if let Some(host) = url.host_str() {
+            if host != "localhost" {
+                subject_alt_names.push(host.to_string());
+            }
+        }
+    }
+
+    // Parse hosts from enclave_audience
+    if let Ok(url) = reqwest::Url::parse(enclave_audience) {
+        if let Some(host) = url.host_str() {
+            if host != "localhost" && !subject_alt_names.contains(&host.to_string()) {
+                subject_alt_names.push(host.to_string());
+            }
+        }
+    }
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(subject_alt_names)
+            .map_err(|e| Error::Config(format!("Failed to generate self-signed cert: {e}")))?;
+
+    let cert_der = cert.der().to_vec();
+    let key_der = signing_key.serialize_der();
+
+    Ok((cert_der, key_der))
+}
+
 /// Returns `Ok(None)` when in-enclave TLS is not enabled (the default plain-HTTP path),
-/// or `Ok(Some(keystone))` when `ENCLAVE_TLS` is set and a cert/key are provided.
-pub fn from_env() -> Result<Option<TlsKeystone>> {
+/// or `Ok(Some(keystone))` when `ENCLAVE_TLS` is set.
+/// Loads certs from the environment variables (if provided), or fetches them from Secret Manager (if they are
+/// in Secret Manager), or dynamically generates a self-signed certificate at runtime.
+pub async fn from_env(base_url: &str, enclave_audience: &str) -> Result<Option<TlsKeystone>> {
     if !is_enabled() {
         return Ok(None);
     }
 
-    let cert_pem = decode_b64_env(ENV_CERT)?;
-    let key_pem = decode_b64_env(ENV_KEY)?;
+    // 1. Try environment variables first (legacy/custom cert path)
+    let cert_pair =
+        if let (Ok(cert_b64), Ok(key_b64)) = (std::env::var(ENV_CERT), std::env::var(ENV_KEY)) {
+            if !cert_b64.is_empty() && !key_b64.is_empty() {
+                let cert_pem = base64::engine::general_purpose::STANDARD
+                    .decode(cert_b64.trim())
+                    .map_err(|e| Error::Config(format!("{ENV_CERT} is not valid base64: {e}")))?;
+                let key_pem = base64::engine::general_purpose::STANDARD
+                    .decode(key_b64.trim())
+                    .map_err(|e| Error::Config(format!("{ENV_KEY} is not valid base64: {e}")))?;
+                Some(CertKeyPair::from_pem(&cert_pem, &key_pem)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-    let chain = parse_pem_blocks(&cert_pem, "CERTIFICATE");
-    if chain.is_empty() {
-        return Err(Error::Config(format!("{ENV_CERT} contains no CERTIFICATE blocks")));
-    }
-    let key = parse_pem_private_key(&key_pem)
-        .ok_or_else(|| Error::Config(format!("{ENV_KEY} contains no usable PRIVATE KEY block")))?;
+    let cert_pair = match cert_pair {
+        Some(pair) => pair,
+        None => {
+            // 2. Try fetching from Secret Manager (if KMS_PROJECT is set and we're not in test mode)
+            let fetched = if std::env::var("ENCLAVE_TEST_MODE").is_err()
+                && std::env::var("KMS_PROJECT").is_ok()
+            {
+                info!("attempting to fetch TLS cert/key from Secret Manager");
+                match (
+                    crate::cp::fetch_secret_from_manager("kioku-enclave-tls-cert", "latest").await,
+                    crate::cp::fetch_secret_from_manager("kioku-enclave-tls-key", "latest").await,
+                ) {
+                    (Ok(cert_str), Ok(key_str)) => {
+                        CertKeyPair::from_pem(cert_str.as_bytes(), key_str.as_bytes()).ok()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
-    let keystone = build_chain(chain, key)?;
+            match fetched {
+                Some(pair) => pair,
+                None => {
+                    // 3. Fall back to generating a self-signed cert dynamically at runtime
+                    info!("generating dynamic self-signed cert/key at runtime");
+                    let (cert_der, key_der) = generate_self_signed(base_url, enclave_audience)?;
+                    CertKeyPair {
+                        chain_der: vec![cert_der],
+                        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+                    }
+                }
+            }
+        }
+    };
+
+    let keystone = TlsKeystone::new(cert_pair)?;
     info!(
         cert_fingerprint = %keystone.cert_fingerprint_hex,
-        chain_len = keystone_chain_note(),
         "in-enclave TLS termination enabled (ADR-0001)"
     );
     Ok(Some(keystone))
-}
-
-fn keystone_chain_note() -> &'static str {
-    "leaf+intermediates"
-}
-
-fn decode_b64_env(var: &str) -> Result<Vec<u8>> {
-    let b64 = std::env::var(var)
-        .map_err(|_| Error::Config(format!("{ENV_ENABLE} set but {var} missing")))?;
-    base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|e| Error::Config(format!("{var} is not valid base64: {e}")))
 }
 
 /// Extract every `-----BEGIN <tag>----- … -----END <tag>-----` block from PEM text
@@ -138,34 +307,13 @@ fn parse_pem_private_key(pem: &[u8]) -> Option<PrivateKeyDer<'static>> {
     None
 }
 
-/// Build a [`TlsKeystone`] from a DER cert chain (leaf first) + a parsed private key.
-fn build_chain(chain_der: Vec<Vec<u8>>, key: PrivateKeyDer<'static>) -> Result<TlsKeystone> {
-    let fingerprint = hex_lower(&Sha256::digest(&chain_der[0]));
-    let certs: Vec<CertificateDer<'static>> =
-        chain_der.into_iter().map(CertificateDer::from).collect();
-
-    // Explicit ring provider so we never depend on a process-default being installed,
-    // and never link aws-lc / OpenSSL (musl FROM-scratch must stay pure-Rust-friendly).
-    let server_config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Config(format!("rustls provider/protocol setup failed: {e}")))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| Error::Config(format!("invalid TLS cert/key: {e}")))?;
-
-    Ok(TlsKeystone {
-        server_config: Arc::new(server_config),
-        cert_fingerprint_hex: fingerprint,
-    })
-}
-
 /// Test helper: build from a single DER cert + PKCS#8 key.
 #[cfg(test)]
 fn build(cert_der: Vec<u8>, key_der: Vec<u8>) -> Result<TlsKeystone> {
-    build_chain(
-        vec![cert_der],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
-    )
+    TlsKeystone::new(CertKeyPair {
+        chain_der: vec![cert_der],
+        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+    })
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -212,5 +360,40 @@ mod tests {
     fn disabled_by_default() {
         // ENCLAVE_TLS unset in the test environment → no keystone.
         assert!(!is_enabled());
+    }
+
+    /// A swap must atomically change what the resolver serves (the ACME renewal path).
+    #[test]
+    fn swap_replaces_served_cert() {
+        let ks = build(decode(TEST_CERT_DER_B64), decode(TEST_KEY_DER_B64)).unwrap();
+        assert_eq!(ks.cert_fingerprint_hex, EXPECTED_FINGERPRINT);
+
+        // Fresh self-signed cert generated with rcgen (same crate the ACME path
+        // uses in-enclave via instant-acme).
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["renewed.example".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let pair =
+            CertKeyPair::from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).unwrap();
+        let new_fp = pair.fingerprint_hex();
+        assert_ne!(new_fp, EXPECTED_FINGERPRINT);
+
+        let swapped_fp = ks.swap(pair).unwrap();
+        assert_eq!(swapped_fp, new_fp);
+
+        // The resolver now hands out the new leaf.
+        let served = ks
+            .resolver
+            .0
+            .read()
+            .unwrap()
+            .cert
+            .first()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+        assert_eq!(hex_lower(&Sha256::digest(&served)), new_fp);
     }
 }

@@ -684,6 +684,7 @@ pub trait GcsClient: Send + Sync {
         if_generation_match: i64,
     ) -> Result<i64>;
     async fn delete_object(&self, object_name: &str) -> Result<()>;
+    async fn rename_object(&self, source_object: &str, dest_object: &str) -> Result<()>;
 }
 
 // ── Production GCS client ──────────────────────────────────────────────────────
@@ -875,6 +876,25 @@ impl GcsClient for GcpGcsClient {
         resp.error_for_status()?;
         Ok(())
     }
+
+    async fn rename_object(&self, source_object: &str, dest_object: &str) -> Result<()> {
+        let token = self.access_token().await?;
+        let src_encoded = urlencoding::encode(source_object);
+        let dest_encoded = urlencoding::encode(dest_object);
+
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}/copyTo/b/{}/o/{}",
+            self.bucket, src_encoded, self.bucket, dest_encoded
+        );
+
+        let resp = self.http.post(&url).bearer_auth(&token).send().await?;
+
+        resp.error_for_status()?;
+
+        // Copy succeeded; now delete source
+        self.delete_object(source_object).await?;
+        Ok(())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1062,6 +1082,20 @@ pub(crate) mod tests {
         async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
             self.objects.lock().unwrap().remove(object_name);
             Ok(())
+        }
+
+        async fn rename_object(
+            &self,
+            source_object: &str,
+            dest_object: &str,
+        ) -> crate::error::Result<()> {
+            let mut store = self.objects.lock().unwrap();
+            if let Some(obj) = store.remove(source_object) {
+                store.insert(dest_object.to_string(), obj);
+                Ok(())
+            } else {
+                Err(crate::error::EnclaveError::NotFound)
+            }
         }
     }
 
