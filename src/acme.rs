@@ -30,8 +30,12 @@
 //! - The :80 listener serves *only* `/.well-known/acme-challenge/<token>`
 //!   lookups from an in-memory map (404 otherwise) — no new plaintext sink
 //!   (invariant §4.4-5) and no user data anywhere near it.
-//! - Rate limits: sslip.io is on the Public Suffix List, so this hostname is
-//!   its own registered domain; ~6 renewals/year is far under every limit.
+//! - Rate limits: ~6 renewals/year is far under every Let's Encrypt limit for
+//!   the production domain (`api.kiokuu.com` as of 2026-07-06; the original
+//!   sslip.io hostname sat on the Public Suffix List, which made this a
+//!   non-issue by construction — a plain registered domain is still fine at
+//!   this cadence). A domain change is handled at boot: persisted ACME state
+//!   for a different domain/directory is discarded and a fresh cert issued.
 
 use std::{
     collections::HashMap,
@@ -91,7 +95,7 @@ const LETS_ENCRYPT_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/dire
 
 #[derive(Clone)]
 pub struct AcmeConfig {
-    /// DNS name to issue for, derived from `BASE_URL` (e.g. `136-114-134-221.sslip.io`).
+    /// DNS name to issue for, derived from `BASE_URL` (e.g. `api.kiokuu.com`).
     pub domain: String,
     pub directory_url: String,
     pub contact: Option<String>,
