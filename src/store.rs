@@ -411,6 +411,15 @@ CREATE TABLE IF NOT EXISTS episodes (
     model         TEXT,
     topics        TEXT,  -- JSON array (legacy)
     people        TEXT,  -- JSON array (legacy)
+    -- Minute-timeline gists (ADR-0004): JSON array of {start, gist} buckets.
+    -- MERGED on episode extension (union by bucket start), never replaced —
+    -- see episodes.rs merge_minute_summaries.
+    minute_summaries TEXT,
+    -- Plain-text concatenation of the minute gists. episodes_fts is an
+    -- external-content table, so the indexed text must be a real column of
+    -- this table (rebuild reads it back); indexing the raw JSON would put
+    -- "start"/"gist"/timestamps into the index.
+    minutes_text  TEXT,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at    TEXT
 );
@@ -429,9 +438,9 @@ CREATE TABLE IF NOT EXISTS episode_members (
 CREATE INDEX IF NOT EXISTS idx_episode_members_record
     ON episode_members(record_type, record_id);
 
--- FTS5 over episode summary + title
+-- FTS5 over episode title + summary + minute-timeline gists
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
-    USING fts5(title, summary, content='episodes', content_rowid='id');
+    USING fts5(title, summary, minutes_text, content='episodes', content_rowid='id');
 
 -- Vector index for utterance embeddings (all-MiniLM-L6-v2, 384-dim, cosine).
 -- Keyed by utterance rowid. Populated only when the ingest payload carries
@@ -448,6 +457,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_utterances USING vec0(
 -- screenshots without OCR or embeddings simply have no row here.
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_screenshots USING vec0(
     screenshot_id INTEGER PRIMARY KEY,
+    embedding float[384] distance_metric=cosine
+);
+
+-- Vector index for episode embeddings (ADR-0004 §G.2). Episodes are born in
+-- the enclave (the Mac never sees them), so these vectors are computed
+-- IN-enclave by the candle encoder at summarizer-upsert time — same pinned
+-- MODEL_ID space as vec_utterances/vec_screenshots. Text = title + exec
+-- summary + minute gists.
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
+    episode_id INTEGER PRIMARY KEY,
     embedding float[384] distance_metric=cosine
 );
 
@@ -480,16 +499,18 @@ END;
 -- terms once the content row has changed. The v2 id-keyed upsert UPDATEs rows
 -- in place, so the update trigger MUST use this form.
 CREATE TRIGGER IF NOT EXISTS episodes_insert_fts AFTER INSERT ON episodes BEGIN
-    INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
+    INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
+        VALUES (new.id, new.title, new.summary, new.minutes_text);
 END;
 CREATE TRIGGER IF NOT EXISTS episodes_delete_fts AFTER DELETE ON episodes BEGIN
-    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary)
-        VALUES ('delete', old.id, old.title, old.summary);
+    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
+        VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
 END;
 CREATE TRIGGER IF NOT EXISTS episodes_update_fts AFTER UPDATE ON episodes BEGIN
-    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary)
-        VALUES ('delete', old.id, old.title, old.summary);
-    INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
+    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
+        VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
+    INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
+        VALUES (new.id, new.title, new.summary, new.minutes_text);
 END;
 "#;
 
@@ -605,6 +626,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         "ALTER TABLE episodes ADD COLUMN languages TEXT;",
         "ALTER TABLE episodes ADD COLUMN action_items TEXT;",
         "ALTER TABLE episodes ADD COLUMN model TEXT;",
+        // ADR-0004: minute-timeline gists (JSON) + their plain-text projection
+        // for FTS. Old rows keep NULL — the debugger derives gists client-side
+        // for them and search simply doesn't index minutes on old rows.
+        "ALTER TABLE episodes ADD COLUMN minute_summaries TEXT;",
+        "ALTER TABLE episodes ADD COLUMN minutes_text TEXT;",
     ] {
         if let Err(e) = conn.execute_batch(col_def) {
             let msg = e.to_string();
@@ -612,6 +638,48 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 return Err(e.into());
             }
         }
+    }
+
+    // ── ADR-0004 §G.3: episodes_fts rebuild to index minutes_text ──────────────
+    //
+    // episodes_fts is an EXTERNAL-CONTENT FTS5 table: a new indexed column is a
+    // rebuild migration, not a column add. Detected by the absence of the
+    // minutes_text column in the FTS shadow schema. Steps: drop the old
+    // triggers + table, recreate with the third column, re-point the triggers
+    // (updates MUST use the 'delete' command — the repo's known footgun; a
+    // plain DELETE/UPDATE on the shadow corrupts the index), then a full
+    // 'rebuild' re-indexes existing rows from the content table.
+    let fts_has_minutes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('episodes_fts') WHERE name = 'minutes_text'",
+        [],
+        |r| r.get(0),
+    )?;
+    if fts_has_minutes == 0 {
+        conn.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS episodes_insert_fts;
+            DROP TRIGGER IF EXISTS episodes_delete_fts;
+            DROP TRIGGER IF EXISTS episodes_update_fts;
+            DROP TABLE IF EXISTS episodes_fts;
+            CREATE VIRTUAL TABLE episodes_fts
+                USING fts5(title, summary, minutes_text, content='episodes', content_rowid='id');
+            CREATE TRIGGER episodes_insert_fts AFTER INSERT ON episodes BEGIN
+                INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
+                    VALUES (new.id, new.title, new.summary, new.minutes_text);
+            END;
+            CREATE TRIGGER episodes_delete_fts AFTER DELETE ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
+                    VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
+            END;
+            CREATE TRIGGER episodes_update_fts AFTER UPDATE ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
+                    VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
+                INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
+                    VALUES (new.id, new.title, new.summary, new.minutes_text);
+            END;
+            INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild');
+            "#,
+        )?;
     }
 
     // vec0 virtual table for utterance embeddings — added in this pass.
@@ -642,6 +710,20 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     if let Err(e) = conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_screenshots USING vec0(
              screenshot_id INTEGER PRIMARY KEY,
+             embedding float[384] distance_metric=cosine
+         );",
+    ) {
+        let msg = e.to_string();
+        if !msg.contains("already exists") {
+            return Err(e.into());
+        }
+    }
+
+    // vec0 table for in-enclave episode embeddings (ADR-0004 §G.2). Same
+    // replay-safety notes as vec_utterances above.
+    if let Err(e) = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
+             episode_id INTEGER PRIMARY KEY,
              embedding float[384] distance_metric=cosine
          );",
     ) {
@@ -1047,6 +1129,87 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "re-running migrations must not re-drop v2 episodes");
+    }
+
+    /// ADR-0004 §G.3: a blob whose episodes_fts predates minutes_text must be
+    /// rebuilt (drop + recreate + 'rebuild' + re-pointed triggers), keeping
+    /// existing rows searchable and indexing minutes for updated rows.
+    #[test]
+    fn episodes_fts_rebuild_indexes_minutes() {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        // v2-era schema WITHOUT the minutes columns / 3-column FTS.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL, ended_at TEXT NOT NULL,
+                type TEXT, title TEXT, summary TEXT,
+                participants TEXT, languages TEXT, action_items TEXT,
+                model TEXT, topics TEXT, people TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT
+            );
+            CREATE TABLE utterances (id INTEGER PRIMARY KEY, audio_segment_id INTEGER NOT NULL,
+                start_offset_seconds REAL NOT NULL DEFAULT 0, end_offset_seconds REAL NOT NULL DEFAULT 0,
+                text TEXT NOT NULL, speaker_label TEXT NOT NULL DEFAULT 'Me');
+            CREATE TABLE screenshots (id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL, ocr_text TEXT);
+            CREATE VIRTUAL TABLE episodes_fts USING fts5(title, summary, content='episodes', content_rowid='id');
+            CREATE TRIGGER episodes_insert_fts AFTER INSERT ON episodes BEGIN
+                INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
+            END;
+            CREATE TRIGGER episodes_update_fts AFTER UPDATE ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, title, summary)
+                    VALUES ('delete', old.id, old.title, old.summary);
+                INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
+            END;
+            INSERT INTO episodes (started_at, ended_at, title, summary)
+                VALUES ('2026-07-01T09:00:00Z','2026-07-01T10:00:00Z','Quarterly planning','budget review');
+            "#,
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        // Pre-existing row still searchable through the rebuilt index.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM episodes_fts WHERE episodes_fts MATCH 'Quarterly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "rebuild must re-index existing rows");
+
+        // The re-pointed UPDATE trigger indexes minutes_text via the 'delete'
+        // command form (a plain UPDATE on the shadow would corrupt the index).
+        conn.execute(
+            "UPDATE episodes SET minutes_text = 'xylophone practice with Ana' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM episodes_fts WHERE episodes_fts MATCH 'xylophone'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "minutes_text must be searchable after update");
+        // Integrity: an external-content mismatch surfaces here.
+        conn.execute_batch("INSERT INTO episodes_fts(episodes_fts) VALUES('integrity-check');")
+            .unwrap();
+
+        // Idempotent on the next open.
+        run_migrations(&conn).unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM episodes_fts WHERE episodes_fts MATCH 'xylophone'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "second migration run must not lose the index");
     }
 
     // ── Fake KMS ──────────────────────────────────────────────────────────────

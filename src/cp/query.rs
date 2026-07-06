@@ -68,23 +68,46 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
     let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
 
     let query_embedding = embed_query(s, &query).await;
-    let req = SearchRequest {
+    // Episodes are the PRIMARY result entity (ADR-0004): each carries its
+    // exec summary + minute-timeline gists + a matched snippet, so an
+    // assistant gets the high-level picture without digesting raw
+    // transcripts. Utterance hits follow as `results` (drill-down evidence;
+    // shape unchanged for existing clients). Episodes come back in relevance
+    // order (rank / RRF), not time order.
+    let ep_req = SearchRequest {
+        user_id: user_id.to_string(),
+        query: query.clone(),
+        time_start: from.clone(),
+        time_end: to.clone(),
+        limit,
+        offset: 0,
+        kinds: vec!["episode".into()],
+        query_embedding: query_embedding.clone(),
+    };
+    let utt_req = SearchRequest {
         user_id: user_id.to_string(),
         query,
         time_start: from,
         time_end: to,
         limit,
         offset: 0,
-        kinds: vec!["utterance".into(), "episode".into()],
+        kinds: vec!["utterance".into()],
         query_embedding,
     };
-    let hits = s
+    let (episodes, utterances) = s
         .store
-        .with_user(user_id, |conn| search_all(conn, &req))
+        .with_user(user_id, |conn| {
+            Ok((
+                crate::search::search_episodes(conn, &ep_req)?,
+                search_all(conn, &utt_req)?,
+            ))
+        })
         .await
         .unwrap_or_default();
-    let results = serde_json::to_value(&hits).unwrap_or_else(|_| json!([]));
-    json!({ "results": results })
+    json!({
+        "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| json!([])),
+        "results": serde_json::to_value(&utterances).unwrap_or_else(|_| json!([])),
+    })
 }
 
 async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Value {
@@ -258,7 +281,8 @@ async fn list_episodes_value(
                         (SELECT count(*) FROM episode_members m \
                           WHERE m.episode_id = e.id AND m.record_type = 'utterance'), \
                         (SELECT count(*) FROM episode_members m \
-                          WHERE m.episode_id = e.id AND m.record_type = 'screenshot') \
+                          WHERE m.episode_id = e.id AND m.record_type = 'screenshot'), \
+                        e.minute_summaries \
                  FROM episodes e \
                  WHERE (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
                  ORDER BY e.started_at DESC LIMIT ?3",
@@ -277,6 +301,10 @@ async fn list_episodes_value(
                         "participants": json_array_column(r.get::<_, Option<String>>(6)?),
                         "languages": json_array_column(r.get::<_, Option<String>>(7)?),
                         "action_items": json_array_column(r.get::<_, Option<String>>(8)?),
+                        // Minute-timeline gists (ADR-0004); the episode page
+                        // renders these, falling back to client-derived gists
+                        // when empty (pre-feature episodes).
+                        "minute_summaries": json_array_column(r.get::<_, Option<String>>(11)?),
                         "utterance_count": utt,
                         "screenshot_count": scr,
                         "member_count": utt + scr,
@@ -366,7 +394,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "search_transcripts",
-            "description": "Full-text search over your transcribed speech (utterances) and episode summaries.",
+            "description": "Search your archive. Returns matching EPISODES first (relevance-ranked, each with its executive summary, minute-by-minute timeline gists, and a matched snippet — usually enough to answer without raw transcripts), then matching utterances as drill-down evidence.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -603,8 +631,13 @@ async fn rest_episode_members(
     let result = s
         .store
         .with_user(&user.0, move |conn| {
+            // source_key ({device_id}:{segment_local_id}:{local_id} for
+            // utterances, {device_id}:{local_id} for screenshots) lets the
+            // debugger — running on the Mac beside the local store — join a
+            // member back to its local row and serve the actual screenshot
+            // image (raw images never leave the Mac; ADR-0004).
             let mut us = conn.prepare(
-                "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text \
+                "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text, u.source_key \
                  FROM episode_members m \
                  JOIN utterances u ON u.id = m.record_id \
                  JOIN audio_segments s ON s.id = u.audio_segment_id \
@@ -622,6 +655,7 @@ async fn rest_episode_members(
                             "speaker_label": r.get::<_, String>(2)?,
                             "language": r.get::<_, Option<String>>(3)?,
                             "text": r.get::<_, String>(4)?,
+                            "source_key": r.get::<_, Option<String>>(5)?,
                         }),
                     ))
                 })?
@@ -630,7 +664,7 @@ async fn rest_episode_members(
 
             let mut ss = conn.prepare(
                 "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
-                        substr(c.ocr_text,1,2000) \
+                        substr(c.ocr_text,1,2000), c.source_key \
                  FROM episode_members m \
                  JOIN screenshots c ON c.id = m.record_id \
                  WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'",
@@ -648,6 +682,7 @@ async fn rest_episode_members(
                             "window_title": r.get::<_, Option<String>>(3)?,
                             "url": r.get::<_, Option<String>>(4)?,
                             "ocr_excerpt": r.get::<_, Option<String>>(5)?,
+                            "source_key": r.get::<_, Option<String>>(6)?,
                         }),
                     ))
                 })?

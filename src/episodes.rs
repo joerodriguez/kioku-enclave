@@ -35,6 +35,9 @@ pub struct EpisodeRow {
     pub participants: Value,
     pub languages: Value,
     pub action_items: Value,
+    /// Minute-timeline gists (ADR-0004): JSON array of {start, gist}, time
+    /// ascending. Empty array for episodes summarized before the feature.
+    pub minute_summaries: Value,
     pub model: Option<String>,
     pub created_at: String,
     /// Member counts (v2) — number of utterances / screenshots bound to this
@@ -42,6 +45,78 @@ pub struct EpisodeRow {
     /// "N utterances, M screenshots" without a second round-trip.
     pub utterance_count: i64,
     pub screenshot_count: i64,
+}
+
+/// One minute-timeline bucket (ADR-0004): a one-line gist of what happened in
+/// the minutes starting at `start`. Stored on the episode row as a JSON array
+/// sorted by start time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinuteBucket {
+    /// ISO-8601 UTC bucket start.
+    pub start: String,
+    pub gist: String,
+}
+
+/// MERGE minute buckets on episode extension (ADR-0004 §G.1).
+///
+/// The summarizer is incremental: on extension the LLM sees only the NEW
+/// window, so its buckets cover only new minutes — a whole-column replace
+/// would wipe the earlier timeline. Union `new` into `existing_json` keyed by
+/// bucket start (minute precision); a bucket from a newer window replaces an
+/// overlapping older one. Returns `None` when the union is empty, else the
+/// merged JSON array plus the plain-text gist projection for episodes_fts.
+fn merge_minute_summaries(
+    existing_json: Option<&str>,
+    new: &[MinuteBucket],
+) -> Option<(String, String)> {
+    use std::collections::BTreeMap;
+    let mut by_start: BTreeMap<i64, MinuteBucket> = BTreeMap::new();
+    let minute_key =
+        |b: &MinuteBucket| crate::cp::isotime::parse_epoch_millis(&b.start).map(|ms| ms / 60_000);
+    let existing: Vec<MinuteBucket> = existing_json
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    for bucket in existing.into_iter().chain(new.iter().cloned()) {
+        // Buckets with an unparseable start are dropped (the responseSchema
+        // constrains starts to strings; defensive against a malformed one).
+        if bucket.gist.trim().is_empty() {
+            continue;
+        }
+        if let Some(key) = minute_key(&bucket) {
+            by_start.insert(key, bucket);
+        }
+    }
+    if by_start.is_empty() {
+        return None;
+    }
+    let merged: Vec<&MinuteBucket> = by_start.values().collect();
+    let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
+    let text = merged
+        .iter()
+        .map(|b| b.gist.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((json, text))
+}
+
+/// Store an episode's in-enclave-computed embedding in `vec_episodes`.
+/// vec0 does not honour ON CONFLICT, so upsert is spelled DELETE + INSERT
+/// (same pattern as the ingest backfill path).
+pub(crate) fn write_episode_embedding(
+    conn: &rusqlite::Connection,
+    episode_id: i64,
+    embedding: &[f32],
+) -> Result<()> {
+    let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+    conn.execute(
+        "DELETE FROM vec_episodes WHERE episode_id = ?1",
+        [episode_id],
+    )?;
+    conn.execute(
+        "INSERT INTO vec_episodes (episode_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![episode_id, bytes.as_slice()],
+    )?;
+    Ok(())
 }
 
 // ── Upsert ─────────────────────────────────────────────────────────────────────
@@ -66,6 +141,11 @@ pub struct EpisodeInput {
     pub languages: Option<Vec<String>>,
     /// Array of action-item strings.
     pub action_items: Option<Vec<String>>,
+    /// Minute-timeline gists for the window this upsert covers (ADR-0004).
+    /// MERGED into the stored buckets on extension — never a whole-column
+    /// replace (§G.1). Absent/empty leaves the stored buckets untouched.
+    #[serde(default)]
+    pub minute_summaries: Option<Vec<MinuteBucket>>,
     /// Model identifier used to produce this episode.
     pub model: Option<String>,
     /// Member utterance ids to bind to this episode (additive: INSERT OR IGNORE).
@@ -149,12 +229,34 @@ pub(crate) fn upsert_episodes(
             None => None,
         };
 
+        // §G.1: union this window's minute buckets into the stored ones —
+        // the LLM never re-sees earlier minutes, so replacing the column
+        // would wipe the earlier timeline on every extension.
+        let existing_minutes: Option<String> = existing_id.and_then(|id| {
+            conn.query_row(
+                "SELECT minute_summaries FROM episodes WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten()
+        });
+        let merged = merge_minute_summaries(
+            existing_minutes.as_deref(),
+            ep.minute_summaries.as_deref().unwrap_or(&[]),
+        );
+        let (minutes_json, minutes_text) = match &merged {
+            Some((j, t)) => (Some(j.as_str()), Some(t.as_str())),
+            None => (None, None),
+        };
+
         let episode_id = if let Some(id) = existing_id {
             conn.execute(
                 r#"UPDATE episodes SET
                        started_at = ?2, ended_at = ?3, type = ?4, title = ?5,
                        summary = ?6, participants = ?7, languages = ?8,
                        action_items = ?9, model = ?10,
+                       minute_summaries = ?11, minutes_text = ?12,
                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                    WHERE id = ?1"#,
                 rusqlite::params![
@@ -168,6 +270,8 @@ pub(crate) fn upsert_episodes(
                     languages_json,
                     action_items_json,
                     ep.model,
+                    minutes_json,
+                    minutes_text,
                 ],
             )?;
             id
@@ -175,8 +279,9 @@ pub(crate) fn upsert_episodes(
             conn.execute(
                 r#"INSERT INTO episodes
                    (started_at, ended_at, type, title, summary, participants,
-                    languages, action_items, model, updated_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    languages, action_items, model, minute_summaries,
+                    minutes_text, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                            strftime('%Y-%m-%dT%H:%M:%fZ','now'))"#,
                 rusqlite::params![
                     ep.started_at,
@@ -188,6 +293,8 @@ pub(crate) fn upsert_episodes(
                     languages_json,
                     action_items_json,
                     ep.model,
+                    minutes_json,
+                    minutes_text,
                 ],
             )?;
             conn.last_insert_rowid()
@@ -261,7 +368,8 @@ fn list_episodes(
                   (SELECT COUNT(*) FROM episode_members m
                      WHERE m.episode_id = e.id AND m.record_type = 'utterance')  AS utterance_count,
                   (SELECT COUNT(*) FROM episode_members m
-                     WHERE m.episode_id = e.id AND m.record_type = 'screenshot') AS screenshot_count
+                     WHERE m.episode_id = e.id AND m.record_type = 'screenshot') AS screenshot_count,
+                  e.minute_summaries
            FROM episodes e
            WHERE (?1 IS NULL OR e.started_at >= ?1)
              AND (?2 IS NULL OR e.started_at < ?2)
@@ -312,7 +420,14 @@ pub async fn handle_episodes_delete_range(
                 "DELETE FROM episodes WHERE started_at >= ?1 AND started_at < ?2",
                 rusqlite::params![req.from, req.to],
             )?;
-            Ok(conn.changes() as usize)
+            let deleted = conn.changes() as usize;
+            // vec0 has no FK/trigger support — sweep vectors orphaned by the
+            // delete (stale entries would only waste KNN slots, but keep tidy).
+            conn.execute(
+                "DELETE FROM vec_episodes WHERE episode_id NOT IN (SELECT id FROM episodes)",
+                [],
+            )?;
+            Ok(deleted)
         })
         .await?;
 
@@ -349,7 +464,7 @@ pub async fn handle_episodes_members(
 
 fn fetch_members(conn: &rusqlite::Connection, episode_id: i64) -> Result<Value> {
     let mut ustmt = conn.prepare(
-        r#"SELECT u.id, u.text, u.language, u.speaker_label, s.started_at
+        r#"SELECT u.id, u.text, u.language, u.speaker_label, s.started_at, u.source_key
            FROM episode_members m
            JOIN utterances u     ON u.id = m.record_id
            JOIN audio_segments s ON s.id = u.audio_segment_id
@@ -364,12 +479,14 @@ fn fetch_members(conn: &rusqlite::Connection, episode_id: i64) -> Result<Value> 
                 "language":      row.get::<_, Option<String>>(2)?,
                 "speaker_label": row.get::<_, String>(3)?,
                 "started_at":    row.get::<_, String>(4)?,
+                "source_key":    row.get::<_, Option<String>>(5)?,
             }))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut sstmt = conn.prepare(
-        r#"SELECT sc.id, sc.captured_at, sc.active_app, sc.window_title, sc.url, sc.ocr_text
+        r#"SELECT sc.id, sc.captured_at, sc.active_app, sc.window_title, sc.url, sc.ocr_text,
+                  sc.source_key
            FROM episode_members m
            JOIN screenshots sc ON sc.id = m.record_id
            WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'
@@ -384,6 +501,7 @@ fn fetch_members(conn: &rusqlite::Connection, episode_id: i64) -> Result<Value> 
                 "window_title": row.get::<_, Option<String>>(3)?,
                 "url":          row.get::<_, Option<String>>(4)?,
                 "ocr_text":     row.get::<_, Option<String>>(5)?,
+                "source_key":   row.get::<_, Option<String>>(6)?,
             }))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -416,6 +534,7 @@ fn parse_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRow> {
         created_at: row.get(10)?,
         utterance_count: row.get(11)?,
         screenshot_count: row.get(12)?,
+        minute_summaries: parse_json_array(row.get(13)?),
     })
 }
 
@@ -443,10 +562,160 @@ mod tests {
             participants: Some(vec!["alice".to_string(), "bob".to_string()]),
             languages: Some(vec!["en".to_string()]),
             action_items: Some(vec!["Ship it".to_string()]),
+            minute_summaries: None,
             model: Some("claude-3".to_string()),
             member_utterance_ids: vec![],
             member_screenshot_ids: vec![],
         }
+    }
+
+    fn bucket(start: &str, gist: &str) -> MinuteBucket {
+        MinuteBucket {
+            start: start.to_string(),
+            gist: gist.to_string(),
+        }
+    }
+
+    /// §G.1 — the merge case: an EXTENDED episode must retain the minute
+    /// buckets from earlier windows the LLM no longer sees; a bucket from a
+    /// newer window replaces an overlapping older one.
+    #[tokio::test]
+    async fn extension_merges_minute_summaries_never_replaces() {
+        let store = make_store();
+
+        // Window 1: episode is born with two minute buckets.
+        let ep1 = EpisodeInput {
+            minute_summaries: Some(vec![
+                bucket("2026-07-05T20:56:00Z", "Talking about baby boys"),
+                bucket("2026-07-05T20:57:00Z", "Kate & Sean arrival plans"),
+            ]),
+            ..sample_episode("2026-07-05T20:56:00Z", "2026-07-05T20:58:00Z")
+        };
+        let ids = store
+            .with_user("merge_user", |conn| upsert_episodes(conn, &[ep1]))
+            .await
+            .unwrap();
+        let id = ids[0];
+
+        // Window 2: extension — the LLM only saw the NEW window, so it only
+        // emits buckets for the new minutes (plus a refined overlap bucket).
+        let ep2 = EpisodeInput {
+            id: Some(id),
+            minute_summaries: Some(vec![
+                bucket("2026-07-05T20:57:30Z", "Kate & Sean plans firmed up"), // overlaps 20:57
+                bucket("2026-07-05T20:58:00Z", "Pesto, lobster question"),
+            ]),
+            ..sample_episode("2026-07-05T20:56:00Z", "2026-07-05T21:01:00Z")
+        };
+        store
+            .with_user("merge_user", |conn| upsert_episodes(conn, &[ep2]))
+            .await
+            .unwrap();
+
+        let stored: String = store
+            .with_user("merge_user", |conn| {
+                Ok(conn.query_row(
+                    "SELECT minute_summaries FROM episodes WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        let buckets: Vec<MinuteBucket> = serde_json::from_str(&stored).unwrap();
+        let gists: Vec<&str> = buckets.iter().map(|b| b.gist.as_str()).collect();
+        assert_eq!(
+            gists,
+            vec![
+                "Talking about baby boys",     // retained from window 1
+                "Kate & Sean plans firmed up", // window-2 bucket replaced the overlapping 20:57 one
+                "Pesto, lobster question",     // new minute appended
+            ],
+            "extension must union buckets by start, retaining earlier minutes"
+        );
+
+        // The plain-text FTS projection covers old AND new gists.
+        let hits: i64 = store
+            .with_user("merge_user", |conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM episodes_fts WHERE episodes_fts MATCH 'baby AND lobster'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits, 1, "gists from both windows must be FTS-searchable");
+    }
+
+    /// An extension upsert that carries NO minute buckets (e.g. a metadata-only
+    /// re-run) must leave the stored buckets untouched.
+    #[tokio::test]
+    async fn upsert_without_minutes_keeps_stored_buckets() {
+        let store = make_store();
+        let ep1 = EpisodeInput {
+            minute_summaries: Some(vec![bucket("2026-07-05T09:00:00Z", "Stand-up recap")]),
+            ..sample_episode("2026-07-05T09:00:00Z", "2026-07-05T09:30:00Z")
+        };
+        let ids = store
+            .with_user("keep_user", |conn| upsert_episodes(conn, &[ep1]))
+            .await
+            .unwrap();
+        let ep2 = EpisodeInput {
+            id: Some(ids[0]),
+            minute_summaries: None,
+            ..sample_episode("2026-07-05T09:00:00Z", "2026-07-05T09:45:00Z")
+        };
+        store
+            .with_user("keep_user", |conn| upsert_episodes(conn, &[ep2]))
+            .await
+            .unwrap();
+        let stored: String = store
+            .with_user("keep_user", |conn| {
+                Ok(conn.query_row(
+                    "SELECT minute_summaries FROM episodes WHERE id = ?1",
+                    [ids[0]],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(
+            stored.contains("Stand-up recap"),
+            "minute buckets must survive a bucket-less upsert"
+        );
+    }
+
+    #[tokio::test]
+    async fn episode_embedding_upsert_replaces() {
+        let store = make_store();
+        let ids = store
+            .with_user("vec_ep_user", |conn| {
+                let ids = upsert_episodes(
+                    conn,
+                    &[sample_episode(
+                        "2026-07-05T09:00:00Z",
+                        "2026-07-05T09:30:00Z",
+                    )],
+                )?;
+                write_episode_embedding(conn, ids[0], &[0.5f32; 384])?;
+                // Second write for the same id must replace, not duplicate.
+                write_episode_embedding(conn, ids[0], &[0.25f32; 384])?;
+                Ok(ids)
+            })
+            .await
+            .unwrap();
+        let count: i64 = store
+            .with_user("vec_ep_user", |conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM vec_episodes WHERE episode_id = ?1",
+                    [ids[0]],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "episode embedding upsert must replace in place");
     }
 
     #[tokio::test]

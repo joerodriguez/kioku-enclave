@@ -9,9 +9,10 @@
 //! **Hybrid** (when `query_embedding` is present — a 384-dim float32 array in
 //! the model space pinned by `crate::embedding::MODEL_ID`, computed in-enclave
 //! at query time): runs vector KNN on the `vec_utterances` / `vec_screenshots`
-//! vec0 tables, then merges FTS + vector scores per kind using **Reciprocal
-//! Rank Fusion (RRF)**. Episodes remain FTS-only (their searchable text is an
-//! LLM summary that FTS already matches well).
+//! / `vec_episodes` vec0 tables, then merges FTS + vector scores per kind
+//! using **Reciprocal Rank Fusion (RRF)**. Episode vectors are computed
+//! in-enclave at summarizer-upsert time (ADR-0004 §G.2); episode FTS covers
+//! title + summary + minute-timeline gists.
 //!
 //! ## Why RRF
 //!
@@ -33,7 +34,7 @@
 //! # `kinds` filter
 //!
 //! When `kinds` is empty, all content types are searched; vector search applies
-//! to utterances and screenshots (episodes have no embeddings).
+//! to all three kinds when a query embedding is present.
 //!
 //! # Backward compatibility
 //!
@@ -112,6 +113,16 @@ pub enum SearchHit {
         ended_at: String,
         title: Option<String>,
         summary: Option<String>,
+        /// Minute-timeline gists (ADR-0004): parsed JSON array of
+        /// {start, gist}, empty for episodes summarized before the feature.
+        minute_summaries: serde_json::Value,
+        /// Contextual FTS5 snippet of the matched text (title, summary, or a
+        /// minute gist). Absent for vector-only matches.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snippet: Option<String>,
+        /// Combined RRF score (hybrid). Absent in FTS-only mode.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score: Option<f64>,
     },
 }
 
@@ -500,22 +511,49 @@ fn search_screenshots_hybrid(
         .map_err(Into::into)
 }
 
-// ── Episode search (FTS-only — no embeddings on episodes) ────────────────────
+// ── Episode search (FTS-only or Hybrid RRF over title/summary/minute gists) ──
 
-fn search_episodes(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<Vec<SearchHit>> {
-    let sql = r#"
-        SELECT id, started_at, ended_at, title, summary
-        FROM episodes
-        WHERE id IN (
-            SELECT rowid FROM episodes_fts WHERE episodes_fts MATCH ?1
-        )
-        AND (?2 IS NULL OR started_at >= ?2)
-        AND (?3 IS NULL OR started_at <= ?3)
-        ORDER BY started_at DESC
+/// Parse a stored JSON-array column into a Value, defaulting to `[]`.
+fn json_array(raw: Option<String>) -> serde_json::Value {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::Value::Array(vec![]))
+}
+
+/// FTS snippet arguments: auto-pick the matched column, bracket markers,
+/// ~12 tokens of context.
+const SNIPPET_FN: &str = "snippet(episodes_fts, -1, '[', ']', ' … ', 12)";
+
+/// Episode search — the PRIMARY result entity as of ADR-0004. Indexed text is
+/// title + exec summary + minute-timeline gists (minutes_text); vectors live
+/// in `vec_episodes`, computed in-enclave at summarizer-upsert time. Results
+/// come back in relevance order (FTS rank, or RRF when hybrid) — callers that
+/// need time ordering re-sort (see [`search_all`]).
+pub(crate) fn search_episodes(
+    conn: &rusqlite::Connection,
+    req: &SearchRequest,
+) -> Result<Vec<SearchHit>> {
+    match &req.query_embedding {
+        Some(qemb) => search_episodes_hybrid(conn, req, qemb),
+        None => search_episodes_fts(conn, req),
+    }
+}
+
+fn search_episodes_fts(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<Vec<SearchHit>> {
+    let sql = format!(
+        r#"
+        SELECT e.id, e.started_at, e.ended_at, e.title, e.summary,
+               e.minute_summaries, {SNIPPET_FN}
+        FROM episodes_fts
+        JOIN episodes e ON e.id = episodes_fts.rowid
+        WHERE episodes_fts MATCH ?1
+          AND (?2 IS NULL OR e.started_at >= ?2)
+          AND (?3 IS NULL OR e.started_at <= ?3)
+        ORDER BY rank
         LIMIT ?4 OFFSET ?5
-    "#;
+    "#
+    );
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         rusqlite::params![
             req.query,
@@ -531,12 +569,107 @@ fn search_episodes(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<V
                 ended_at: r.get(2)?,
                 title: r.get(3)?,
                 summary: r.get(4)?,
+                minute_summaries: json_array(r.get(5)?),
+                snippet: r.get(6)?,
+                score: None,
             })
         },
     )?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Hybrid episode search — same shape as [`search_utterances_hybrid`]: FTS
+/// candidates (with snippets) + standalone vec0 KNN over `vec_episodes`
+/// (sqlite-vec: MATCH must not mix with JOINs), RRF merge, join back.
+fn search_episodes_hybrid(
+    conn: &rusqlite::Connection,
+    req: &SearchRequest,
+    query_emb: &[f32],
+) -> Result<Vec<SearchHit>> {
+    use std::collections::HashMap;
+    let candidate_limit = (req.limit * 3).max(60) as i64;
+
+    let fts_sql = format!(
+        "SELECT rowid, {SNIPPET_FN} FROM episodes_fts \
+         WHERE episodes_fts MATCH ?1 ORDER BY rank LIMIT ?2"
+    );
+    let mut fts_stmt = conn.prepare(&fts_sql)?;
+    let fts: Vec<(i64, String)> = fts_stmt
+        .query_map(rusqlite::params![req.query, candidate_limit], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let fts_rows: Vec<i64> = fts.iter().map(|(id, _)| *id).collect();
+    let snippets: HashMap<i64, String> = fts.into_iter().collect();
+
+    let query_bytes: Vec<u8> = query_emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let knn_sql = r#"
+        SELECT episode_id, distance
+        FROM vec_episodes
+        WHERE embedding MATCH ?1
+        ORDER BY distance
+        LIMIT ?2
+    "#;
+    let mut knn_stmt = conn.prepare(knn_sql)?;
+    let knn_rows: Vec<(i64, f64)> = knn_stmt
+        .query_map(
+            rusqlite::params![query_bytes.as_slice(), candidate_limit],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let candidates_page: Vec<(i64, f64)> = rrf_merge(&fts_rows, &knn_rows)
+        .into_iter()
+        .skip(req.offset)
+        .take(req.limit)
+        .collect();
+
+    if candidates_page.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let values_clause: String = candidates_page
+        .iter()
+        .map(|(id, score)| format!("({id},{score})"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let join_sql = format!(
+        r#"
+        WITH ranked(episode_id, rrf_score) AS (VALUES {values_clause})
+        SELECT e.id, e.started_at, e.ended_at, e.title, e.summary,
+               e.minute_summaries, r.rrf_score
+        FROM ranked r
+        JOIN episodes e ON e.id = r.episode_id
+        WHERE (?1 IS NULL OR e.started_at >= ?1)
+          AND (?2 IS NULL OR e.started_at <= ?2)
+        ORDER BY r.rrf_score DESC
+        "#
+    );
+
+    let mut stmt = conn.prepare(&join_sql)?;
+    let rows = stmt.query_map(rusqlite::params![req.time_start, req.time_end], |r| {
+        let id: i64 = r.get(0)?;
+        Ok(SearchHit::Episode {
+            id,
+            started_at: r.get(1)?,
+            ended_at: r.get(2)?,
+            title: r.get(3)?,
+            summary: r.get(4)?,
+            minute_summaries: json_array(r.get(5)?),
+            snippet: None, // filled from the FTS map below
+            score: Some(r.get::<_, f64>(6)?),
+        })
+    })?;
+    let mut hits = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    for hit in &mut hits {
+        if let SearchHit::Episode { id, snippet, .. } = hit {
+            *snippet = snippets.get(id).cloned();
+        }
+    }
+    Ok(hits)
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────────
@@ -892,6 +1025,114 @@ mod tests {
             })
             .await
             .expect("reload should not error on existing vec0 table");
+    }
+
+    /// ADR-0004: a phrase that appears ONLY in a minute gist finds the
+    /// episode, with a snippet and the parsed minute_summaries attached.
+    #[tokio::test]
+    async fn episode_found_by_minute_gist_with_snippet() {
+        use crate::episodes::{upsert_episodes, EpisodeInput, MinuteBucket};
+        let store = make_store();
+        store
+            .with_user("ep_gist_u", |conn| {
+                upsert_episodes(
+                    conn,
+                    &[EpisodeInput {
+                        id: None,
+                        started_at: "2026-07-05T20:56:00Z".into(),
+                        ended_at: "2026-07-05T21:01:00Z".into(),
+                        episode_type: Some("other".into()),
+                        title: "Family dinner chat".into(),
+                        summary: Some("- catching up".into()),
+                        participants: None,
+                        languages: None,
+                        action_items: None,
+                        minute_summaries: Some(vec![MinuteBucket {
+                            start: "2026-07-05T20:58:00Z".into(),
+                            gist: "Pesto recipe, lobster question".into(),
+                        }]),
+                        model: None,
+                        member_utterance_ids: vec![],
+                        member_screenshot_ids: vec![],
+                    }],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .with_user("ep_gist_u", |conn| {
+                search_episodes(
+                    conn,
+                    &req_fts("ep_gist_u", "lobster", vec!["episode".into()]),
+                )
+            })
+            .await
+            .unwrap();
+        match hits.first() {
+            Some(SearchHit::Episode {
+                snippet,
+                minute_summaries,
+                ..
+            }) => {
+                assert!(
+                    snippet.as_deref().unwrap_or("").contains("lobster"),
+                    "snippet should mark the matched gist, got {snippet:?}"
+                );
+                assert_eq!(minute_summaries.as_array().unwrap().len(), 1);
+            }
+            other => panic!("expected episode hit via minute gist, got {other:?}"),
+        }
+    }
+
+    /// Hybrid episode search: an episode whose text does NOT match FTS is
+    /// still found via its in-enclave vector, with an RRF score attached.
+    #[tokio::test]
+    async fn episode_hybrid_finds_vector_match() {
+        use crate::episodes::{upsert_episodes, write_episode_embedding, EpisodeInput};
+        let store = make_store();
+        store
+            .with_user("ep_hybrid_u", |conn| {
+                let ids = upsert_episodes(
+                    conn,
+                    &[EpisodeInput {
+                        id: None,
+                        started_at: "2026-07-05T09:00:00Z".into(),
+                        ended_at: "2026-07-05T09:30:00Z".into(),
+                        episode_type: None,
+                        title: "Morning sync".into(),
+                        summary: None,
+                        participants: None,
+                        languages: None,
+                        action_items: None,
+                        minute_summaries: None,
+                        model: None,
+                        member_utterance_ids: vec![],
+                        member_screenshot_ids: vec![],
+                    }],
+                )?;
+                write_episode_embedding(conn, ids[0], &make_embedding(1.0))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let req = SearchRequest {
+            kinds: vec!["episode".into()],
+            ..req_hybrid("ep_hybrid_u", "nomatchterm", 1.0)
+        };
+        let hits = store
+            .with_user("ep_hybrid_u", |conn| search_episodes(conn, &req))
+            .await
+            .unwrap();
+        match hits.first() {
+            Some(SearchHit::Episode { score, snippet, .. }) => {
+                assert!(score.is_some(), "hybrid episode hit must carry RRF score");
+                assert!(snippet.is_none(), "vector-only match has no FTS snippet");
+            }
+            other => panic!("expected vector-matched episode, got {other:?}"),
+        }
     }
 
     /// Hybrid screenshot search: a screenshot whose OCR text does NOT match

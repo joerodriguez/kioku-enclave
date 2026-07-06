@@ -56,9 +56,24 @@ fn response_schema() -> Value {
                         "summary": {"type": "STRING"},
                         "participants": {"type": "ARRAY", "items": {"type": "STRING"}},
                         "languages": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "action_items": {"type": "ARRAY", "items": {"type": "STRING"}}
+                        "action_items": {"type": "ARRAY", "items": {"type": "STRING"}},
+                        // ADR-0004: minute-timeline gists, generated eagerly in
+                        // this same pass. Constrained decoding emits nothing
+                        // that isn't in the schema — without this field the
+                        // model could never return minutes.
+                        "minutes": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "start": {"type": "STRING"},
+                                    "gist": {"type": "STRING"}
+                                },
+                                "required": ["start","gist"]
+                            }
+                        }
                     },
-                    "required": ["started_at","ended_at","title"]
+                    "required": ["started_at","ended_at","title","minutes"]
                 }
             }
         },

@@ -34,7 +34,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::episodes::{upsert_episodes, EpisodeInput};
+use crate::episodes::{upsert_episodes, write_episode_embedding, EpisodeInput, MinuteBucket};
 use crate::error::Result;
 
 use super::isotime::{format_epoch_millis, parse_epoch_millis};
@@ -402,6 +402,7 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         participants: Option<Vec<String>>,
         languages: Option<Vec<String>>,
         action_items: Option<Vec<String>>,
+        minutes: Option<Vec<MinuteBucket>>,
     }
     let str_arr = |v: Option<&Value>| -> Option<Vec<String>> {
         v.and_then(|x| x.as_array()).map(|a| {
@@ -428,6 +429,19 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
                 e_ms = e_ms.max(ms(&open.ended_at));
             }
         }
+        // Minute-timeline gists for THIS window (ADR-0004). On extension these
+        // cover only the new minutes; the upsert merges them into the stored
+        // buckets (§G.1).
+        let minutes = e.get("minutes").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    Some(MinuteBucket {
+                        start: m.get("start")?.as_str()?.to_string(),
+                        gist: m.get("gist")?.as_str()?.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
         eps.push(Ep {
             existing_id,
             started: s_ms,
@@ -438,6 +452,7 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
             participants: str_arr(e.get("participants")),
             languages: str_arr(e.get("languages")),
             action_items: str_arr(e.get("action_items")),
+            minutes,
         });
     }
 
@@ -482,6 +497,7 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
             participants: ep.participants.clone(),
             languages: ep.languages.clone(),
             action_items: ep.action_items.clone(),
+            minute_summaries: ep.minutes.clone(),
             model: Some(state.config.vertex_model.clone()),
             member_utterance_ids: utt_ids.clone(),
             member_screenshot_ids: scr_ids.clone(),
@@ -495,8 +511,11 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
             .store
             .with_user(&user, move |conn| upsert_episodes(conn, &to_upsert))
             .await?;
-        state.store.save_user(&user).await?;
         upserted = ids.len();
+        // §G.2: embed the upserted episodes in-enclave BEFORE the save so the
+        // vectors persist in the same GCS write.
+        embed_episodes(state, &user, &ids).await;
+        state.store.save_user(&user).await?;
     }
 
     // Nothing upserted from a tail-bounded window: HOLD the cursor so the tail
@@ -518,6 +537,88 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         .await?;
     info!(user_id, upserted, dropped, "summarized");
     Ok(serde_json::json!({ "episodes": upserted, "dropped": dropped, "to": cutoff_iso }))
+}
+
+/// In-enclave episode embeddings (ADR-0004 §G.2). Episodes are born in the
+/// enclave — the Mac never sees them — so their vectors are computed HERE
+/// with the in-TEE candle encoder, in the same pinned `MODEL_ID` space as the
+/// Mac-computed document vectors (mixing spaces silently corrupts KNN). Cost
+/// is bounded: one embed per upserted episode per summarizer window.
+///
+/// Text is read back from the stored rows (title + exec summary + minute
+/// gists) so extensions embed the full §G.1-merged timeline, not just the new
+/// window. Best-effort: an absent engine or a failed embed leaves the episode
+/// FTS-only — it never fails the summarizer run.
+async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) {
+    let Some(engine) = state.embedding.as_ref().cloned() else {
+        return;
+    };
+
+    let id_list = ids.to_vec();
+    let rows: Vec<(i64, String)> = match state
+        .store
+        .with_user(user_id, move |conn| {
+            let mut out = Vec::new();
+            for id in id_list {
+                let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+                    .query_row(
+                        "SELECT title, summary, minutes_text FROM episodes WHERE id = ?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .ok();
+                if let Some((title, summary, minutes)) = row {
+                    let text = [title, summary, minutes]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.trim().is_empty() {
+                        out.push((id, text));
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "episode embed: read-back failed");
+            return;
+        }
+    };
+
+    // CPU-bound inference (~10–50 ms each) — blocking pool, not the async worker.
+    let mut vectors: Vec<(i64, Vec<f32>)> = Vec::new();
+    for (id, text) in rows {
+        let eng = engine.clone();
+        match tokio::task::spawn_blocking(move || eng.embed(&text)).await {
+            Ok(Ok(v)) => vectors.push((id, v)),
+            Ok(Err(e)) => {
+                warn!(
+                    episode_id = id,
+                    "episode embed failed ({e}) — FTS-only for this episode"
+                );
+            }
+            Err(e) => warn!(episode_id = id, "episode embed task panicked ({e})"),
+        }
+    }
+    if vectors.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .store
+        .with_user(user_id, move |conn| {
+            for (id, v) in &vectors {
+                write_episode_embedding(conn, *id, v)?;
+            }
+            Ok(())
+        })
+        .await
+    {
+        warn!(error = %e, "episode embed: vector write failed");
+    }
 }
 
 fn parse_ref(r: &str) -> usize {
@@ -769,7 +870,7 @@ pub fn maybe_trigger(state: Arc<CpState>, user_id: String) {
     });
 }
 
-const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[]}]}";
+const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n9. minutes: a minute-by-minute timeline of the episode's NEW activity. Bucket the NEW CAPTURE LOG into 1–5-minute buckets and give each a one-line concrete gist naming the subject (\"Kate & Sean arrival plans\", \"Pesto recipe, lobster question\") — never generic filler (\"conversation continues\"). Each bucket: {\"start\":\"<ISO of bucket start>\",\"gist\":\"...\"}. Cover ONLY minutes present in the NEW CAPTURE LOG — for an extension, earlier minutes are already stored; never re-emit or invent them.\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[],\"minutes\":[{\"start\":\"<ISO>\",\"gist\":\"...\"}]}]}";
 
 #[cfg(test)]
 mod tests {
