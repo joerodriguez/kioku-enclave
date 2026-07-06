@@ -435,6 +435,129 @@ pub async fn handle_episodes_delete_range(
     Ok(Json(EpisodesDeleteRangeResponse { deleted }))
 }
 
+// ── Purge (episode + member raw data) ────────────────────────────────────────
+
+/// Result of purging one episode: counts plus the `source_key`s of the
+/// deleted records, so the Mac debugger can purge the matching LOCAL rows and
+/// media files (a cloud-only delete would resurrect on a forced resync).
+#[derive(Debug, Serialize, Default)]
+pub struct EpisodePurge {
+    pub deleted_utterances: usize,
+    pub deleted_screenshots: usize,
+    pub deleted_segments: usize,
+    pub utterance_source_keys: Vec<String>,
+    pub screenshot_source_keys: Vec<String>,
+}
+
+/// Delete an episode AND the raw records behind it (user-initiated purge;
+/// PRODUCT-SPEC §4.4: delete must be complete). Removes:
+/// - member utterances + screenshots (fixed 'delete'-command triggers keep
+///   the external-content FTS indexes consistent), their vec0 vectors, and
+///   any episode_members rows referencing them from OTHER episodes;
+/// - audio_segments left with no utterances;
+/// - the episode row (FTS trigger + episode_members cascade) and its
+///   vec_episodes vector.
+///
+/// Records shared with other episodes are deleted too — the user asked for
+/// the content to be gone, not merely unlinked. Returns `None` when the
+/// episode does not exist.
+pub(crate) fn purge_episode(
+    conn: &rusqlite::Connection,
+    episode_id: i64,
+) -> Result<Option<EpisodePurge>> {
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM episodes WHERE id = ?1", [episode_id], |_| {
+            Ok(true)
+        })
+        .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    }
+
+    let collect = |sql: &str| -> Result<Vec<(i64, Option<String>)>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([episode_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    };
+    let utts = collect(
+        "SELECT u.id, u.source_key FROM episode_members m \
+         JOIN utterances u ON u.id = m.record_id \
+         WHERE m.episode_id = ?1 AND m.record_type = 'utterance'",
+    )?;
+    let scrs = collect(
+        "SELECT s.id, s.source_key FROM episode_members m \
+         JOIN screenshots s ON s.id = m.record_id \
+         WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'",
+    )?;
+
+    let id_list = |rows: &[(i64, Option<String>)]| {
+        rows.iter()
+            .map(|(id, _)| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut purge = EpisodePurge {
+        utterance_source_keys: utts.iter().filter_map(|(_, k)| k.clone()).collect(),
+        screenshot_source_keys: scrs.iter().filter_map(|(_, k)| k.clone()).collect(),
+        ..Default::default()
+    };
+
+    if !utts.is_empty() {
+        let ids = id_list(&utts);
+        // Segments touched by these utterances, checked for emptiness after.
+        let seg_ids: Vec<i64> = {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT audio_segment_id FROM utterances WHERE id IN ({ids})"
+            ))?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<i64>, _>>()?;
+            rows
+        };
+        conn.execute_batch(&format!(
+            "DELETE FROM vec_utterances WHERE utterance_id IN ({ids});
+             DELETE FROM episode_members WHERE record_type='utterance' AND record_id IN ({ids});
+             DELETE FROM utterances WHERE id IN ({ids});"
+        ))?;
+        purge.deleted_utterances = utts.len();
+        if !seg_ids.is_empty() {
+            let segs = seg_ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(
+                &format!(
+                    "DELETE FROM audio_segments WHERE id IN ({segs}) \
+                     AND NOT EXISTS (SELECT 1 FROM utterances u WHERE u.audio_segment_id = audio_segments.id)"
+                ),
+                [],
+            )?;
+            purge.deleted_segments = conn.changes() as usize;
+        }
+    }
+
+    if !scrs.is_empty() {
+        let ids = id_list(&scrs);
+        conn.execute_batch(&format!(
+            "DELETE FROM vec_screenshots WHERE screenshot_id IN ({ids});
+             DELETE FROM episode_members WHERE record_type='screenshot' AND record_id IN ({ids});
+             DELETE FROM screenshots WHERE id IN ({ids});"
+        ))?;
+        purge.deleted_screenshots = scrs.len();
+    }
+
+    conn.execute("DELETE FROM episodes WHERE id = ?1", [episode_id])?;
+    conn.execute(
+        "DELETE FROM vec_episodes WHERE episode_id = ?1",
+        [episode_id],
+    )?;
+
+    Ok(Some(purge))
+}
+
 // ── Members (drill-in) ───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -903,6 +1026,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2, "re-binding same members must not duplicate");
+    }
+
+    /// Purge: the episode, its member rows, their FTS + vec entries, emptied
+    /// segments, and cross-episode member references all go; unrelated
+    /// records survive; the external-content FTS indexes stay consistent
+    /// (integrity-check passes — this is what the trigger fix is for).
+    #[tokio::test]
+    async fn purge_episode_removes_members_and_keeps_fts_consistent() {
+        let store = make_store();
+        let (ep_id, other_ep, keep_utt) = store
+            .with_user("purge_user", |conn| {
+                conn.execute(
+                    r#"INSERT INTO audio_segments (started_at, ended_at, duration_seconds, source_type)
+                       VALUES ('2026-07-06T09:00:00Z', '2026-07-06T09:01:00Z', 60.0, 'mic')"#,
+                    [],
+                )?;
+                let seg = conn.last_insert_rowid();
+                conn.execute(
+                    r#"INSERT INTO utterances (audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label, source_key)
+                       VALUES (?1, 0.0, 5.0, 'secret lobster recipe', 'Me', 'dev:1:11')"#,
+                    [seg],
+                )?;
+                let utt = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO vec_utterances (utterance_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![utt, vec![0u8; 384 * 4]],
+                )?;
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text, source_key) VALUES ('2026-07-06T09:00:30Z', 'zanzibar dashboard', 'dev:21')",
+                    [],
+                )?;
+                let scr = conn.last_insert_rowid();
+                // A second, UNRELATED segment+utterance that must survive.
+                conn.execute(
+                    r#"INSERT INTO audio_segments (started_at, ended_at, duration_seconds, source_type)
+                       VALUES ('2026-07-06T10:00:00Z', '2026-07-06T10:01:00Z', 60.0, 'mic')"#,
+                    [],
+                )?;
+                let seg2 = conn.last_insert_rowid();
+                conn.execute(
+                    r#"INSERT INTO utterances (audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label)
+                       VALUES (?1, 0.0, 5.0, 'unrelated survivor', 'Me')"#,
+                    [seg2],
+                )?;
+                let keep_utt = conn.last_insert_rowid();
+
+                let ids = upsert_episodes(
+                    conn,
+                    &[EpisodeInput {
+                        member_utterance_ids: vec![utt],
+                        member_screenshot_ids: vec![scr],
+                        ..sample_episode("2026-07-06T09:00:00Z", "2026-07-06T09:30:00Z")
+                    }],
+                )?;
+                write_episode_embedding(conn, ids[0], &[0.5f32; 384])?;
+                // A second episode also referencing the screenshot (shared record).
+                let other = upsert_episodes(
+                    conn,
+                    &[EpisodeInput {
+                        member_screenshot_ids: vec![scr],
+                        ..sample_episode("2026-07-06T09:10:00Z", "2026-07-06T09:20:00Z")
+                    }],
+                )?;
+                Ok((ids[0], other[0], keep_utt))
+            })
+            .await
+            .unwrap();
+
+        let purge = store
+            .with_user("purge_user", |conn| purge_episode(conn, ep_id))
+            .await
+            .unwrap()
+            .expect("episode exists");
+        assert_eq!(purge.deleted_utterances, 1);
+        assert_eq!(purge.deleted_screenshots, 1);
+        assert_eq!(purge.deleted_segments, 1, "emptied segment removed");
+        assert_eq!(purge.utterance_source_keys, vec!["dev:1:11"]);
+        assert_eq!(purge.screenshot_source_keys, vec!["dev:21"]);
+
+        store
+            .with_user("purge_user", |conn| {
+                let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+                assert_eq!(count("SELECT count(*) FROM episodes WHERE id = 1"), 0);
+                assert_eq!(count("SELECT count(*) FROM utterances WHERE source_key='dev:1:11'"), 0);
+                assert_eq!(count("SELECT count(*) FROM screenshots"), 0);
+                assert_eq!(count("SELECT count(*) FROM vec_utterances"), 0);
+                assert_eq!(count("SELECT count(*) FROM vec_episodes WHERE episode_id = 1"), 0);
+                // Cross-episode reference to the shared screenshot is gone,
+                // but the other episode itself survives.
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM episode_members WHERE episode_id = ?1",
+                        [other_ep],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                    0
+                );
+                assert_eq!(count("SELECT count(*) FROM episodes"), 1);
+                // Unrelated records survive.
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM utterances WHERE id = ?1",
+                        [keep_utt],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                    1
+                );
+                // FTS indexes are CONSISTENT after the deletes (the whole
+                // point of the 'delete'-command trigger fix): integrity-check
+                // errors out on a corrupted external-content index.
+                conn.execute_batch(
+                    "INSERT INTO utterances_fts(utterances_fts) VALUES('integrity-check');
+                     INSERT INTO screenshots_fts(screenshots_fts) VALUES('integrity-check');
+                     INSERT INTO episodes_fts(episodes_fts) VALUES('integrity-check');",
+                )?;
+                // And the deleted text is gone from search while the survivor is found.
+                assert_eq!(
+                    count("SELECT count(*) FROM utterances_fts WHERE utterances_fts MATCH 'lobster'"),
+                    0
+                );
+                assert_eq!(
+                    count("SELECT count(*) FROM utterances_fts WHERE utterances_fts MATCH 'survivor'"),
+                    1
+                );
+                assert_eq!(
+                    count("SELECT count(*) FROM screenshots_fts WHERE screenshots_fts MATCH 'zanzibar'"),
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Purging a nonexistent episode is a clean None.
+        let missing = store
+            .with_user("purge_user", |conn| purge_episode(conn, 9999))
+            .await
+            .unwrap();
+        assert!(missing.is_none());
     }
 
     #[tokio::test]

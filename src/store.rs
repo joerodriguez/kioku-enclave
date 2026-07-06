@@ -470,26 +470,33 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
     embedding float[384] distance_metric=cosine
 );
 
--- FTS sync triggers: utterances
+-- FTS sync triggers: utterances. Like episodes_fts below, these are
+-- EXTERNAL-CONTENT tables: delete/update must use the 'delete' command with
+-- the OLD column values — by AFTER DELETE time the content row is gone and a
+-- plain DELETE/UPDATE on the shadow can't recover the terms (index
+-- corruption). Harmless historically (rows were never deleted); load-bearing
+-- since episode purge (ADR-0004 follow-up) started deleting member rows.
 CREATE TRIGGER IF NOT EXISTS utterances_insert_fts AFTER INSERT ON utterances BEGIN
     INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
 END;
 CREATE TRIGGER IF NOT EXISTS utterances_delete_fts AFTER DELETE ON utterances BEGIN
-    DELETE FROM utterances_fts WHERE rowid = old.id;
+    INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
 CREATE TRIGGER IF NOT EXISTS utterances_update_fts AFTER UPDATE ON utterances BEGIN
-    UPDATE utterances_fts SET text = new.text WHERE rowid = new.id;
+    INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
 END;
 
--- FTS sync triggers: screenshots
+-- FTS sync triggers: screenshots (same 'delete'-command requirement as above)
 CREATE TRIGGER IF NOT EXISTS screenshots_insert_fts AFTER INSERT ON screenshots BEGIN
     INSERT INTO screenshots_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
 END;
 CREATE TRIGGER IF NOT EXISTS screenshots_delete_fts AFTER DELETE ON screenshots BEGIN
-    DELETE FROM screenshots_fts WHERE rowid = old.id;
+    INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
 END;
 CREATE TRIGGER IF NOT EXISTS screenshots_update_fts AFTER UPDATE ON screenshots BEGIN
-    UPDATE screenshots_fts SET ocr_text = new.ocr_text WHERE rowid = new.id;
+    INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
+    INSERT INTO screenshots_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
 END;
 
 -- FTS sync triggers: episodes. external-content FTS5 must be maintained with
@@ -731,6 +738,46 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         if !msg.contains("already exists") {
             return Err(e.into());
         }
+    }
+
+    // ── utterances/screenshots FTS trigger re-point (episode purge prereq) ────
+    //
+    // Old blobs carry delete/update triggers in the plain DELETE/UPDATE form,
+    // which corrupts an external-content FTS5 index the first time a row is
+    // actually deleted (the episodes footgun, present-but-dormant here since
+    // day one). Detect the old form by the absence of the 'delete' command in
+    // the trigger SQL and recreate. Trigger-only swap — the indexed content is
+    // unchanged, so no rebuild is needed.
+    let old_form: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+         AND name IN ('utterances_delete_fts','screenshots_delete_fts') \
+         AND sql NOT LIKE '%''delete''%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if old_form > 0 {
+        conn.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS utterances_delete_fts;
+            DROP TRIGGER IF EXISTS utterances_update_fts;
+            DROP TRIGGER IF EXISTS screenshots_delete_fts;
+            DROP TRIGGER IF EXISTS screenshots_update_fts;
+            CREATE TRIGGER utterances_delete_fts AFTER DELETE ON utterances BEGIN
+                INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
+            END;
+            CREATE TRIGGER utterances_update_fts AFTER UPDATE ON utterances BEGIN
+                INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
+                INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
+            END;
+            CREATE TRIGGER screenshots_delete_fts AFTER DELETE ON screenshots BEGIN
+                INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
+            END;
+            CREATE TRIGGER screenshots_update_fts AFTER UPDATE ON screenshots BEGIN
+                INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
+                INSERT INTO screenshots_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
+            END;
+            "#,
+        )?;
     }
 
     Ok(())
@@ -1210,6 +1257,83 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1, "second migration run must not lose the index");
+    }
+
+    /// A blob with the old plain-DELETE FTS triggers on utterances/screenshots
+    /// (the dormant external-content footgun) must get them re-pointed to the
+    /// 'delete'-command form so row deletion keeps the index consistent.
+    #[test]
+    fn utterance_fts_delete_trigger_repointed() {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE audio_segments (id INTEGER PRIMARY KEY, started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL, duration_seconds REAL NOT NULL DEFAULT 0,
+                source_type TEXT NOT NULL DEFAULT 'mic');
+            CREATE TABLE utterances (id INTEGER PRIMARY KEY, audio_segment_id INTEGER NOT NULL,
+                start_offset_seconds REAL NOT NULL DEFAULT 0, end_offset_seconds REAL NOT NULL DEFAULT 0,
+                text TEXT NOT NULL, speaker_label TEXT NOT NULL DEFAULT 'Me');
+            CREATE TABLE screenshots (id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL, ocr_text TEXT);
+            CREATE TABLE episodes (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL, type TEXT, title TEXT, summary TEXT, participants TEXT,
+                languages TEXT, action_items TEXT, model TEXT, topics TEXT, people TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT);
+            CREATE VIRTUAL TABLE utterances_fts USING fts5(text, content='utterances', content_rowid='id');
+            CREATE VIRTUAL TABLE screenshots_fts USING fts5(ocr_text, content='screenshots', content_rowid='id');
+            CREATE TRIGGER utterances_insert_fts AFTER INSERT ON utterances BEGIN
+                INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
+            END;
+            CREATE TRIGGER utterances_delete_fts AFTER DELETE ON utterances BEGIN
+                DELETE FROM utterances_fts WHERE rowid = old.id;
+            END;
+            CREATE TRIGGER screenshots_insert_fts AFTER INSERT ON screenshots BEGIN
+                INSERT INTO screenshots_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
+            END;
+            CREATE TRIGGER screenshots_delete_fts AFTER DELETE ON screenshots BEGIN
+                DELETE FROM screenshots_fts WHERE rowid = old.id;
+            END;
+            INSERT INTO audio_segments (started_at, ended_at) VALUES ('2026-07-06T09:00:00Z','2026-07-06T09:01:00Z');
+            INSERT INTO utterances (audio_segment_id, text) VALUES (1, 'ephemeral walrus');
+            INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-07-06T09:00:30Z', 'ephemeral aurora');
+            "#,
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        // Deleting through the re-pointed triggers keeps the index consistent…
+        conn.execute("DELETE FROM utterances WHERE id = 1", [])
+            .unwrap();
+        conn.execute("DELETE FROM screenshots WHERE id = 1", [])
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO utterances_fts(utterances_fts) VALUES('integrity-check');
+             INSERT INTO screenshots_fts(screenshots_fts) VALUES('integrity-check');",
+        )
+        .unwrap();
+        // …and the terms are actually gone.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM utterances_fts WHERE utterances_fts MATCH 'walrus'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0);
+
+        // Idempotent: second run leaves the fixed triggers alone.
+        run_migrations(&conn).unwrap();
+        let fixed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+                 AND name IN ('utterances_delete_fts','screenshots_delete_fts') \
+                 AND sql LIKE '%''delete''%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fixed, 2);
     }
 
     // ── Fake KMS ──────────────────────────────────────────────────────────────

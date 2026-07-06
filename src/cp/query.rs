@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Extension, Router,
 };
 use serde::Deserialize;
@@ -29,6 +29,7 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/mcp", post(mcp_endpoint))
         .route("/api/search", get(rest_search))
         .route("/api/episodes", get(rest_episodes))
+        .route("/api/episodes/{id}", delete(rest_episode_delete))
         .route("/api/episodes/{id}/members", get(rest_episode_members))
 }
 
@@ -616,6 +617,69 @@ async fn rest_episodes(
 ) -> Response {
     Json(list_episodes_value(&s, &user.0, p.from, p.to, p.max_episodes.unwrap_or(50)).await)
         .into_response()
+}
+
+/// DELETE /api/episodes/{id} — purge an episode AND its member raw records
+/// (utterances, screenshots, emptied segments, vectors, FTS entries). The
+/// response carries the deleted records' source_keys so the caller (the Mac
+/// debugger's local server) can purge the matching LOCAL rows and media files
+/// — without that, a forced resync would re-upload the content.
+async fn rest_episode_delete(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<i64>,
+) -> Response {
+    let result = s
+        .store
+        .with_user(&user.0, move |conn| {
+            crate::episodes::purge_episode(conn, id)
+        })
+        .await;
+    match result {
+        Ok(Some(p)) => {
+            // Persist before answering — a purge that only lives in the
+            // cached handle isn't a purge.
+            if let Err(e) = s.store.save_user(&user.0).await {
+                tracing::error!(error = %e, "episode purge: save failed");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "save_failed"})),
+                )
+                    .into_response();
+            }
+            tracing::info!(
+                user_id = %user.0,
+                episode_id = id,
+                utterances = p.deleted_utterances,
+                screenshots = p.deleted_screenshots,
+                segments = p.deleted_segments,
+                "episode purged"
+            );
+            Json(json!({
+                "deleted": true,
+                "episode_id": id,
+                "deleted_utterances": p.deleted_utterances,
+                "deleted_screenshots": p.deleted_screenshots,
+                "deleted_segments": p.deleted_segments,
+                "utterance_source_keys": p.utterance_source_keys,
+                "screenshot_source_keys": p.screenshot_source_keys,
+            }))
+            .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "episode_not_found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, episode_id = id, "episode purge failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "enclave_unavailable"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn rest_episode_members(
