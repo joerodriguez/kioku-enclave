@@ -482,7 +482,9 @@ END;
 CREATE TRIGGER IF NOT EXISTS utterances_delete_fts AFTER DELETE ON utterances BEGIN
     INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
-CREATE TRIGGER IF NOT EXISTS utterances_update_fts AFTER UPDATE ON utterances BEGIN
+-- Scoped to the indexed column (ADR-0006 §F.7): bulk speaker relabels
+-- must not delete-and-reinsert unchanged text for every touched row.
+CREATE TRIGGER IF NOT EXISTS utterances_update_fts AFTER UPDATE OF text ON utterances BEGIN
     INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
     INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -494,7 +496,7 @@ END;
 CREATE TRIGGER IF NOT EXISTS screenshots_delete_fts AFTER DELETE ON screenshots BEGIN
     INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
 END;
-CREATE TRIGGER IF NOT EXISTS screenshots_update_fts AFTER UPDATE ON screenshots BEGIN
+CREATE TRIGGER IF NOT EXISTS screenshots_update_fts AFTER UPDATE OF ocr_text ON screenshots BEGIN
     INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
     INSERT INTO screenshots_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
 END;
@@ -513,7 +515,9 @@ CREATE TRIGGER IF NOT EXISTS episodes_delete_fts AFTER DELETE ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
         VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
 END;
-CREATE TRIGGER IF NOT EXISTS episodes_update_fts AFTER UPDATE ON episodes BEGIN
+-- Scoped (ADR-0006 §F.7): participants-only patches (§E.2) must not
+-- re-index title/summary/minutes.
+CREATE TRIGGER IF NOT EXISTS episodes_update_fts AFTER UPDATE OF title, summary, minutes_text ON episodes BEGIN
     INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
         VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
     INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
@@ -678,7 +682,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
                     VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
             END;
-            CREATE TRIGGER episodes_update_fts AFTER UPDATE ON episodes BEGIN
+            CREATE TRIGGER episodes_update_fts AFTER UPDATE OF title, summary, minutes_text ON episodes BEGIN
                 INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
                     VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
                 INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
@@ -740,6 +744,51 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         }
     }
 
+    // ── FTS update-trigger scoping (ADR-0006 §F.7) ─────────────────────────────
+    //
+    // Blobs migrated before this pass carry UPDATE triggers that fire on ANY
+    // column update. A bulk speaker relabel (thousands of rows, only
+    // speaker_label changes) would then delete-and-reinsert the unchanged
+    // indexed text for every row — pure FTS write churn. Same for
+    // participants-only episode patches (§E.2). Re-point the update triggers
+    // to `AFTER UPDATE OF <indexed column(s)>`; detection is the absence of
+    // "UPDATE OF" in the trigger SQL. Trigger-only swap; content unchanged,
+    // no rebuild. Runs AFTER the blocks below so their (scoped) recreations
+    // aren't double-handled on fresh migrations.
+    let scope_update_triggers = |conn: &Connection| -> Result<()> {
+        let unscoped: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' \
+             AND name IN ('utterances_update_fts','screenshots_update_fts','episodes_update_fts') \
+             AND sql NOT LIKE '%UPDATE OF%'",
+            [],
+            |r| r.get(0),
+        )?;
+        if unscoped > 0 {
+            conn.execute_batch(
+                r#"
+                DROP TRIGGER IF EXISTS utterances_update_fts;
+                DROP TRIGGER IF EXISTS screenshots_update_fts;
+                DROP TRIGGER IF EXISTS episodes_update_fts;
+                CREATE TRIGGER utterances_update_fts AFTER UPDATE OF text ON utterances BEGIN
+                    INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
+                    INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+                CREATE TRIGGER screenshots_update_fts AFTER UPDATE OF ocr_text ON screenshots BEGIN
+                    INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
+                    INSERT INTO screenshots_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
+                END;
+                CREATE TRIGGER episodes_update_fts AFTER UPDATE OF title, summary, minutes_text ON episodes BEGIN
+                    INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, minutes_text)
+                        VALUES ('delete', old.id, old.title, old.summary, old.minutes_text);
+                    INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
+                        VALUES (new.id, new.title, new.summary, new.minutes_text);
+                END;
+                "#,
+            )?;
+        }
+        Ok(())
+    };
+
     // ── utterances/screenshots FTS trigger re-point (episode purge prereq) ────
     //
     // Old blobs carry delete/update triggers in the plain DELETE/UPDATE form,
@@ -765,20 +814,25 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             CREATE TRIGGER utterances_delete_fts AFTER DELETE ON utterances BEGIN
                 INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
             END;
-            CREATE TRIGGER utterances_update_fts AFTER UPDATE ON utterances BEGIN
+            CREATE TRIGGER utterances_update_fts AFTER UPDATE OF text ON utterances BEGIN
                 INSERT INTO utterances_fts(utterances_fts, rowid, text) VALUES ('delete', old.id, old.text);
                 INSERT INTO utterances_fts(rowid, text) VALUES (new.id, new.text);
             END;
             CREATE TRIGGER screenshots_delete_fts AFTER DELETE ON screenshots BEGIN
                 INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
             END;
-            CREATE TRIGGER screenshots_update_fts AFTER UPDATE ON screenshots BEGIN
+            CREATE TRIGGER screenshots_update_fts AFTER UPDATE OF ocr_text ON screenshots BEGIN
                 INSERT INTO screenshots_fts(screenshots_fts, rowid, ocr_text) VALUES ('delete', old.id, old.ocr_text);
                 INSERT INTO screenshots_fts(rowid, ocr_text) VALUES (new.id, new.ocr_text);
             END;
             "#,
         )?;
     }
+
+    // Last: scope any remaining unscoped update triggers (§F.7). Runs after
+    // every block that may have (re)created triggers, so one pass suffices
+    // for blobs at any prior migration level.
+    scope_update_triggers(conn)?;
 
     Ok(())
 }

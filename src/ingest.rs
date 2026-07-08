@@ -241,6 +241,34 @@ pub(crate) fn ingest_utterances(
         let row_inserted = conn.changes() as usize;
         inserted += row_inserted;
 
+        // Relabel path (ADR-0006 §C.4): a re-sent row whose source_key already
+        // exists may carry a NEW speaker_label (voice-memory naming on the Mac
+        // renames "S7" → "Lynn" and re-queues the rows). Update the label in
+        // place — utterances_fts doesn't index it and the update trigger is
+        // scoped to `text` (§F.7), so this is churn-free — and patch the
+        // containing episodes' participants arrays (exact-element match only;
+        // prose is deliberately untouched, §E.3).
+        if row_inserted == 0 {
+            if let Some(ref sk) = u.source_key {
+                let existing: Option<(i64, String)> = conn
+                    .query_row(
+                        "SELECT id, speaker_label FROM utterances WHERE source_key = ?1",
+                        [sk],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .ok();
+                if let Some((utt_id, old_label)) = existing {
+                    if old_label != u.speaker_label && !u.speaker_label.is_empty() {
+                        conn.execute(
+                            "UPDATE utterances SET speaker_label = ?1 WHERE id = ?2",
+                            rusqlite::params![u.speaker_label, utt_id],
+                        )?;
+                        patch_episode_participants(conn, utt_id, &old_label, &u.speaker_label)?;
+                    }
+                }
+            }
+        }
+
         if !accept_embeddings {
             continue;
         }
@@ -267,6 +295,53 @@ pub(crate) fn ingest_utterances(
         }
     }
     Ok(inserted)
+}
+
+/// Patch the `participants` JSON arrays of episodes containing a relabeled
+/// utterance: replace array ELEMENTS exactly equal to the old label with the
+/// new one (ADR-0006 §E.2). Free-text summaries and minute gists are NOT
+/// rewritten (§E.3 — substring replacement in prose risks corrupting content).
+/// The episodes FTS update trigger is scoped to title/summary/minutes_text
+/// (§F.7), so a participants-only UPDATE causes no index churn.
+fn patch_episode_participants(
+    conn: &rusqlite::Connection,
+    utterance_id: i64,
+    old_label: &str,
+    new_label: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT e.id, e.participants FROM episodes e \
+         JOIN episode_members m ON m.episode_id = e.id \
+         WHERE m.record_type = 'utterance' AND m.record_id = ?1 \
+           AND e.participants IS NOT NULL",
+    )?;
+    let episodes: Vec<(i64, String)> = stmt
+        .query_map([utterance_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .filter_map(|x| x.ok())
+        .collect();
+
+    for (episode_id, participants_json) in episodes {
+        let Ok(serde_json::Value::Array(mut arr)) =
+            serde_json::from_str::<serde_json::Value>(&participants_json)
+        else {
+            continue;
+        };
+        let mut changed = false;
+        for v in arr.iter_mut() {
+            if v.as_str() == Some(old_label) {
+                *v = serde_json::Value::String(new_label.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            let updated = serde_json::to_string(&arr).unwrap_or_else(|_| participants_json.clone());
+            conn.execute(
+                "UPDATE episodes SET participants = ?1 WHERE id = ?2",
+                rusqlite::params![updated, episode_id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Which vec0 table an embedding targets.
@@ -791,5 +866,106 @@ mod tests {
             .expect("counts");
         assert_eq!(rows, 3, "all three texts ingest regardless of model gate");
         assert_eq!(vecs, 1, "only the matching-model vector survives");
+    }
+    /// ADR-0006 §C.4/§E.2: a re-sent utterance with the same source_key and a
+    /// NEW speaker_label relabels the stored row and patches the containing
+    /// episodes' participants arrays (exact element match only); FTS stays
+    /// consistent and unindexed-column churn does not occur.
+    #[tokio::test]
+    async fn resend_with_new_label_relabels_and_patches_participants() {
+        let store = make_store();
+
+        // Ingest the original row.
+        let mut original = utt(Some("dev:1:7"), "the quick brown fox");
+        original.speaker_label = "S7".to_string();
+        store
+            .with_user("relabel_u", |conn| {
+                ingest_utterances(conn, &[original], true)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Bind it to an episode whose participants mention S7 (and others).
+        store
+            .with_user("relabel_u", |conn| {
+                let utt_id: i64 = conn.query_row(
+                    "SELECT id FROM utterances WHERE source_key='dev:1:7'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                crate::episodes::upsert_episodes(
+                    conn,
+                    &[crate::episodes::EpisodeInput {
+                        id: None,
+                        started_at: "2026-01-01T09:00:00Z".into(),
+                        ended_at: "2026-01-01T09:30:00Z".into(),
+                        episode_type: None,
+                        title: "Chat with S7".into(),
+                        summary: Some("S7 said things".into()),
+                        participants: Some(vec!["Me".into(), "S7".into(), "Kate".into()]),
+                        languages: None,
+                        action_items: None,
+                        minute_summaries: None,
+                        model: None,
+                        member_utterance_ids: vec![utt_id],
+                        member_screenshot_ids: vec![],
+                    }],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Re-send the same source_key with the resolved name.
+        let mut renamed = utt(Some("dev:1:7"), "the quick brown fox");
+        renamed.speaker_label = "Lynn".to_string();
+        store
+            .with_user("relabel_u", |conn| {
+                let n = ingest_utterances(conn, &[renamed], true)?;
+                assert_eq!(n, 0, "re-send is not a new insert");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        store
+            .with_user("relabel_u", |conn| {
+                let label: String = conn.query_row(
+                    "SELECT speaker_label FROM utterances WHERE source_key='dev:1:7'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(label, "Lynn", "utterance relabeled in place");
+
+                let participants: String =
+                    conn.query_row("SELECT participants FROM episodes", [], |r| r.get(0))?;
+                let arr: Vec<String> = serde_json::from_str(&participants).unwrap();
+                assert_eq!(arr, vec!["Me", "Lynn", "Kate"], "exact element swapped");
+
+                // Prose untouched (§E.3).
+                let (title, summary): (String, String) =
+                    conn.query_row("SELECT title, summary FROM episodes", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                assert_eq!(title, "Chat with S7");
+                assert_eq!(summary, "S7 said things");
+
+                // FTS consistent after relabel + participants patch.
+                conn.execute_batch(
+                    "INSERT INTO utterances_fts(utterances_fts) VALUES('integrity-check');
+                     INSERT INTO episodes_fts(episodes_fts) VALUES('integrity-check');",
+                )?;
+                // Text unchanged and still searchable.
+                let hits: i64 = conn.query_row(
+                    "SELECT count(*) FROM utterances_fts WHERE utterances_fts MATCH 'fox'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(hits, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }
