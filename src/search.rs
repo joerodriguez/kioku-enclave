@@ -52,10 +52,17 @@ use crate::{error::Result, AppState};
 
 // ── Request / response types ──────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SearchRequest {
     pub user_id: String,
     pub query: String,
+    /// Optional speaker filter (ADR-0006 Phase 3): restricts utterance hits to
+    /// this exact `speaker_label` (a name or stable label, case-insensitive)
+    /// and episode hits to episodes whose `participants` include it. Clients
+    /// can also embed it in the query string as `speaker:Lynn` /
+    /// `speaker:"Lynn Chen"` — parsed out by [`search_all`].
+    #[serde(default)]
+    pub speaker: Option<String>,
     /// ISO-8601 lower bound (inclusive), optional
     pub time_start: Option<String>,
     /// ISO-8601 upper bound (inclusive), optional
@@ -158,10 +165,52 @@ pub async fn handle_search(
 
 // ── Core search logic ─────────────────────────────────────────────────────────
 
+/// Pull a `speaker:Name` / `speaker:"Multi Word"` token out of a query string
+/// (ADR-0006 Phase 3). Returns (query without the token, speaker if found).
+pub(crate) fn extract_speaker_filter(query: &str) -> (String, Option<String>) {
+    let lower = query.to_lowercase();
+    let Some(pos) = lower.find("speaker:") else {
+        return (query.to_string(), None);
+    };
+    let after = &query[pos + "speaker:".len()..];
+    let (speaker, rest) = if let Some(stripped) = after.strip_prefix('"') {
+        match stripped.find('"') {
+            Some(end) => (&stripped[..end], &stripped[end + 1..]),
+            None => (stripped, ""),
+        }
+    } else {
+        match after.find(char::is_whitespace) {
+            Some(end) => (&after[..end], &after[end..]),
+            None => (after, ""),
+        }
+    };
+    let cleaned = format!("{} {}", query[..pos].trim_end(), rest.trim())
+        .trim()
+        .to_string();
+    let speaker = speaker.trim();
+    if speaker.is_empty() {
+        (cleaned, None)
+    } else {
+        (cleaned, Some(speaker.to_string()))
+    }
+}
+
 pub(crate) fn search_all(
     conn: &rusqlite::Connection,
     req: &SearchRequest,
 ) -> Result<Vec<SearchHit>> {
+    // Honour an inline `speaker:` token in the query string.
+    let req = {
+        let (cleaned, parsed) = extract_speaker_filter(&req.query);
+        let mut r = req.clone();
+        if parsed.is_some() {
+            r.query = cleaned;
+            r.speaker = r.speaker.or(parsed);
+        }
+        r
+    };
+    let req = &req;
+
     let mut hits = Vec::new();
 
     // When `kinds` is empty, search everything; otherwise honour the filter.
@@ -171,7 +220,8 @@ pub(crate) fn search_all(
     if want("utterance") {
         hits.extend(search_utterances(conn, req)?);
     }
-    if want("screenshot") {
+    // A speaker filter can never match a screenshot — skip the kind entirely.
+    if want("screenshot") && req.speaker.is_none() {
         hits.extend(search_screenshots(conn, req)?);
     }
     if want("episode") {
@@ -217,13 +267,63 @@ fn rrf_merge(fts_rows: &[i64], knn_rows: &[(i64, f64)]) -> Vec<(i64, f64)> {
 // ── Utterance search (FTS-only or Hybrid RRF) ────────────────────────────────
 
 fn search_utterances(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<Vec<SearchHit>> {
+    // Pure speaker browse ("everything Lynn said"): no query text to match.
+    if req.query.trim().is_empty() {
+        return match &req.speaker {
+            Some(s) => search_utterances_by_speaker(conn, req, s),
+            None => Ok(vec![]),
+        };
+    }
     match &req.query_embedding {
         Some(qemb) => search_utterances_hybrid(conn, req, qemb),
         None => search_utterances_fts(conn, req),
     }
 }
 
-/// FTS-only utterance search — identical to the pre-vector implementation.
+/// Speaker-only browse (ADR-0006 Phase 3): newest utterances by one speaker.
+fn search_utterances_by_speaker(
+    conn: &rusqlite::Connection,
+    req: &SearchRequest,
+    speaker: &str,
+) -> Result<Vec<SearchHit>> {
+    let sql = r#"
+        SELECT u.id, u.text, u.speaker_label,
+               s.started_at, u.start_offset_seconds, u.end_offset_seconds
+        FROM utterances u
+        JOIN audio_segments s ON s.id = u.audio_segment_id
+        WHERE u.speaker_label = ?1 COLLATE NOCASE
+        AND (?2 IS NULL OR s.started_at >= ?2)
+        AND (?3 IS NULL OR s.started_at <= ?3)
+        ORDER BY s.started_at DESC
+        LIMIT ?4 OFFSET ?5
+    "#;
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            speaker,
+            req.time_start,
+            req.time_end,
+            req.limit as i64,
+            req.offset as i64,
+        ],
+        |r| {
+            Ok(SearchHit::Utterance {
+                id: r.get(0)?,
+                text: r.get(1)?,
+                speaker_label: r.get(2)?,
+                started_at: r.get(3)?,
+                start_offset_seconds: r.get(4)?,
+                end_offset_seconds: r.get(5)?,
+                score: None,
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// FTS-only utterance search — identical to the pre-vector implementation
+/// (plus the optional ADR-0006 speaker filter).
 fn search_utterances_fts(
     conn: &rusqlite::Connection,
     req: &SearchRequest,
@@ -238,6 +338,7 @@ fn search_utterances_fts(
         )
         AND (?2 IS NULL OR s.started_at >= ?2)
         AND (?3 IS NULL OR s.started_at <= ?3)
+        AND (?6 IS NULL OR u.speaker_label = ?6 COLLATE NOCASE)
         ORDER BY s.started_at DESC
         LIMIT ?4 OFFSET ?5
     "#;
@@ -250,6 +351,7 @@ fn search_utterances_fts(
             req.time_end,
             req.limit as i64,
             req.offset as i64,
+            req.speaker,
         ],
         |r| {
             Ok(SearchHit::Utterance {
@@ -355,22 +457,26 @@ fn search_utterances_hybrid(
         JOIN audio_segments s ON s.id = u.audio_segment_id
         WHERE (?1 IS NULL OR s.started_at >= ?1)
           AND (?2 IS NULL OR s.started_at <= ?2)
+          AND (?3 IS NULL OR u.speaker_label = ?3 COLLATE NOCASE)
         ORDER BY r.rrf_score DESC
         "#
     );
 
     let mut stmt = conn.prepare(&join_sql)?;
-    let rows = stmt.query_map(rusqlite::params![req.time_start, req.time_end], |r| {
-        Ok(SearchHit::Utterance {
-            id: r.get(0)?,
-            text: r.get(1)?,
-            speaker_label: r.get(2)?,
-            started_at: r.get(3)?,
-            start_offset_seconds: r.get(4)?,
-            end_offset_seconds: r.get(5)?,
-            score: Some(r.get::<_, f64>(6)?),
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![req.time_start, req.time_end, req.speaker],
+        |r| {
+            Ok(SearchHit::Utterance {
+                id: r.get(0)?,
+                text: r.get(1)?,
+                speaker_label: r.get(2)?,
+                started_at: r.get(3)?,
+                start_offset_seconds: r.get(4)?,
+                end_offset_seconds: r.get(5)?,
+                score: Some(r.get::<_, f64>(6)?),
+            })
+        },
+    )?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -532,10 +638,73 @@ pub(crate) fn search_episodes(
     conn: &rusqlite::Connection,
     req: &SearchRequest,
 ) -> Result<Vec<SearchHit>> {
+    if req.query.trim().is_empty() {
+        return match &req.speaker {
+            Some(s) => search_episodes_by_speaker(conn, req, s),
+            None => Ok(vec![]),
+        };
+    }
     match &req.query_embedding {
         Some(qemb) => search_episodes_hybrid(conn, req, qemb),
         None => search_episodes_fts(conn, req),
     }
+}
+
+/// SQL fragment matching a speaker against an episode's `participants` JSON
+/// array (ADR-0006 Phase 3): an element equal to the name, or the
+/// summarizer's "Name (S3)" form starting with it. `?N` is the speaker param.
+fn participants_match_sql(param: &str) -> String {
+    format!(
+        "(e.participants IS NOT NULL AND EXISTS ( \
+            SELECT 1 FROM json_each(e.participants) je \
+            WHERE je.value = {param} COLLATE NOCASE \
+               OR lower(je.value) LIKE lower({param}) || ' (%'))"
+    )
+}
+
+/// Speaker-only episode browse: episodes the person participated in.
+fn search_episodes_by_speaker(
+    conn: &rusqlite::Connection,
+    req: &SearchRequest,
+    speaker: &str,
+) -> Result<Vec<SearchHit>> {
+    let sql = format!(
+        r#"
+        SELECT e.id, e.started_at, e.ended_at, e.title, e.summary,
+               e.minute_summaries
+        FROM episodes e
+        WHERE {participants}
+          AND (?2 IS NULL OR e.started_at >= ?2)
+          AND (?3 IS NULL OR e.started_at <= ?3)
+        ORDER BY e.started_at DESC
+        LIMIT ?4 OFFSET ?5
+    "#,
+        participants = participants_match_sql("?1")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            speaker,
+            req.time_start,
+            req.time_end,
+            req.limit as i64,
+            req.offset as i64,
+        ],
+        |r| {
+            Ok(SearchHit::Episode {
+                id: r.get(0)?,
+                started_at: r.get(1)?,
+                ended_at: r.get(2)?,
+                title: r.get(3)?,
+                summary: r.get(4)?,
+                minute_summaries: json_array(r.get(5)?),
+                snippet: None,
+                score: None,
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn search_episodes_fts(conn: &rusqlite::Connection, req: &SearchRequest) -> Result<Vec<SearchHit>> {
@@ -548,9 +717,11 @@ fn search_episodes_fts(conn: &rusqlite::Connection, req: &SearchRequest) -> Resu
         WHERE episodes_fts MATCH ?1
           AND (?2 IS NULL OR e.started_at >= ?2)
           AND (?3 IS NULL OR e.started_at <= ?3)
+          AND (?6 IS NULL OR {participants})
         ORDER BY rank
         LIMIT ?4 OFFSET ?5
-    "#
+    "#,
+        participants = participants_match_sql("?6")
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -561,6 +732,7 @@ fn search_episodes_fts(conn: &rusqlite::Connection, req: &SearchRequest) -> Resu
             req.time_end,
             req.limit as i64,
             req.offset as i64,
+            req.speaker,
         ],
         |r| {
             Ok(SearchHit::Episode {
@@ -645,24 +817,29 @@ fn search_episodes_hybrid(
         JOIN episodes e ON e.id = r.episode_id
         WHERE (?1 IS NULL OR e.started_at >= ?1)
           AND (?2 IS NULL OR e.started_at <= ?2)
+          AND (?3 IS NULL OR {participants})
         ORDER BY r.rrf_score DESC
-        "#
+        "#,
+        participants = participants_match_sql("?3")
     );
 
     let mut stmt = conn.prepare(&join_sql)?;
-    let rows = stmt.query_map(rusqlite::params![req.time_start, req.time_end], |r| {
-        let id: i64 = r.get(0)?;
-        Ok(SearchHit::Episode {
-            id,
-            started_at: r.get(1)?,
-            ended_at: r.get(2)?,
-            title: r.get(3)?,
-            summary: r.get(4)?,
-            minute_summaries: json_array(r.get(5)?),
-            snippet: None, // filled from the FTS map below
-            score: Some(r.get::<_, f64>(6)?),
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![req.time_start, req.time_end, req.speaker],
+        |r| {
+            let id: i64 = r.get(0)?;
+            Ok(SearchHit::Episode {
+                id,
+                started_at: r.get(1)?,
+                ended_at: r.get(2)?,
+                title: r.get(3)?,
+                summary: r.get(4)?,
+                minute_summaries: json_array(r.get(5)?),
+                snippet: None, // filled from the FTS map below
+                score: Some(r.get::<_, f64>(6)?),
+            })
+        },
+    )?;
     let mut hits = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     for hit in &mut hits {
         if let SearchHit::Episode { id, snippet, .. } = hit {
@@ -727,6 +904,7 @@ mod tests {
         SearchRequest {
             user_id: user.to_string(),
             query: query.to_string(),
+            speaker: None,
             time_start: None,
             time_end: None,
             limit: 100,
@@ -740,6 +918,7 @@ mod tests {
         SearchRequest {
             user_id: user.to_string(),
             query: query.to_string(),
+            speaker: None,
             time_start: None,
             time_end: None,
             limit: 100,
@@ -948,6 +1127,7 @@ mod tests {
         let req = SearchRequest {
             user_id: "hybrid_u".to_string(),
             query: "unique_fts_term".to_string(),
+            speaker: None,
             time_start: None,
             time_end: None,
             limit: 100,
@@ -1193,5 +1373,162 @@ mod tests {
             }
             other => panic!("expected screenshot hit, got {other:?}"),
         }
+    }
+
+    // ── Speaker filter (ADR-0006 Phase 3) ────────────────────────────────────
+
+    #[test]
+    fn speaker_token_extraction() {
+        assert_eq!(
+            extract_speaker_filter("speaker:Lynn pesto recipe"),
+            ("pesto recipe".to_string(), Some("Lynn".to_string()))
+        );
+        assert_eq!(
+            extract_speaker_filter("pesto speaker:\"Lynn Chen\" recipe"),
+            ("pesto recipe".to_string(), Some("Lynn Chen".to_string()))
+        );
+        assert_eq!(
+            extract_speaker_filter("speaker:S3"),
+            ("".to_string(), Some("S3".to_string()))
+        );
+        assert_eq!(
+            extract_speaker_filter("plain query"),
+            ("plain query".to_string(), None)
+        );
+    }
+
+    /// Seed two speakers saying the same term; the filter must pick one, and
+    /// an empty-query speaker browse must return only that speaker's rows.
+    #[tokio::test]
+    async fn speaker_filter_on_utterances() {
+        let store = make_store();
+        store
+            .with_user("spk_u", |conn| {
+                conn.execute(
+                    r#"INSERT INTO audio_segments
+                       (started_at, ended_at, duration_seconds, source_type)
+                       VALUES ('2026-01-02T09:00:00Z','2026-01-02T09:01:00Z',60.0,'system')"#,
+                    [],
+                )?;
+                let seg: i64 = conn.query_row(
+                    "SELECT id FROM audio_segments WHERE started_at='2026-01-02T09:00:00Z'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                for (label, text) in [("Lynn", "pesto recipe secrets"), ("S7", "pesto is overrated")] {
+                    conn.execute(
+                        r#"INSERT INTO utterances
+                           (audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label)
+                           VALUES (?1, 0.0, 5.0, ?2, ?3)"#,
+                        rusqlite::params![seg, text, label],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Inline token, case-insensitive label match.
+        let hits = store
+            .with_user("spk_u", |conn| {
+                search_all(conn, &req_fts("spk_u", "speaker:lynn pesto", vec![]))
+            })
+            .await
+            .unwrap();
+        let labels: Vec<&str> = hits
+            .iter()
+            .filter_map(|h| match h {
+                SearchHit::Utterance { speaker_label, .. } => Some(speaker_label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["Lynn"],
+            "speaker filter must drop other speakers"
+        );
+
+        // Pure browse: empty query + speaker returns the speaker's rows.
+        let hits = store
+            .with_user("spk_u", |conn| {
+                search_all(conn, &req_fts("spk_u", "speaker:S7", vec![]))
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            SearchHit::Utterance {
+                speaker_label,
+                text,
+                ..
+            } => {
+                assert_eq!(speaker_label, "S7");
+                assert!(text.contains("overrated"));
+            }
+            other => panic!("expected utterance, got {other:?}"),
+        }
+    }
+
+    /// Episodes match a speaker via participants — both the exact element and
+    /// the summarizer's "Name (S3)" form.
+    #[tokio::test]
+    async fn speaker_filter_on_episode_participants() {
+        use crate::episodes::{upsert_episodes, EpisodeInput};
+        let store = make_store();
+        store
+            .with_user("spk_ep_u", |conn| {
+                upsert_episodes(
+                    conn,
+                    &[EpisodeInput {
+                        id: None,
+                        started_at: "2026-07-05T20:00:00Z".into(),
+                        ended_at: "2026-07-05T20:30:00Z".into(),
+                        episode_type: Some("conversation".into()),
+                        title: "Dinner planning".into(),
+                        summary: Some("- pesto pesto".into()),
+                        participants: Some(vec!["Me".into(), "Ana (S3)".into()]),
+                        languages: None,
+                        action_items: None,
+                        minute_summaries: None,
+                        model: None,
+                        member_utterance_ids: vec![],
+                        member_screenshot_ids: vec![],
+                    }],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // "Ana" matches the "Ana (S3)" participants element; browse mode.
+        let hits = store
+            .with_user("spk_ep_u", |conn| {
+                search_all(
+                    conn,
+                    &req_fts("spk_ep_u", "speaker:Ana", vec!["episode".into()]),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "participants 'Ana (S3)' must match speaker:Ana"
+        );
+
+        // FTS + speaker filter: query matches but the speaker doesn't → no hit.
+        let hits = store
+            .with_user("spk_ep_u", |conn| {
+                search_all(
+                    conn,
+                    &req_fts("spk_ep_u", "speaker:Bob pesto", vec!["episode".into()]),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "non-participant speaker must filter the episode out"
+        );
     }
 }

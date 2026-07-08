@@ -59,7 +59,7 @@ async fn embed_query(s: &CpState, query: &str) -> Option<Vec<f32>> {
 }
 
 async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Value {
-    let query = args
+    let raw_query = args
         .get("query")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -68,7 +68,14 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
     let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
     let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
 
-    let query_embedding = embed_query(s, &query).await;
+    // Strip a `speaker:Name` token BEFORE embedding so the vector reflects
+    // only the content query (ADR-0006 Phase 3).
+    let (query, speaker) = crate::search::extract_speaker_filter(&raw_query);
+    let query_embedding = if query.trim().is_empty() {
+        None
+    } else {
+        embed_query(s, &query).await
+    };
     // Episodes are the PRIMARY result entity (ADR-0004): each carries its
     // exec summary + minute-timeline gists + a matched snippet, so an
     // assistant gets the high-level picture without digesting raw
@@ -78,6 +85,7 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
     let ep_req = SearchRequest {
         user_id: user_id.to_string(),
         query: query.clone(),
+        speaker: speaker.clone(),
         time_start: from.clone(),
         time_end: to.clone(),
         limit,
@@ -88,6 +96,7 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
     let utt_req = SearchRequest {
         user_id: user_id.to_string(),
         query,
+        speaker,
         time_start: from,
         time_end: to,
         limit,
@@ -122,6 +131,7 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
     let req = SearchRequest {
         user_id: user_id.to_string(),
         query,
+        speaker: None,
         time_start: args.get("from").and_then(|v| v.as_str()).map(String::from),
         time_end: args.get("to").and_then(|v| v.as_str()).map(String::from),
         limit,
