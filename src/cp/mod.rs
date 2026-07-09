@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod control_store;
+pub mod cors;
 pub mod isotime;
 pub mod limits;
 pub mod oauth;
@@ -47,6 +48,7 @@ pub struct CpConfig {
     pub quota_utterances_per_day: i64,
     pub quota_screenshots_per_day: i64,
     pub quota_mcp_calls_per_day: i64,
+    pub web_origin: String,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -96,6 +98,9 @@ impl CpConfig {
             quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000),
             quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000),
             quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000),
+            web_origin: env_or("WEB_ORIGIN", "https://kiokuu.com")
+                .trim_end_matches('/')
+                .to_string(),
         })
     }
 

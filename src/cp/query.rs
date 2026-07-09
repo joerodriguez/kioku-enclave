@@ -31,6 +31,7 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/api/episodes", get(rest_episodes))
         .route("/api/episodes/{id}", delete(rest_episode_delete))
         .route("/api/episodes/{id}/members", get(rest_episode_members))
+        .route("/api/feed", get(rest_feed))
 }
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
@@ -775,5 +776,394 @@ async fn rest_episode_members(
             Json(json!({"error": "enclave_unavailable"})),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FeedParams {
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<usize>,
+    before: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+struct FeedRecord {
+    kind: String, // "utterance" | "screenshot"
+    id: i64,
+    at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_app: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ocr_excerpt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_key: Option<String>,
+    episode_id: Option<i64>,
+}
+
+fn query_feed(
+    conn: &rusqlite::Connection,
+    p: &FeedParams,
+) -> crate::error::Result<serde_json::Value> {
+    let limit = p.limit.unwrap_or(50).min(200);
+
+    // 1. Fetch utterances
+    let mut u_sql = r#"
+        WITH utterance_at AS (
+            SELECT u.id, u.speaker_label, u.text, u.source_key,
+                   strftime('%Y-%m-%dT%H:%M:%fZ', s.started_at, '+' || u.start_offset_seconds || ' seconds') AS at
+            FROM utterances u
+            JOIN audio_segments s ON s.id = u.audio_segment_id
+        )
+        SELECT id, speaker_label, text, at, source_key
+        FROM utterance_at
+        WHERE at IS NOT NULL
+    "#.to_string();
+
+    let mut u_params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(from) = &p.from {
+        u_sql.push_str(" AND at >= ?");
+        u_params.push(rusqlite::types::Value::Text(from.clone()));
+    }
+    if let Some(to) = &p.to {
+        u_sql.push_str(" AND at <= ?");
+        u_params.push(rusqlite::types::Value::Text(to.clone()));
+    }
+    if let Some(before) = &p.before {
+        u_sql.push_str(" AND at < ?");
+        u_params.push(rusqlite::types::Value::Text(before.clone()));
+    }
+    u_sql.push_str(" ORDER BY at DESC LIMIT ?");
+    u_params.push(rusqlite::types::Value::Integer(limit as i64));
+
+    let mut stmt = conn.prepare(&u_sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(u_params))?;
+    let mut records = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        records.push(FeedRecord {
+            kind: "utterance".to_string(),
+            id: row.get(0)?,
+            at: row.get(3)?,
+            speaker_label: row.get(1)?,
+            text: row.get(2)?,
+            active_app: None,
+            window_title: None,
+            url: None,
+            ocr_excerpt: None,
+            source_key: row.get(4)?,
+            episode_id: None,
+        });
+    }
+
+    // 2. Fetch screenshots
+    let mut s_sql = r#"
+        SELECT id, captured_at, active_app, window_title, url, ocr_text, source_key
+        FROM screenshots
+        WHERE captured_at IS NOT NULL
+    "#
+    .to_string();
+
+    let mut s_params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(from) = &p.from {
+        s_sql.push_str(" AND captured_at >= ?");
+        s_params.push(rusqlite::types::Value::Text(from.clone()));
+    }
+    if let Some(to) = &p.to {
+        s_sql.push_str(" AND captured_at <= ?");
+        s_params.push(rusqlite::types::Value::Text(to.clone()));
+    }
+    if let Some(before) = &p.before {
+        s_sql.push_str(" AND captured_at < ?");
+        s_params.push(rusqlite::types::Value::Text(before.clone()));
+    }
+    s_sql.push_str(" ORDER BY captured_at DESC LIMIT ?");
+    s_params.push(rusqlite::types::Value::Integer(limit as i64));
+
+    let mut stmt = conn.prepare(&s_sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(s_params))?;
+
+    while let Some(row) = rows.next()? {
+        let ocr_text: Option<String> = row.get(5)?;
+        let ocr_excerpt = ocr_text.map(|t| {
+            if t.chars().count() > 300 {
+                t.chars().take(300).collect::<String>()
+            } else {
+                t
+            }
+        });
+        records.push(FeedRecord {
+            kind: "screenshot".to_string(),
+            id: row.get(0)?,
+            at: row.get(1)?,
+            speaker_label: None,
+            text: None,
+            active_app: row.get(2)?,
+            window_title: row.get(3)?,
+            url: row.get(4)?,
+            ocr_excerpt,
+            source_key: row.get(6)?,
+            episode_id: None,
+        });
+    }
+
+    // 3. Merge & Sort & Limit
+    records.sort_by(|a, b| b.at.cmp(&a.at));
+    records.truncate(limit);
+
+    // 4. Lookup episode_id memberships
+    if !records.is_empty() {
+        let mut u_ids = Vec::new();
+        let mut s_ids = Vec::new();
+        for r in &records {
+            if r.kind == "utterance" {
+                u_ids.push(r.id);
+            } else {
+                s_ids.push(r.id);
+            }
+        }
+
+        if !u_ids.is_empty() {
+            let placeholders = u_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let u_members_sql = format!(
+                "SELECT record_id, episode_id FROM episode_members WHERE record_type = 'utterance' AND record_id IN ({})",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&u_members_sql)?;
+            let params = u_ids.iter().map(|&id| rusqlite::types::Value::Integer(id));
+            let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+            let mut u_map = std::collections::HashMap::new();
+            while let Some(row) = rows.next()? {
+                u_map.insert(row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
+            }
+            for r in &mut records {
+                if r.kind == "utterance" {
+                    r.episode_id = u_map.get(&r.id).copied();
+                }
+            }
+        }
+
+        if !s_ids.is_empty() {
+            let placeholders = s_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let s_members_sql = format!(
+                "SELECT record_id, episode_id FROM episode_members WHERE record_type = 'screenshot' AND record_id IN ({})",
+                placeholders
+            );
+            let mut stmt = conn.prepare(&s_members_sql)?;
+            let params = s_ids.iter().map(|&id| rusqlite::types::Value::Integer(id));
+            let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+            let mut s_map = std::collections::HashMap::new();
+            while let Some(row) = rows.next()? {
+                s_map.insert(row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
+            }
+            for r in &mut records {
+                if r.kind == "screenshot" {
+                    r.episode_id = s_map.get(&r.id).copied();
+                }
+            }
+        }
+    }
+
+    let next_before = if records.len() == limit {
+        records.last().map(|r| r.at.clone())
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "records": records,
+        "next_before": next_before,
+    }))
+}
+
+async fn rest_feed(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(p): Query<FeedParams>,
+) -> Response {
+    let result = s
+        .store
+        .with_user(&user.0, move |conn| query_feed(conn, &p))
+        .await;
+
+    match result {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "feed query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "server_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::tests::{FakeGcs, FakeKms};
+    use crate::store::Store;
+
+    #[tokio::test]
+    async fn feed_fuses_kinds_chronologically_newest_first() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store.with_user("user-1", |conn| {
+            conn.execute("INSERT INTO audio_segments (id, started_at, ended_at, duration_seconds, source_type) VALUES (1, '2026-01-01T10:00:00.000Z', '2026-01-01T10:10:00.000Z', 600.0, 'mic')", [])?;
+            conn.execute("INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label) VALUES (1, 1, 10.0, 15.0, 'hello from mic', 'Me')", [])?;
+
+            conn.execute("INSERT INTO screenshots (id, captured_at, active_app, window_title, ocr_text) VALUES (1, '2026-01-01T10:00:05.000Z', 'Chrome', 'GitHub', 'some ocr')", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, active_app, window_title, ocr_text) VALUES (2, '2026-01-01T10:00:15.000Z', 'Safari', 'Docs', 'other ocr')", [])?;
+
+            let p = FeedParams {
+                from: None,
+                to: None,
+                limit: None,
+                before: None,
+            };
+            let val = query_feed(conn, &p).unwrap();
+            let records: Vec<FeedRecord> = serde_json::from_value(val.get("records").unwrap().clone()).unwrap();
+
+            assert_eq!(records.len(), 3);
+            assert_eq!(records[0].kind, "screenshot");
+            assert_eq!(records[0].id, 2);
+            assert_eq!(records[0].at, "2026-01-01T10:00:15.000Z");
+
+            assert_eq!(records[1].kind, "utterance");
+            assert_eq!(records[1].id, 1);
+            assert_eq!(records[1].at, "2026-01-01T10:00:10.000Z");
+
+            assert_eq!(records[2].kind, "screenshot");
+            assert_eq!(records[2].id, 1);
+            assert_eq!(records[2].at, "2026-01-01T10:00:05.000Z");
+
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn feed_records_carry_episode_id_when_member_of_episode() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store.with_user("user-1", |conn| {
+            conn.execute("INSERT INTO audio_segments (id, started_at, ended_at, duration_seconds, source_type) VALUES (1, '2026-01-01T10:00:00.000Z', '2026-01-01T10:10:00.000Z', 600.0, 'mic')", [])?;
+            conn.execute("INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label) VALUES (1, 1, 10.0, 15.0, 'hello', 'Me')", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, ocr_text) VALUES (1, '2026-01-01T10:00:05.000Z', 'ocr')", [])?;
+
+            conn.execute("INSERT INTO episodes (id, started_at, ended_at, title, summary) VALUES (99, '2026-01-01T10:00:00.000Z', '2026-01-01T10:10:00.000Z', 'Meeting', 'desc')", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (99, 'utterance', 1)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (99, 'screenshot', 1)", [])?;
+
+            let p = FeedParams {
+                from: None,
+                to: None,
+                limit: None,
+                before: None,
+            };
+            let val = query_feed(conn, &p).unwrap();
+            let records: Vec<FeedRecord> = serde_json::from_value(val.get("records").unwrap().clone()).unwrap();
+
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].episode_id, Some(99));
+            assert_eq!(records[1].episode_id, Some(99));
+
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn feed_pagination_keyset_no_dup_no_gap() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store.with_user("user-1", |conn| {
+            conn.execute("INSERT INTO audio_segments (id, started_at, ended_at, duration_seconds, source_type) VALUES (1, '2026-01-01T10:00:00.000Z', '2026-01-01T10:10:00.000Z', 600.0, 'mic')", [])?;
+            conn.execute("INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label) VALUES (1, 1, 10.0, 15.0, 'one', 'Me')", [])?;
+            conn.execute("INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label) VALUES (2, 1, 20.0, 25.0, 'two', 'Me')", [])?;
+            conn.execute("INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label) VALUES (3, 1, 30.0, 35.0, 'three', 'Me')", [])?;
+
+            let p1 = FeedParams {
+                from: None,
+                to: None,
+                limit: Some(2),
+                before: None,
+            };
+            let val1 = query_feed(conn, &p1).unwrap();
+            let recs1: Vec<FeedRecord> = serde_json::from_value(val1.get("records").unwrap().clone()).unwrap();
+            let next1 = val1.get("next_before").unwrap().as_str().map(|s| s.to_string());
+
+            assert_eq!(recs1.len(), 2);
+            assert_eq!(recs1[0].text.as_deref(), Some("three"));
+            assert_eq!(recs1[1].text.as_deref(), Some("two"));
+            assert!(next1.is_some());
+
+            let p2 = FeedParams {
+                from: None,
+                to: None,
+                limit: Some(2),
+                before: next1,
+            };
+            let val2 = query_feed(conn, &p2).unwrap();
+            let recs2: Vec<FeedRecord> = serde_json::from_value(val2.get("records").unwrap().clone()).unwrap();
+            let next2 = val2.get("next_before").unwrap();
+
+            assert_eq!(recs2.len(), 1);
+            assert_eq!(recs2[0].text.as_deref(), Some("one"));
+            assert!(next2.is_null());
+
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn feed_respects_time_range_and_limit_cap() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store
+            .with_user("user-1", |conn| {
+                // 250 screenshots one second apart — enough to exceed the 200 cap.
+                for i in 0..250 {
+                    conn.execute(
+                        "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, 'x')",
+                        [format!("2026-01-01T10:{:02}:{:02}.000Z", i / 60, i % 60)],
+                    )?;
+                }
+
+                // limit caps at 200 even when a larger value is requested.
+                let p = FeedParams {
+                    from: None,
+                    to: None,
+                    limit: Some(10_000),
+                    before: None,
+                };
+                let val = query_feed(conn, &p).unwrap();
+                let recs: Vec<FeedRecord> =
+                    serde_json::from_value(val.get("records").unwrap().clone()).unwrap();
+                assert_eq!(recs.len(), 200, "limit must cap at 200");
+
+                // from/to bound the window inclusively.
+                let p = FeedParams {
+                    from: Some("2026-01-01T10:00:10.000Z".into()),
+                    to: Some("2026-01-01T10:00:19.000Z".into()),
+                    limit: None,
+                    before: None,
+                };
+                let val = query_feed(conn, &p).unwrap();
+                let recs: Vec<FeedRecord> =
+                    serde_json::from_value(val.get("records").unwrap().clone()).unwrap();
+                assert_eq!(recs.len(), 10);
+                assert!(recs
+                    .iter()
+                    .all(|r| r.at.as_str() >= "2026-01-01T10:00:10.000Z"
+                        && r.at.as_str() <= "2026-01-01T10:00:19.000Z"));
+
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }

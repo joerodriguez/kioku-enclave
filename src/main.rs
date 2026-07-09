@@ -495,13 +495,16 @@ async fn main() {
         .with_state(Arc::clone(&state));
 
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
-    let cp_authed =
-        cp::sync::router()
-            .merge(cp::query::router())
-            .layer(middleware::from_fn_with_state(
-                Arc::clone(&cp_state),
-                cp::auth::require_auth,
-            ));
+    let cp_authed = cp::sync::router()
+        .merge(cp::query::router())
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&cp_state),
+            cp::auth::require_auth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&cp_state),
+            cp::cors::cors_middleware,
+        ));
     let control_plane = cp::oauth::router()
         .merge(cp_authed)
         .with_state(Arc::clone(&cp_state));
