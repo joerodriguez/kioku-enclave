@@ -86,6 +86,44 @@ pub fn decrypt_blob(dek: &Dek, blob: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| EnclaveError::Crypto(format!("decrypt failed: {e}")))
 }
 
+/// Encrypt `plaintext` with `dek`, binding `aad` as Additional Authenticated Data.
+/// Returns `nonce ‖ ciphertext ‖ tag`.
+pub fn encrypt_blob_with_aad(dek: &Dek, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+    let cipher = Aes256Gcm::new(dek.as_aes_key());
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 12 random bytes
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
+    let ciphertext = cipher
+        .encrypt(&nonce, payload)
+        .map_err(|e| EnclaveError::Crypto(e.to_string()))?;
+
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypt a blob produced by [`encrypt_blob_with_aad`], validating the `aad`.
+pub fn decrypt_blob_with_aad(dek: &Dek, blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::aead::Payload;
+    if blob.len() < 12 {
+        return Err(EnclaveError::Crypto("blob too short".into()));
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(12);
+    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new(dek.as_aes_key());
+    let payload = Payload {
+        msg: ciphertext,
+        aad,
+    };
+    cipher
+        .decrypt(nonce, payload)
+        .map_err(|e| EnclaveError::Crypto(format!("decrypt failed: {e}")))
+}
+
 // ── KMS trait (seam for testing) ──────────────────────────────────────────────
 
 /// Abstraction over Cloud KMS so unit tests can inject a fake.
@@ -351,6 +389,29 @@ mod tests {
             "nonces should differ (birthday probability ~1/2^96)"
         );
         assert_ne!(b1, b2, "ciphertexts must differ");
+    }
+
+    #[test]
+    fn blob_with_aad_roundtrip() {
+        let dek = Dek::generate();
+        let plaintext = b"hello enclave world -- AAD test content";
+        let aad = b"user-12345";
+        let blob = encrypt_blob_with_aad(&dek, plaintext, aad).expect("encrypt");
+        let recovered = decrypt_blob_with_aad(&dek, &blob, aad).expect("decrypt");
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn blob_with_aad_wrong_aad_fails() {
+        let dek = Dek::generate();
+        let plaintext = b"hello enclave world -- AAD test content";
+        let aad1 = b"user-12345";
+        let aad2 = b"user-67890";
+        let blob = encrypt_blob_with_aad(&dek, plaintext, aad1).expect("encrypt");
+        assert!(
+            decrypt_blob_with_aad(&dek, &blob, aad2).is_err(),
+            "decrypting with wrong AAD must fail"
+        );
     }
 
     #[test]

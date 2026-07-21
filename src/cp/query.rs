@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
@@ -33,6 +33,8 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/api/episodes/{id}/members", get(rest_episode_members))
         .route("/api/feed", get(rest_feed))
         .route("/api/screenshot-images/plan", get(rest_screenshot_upload_plan))
+        .route("/api/screenshot-images", post(rest_screenshot_image_upload))
+        .route("/api/screenshot-images/{id}/content", get(rest_screenshot_image_content))
         .route("/api/preferences/episode-email", get(rest_get_preference).post(rest_set_preference))
         .route("/api/preferences/episode-email/connect", post(rest_connect_preference))
 }
@@ -1156,6 +1158,269 @@ async fn rest_screenshot_upload_plan(
                 .into_response()
         }
     }
+}
+
+async fn rest_screenshot_image_upload(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    mut multipart: Multipart,
+) -> Response {
+    let user_id = user.0;
+    if let Err(e) = crate::store::validate_user_id(&user_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    let mut image_bytes = Vec::new();
+    let mut captured_at = None;
+    let mut episode_id = None;
+    let mut source_key = None;
+    let mut width = None;
+    let mut height = None;
+    let mut req_sha256 = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "image" {
+            let mut stream = field;
+            while let Ok(Some(chunk)) = stream.chunk().await {
+                if image_bytes.len() + chunk.len() > 153_600 {
+                    return (StatusCode::PAYLOAD_TOO_LARGE, "payload too large (max 150 KiB)").into_response();
+                }
+                image_bytes.extend_from_slice(&chunk);
+            }
+        } else {
+            let value = match field.text().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            match name.as_str() {
+                "captured_at" => captured_at = Some(value),
+                "episode_id" => episode_id = value.parse::<i64>().ok(),
+                "source_key" => source_key = Some(value),
+                "width" => width = value.parse::<i32>().ok(),
+                "height" => height = value.parse::<i32>().ok(),
+                "sha256" => req_sha256 = Some(value),
+                _ => {}
+            }
+        }
+    }
+
+    let (Some(captured_at), Some(episode_id), Some(source_key), Some(width), Some(height), Some(req_sha256)) =
+        (captured_at, episode_id, source_key, width, height, req_sha256) else {
+            return (StatusCode::BAD_REQUEST, "missing fields").into_response();
+        };
+
+    if image_bytes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing image bytes").into_response();
+    }
+
+    // Verify SHA-256
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&image_bytes);
+    let computed_hash = format!("{:x}", hasher.finalize());
+    if computed_hash != req_sha256 {
+        return (StatusCode::BAD_REQUEST, "SHA-256 mismatch").into_response();
+    }
+
+    // 1. Get wrapped DEK or generate one
+    let user_id_cloned = user_id.clone();
+    let wrapped_opt_res = s.store.with_user(&user_id_cloned, |conn| {
+        let mut stmt = conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
+        let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
+        Ok(val)
+    }).await;
+
+    let wrapped_opt = match wrapped_opt_res {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database query failed: {}", e)).into_response(),
+    };
+
+    let (media_dek, wrapped_b64) = match wrapped_opt {
+        Some(wrapped) => {
+            match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped).await {
+                Ok(dek) => (dek, wrapped),
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Load DEK failed: {}", e)).into_response(),
+            }
+        }
+        None => {
+            match crate::crypto::generate_and_wrap_dek(s.store.kms.as_ref()).await {
+                Ok((dek, wrapped)) => {
+                    let wrapped_clone = wrapped.clone();
+                    let user_id_cloned = user_id.clone();
+                    let save_res = s.store.with_user(&user_id_cloned, move |conn| {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('wrapped_media_dek', ?1)",
+                            [&wrapped_clone],
+                        )?;
+                        Ok(())
+                    }).await;
+                    if let Err(e) = save_res {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Save DEK failed: {}", e)).into_response();
+                    }
+                    (dek, wrapped)
+                }
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Generate DEK failed: {}", e)).into_response(),
+            }
+        }
+    };
+
+    // 2. Encrypt JPEG bytes using media DEK and user_id as AAD
+    let encrypted_data = match crate::crypto::encrypt_blob_with_aad(&media_dek, &image_bytes, user_id.as_bytes()) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Encryption failed: {}", e)).into_response(),
+    };
+
+    // 3. Generate random 128-bit hex key as opaque ID
+    let mut random_bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random_bytes);
+    let opaque_key: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let object_key = format!("media/{}", opaque_key);
+
+    // 4. Upload to GCS
+    if let Err(e) = s.store.put_media(&object_key, &encrypted_data, &wrapped_b64).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("GCS upload failed: {}", e)).into_response();
+    }
+
+    // 5. Insert tracking record in SQLite database
+    let user_id_cloned = user_id.clone();
+    let insert_res = s.store.with_user(&user_id_cloned, {
+        let object_key_clone = object_key.clone();
+        let source_key_clone = source_key.clone();
+        let captured_at_clone = captured_at.clone();
+        let sha256_clone = req_sha256.clone();
+        let image_len = image_bytes.len() as i64;
+        let opaque_key_clone = opaque_key.clone();
+        move |conn| {
+            let screenshot_id: i64 = conn.query_row(
+                "SELECT id FROM screenshots WHERE source_key = ?1",
+                [&source_key_clone],
+                |r| r.get(0),
+            )?;
+            
+            conn.execute(
+                "INSERT INTO screenshot_images (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'image/jpeg', ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    opaque_key_clone,
+                    screenshot_id,
+                    episode_id,
+                    source_key_clone,
+                    captured_at_clone,
+                    object_key_clone,
+                    width,
+                    height,
+                    image_len,
+                    sha256_clone,
+                ],
+            )?;
+            Ok(())
+        }
+    }).await;
+
+    if let Err(e) = insert_res {
+        let _ = s.store.delete_media(&object_key).await;
+        return (StatusCode::BAD_REQUEST, format!("Database insert failed: {}", e)).into_response();
+    }
+
+    // Save user SQLite database state
+    if let Err(e) = s.store.save_user(&user_id).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database save failed: {}", e)).into_response();
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": opaque_key,
+            "object_key": object_key,
+            "mime_type": "image/jpeg",
+            "width": width,
+            "height": height,
+            "byte_length": image_bytes.len(),
+            "sha256": req_sha256,
+        })),
+    )
+        .into_response()
+}
+
+async fn rest_screenshot_image_content(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Response {
+    let user_id = user.0;
+    if let Err(e) = crate::store::validate_user_id(&user_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    // 1. Retrieve the object_key from the database
+    let user_id_cloned = user_id.clone();
+    let query_res = s.store.with_user(&user_id_cloned, {
+        let id_clone = id.clone();
+        move |conn| {
+            let object_key: String = conn.query_row(
+                "SELECT object_key FROM screenshot_images WHERE id = ?1",
+                [&id_clone],
+                |r| r.get(0),
+            )?;
+            Ok(object_key)
+        }
+    }).await;
+
+    let object_key = match query_res {
+        Ok(ok) => ok,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // 2. Fetch the encrypted object from GCS
+    let gcs_resp = match s.store.get_media(&object_key).await {
+        Ok(r) => r,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    // 3. Load user's media DEK
+    let user_id_cloned = user_id.clone();
+    let wrapped_opt_res = s.store.with_user(&user_id_cloned, |conn| {
+        let mut stmt = conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
+        let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
+        Ok(val)
+    }).await;
+
+    let wrapped_opt = match wrapped_opt_res {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database query failed: {}", e)).into_response(),
+    };
+
+    let wrapped_b64 = match wrapped_opt {
+        Some(w) => w,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let media_dek = match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped_b64).await {
+        Ok(dek) => dek,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Load DEK failed: {}", e)).into_response(),
+    };
+
+    // 4. Decrypt object using media DEK and user_id as AAD
+    let decrypted_bytes = match crate::crypto::decrypt_blob_with_aad(&media_dek, &gcs_resp.ciphertext, user_id.as_bytes()) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Decryption failed: {}", e)).into_response(),
+    };
+
+    (
+        StatusCode::OK,
+        [("Content-Type", "image/jpeg")],
+        decrypted_bytes,
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]

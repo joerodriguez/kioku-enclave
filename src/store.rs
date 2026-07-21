@@ -108,8 +108,9 @@ struct UserHandle {
 /// The shared store, wrapped in Arc so handlers can clone it cheaply.
 pub struct Store {
     inner: Mutex<StoreInner>,
-    kms: Arc<dyn KmsClient>,
-    gcs: Arc<dyn GcsClient>,
+    pub kms: Arc<dyn KmsClient>,
+    pub gcs: Arc<dyn GcsClient>,
+    pub media_gcs: Arc<dyn GcsClient>,
     max_open: usize,
 }
 
@@ -119,6 +120,15 @@ struct StoreInner {
 
 impl Store {
     pub fn new(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>) -> Self {
+        let media_gcs = Arc::clone(&gcs);
+        Self::new_internal(kms, gcs, media_gcs)
+    }
+
+    pub fn new_with_media(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>, media_gcs: Arc<dyn GcsClient>) -> Self {
+        Self::new_internal(kms, gcs, media_gcs)
+    }
+
+    fn new_internal(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>, media_gcs: Arc<dyn GcsClient>) -> Self {
         let max_open = std::env::var("STORE_MAX_OPEN")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -129,8 +139,22 @@ impl Store {
             }),
             kms,
             gcs,
+            media_gcs,
             max_open,
         }
+    }
+
+    pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<()> {
+        self.media_gcs.put_object(name, data, wrapped_dek_b64, 0).await?;
+        Ok(())
+    }
+
+    pub async fn get_media(&self, name: &str) -> Result<crate::store::GcsGetResponse> {
+        self.media_gcs.get_object(name).await
+    }
+
+    pub async fn delete_media(&self, name: &str) -> Result<()> {
+        self.media_gcs.delete_object(name).await
     }
 
     /// Run an operation with a user's open SQLite connection.
@@ -169,7 +193,34 @@ impl Store {
     /// this returns `Ok(())`.
     pub async fn delete_user(&self, user_id: &str) -> Result<()> {
         validate_user_id(user_id)?;
-        // 1. Evict the cached handle (and temp file) without flushing —
+
+        // 1. Query for GCS media keys to clean up
+        let user_str = user_id.to_string();
+        let mut keys_to_delete = Vec::new();
+        if let Ok(keys) = self.with_user(&user_str, |conn| {
+            let table_exists: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
+                [],
+                |r| r.get(0),
+            )?;
+            if table_exists == 0 {
+                return Ok(Vec::new());
+            }
+
+            let mut stmt = conn.prepare("SELECT object_key FROM screenshot_images")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut list = Vec::new();
+            for row in rows {
+                if let Ok(k) = row {
+                    list.push(k);
+                }
+            }
+            Ok(list)
+        }).await {
+            keys_to_delete = keys;
+        }
+
+        // 2. Evict the cached handle (and temp file) without flushing —
         //    we are deleting the data, not saving it.
         {
             let mut inner = self.inner.lock().await;
@@ -182,11 +233,17 @@ impl Store {
             }
         }
 
-        // 2. Delete the GCS object. 404 is treated as success by the GCS
+        // 3. Delete the GCS database object. 404 is treated as success by the GCS
         //    implementations, so this call is idempotent.
         let object_name = gcs_object_name(user_id);
         info!(user_id, object = %object_name, "deleting GCS object");
         self.gcs.delete_object(&object_name).await?;
+
+        // 4. Delete associated GCS media objects
+        for key in keys_to_delete {
+            info!(user_id, key = %key, "deleting associated GCS media object");
+            let _ = self.delete_media(&key).await;
+        }
 
         Ok(())
     }
@@ -1054,6 +1111,13 @@ impl GcpGcsClient {
             http: reqwest::Client::new(),
             bucket,
         })
+    }
+
+    pub fn from_bucket(bucket: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            bucket,
+        }
     }
 
     async fn access_token(&self) -> Result<String> {

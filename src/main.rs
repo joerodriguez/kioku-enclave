@@ -115,12 +115,25 @@ pub(crate) async fn dump_user_export(
         .with_user(user_id, |conn| {
             let utterances = dump_table(conn, "SELECT * FROM utterances ORDER BY id")?;
             let screenshots = dump_table(conn, "SELECT * FROM screenshots ORDER BY id")?;
+            let screenshot_images = {
+                let table_exists: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if table_exists > 0 {
+                    dump_table(conn, "SELECT * FROM screenshot_images ORDER BY id")?
+                } else {
+                    Vec::new()
+                }
+            };
             let episodes = dump_table(conn, "SELECT * FROM episodes ORDER BY id")?;
             let final_briefs = dump_table(conn, "SELECT * FROM episode_final_briefs ORDER BY episode_id")?;
             let deliveries = dump_table(conn, "SELECT * FROM episode_deliveries ORDER BY episode_id")?;
             Ok(json!({
                 "utterances": utterances,
                 "screenshots": screenshots,
+                "screenshot_images": screenshot_images,
                 "episodes": episodes,
                 "episode_final_briefs": final_briefs,
                 "episode_deliveries": deliveries,
@@ -344,7 +357,13 @@ async fn main() {
     let gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_env().expect("GCS_BUCKET must be set"));
 
-    let store = Arc::new(Store::new(Arc::clone(&kms), Arc::clone(&gcs)));
+    let media_gcs: Arc<dyn crate::store::GcsClient> = if let Ok(bucket) = std::env::var("GCS_MEDIA_BUCKET") {
+        Arc::new(GcpGcsClient::from_bucket(bucket))
+    } else {
+        Arc::clone(&gcs)
+    };
+
+    let store = Arc::new(Store::new_with_media(Arc::clone(&kms), Arc::clone(&gcs), media_gcs));
 
     // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
     // control store consumes the originals.

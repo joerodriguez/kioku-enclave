@@ -110,8 +110,11 @@ struct OpenEp {
     id: i64,
     started_at: String,
     ended_at: String,
+    episode_type: Option<String>,
     title: String,
     summary: Option<String>,
+    participants: Vec<String>,
+    recent_minutes: Option<String>,
     utt_count: i64,
     scr_count: i64,
 }
@@ -238,13 +241,7 @@ fn render_capture_text(utterances: &[UttRow], screenshots: &[ScrRow]) -> String 
                     fmt_time(&s.captured_at)
                 };
 
-                lines.push(format!(
-                    "{} [screen] {}{}{}",
-                    time_str,
-                    app,
-                    title,
-                    url
-                ));
+                lines.push(format!("{} [screen] {}{}{}", time_str, app, title, url));
                 if let Some(ocr) = &s.ocr_text {
                     if ocr_budget > 0 {
                         let collapsed: String =
@@ -585,7 +582,8 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     // Call Vertex. Failed windows return an `error` status carrying
     // `window_to` so the sweep can skip past a window that fails
     // deterministically (see summarize_all) instead of stalling forever.
-    let response = match super::vertex::generate(&state.config, SYSTEM_PROMPT, &user_message).await
+    let system_prompt = format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}");
+    let response = match super::vertex::generate(&state.config, &system_prompt, &user_message).await
     {
         Ok(t) => t,
         Err(e) if e.to_string().contains("quota") => {
@@ -868,21 +866,49 @@ fn render_open_episodes(open: &[OpenEp]) -> String {
     open.iter()
         .enumerate()
         .map(|(i, ep)| {
-            let s1 = ep
-                .summary
-                .as_deref()
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("");
-            let s1 = &s1[..s1.len().min(120)];
+            // The extend-vs-new decision needs the prior episode's objective,
+            // not just a short title. Multi-hop workflows can cross calls,
+            // apps, and participants while remaining one activity. Keep this
+            // bounded because up to 30 open episodes share the prompt.
+            let summary = compact_excerpt(ep.summary.as_deref().unwrap_or(""), 600);
+            let recent = compact_tail_excerpt(ep.recent_minutes.as_deref().unwrap_or(""), 300);
+            let participants = if ep.participants.is_empty() {
+                "unknown".to_string()
+            } else {
+                ep.participants.join(", ")
+            };
             format!(
-                "[E{i}] \"{}\" ({} → {}, {} utt/{} scr): {}",
-                ep.title, ep.started_at, ep.ended_at, ep.utt_count, ep.scr_count, s1
+                "[E{i}] type={} \"{}\" ({} → {}, {} utt/{} scr)\n  participants: {}\n  objective/summary: {}\n  recent timeline: {}",
+                ep.episode_type.as_deref().unwrap_or("other"),
+                ep.title,
+                ep.started_at,
+                ep.ended_at,
+                ep.utt_count,
+                ep.scr_count,
+                participants,
+                if summary.is_empty() { "unavailable" } else { &summary },
+                if recent.is_empty() { "unavailable" } else { &recent },
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn compact_excerpt(text: &str, max_chars: usize) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn compact_tail_excerpt(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = compact.chars().collect();
+    chars[chars.len().saturating_sub(max_chars)..]
+        .iter()
+        .collect()
 }
 
 async fn fetch_range(
@@ -949,22 +975,31 @@ async fn fetch_open_episodes(
         .store
         .with_user(user_id, move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT e.id, e.started_at, e.ended_at, e.title, e.summary, \
+                "SELECT e.id, e.started_at, e.ended_at, e.type, e.title, e.summary, \
+                        e.participants, e.minutes_text, \
                         (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='utterance'), \
                         (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='screenshot') \
-                 FROM episodes e WHERE e.started_at >= ?1 AND e.started_at <= ?2 \
-                 ORDER BY e.started_at ASC LIMIT 100",
+                 FROM episodes e WHERE e.ended_at >= ?1 AND e.started_at <= ?2 \
+                 ORDER BY e.ended_at ASC LIMIT 100",
             )?;
             let rows: Vec<OpenEp> = stmt
                 .query_map(rusqlite::params![ls, le], |r| {
+                    let participants_json: Option<String> = r.get(6)?;
+                    let participants = participants_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                        .unwrap_or_default();
                     Ok(OpenEp {
                         id: r.get(0)?,
                         started_at: r.get(1)?,
                         ended_at: r.get(2)?,
-                        title: r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "untitled".into()),
-                        summary: r.get(4)?,
-                        utt_count: r.get(5)?,
-                        scr_count: r.get(6)?,
+                        episode_type: r.get(3)?,
+                        title: r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "untitled".into()),
+                        summary: r.get(5)?,
+                        participants,
+                        recent_minutes: r.get(7)?,
+                        utt_count: r.get(8)?,
+                        scr_count: r.get(9)?,
                     })
                 })?
                 .filter_map(|x| x.ok())
@@ -1116,6 +1151,8 @@ pub fn maybe_trigger(state: Arc<CpState>, user_id: String) {
 
 const SUBSTANCE_BACKFILL_PROMPT: &str = "Classify the substance of stored personal activity episodes from title, summary, and minute gists. substance=none: fragments with no coherent topic, hallucination-like repetition, or content-free filler. substance=low: real but trivial activity such as a few passing remarks or background TV. substance=normal: everything else. When in doubt, prefer the higher tier. Return one classification for every supplied id and do not invent ids.";
 
+const WORKFLOW_CONTINUITY_RULE: &str = "CRITICAL EXTENSION RULE: Define continuity by the person's concrete real-world objective, subject, or workflow — not by session mechanics. Continuation does NOT require the same call connection, participant, app, or document. A goodbye followed by a new greeting, a transfer, hold time, reconnect, or a call to a different person or organization is not a boundary when the person is still pursuing the same task. For example, calling a provider, then an insurer, then the provider again about one bill is ONE episode using the same OPEN EPISODE ref. Prefer EXTEND when the open episode and new log share the same real-world goal; open a NEW episode only when the goal or subject actually changes.";
+
 const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n9. minutes: a minute-by-minute timeline of the episode's NEW activity. Bucket the NEW CAPTURE LOG into 1–5-minute buckets and give each a one-line concrete gist naming the subject (\"Kate & Sean arrival plans\", \"Pesto recipe, lobster question\") — never generic filler (\"conversation continues\"). Each bucket: {\"start\":\"<ISO of bucket start>\",\"gist\":\"...\"}. Cover ONLY minutes present in the NEW CAPTURE LOG — for an extension, earlier minutes are already stored; never re-emit or invent them.\n10. substance: none for fragments with no coherent topic, hallucination-like repetition, or content-free filler; low for real but trivial activity (a few passing remarks, background TV); normal for everything else. When in doubt, prefer the higher tier.\n11. visual_evidence: useful if visual state is material (for example a slide, document, diagram, error, design, settings state, or on-screen decision evidence); none if pixels would not materially improve verification.\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[],\"substance\":\"normal\",\"visual_evidence\":\"none\",\"minutes\":[{\"start\":\"<ISO>\",\"gist\":\"...\"}]}]}";
 
 #[cfg(test)]
@@ -1198,10 +1235,46 @@ mod tests {
         assert_eq!(collapsed.len(), 2);
         assert_eq!(collapsed[0].active_app.as_deref(), Some("Finder"));
         assert_eq!(collapsed[0].captured_at, "2026-06-01T14:00:00Z");
-        assert_eq!(collapsed[0].visible_until.as_deref(), Some("2026-06-01T14:00:04Z"));
+        assert_eq!(
+            collapsed[0].visible_until.as_deref(),
+            Some("2026-06-01T14:00:04Z")
+        );
 
         assert_eq!(collapsed[1].active_app.as_deref(), Some("Xcode"));
         assert_eq!(collapsed[1].captured_at, "2026-06-01T14:00:06Z");
         assert_eq!(collapsed[1].visible_until, None);
+    }
+
+    #[test]
+    fn open_episode_digest_preserves_workflow_context() {
+        let rendered = render_open_episodes(&[OpenEp {
+            id: 307,
+            started_at: "2026-07-21T16:39:04Z".into(),
+            ended_at: "2026-07-21T16:47:09Z".into(),
+            episode_type: Some("call".into()),
+            title: "Transportation billing inquiry".into(),
+            summary: Some(
+                "Discussed an outstanding transportation balance and next steps with insurance."
+                    .into(),
+            ),
+            participants: vec!["Me".into(), "Provider representative".into()],
+            recent_minutes: Some("12:46 PM: insurer payment and balance billing".into()),
+            utt_count: 24,
+            scr_count: 80,
+        }]);
+
+        assert!(rendered.contains("[E0] type=call"));
+        assert!(rendered.contains("Provider representative"));
+        assert!(rendered.contains("outstanding transportation balance"));
+        assert!(rendered.contains("insurer payment and balance billing"));
+    }
+
+    #[test]
+    fn prompt_keeps_multi_hop_workflows_in_one_episode() {
+        assert!(WORKFLOW_CONTINUITY_RULE.contains(
+            "calling a provider, then an insurer, then the provider again about one bill is ONE episode"
+        ));
+        assert!(WORKFLOW_CONTINUITY_RULE
+            .contains("A goodbye followed by a new greeting, a transfer, hold time, reconnect"));
     }
 }
