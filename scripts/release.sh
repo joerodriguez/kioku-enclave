@@ -91,10 +91,14 @@ fi
 
 REMOTE_TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG" 2>/dev/null || true)"
 ROLLBACK_EXISTING=false
+RESUME_EXISTING=false
 if [[ -n "$REMOTE_TAG_COMMIT" && "$REMOTE_TAG_COMMIT" != "$COMMIT" ]]; then
   if [[ "$ROLL" == "true" ]] && gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
     ROLLBACK_EXISTING=true
     echo "Using previously published $RELEASE_TAG at $REMOTE_TAG_COMMIT for rollback."
+  elif ! gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+    RESUME_EXISTING=true
+    echo "Resuming incomplete $RELEASE_TAG at $REMOTE_TAG_COMMIT."
   else
     echo "Error: $RELEASE_TAG already points to a different commit." >&2
     echo "       Add --roll only if you intend to roll back to its existing public release." >&2
@@ -102,7 +106,7 @@ if [[ -n "$REMOTE_TAG_COMMIT" && "$REMOTE_TAG_COMMIT" != "$COMMIT" ]]; then
   fi
 fi
 
-if [[ "$ROLLBACK_EXISTING" == "false" ]]; then
+if [[ "$ROLLBACK_EXISTING" == "false" && "$RESUME_EXISTING" == "false" ]]; then
   echo "Running release checks..."
   cargo fmt --all -- --check
   cargo test --locked
@@ -149,7 +153,7 @@ import json, sys
 tag = sys.argv[1]
 for run in json.load(sys.stdin):
     if run.get("headBranch") == tag:
-        print(f"{run[\"databaseId\"]}\t{run[\"url\"]}")
+        print("{}\t{}".format(run["databaseId"], run["url"]))
         break
 ' "$RELEASE_TAG")"
     if [[ -n "$RUN_RESULT" ]]; then
