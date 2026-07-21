@@ -814,9 +814,10 @@ async fn rest_episode_members(
 
             let mut ss = conn.prepare(
                 "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
-                        substr(c.ocr_text,1,2000), c.source_key \
+                        substr(c.ocr_text,1,2000), c.source_key, img.id \
                  FROM episode_members m \
                  JOIN screenshots c ON c.id = m.record_id \
+                 LEFT JOIN screenshot_images img ON img.source_key = c.source_key \
                  WHERE m.episode_id = ?1 AND m.record_type = 'screenshot' AND c.is_duplicate = 0",
             )?;
             members.extend(
@@ -833,6 +834,7 @@ async fn rest_episode_members(
                             "url": r.get::<_, Option<String>>(4)?,
                             "ocr_excerpt": r.get::<_, Option<String>>(5)?,
                             "source_key": r.get::<_, Option<String>>(6)?,
+                            "cloud_image_id": r.get::<_, Option<String>>(7)?,
                         }),
                     ))
                 })?
@@ -1714,5 +1716,77 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rest_screenshot_upload_plan() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user_id = "plan_test_user";
+        
+        store.with_user(user_id, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS screenshots (id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL, source_key TEXT UNIQUE, is_duplicate INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE IF NOT EXISTS episodes (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, ended_at TEXT NOT NULL, substance TEXT NOT NULL, visual_evidence TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS episode_members (episode_id INTEGER NOT NULL, record_type TEXT NOT NULL, record_id INTEGER NOT NULL, PRIMARY KEY(episode_id, record_type, record_id));
+                 CREATE TABLE IF NOT EXISTS screenshot_images (id TEXT PRIMARY KEY, screenshot_id INTEGER NOT NULL, episode_id INTEGER NOT NULL, source_key TEXT UNIQUE, captured_at TEXT NOT NULL, object_key TEXT UNIQUE, mime_type TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, byte_length INTEGER NOT NULL, sha256 TEXT NOT NULL, created_at TEXT NOT NULL);"
+            )?;
+
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (1, '2026-01-01T10:00:00Z', 'dev1:1', 0)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (2, '2026-01-01T10:01:00Z', 'dev1:2', 0)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (3, '2026-01-01T10:02:00Z', 'dev1:3', 1)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (4, '2026-01-01T10:03:00Z', 'dev1:4', 0)", [])?;
+
+            conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (10, '2026-01-01T10:00:00Z', '2026-01-01T10:05:00Z', 'normal', 'useful')", [])?;
+            conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (11, '2026-01-01T10:05:00Z', '2026-01-01T10:10:00Z', 'low', 'useful')", [])?;
+            conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (12, '2026-01-01T10:10:00Z', '2026-01-01T10:15:00Z', 'normal', 'none')", [])?;
+
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 1)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 2)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 3)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 4)", [])?;
+            
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (11, 'screenshot', 2)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (12, 'screenshot', 2)", [])?;
+
+            conn.execute(
+                "INSERT INTO screenshot_images (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256, created_at) \
+                 VALUES ('img4', 4, 10, 'dev1:4', '2026-01-01T10:03:00Z', 'media/img4', 'image/jpeg', 100, 100, 100, 'sha', '2026-01-01T10:04:00Z')",
+                []
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        let result = store.with_user(user_id, |conn| {
+            let prefix = "dev1:";
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.started_at, e.ended_at, c.source_key
+                 FROM episodes e
+                 JOIN episode_members m ON m.episode_id = e.id AND m.record_type = 'screenshot'
+                 JOIN screenshots c ON c.id = m.record_id
+                 WHERE e.substance = 'normal' AND e.visual_evidence = 'useful'
+                   AND c.source_key LIKE ?1
+                   AND c.is_duplicate = 0
+                   AND c.source_key NOT IN (SELECT source_key FROM screenshot_images)
+                 ORDER BY e.started_at DESC, c.captured_at ASC",
+            )?;
+            let rows = stmt.query_map([format!("{}%", prefix)], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut list = Vec::new();
+            for r in rows {
+                list.push(r?);
+            }
+            Ok(list)
+        }).await.unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 10);
+        assert_eq!(result[0].3, "dev1:1");
+        assert_eq!(result[1].3, "dev1:2");
     }
 }

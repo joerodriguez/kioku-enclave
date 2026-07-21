@@ -22,7 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 # HTTP server — axum on tokio
-axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"] }
+axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio", "multipart"] }
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net"] }
 tower = { version = "0.5.2", default-features = false }
 
