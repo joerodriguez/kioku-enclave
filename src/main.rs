@@ -116,10 +116,14 @@ pub(crate) async fn dump_user_export(
             let utterances = dump_table(conn, "SELECT * FROM utterances ORDER BY id")?;
             let screenshots = dump_table(conn, "SELECT * FROM screenshots ORDER BY id")?;
             let episodes = dump_table(conn, "SELECT * FROM episodes ORDER BY id")?;
+            let final_briefs = dump_table(conn, "SELECT * FROM episode_final_briefs ORDER BY episode_id")?;
+            let deliveries = dump_table(conn, "SELECT * FROM episode_deliveries ORDER BY episode_id")?;
             Ok(json!({
                 "utterances": utterances,
                 "screenshots": screenshots,
                 "episodes": episodes,
+                "episode_final_briefs": final_briefs,
+                "episode_deliveries": deliveries,
             }))
         })
         .await

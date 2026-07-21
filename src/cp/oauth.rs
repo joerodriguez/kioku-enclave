@@ -31,6 +31,7 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/register", post(register))
         .route("/authorize", get(authorize))
         .route("/oauth/google/callback", get(google_callback))
+        .route("/oauth/gmail/callback", get(gmail_callback))
         .route("/token", post(token))
 }
 
@@ -394,6 +395,215 @@ async fn google_callback(
         serde_urlencoded::to_string(&params).unwrap_or_default()
     );
     redirect_302(&url)
+}
+
+// ── Gmail OAuth Callback and Connection ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GmailTokenResp {
+    access_token: String,
+    refresh_token: Option<String>,
+    id_token: String,
+}
+
+async fn gmail_callback(
+    State(s): State<Arc<CpState>>,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    if let Some(e) = q.error {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(format!("<h1>Gmail authorization failed</h1><p>{e}</p>")),
+        )
+            .into_response();
+    }
+    let (Some(code), Some(state_jwt)) = (q.code, q.state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Missing code/state</h1>".to_string()),
+        )
+            .into_response();
+    };
+
+    let gmail_state = match tokens::verify_gmail_state(&s.config.jwt_secrets[0], &state_jwt) {
+        Ok(st) => st,
+        Err(_) => {
+            match s
+                .config
+                .jwt_secrets
+                .iter()
+                .skip(1)
+                .find_map(|sec| tokens::verify_gmail_state(sec, &state_jwt).ok())
+            {
+                Some(st) => st,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Html("<h1>Invalid or expired Gmail OAuth state</h1>".to_string()),
+                    )
+                        .into_response()
+                }
+            }
+        }
+    };
+
+    let base = &s.config.base_url;
+    let body = serde_urlencoded::to_string([
+        ("code", code.as_str()),
+        ("client_id", s.config.google_web_client_id.as_str()),
+        ("client_secret", s.config.google_web_client_secret.as_str()),
+        ("redirect_uri", &format!("{base}/oauth/gmail/callback")),
+        ("grant_type", "authorization_code"),
+    ])
+    .unwrap_or_default();
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .post("https://oauth2.googleapis.com/token")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await;
+
+    let token_data: GmailTokenResp = match resp {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(t) => t,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Html("<h1>Google token parse failed</h1>".to_string()),
+                )
+                    .into_response()
+            }
+        },
+        _ => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Html("<h1>Google token exchange failed</h1>".to_string()),
+            )
+                .into_response()
+        }
+    };
+
+    let (returned_sub, returned_email) = match s.user_verifier.verify(&token_data.id_token).await {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Html("<h1>Google ID token verification failed</h1>".to_string()),
+            )
+                .into_response()
+        }
+    };
+
+    let user_id = gmail_state.user_id;
+    let expected_email = match s.control.user_email(&user_id).await {
+        Ok(Some(email)) => email,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("<h1>User not found</h1>".to_string()),
+            )
+                .into_response()
+        }
+    };
+
+    let dest_lower = returned_email.to_lowercase();
+    if !dest_lower.ends_with("@gmail.com") && !dest_lower.ends_with("@googlemail.com") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Feature requires a personal Gmail or Googlemail account</h1>".to_string()),
+        )
+            .into_response();
+    }
+
+    if expected_email.to_lowercase() != dest_lower {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Account mismatch: authorized Google account does not match Kioku account</h1>".to_string()),
+        )
+            .into_response();
+    }
+
+    let Some(refresh_token) = token_data.refresh_token else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Failed to obtain refresh token. Please disconnect and reconnect Gmail with offline access permitted.</h1>".to_string()),
+        )
+            .into_response();
+    };
+
+    let now_iso = crate::cp::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    );
+    let config = crate::cp::control_store::GmailConfig {
+        user_id: user_id.clone(),
+        enabled: true,
+        enabled_at: Some(now_iso),
+        gmail_email: Some(returned_email),
+        google_sub: Some(returned_sub),
+        refresh_token: Some(refresh_token),
+        reconnect_required: false,
+    };
+
+    if let Err(e) = s.control.upsert_gmail_config(config).await {
+        tracing::error!(error = %e, "failed to save Gmail configuration");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html("<h1>Failed to save configuration</h1>".to_string()),
+        )
+            .into_response();
+    }
+
+    let redirect_url = format!("{}/app#settings", s.config.web_origin);
+    redirect_302(&redirect_url)
+}
+
+pub async fn connect_gmail_url(
+    State(s): State<Arc<CpState>>,
+    axum::Extension(user): axum::Extension<crate::cp::auth::AuthUser>,
+) -> Response {
+    let user_id = user.0;
+    
+    let email = match s.control.user_email(&user_id).await {
+        Ok(Some(email)) => email,
+        _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response(),
+    };
+
+    let email_lower = email.to_lowercase();
+    if !email_lower.ends_with("@gmail.com") && !email_lower.ends_with("@googlemail.com") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "gmail_only", "message": "Only personal Gmail accounts support this feature"})),
+        )
+            .into_response();
+    }
+
+    let state_jwt = match tokens::issue_gmail_state(&s.config.jwt_secrets[0], &user_id) {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "server_error"}))).into_response(),
+    };
+
+    let base = &s.config.base_url;
+    let mut url = String::from("https://accounts.google.com/o/oauth2/v2/auth?");
+    url.push_str(
+        &serde_urlencoded::to_string([
+            ("client_id", s.config.google_web_client_id.as_str()),
+            ("redirect_uri", &format!("{base}/oauth/gmail/callback")),
+            ("response_type", "code"),
+            ("scope", "openid email https://www.googleapis.com/auth/gmail.send"),
+            ("state", &state_jwt),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+            ("include_granted_scopes", "true"),
+        ])
+        .unwrap_or_default(),
+    );
+
+    Json(json!({ "url": url })).into_response()
 }
 
 // ── /token ──────────────────────────────────────────────────────────────────────

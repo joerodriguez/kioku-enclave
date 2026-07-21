@@ -32,6 +32,9 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/api/episodes/{id}", delete(rest_episode_delete))
         .route("/api/episodes/{id}/members", get(rest_episode_members))
         .route("/api/feed", get(rest_feed))
+        .route("/api/screenshot-images/plan", get(rest_screenshot_upload_plan))
+        .route("/api/preferences/episode-email", get(rest_get_preference).post(rest_set_preference))
+        .route("/api/preferences/episode-email/connect", post(rest_connect_preference))
 }
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
@@ -256,7 +259,21 @@ async fn tool_list_episodes(s: &Arc<CpState>, user_id: &str, args: &Value) -> Va
         .get("max_episodes")
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as i64;
-    list_episodes_value(s, user_id, from, to, max).await
+    let include_low = args.get("include_low").is_some_and(value_is_truthy);
+    list_episodes_value(s, user_id, from, to, max, include_low).await
+}
+
+fn value_is_truthy(value: &Value) -> bool {
+    value.as_bool().unwrap_or(false)
+        || value.as_i64().is_some_and(|v| v == 1)
+        || value.as_str().is_some_and(string_is_truthy)
+}
+
+fn string_is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 /// Parse a stored JSON-array column (participants/languages/action_items)
@@ -279,6 +296,7 @@ async fn list_episodes_value(
     from: Option<String>,
     to: Option<String>,
     max: i64,
+    include_low: bool,
 ) -> Value {
     s.store
         .with_user(user_id, move |conn| {
@@ -294,15 +312,35 @@ async fn list_episodes_value(
                           WHERE m.episode_id = e.id AND m.record_type = 'utterance'), \
                         (SELECT count(*) FROM episode_members m \
                           WHERE m.episode_id = e.id AND m.record_type = 'screenshot'), \
-                        e.minute_summaries \
+                        e.minute_summaries, e.substance, e.visual_evidence, \
+                        e.finalized_at, e.finalization_version, \
+                        fb.overview, fb.decisions, fb.action_items, fb.important_links, fb.open_questions \
                  FROM episodes e \
+                 LEFT JOIN episode_final_briefs fb ON fb.episode_id = e.id \
                  WHERE (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
-                 ORDER BY e.started_at DESC LIMIT ?3",
+                   AND (?3 = 1 OR e.substance != 'none') \
+                 ORDER BY e.started_at DESC LIMIT ?4",
             )?;
             let mut episodes: Vec<Value> = stmt
-                .query_map(rusqlite::params![from, to, max], |r| {
+                .query_map(rusqlite::params![from, to, include_low, max], |r| {
                     let utt: i64 = r.get(9)?;
                     let scr: i64 = r.get(10)?;
+                    
+                    let finalized_at: Option<String> = r.get(14)?;
+                    let finalization_version: Option<i32> = r.get(15)?;
+                    
+                    let final_brief = if let Some(overview) = r.get::<_, Option<String>>(16)? {
+                        Some(json!({
+                            "overview": overview,
+                            "decisions": serde_json::from_str::<Value>(&r.get::<_, String>(17)?).unwrap_or(json!([])),
+                            "action_items": serde_json::from_str::<Value>(&r.get::<_, String>(18)?).unwrap_or(json!([])),
+                            "important_links": serde_json::from_str::<Value>(&r.get::<_, String>(19)?).unwrap_or(json!([])),
+                            "open_questions": serde_json::from_str::<Value>(&r.get::<_, String>(20)?).unwrap_or(json!([])),
+                        }))
+                    } else {
+                        None
+                    };
+
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?,
                         "started_at": r.get::<_, String>(1)?,
@@ -317,14 +355,32 @@ async fn list_episodes_value(
                         // renders these, falling back to client-derived gists
                         // when empty (pre-feature episodes).
                         "minute_summaries": json_array_column(r.get::<_, Option<String>>(11)?),
+                        "substance": r.get::<_, String>(12)?,
+                        "visual_evidence": r.get::<_, String>(13)?,
                         "utterance_count": utt,
                         "screenshot_count": scr,
                         "member_count": utt + scr,
                         "source": "summarized",
+                        "finalized_at": finalized_at,
+                        "finalization_version": finalization_version,
+                        "final_brief": final_brief,
                     }))
                 })?
                 .filter_map(|x| x.ok())
                 .collect();
+
+            let hidden_count: i64 = if include_low {
+                0
+            } else {
+                conn.query_row(
+                    "SELECT count(*) FROM episodes e \
+                     WHERE (?1 IS NULL OR e.ended_at >= ?1) \
+                       AND (?2 IS NULL OR e.started_at <= ?2) \
+                       AND e.substance = 'none'",
+                    rusqlite::params![from, to],
+                    |r| r.get(0),
+                )?
+            };
 
             // Top apps + domains per episode from member screenshots (top 3
             // each, by frequency). One grouped query, merged in memory.
@@ -370,10 +426,14 @@ async fn list_episodes_value(
 
             // episode_count is part of the debugger contract: the Episodes tab
             // header renders `${data.episode_count} episodes`.
-            Ok(json!({ "episode_count": episodes.len(), "episodes": episodes }))
+            Ok(json!({
+                "episode_count": episodes.len(),
+                "hidden_count": hidden_count,
+                "episodes": episodes
+            }))
         })
         .await
-        .unwrap_or_else(|_| json!({ "episode_count": 0, "episodes": [] }))
+        .unwrap_or_else(|_| json!({ "episode_count": 0, "hidden_count": 0, "episodes": [] }))
 }
 
 async fn tool_get_capture_status(s: &CpState, user_id: &str) -> Value {
@@ -466,7 +526,8 @@ fn tool_definitions() -> Value {
                     "from": {"type": "string"},
                     "to": {"type": "string"},
                     "gap_minutes": {"type": "number", "default": 15},
-                    "max_episodes": {"type": "number", "default": 20}
+                    "max_episodes": {"type": "number", "default": 20},
+                    "include_low": {"type": "boolean", "default": false, "description": "Include substance=none episodes normally hidden from browse."}
                 }
             }
         },
@@ -619,6 +680,7 @@ struct EpisodesParams {
     from: Option<String>,
     to: Option<String>,
     max_episodes: Option<i64>,
+    include_low: Option<String>,
 }
 
 async fn rest_episodes(
@@ -626,8 +688,19 @@ async fn rest_episodes(
     Extension(user): Extension<AuthUser>,
     Query(p): Query<EpisodesParams>,
 ) -> Response {
-    Json(list_episodes_value(&s, &user.0, p.from, p.to, p.max_episodes.unwrap_or(50)).await)
-        .into_response()
+    let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
+    Json(
+        list_episodes_value(
+            &s,
+            &user.0,
+            p.from,
+            p.to,
+            p.max_episodes.unwrap_or(50),
+            include_low,
+        )
+        .await,
+    )
+    .into_response()
 }
 
 /// DELETE /api/episodes/{id} — purge an episode AND its member raw records
@@ -710,7 +783,7 @@ async fn rest_episode_members(
             // utterances, {device_id}:{local_id} for screenshots) lets the
             // debugger — running on the Mac beside the local store — join a
             // member back to its local row and serve the actual screenshot
-            // image (raw images never leave the Mac; ADR-0004).
+            // image (full-resolution originals stay on the Mac; see ADR-0010 for Cloud Screenshot Evidence).
             let mut us = conn.prepare(
                 "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text, u.source_key \
                  FROM episode_members m \
@@ -742,7 +815,7 @@ async fn rest_episode_members(
                         substr(c.ocr_text,1,2000), c.source_key \
                  FROM episode_members m \
                  JOIN screenshots c ON c.id = m.record_id \
-                 WHERE m.episode_id = ?1 AND m.record_type = 'screenshot'",
+                 WHERE m.episode_id = ?1 AND m.record_type = 'screenshot' AND c.is_duplicate = 0",
             )?;
             members.extend(
                 ss.query_map([id], |r| {
@@ -868,7 +941,7 @@ fn query_feed(
     let mut s_sql = r#"
         SELECT id, captured_at, active_app, window_title, url, ocr_text, source_key
         FROM screenshots
-        WHERE captured_at IS NOT NULL
+        WHERE captured_at IS NOT NULL AND is_duplicate = 0
     "#
     .to_string();
 
@@ -1007,11 +1080,222 @@ async fn rest_feed(
     }
 }
 
+#[derive(Deserialize)]
+struct PlanParams {
+    device_id: String,
+    after: Option<String>,
+}
+
+async fn rest_screenshot_upload_plan(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(p): Query<PlanParams>,
+) -> Response {
+    if let Err(e) = crate::store::validate_user_id(&user.0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    let result = s.store.with_user(&user.0, move |conn| {
+        let prefix = format!("{}:", p.device_id);
+        
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.started_at, e.ended_at, c.source_key
+             FROM episodes e
+             JOIN episode_members m ON m.episode_id = e.id AND m.record_type = 'screenshot'
+             JOIN screenshots c ON c.id = m.record_id
+             WHERE e.substance = 'normal' AND e.visual_evidence = 'useful'
+               AND c.source_key LIKE ?1
+               AND c.is_duplicate = 0
+               AND (?2 IS NULL OR c.captured_at >= ?2)
+               AND c.source_key NOT IN (SELECT source_key FROM screenshot_images)
+             ORDER BY e.started_at DESC, c.captured_at ASC",
+        )?;
+        
+        let rows = stmt.query_map(
+            rusqlite::params![format!("{}%", prefix), p.after],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+
+        let mut episodes_map = std::collections::BTreeMap::new();
+        for r in rows {
+            let (ep_id, start, end, sk) = r?;
+            let entry = episodes_map.entry(ep_id).or_insert_with(|| {
+                json!({
+                    "id": ep_id,
+                    "started_at": start,
+                    "ended_at": end,
+                    "source_keys": Vec::<String>::new()
+                })
+            });
+            entry.as_object_mut().unwrap()["source_keys"].as_array_mut().unwrap().push(Value::String(sk));
+        }
+
+        let episodes_list: Vec<Value> = episodes_map.into_values().collect();
+        Ok(json!({ "episodes": episodes_list }))
+    }).await;
+
+    match result {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "screenshot upload plan failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "server_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPreferenceRequest {
+    enabled: bool,
+}
+
+async fn rest_get_preference(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let user_id = user.0;
+    let cfg = match s.control.get_gmail_config(&user_id).await {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match cfg {
+        Some(c) => Json(json!({
+            "enabled": c.enabled,
+            "recipient": c.gmail_email,
+            "gmail_connected": c.refresh_token.is_some(),
+            "reconnect_required": c.reconnect_required,
+            "enabled_at": c.enabled_at,
+        }))
+        .into_response(),
+        None => {
+            // Check user email
+            let email = match s.control.user_email(&user_id).await {
+                Ok(Some(e)) => e,
+                _ => return StatusCode::UNAUTHORIZED.into_response(),
+            };
+            Json(json!({
+                "enabled": false,
+                "recipient": Some(email),
+                "gmail_connected": false,
+                "reconnect_required": false,
+                "enabled_at": None::<String>,
+            }))
+            .into_response()
+        }
+    }
+}
+
+async fn rest_set_preference(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<SetPreferenceRequest>,
+) -> Response {
+    let user_id = user.0;
+    
+    // Check if configuration exists
+    let mut cfg = match s.control.get_gmail_config(&user_id).await {
+        Ok(Some(c)) => c,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "reconnect_required", "message": "Gmail account not connected"})),
+            )
+                .into_response();
+        }
+    };
+
+    if req.enabled {
+        if cfg.refresh_token.is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "reconnect_required", "message": "Gmail credentials missing"})),
+            )
+                .into_response();
+        }
+        cfg.enabled = true;
+        let now_iso = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64
+        );
+        cfg.enabled_at = Some(now_iso);
+    } else {
+        cfg.enabled = false;
+        let refresh_token = cfg.refresh_token.take();
+
+        if let Some(token) = refresh_token {
+            tokio::spawn(async move {
+                let http = reqwest::Client::new();
+                let _ = http
+                    .post("https://oauth2.googleapis.com/revoke")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(format!("token={}", token))
+                    .send()
+                    .await;
+            });
+        }
+
+        let user_id_cloned = user_id.clone();
+        let db_res = s.store.with_user(&user_id_cloned, |conn| {
+            conn.execute(
+                "UPDATE episode_deliveries SET state = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE state IN ('pending', 'retry')",
+                [],
+            )?;
+            Ok(())
+        }).await;
+        if let Err(e) = db_res {
+            tracing::warn!(user_id = %user_id, error = %e, "failed to cancel pending deliveries on disable");
+        } else {
+            let _ = s.store.save_user(&user_id).await;
+        }
+    }
+
+    if let Err(e) = s.control.upsert_gmail_config(cfg).await {
+        tracing::warn!(error = %e, "failed to update preference");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    StatusCode::OK.into_response()
+}
+
+async fn rest_connect_preference(
+    state: State<Arc<CpState>>,
+    user: Extension<AuthUser>,
+) -> Response {
+    super::oauth::connect_gmail_url(state, user).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::tests::{FakeGcs, FakeKms};
     use crate::store::Store;
+
+    #[test]
+    fn include_low_accepts_documented_and_mcp_truthy_values() {
+        assert!(string_is_truthy("1"));
+        assert!(string_is_truthy(" TRUE "));
+        assert!(value_is_truthy(&json!(true)));
+        assert!(value_is_truthy(&json!(1)));
+        assert!(!string_is_truthy("0"));
+        assert!(!value_is_truthy(&json!(false)));
+    }
 
     #[tokio::test]
     async fn feed_fuses_kinds_chronologically_newest_first() {

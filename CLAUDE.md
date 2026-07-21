@@ -26,7 +26,7 @@ get a `map.md` linked from their parent. Treat a stale `map.md` like stale docs.
 - `CONTRIBUTING.md` — contribution + PR rules (summarized below).
 - **Product + security ground truth: `docs/PRODUCT-SPEC.md` in the sibling
   `kioku-monorepo` repo.** It states what Kioku is for and the **security invariants** that
-  govern this repo above all (raw media never leaves the Mac; plaintext only in this
+  govern this repo above all (raw media stays local by default; plaintext only in this
   attested process; per-user encryption; key access bound to the attested digest; no new
   plaintext sink; export/delete always complete). Resolve decisions in its favor; a change
   that weakens an invariant is wrong by default.

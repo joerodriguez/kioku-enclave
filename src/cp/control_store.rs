@@ -74,6 +74,16 @@ CREATE TABLE IF NOT EXISTS config (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS user_gmail_configs (
+    user_id            TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    enabled            INTEGER NOT NULL DEFAULT 0,
+    enabled_at         TEXT,
+    gmail_email        TEXT,
+    google_sub         TEXT,
+    refresh_token      TEXT,
+    reconnect_required INTEGER NOT NULL DEFAULT 0,
+    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 "#;
 
 struct BlobMeta {
@@ -98,6 +108,17 @@ pub struct User {
     pub id: String,
     #[allow(dead_code)] // surfaced for callers that log/display the account
     pub email: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GmailConfig {
+    pub user_id: String,
+    pub enabled: bool,
+    pub enabled_at: Option<String>,
+    pub gmail_email: Option<String>,
+    pub google_sub: Option<String>,
+    pub refresh_token: Option<String>,
+    pub reconnect_required: bool,
 }
 
 impl ControlStore {
@@ -452,8 +473,79 @@ impl ControlStore {
         self.write(move |conn| {
             conn.execute("DELETE FROM refresh_tokens WHERE user_id = ?1", [&user_id])?;
             conn.execute("DELETE FROM usage_daily WHERE user_id = ?1", [&user_id])?;
+            conn.execute("DELETE FROM user_gmail_configs WHERE user_id = ?1", [&user_id])?;
             let n = conn.execute("DELETE FROM users WHERE id = ?1", [&user_id])?;
             Ok(n > 0)
+        })
+        .await
+    }
+
+    pub async fn get_gmail_config(&self, user_id: &str) -> Result<Option<GmailConfig>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT enabled, enabled_at, gmail_email, google_sub, refresh_token, reconnect_required
+                     FROM user_gmail_configs WHERE user_id = ?1",
+                    [&user_id],
+                    |r| {
+                        Ok(GmailConfig {
+                            user_id: user_id.clone(),
+                            enabled: r.get::<_, i32>(0)? != 0,
+                            enabled_at: r.get(1)?,
+                            gmail_email: r.get(2)?,
+                            google_sub: r.get(3)?,
+                            refresh_token: r.get(4)?,
+                            reconnect_required: r.get::<_, i32>(5)? != 0,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+    }
+
+    pub async fn upsert_gmail_config(&self, config: GmailConfig) -> Result<()> {
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO user_gmail_configs (user_id, enabled, enabled_at, gmail_email, google_sub, refresh_token, reconnect_required)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    enabled_at = excluded.enabled_at,
+                    gmail_email = excluded.gmail_email,
+                    google_sub = excluded.google_sub,
+                    refresh_token = excluded.refresh_token,
+                    reconnect_required = excluded.reconnect_required,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                rusqlite::params![
+                    config.user_id,
+                    if config.enabled { 1 } else { 0 },
+                    config.enabled_at,
+                    config.gmail_email,
+                    config.google_sub,
+                    config.refresh_token,
+                    if config.reconnect_required { 1 } else { 0 }
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn disable_gmail_config(&self, user_id: &str) -> Result<()> {
+        let user_id = user_id.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE user_gmail_configs SET
+                    enabled = 0,
+                    refresh_token = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE user_id = ?1",
+                [&user_id],
+            )?;
+            Ok(())
         })
         .await
     }

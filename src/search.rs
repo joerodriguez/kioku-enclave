@@ -501,6 +501,7 @@ fn search_screenshots_fts(
         WHERE id IN (
             SELECT rowid FROM screenshots_fts WHERE screenshots_fts MATCH ?1
         )
+        AND is_duplicate = 0
         AND (?2 IS NULL OR captured_at >= ?2)
         AND (?3 IS NULL OR captured_at <= ?3)
         ORDER BY captured_at DESC
@@ -596,6 +597,7 @@ fn search_screenshots_hybrid(
         JOIN screenshots sc ON sc.id = r.screenshot_id
         WHERE (?1 IS NULL OR sc.captured_at >= ?1)
           AND (?2 IS NULL OR sc.captured_at <= ?2)
+          AND sc.is_duplicate = 0
         ORDER BY r.rrf_score DESC
         "#
     );
@@ -674,6 +676,7 @@ fn search_episodes_by_speaker(
                e.minute_summaries
         FROM episodes e
         WHERE {participants}
+          AND e.substance != 'none'
           AND (?2 IS NULL OR e.started_at >= ?2)
           AND (?3 IS NULL OR e.started_at <= ?3)
         ORDER BY e.started_at DESC
@@ -715,6 +718,7 @@ fn search_episodes_fts(conn: &rusqlite::Connection, req: &SearchRequest) -> Resu
         FROM episodes_fts
         JOIN episodes e ON e.id = episodes_fts.rowid
         WHERE episodes_fts MATCH ?1
+          AND e.substance != 'none'
           AND (?2 IS NULL OR e.started_at >= ?2)
           AND (?3 IS NULL OR e.started_at <= ?3)
           AND (?6 IS NULL OR {participants})
@@ -764,8 +768,10 @@ fn search_episodes_hybrid(
     let candidate_limit = (req.limit * 3).max(60) as i64;
 
     let fts_sql = format!(
-        "SELECT rowid, {SNIPPET_FN} FROM episodes_fts \
-         WHERE episodes_fts MATCH ?1 ORDER BY rank LIMIT ?2"
+        "SELECT episodes_fts.rowid, {SNIPPET_FN} FROM episodes_fts \
+         JOIN episodes e ON e.id = episodes_fts.rowid \
+         WHERE episodes_fts MATCH ?1 AND e.substance != 'none' \
+         ORDER BY rank LIMIT ?2"
     );
     let mut fts_stmt = conn.prepare(&fts_sql)?;
     let fts: Vec<(i64, String)> = fts_stmt
@@ -785,12 +791,24 @@ fn search_episodes_hybrid(
         LIMIT ?2
     "#;
     let mut knn_stmt = conn.prepare(knn_sql)?;
-    let knn_rows: Vec<(i64, f64)> = knn_stmt
+    let mut knn_rows: Vec<(i64, f64)> = knn_stmt
         .query_map(
             rusqlite::params![query_bytes.as_slice(), candidate_limit],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(knn_stmt);
+    // sqlite-vec requires KNN MATCH to remain standalone, so apply the episode
+    // visibility predicate immediately after candidate retrieval and before
+    // RRF/pagination. Filtering only in the final join would create short pages.
+    knn_rows.retain(|(id, _)| {
+        conn.query_row(
+            "SELECT substance != 'none' FROM episodes WHERE id = ?1",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    });
 
     let candidates_page: Vec<(i64, f64)> = rrf_merge(&fts_rows, &knn_rows)
         .into_iter()
@@ -815,7 +833,8 @@ fn search_episodes_hybrid(
                e.minute_summaries, r.rrf_score
         FROM ranked r
         JOIN episodes e ON e.id = r.episode_id
-        WHERE (?1 IS NULL OR e.started_at >= ?1)
+        WHERE e.substance != 'none'
+          AND (?1 IS NULL OR e.started_at >= ?1)
           AND (?2 IS NULL OR e.started_at <= ?2)
           AND (?3 IS NULL OR {participants})
         ORDER BY r.rrf_score DESC
@@ -1227,6 +1246,8 @@ mod tests {
                         participants: None,
                         languages: None,
                         action_items: None,
+                        substance: None,
+                        visual_evidence: None,
                         minute_summaries: Some(vec![MinuteBucket {
                             start: "2026-07-05T20:58:00Z".into(),
                             gist: "Pesto recipe, lobster question".into(),
@@ -1266,6 +1287,74 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn episode_search_hides_none_but_keeps_low() {
+        use crate::episodes::write_episode_embedding;
+        let store = make_store();
+        let hidden_id = store
+            .with_user("ep_substance_u", |conn| {
+                conn.execute_batch(
+                    r#"
+                    INSERT INTO episodes
+                        (started_at, ended_at, title, summary, participants, substance)
+                    VALUES
+                        ('2026-07-05T09:00:00Z','2026-07-05T09:30:00Z','Orchid normal','orchid notes','["Ana"]','normal'),
+                        ('2026-07-05T10:00:00Z','2026-07-05T10:30:00Z','Orchid low','orchid remarks','["Ana"]','low'),
+                        ('2026-07-05T11:00:00Z','2026-07-05T11:30:00Z','Orchid hidden','orchid noise','["Ana"]','none');
+                    "#,
+                )?;
+                let id: i64 = conn.query_row(
+                    "SELECT id FROM episodes WHERE substance='none'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                write_episode_embedding(conn, id, &make_embedding(1.0))?;
+                Ok(id)
+            })
+            .await
+            .unwrap();
+
+        let fts = store
+            .with_user("ep_substance_u", |conn| {
+                search_episodes(
+                    conn,
+                    &req_fts("ep_substance_u", "orchid", vec!["episode".into()]),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fts.len(),
+            2,
+            "normal and low stay searchable; none is hidden"
+        );
+
+        let speaker = store
+            .with_user("ep_substance_u", |conn| {
+                search_all(
+                    conn,
+                    &req_fts("ep_substance_u", "speaker:Ana", vec!["episode".into()]),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(speaker.len(), 2, "speaker browse follows the same filter");
+
+        let hybrid = SearchRequest {
+            kinds: vec!["episode".into()],
+            ..req_hybrid("ep_substance_u", "nomatchterm", 1.0)
+        };
+        let hits = store
+            .with_user("ep_substance_u", |conn| search_episodes(conn, &hybrid))
+            .await
+            .unwrap();
+        assert!(
+            hits.iter()
+                .all(|hit| !matches!(hit, SearchHit::Episode { id, .. } if *id == hidden_id)),
+            "hidden vector candidates must be removed before RRF pagination"
+        );
+    }
+
     /// Hybrid episode search: an episode whose text does NOT match FTS is
     /// still found via its in-enclave vector, with an RRF score attached.
     #[tokio::test]
@@ -1286,6 +1375,8 @@ mod tests {
                         participants: None,
                         languages: None,
                         action_items: None,
+                        substance: None,
+                        visual_evidence: None,
                         minute_summaries: None,
                         model: None,
                         member_utterance_ids: vec![],
@@ -1334,6 +1425,7 @@ mod tests {
                         ocr_text: Some("participant panel names list".to_string()),
                         url: None,
                         image_hash: None,
+                        is_duplicate: None,
                         source_key: Some("dev:9".to_string()),
                         embedding_b64: Some(make_embedding_b64(1.0)),
                     }],
@@ -1489,6 +1581,8 @@ mod tests {
                         participants: Some(vec!["Me".into(), "Ana (S3)".into()]),
                         languages: None,
                         action_items: None,
+                        substance: None,
+                        visual_evidence: None,
                         minute_summaries: None,
                         model: None,
                         member_utterance_ids: vec![],

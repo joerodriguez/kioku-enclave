@@ -57,6 +57,7 @@ fn response_schema() -> Value {
                         "participants": {"type": "ARRAY", "items": {"type": "STRING"}},
                         "languages": {"type": "ARRAY", "items": {"type": "STRING"}},
                         "action_items": {"type": "ARRAY", "items": {"type": "STRING"}},
+                        "substance": {"type": "STRING", "enum": ["none","low","normal"]},
                         // ADR-0004: minute-timeline gists, generated eagerly in
                         // this same pass. Constrained decoding emits nothing
                         // that isn't in the schema — without this field the
@@ -73,7 +74,7 @@ fn response_schema() -> Value {
                             }
                         }
                     },
-                    "required": ["started_at","ended_at","title","minutes"]
+                    "required": ["started_at","ended_at","title","substance","minutes"]
                 }
             }
         },
@@ -84,6 +85,19 @@ fn response_schema() -> Value {
 /// Call Gemini and return the raw response text (expected to be JSON per the
 /// schema). `Err` with a `quota` marker string on HTTP 429.
 pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Result<String> {
+    generate_custom(config, system, user_message, response_schema(), 65_535).await
+}
+
+/// Call Gemini with a caller-supplied constrained-decoding schema. The episode
+/// summarizer uses [`generate`]; ADR-0009's one-time historical classifier uses
+/// this entry point with a compact `{id, substance}` schema.
+pub async fn generate_custom(
+    config: &CpConfig,
+    system: &str,
+    user_message: &str,
+    schema: Value,
+    max_output_tokens: u32,
+) -> Result<String> {
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }
@@ -106,9 +120,9 @@ pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Re
             // Model max (Gemini 2.5 Flash): a JSON response truncated by the
             // output cap is unparseable and deterministically stalls that
             // summarizer window, so leave no headroom to waste.
-            "maxOutputTokens": 65535,
+            "maxOutputTokens": max_output_tokens,
             "responseMimeType": "application/json",
-            "responseSchema": response_schema(),
+            "responseSchema": schema,
             "thinkingConfig": { "thinkingBudget": 0 }
         }
     });

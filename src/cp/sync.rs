@@ -66,8 +66,16 @@ struct Screenshot {
     window_title: Option<String>,
     ocr_text: Option<String>,
     url: Option<String>,
+    image_hash: Option<String>,
+    is_duplicate: Option<i64>,
     /// Optional 384-dim OCR-text embedding (see `crate::embedding::MODEL_ID`).
     embedding_b64: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SettledWatermarks {
+    audio: Option<String>,
+    screen: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +91,8 @@ struct Batch {
     utterances: Vec<Utterance>,
     #[serde(default)]
     screenshots: Vec<Screenshot>,
+    #[serde(default)]
+    settled_watermarks: Option<SettledWatermarks>,
 }
 
 async fn sync_batch(
@@ -144,20 +154,58 @@ async fn sync_batch(
     // 4. Join utterances → segments, build the in-process ingest request.
     let req = build_ingest(&user_id, &batch);
 
-    match crate::ingest::ingest_batch(&s.store, &req).await {
-        Ok(resp) => Json(json!({
-            "ok": true,
-            "upserted": {
-                "utterances": resp.utterances_inserted,
-                "screenshots": resp.screenshots_inserted,
-            }
-        }))
-        .into_response(),
+    let ingest_resp = match crate::ingest::ingest_batch(&s.store, &req).await {
+        Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "enclave ingest failed");
-            err503()
+            return err503();
+        }
+    };
+
+    // 5. If watermarks are provided, upsert them and save the DB
+    if let Some(w) = &batch.settled_watermarks {
+        let user_id_cloned = user_id.clone();
+        let device_id = batch.device_id.clone();
+        let audio = w.audio.clone();
+        let screen = w.screen.clone();
+        let db_res = s.store.with_user(&user_id_cloned, move |conn| {
+            if let Some(a) = audio {
+                conn.execute(
+                    "INSERT INTO device_watermarks (device_id, modality, watermark_at)
+                     VALUES (?1, 'audio', ?2)
+                     ON CONFLICT(device_id, modality) DO UPDATE SET
+                        watermark_at = CASE WHEN excluded.watermark_at > watermark_at THEN excluded.watermark_at ELSE watermark_at END,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    [&device_id, &a],
+                )?;
+            }
+            if let Some(sc) = screen {
+                conn.execute(
+                    "INSERT INTO device_watermarks (device_id, modality, watermark_at)
+                     VALUES (?1, 'screen', ?2)
+                     ON CONFLICT(device_id, modality) DO UPDATE SET
+                        watermark_at = CASE WHEN excluded.watermark_at > watermark_at THEN excluded.watermark_at ELSE watermark_at END,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    [&device_id, &sc],
+                )?;
+            }
+            Ok(())
+        }).await;
+        if let Err(e) = db_res {
+            warn!(error = %e, "failed to save settled watermarks");
+        } else if let Err(e) = s.store.save_user(&user_id).await {
+            warn!(error = %e, "failed to save user DB after watermark update");
         }
     }
+
+    Json(json!({
+        "ok": true,
+        "upserted": {
+            "utterances": ingest_resp.utterances_inserted,
+            "screenshots": ingest_resp.screenshots_inserted,
+        }
+    }))
+    .into_response()
 }
 
 /// Join utterances to their segments (computing absolute timestamps +
@@ -206,7 +254,8 @@ fn build_ingest(user_id: &str, batch: &Batch) -> IngestRequest {
             window_title: sc.window_title.clone(),
             ocr_text: sc.ocr_text.clone(),
             url: sc.url.clone(),
-            image_hash: None,
+            image_hash: sc.image_hash.clone(),
+            is_duplicate: sc.is_duplicate,
             source_key: Some(format!("{}:{}", batch.device_id, sc.local_id)),
             embedding_b64: sc.embedding_b64.clone(),
         })

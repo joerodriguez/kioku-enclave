@@ -16,6 +16,8 @@ pub mod cors;
 pub mod isotime;
 pub mod limits;
 pub mod oauth;
+pub mod email_worker;
+pub mod finalizer;
 pub mod query;
 pub mod summarizer;
 pub mod sync;

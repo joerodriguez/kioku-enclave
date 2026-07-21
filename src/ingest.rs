@@ -99,6 +99,7 @@ pub struct ScreenshotInput {
     pub ocr_text: Option<String>,
     pub url: Option<String>,
     pub image_hash: Option<String>,
+    pub is_duplicate: Option<i64>,
     /// Idempotency key: `device_id:screenshot_local_id`.
     /// When present, `INSERT OR IGNORE` is used so re-sent batches are no-ops.
     pub source_key: Option<String>,
@@ -443,7 +444,23 @@ pub(crate) fn ingest_screenshots(
         if let Some(ref sk) = s.source_key {
             conn.execute(
                 r#"INSERT OR IGNORE INTO screenshots
-                   (captured_at, active_app, window_title, ocr_text, url, image_hash, source_key)
+                   (captured_at, active_app, window_title, ocr_text, url, image_hash, is_duplicate, source_key)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                rusqlite::params![
+                    s.captured_at,
+                    s.active_app,
+                    s.window_title,
+                    s.ocr_text,
+                    s.url,
+                    s.image_hash,
+                    s.is_duplicate.unwrap_or(0),
+                    sk,
+                ],
+            )?;
+        } else {
+            conn.execute(
+                r#"INSERT INTO screenshots
+                   (captured_at, active_app, window_title, ocr_text, url, image_hash, is_duplicate)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
                 rusqlite::params![
                     s.captured_at,
@@ -452,21 +469,7 @@ pub(crate) fn ingest_screenshots(
                     s.ocr_text,
                     s.url,
                     s.image_hash,
-                    sk,
-                ],
-            )?;
-        } else {
-            conn.execute(
-                r#"INSERT INTO screenshots
-                   (captured_at, active_app, window_title, ocr_text, url, image_hash)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-                rusqlite::params![
-                    s.captured_at,
-                    s.active_app,
-                    s.window_title,
-                    s.ocr_text,
-                    s.url,
-                    s.image_hash,
+                    s.is_duplicate.unwrap_or(0),
                 ],
             )?;
         }
@@ -549,13 +552,14 @@ mod tests {
 
     fn scr(source_key: Option<&str>) -> ScreenshotInput {
         ScreenshotInput {
-            captured_at: "2026-01-01T09:00:00Z".to_string(),
-            active_app: None,
-            window_title: None,
-            ocr_text: Some("hello world".to_string()),
+            captured_at: "2026-06-01T14:00:00Z".to_string(),
+            active_app: Some("Finder".to_string()),
+            window_title: Some("Desktop".to_string()),
+            ocr_text: Some("hello".to_string()),
             url: None,
             image_hash: None,
-            source_key: source_key.map(|s| s.to_string()),
+            is_duplicate: None,
+            source_key: source_key.map(String::from),
             embedding_b64: None,
         }
     }
@@ -906,6 +910,8 @@ mod tests {
                         participants: Some(vec!["Me".into(), "S7".into(), "Kate".into()]),
                         languages: None,
                         action_items: None,
+                        substance: None,
+                        visual_evidence: None,
                         minute_summaries: None,
                         model: None,
                         member_utterance_ids: vec![utt_id],

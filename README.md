@@ -12,9 +12,7 @@ that the running instance is exactly this code.
 
 ## Why this is public
 
-The privacy claim for Kioku is: _"Your recordings never leave your Mac; the
-text that does is processed only inside sealed hardware running exactly the
-open-source code you can read."_
+The privacy claim for Kioku is: _"Raw audio and full-resolution screenshot originals stay on your Mac. If you enable Cloud Screenshot Evidence, Kioku uploads a small set of selected, downscaled, compressed screenshots from meaningful episodes to the hardware-attested Kioku Cloud Core. They are encrypted per user, are never sent to the episode-summary model, and are included in export and deletion. The text and metadata that sync are processed only inside sealed hardware running exactly the open-source code you can read."_
 
 For that claim to be verifiable — not just asserted — the code must be public
 and the build must be reproducible. Hardware attestation then provides the

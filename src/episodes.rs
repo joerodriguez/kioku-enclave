@@ -38,6 +38,8 @@ pub struct EpisodeRow {
     /// Minute-timeline gists (ADR-0004): JSON array of {start, gist}, time
     /// ascending. Empty array for episodes summarized before the feature.
     pub minute_summaries: Value,
+    /// ADR-0009 visibility tier: none (hidden), low, or normal.
+    pub substance: String,
     pub model: Option<String>,
     pub created_at: String,
     /// Member counts (v2) — number of utterances / screenshots bound to this
@@ -141,6 +143,13 @@ pub struct EpisodeInput {
     pub languages: Option<Vec<String>>,
     /// Array of action-item strings.
     pub action_items: Option<Vec<String>>,
+    /// ADR-0009 visibility tier. Missing or invalid values default to `normal`
+    /// so an uncertain model result never silently hides an episode.
+    #[serde(default)]
+    pub substance: Option<String>,
+    /// ADR-0010 visual evidence eligibility. Defaults to `none`.
+    #[serde(default)]
+    pub visual_evidence: Option<String>,
     /// Minute-timeline gists for the window this upsert covers (ADR-0004).
     /// MERGED into the stored buckets on extension — never a whole-column
     /// replace (§G.1). Absent/empty leaves the stored buckets untouched.
@@ -154,6 +163,65 @@ pub struct EpisodeInput {
     /// Member screenshot ids to bind to this episode (additive: INSERT OR IGNORE).
     #[serde(default)]
     pub member_screenshot_ids: Vec<i64>,
+}
+
+/// Return the canonical ADR-0009 substance value, if valid.
+pub(crate) fn validate_substance(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some("none"),
+        "low" => Some("low"),
+        "normal" => Some("normal"),
+        _ => None,
+    }
+}
+
+fn normalized_substance(value: Option<&str>) -> &'static str {
+    value.and_then(validate_substance).unwrap_or("normal")
+}
+
+/// Episode extensions can only increase visibility. One substantive window
+/// makes the whole accumulated episode substantive; later sparse windows must
+/// not downgrade it.
+pub(crate) fn merge_substance(existing: Option<&str>, incoming: Option<&str>) -> &'static str {
+    let rank = |value: &str| match value {
+        "none" => 0,
+        "low" => 1,
+        _ => 2,
+    };
+    let existing = normalized_substance(existing);
+    let incoming = normalized_substance(incoming);
+    if rank(incoming) > rank(existing) {
+        incoming
+    } else {
+        existing
+    }
+}
+
+pub(crate) fn validate_visual_evidence(value: &str) -> Option<&'static str> {
+    match value {
+        "none" => Some("none"),
+        "useful" => Some("useful"),
+        _ => None,
+    }
+}
+
+fn normalized_visual_evidence(value: Option<&str>) -> &'static str {
+    value.and_then(validate_visual_evidence).unwrap_or("none")
+}
+
+/// Episode visual_evidence can only upgrade.
+pub(crate) fn merge_visual_evidence(existing: Option<&str>, incoming: Option<&str>) -> &'static str {
+    let rank = |value: &str| match value {
+        "none" => 0,
+        _ => 1,
+    };
+    let existing = normalized_visual_evidence(existing);
+    let incoming = normalized_visual_evidence(incoming);
+    if rank(incoming) > rank(existing) {
+        incoming
+    } else {
+        existing
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,15 +300,16 @@ pub(crate) fn upsert_episodes(
         // §G.1: union this window's minute buckets into the stored ones —
         // the LLM never re-sees earlier minutes, so replacing the column
         // would wipe the earlier timeline on every extension.
-        let existing_minutes: Option<String> = existing_id.and_then(|id| {
-            conn.query_row(
-                "SELECT minute_summaries FROM episodes WHERE id = ?1",
-                [id],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten()
-        });
+        let (existing_minutes, existing_substance, existing_visual): (Option<String>, Option<String>, Option<String>) = existing_id
+            .and_then(|id| {
+                conn.query_row(
+                    "SELECT minute_summaries, substance, visual_evidence FROM episodes WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok()
+            })
+            .unwrap_or((None, None, None));
         let merged = merge_minute_summaries(
             existing_minutes.as_deref(),
             ep.minute_summaries.as_deref().unwrap_or(&[]),
@@ -248,6 +317,16 @@ pub(crate) fn upsert_episodes(
         let (minutes_json, minutes_text) = match &merged {
             Some((j, t)) => (Some(j.as_str()), Some(t.as_str())),
             None => (None, None),
+        };
+        let substance = if existing_id.is_some() {
+            merge_substance(existing_substance.as_deref(), ep.substance.as_deref())
+        } else {
+            normalized_substance(ep.substance.as_deref())
+        };
+        let visual_evidence = if existing_id.is_some() {
+            merge_visual_evidence(existing_visual.as_deref(), ep.visual_evidence.as_deref())
+        } else {
+            normalized_visual_evidence(ep.visual_evidence.as_deref())
         };
 
         let episode_id = if let Some(id) = existing_id {
@@ -257,6 +336,7 @@ pub(crate) fn upsert_episodes(
                        summary = ?6, participants = ?7, languages = ?8,
                        action_items = ?9, model = ?10,
                        minute_summaries = ?11, minutes_text = ?12,
+                       substance = ?13, visual_evidence = ?14,
                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                    WHERE id = ?1"#,
                 rusqlite::params![
@@ -272,6 +352,8 @@ pub(crate) fn upsert_episodes(
                     ep.model,
                     minutes_json,
                     minutes_text,
+                    substance,
+                    visual_evidence,
                 ],
             )?;
             id
@@ -280,9 +362,9 @@ pub(crate) fn upsert_episodes(
                 r#"INSERT INTO episodes
                    (started_at, ended_at, type, title, summary, participants,
                     languages, action_items, model, minute_summaries,
-                    minutes_text, updated_at)
+                    minutes_text, substance, visual_evidence, updated_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                           strftime('%Y-%m-%dT%H:%M:%fZ','now'))"#,
+                           ?12, ?13, strftime('%Y-%m-%dT%H:%M:%fZ','now'))"#,
                 rusqlite::params![
                     ep.started_at,
                     ep.ended_at,
@@ -295,6 +377,8 @@ pub(crate) fn upsert_episodes(
                     ep.model,
                     minutes_json,
                     minutes_text,
+                    substance,
+                    visual_evidence,
                 ],
             )?;
             conn.last_insert_rowid()
@@ -369,7 +453,7 @@ fn list_episodes(
                      WHERE m.episode_id = e.id AND m.record_type = 'utterance')  AS utterance_count,
                   (SELECT COUNT(*) FROM episode_members m
                      WHERE m.episode_id = e.id AND m.record_type = 'screenshot') AS screenshot_count,
-                  e.minute_summaries
+                  e.minute_summaries, e.substance
            FROM episodes e
            WHERE (?1 IS NULL OR e.started_at >= ?1)
              AND (?2 IS NULL OR e.started_at < ?2)
@@ -658,6 +742,7 @@ fn parse_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRow> {
         utterance_count: row.get(11)?,
         screenshot_count: row.get(12)?,
         minute_summaries: parse_json_array(row.get(13)?),
+        substance: row.get(14)?,
     })
 }
 
@@ -685,6 +770,8 @@ mod tests {
             participants: Some(vec!["alice".to_string(), "bob".to_string()]),
             languages: Some(vec!["en".to_string()]),
             action_items: Some(vec!["Ship it".to_string()]),
+            substance: None,
+            visual_evidence: None,
             minute_summaries: None,
             model: Some("claude-3".to_string()),
             member_utterance_ids: vec![],
@@ -697,6 +784,57 @@ mod tests {
             start: start.to_string(),
             gist: gist.to_string(),
         }
+    }
+
+    #[test]
+    fn substance_validation_and_merge_are_conservative() {
+        assert_eq!(validate_substance("LOW"), Some("low"));
+        assert_eq!(validate_substance("unknown"), None);
+        assert_eq!(merge_substance(Some("none"), Some("low")), "low");
+        assert_eq!(merge_substance(Some("low"), Some("normal")), "normal");
+        assert_eq!(merge_substance(Some("normal"), Some("none")), "normal");
+        assert_eq!(merge_substance(Some("low"), Some("none")), "low");
+        assert_eq!(merge_substance(Some("none"), Some("invalid")), "normal");
+    }
+
+    #[tokio::test]
+    async fn upsert_substance_only_upgrades() {
+        let store = make_store();
+        let initial = EpisodeInput {
+            substance: Some("none".into()),
+            ..sample_episode("2026-07-09T09:00:00Z", "2026-07-09T09:30:00Z")
+        };
+        let id = store
+            .with_user("substance_user", |conn| upsert_episodes(conn, &[initial]))
+            .await
+            .unwrap()[0];
+
+        for incoming in ["low", "none", "normal", "low"] {
+            let extension = EpisodeInput {
+                id: Some(id),
+                substance: Some(incoming.into()),
+                ..sample_episode("2026-07-09T09:00:00Z", "2026-07-09T10:00:00Z")
+            };
+            store
+                .with_user("substance_user", |conn| upsert_episodes(conn, &[extension]))
+                .await
+                .unwrap();
+        }
+
+        let stored: String = store
+            .with_user("substance_user", |conn| {
+                Ok(
+                    conn.query_row("SELECT substance FROM episodes WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, "normal",
+            "later low windows cannot downgrade normal"
+        );
     }
 
     /// §G.1 — the merge case: an EXTENDED episode must retain the minute

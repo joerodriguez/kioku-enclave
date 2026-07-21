@@ -30,12 +30,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::episodes::{upsert_episodes, write_episode_embedding, EpisodeInput, MinuteBucket};
-use crate::error::Result;
+use crate::error::{EnclaveError, Result};
 
 use super::isotime::{format_epoch_millis, parse_epoch_millis};
 use super::CpState;
@@ -55,6 +55,8 @@ const SIG_MIN_SCREEN_MS: i64 = 2 * 60 * 1000;
 const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
 const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
 const TRIGGER_COOLDOWN_MS: i64 = 3 * 60 * 1000;
+const SUBSTANCE_BACKFILL_KEY: &str = "adr_0009_substance_backfill_v1";
+const SUBSTANCE_BACKFILL_BATCH: usize = 50;
 
 /// Compute the summarization window ending bound for a run starting at
 /// `new_from` with the live tail at `tail_cutoff` (both epoch ms).
@@ -101,6 +103,7 @@ struct ScrRow {
     window_title: Option<String>,
     ocr_text: Option<String>,
     url: Option<String>,
+    is_duplicate: i64,
 }
 
 struct OpenEp {
@@ -142,17 +145,59 @@ fn is_substantive(text: &str) -> bool {
     true
 }
 
+#[derive(Clone)]
+struct CollapsedScr {
+    _id: i64,
+    captured_at: String,
+    visible_until: Option<String>,
+    active_app: Option<String>,
+    window_title: Option<String>,
+    ocr_text: Option<String>,
+    url: Option<String>,
+}
+
+fn collapse_screenshots(screenshots: &[ScrRow]) -> Vec<CollapsedScr> {
+    let mut collapsed = Vec::new();
+    let mut current: Option<CollapsedScr> = None;
+
+    for s in screenshots {
+        if s.is_duplicate == 1 {
+            if let Some(ref mut cur) = current {
+                cur.visible_until = Some(s.captured_at.clone());
+            }
+        } else {
+            if let Some(cur) = current.take() {
+                collapsed.push(cur);
+            }
+            current = Some(CollapsedScr {
+                _id: s.id,
+                captured_at: s.captured_at.clone(),
+                visible_until: None,
+                active_app: s.active_app.clone(),
+                window_title: s.window_title.clone(),
+                ocr_text: s.ocr_text.clone(),
+                url: s.url.clone(),
+            });
+        }
+    }
+    if let Some(cur) = current {
+        collapsed.push(cur);
+    }
+    collapsed
+}
+
 /// Chronological text block for the prompt (utterances + screenshot lines).
 fn render_capture_text(utterances: &[UttRow], screenshots: &[ScrRow]) -> String {
     enum Ev<'a> {
         Utt(&'a UttRow),
-        Scr(&'a ScrRow),
+        Scr(CollapsedScr),
     }
+    let collapsed_scrs = collapse_screenshots(screenshots);
     let mut events: Vec<(i64, Ev)> = Vec::new();
     for u in utterances {
         events.push((ms(&u.started_at), Ev::Utt(u)));
     }
-    for s in screenshots {
+    for s in collapsed_scrs {
         events.push((ms(&s.captured_at), Ev::Scr(s)));
     }
     events.sort_by_key(|(t, _)| *t);
@@ -186,9 +231,16 @@ fn render_capture_text(utterances: &[UttRow], screenshots: &[ScrRow]) -> String 
                     .as_ref()
                     .map(|u| format!(" <{}>", &u[..u.len().min(120)]))
                     .unwrap_or_default();
+
+                let time_str = if let Some(until) = &s.visible_until {
+                    format!("{} - {}", fmt_time(&s.captured_at), fmt_time(until))
+                } else {
+                    fmt_time(&s.captured_at)
+                };
+
                 lines.push(format!(
                     "{} [screen] {}{}{}",
-                    fmt_time(&s.captured_at),
+                    time_str,
                     app,
                     title,
                     url
@@ -243,6 +295,169 @@ fn extract_json(text: &str) -> Option<Value> {
     None
 }
 
+fn substance_backfill_schema() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "classifications": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": {"type": "INTEGER"},
+                        "substance": {"type": "STRING", "enum": ["none", "low", "normal"]}
+                    },
+                    "required": ["id", "substance"]
+                }
+            }
+        },
+        "required": ["classifications"]
+    })
+}
+
+/// Classify historical episodes once per encrypted user database. This is
+/// best-effort at the call site: a Vertex outage must not block current-window
+/// summarization. The completion marker is written only after every stored row
+/// has a valid classification, so interrupted runs safely resume.
+async fn run_substance_backfill(state: &CpState, user_id: &str) -> Result<()> {
+    let user = user_id.to_string();
+    let pending: Option<Vec<(i64, String)>> = state
+        .store
+        .with_user(&user, |conn| {
+            let complete: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM app_metadata WHERE key = ?1",
+                    [SUBSTANCE_BACKFILL_KEY],
+                    |r| r.get(0),
+                )
+                .ok();
+            if complete.as_deref() == Some("complete") {
+                return Ok(None);
+            }
+
+            let mut stmt = conn
+                .prepare("SELECT id, title, summary, minutes_text FROM episodes ORDER BY id ASC")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let id: i64 = r.get(0)?;
+                    let parts = [
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ];
+                    let joined = parts.into_iter().flatten().collect::<Vec<_>>().join("\n");
+                    // Keep batches bounded even for unusually long OCR-derived
+                    // summaries. Classification needs the gist, not full fidelity.
+                    let text = joined.chars().take(6_000).collect::<String>();
+                    Ok((id, text))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(Some(rows))
+        })
+        .await?;
+
+    let Some(rows) = pending else {
+        return Ok(());
+    };
+
+    let mut distribution: HashMap<String, usize> = HashMap::new();
+    for batch in rows.chunks(SUBSTANCE_BACKFILL_BATCH) {
+        let input: Vec<Value> = batch
+            .iter()
+            .map(|(id, text)| json!({"id": id, "text": text}))
+            .collect();
+        let message = format!(
+            "Classify every episode in this JSON array. Preserve each id exactly.\n\n{}",
+            serde_json::to_string(&input)?
+        );
+        let response = super::vertex::generate_custom(
+            &state.config,
+            SUBSTANCE_BACKFILL_PROMPT,
+            &message,
+            substance_backfill_schema(),
+            8_192,
+        )
+        .await?;
+        let parsed = extract_json(&response).ok_or_else(|| {
+            EnclaveError::Config("substance backfill response was not valid JSON".into())
+        })?;
+        let classifications = parsed
+            .get("classifications")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                EnclaveError::Config("substance backfill omitted classifications".into())
+            })?;
+
+        let expected: std::collections::HashSet<i64> = batch.iter().map(|(id, _)| *id).collect();
+        let mut updates: HashMap<i64, String> = HashMap::new();
+        for item in classifications {
+            let Some(id) = item.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if !expected.contains(&id) {
+                continue;
+            }
+            let Some(substance) = item
+                .get("substance")
+                .and_then(Value::as_str)
+                .and_then(crate::episodes::validate_substance)
+            else {
+                continue;
+            };
+            updates.insert(id, substance.to_string());
+        }
+        if updates.len() != batch.len() {
+            return Err(EnclaveError::Config(format!(
+                "substance backfill classified {}/{} episodes in a batch",
+                updates.len(),
+                batch.len()
+            )));
+        }
+
+        for substance in updates.values() {
+            *distribution.entry(substance.clone()).or_default() += 1;
+        }
+        state
+            .store
+            .with_user(&user, move |conn| {
+                for (id, substance) in updates {
+                    // Historical rows carry the migration placeholder `normal`;
+                    // this one-time pass intentionally overwrites it. Normal
+                    // summarizer extensions use upgrade-only merge instead.
+                    conn.execute(
+                        "UPDATE episodes SET substance = ?2 WHERE id = ?1",
+                        rusqlite::params![id, substance],
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+    }
+
+    state
+        .store
+        .with_user(&user, |conn| {
+            conn.execute(
+                "INSERT INTO app_metadata (key, value) VALUES (?1, 'complete') \
+                 ON CONFLICT(key) DO UPDATE SET value='complete', \
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                [SUBSTANCE_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await?;
+    state.store.save_user(&user).await?;
+    info!(
+        user_id,
+        episodes = rows.len(),
+        none = distribution.get("none").copied().unwrap_or(0),
+        low = distribution.get("low").copied().unwrap_or(0),
+        normal = distribution.get("normal").copied().unwrap_or(0),
+        "episode substance backfill complete"
+    );
+    Ok(())
+}
+
 /// Membership by innermost-containing span. Returns, per episode index, the
 /// member utterance ids and screenshot ids.
 fn derive_membership(
@@ -290,6 +505,12 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     // anyway to avoid Vertex rate-limit storms.
     static SUMMARIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = SUMMARIZE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
+    if let Err(e) = run_substance_backfill(state, user_id).await {
+        // Backfill is corrective and retryable; current capture must continue
+        // to summarize even when its separate short Vertex call fails.
+        warn!(user_id, error = %e, "episode substance backfill deferred");
+    }
 
     let summarized_until = state.control.summarized_until(user_id).await?;
     let now = now_ms();
@@ -402,6 +623,8 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         participants: Option<Vec<String>>,
         languages: Option<Vec<String>>,
         action_items: Option<Vec<String>>,
+        substance: Option<String>,
+        visual_evidence: Option<String>,
         minutes: Option<Vec<MinuteBucket>>,
     }
     let str_arr = |v: Option<&Value>| -> Option<Vec<String>> {
@@ -442,6 +665,15 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
                 })
                 .collect::<Vec<_>>()
         });
+        let substance = e
+            .get("substance")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let visual_evidence = e
+            .get("visual_evidence")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         eps.push(Ep {
             existing_id,
             started: s_ms,
@@ -452,6 +684,8 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
             participants: str_arr(e.get("participants")),
             languages: str_arr(e.get("languages")),
             action_items: str_arr(e.get("action_items")),
+            substance,
+            visual_evidence,
             minutes,
         });
     }
@@ -497,6 +731,8 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
             participants: ep.participants.clone(),
             languages: ep.languages.clone(),
             action_items: ep.action_items.clone(),
+            substance: ep.substance.clone(),
+            visual_evidence: ep.visual_evidence.clone(),
             minute_summaries: ep.minutes.clone(),
             model: Some(state.config.vertex_model.clone()),
             member_utterance_ids: utt_ids.clone(),
@@ -678,7 +914,7 @@ async fn fetch_range(
                 .filter_map(|x| x.ok())
                 .collect();
             let mut ss = conn.prepare(
-                "SELECT id, captured_at, active_app, window_title, substr(ocr_text,1,4000), url \
+                "SELECT id, captured_at, active_app, window_title, substr(ocr_text,1,4000), url, is_duplicate \
                  FROM screenshots WHERE captured_at >= ?1 AND captured_at < ?2 \
                  ORDER BY captured_at ASC LIMIT ?3",
             )?;
@@ -691,6 +927,7 @@ async fn fetch_range(
                         window_title: r.get(3)?,
                         ocr_text: r.get(4)?,
                         url: r.get(5)?,
+                        is_duplicate: r.get(6)?,
                     })
                 })?
                 .filter_map(|x| x.ok())
@@ -830,6 +1067,13 @@ pub async fn summarize_all(state: &CpState) {
                 }
             }
         }
+
+        if let Err(e) = super::finalizer::finalize_user_episodes(state, &id).await {
+            warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
+        }
+        if let Err(e) = super::email_worker::deliver_user_emails(state, &id).await {
+            warn!(user_id = %id, error = %e, "deliver_user_emails failed");
+        }
     }
 }
 
@@ -870,7 +1114,9 @@ pub fn maybe_trigger(state: Arc<CpState>, user_id: String) {
     });
 }
 
-const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n9. minutes: a minute-by-minute timeline of the episode's NEW activity. Bucket the NEW CAPTURE LOG into 1–5-minute buckets and give each a one-line concrete gist naming the subject (\"Kate & Sean arrival plans\", \"Pesto recipe, lobster question\") — never generic filler (\"conversation continues\"). Each bucket: {\"start\":\"<ISO of bucket start>\",\"gist\":\"...\"}. Cover ONLY minutes present in the NEW CAPTURE LOG — for an extension, earlier minutes are already stored; never re-emit or invent them.\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[],\"minutes\":[{\"start\":\"<ISO>\",\"gist\":\"...\"}]}]}";
+const SUBSTANCE_BACKFILL_PROMPT: &str = "Classify the substance of stored personal activity episodes from title, summary, and minute gists. substance=none: fragments with no coherent topic, hallucination-like repetition, or content-free filler. substance=low: real but trivial activity such as a few passing remarks or background TV. substance=normal: everything else. When in doubt, prefer the higher tier. Return one classification for every supplied id and do not invent ids.";
+
+const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n9. minutes: a minute-by-minute timeline of the episode's NEW activity. Bucket the NEW CAPTURE LOG into 1–5-minute buckets and give each a one-line concrete gist naming the subject (\"Kate & Sean arrival plans\", \"Pesto recipe, lobster question\") — never generic filler (\"conversation continues\"). Each bucket: {\"start\":\"<ISO of bucket start>\",\"gist\":\"...\"}. Cover ONLY minutes present in the NEW CAPTURE LOG — for an extension, earlier minutes are already stored; never re-emit or invent them.\n10. substance: none for fragments with no coherent topic, hallucination-like repetition, or content-free filler; low for real but trivial activity (a few passing remarks, background TV); normal for everything else. When in doubt, prefer the higher tier.\n11. visual_evidence: useful if visual state is material (for example a slide, document, diagram, error, design, settings state, or on-screen decision evidence); none if pixels would not materially improve verification.\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[],\"substance\":\"normal\",\"visual_evidence\":\"none\",\"minutes\":[{\"start\":\"<ISO>\",\"gist\":\"...\"}]}]}";
 
 #[cfg(test)]
 mod tests {
@@ -905,5 +1151,57 @@ mod tests {
         let (to, tail_bounded) = window_bounds(tail - MAX_WINDOW_HOURS * HOUR, tail).unwrap();
         assert_eq!(to, tail);
         assert!(!tail_bounded);
+    }
+
+    #[test]
+    fn test_collapse_screenshots() {
+        let scrs = vec![
+            ScrRow {
+                id: 1,
+                captured_at: "2026-06-01T14:00:00Z".to_string(),
+                active_app: Some("Finder".to_string()),
+                window_title: Some("Desktop".to_string()),
+                ocr_text: Some("foo".to_string()),
+                url: None,
+                is_duplicate: 0,
+            },
+            ScrRow {
+                id: 2,
+                captured_at: "2026-06-01T14:00:02Z".to_string(),
+                active_app: Some("Finder".to_string()),
+                window_title: Some("Desktop".to_string()),
+                ocr_text: Some("foo".to_string()),
+                url: None,
+                is_duplicate: 1,
+            },
+            ScrRow {
+                id: 3,
+                captured_at: "2026-06-01T14:00:04Z".to_string(),
+                active_app: Some("Finder".to_string()),
+                window_title: Some("Desktop".to_string()),
+                ocr_text: Some("foo".to_string()),
+                url: None,
+                is_duplicate: 1,
+            },
+            ScrRow {
+                id: 4,
+                captured_at: "2026-06-01T14:00:06Z".to_string(),
+                active_app: Some("Xcode".to_string()),
+                window_title: Some("main.swift".to_string()),
+                ocr_text: Some("bar".to_string()),
+                url: None,
+                is_duplicate: 0,
+            },
+        ];
+
+        let collapsed = collapse_screenshots(&scrs);
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0].active_app.as_deref(), Some("Finder"));
+        assert_eq!(collapsed[0].captured_at, "2026-06-01T14:00:00Z");
+        assert_eq!(collapsed[0].visible_until.as_deref(), Some("2026-06-01T14:00:04Z"));
+
+        assert_eq!(collapsed[1].active_app.as_deref(), Some("Xcode"));
+        assert_eq!(collapsed[1].captured_at, "2026-06-01T14:00:06Z");
+        assert_eq!(collapsed[1].visible_until, None);
     }
 }

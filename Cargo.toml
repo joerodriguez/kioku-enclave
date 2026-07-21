@@ -121,6 +121,7 @@ candle-core = { version = "0.11", default-features = false }
 candle-nn = { version = "0.11", default-features = false }
 candle-transformers = { version = "0.11", default-features = false }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+regex = "1.10"
 
 [dev-dependencies]
 tokio = { version = "1.45.1", features = ["rt", "macros"] }

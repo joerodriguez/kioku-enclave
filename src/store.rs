@@ -420,10 +420,26 @@ CREATE TABLE IF NOT EXISTS episodes (
     -- this table (rebuild reads it back); indexing the raw JSON would put
     -- "start"/"gist"/timestamps into the index.
     minutes_text  TEXT,
+    -- ADR-0009: summarizer-assigned visibility tier. `none` is hidden from
+    -- normal episode browse/search; `low` and `normal` remain visible.
+    substance     TEXT NOT NULL DEFAULT 'normal'
+                  CHECK (substance IN ('none','low','normal')),
+    visual_evidence TEXT NOT NULL DEFAULT 'none'
+                  CHECK (visual_evidence IN ('none','useful')),
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at    TEXT
+    updated_at    TEXT,
+    finalized_at  TEXT,
+    finalization_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_started_at ON episodes(started_at);
+
+-- Per-user, content-side task markers. Kept in the encrypted user DB so
+-- one-off data passes follow the data through cache eviction and redeploys.
+CREATE TABLE IF NOT EXISTS app_metadata (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 
 -- Explicit episode membership (FK join). record_type ∈ {utterance, screenshot};
 -- record_id references utterances(id) / screenshots(id). Enables both
@@ -437,6 +453,23 @@ CREATE TABLE IF NOT EXISTS episode_members (
 );
 CREATE INDEX IF NOT EXISTS idx_episode_members_record
     ON episode_members(record_type, record_id);
+
+-- Opaque random object mapping for screenshot evidence (ADR-0010).
+CREATE TABLE IF NOT EXISTS screenshot_images (
+    id            TEXT PRIMARY KEY,
+    screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+    episode_id    INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    source_key    TEXT NOT NULL UNIQUE,
+    captured_at   TEXT NOT NULL,
+    object_key    TEXT NOT NULL UNIQUE,
+    mime_type     TEXT NOT NULL CHECK (mime_type = 'image/jpeg'),
+    width         INTEGER NOT NULL,
+    height        INTEGER NOT NULL,
+    byte_length   INTEGER NOT NULL CHECK (byte_length <= 153600),
+    sha256        TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_screenshot_images_episode_id ON screenshot_images(episode_id);
 
 -- FTS5 over episode title + summary + minute-timeline gists
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
@@ -523,6 +556,41 @@ CREATE TRIGGER IF NOT EXISTS episodes_update_fts AFTER UPDATE OF title, summary,
     INSERT INTO episodes_fts(rowid, title, summary, minutes_text)
         VALUES (new.id, new.title, new.summary, new.minutes_text);
 END;
+
+-- Canonical structured brief storage
+CREATE TABLE IF NOT EXISTS episode_final_briefs (
+    episode_id        INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+    overview          TEXT NOT NULL,
+    decisions         TEXT NOT NULL, -- JSON array
+    action_items      TEXT NOT NULL, -- JSON array
+    important_links   TEXT NOT NULL, -- JSON array
+    open_questions    TEXT NOT NULL, -- JSON array
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Email delivery outbox
+CREATE TABLE IF NOT EXISTS episode_deliveries (
+    episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    channel             TEXT NOT NULL CHECK (channel IN ('gmail')),
+    delivery_version    INTEGER NOT NULL,
+    state               TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'sent', 'retry', 'cancelled', 'reconnect_required')),
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     TEXT, -- ISO 8601
+    gmail_message_id    TEXT,
+    error_message       TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (episode_id, channel, delivery_version)
+);
+
+-- Device sync watermarks per modality
+CREATE TABLE IF NOT EXISTS device_watermarks (
+    device_id    TEXT NOT NULL,
+    modality     TEXT NOT NULL CHECK (modality IN ('audio','screen')),
+    watermark_at TEXT NOT NULL, -- ISO 8601
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (device_id, modality)
+);
 "#;
 
 /// Schema-upgrade statements that are safe to replay on every open.
@@ -598,6 +666,8 @@ fn run_migrations(conn: &Connection) -> Result<()> {
                 model         TEXT,
                 topics        TEXT,
                 people        TEXT,
+                substance     TEXT NOT NULL DEFAULT 'normal'
+                              CHECK (substance IN ('none','low','normal')),
                 created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 updated_at    TEXT
             );
@@ -642,6 +712,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         // for them and search simply doesn't index minutes on old rows.
         "ALTER TABLE episodes ADD COLUMN minute_summaries TEXT;",
         "ALTER TABLE episodes ADD COLUMN minutes_text TEXT;",
+        // ADR-0009: legacy rows conservatively remain visible until the
+        // one-time summarizer backfill classifies them.
+        "ALTER TABLE episodes ADD COLUMN substance TEXT NOT NULL DEFAULT 'normal' CHECK (substance IN ('none','low','normal'));",
+        // ADR-0010: visual evidence eligibility
+        "ALTER TABLE episodes ADD COLUMN visual_evidence TEXT NOT NULL DEFAULT 'none' CHECK (visual_evidence IN ('none','useful'));",
     ] {
         if let Err(e) = conn.execute_batch(col_def) {
             let msg = e.to_string();
@@ -650,6 +725,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             }
         }
     }
+
+    // ADR-0009 one-off backfill marker. This table is deliberately separate
+    // from the control DB: it belongs to the encrypted per-user content blob.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS app_metadata (
+             key         TEXT PRIMARY KEY,
+             value       TEXT NOT NULL,
+             updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );",
+    )?;
 
     // ── ADR-0004 §G.3: episodes_fts rebuild to index minutes_text ──────────────
     //
@@ -833,6 +918,55 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // every block that may have (re)created triggers, so one pass suffices
     // for blobs at any prior migration level.
     scope_update_triggers(conn)?;
+
+    // ADR-0011: Add finalized_at and finalization_version columns to episodes table
+    if let Err(e) = conn.execute_batch("ALTER TABLE episodes ADD COLUMN finalized_at TEXT;") {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(e.into());
+        }
+    }
+    if let Err(e) = conn.execute_batch("ALTER TABLE episodes ADD COLUMN finalization_version INTEGER DEFAULT 1;") {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(e.into());
+        }
+    }
+
+    // ADR-0011: Create new tables for canonical briefs, outbox deliveries, and watermarks
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS episode_final_briefs (
+            episode_id        INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+            overview          TEXT NOT NULL,
+            decisions         TEXT NOT NULL,
+            action_items      TEXT NOT NULL,
+            important_links   TEXT NOT NULL,
+            open_questions    TEXT NOT NULL,
+            created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS episode_deliveries (
+            episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            channel             TEXT NOT NULL CHECK (channel IN ('gmail')),
+            delivery_version    INTEGER NOT NULL,
+            state               TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'sent', 'retry', 'cancelled', 'reconnect_required')),
+            attempt_count       INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at     TEXT,
+            gmail_message_id    TEXT,
+            error_message       TEXT,
+            created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (episode_id, channel, delivery_version)
+        );
+        CREATE TABLE IF NOT EXISTS device_watermarks (
+            device_id    TEXT NOT NULL,
+            modality     TEXT NOT NULL CHECK (modality IN ('audio','screen')),
+            watermark_at TEXT NOT NULL,
+            updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (device_id, modality)
+        );
+        "#,
+    )?;
 
     Ok(())
 }
@@ -1211,6 +1345,22 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(mem_exists, 1, "episode_members created");
+        let has_substance: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('episodes') WHERE name='substance'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_substance, 1, "substance column added");
+        let metadata_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_metadata'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(metadata_exists, 1, "per-user task markers created");
 
         // started_at is no longer UNIQUE in v2.
         conn.execute(
@@ -1218,6 +1368,13 @@ pub(crate) mod tests {
             [],
         )
         .unwrap();
+        let default_substance: String = conn
+            .query_row("SELECT substance FROM episodes LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            default_substance, "normal",
+            "legacy-compatible default is visible"
+        );
         conn.execute(
             "INSERT INTO episodes (started_at, ended_at, title) VALUES ('2026-02-01T09:00:00Z','2026-02-01T09:10:00Z','b')",
             [],

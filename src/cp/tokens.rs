@@ -235,6 +235,35 @@ fn exp_only_validation() -> Validation {
     v
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct GmailOAuthStateClaims {
+    pub user_id: String,
+    pub exp: u64,
+}
+
+pub fn issue_gmail_state(secret: &str, user_id: &str) -> Result<String> {
+    let claims = GmailOAuthStateClaims {
+        user_id: user_id.to_string(),
+        exp: now_secs() + STATE_TTL_SECS,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| EnclaveError::Auth(format!("issue gmail state: {e}")))
+}
+
+pub fn verify_gmail_state(secret: &str, token: &str) -> Result<GmailOAuthStateClaims> {
+    decode::<GmailOAuthStateClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &exp_only_validation(),
+    )
+    .map(|data| data.claims)
+    .map_err(|e| EnclaveError::Auth(format!("verify gmail state: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
