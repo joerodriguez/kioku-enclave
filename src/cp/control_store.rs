@@ -473,7 +473,10 @@ impl ControlStore {
         self.write(move |conn| {
             conn.execute("DELETE FROM refresh_tokens WHERE user_id = ?1", [&user_id])?;
             conn.execute("DELETE FROM usage_daily WHERE user_id = ?1", [&user_id])?;
-            conn.execute("DELETE FROM user_gmail_configs WHERE user_id = ?1", [&user_id])?;
+            conn.execute(
+                "DELETE FROM user_gmail_configs WHERE user_id = ?1",
+                [&user_id],
+            )?;
             let n = conn.execute("DELETE FROM users WHERE id = ?1", [&user_id])?;
             Ok(n > 0)
         })
@@ -534,6 +537,7 @@ impl ControlStore {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn disable_gmail_config(&self, user_id: &str) -> Result<()> {
         let user_id = user_id.to_string();
         self.write(move |conn| {

@@ -11,7 +11,7 @@ name: Build & push enclave image
 #
 # ── What this workflow does ──────────────────────────────────────────────────
 #
-# Builds the enclave Docker image and pushes it to the deployment's Artifact
+# Builds the enclave Docker image on main and public release-tag pushes, then pushes it to the deployment's Artifact
 # Registry (us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave).
 # All security-sensitive config is baked in via --build-arg so it is part of
 # the attested image digest and cannot be overridden at VM launch time.
@@ -39,11 +39,23 @@ name: Build & push enclave image
 #   ENCLAVE_RUN_SA_EMAIL      Control-plane service account email
 #   ENCLAVE_AUDIENCE          Enclave's own URL (for ID-token aud validation)
 #   ENCLAVE_ATTEST_STS_AUDIENCE  WIF provider resource name for attestation STS
+#   GOOGLE_DESKTOP_CLIENT_ID  Google OAuth desktop audience
+#   GOOGLE_WEB_CLIENT_ID      Google OAuth web audience
+#   ALLOWED_EMAILS            Comma-separated production account allow-list
+#   BASE_URL                  Public origin, e.g. https://api.kiokuu.com
+#   VERTEX_PROJECT            GCP project for episode summarization
+#   VERTEX_LOCATION           Vertex region (e.g. us-central1)
+#   VERTEX_MODEL              Vertex model name
+#   ENCLAVE_ACME              Must be 1 for production in-enclave TLS
+#   ENCLAVE_ACME_DIRECTORY    ACME directory URL
+#   ENCLAVE_ACME_CONTACT      ACME account contact email
 
 on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   workflow_dispatch:
 
 concurrency:
@@ -94,6 +106,46 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
 
+      - name: Validate baked production configuration
+        env:
+          ENCLAVE_KMS_PROJECT: ${{ vars.ENCLAVE_KMS_PROJECT }}
+          ENCLAVE_KMS_LOCATION: ${{ vars.ENCLAVE_KMS_LOCATION }}
+          ENCLAVE_KMS_KEY_RING: ${{ vars.ENCLAVE_KMS_KEY_RING }}
+          ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
+          ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
+          ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
+          ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
+          ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
+          GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
+          GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
+          ALLOWED_EMAILS: ${{ vars.ALLOWED_EMAILS }}
+          BASE_URL: ${{ vars.BASE_URL }}
+          VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+          VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
+          ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
+          ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
+          ENCLAVE_ACME_CONTACT: ${{ vars.ENCLAVE_ACME_CONTACT }}
+        run: |
+          REQUIRED=(
+            ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING
+            ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_RUN_SA_EMAIL
+            ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
+            GOOGLE_DESKTOP_CLIENT_ID GOOGLE_WEB_CLIENT_ID ALLOWED_EMAILS BASE_URL
+            VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
+            ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY ENCLAVE_ACME_CONTACT
+          )
+          for name in "${REQUIRED[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required repository variable: $name" >&2
+              exit 1
+            fi
+          done
+          if [[ "$ENCLAVE_ACME" != "1" ]]; then
+            echo "ENCLAVE_ACME must be 1 for the production image." >&2
+            exit 1
+          fi
+
       - name: Build and push image
         id: build
         run: |
@@ -116,6 +168,16 @@ jobs:
             --build-arg RUN_SA_EMAIL="${{ vars.ENCLAVE_RUN_SA_EMAIL }}" \
             --build-arg ENCLAVE_AUDIENCE="${{ vars.ENCLAVE_AUDIENCE }}" \
             --build-arg ATTEST_STS_AUDIENCE="${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}" \
+            --build-arg GOOGLE_DESKTOP_CLIENT_ID="${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}" \
+            --build-arg GOOGLE_WEB_CLIENT_ID="${{ vars.GOOGLE_WEB_CLIENT_ID }}" \
+            --build-arg ALLOWED_EMAILS="${{ vars.ALLOWED_EMAILS }}" \
+            --build-arg BASE_URL="${{ vars.BASE_URL }}" \
+            --build-arg VERTEX_PROJECT="${{ vars.VERTEX_PROJECT }}" \
+            --build-arg VERTEX_LOCATION="${{ vars.VERTEX_LOCATION }}" \
+            --build-arg VERTEX_MODEL="${{ vars.VERTEX_MODEL }}" \
+            --build-arg ENCLAVE_ACME="${{ vars.ENCLAVE_ACME }}" \
+            --build-arg ENCLAVE_ACME_DIRECTORY="${{ vars.ENCLAVE_ACME_DIRECTORY }}" \
+            --build-arg ENCLAVE_ACME_CONTACT="${{ vars.ENCLAVE_ACME_CONTACT }}" \
             -t "${IMAGE_URI}" .
 
           docker push "${IMAGE_URI}"
@@ -154,3 +216,42 @@ jobs:
             echo "Pin this digest as \`enclave_image_digest\` in the deployment terraform"
             echo "and trigger the deployment repo's VM-roll workflow to replace the VM."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Keep release metadata machine-readable as well as visible in the job
+      # summary. scripts/release.sh publishes this file on the public GitHub
+      # Release, giving auditors a stable source commit -> image digest record.
+      - name: Write release metadata
+        run: |
+          IMAGE_URI="${{ steps.build.outputs.image_uri }}"
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          IMAGE_REPOSITORY="${IMAGE_URI%:*}"
+          python3 - \
+            "${GITHUB_REF_NAME}" \
+            "${GITHUB_SHA}" \
+            "${IMAGE_URI}" \
+            "${IMAGE_REPOSITORY}@${DIGEST}" \
+            "${DIGEST}" \
+            "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > enclave-release.json <<'PY'
+          import json
+          import sys
+
+          tag, commit, image_uri, digest_uri, digest, build_url = sys.argv[1:]
+          print(json.dumps({
+              "schema_version": 1,
+              "source_repository": "https://github.com/${{ github.repository }}",
+              "source_ref": tag,
+              "source_commit": commit,
+              "image_uri": image_uri,
+              "image_digest_uri": digest_uri,
+              "image_digest": digest,
+              "build_url": build_url,
+          }, indent=2))
+          PY
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: enclave-release-metadata-${{ github.run_id }}
+          path: enclave-release.json
+          retention-days: 90

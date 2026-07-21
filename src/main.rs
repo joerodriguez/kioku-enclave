@@ -357,13 +357,18 @@ async fn main() {
     let gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_env().expect("GCS_BUCKET must be set"));
 
-    let media_gcs: Arc<dyn crate::store::GcsClient> = if let Ok(bucket) = std::env::var("GCS_MEDIA_BUCKET") {
-        Arc::new(GcpGcsClient::from_bucket(bucket))
-    } else {
-        Arc::clone(&gcs)
-    };
+    let media_gcs: Arc<dyn crate::store::GcsClient> =
+        if let Ok(bucket) = std::env::var("GCS_MEDIA_BUCKET") {
+            Arc::new(GcpGcsClient::from_bucket(bucket))
+        } else {
+            Arc::clone(&gcs)
+        };
 
-    let store = Arc::new(Store::new_with_media(Arc::clone(&kms), Arc::clone(&gcs), media_gcs));
+    let store = Arc::new(Store::new_with_media(
+        Arc::clone(&kms),
+        Arc::clone(&gcs),
+        media_gcs,
+    ));
 
     // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
     // control store consumes the originals.

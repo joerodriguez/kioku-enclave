@@ -124,11 +124,19 @@ impl Store {
         Self::new_internal(kms, gcs, media_gcs)
     }
 
-    pub fn new_with_media(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>, media_gcs: Arc<dyn GcsClient>) -> Self {
+    pub fn new_with_media(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+    ) -> Self {
         Self::new_internal(kms, gcs, media_gcs)
     }
 
-    fn new_internal(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>, media_gcs: Arc<dyn GcsClient>) -> Self {
+    fn new_internal(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+    ) -> Self {
         let max_open = std::env::var("STORE_MAX_OPEN")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -145,7 +153,9 @@ impl Store {
     }
 
     pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<()> {
-        self.media_gcs.put_object(name, data, wrapped_dek_b64, 0).await?;
+        self.media_gcs
+            .put_object(name, data, wrapped_dek_b64, 0)
+            .await?;
         Ok(())
     }
 
@@ -210,10 +220,8 @@ impl Store {
             let mut stmt = conn.prepare("SELECT object_key FROM screenshot_images")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             let mut list = Vec::new();
-            for row in rows {
-                if let Ok(k) = row {
-                    list.push(k);
-                }
+            for key in rows.flatten() {
+                list.push(key);
             }
             Ok(list)
         }).await {
@@ -983,7 +991,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             return Err(e.into());
         }
     }
-    if let Err(e) = conn.execute_batch("ALTER TABLE episodes ADD COLUMN finalization_version INTEGER DEFAULT 1;") {
+    if let Err(e) = conn
+        .execute_batch("ALTER TABLE episodes ADD COLUMN finalization_version INTEGER DEFAULT 1;")
+    {
         let msg = e.to_string();
         if !msg.contains("duplicate column name") {
             return Err(e.into());

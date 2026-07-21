@@ -1,12 +1,15 @@
 # map.md — ci/
 
-CI pipeline for building and rolling the enclave onto its Confidential Space VM.
+Optional operator template for a combined build-and-roll pipeline.
 
-- `build-and-roll.yml.template` — template for the build → push image → roll-VM pipeline.
-  Builds the reproducible `x86_64-unknown-linux-musl` image, pushes it, and rolls the VM
-  (impersonating the push-only `kioku-enclave-ci` service account, not the deployer).
+- `build-and-roll.yml.template` — inert example for operators who own both their image
+  registry and deployment Terraform. The canonical Kioku project intentionally keeps
+  these privileges split: this public repo's `.github/workflows/build.yml` uses the
+  push-only `kioku-enclave-ci` identity, while the deployment repository performs the
+  separately requested VM roll.
 
-Because the attestation claim depends on a reproducible build, the image digest produced
-here is what gets bound in KMS and recorded in the monorepo `PROGRESS.md`.
+The canonical release command and public digest record are documented in
+[`RELEASING.md`](../RELEASING.md). The build is locked but not yet bit-for-bit
+reproducible; do not describe it as reproducible until the `SECURITY.md` gap is closed.
 
 > Keep this `map.md` current if the CI flow changes.

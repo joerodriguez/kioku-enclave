@@ -32,11 +32,23 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/api/episodes/{id}", delete(rest_episode_delete))
         .route("/api/episodes/{id}/members", get(rest_episode_members))
         .route("/api/feed", get(rest_feed))
-        .route("/api/screenshot-images/plan", get(rest_screenshot_upload_plan))
+        .route(
+            "/api/screenshot-images/plan",
+            get(rest_screenshot_upload_plan),
+        )
         .route("/api/screenshot-images", post(rest_screenshot_image_upload))
-        .route("/api/screenshot-images/{id}/content", get(rest_screenshot_image_content))
-        .route("/api/preferences/episode-email", get(rest_get_preference).post(rest_set_preference))
-        .route("/api/preferences/episode-email/connect", post(rest_connect_preference))
+        .route(
+            "/api/screenshot-images/{id}/content",
+            get(rest_screenshot_image_content),
+        )
+        .route(
+            "/api/preferences/episode-email",
+            get(rest_get_preference).post(rest_set_preference),
+        )
+        .route(
+            "/api/preferences/episode-email/connect",
+            post(rest_connect_preference),
+        )
 }
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
@@ -327,10 +339,10 @@ async fn list_episodes_value(
                 .query_map(rusqlite::params![from, to, include_low, max], |r| {
                     let utt: i64 = r.get(9)?;
                     let scr: i64 = r.get(10)?;
-                    
+
                     let finalized_at: Option<String> = r.get(14)?;
                     let finalization_version: Option<i32> = r.get(15)?;
-                    
+
                     let final_brief = if let Some(overview) = r.get::<_, Option<String>>(16)? {
                         Some(json!({
                             "overview": overview,
@@ -1103,11 +1115,13 @@ async fn rest_screenshot_upload_plan(
             .into_response();
     }
 
-    let result = s.store.with_user(&user.0, move |conn| {
-        let prefix = format!("{}:", p.device_id);
-        
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.started_at, e.ended_at, c.source_key
+    let result = s
+        .store
+        .with_user(&user.0, move |conn| {
+            let prefix = format!("{}:", p.device_id);
+
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.started_at, e.ended_at, c.source_key
              FROM episodes e
              JOIN episode_members m ON m.episode_id = e.id AND m.record_type = 'screenshot'
              JOIN screenshots c ON c.id = m.record_id
@@ -1117,37 +1131,38 @@ async fn rest_screenshot_upload_plan(
                AND (?2 IS NULL OR c.captured_at >= ?2)
                AND c.source_key NOT IN (SELECT source_key FROM screenshot_images)
              ORDER BY e.started_at DESC, c.captured_at ASC",
-        )?;
-        
-        let rows = stmt.query_map(
-            rusqlite::params![format!("{}%", prefix), p.after],
-            |r| {
+            )?;
+
+            let rows = stmt.query_map(rusqlite::params![format!("{}%", prefix), p.after], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                 ))
-            },
-        )?;
+            })?;
 
-        let mut episodes_map = std::collections::BTreeMap::new();
-        for r in rows {
-            let (ep_id, start, end, sk) = r?;
-            let entry = episodes_map.entry(ep_id).or_insert_with(|| {
-                json!({
-                    "id": ep_id,
-                    "started_at": start,
-                    "ended_at": end,
-                    "source_keys": Vec::<String>::new()
-                })
-            });
-            entry.as_object_mut().unwrap()["source_keys"].as_array_mut().unwrap().push(Value::String(sk));
-        }
+            let mut episodes_map = std::collections::BTreeMap::new();
+            for r in rows {
+                let (ep_id, start, end, sk) = r?;
+                let entry = episodes_map.entry(ep_id).or_insert_with(|| {
+                    json!({
+                        "id": ep_id,
+                        "started_at": start,
+                        "ended_at": end,
+                        "source_keys": Vec::<String>::new()
+                    })
+                });
+                entry.as_object_mut().unwrap()["source_keys"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(Value::String(sk));
+            }
 
-        let episodes_list: Vec<Value> = episodes_map.into_values().collect();
-        Ok(json!({ "episodes": episodes_list }))
-    }).await;
+            let episodes_list: Vec<Value> = episodes_map.into_values().collect();
+            Ok(json!({ "episodes": episodes_list }))
+        })
+        .await;
 
     match result {
         Ok(val) => Json(val).into_response(),
@@ -1190,7 +1205,11 @@ async fn rest_screenshot_image_upload(
             let mut stream = field;
             while let Ok(Some(chunk)) = stream.chunk().await {
                 if image_bytes.len() + chunk.len() > 153_600 {
-                    return (StatusCode::PAYLOAD_TOO_LARGE, "payload too large (max 150 KiB)").into_response();
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "payload too large (max 150 KiB)",
+                    )
+                        .into_response();
                 }
                 image_bytes.extend_from_slice(&chunk);
             }
@@ -1211,10 +1230,24 @@ async fn rest_screenshot_image_upload(
         }
     }
 
-    let (Some(captured_at), Some(episode_id), Some(source_key), Some(width), Some(height), Some(req_sha256)) =
-        (captured_at, episode_id, source_key, width, height, req_sha256) else {
-            return (StatusCode::BAD_REQUEST, "missing fields").into_response();
-        };
+    let (
+        Some(captured_at),
+        Some(episode_id),
+        Some(source_key),
+        Some(width),
+        Some(height),
+        Some(req_sha256),
+    ) = (
+        captured_at,
+        episode_id,
+        source_key,
+        width,
+        height,
+        req_sha256,
+    )
+    else {
+        return (StatusCode::BAD_REQUEST, "missing fields").into_response();
+    };
 
     if image_bytes.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing image bytes").into_response();
@@ -1231,51 +1264,80 @@ async fn rest_screenshot_image_upload(
 
     // 1. Get wrapped DEK or generate one
     let user_id_cloned = user_id.clone();
-    let wrapped_opt_res = s.store.with_user(&user_id_cloned, |conn| {
-        let mut stmt = conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
-        let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
-        Ok(val)
-    }).await;
+    let wrapped_opt_res = s
+        .store
+        .with_user(&user_id_cloned, |conn| {
+            let mut stmt =
+                conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
+            let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
+            Ok(val)
+        })
+        .await;
 
     let wrapped_opt = match wrapped_opt_res {
         Ok(w) => w,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database query failed: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database query failed: {}", e),
+            )
+                .into_response()
+        }
     };
 
     let (media_dek, wrapped_b64) = match wrapped_opt {
-        Some(wrapped) => {
-            match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped).await {
-                Ok(dek) => (dek, wrapped),
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Load DEK failed: {}", e)).into_response(),
+        Some(wrapped) => match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped).await {
+            Ok(dek) => (dek, wrapped),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Load DEK failed: {}", e),
+                )
+                    .into_response()
             }
-        }
-        None => {
-            match crate::crypto::generate_and_wrap_dek(s.store.kms.as_ref()).await {
-                Ok((dek, wrapped)) => {
-                    let wrapped_clone = wrapped.clone();
-                    let user_id_cloned = user_id.clone();
-                    let save_res = s.store.with_user(&user_id_cloned, move |conn| {
+        },
+        None => match crate::crypto::generate_and_wrap_dek(s.store.kms.as_ref()).await {
+            Ok((dek, wrapped)) => {
+                let wrapped_clone = wrapped.clone();
+                let user_id_cloned = user_id.clone();
+                let save_res = s.store.with_user(&user_id_cloned, move |conn| {
                         conn.execute(
                             "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('wrapped_media_dek', ?1)",
                             [&wrapped_clone],
                         )?;
                         Ok(())
                     }).await;
-                    if let Err(e) = save_res {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Save DEK failed: {}", e)).into_response();
-                    }
-                    (dek, wrapped)
+                if let Err(e) = save_res {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Save DEK failed: {}", e),
+                    )
+                        .into_response();
                 }
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Generate DEK failed: {}", e)).into_response(),
+                (dek, wrapped)
             }
-        }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Generate DEK failed: {}", e),
+                )
+                    .into_response()
+            }
+        },
     };
 
     // 2. Encrypt JPEG bytes using media DEK and user_id as AAD
-    let encrypted_data = match crate::crypto::encrypt_blob_with_aad(&media_dek, &image_bytes, user_id.as_bytes()) {
-        Ok(d) => d,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Encryption failed: {}", e)).into_response(),
-    };
+    let encrypted_data =
+        match crate::crypto::encrypt_blob_with_aad(&media_dek, &image_bytes, user_id.as_bytes()) {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Encryption failed: {}", e),
+                )
+                    .into_response()
+            }
+        };
 
     // 3. Generate random 128-bit hex key as opaque ID
     let mut random_bytes = [0u8; 16];
@@ -1284,8 +1346,16 @@ async fn rest_screenshot_image_upload(
     let object_key = format!("media/{}", opaque_key);
 
     // 4. Upload to GCS
-    if let Err(e) = s.store.put_media(&object_key, &encrypted_data, &wrapped_b64).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("GCS upload failed: {}", e)).into_response();
+    if let Err(e) = s
+        .store
+        .put_media(&object_key, &encrypted_data, &wrapped_b64)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("GCS upload failed: {}", e),
+        )
+            .into_response();
     }
 
     // 5. Insert tracking record in SQLite database
@@ -1303,7 +1373,7 @@ async fn rest_screenshot_image_upload(
                 [&source_key_clone],
                 |r| r.get(0),
             )?;
-            
+
             conn.execute(
                 "INSERT INTO screenshot_images (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'image/jpeg', ?7, ?8, ?9, ?10)",
@@ -1326,12 +1396,20 @@ async fn rest_screenshot_image_upload(
 
     if let Err(e) = insert_res {
         let _ = s.store.delete_media(&object_key).await;
-        return (StatusCode::BAD_REQUEST, format!("Database insert failed: {}", e)).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Database insert failed: {}", e),
+        )
+            .into_response();
     }
 
     // Save user SQLite database state
     if let Err(e) = s.store.save_user(&user_id).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database save failed: {}", e)).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database save failed: {}", e),
+        )
+            .into_response();
     }
 
     (
@@ -1365,17 +1443,20 @@ async fn rest_screenshot_image_content(
 
     // 1. Retrieve the object_key from the database
     let user_id_cloned = user_id.clone();
-    let query_res = s.store.with_user(&user_id_cloned, {
-        let id_clone = id.clone();
-        move |conn| {
-            let object_key: String = conn.query_row(
-                "SELECT object_key FROM screenshot_images WHERE id = ?1",
-                [&id_clone],
-                |r| r.get(0),
-            )?;
-            Ok(object_key)
-        }
-    }).await;
+    let query_res = s
+        .store
+        .with_user(&user_id_cloned, {
+            let id_clone = id.clone();
+            move |conn| {
+                let object_key: String = conn.query_row(
+                    "SELECT object_key FROM screenshot_images WHERE id = ?1",
+                    [&id_clone],
+                    |r| r.get(0),
+                )?;
+                Ok(object_key)
+            }
+        })
+        .await;
 
     let object_key = match query_res {
         Ok(ok) => ok,
@@ -1390,15 +1471,25 @@ async fn rest_screenshot_image_content(
 
     // 3. Load user's media DEK
     let user_id_cloned = user_id.clone();
-    let wrapped_opt_res = s.store.with_user(&user_id_cloned, |conn| {
-        let mut stmt = conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
-        let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
-        Ok(val)
-    }).await;
+    let wrapped_opt_res = s
+        .store
+        .with_user(&user_id_cloned, |conn| {
+            let mut stmt =
+                conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
+            let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
+            Ok(val)
+        })
+        .await;
 
     let wrapped_opt = match wrapped_opt_res {
         Ok(w) => w,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database query failed: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database query failed: {}", e),
+            )
+                .into_response()
+        }
     };
 
     let wrapped_b64 = match wrapped_opt {
@@ -1408,13 +1499,29 @@ async fn rest_screenshot_image_content(
 
     let media_dek = match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped_b64).await {
         Ok(dek) => dek,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Load DEK failed: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Load DEK failed: {}", e),
+            )
+                .into_response()
+        }
     };
 
     // 4. Decrypt object using media DEK and user_id as AAD
-    let decrypted_bytes = match crate::crypto::decrypt_blob_with_aad(&media_dek, &gcs_resp.ciphertext, user_id.as_bytes()) {
+    let decrypted_bytes = match crate::crypto::decrypt_blob_with_aad(
+        &media_dek,
+        &gcs_resp.ciphertext,
+        user_id.as_bytes(),
+    ) {
         Ok(d) => d,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Decryption failed: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Decryption failed: {}", e),
+            )
+                .into_response()
+        }
     };
 
     (
@@ -1473,7 +1580,7 @@ async fn rest_set_preference(
     Json(req): Json<SetPreferenceRequest>,
 ) -> Response {
     let user_id = user.0;
-    
+
     // Check if configuration exists
     let mut cfg = match s.control.get_gmail_config(&user_id).await {
         Ok(Some(c)) => c,
@@ -1490,7 +1597,9 @@ async fn rest_set_preference(
         if cfg.refresh_token.is_none() {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "reconnect_required", "message": "Gmail credentials missing"})),
+                Json(
+                    json!({"error": "reconnect_required", "message": "Gmail credentials missing"}),
+                ),
             )
                 .into_response();
         }
@@ -1499,7 +1608,7 @@ async fn rest_set_preference(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() as i64
+                .as_millis() as i64,
         );
         cfg.enabled_at = Some(now_iso);
     } else {
@@ -1722,7 +1831,7 @@ mod tests {
     async fn test_rest_screenshot_upload_plan() {
         let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user_id = "plan_test_user";
-        
+
         store.with_user(user_id, |conn| {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS screenshots (id INTEGER PRIMARY KEY, captured_at TEXT NOT NULL, source_key TEXT UNIQUE, is_duplicate INTEGER NOT NULL DEFAULT 0);
@@ -1744,7 +1853,7 @@ mod tests {
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 2)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 3)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 4)", [])?;
-            
+
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (11, 'screenshot', 2)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (12, 'screenshot', 2)", [])?;
 
@@ -1756,10 +1865,11 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
-        let result = store.with_user(user_id, |conn| {
-            let prefix = "dev1:";
-            let mut stmt = conn.prepare(
-                "SELECT e.id, e.started_at, e.ended_at, c.source_key
+        let result = store
+            .with_user(user_id, |conn| {
+                let prefix = "dev1:";
+                let mut stmt = conn.prepare(
+                    "SELECT e.id, e.started_at, e.ended_at, c.source_key
                  FROM episodes e
                  JOIN episode_members m ON m.episode_id = e.id AND m.record_type = 'screenshot'
                  JOIN screenshots c ON c.id = m.record_id
@@ -1768,21 +1878,23 @@ mod tests {
                    AND c.is_duplicate = 0
                    AND c.source_key NOT IN (SELECT source_key FROM screenshot_images)
                  ORDER BY e.started_at DESC, c.captured_at ASC",
-            )?;
-            let rows = stmt.query_map([format!("{}%", prefix)], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
-            let mut list = Vec::new();
-            for r in rows {
-                list.push(r?);
-            }
-            Ok(list)
-        }).await.unwrap();
+                )?;
+                let rows = stmt.query_map([format!("{}%", prefix)], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?;
+                let mut list = Vec::new();
+                for r in rows {
+                    list.push(r?);
+                }
+                Ok(list)
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 10);

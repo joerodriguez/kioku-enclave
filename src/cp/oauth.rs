@@ -401,15 +401,13 @@ async fn google_callback(
 
 #[derive(Deserialize)]
 struct GmailTokenResp {
-    access_token: String,
+    #[serde(rename = "access_token")]
+    _access_token: String,
     refresh_token: Option<String>,
     id_token: String,
 }
 
-async fn gmail_callback(
-    State(s): State<Arc<CpState>>,
-    Query(q): Query<CallbackQuery>,
-) -> Response {
+async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQuery>) -> Response {
     if let Some(e) = q.error {
         return (
             StatusCode::BAD_REQUEST,
@@ -520,7 +518,10 @@ async fn gmail_callback(
     if expected_email.to_lowercase() != dest_lower {
         return (
             StatusCode::BAD_REQUEST,
-            Html("<h1>Account mismatch: authorized Google account does not match Kioku account</h1>".to_string()),
+            Html(
+                "<h1>Account mismatch: authorized Google account does not match Kioku account</h1>"
+                    .to_string(),
+            ),
         )
             .into_response();
     }
@@ -537,7 +538,7 @@ async fn gmail_callback(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as i64
+            .as_millis() as i64,
     );
     let config = crate::cp::control_store::GmailConfig {
         user_id: user_id.clone(),
@@ -567,10 +568,16 @@ pub async fn connect_gmail_url(
     axum::Extension(user): axum::Extension<crate::cp::auth::AuthUser>,
 ) -> Response {
     let user_id = user.0;
-    
+
     let email = match s.control.user_email(&user_id).await {
         Ok(Some(email)) => email,
-        _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
+            )
+                .into_response()
+        }
     };
 
     let email_lower = email.to_lowercase();
@@ -584,7 +591,13 @@ pub async fn connect_gmail_url(
 
     let state_jwt = match tokens::issue_gmail_state(&s.config.jwt_secrets[0], &user_id) {
         Ok(t) => t,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "server_error"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "server_error"})),
+            )
+                .into_response()
+        }
     };
 
     let base = &s.config.base_url;
@@ -594,7 +607,10 @@ pub async fn connect_gmail_url(
             ("client_id", s.config.google_web_client_id.as_str()),
             ("redirect_uri", &format!("{base}/oauth/gmail/callback")),
             ("response_type", "code"),
-            ("scope", "openid email https://www.googleapis.com/auth/gmail.send"),
+            (
+                "scope",
+                "openid email https://www.googleapis.com/auth/gmail.send",
+            ),
             ("state", &state_jwt),
             ("access_type", "offline"),
             ("prompt", "consent"),

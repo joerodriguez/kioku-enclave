@@ -43,6 +43,12 @@
 #                        exchange (format:
 #                        //iam.googleapis.com/projects/<NUM>/locations/global/
 #                        workloadIdentityPools/<POOL>/providers/<PROVIDER>)
+#   GOOGLE_DESKTOP_CLIENT_ID / GOOGLE_WEB_CLIENT_ID  Google OAuth audiences
+#   ALLOWED_EMAILS       Comma-separated account allow-list
+#   BASE_URL             Public HTTPS origin and OAuth issuer
+#   VERTEX_PROJECT / VERTEX_LOCATION / VERTEX_MODEL  Summarizer configuration
+#   ENCLAVE_ACME         Set to 1 for production in-enclave TLS
+#   ENCLAVE_ACME_DIRECTORY / ENCLAVE_ACME_CONTACT  ACME endpoint and contact
 #
 # Example build command:
 #   docker build \
@@ -54,6 +60,16 @@
 #     --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
 #     --build-arg ENCLAVE_AUDIENCE=http://10.0.0.5:8080 \
 #     --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/123.../... \
+#     --build-arg GOOGLE_DESKTOP_CLIENT_ID=...apps.googleusercontent.com \
+#     --build-arg GOOGLE_WEB_CLIENT_ID=...apps.googleusercontent.com \
+#     --build-arg ALLOWED_EMAILS=owner@example.com \
+#     --build-arg BASE_URL=https://api.example.com \
+#     --build-arg VERTEX_PROJECT=my-project \
+#     --build-arg VERTEX_LOCATION=us-central1 \
+#     --build-arg VERTEX_MODEL=gemini-2.5-flash \
+#     --build-arg ENCLAVE_ACME=1 \
+#     --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
+#     --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
 #     -t kioku-enclave:local .
 
 # ── Stage 1: build ────────────────────────────────────────────────────────────
@@ -182,11 +198,11 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
 # ── Control-plane config (ADR-0001) — baked into the attested digest ──────────
 #
 # The enclave is now the whole backend (OAuth/sync/MCP/summarizer + TLS). These
-# are security-relevant (JWT signing, the trusted OAuth audiences, the public
-# base URL that is the access-token issuer) so they are baked, not
+# are security-relevant (trusted OAuth audiences and the public base URL that
+# is the access-token issuer) so they are baked, not
 # operator-overridable — same rationale as the KMS config above.
-# Single-user note: secrets baked into a private-AR image are acceptable here and
-# satisfy ROADMAP Phase 7 gap #1 (caller creds pinned in-image, not injectable).
+# Secret values are not build args: the web client secret is fetched from Secret
+# Manager and JWT secrets live in the KMS-protected control store.
 #
 # TLS (ADR-0003): the certificate is NOT baked. ENCLAVE_ACME=1 makes the enclave
 # obtain + renew it from Let's Encrypt itself (HTTP-01 on :80), generating the

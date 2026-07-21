@@ -5,7 +5,8 @@
 //! account export/delete, per-user quotas, and the LLM episode summarizer. It
 //! runs inside the same attested binary as the data plane, so the code that
 //! terminates TLS and first touches request plaintext is the open-source,
-//! reproducibly-built enclave — not an un-attested proxy.
+//! release-digest-pinned enclave — not an un-attested proxy. The build is
+//! dependency-locked but is not yet claimed to be bit-for-bit reproducible.
 //!
 //! Identity + accounting live in [`control_store`] (an encrypted SQLite blob in
 //! GCS), replacing Cloud SQL Postgres. There is no Node.js anywhere in the system.
@@ -13,11 +14,11 @@
 pub mod auth;
 pub mod control_store;
 pub mod cors;
+pub mod email_worker;
+pub mod finalizer;
 pub mod isotime;
 pub mod limits;
 pub mod oauth;
-pub mod email_worker;
-pub mod finalizer;
 pub mod query;
 pub mod summarizer;
 pub mod sync;

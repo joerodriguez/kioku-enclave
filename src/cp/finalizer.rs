@@ -1,11 +1,11 @@
+use crate::cp::{isotime, vertex, CpState};
+use crate::error::{EnclaveError, Result};
 use regex::Regex;
-use std::collections::HashSet;
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tracing::{info, warn};
-use rusqlite::OptionalExtension;
-use crate::error::{EnclaveError, Result};
-use crate::cp::{CpState, vertex, isotime};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UrlCandidate {
@@ -15,6 +15,7 @@ pub struct UrlCandidate {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct EpisodeRow {
     id: i64,
     started_at: String,
@@ -75,12 +76,10 @@ pub fn clean_url(url: &str) -> String {
             break;
         }
     }
-    
+
     let mut norm = cleaned;
     let lower = norm.to_lowercase();
-    if lower.starts_with("www.") {
-        norm = format!("https://{}", norm);
-    } else if !lower.starts_with("http://") && !lower.starts_with("https://") {
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
         norm = format!("https://{}", norm);
     }
     norm
@@ -92,7 +91,8 @@ pub fn extract_candidates(
     screenshots: &[(i64, Option<String>, Option<String>)],
 ) -> Vec<UrlCandidate> {
     // Regex for URLs starting with http://, https://, or www.
-    let url_regex = Regex::new(r"(?i)\b(?:https?://|www\.)[a-zA-Z0-9-._~:/?#\[\]@!$&'()*+,;=%]+").unwrap();
+    let url_regex =
+        Regex::new(r"(?i)\b(?:https?://|www\.)[a-zA-Z0-9-._~:/?#\[\]@!$&'()*+,;=%]+").unwrap();
     // Regex for bare domains with common TLDs
     let bare_domain_regex = Regex::new(r"(?i)\b[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.(?:com|org|net|edu|gov|io|co|us|info|biz|me|ly|gl|ai|app|dev|sh)\b(?:/[a-zA-Z0-9-._~:/?#\[\]@!$&'()*+,;=%]*)?").unwrap();
 
@@ -267,7 +267,7 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    
+
     // Four-hour extension window
     let horizon_ms = now - 4 * 60 * 60 * 1000;
     let horizon_iso = isotime::format_epoch_millis(horizon_ms);
@@ -367,44 +367,58 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         }
 
         if !settled {
-            info!(episode_id = ep.id, "episode finalization deferred: devices not settled yet");
+            info!(
+                episode_id = ep.id,
+                "episode finalization deferred: devices not settled yet"
+            );
             continue;
         }
 
         // 3. Fetch evidence for final brief model input
         let user_cloned3 = user.clone();
         let ep_id = ep.id;
-        let (utts, scrs): (Vec<(i64, String)>, Vec<(i64, Option<String>, Option<String>)>) = state.store.with_user(&user_cloned3, move |conn| {
-            let mut u_stmt = conn.prepare(
-                "SELECT u.id, u.text FROM utterances u
+        type UtteranceEvidence = Vec<(i64, String)>;
+        type ScreenshotEvidence = Vec<(i64, Option<String>, Option<String>)>;
+        let (utts, scrs): (UtteranceEvidence, ScreenshotEvidence) = state
+            .store
+            .with_user(&user_cloned3, move |conn| {
+                let mut u_stmt = conn.prepare(
+                    "SELECT u.id, u.text FROM utterances u
                  JOIN episode_members m ON m.record_type = 'utterance' AND m.record_id = u.id
-                 WHERE m.episode_id = ?1"
-            )?;
-            let utterances = u_stmt.query_map([ep_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .filter_map(|x| x.ok())
-                .collect();
+                 WHERE m.episode_id = ?1",
+                )?;
+                let utterances = u_stmt
+                    .query_map([ep_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .filter_map(|x| x.ok())
+                    .collect();
 
-            let mut s_stmt = conn.prepare(
-                "SELECT s.id, s.url, s.ocr_text FROM screenshots s
+                let mut s_stmt = conn.prepare(
+                    "SELECT s.id, s.url, s.ocr_text FROM screenshots s
                  JOIN episode_members m ON m.record_type = 'screenshot' AND m.record_id = s.id
-                 WHERE m.episode_id = ?1"
-            )?;
-            let screenshots = s_stmt.query_map([ep_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .filter_map(|x| x.ok())
-                .collect();
+                 WHERE m.episode_id = ?1",
+                )?;
+                let screenshots = s_stmt
+                    .query_map([ep_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .filter_map(|x| x.ok())
+                    .collect();
 
-            Ok((utterances, screenshots))
-        }).await?;
+                Ok((utterances, screenshots))
+            })
+            .await?;
 
         // 4. Extract URL candidates
         let candidates = extract_candidates(&utts, &scrs);
-        let candidate_urls_set: HashSet<String> = candidates.iter().map(|c| c.url.clone()).collect();
+        let candidate_urls_set: HashSet<String> =
+            candidates.iter().map(|c| c.url.clone()).collect();
 
         // 5. Build prompt
         let mut log_text = String::new();
         log_text.push_str("CAPTURE LOG EVIDENCE:\n");
         for (id, text) in &utts {
-            log_text.push_str(&format!("[utterance-evidence] ID: {} | Text: \"{}\"\n", id, text));
+            log_text.push_str(&format!(
+                "[utterance-evidence] ID: {} | Text: \"{}\"\n",
+                id, text
+            ));
         }
         for (id, url_opt, ocr_opt) in &scrs {
             log_text.push_str(&format!(
@@ -417,12 +431,26 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
 
         log_text.push_str("\nCANDIDATE URLS ALLOWED:\n");
         for (idx, cand) in candidates.iter().enumerate() {
-            log_text.push_str(&format!("Candidate URL {}: {} (from {} id {})\n", idx + 1, cand.url, cand.record_type, cand.record_id));
+            log_text.push_str(&format!(
+                "Candidate URL {}: {} (from {} id {})\n",
+                idx + 1,
+                cand.url,
+                cand.record_type,
+                cand.record_id
+            ));
         }
 
         info!(episode_id = ep.id, "generating final brief with Gemini");
-        
-        let model_resp = match vertex::generate_custom(&state.config, FINALIZER_SYSTEM_PROMPT, &log_text, brief_response_schema(), 16384).await {
+
+        let model_resp = match vertex::generate_custom(
+            &state.config,
+            FINALIZER_SYSTEM_PROMPT,
+            &log_text,
+            brief_response_schema(),
+            16384,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "Gemini call for final brief failed");
@@ -450,37 +478,53 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
             }
         };
 
-        let decisions: Vec<Value> = parsed.decisions.into_iter().map(|d| {
-            let filtered_evidence: Vec<Value> = d.evidence.into_iter()
-                .filter(|e| is_valid_evidence(e))
-                .map(|e| json!({"record_type": e.record_type, "record_id": e.record_id}))
-                .collect();
-            json!({
-                "text": d.text,
-                "evidence": filtered_evidence
+        let decisions: Vec<Value> = parsed
+            .decisions
+            .into_iter()
+            .map(|d| {
+                let filtered_evidence: Vec<Value> = d
+                    .evidence
+                    .into_iter()
+                    .filter(|e| is_valid_evidence(e))
+                    .map(|e| json!({"record_type": e.record_type, "record_id": e.record_id}))
+                    .collect();
+                json!({
+                    "text": d.text,
+                    "evidence": filtered_evidence
+                })
             })
-        }).collect();
+            .collect();
 
-        let action_items: Vec<Value> = parsed.action_items.into_iter().map(|a| {
-            let filtered_evidence: Vec<Value> = a.evidence.into_iter()
-                .filter(|e| is_valid_evidence(e))
-                .map(|e| json!({"record_type": e.record_type, "record_id": e.record_id}))
-                .collect();
-            json!({
-                "text": a.text,
-                "owner": a.owner,
-                "due_at": a.due_at,
-                "evidence": filtered_evidence
+        let action_items: Vec<Value> = parsed
+            .action_items
+            .into_iter()
+            .map(|a| {
+                let filtered_evidence: Vec<Value> = a
+                    .evidence
+                    .into_iter()
+                    .filter(|e| is_valid_evidence(e))
+                    .map(|e| json!({"record_type": e.record_type, "record_id": e.record_id}))
+                    .collect();
+                json!({
+                    "text": a.text,
+                    "owner": a.owner,
+                    "due_at": a.due_at,
+                    "evidence": filtered_evidence
+                })
             })
-        }).collect();
+            .collect();
 
-        let important_links: Vec<Value> = parsed.important_links.into_iter()
+        let important_links: Vec<Value> = parsed
+            .important_links
+            .into_iter()
             .filter(|l| {
                 let norm = clean_url(&l.url);
                 candidate_urls_set.contains(&norm)
             })
             .map(|l| {
-                let filtered_evidence: Vec<Value> = l.evidence.into_iter()
+                let filtered_evidence: Vec<Value> = l
+                    .evidence
+                    .into_iter()
                     .filter(|e| is_valid_evidence(e))
                     .map(|e| json!({"record_type": e.record_type, "record_id": e.record_id}))
                     .collect();
@@ -508,7 +552,7 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
 
         let commit_res = state.store.with_user(&user_cloned4, move |conn| {
             conn.execute("BEGIN IMMEDIATE TRANSACTION", [])?;
-            
+
             // Re-verify that finalized_at is still null
             let is_finalized: Option<String> = conn.query_row(
                 "SELECT finalized_at FROM episodes WHERE id = ?1",
@@ -575,7 +619,11 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
 
         match commit_res {
             Ok(_) => {
-                info!(episode_id = ep.id, email_enqueued = email_enabled, "episode successfully finalized");
+                info!(
+                    episode_id = ep.id,
+                    email_enqueued = email_enabled,
+                    "episode successfully finalized"
+                );
                 let _ = state.store.save_user(&user).await;
             }
             Err(e) => {

@@ -210,7 +210,10 @@ fn normalized_visual_evidence(value: Option<&str>) -> &'static str {
 }
 
 /// Episode visual_evidence can only upgrade.
-pub(crate) fn merge_visual_evidence(existing: Option<&str>, incoming: Option<&str>) -> &'static str {
+pub(crate) fn merge_visual_evidence(
+    existing: Option<&str>,
+    incoming: Option<&str>,
+) -> &'static str {
     let rank = |value: &str| match value {
         "none" => 0,
         _ => 1,
