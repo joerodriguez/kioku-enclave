@@ -2652,7 +2652,7 @@ mod tests {
 
         let capped = store
             .with_user(user_id, |conn| {
-                for id in 2..=4 {
+                for id in 2..=24 {
                     conn.execute(
                         "INSERT INTO screenshot_images \
                          (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
@@ -2849,22 +2849,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_record_transaction_rejects_fifth_image_but_keeps_retry_idempotent() {
+    async fn upload_record_transaction_rejects_over_budget_image_but_keeps_retry_idempotent() {
+        let user_id = "3668d78a-1b24-5c16-ac8d-0042cd37a743";
         let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         store
-            .with_user("upload-budget-user", |conn| {
+            .with_user(user_id, |conn| {
                 conn.execute(
                     "INSERT INTO episodes (id, started_at, ended_at, title, substance, visual_evidence) \
                      VALUES (10, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 'eligible', 'normal', 'useful')",
                     [],
                 )?;
-                for id in 1_i64..=5 {
-                    let captured_at = format!("2026-01-01T10:0{id}:00Z");
-                    let source_key = format!("dev:{id}");
+                for id in 1_i64..=25 {
+                    let captured_at = format!("2026-01-01T10:{id:02}:00Z");
                     conn.execute(
                         "INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) \
                          VALUES (?1, ?2, ?3, 0)",
-                        rusqlite::params![id, captured_at, source_key],
+                        rusqlite::params![id, captured_at, format!("dev:{id}")],
                     )?;
                     conn.execute(
                         "INSERT INTO episode_members (episode_id, record_type, record_id) \
@@ -2873,11 +2873,12 @@ mod tests {
                     )?;
                 }
 
-                for id in 1_i64..=4 {
+                let bytes_per_img = 150_000;
+                for id in 1_i64..=MAX_EPISODE_IMAGES {
                     let jpeg = ValidatedJpeg {
                         width: 2,
                         height: 3,
-                        byte_length: MAX_SCREENSHOT_IMAGE_BYTES as i64,
+                        byte_length: bytes_per_img,
                         sha256: format!("{id:064x}"),
                     };
                     assert!(matches!(
@@ -2887,7 +2888,7 @@ mod tests {
                             &format!("media/image-{id}"),
                             10,
                             &format!("dev:{id}"),
-                            &format!("2026-01-01T10:0{id}:00Z"),
+                            &format!("2026-01-01T10:{id:02}:00Z"),
                             &jpeg,
                         )?,
                         ScreenshotRecordOutcome::Created(_)
@@ -2897,7 +2898,7 @@ mod tests {
                 let first = ValidatedJpeg {
                     width: 2,
                     height: 3,
-                    byte_length: MAX_SCREENSHOT_IMAGE_BYTES as i64,
+                    byte_length: bytes_per_img,
                     sha256: format!("{:064x}", 1),
                 };
                 assert!(matches!(
@@ -2913,21 +2914,21 @@ mod tests {
                     ScreenshotRecordOutcome::Existing(_)
                 ));
 
-                let fifth = ValidatedJpeg {
+                let extra = ValidatedJpeg {
                     width: 2,
                     height: 3,
                     byte_length: 1,
-                    sha256: format!("{:064x}", 5),
+                    sha256: format!("{:064x}", 25),
                 };
                 assert!(matches!(
                     record_screenshot_image(
                         conn,
-                        "image-5",
-                        "media/image-5",
+                        "image-25",
+                        "media/image-25",
                         10,
-                        "dev:5",
-                        "2026-01-01T10:05:00Z",
-                        &fifth,
+                        "dev:25",
+                        "2026-01-01T10:25:00Z",
+                        &extra,
                     ),
                     Err(crate::error::EnclaveError::Conflict(_))
                 ));
@@ -2937,7 +2938,7 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 assert_eq!(count, MAX_EPISODE_IMAGES);
-                assert_eq!(bytes, MAX_EPISODE_IMAGE_BYTES);
+                assert_eq!(bytes, MAX_EPISODE_IMAGES * 150_000);
                 Ok(())
             })
             .await
