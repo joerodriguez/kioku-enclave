@@ -1,128 +1,264 @@
 # Releasing the open-source Kioku enclave
 
-Every production enclave image must be traceable to stable public source. A release is
-therefore more than a container push: it is a public Git tag and GitHub Release that
-record the exact source commit, build run, image URI, and attestation digest.
+A production image must be traceable to signed public source and a content-addressable
+image digest. A release therefore includes a signed Git tag, immutable GitHub Release,
+validated image metadata, GitHub-signed build provenance, an SPDX SBOM, and a signed SBOM
+attestation. The image digest is the value authorized by the deployment's KMS
+attestation condition.
 
 ## Prerequisites
 
-- Work on clean `main`, synchronized with `origin/main`.
-- `cargo`, `git`, Python 3, and GitHub CLI (`gh`) installed.
-- `gh` authenticated with permission to push tags, publish releases in
-  `joerodriguez/kioku-enclave`, and dispatch the deployment workflow when using
-  `--roll`.
-- The repository's GitHub Actions variables and keyless GCP Workload Identity binding
-  configured as documented in `README.md`.
+- Work on a clean `main` synchronized with `origin/main`.
+- Set the package version in `Cargo.toml`; the release tag must be exactly
+  `v<Cargo package version>`.
+- Install Rust/Cargo, Git, Python 3, the Google Cloud CLI, a current GitHub CLI
+  with `gh attestation verify` and `gh release verify`, and the tools required
+  by your Git signing setup.
+- Configure a Git signing key. `scripts/release.sh` creates `git tag -s` tags and rejects
+  a tag that cannot be verified against the required `RELEASE_SIGNER_FINGERPRINT`
+  trust anchor (an OpenPGP fingerprint or `SHA256:…` SSH key fingerprint).
+- Publish the trusted signing public key and fingerprint through a separately authenticated
+  channel, and require release verifiers to pin that identity. A cryptographically valid
+  signature from an unknown key does not authenticate the release operator.
+- Authenticate `gh` with permission to push tags, publish releases in this source
+  repository, read Actions artifacts/attestations, and—only when using `--roll`—dispatch
+  the operator's deployment workflow.
+- Authenticate `gcloud` with read-only access to the configured Artifact Registry
+  repository. OCI attestation verification resolves the image manifest even when the
+  signed bundle is local; the script configures the standard Docker credential helper
+  and fails before tagging if the repository is not readable. Writer, deploy, IAM,
+  Secret Manager, and KMS permissions are unnecessary.
+- When using `--roll`, set `DEPLOYMENT_REPO=owner/repository`.
+- Enable GitHub immutable releases. The release script requires the setting, uploads all
+  assets while a release is still a draft, and confirms GitHub made the published release
+  immutable before it can request a roll.
 
-The image workflow validates every production build argument before Docker runs. This
-includes the OAuth audiences/allow-list, public base URL, Vertex configuration, and ACME
-TLS configuration in addition to KMS/GCS/attestation identifiers; a missing value fails
-the build instead of publishing a partially configured image.
+## Required repository variables
 
-Before tagging, `scripts/release.sh` also verifies that these repository variable names
-exist: the WIF/provider pair, all `ENCLAVE_*` identifiers listed in
-`.github/workflows/build.yml`, `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`,
-`ALLOWED_EMAILS`, `BASE_URL`, `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL`,
-`ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, and `ENCLAVE_ACME_CONTACT`. Configure them in
-GitHub Settings → Secrets and variables → Actions, or with `gh variable set`. These are
-non-secret deployment coordinates; do not put credential values or TLS private keys in
-repository variables.
+The public build validates these non-secret GitHub Actions variables before Docker runs:
 
-## One-time public-repository gate
+| Group | Variables |
+|---|---|
+| Keyless image push | `GCP_WIF_PROVIDER`, `GCP_SERVICE_ACCOUNT` |
+| Artifact Registry destination | `GCP_PROJECT_ID`, `GCP_REGION`, `AR_REPOSITORY`, `IMAGE_NAME` |
+| KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
+| Internal KMS attestation exchange | `ENCLAVE_ATTEST_STS_AUDIENCE` |
+| OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
+| Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
+| Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |
 
-The release script requires GitHub to report `visibility: PUBLIC` and exits before
-tagging when it does not. Before changing visibility for the first release:
+Set them in GitHub Settings → Secrets and variables → Actions or with
+`gh variable set`. The workflow maps the `ENCLAVE_*` repository-variable names to the
+Docker build arguments documented in [`README.md`](README.md#build).
 
-1. run a dedicated secret scanner across the full Git history, not only the current
+Store `ALLOWED_EMAILS` and `ENCLAVE_ACME_CONTACT` as repository **Actions secrets**, not
+variables. They are build-time configuration rather than credentials, but masking them
+prevents account and contact addresses from being copied into public Actions logs. The
+resulting values remain baked into the image, so they must not contain authentication
+secrets.
+
+Production requirements are fail-closed:
+
+- `BASE_URL` and `WEB_ORIGIN` must be HTTPS origins; legacy `ENCLAVE_AUDIENCE` must match
+  the caller's ID-token `aud` exactly and should normally be the public HTTPS API URL;
+- `ALLOWED_EMAILS` must be nonempty and must not be `*`;
+- `ENCLAVE_ACME` must be `1`; and
+- `ENCLAVE_ATTEST_STS_AUDIENCE` is an internal WIF provider resource, never the audience
+  of the public `/v1/attestation` token.
+
+Repository variables may appear in public logs. Do not put
+credentials, OAuth client secrets, JWT secrets, TLS private keys, or other secret values
+in them. The web OAuth secret comes from Secret Manager and JWT secrets live in the
+KMS-protected control database.
+
+The GitHub-to-GCP WIF provider is itself part of the release boundary. Map and constrain
+immutable GitHub OIDC claims such as `repository_id` and `repository_owner_id`, require
+the `build.yml` workflow identity, and allow only `refs/heads/main` or protected `v*`
+release tags. Do not trust only a mutable repository name. Bind the push-only service
+account to that constrained principal and grant it only Artifact Registry write access.
+The workflow independently refuses to run its credentialed job for any other ref.
+
+## Public-repository security gate
+
+Before the first release from a newly public repository:
+
+1. scan the complete Git object graph and reachable history for secrets, not only the
    checkout;
-2. review all GitHub Actions variables and workflow logs for values that should instead
-   be secrets (deployment identifiers and service-account email addresses are public;
-   credentials and TLS private keys are not);
-3. confirm `LICENSE`, `SECURITY.md`, contribution guidance, and the vulnerability contact;
-4. enable branch protection and required CI on `main`; and
-5. change the repository visibility in GitHub, then verify with:
+2. review Actions variables, artifacts, caches, summaries, and logs for credentials or
+   privacy-sensitive values;
+3. confirm `LICENSE`, `SECURITY.md`, contribution guidance, and the private vulnerability
+   contact;
+4. enable branch protection, required CI/security checks, tag protection, secret
+   scanning, push protection, and immutable releases;
+5. verify the GitHub OIDC provider's immutable repository/workflow/ref condition and
+   least-privilege Artifact Registry writer binding; and
+6. verify that GitHub reports the repository as public.
 
-   ```sh
-   gh repo view joerodriguez/kioku-enclave --json visibility --jq .visibility
-   # expected: PUBLIC
-   ```
+```sh
+gh repo view joerodriguez/kioku-enclave --json visibility --jq .visibility
+# expected: PUBLIC
+```
 
-The repository currently contains an Apache-2.0 license and ignores local `.env` files,
-but those facts do not replace a full-history secret scan.
+Do not report a discovered vulnerability in a public issue. Follow
+[`SECURITY.md`](SECURITY.md#reporting-vulnerabilities).
 
 ## Publish a release
 
-Use SemVer tags. When an enclave and desktop change are one coordinated product release,
-use the same version in their separate repositories.
+Choose a SemVer version, update `Cargo.toml`, and run:
 
 ```sh
-./scripts/release.sh v0.6.6
+RELEASE_SIGNER_FINGERPRINT=<trusted-key-fingerprint> \
+  ./scripts/release.sh vX.Y.Z
 ```
 
-The script:
+The script and workflow then:
 
-1. verifies clean, synchronized `main`;
-2. runs `cargo fmt --check`, locked tests, and clippy with warnings denied;
-3. creates and pushes the annotated source tag;
-4. waits for `.github/workflows/build.yml` to build and push the image;
-5. validates the returned `sha256:` digest; and
-6. creates the public GitHub Release with `enclave-release.json` attached.
+1. verify clean, synchronized public `main` and all required repository variables;
+2. require the tag version to match the Cargo package version;
+3. run `cargo fmt --all -- --check`, locked tests, and clippy with warnings denied;
+4. create, verify against `RELEASE_SIGNER_FINGERPRINT`, and push a signed source tag;
+5. run CI and build with full-SHA-pinned Actions, a digest-pinned Rust builder, and a
+   revision- and hash-pinned embedding model;
+6. push the image to the configured
+   `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>` destination;
+7. generate an SPDX SBOM, fail on fixed high-severity image findings, and create
+   GitHub-signed image-provenance and SBOM attestations;
+8. validate the source repository/ref/commit, build URL, configured image repository,
+   digest, provenance signer workflow, and exact equality between the standalone SBOM
+   and the verified SBOM-attestation predicate; and
+9. create a draft, attach `enclave-release.json`,
+   `enclave-provenance.jsonl`, `enclave-sbom.spdx.json`, and
+   `enclave-sbom-attestation.jsonl`, publish it, and verify GitHub's immutable-release
+   attestation.
 
-The resulting public release is the stable audit record. Workflow artifacts alone are
-not sufficient because they expire and may require authentication.
+If a prior invocation left a draft, the script repairs only the four expected assets and
+rejects unexpected ones before publication. If a public release already exists, the
+script requires GitHub to report it as immutable and does not edit or clobber it.
+Investigate a mismatch; do not delete and recreate provenance to make verification pass.
 
-Publishing does **not** change production.
+Publishing creates a verified public release build. The private `kioku-monorepo` automated watcher workflow (`watch-enclave.yml`) automatically detects published releases, updates `infra/terraform.tfvars`, and rolls production with zero downtime.
+
+## Verify the release before deployment
+
+At minimum:
+
+```sh
+git tag -v vX.Y.Z
+
+gh release verify vX.Y.Z --repo joerodriguez/kioku-enclave
+
+gh release download vX.Y.Z \
+  --repo joerodriguez/kioku-enclave \
+  --pattern 'enclave-*.json*'
+```
+
+Check that:
+
+- `enclave-release.json` names this repository, tag, signed-tag commit, build URL, and the
+  expected digest-qualified Artifact Registry repository;
+- `gh attestation verify` accepts the image provenance for this repository's
+  `.github/workflows/build.yml`, tag, and commit;
+- the SPDX SBOM is present and its signed attestation verifies for the same image digest;
+- CI, CodeQL, dependency review/audit, and image scanning succeeded; and
+- release notes make no independent-reproducibility claim.
+
+`scripts/release.sh` performs the machine-verifiable provenance checks before it can
+request a roll. An operator should still review the evidence and changed source.
 
 ## Roll production
 
-After reviewing the release metadata, resume the same release with:
+After verification:
 
 ```sh
-./scripts/release.sh v0.6.6 --roll
+DEPLOYMENT_REPO=owner/deployment-repository \
+RELEASE_SIGNER_FINGERPRINT=<trusted-key-fingerprint> \
+  ./scripts/release.sh vX.Y.Z --roll
 ```
 
-The checks rerun, the existing tagged build metadata is reused, and the script dispatches
-the `Roll enclave VM` workflow in `joerodriguez/kioku`. That workflow:
+The script re-verifies the existing signed release and dispatches the operator's
+approval-gated `enclave.yml` workflow with the digest-qualified image URI and digest. The
+deployment workflow must verify the same release evidence, update the KMS image-digest
+condition, replace the Confidential Space VM, and record the successful pin. Do not
+bypass it with direct metadata edits, mutable image tags, or a digest from an unverified
+build.
 
-- verifies the tag, digest-pinned URI, and digest against the public
-  `enclave-release.json` before using them;
-- updates the KMS attestation condition;
-- replaces the standalone Confidential Space VM;
-- and commits the successful image/digest pin to `infra/terraform.tfvars`.
+After approval and rollout:
 
-The deployment workflow is the production boundary. Do not bypass it with a direct VM
-metadata edit or an unpinned image tag.
+1. confirm the deployment workflow succeeded;
+2. confirm the HTTPS `/health` endpoint succeeds after replacement;
+3. fetch `/v1/attestation` and verify its Google signature, HTTPS verifier audience,
+   claims, active-certificate-fingerprint nonce, and container digest; retry over a new
+   TLS connection if the request straddled certificate renewal;
+4. match that digest to the signed release provenance and KMS policy;
+5. exercise sign-in, sync, query, screenshot evidence, export, and deletion; and
+6. review logs without copying user content into deployment records or issues.
 
-## Verify
+Record the release URL, signed tag commit, digest-qualified image, provenance result,
+deployment run, and verification result in the operator's deployment record.
 
-1. Confirm the deployment workflow succeeded.
-2. Confirm `https://api.kiokuu.com/health` returns successfully after the replacement
-   window.
-3. Compare the running Confidential Space attestation token's container digest with the
-   digest on the public GitHub Release.
-4. Exercise the changed endpoints and the core sign-in, sync, search, export, and delete
-   flows.
-5. Check operational logs without copying user content into release notes or issues.
+## One-time legacy-blob migration
 
-Record the public release URL, source commit, digest, deployment run, and verification in
-the deployment repository's `PROGRESS.md`.
+Version 2 encryption binds every user database, control database, ACME state object, and
+screenshot-evidence object to its logical context. Strict images use
+`ENCLAVE_ALLOW_LEGACY_BLOBS=0` and reject pre-v2 ciphertext. Migration is automatic on a
+successful open, but only while a migration image has explicitly baked in
+`ENCLAVE_ALLOW_LEGACY_BLOBS=1`.
+
+This is a **one-way data-format migration**. A pre-v2 binary cannot read the v2 header and
+AAD. Never begin without a tested recovery plan, and never roll a migrated deployment
+back to a pre-v2 release.
+
+1. Inventory every user database, `control/control.db.enc`, `acme/tls.json.enc`, and
+   screenshot-evidence object. Enable GCS object versioning or take a verified backup that
+   preserves both ciphertext and wrapped-DEK metadata.
+2. Prepare a reviewed, temporary public source change that makes the tagged build pass
+   `--build-arg ENCLAVE_ALLOW_LEGACY_BLOBS=1`. The current workflow does **not** consume a
+   repository variable for this flag; merely setting one has no effect. Publish the
+   migration image through the normal signed-tag, scan, provenance, and SBOM process.
+3. Roll the verified migration digest through the approval-gated deployment workflow and
+   move the KMS condition to that digest.
+4. Cause every legacy object to be opened exactly once:
+   - startup loads and rewrites the control database and persisted ACME state;
+   - perform an authenticated `/api/export` for every user to load and rewrite each user
+     database; and
+   - enumerate every `screenshot_images` entry from the export and request its
+     `/api/screenshot-images/{id}/content` endpoint to rewrite each media object.
+5. Monitor the control/ACME/user migration events and every authentication,
+   generation-precondition, or write failure. Media rewrites do not emit a success event,
+   so confirm their GCS generations/format explicitly. Confirm every inventoried object
+   was rewritten; do not infer completion from startup health alone.
+6. Prepare and publish the next reviewed release with the temporary workflow argument
+   removed (or explicitly restored to `0`). Roll that strict, v2-aware image and repeat
+   read/export checks for every account and media object.
+7. Retain backups according to policy, but treat rollback to a pre-v2 binary as
+   unsupported. Roll back only to a release that understands v2 context-bound blobs.
+
+Do not leave the migration gate enabled for routine operation. It exists solely to
+perform this bounded conversion and would otherwise restore acceptance of relocatable
+legacy ciphertext.
 
 ## Rollback
 
-Use a previously verified release tag:
+Use a previously verified, signed, v2-compatible release:
 
 ```sh
-./scripts/release.sh v0.6.5 --roll
+DEPLOYMENT_REPO=owner/deployment-repository \
+RELEASE_SIGNER_FINGERPRINT=<trusted-key-fingerprint> \
+  ./scripts/release.sh vW.X.Y --roll
 ```
 
-The script reuses that tag's published build metadata and requests a roll back to its
-exact digest. Verify health and attestation again. Do not rebuild an old source tag and
-assume it has the same digest; the current build is not yet bit-for-bit reproducible.
+The script reuses and verifies that release's immutable metadata and attestation bundles,
+then requests a roll to its exact digest. Recheck HTTPS health, public attestation, core
+flows, and KMS binding. Never rebuild an old tag and assume it has the same digest, and
+after the legacy-blob migration never roll back to a pre-v2 binary.
 
 ## Trust statement
 
-The public tag lets anyone inspect the intended source, and the published image digest is
-the value enforced by the attestation-gated KMS binding. Today, GitHub Actions and build-
-time dependency delivery remain in the trusted path. `SECURITY.md` documents this
-reproducibility/provenance gap; release notes must not claim independent reproducibility
-until that work is complete.
+The signed tag identifies intended source. GitHub-signed provenance identifies the
+workflow, source tag/commit, and image digest, while the public attestation token reports
+the digest running in Confidential Space and KMS authorizes that digest.
+
+This is publicly auditable, but not yet independently reproducible. GitHub Actions,
+unvendored crate delivery, and mutable apt package repositories remain in the trusted
+build path. The builder digest, model revision/hashes, Action SHAs, provenance, and SBOM
+substantially narrow that path without eliminating it. See [`SECURITY.md`](SECURITY.md).
