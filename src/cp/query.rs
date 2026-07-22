@@ -2109,18 +2109,14 @@ async fn rest_screenshot_image_content(
 
     // 4. Bind media to both the authenticated user and exact object key.
     let media_context = crate::store::media_blob_context(&user_id, &object_key);
-    let opened = match crate::crypto::decrypt_bound_blob(
-        &media_dek,
-        &gcs_resp.ciphertext,
-        &media_context,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(error = %e, "media download authentication failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
+    let opened =
+        match crate::crypto::decrypt_bound_blob(&media_dek, &gcs_resp.ciphertext, &media_context) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(error = %e, "media download authentication failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
 
     (
         StatusCode::OK,

@@ -398,7 +398,6 @@ impl ControlStore {
                         wrapped_dek_b64: resp.wrapped_dek_b64,
                     },
                 )
-
             }
             Err(EnclaveError::NotFound) => {
                 info!("creating new control DB");

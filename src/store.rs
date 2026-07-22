@@ -297,7 +297,6 @@ impl Store {
                         wrapped_dek_b64: resp.wrapped_dek_b64,
                     },
                 )
-
             }
             Err(EnclaveError::NotFound) => {
                 // New user — generate a fresh DEK and an empty database
