@@ -28,8 +28,8 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_SCREENSHOT_IMAGE_BYTES: usize = 150 * 1024;
 const MAX_SCREENSHOT_MULTIPART_BYTES: usize = MAX_SCREENSHOT_IMAGE_BYTES + 16 * 1024;
 const MAX_SCREENSHOT_METADATA_FIELD_BYTES: usize = 512;
-const MAX_EPISODE_IMAGE_BYTES: i64 = 600 * 1024;
-const MAX_EPISODE_IMAGES: i64 = 4;
+const MAX_EPISODE_IMAGE_BYTES: i64 = 4000 * 1024;
+const MAX_EPISODE_IMAGES: i64 = 24;
 const MAX_SCREENSHOT_LONG_EDGE: u16 = 960;
 const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
 
@@ -2634,7 +2634,7 @@ mod tests {
         let episodes = result["episodes"].as_array().unwrap();
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0]["id"], 10);
-        assert_eq!(episodes[0]["remaining_images"], 3);
+        assert_eq!(episodes[0]["remaining_images"], 23);
         assert_eq!(
             episodes[0]["remaining_bytes"],
             MAX_EPISODE_IMAGE_BYTES - 100
