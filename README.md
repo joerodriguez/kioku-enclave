@@ -1,365 +1,370 @@
 # kioku-enclave
 
-**The Kioku data plane. The only process that ever holds user plaintext.**
+**The attested Kioku backend—the only Kioku-operated server process that handles user
+plaintext.**
 
-Kioku (記憶, "memory" in Japanese) is a personal memory capture and recall
-system. This repository is the data-plane service that runs inside a
+Kioku (記憶, “memory” in Japanese) is a personal memory capture and recall system.
+This repository contains the Rust service that runs inside a
 [GCP Confidential Space](https://cloud.google.com/confidential-computing/confidential-space/docs/overview)
-VM (AMD SEV), and is intended for public open-source release so that anyone can verify
-that the running instance is exactly this code. The one-time publication checklist and
-the public source-tag/digest process are in [`RELEASING.md`](RELEASING.md).
+VM (AMD SEV). It terminates TLS and implements OAuth, sync, MCP and REST queries,
+account operations, summarisation, and encrypted storage in one attested binary.
 
----
+See [`SECURITY.md`](SECURITY.md) for the threat model and [`RELEASING.md`](RELEASING.md)
+for the signed source-tag, provenance, SBOM, image-digest, and deployment procedure.
 
 ## Why this is public
 
-The privacy claim for Kioku is: _"Raw audio and full-resolution screenshot originals stay on your Mac. If you enable Cloud Screenshot Evidence, Kioku uploads a small set of selected, downscaled, compressed screenshots from meaningful episodes to the hardware-attested Kioku Cloud Core. They are encrypted per user, are never sent to the episode-summary model, and are included in export and deletion. The text and metadata that sync are processed only inside sealed hardware running exactly the open-source code you can read."_
+Kioku's privacy claim is:
 
-For that claim to be verifiable — not just asserted — the code and the exact deployed
-image digest must be public. Hardware attestation provides the cryptographic link: the
-running VM's OIDC attestation token contains the image digest, and anyone can compare it
-with the digest attached to a public source release. Independent bit-for-bit
-reproducibility is a stated goal, not a claim about the current build; see the caveats
-below.
+> Raw audio and full-resolution screenshot originals stay on your Mac. If you enable
+> Cloud Screenshot Evidence, Kioku uploads a small set of selected, downscaled,
+> compressed screenshots from meaningful episodes to the hardware-attested Kioku Cloud
+> Core. They are encrypted per user, are never sent to the episode-summary model, and are
+> included in export and deletion. Text and metadata that sync are handled by sealed
+> hardware running the open-source code you can inspect.
 
----
+The exact deployed image digest is public. A Confidential Space attestation token reports
+the running container digest; a signed GitHub build attestation connects that digest to a
+tagged source commit and workflow. This makes the deployment publicly auditable.
 
-## What the enclave does
+It does **not** yet make the image independently or bit-for-bit reproducible. Rust crate
+sources are not vendored, apt packages come from mutable repositories, and an independent
+rebuild comparison is not part of CI. The precise remaining trust is documented below and
+in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independently-reproducible).
 
-- Terminates public TLS and handles Google OAuth, device sync, MCP, account, export, and
-  deletion in the same attested open-source binary.
-- Receives pre-transcribed audio utterances, OCR text, and opted-in compressed screenshot
+## What the service does
+
+- Terminates public TLS inside Confidential Space and obtains/renews its certificate with
+  ACME without exporting the private key.
+- Verifies Google identity, runs OAuth 2.1-style authorization with PKCE, and issues Kioku
+  access and refresh tokens.
+- Receives pre-transcribed utterances, OCR text, and opted-in compressed screenshot
   evidence from Kioku clients.
-- Stores per-user content as AES-256-GCM encrypted SQLite blobs in GCS.
-- Answers full-text search (SQLite FTS5) and context/range queries.
-- Schedules episode summaries and calls Vertex from inside the service (see the Vertex
-  caveat below).
+- Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
+- Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
+- Runs episode summarisation and evidence verification, including calls to Vertex Gemini
+  from inside the service.
+- Optionally delivers final briefs through the user's connected Gmail account.
 
-Plaintext lives **only** in this process and in the SEV-encrypted tmpfs that
-backs `/tmp`. It is never written to the VM's persistent disk.
-
----
+Within Kioku-operated compute and storage, plaintext exists only in this process and in
+the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Selected
+text leaves the TEE only through the documented Vertex and opt-in Gmail delivery paths.
 
 ## Security and trust model
 
-### What the TEE guarantees
+### Confidential Space and KMS
 
-GCP Confidential Space uses AMD SEV to encrypt VM memory at the hardware
-level. The hypervisor cannot read the guest's memory in plaintext. The
-Confidential Space launcher issues an OIDC attestation token (signed by
-Google) that contains the SHA-256 digest of the running container image.
+Confidential Space uses AMD SEV to encrypt guest memory. Its launcher issues Google-signed
+OIDC attestation tokens containing the running container's SHA-256 digest.
 
-### What the attestation proves
+The deployment's KMS IAM condition must authorize only a WIF `principalSet` satisfying
+the Confidential Space workload and approved image digest, for example:
 
-The KMS key that wraps per-user data-encryption keys (DEKs) is bound to a
-Workload Identity Federation `principalSet`. The IAM condition on that binding
-requires:
-
-```
-assertion.swname == 'CONFIDENTIAL_SPACE'
-AND 'STABLE' in submods.confidential_space.support_attributes
-AND attribute.image_digest == <published release digest>
+```text
+assertion.swname == "CONFIDENTIAL_SPACE"
+AND "STABLE" in submods.confidential_space.support_attributes
+AND attribute.image_digest == <approved release digest>
 ```
 
-This means KMS will only release DEKs to a VM running the exact image digest
-that was pinned at key-binding time. Changing even one byte of the image
-changes the digest and voids the KMS grant.
+No human or service-account principal should have KMS decrypt permission. KMS calls use a
+short-lived access token derived from a Confidential Space token and Google STS; there is
+no VM metadata-service credential fallback for KMS. The VM service account is used for
+ciphertext-only GCS I/O, runtime Secret Manager access, and Vertex; it has no KMS decrypt
+path.
 
-**No human principal and no service account has KMS decrypt permission.** The
-KMS key's only principal is the attestation-gated `principalSet`. An operator
-with full GCP project owner role cannot decrypt user data without modifying the
-image, which changes the digest and breaks the attestation condition.
+### Context-bound blob encryption
 
-### Caller authentication
+Version 2 blobs are prefixed with `KIOKU-BLOB\x02` and encrypted with AES-256-GCM. Their
+authenticated data binds each ciphertext to its logical purpose and location:
 
-The public OAuth flow verifies Google identity tokens against the configured desktop and
-web client audiences, enforces the account allow-list, and issues Kioku access/refresh
-tokens for auth-gated sync, query, MCP, and account routes. Legacy `/v1/*` data-plane
-routes retain their Google-signed service-identity-token verifier for compatibility.
-There is no shared-secret bypass for those legacy routes.
+- user databases bind to `indexes/{user_id}.db.enc`;
+- screenshot evidence binds to both the authenticated user and opaque media object key;
+- the control database and ACME state use separate fixed contexts.
 
-### Launch policy
+Copying ciphertext and its wrapped DEK to another user or object therefore fails
+authentication. Strict production images reject the older unbound format by default.
+Existing deployments must follow the explicit, one-way
+[legacy-blob migration procedure](RELEASING.md#one-time-legacy-blob-migration); never
+enable `ENCLAVE_ALLOW_LEGACY_BLOBS` as a permanent compatibility setting.
 
-The Confidential Space launch policy label in the Dockerfile pins
-`allow_env_override="PORT,RUST_LOG"`. Everything else — KMS coordinates,
-bucket name, trusted caller identity, and auth flags — is baked into the
-image. An operator cannot weaken the security posture by changing launch
-metadata.
+### Authentication and control plane
 
-### What is explicitly out of scope
+The public OAuth flow validates Google tokens against the baked desktop and web client
+audiences, enforces a non-wildcard account allow-list, and issues Kioku tokens for sync,
+query, MCP, and account routes. OAuth authorization uses PKCE, explicit consent,
+persisted single-use authorization codes, and client-bound refresh-token rotation.
 
-- **Payment processing** — no billing provider is part of this service.
-- **Side-channel attacks on AMD SEV** — the enclave code does not perform
-  timing-sensitive operations over secret material, but CPU-level
-  microarchitectural side channels (Spectre class) are not fully mitigated by
-  AMD SEV.
+Legacy `/v1/*` compatibility routes retain Google-signed service-identity-token
+authentication. The expected service-account email and token audience are baked into the
+image. There is no shared-secret bypass or flag that disables authentication.
 
-### Vertex summarisation caveat (important)
+### Production TLS is fail-closed
 
-Episode summarisation sends text **outside the enclave** to Google Vertex Gemini. The
-request originates inside this service, but the model invocation leaves the TEE boundary.
-The privacy claim is therefore:
+The production container build requires `ENCLAVE_ACME=1` and HTTPS origins. At boot the
+service loads or obtains a usable certificate before serving; ACME issuance retries rather
+than falling back to the application over HTTP. A non-debug binary without TLS refuses to
+start. Plain HTTP application serving exists only in a debug build with
+`ENCLAVE_TEST_MODE=1`; port 80 in production is only the isolated ACME HTTP-01 challenge
+listener.
 
-> _"Attested enclave + Google Vertex Gemini inference under Google's
-> [no-data-retention terms](https://cloud.google.com/vertex-ai/docs/generative-ai/data-governance)."_
+The Confidential Space launch policy permits only `PORT` to be changed through VM
+metadata. `RUST_LOG` and every security-relevant setting are not production launch-time
+overrides; KMS, GCS, auth, TLS, attestation, and migration values are fixed by the image
+digest.
 
-It is not an enclave-only claim. This is a documented design choice, not a
-gap. See SECURITY.md for further detail.
+### Public attestation tokens are not cloud credentials
 
----
+The `/v1/attestation` endpoint returns a public Confidential Space OIDC token and the
+lowercase hexadecimal SHA-256 fingerprint of the active leaf certificate's DER bytes,
+which is supplied as the token nonce. Certificate renewal atomically updates the active
+certificate and fingerprint. A TLS connection and request can still straddle that swap;
+on a mismatch, discard the evidence and retry over a new connection. The token audience
+is always the HTTPS verifier URL `${BASE_URL}/v1/attestation`.
 
-## HTTP API
+`ATTEST_STS_AUDIENCE` is entirely separate: it is the internal WIF provider resource used
+to mint KMS credentials. A token with that audience is a bearer credential that can be
+exchanged at STS, so the public endpoint never requests or returns one. Verifiers must
+validate the public token's signature, issuer, expiry, audience, claims, nonce, and image
+digest; decoding a JWT without verification is insufficient.
 
-The table below lists the legacy `/v1/*` data-plane routes, which require the configured
-Google service identity token. The same binary also serves the public OAuth, sync,
-account, REST query, and MCP surfaces under `src/cp/`; those user-facing routes require a
-Kioku access token issued after Google sign-in. `/health` and `/v1/attestation` are
-public.
+### External processing caveats
 
-| Method | Path                        | Body / Query                   | Description                                      |
-|--------|-----------------------------|--------------------------------|--------------------------------------------------|
-| GET    | `/health`                   | —                              | Liveness probe; returns `{"ok":true}`            |
-| POST   | `/v1/ingest`                | `IngestRequest` JSON           | Append utterances + screenshots; idempotent via `source_key` |
-| POST   | `/v1/search`                | `SearchRequest` JSON           | FTS5 + vector (hybrid) search; optional `kinds` filter and `query_embedding` |
-| POST   | `/v1/context`               | `ContextRequest` JSON          | Rows around a center timestamp                   |
-| POST   | `/v1/range`                 | `RangeRequest` JSON            | Raw rows in `[from, to)` (summariser input)      |
-| POST   | `/v1/episodes/upsert`       | `EpisodesUpsertRequest` JSON   | Write episodes (upsert on `user_id + started_at`) |
-| POST   | `/v1/episodes/list`         | `EpisodesListRequest` JSON     | Episodes in a time range, newest first           |
-| POST   | `/v1/episodes/delete_range` | `EpisodesDeleteRangeRequest`   | Delete episodes by time range (summariser rewind)|
-| POST   | `/v1/stats`                 | `{ "user_id": "…" }`          | Per-user row counts + latest timestamps          |
-| GET    | `/v1/export?user_id=`       | —                              | Full JSON dump of user's index — authenticated control-plane-only call (same ID-token auth as every other route) |
-| DELETE | `/v1/user`                  | `{"user_id":"<id>"}` JSON      | Hard-delete all user data; idempotent            |
+Episode summarisation and evidence verification send selected text outside the TEE to
+Google Vertex Gemini. The request originates inside this service, but Vertex processes it
+under Google's
+[no-data-retention terms](https://cloud.google.com/vertex-ai/docs/generative-ai/data-governance).
+This is an explicit external trust boundary, not an enclave-only inference claim.
 
----
+If a user opts into episode-email delivery and connects Gmail, the service also sends the
+final-brief MIME content to the Gmail API using that user's OAuth grant. Gmail delivery is
+an explicit egress boundary; disabling the preference prevents new deliveries.
+
+## API surfaces
+
+The same binary serves all of these surfaces:
+
+| Surface | Representative paths | Authentication |
+|---|---|---|
+| Health and attestation | `/health`, `/v1/attestation` | Public |
+| OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/google/callback`, `/token` | Protocol-specific validation |
+| Device and account API | `/api/sync/*`, `/api/export`, `/api/account` | Kioku access token or accepted Google ID token |
+| Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
+| Screenshot evidence | `/api/screenshot-images*` | Kioku access token or accepted Google ID token |
+| Legacy data plane | `/v1/*` below | Google service identity token |
+
+Legacy compatibility routes are:
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/ingest` | Ingest utterances and screenshot metadata |
+| `POST` | `/v1/search` | FTS5 and optional vector/hybrid search |
+| `POST` | `/v1/context` | Rows around a center timestamp |
+| `POST` | `/v1/range` | Raw rows in a half-open time range |
+| `POST` | `/v1/episodes/upsert` | Upsert episodes |
+| `POST` | `/v1/episodes/list` | List episodes in a time range |
+| `POST` | `/v1/episodes/members` | Read episode members |
+| `POST` | `/v1/episodes/delete_range` | Delete episodes in a time range |
+| `POST` | `/v1/stats` | Per-user row counts and latest timestamps |
+| `GET` | `/v1/export?user_id=…` | Full authenticated user export |
+| `DELETE` | `/v1/user` | Idempotent hard deletion |
 
 ## Build
 
-**Prerequisites:** Rust 1.96+ (toolchain pinned in `rust-toolchain.toml`), `cargo`.
+Prerequisites are Rust 1.96+, the pinned toolchain in `rust-toolchain.toml`, and Cargo.
 
 ```sh
-# Development build (native, macOS or Linux)
 cargo build
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
 
-# Run tests (all crypto + store roundtrips, no network required)
-cargo test
+The production Docker build has no permissive configuration defaults. Supply every
+deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` or
+`WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the
+build.
 
-# Lint — must pass with zero warnings
-cargo clippy -- -D warnings
-
-# Container build (Linux x86-64 CI runner)
-# Requires musl toolchain: rustup target add x86_64-unknown-linux-musl
-cargo build --release --locked --target x86_64-unknown-linux-musl
-
-# Docker build (supply your own deployment values)
-docker build \
+```sh
+docker build --platform linux/amd64 \
+  --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
   --build-arg KMS_PROJECT=my-project \
   --build-arg KMS_LOCATION=us-central1 \
   --build-arg KMS_KEY_RING=my-keyring \
   --build-arg KMS_KEY=my-kek \
   --build-arg GCS_BUCKET=my-enclave-indexes \
-  --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
-  --build-arg ENCLAVE_AUDIENCE=http://10.0.0.5:8080 \
-  --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/<NUM>/... \
+  --build-arg RUN_SA_EMAIL=legacy-caller@my-project.iam.gserviceaccount.com \
+  --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
+  --build-arg ATTEST_STS_AUDIENCE='//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/confidential-space' \
+  --build-arg GOOGLE_DESKTOP_CLIENT_ID=desktop-id.apps.googleusercontent.com \
+  --build-arg GOOGLE_WEB_CLIENT_ID=web-id.apps.googleusercontent.com \
+  --build-arg ALLOWED_EMAILS=owner@example.com \
+  --build-arg BASE_URL=https://api.example.com \
+  --build-arg WEB_ORIGIN=https://app.example.com \
+  --build-arg VERTEX_PROJECT=my-project \
+  --build-arg VERTEX_LOCATION=us-central1 \
+  --build-arg VERTEX_MODEL=gemini-2.5-flash \
+  --build-arg ENCLAVE_ACME=1 \
+  --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
+  --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
+  --build-arg ENCLAVE_ALLOW_LEGACY_BLOBS=0 \
   -t kioku-enclave:local .
 ```
 
----
+`ENCLAVE_ALLOW_LEGACY_BLOBS` defaults to `0`; it is shown to make the strict posture
+explicit. Do not set it to `1` for a fresh deployment.
 
-## CI/CD — image build pipeline
+## Production configuration
 
-For the canonical public tag → image digest → production roll procedure, see
-[`RELEASING.md`](RELEASING.md).
+Security-sensitive values are Docker build arguments and become image `ENV` values.
+Changing one produces a different digest and requires a new attestation-gated KMS
+binding.
 
-The enclave image is built automatically by this repository's GitHub Actions
-workflow (`.github/workflows/build.yml`). On every push to `main`, the
-workflow:
+| Variable | Purpose |
+|---|---|
+| `KMS_PROJECT`, `KMS_LOCATION`, `KMS_KEY_RING`, `KMS_KEY` | KMS KEK coordinates |
+| `GCS_BUCKET` | Encrypted database and default media bucket |
+| `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
+| `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
+| `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
+| `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
+| `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
+| `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
+| `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
+| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex inference configuration |
+| `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
+| `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
+| `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
+| `PORT` | The only launch-time override; application TLS listen port, default `8080` |
 
-1. Authenticates to GCP using Workload Identity Federation (keyless — no
-   long-lived SA key stored in GitHub secrets).
-2. Builds the Docker image with `docker build --platform linux/amd64` and
-   passes all security-sensitive config via `--build-arg` so that every build
-   parameter is part of the attested image digest.
-3. Pushes the image to the deployment's Artifact Registry:
-   `us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave:<tag>`
-4. Retrieves and publishes the content-addressable `sha256:` digest in the
-   job summary.
+The web OAuth client secret is fetched at runtime from Secret Manager. JWT signing
+secrets are generated and stored in the KMS-protected control database; neither is a
+Docker build argument or launch metadata value. Static `ENCLAVE_TLS*` variables exist for
+debug/custom bootstrap paths but are neither accepted production build arguments nor
+launch-policy overrides.
 
-**Rolling the VM is a separate step.** The operator pins the digest from step 4 in
-deployment Terraform (`enclave_image` and `enclave_image_digest`), which moves the
-attestation-gated KMS decrypt binding to the new digest and replaces the standalone
-Confidential Space VM. The canonical deployment currently has an expected 2–4 minute
-data-plane interruption while the replacement boots and attests.
+## CI and release evidence
 
-### Required infra prerequisite
+`.github/workflows/build.yml` runs formatting, locked tests, clippy, and RustSec audit on
+pull requests and pushes. The audit has a documented `RUSTSEC-2023-0071` exception because
+this service verifies third-party RS256 signatures but performs no RSA private-key
+operation. For `main` and tags the workflow then:
 
-Before this workflow can authenticate to GCP, the operator's deployment
-terraform must contain a Workload Identity Federation binding that trusts this
-repository and maps it to a push-only service account
-(`roles/artifactregistry.writer` on the target registry — deliberately NOT a
-deployer identity). See the comment at the top of
-`.github/workflows/build.yml` for the exact terraform resources required.
+1. authenticates to GCP through keyless WIF using a push-only Artifact Registry identity;
+2. validates every required repository and build variable;
+3. builds with a digest-pinned Rust builder, a commit-derived `SOURCE_DATE_EPOCH`,
+   cargo-auditable dependency metadata, and a revision- and hash-pinned embedding model;
+4. pushes to the operator-configured registry
+   `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>`;
+5. generates an SPDX JSON SBOM and scans it for fixed high-severity vulnerabilities;
+6. creates GitHub-signed image provenance and a signed SBOM attestation; and
+7. uploads release metadata, provenance, SBOM, and attestation bundles.
 
-### Digest pinning and attestation
+All third-party Actions are pinned to reviewed commit SHAs. A separate security workflow
+runs CodeQL on pull requests, `main`, and a weekly schedule, plus dependency review on
+pull requests. Dependabot checks Cargo, GitHub Actions, and Docker weekly.
 
-The KMS attestation condition in `infra/enclave.tf` pins the exact image
-digest:
+The image-push identity is deliberately not a deployment, IAM, Secret Manager, or KMS
+identity. Rolling a VM remains a separate approval-gated operator action using the
+digest-qualified image URI. Its GCP WIF provider must constrain immutable GitHub
+repository/owner IDs, the `build.yml` workflow identity, and main or protected release-tag
+refs; the credentialed job also refuses manual runs from other branches.
 
-```
-attribute.image_digest == <enclave_image_digest>
-```
+## Verify a running deployment
 
-Only a VM running that exact digest can unwrap user DEKs via KMS. Changing a
-single byte of the image — source, dependencies, or build args — produces a
-different digest and voids the KMS grant. The digest pinning is therefore the
-cryptographic root of the privacy claim.
-
----
-
-## Environment variables
-
-All security-sensitive variables are baked into the image at `docker build`
-time via `--build-arg`. They become `ENV` entries in the final image and
-cannot be overridden at VM launch time (the Confidential Space launch policy
-only allows `PORT` and `RUST_LOG` to be set by the operator).
-
-| Variable               | Source       | Description                                                         |
-|------------------------|--------------|---------------------------------------------------------------------|
-| `KMS_PROJECT`          | Build ARG    | GCP project containing the KEK                                      |
-| `KMS_LOCATION`         | Build ARG    | KMS key location (e.g. `us-central1`)                               |
-| `KMS_KEY_RING`         | Build ARG    | KMS key ring name                                                   |
-| `KMS_KEY`              | Build ARG    | KMS key name                                                        |
-| `GCS_BUCKET`           | Build ARG    | GCS bucket name for encrypted index blobs                           |
-| `RUN_SA_EMAIL`         | Build ARG    | Control-plane service account email (trusted caller identity)       |
-| `ENCLAVE_AUDIENCE`     | Build ARG    | The enclave's own URL; validated against ID-token `aud` claim       |
-| `ATTEST_STS_AUDIENCE`  | Build ARG    | Full WIF provider resource name for attestation STS exchange        |
-| `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded `1` | Use attestation STS for KMS credentials (not overridable)  |
-| `PORT`                 | Operator / default `8080` | Listen port                                          |
-| `RUST_LOG`             | Operator / default `info` | Log filter, e.g. `kioku_enclave=debug`               |
-| `STORE_MAX_OPEN`       | Optional     | Max concurrently open user indexes (default `16`)                   |
-| `ENCLAVE_TLS*` | Local/runtime fallback only | Optional static certificate path for development; not a production build arg |
-| `GOOGLE_DESKTOP_CLIENT_ID` | Build ARG | Google OAuth audience for the macOS app |
-| `GOOGLE_WEB_CLIENT_ID` | Build ARG | Google OAuth audience for the web app |
-| `ALLOWED_EMAILS` | Build ARG | Comma-separated production account allow-list |
-| `BASE_URL` | Build ARG | Public HTTPS origin and token issuer |
-| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Build ARG | Episode summarizer configuration |
-| `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Build ARG | In-enclave ACME TLS configuration |
-
-> **In-enclave TLS:** production uses `ENCLAVE_ACME=1`. The enclave generates the keypair
-> inside the TEE, obtains/renews the certificate with ACME, and persists the private key
-> only as KMS-encrypted state. Static `ENCLAVE_TLS*` values remain a local/bootstrap
-> fallback and must not be added to the production launch-policy override list. RA-TLS —
-> cryptographically binding that certificate to the attestation token — remains future
-> work.
-
----
-
-## How to verify a running instance
-
-This procedure lets any third party confirm that the production enclave is
-running exactly this source code.
-
-### Step 1 — Fetch the attestation token
-
-From inside the Confidential Space VM (or via a caller with metadata access):
+### 1. Fetch the public attestation response
 
 ```sh
-curl -H "Metadata-Flavor: Google" \
-  "http://metadata.google.internal/computeMetadata/v1/instance/attestation/token"
+curl --fail --silent --show-error \
+  https://api.example.com/v1/attestation > attestation.json
 ```
 
-The response is a signed OIDC JWT issued by Google's Confidential Space
-infrastructure.
+The JSON contains `token` and `fingerprint`. Verify the JWT with Google's published keys
+and require, at minimum:
 
-### Step 2 — Inspect the image digest
+- the expected Confidential Space issuer and workload claims;
+- a valid signature and time window;
+- `aud == https://api.example.com/v1/attestation`—never a WIF provider resource;
+- the expected certificate-fingerprint nonce; and
+- the expected `submods.container.image_digest`.
 
-Decode the JWT (any JWT decoder works; the payload is base64-url encoded):
+Independently calculate the lowercase hex SHA-256 fingerprint of the live leaf DER and
+compare it with the response and token nonce. Fail verification on any mismatch; if the
+request crossed an ACME certificate swap, retry over a fresh TLS connection.
+
+### 2. Inspect the signed release
+
+Download the release assets for the matching digest:
 
 ```sh
-# Decode without verifying (for inspection only)
-python3 -c "
-import base64, json, sys
-tok = sys.argv[1].split('.')[1]
-tok += '=' * (-len(tok) % 4)
-print(json.dumps(json.loads(base64.urlsafe_b64decode(tok)), indent=2))
-" <TOKEN>
+gh release download <release-tag> \
+  --repo joerodriguez/kioku-enclave \
+  --pattern 'enclave-*.json*'
+
+git fetch --tags origin
+git tag -v <release-tag>
 ```
 
-Look for `submods.container.image_digest` — this is the `sha256:` digest of
-the running image.
+`git tag -v` proves only that the tag was signed by a key in the verifier's keyring.
+Authenticate the displayed key fingerprint against the release operator's separately
+published trusted fingerprint; a valid signature from an unknown key is not sufficient.
 
-### Step 3 — Match against a published release
+The release contains:
 
-Compare the digest from the attestation token against the image digest
-published in the GitHub Actions job summary for the corresponding release.
-Releases tag the commit and record the exact digest that was pushed to
-Artifact Registry.
+- `enclave-release.json` — source ref/commit, image URI/digest, and build URL;
+- `enclave-provenance.jsonl` — GitHub-signed image provenance;
+- `enclave-sbom.spdx.json` — SPDX SBOM; and
+- `enclave-sbom-attestation.jsonl` — signed SBOM attestation.
 
-If these match, the running VM is the image that CI built from the tagged
-commit — and the attestation-gated KMS binding (Step in "What the attestation
-proves") guarantees no other image could have decrypted your data.
+Verify the provenance against the digest-qualified image, source repository, workflow,
+tag, and commit. `scripts/release.sh` performs these checks with `gh attestation verify`
+before it publishes a new release or requests a roll.
 
-### Step 4 — Read the tagged source
+### 3. Match all anchors
 
-Check out the release tag and read the code that produced that image:
+The verified chain is:
 
-```sh
-git checkout <release-tag>
+```text
+Google-signed public attestation token image digest
+    == release image digest
+    == subject of GitHub-signed build provenance
+    == digest authorized by the deployment's KMS condition
 ```
 
-The source you read is the source CI compiled. The dependency set is pinned by
-`Cargo.lock` (`cargo build --locked`).
+The release script pins the expected tag-signing fingerprint, compares the standalone
+SBOM with its verified signed predicate, and refuses to edit or clobber an existing
+immutable public release. GitHub release immutability, tag rules, and the operator's
+deployment controls remain part of the operational boundary.
 
-### What you are trusting today (be precise)
+## Honest limitations
 
-At this stage of the project, the chain is:
+### Build provenance is signed; independent reproducibility is not complete
 
-> attestation token digest  ==  published release digest  ==  image CI built from `<release-tag>`
+The Rust builder image is digest-pinned, the embedding model is revision- and hash-pinned,
+and third-party Actions use full commit SHAs. However, Cargo still downloads unvendored
+crate sources, apt installs unversioned packages from mutable repositories, and CI does
+not perform an independent bit-for-bit rebuild. Trust in GitHub Actions and dependency
+delivery therefore remains. Do not describe releases as independently reproducible.
 
-The one link you must currently **trust rather than independently verify** is
-"CI built that digest from that source" — i.e. you trust GitHub Actions and
-crates.io at build time. Full **source-to-binary reproducibility** — where you
-rebuild this tag yourself and obtain the *identical* digest, trusting no one —
-is **not yet available**. It requires vendored dependencies, a digest-pinned
-builder, and signed provenance; see **SECURITY.md → Gap 2** for the plan and
-status. Until then, do not claim a rebuild will reproduce the digest — it
-won't, because the build is not yet deterministic.
+### Vertex and opt-in Gmail delivery leave Confidential Space
 
-If you find anything surprising in the source, `git diff` the release tag
-against `main` and open an issue.
+Selected text is sent to Vertex Gemini. Attestation covers the Kioku service and its
+storage/retrieval behavior, not Vertex's internal execution. When episode-email delivery
+is enabled, final-brief content is also sent to Gmail under the connected user's OAuth
+grant.
 
----
+## Reporting vulnerabilities
 
-## Honest caveats
+Please report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md#reporting-vulnerabilities):
 
-### Vertex summarisation is outside the enclave
-
-Episode summarisation sends user plaintext from this service to Google Vertex Gemini.
-The data leaves the TEE boundary.
-Google's no-data-retention API terms apply. This is the intended design, not a
-gap, but it means the attestation covers content storage and retrieval only —
-not summarisation.
-
-### Reproducible-build hardening is in progress
-
-The current build fetches Rust crates from crates.io at build time (`cargo
-build --locked` pins versions via `Cargo.lock`, but does not vendor the
-source). A supply-chain attacker who compromises a dependency before the CI
-build runs could influence the binary. Future work: `cargo vendor` in CI,
-digest-pinned builder image, and cosign/SLSA provenance attestation so the
-digest-to-source link is independently verifiable without trusting GitHub.
-
-### Public TLS and attestation
-
-The enclave terminates TLS itself and renews its public certificate with ACME, so no
-unattested reverse proxy sees request plaintext. The certificate is not yet
-cryptographically bound to the Confidential Space attestation token (RA-TLS); clients
-therefore verify normal public PKI and separately inspect the attestation digest.
-
----
+- use the repository's [private vulnerability reporting
+  form](https://github.com/joerodriguez/kioku-enclave/security/advisories/new);
+- do **not** open a public GitHub issue or publish exploit details; and
+- allow coordinated remediation and disclosure.
 
 ## Dependency philosophy
 
-No heavy cloud SDKs. KMS and GCS are accessed via plain REST (reqwest +
-rustls) so every network call is visible, auditable, and the binary stays
-small. The dependency versions are pinned in `Cargo.lock` and releases build with
-`--locked`; this is necessary but not sufficient for bit-for-bit reproducibility.
+The runtime is a static binary in a `scratch` image. KMS and GCS use direct REST calls
+through `reqwest`/`rustls`; versions are locked in `Cargo.lock`. Native components such as
+sqlite-vec and the transitive Oniguruma build are listed in the SBOM and covered by
+dependency/image scanning. Locked versions are necessary for auditing but are not, by
+themselves, proof of a reproducible image.

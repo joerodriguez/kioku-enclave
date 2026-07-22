@@ -59,6 +59,26 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// MIME headers are line-oriented. Strip CR/LF and other controls from values
+/// derived from model/user content so they cannot create new headers such as
+/// Bcc or alter the message body. Bound the result to keep messages sane.
+fn safe_header_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(240));
+    for ch in value.chars() {
+        if out.len() >= 240 {
+            break;
+        }
+        if ch == '\r' || ch == '\n' || ch.is_control() {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
 fn format_mime_message(
     self_email: &str,
     subject: &str,
@@ -77,9 +97,11 @@ fn format_mime_message(
     );
 
     let mut mime = String::new();
-    mime.push_str(&format!("From: {}\r\n", self_email));
-    mime.push_str(&format!("To: {}\r\n", self_email));
-    mime.push_str(&format!("Subject: {}\r\n", subject));
+    let safe_email = safe_header_value(self_email);
+    let safe_subject = safe_header_value(subject);
+    mime.push_str(&format!("From: {}\r\n", safe_email));
+    mime.push_str(&format!("To: {}\r\n", safe_email));
+    mime.push_str(&format!("Subject: {}\r\n", safe_subject));
     mime.push_str(&format!("Message-ID: {}\r\n", message_id));
     mime.push_str(&format!("X-Kioku-Episode-ID: {}\r\n", episode_id));
     mime.push_str("MIME-Version: 1.0\r\n");
@@ -174,7 +196,7 @@ pub async fn deliver_user_emails(state: &CpState, user_id: &str) -> Result<()> {
 
     // Refresh Gmail access token
     let refresh_token = config.refresh_token.as_ref().unwrap();
-    let http = reqwest::Client::new();
+    let http = super::bounded_http_client();
     let token_body = serde_urlencoded::to_string([
         ("client_id", state.config.google_web_client_id.as_str()),
         (
@@ -211,17 +233,13 @@ pub async fn deliver_user_emails(state: &CpState, user_id: &str) -> Result<()> {
         }
         Ok(resp) => {
             let status = resp.status();
-            let err_text = resp.text().await.unwrap_or_default();
-            warn!(user_id = %user_id, status = %status, error = %err_text, "failed to refresh Gmail access token");
-            // If invalid_grant, trigger reconnect
-            let is_permanent = err_text.contains("invalid_grant")
-                || status.as_u16() == 400
-                || status.as_u16() == 401;
+            warn!(user_id = %user_id, status = %status, "failed to refresh Gmail access token");
+            let is_permanent = status.as_u16() == 400 || status.as_u16() == 401;
             return handle_delivery_failure(
                 state,
                 &user,
                 &outbox,
-                &format!("Token refresh failed: {}", err_text),
+                &format!("Google token refresh failed ({status})"),
                 is_permanent,
             )
             .await;
@@ -554,15 +572,14 @@ pub async fn deliver_user_emails(state: &CpState, user_id: &str) -> Result<()> {
         }
         Ok(resp) => {
             let status = resp.status();
-            let err_text = resp.text().await.unwrap_or_default();
-            warn!(episode_id = outbox.episode_id, status = %status, error = %err_text, "Gmail API returned error status");
+            warn!(episode_id = outbox.episode_id, status = %status, "Gmail API returned error status");
             let is_permanent =
                 status.as_u16() == 400 || status.as_u16() == 401 || status.as_u16() == 403;
             handle_delivery_failure(
                 state,
                 &user,
                 &outbox,
-                &format!("Gmail API send error ({}): {}", status, err_text),
+                &format!("Gmail API send error ({status})"),
                 is_permanent,
             )
             .await?;
@@ -647,4 +664,24 @@ async fn handle_delivery_failure(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mime_header_values_cannot_inject_headers() {
+        let message = format_mime_message(
+            "owner@example.com\r\nBcc: attacker@example.com",
+            "Safe title\r\nBcc: attacker@example.com",
+            "plain",
+            "<p>html</p>",
+            7,
+        );
+
+        assert!(!message.contains("\r\nBcc:"));
+        assert_eq!(message.matches("\r\nSubject:").count(), 1);
+        assert_eq!(message.matches("\r\nTo:").count(), 1);
+    }
 }

@@ -6,45 +6,49 @@
 
 ## What this repo is
 
-The **Kioku data plane** — the only process that ever holds user plaintext. A Rust
-service that runs inside a GCP Confidential Space VM (AMD SEV) and is published open
-source so the running instance can be **attested** against this exact code. The
-control plane and macOS app live in the separate **`kioku-monorepo`** repo.
+The **attested Kioku backend** — the only Kioku-operated server process that handles user
+plaintext. This Rust service runs inside a GCP Confidential Space VM (AMD SEV) and is
+published so a running image can be audited against signed source and build provenance.
+It includes TLS, OAuth, sync, MCP/REST queries, account operations, summarisation, and
+encrypted persistence; client applications and deployment automation are downstream
+consumers.
 
 ## Where it sits
 
 ```
-kioku-monorepo control plane (Cloud Run)
-        │  ID-token-attested HTTPS calls to /v1/*
+OAuth clients and legacy service-identity integrations
+        │  authenticated HTTPS
         ▼
    THIS SERVICE (Confidential Space VM, SEV)
-        │  AES-256-GCM encrypted per-user SQLite blobs
-        ▼
-   GCS  (ciphertext only; keys gated by Cloud KMS attestation)
+        ├── context-bound AES-256-GCM blobs ──► GCS (ciphertext only)
+        ├── attestation-derived credentials ─► Cloud KMS
+        └── documented plaintext egress ─────► Vertex / opt-in Gmail delivery
 ```
 
-The control plane never receives user keys or plaintext. Plaintext lives **only** in
-this process and in SEV-encrypted tmpfs (`/tmp`) — never on persistent disk.
+The control plane is part of this process. Plaintext databases live only in process memory
+and SEV-protected tmpfs (`/tmp`), never on persistent disk. Selected summarisation text
+and opt-in final-brief email cross the TEE boundary as documented in `SECURITY.md`.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| [src/](src/map.md) | The Rust service: HTTP API, crypto, attestation, storage, search, episodes |
-| [ci/](ci/map.md) | CI build-and-roll pipeline template |
-| `Dockerfile` | Reproducible `x86_64-unknown-linux-musl` image for the VM (attestation depends on reproducibility) |
+| [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, attestation, storage, search, episodes |
+| `.github/workflows/` | CI, CodeQL/dependency checks, image build/scan, provenance, and SBOM attestations |
+| `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image; remaining rebuild limits are documented in `SECURITY.md` |
 | `Cargo.toml` / `Cargo.lock` | Crate manifest |
 | `README.md` | What the enclave does + the attestation/privacy claim |
-| `SECURITY.md` | **Threat model + known gaps — read before touching crypto/auth/attestation** |
+| `SECURITY.md` | **Threat model + residual risks — read before touching crypto/auth/attestation** |
 | `CONTRIBUTING.md` | PR rules; the three pre-commit checks |
 | `rust-toolchain.toml` | Pinned toolchain |
 
 ## Working here
 
-- Pre-commit, all must pass: `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt`.
+- Pre-commit, all must pass: `cargo test --locked`,
+  `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`.
 - Treat every change as security-sensitive; explain threat-model impact for auth/crypto/
   attestation changes.
-- The `/v1/*` API contract mirrors `kioku-monorepo`'s `docs/CONTRACTS.md` /
-  `cloud/src/enclave.js` — keep them in sync.
-- Progress is logged in the **monorepo's** `PROGRESS.md` (this repo has none); record the
-  enclave commit SHA + deployed image digest there.
+- The `/v1/*` API is a public compatibility boundary; keep handler behavior and public
+  documentation in sync, and coordinate breaking changes with downstream clients.
+- Record the enclave commit SHA + deployed image digest in the operator's deployment
+  record.

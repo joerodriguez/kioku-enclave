@@ -1,22 +1,18 @@
-//! Optional in-enclave TLS termination (ADR-0001).
+//! In-enclave TLS termination (ADR-0001).
 //!
-//! By default the enclave serves plain HTTP and relies on the private VPC firewall +
-//! per-request Google ID-token auth (see `main.rs`). When `ENCLAVE_TLS` is set, the
-//! enclave terminates TLS **itself**, so the attested, open-source binary is the first
-//! and only code to see request plaintext — closing the gap where an upstream proxy
-//! (today: Cloud Run) terminates TLS and can read everything. See
-//! `docs/adr/0001-enclave-as-sole-backend.md` in the monorepo.
+//! Production startup requires the enclave to terminate TLS itself, so the
+//! attested binary is the first application code to see request plaintext.
+//! Plain HTTP is available only in an explicitly enabled debug build.
 //!
-//! ## What this module does today (ADR step A)
+//! ## What this module does
 //!
-//! - Loads a **deploy-provided** cert chain + key (base64-encoded PEM, via env), parsed
-//!   with the minimal in-house PEM-block scanner below (no `rustls-pemfile` dependency).
+//! - Serves the in-TEE key and certificate supplied by the ACME renewal path.
+//!   A minimal PEM parser also supports static debug/custom bootstrap input.
 //! - Builds a rustls [`ServerConfig`] using the ring provider (pure-Rust-friendly, no
 //!   OpenSSL — required for the musl FROM-scratch image).
-//! - Computes the leaf certificate's **SHA-256 fingerprint**. This is the channel-binding
-//!   value: a later step (ADR step C) generates the keypair *inside* the TEE at boot and
-//!   binds this fingerprint into the Confidential Space attestation token, so a client
-//!   can verify "the TLS key I'm talking to belongs to the attested image" (RA-TLS).
+//! - Computes the leaf certificate's **SHA-256 fingerprint**. The public
+//!   attestation endpoint binds it into the token nonce so a verifier can compare
+//!   the live TLS leaf to the attested image (RA-TLS-style channel binding).
 //!
 //! ## ACME renewal (ADR-0003)
 //!
@@ -26,11 +22,9 @@
 //! resolver — no restart). The env-var path below remains as the static/bootstrap
 //! fallback and for local testing.
 //!
-//! ## What this module does NOT do yet
-//!
-//! - It does not put the fingerprint into the attestation token (ADR step C) or have the
-//!   client verify it (ADR step D). Note the ACME path already satisfies step C's key
-//!   precondition: the key is generated in-TEE and never exists in operator-visible form.
+//! Verifiers remain responsible for validating the attestation signature, claims,
+//! audience, nonce, and expected image digest, then comparing the nonce with the
+//! certificate fingerprint observed on their TLS connection.
 
 use std::sync::{Arc, RwLock};
 
@@ -94,20 +88,29 @@ impl CertKeyPair {
 /// renewal swaps the served certificate without dropping connections or
 /// restarting the accept loop. Handshakes read the current key atomically.
 #[derive(Debug)]
-struct SwappableCertResolver(RwLock<Arc<CertifiedKey>>);
+struct ActiveCertificate {
+    certified_key: Arc<CertifiedKey>,
+    fingerprint_hex: String,
+}
+
+#[derive(Debug)]
+struct SwappableCertResolver(RwLock<ActiveCertificate>);
 
 impl ResolvesServerCert for SwappableCertResolver {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(self.0.read().expect("cert resolver lock poisoned").clone())
+        Some(
+            self.0
+                .read()
+                .expect("cert resolver lock poisoned")
+                .certified_key
+                .clone(),
+        )
     }
 }
 
 /// A built TLS server config plus the leaf cert fingerprint used for attestation binding.
 pub struct TlsKeystone {
     pub server_config: Arc<ServerConfig>,
-    /// Lowercase hex SHA-256 of the leaf certificate DER (the RA-TLS channel-binding
-    /// value) as of the last build/swap.
-    pub cert_fingerprint_hex: String,
     resolver: Arc<SwappableCertResolver>,
 }
 
@@ -115,9 +118,10 @@ impl TlsKeystone {
     /// Build a keystone serving `pair`, with a resolver that supports live swaps.
     pub fn new(pair: CertKeyPair) -> Result<Self> {
         let fingerprint = pair.fingerprint_hex();
-        let resolver = Arc::new(SwappableCertResolver(RwLock::new(Arc::new(
-            pair.into_certified_key()?,
-        ))));
+        let resolver = Arc::new(SwappableCertResolver(RwLock::new(ActiveCertificate {
+            certified_key: Arc::new(pair.into_certified_key()?),
+            fingerprint_hex: fingerprint,
+        })));
 
         // Explicit ring provider so we never depend on a process-default being installed,
         // and never link aws-lc / OpenSSL (musl FROM-scratch must stay pure-Rust-friendly).
@@ -129,9 +133,19 @@ impl TlsKeystone {
 
         Ok(TlsKeystone {
             server_config: Arc::new(server_config),
-            cert_fingerprint_hex: fingerprint,
             resolver,
         })
+    }
+
+    /// Lowercase hex SHA-256 of the certificate currently served to new TLS
+    /// connections. This value changes atomically with the live certificate.
+    pub fn fingerprint_hex(&self) -> String {
+        self.resolver
+            .0
+            .read()
+            .expect("cert resolver lock poisoned")
+            .fingerprint_hex
+            .clone()
     }
 
     /// Replace the served certificate (ACME renewal). In-flight and future
@@ -144,7 +158,10 @@ impl TlsKeystone {
             .resolver
             .0
             .write()
-            .expect("cert resolver lock poisoned") = certified;
+            .expect("cert resolver lock poisoned") = ActiveCertificate {
+            certified_key: certified,
+            fingerprint_hex: fingerprint.clone(),
+        };
         Ok(fingerprint)
     }
 }
@@ -229,9 +246,7 @@ pub async fn from_env(base_url: &str, enclave_audience: &str) -> Result<Option<T
         Some(pair) => pair,
         None => {
             // 2. Try fetching from Secret Manager (if KMS_PROJECT is set and we're not in test mode)
-            let fetched = if std::env::var("ENCLAVE_TEST_MODE").is_err()
-                && std::env::var("KMS_PROJECT").is_ok()
-            {
+            let fetched = if !crate::test_mode_enabled() && std::env::var("KMS_PROJECT").is_ok() {
                 info!("attempting to fetch TLS cert/key from Secret Manager");
                 match (
                     crate::cp::fetch_secret_from_manager("kioku-enclave-tls-cert", "latest").await,
@@ -263,7 +278,7 @@ pub async fn from_env(base_url: &str, enclave_audience: &str) -> Result<Option<T
 
     let keystone = TlsKeystone::new(cert_pair)?;
     info!(
-        cert_fingerprint = %keystone.cert_fingerprint_hex,
+        cert_fingerprint = %keystone.fingerprint_hex(),
         "in-enclave TLS termination enabled (ADR-0001)"
     );
     Ok(Some(keystone))
@@ -328,31 +343,28 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    // Throwaway P-256 self-signed cert + PKCS#8 key (DER, base64), generated with openssl
-    // for tests only. NOT used anywhere at runtime.
-    const TEST_CERT_DER_B64: &str = "MIIBjjCCATWgAwIBAgIUIytx8lNz5aDdy67h5sxE8A+CJa0wCgYIKoZIzj0EAwIwHTEbMBkGA1UEAwwSa2lva3UtZW5jbGF2ZS10ZXN0MB4XDTI2MDYxMzIyMjMyOFoXDTI2MDYxNDIyMjMyOFowHTEbMBkGA1UEAwwSa2lva3UtZW5jbGF2ZS10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEzGwDYRrcIjAqX48U+diBS3zb0UiR1OorU9wcCSQo6aUeN4Zp8pYOocJMdc4HnZ+V8voWl66YIP6eYq2H01CTU6NTMFEwHQYDVR0OBBYEFD0sLmpIXL9fop226VLPpN4hVyBWMB8GA1UdIwQYMBaAFD0sLmpIXL9fop226VLPpN4hVyBWMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgJjFTQmQRm5rcUmKBhYaQbMbUYFSnaeZa94kN8/V2q44CIHkGiPTacXw931l4DUrVtPvHwpZv2kUwKQQmFccYKZ0y";
-    const TEST_KEY_DER_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQguFGp8VQUlYvbcw0sx185058IH6Inx/FXgjoQbrG1/pyhRANCAATMbANhGtwiMCpfjxT52IFLfNvRSJHU6itT3BwJJCjppR43hmnylg6hwkx1zgedn5Xy+haXrpgg/p5irYfTUJNT";
-    // SHA-256 of the cert DER above (openssl dgst -sha256).
-    const EXPECTED_FINGERPRINT: &str =
-        "d1817916fc0ecb6a30f947b43f452325b09cc9c88067fcdcaadef547a4d84580";
-
-    fn decode(b64: &str) -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
+    fn generated_pair(name: &str) -> CertKeyPair {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec![name.into()])
             .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        CertKeyPair::from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).unwrap()
     }
 
     #[test]
     fn builds_config_and_computes_fingerprint() {
-        let ks = build(decode(TEST_CERT_DER_B64), decode(TEST_KEY_DER_B64))
-            .expect("valid cert+key should build");
-        assert_eq!(ks.cert_fingerprint_hex, EXPECTED_FINGERPRINT);
-        assert_eq!(ks.cert_fingerprint_hex.len(), 64);
+        let pair = generated_pair("test.example");
+        let expected = pair.fingerprint_hex();
+        let ks = TlsKeystone::new(pair).expect("valid cert+key should build");
+        assert_eq!(ks.fingerprint_hex(), expected);
+        assert_eq!(ks.fingerprint_hex().len(), 64);
     }
 
     #[test]
     fn rejects_garbage_key() {
-        let err = build(decode(TEST_CERT_DER_B64), vec![0u8; 8]);
+        let pair = generated_pair("test.example");
+        let err = build(pair.chain_der[0].clone(), vec![0u8; 8]);
         assert!(err.is_err(), "garbage key must be rejected");
     }
 
@@ -365,8 +377,10 @@ mod tests {
     /// A swap must atomically change what the resolver serves (the ACME renewal path).
     #[test]
     fn swap_replaces_served_cert() {
-        let ks = build(decode(TEST_CERT_DER_B64), decode(TEST_KEY_DER_B64)).unwrap();
-        assert_eq!(ks.cert_fingerprint_hex, EXPECTED_FINGERPRINT);
+        let initial_pair = generated_pair("initial.example");
+        let initial_fp = initial_pair.fingerprint_hex();
+        let ks = TlsKeystone::new(initial_pair).unwrap();
+        assert_eq!(ks.fingerprint_hex(), initial_fp);
 
         // Fresh self-signed cert generated with rcgen (same crate the ACME path
         // uses in-enclave via instant-acme).
@@ -378,10 +392,11 @@ mod tests {
         let pair =
             CertKeyPair::from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).unwrap();
         let new_fp = pair.fingerprint_hex();
-        assert_ne!(new_fp, EXPECTED_FINGERPRINT);
+        assert_ne!(new_fp, initial_fp);
 
         let swapped_fp = ks.swap(pair).unwrap();
         assert_eq!(swapped_fp, new_fp);
+        assert_eq!(ks.fingerprint_hex(), new_fp);
 
         // The resolver now hands out the new leaf.
         let served = ks
@@ -389,6 +404,7 @@ mod tests {
             .0
             .read()
             .unwrap()
+            .certified_key
             .cert
             .first()
             .unwrap()

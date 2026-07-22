@@ -17,6 +17,46 @@ Cargo.lock.bak
 *.swo
 *~
 
-# Local env overrides (never commit real values)
+# Local env overrides (never commit real values; examples remain trackable)
 .env
-.env.local
+.env.*
+.envrc
+!.env.example
+!.env.*.example
+!.envrc.example
+
+# Generated credentials and private keys (examples/templates remain trackable)
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+gha-creds-*.json
+credentials*.json
+service-account*.json
+application_default_credentials.json
+.netrc
+.npmrc
+.pypirc
+!*.example.pem
+!*.example.key
+!*.template.pem
+!*.template.key
+!credentials*.example.json
+!credentials*.template.json
+!service-account*.example.json
+!service-account*.template.json
+
+# Local infrastructure state and variable values
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example

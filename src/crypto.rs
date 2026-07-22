@@ -1,15 +1,15 @@
 //! AES-256-GCM envelope encryption for per-user SQLite index blobs.
 //!
-//! # Blob wire format
+//! # Blob wire formats
 //!
 //! ```text
-//! [ nonce: 12 bytes ][ ciphertext + auth-tag: variable ]
+//! v2:     [ "KIOKU-BLOB\\x02" ][ nonce: 12 bytes ][ ciphertext + auth-tag ]
+//! legacy: [ nonce: 12 bytes ][ ciphertext + auth-tag ]
 //! ```
 //!
-//! The 96-bit (12-byte) nonce is randomly generated per encrypt call and
-//! prepended to the output so the decryptor can find it without side-channel.
-//! The 128-bit GCM auth tag is appended by the aes-gcm crate after the
-//! ciphertext (standard AEAD convention).
+//! V2 authenticates a domain-separated logical-object context as AAD, which
+//! prevents a valid ciphertext from being substituted at another object key.
+//! The legacy format is accepted only during an explicitly enabled migration.
 //!
 //! # DEK format
 //!
@@ -20,11 +20,12 @@
 //!
 //! # KMS authentication (production)
 //!
-//! In Confidential Space, the default service account token is fetched from
-//! the metadata server. KMS IAM is bound to the Workload Identity Pool with
+//! In Confidential Space, KMS credentials are derived from an attestation
+//! token and exchanged through Workload Identity Federation. KMS IAM is bound
+//! to the Workload Identity Pool with
 //! an attribute condition that requires:
 //!   - `google.subject` == the Confidential Space workload identity
-//!   - `attribute.image_digest` == the published, reproducibly-built digest
+//!   - `attribute.image_digest` == the published, provenance-verified digest
 //!
 //! No human principal has decrypt permission on the KEK.
 
@@ -35,9 +36,23 @@ use aes_gcm::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::attestation::AttestationCredentials;
 use crate::error::{EnclaveError, Result};
+
+/// Version marker for blobs whose AEAD tag binds them to a logical object.
+/// Legacy blobs had no marker and, for databases, no AAD at all.
+const BOUND_BLOB_V2_MAGIC: &[u8] = b"KIOKU-BLOB\x02";
+const BOUND_BLOB_V2_DOMAIN: &[u8] = b"kioku-enclave:bound-blob:v2\0";
+
+/// Result of opening a context-bound blob. `was_legacy` is true only during
+/// the explicitly enabled one-time migration window; callers should rewrite
+/// the object immediately in the v2 format.
+pub struct OpenedBoundBlob {
+    pub plaintext: Vec<u8>,
+    pub was_legacy: bool,
+}
 
 // ── DEK type ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +75,7 @@ impl Dek {
 // ── Blob crypto ───────────────────────────────────────────────────────────────
 
 /// Encrypt `plaintext` with `dek`.  Returns `nonce ‖ ciphertext ‖ tag`.
+#[cfg(test)]
 pub fn encrypt_blob(dek: &Dek, plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(dek.as_aes_key());
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 12 random bytes
@@ -73,7 +89,7 @@ pub fn encrypt_blob(dek: &Dek, plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decrypt a blob produced by [`encrypt_blob`].
+/// Decrypt the unbound legacy `nonce ‖ ciphertext ‖ tag` format.
 pub fn decrypt_blob(dek: &Dek, blob: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < 12 {
         return Err(EnclaveError::Crypto("blob too short".into()));
@@ -124,6 +140,62 @@ pub fn decrypt_blob_with_aad(dek: &Dek, blob: &[u8], aad: &[u8]) -> Result<Vec<u
         .map_err(|e| EnclaveError::Crypto(format!("decrypt failed: {e}")))
 }
 
+fn bound_blob_aad(context: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(BOUND_BLOB_V2_DOMAIN.len() + context.len());
+    aad.extend_from_slice(BOUND_BLOB_V2_DOMAIN);
+    aad.extend_from_slice(context);
+    aad
+}
+
+/// Encrypt a versioned blob and cryptographically bind it to `context` (for
+/// example, the exact GCS object name plus user id). Moving the ciphertext and
+/// wrapped DEK to a different object therefore fails authentication.
+pub fn encrypt_bound_blob(dek: &Dek, plaintext: &[u8], context: &[u8]) -> Result<Vec<u8>> {
+    let aad = bound_blob_aad(context);
+    let encrypted = encrypt_blob_with_aad(dek, plaintext, &aad)?;
+    let mut out = Vec::with_capacity(BOUND_BLOB_V2_MAGIC.len() + encrypted.len());
+    out.extend_from_slice(BOUND_BLOB_V2_MAGIC);
+    out.extend_from_slice(&encrypted);
+    Ok(out)
+}
+
+/// Open a context-bound blob. Legacy input is rejected by default. A deployment
+/// may temporarily bake `ENCLAVE_ALLOW_LEGACY_BLOBS=1` into a migration image;
+/// callers must rewrite every successfully opened legacy object before rolling
+/// back to a strict image.
+///
+/// `legacy_aad` describes the old format: `None` for database/ACME blobs that
+/// had no AAD, or `Some(user_id)` for the former media format.
+pub fn decrypt_bound_blob(
+    dek: &Dek,
+    blob: &[u8],
+    context: &[u8],
+    legacy_aad: Option<&[u8]>,
+) -> Result<OpenedBoundBlob> {
+    if let Some(encrypted) = blob.strip_prefix(BOUND_BLOB_V2_MAGIC) {
+        let aad = bound_blob_aad(context);
+        return Ok(OpenedBoundBlob {
+            plaintext: decrypt_blob_with_aad(dek, encrypted, &aad)?,
+            was_legacy: false,
+        });
+    }
+
+    if std::env::var("ENCLAVE_ALLOW_LEGACY_BLOBS").as_deref() != Ok("1") {
+        return Err(EnclaveError::Crypto(
+            "legacy encrypted blob rejected; use a controlled one-time migration image".into(),
+        ));
+    }
+
+    let plaintext = match legacy_aad {
+        Some(aad) => decrypt_blob_with_aad(dek, blob, aad)?,
+        None => decrypt_blob(dek, blob)?,
+    };
+    Ok(OpenedBoundBlob {
+        plaintext,
+        was_legacy: true,
+    })
+}
+
 // ── KMS trait (seam for testing) ──────────────────────────────────────────────
 
 /// Abstraction over Cloud KMS so unit tests can inject a fake.
@@ -137,16 +209,11 @@ pub trait KmsClient: Send + Sync {
 
 // ── Production KMS client ─────────────────────────────────────────────────────
 
-/// Cloud KMS REST client.  Uses the metadata server token, which in Confidential
-/// Space is attestation-gated to the exact image digest.
-///
-/// ## Feature flag: `ENCLAVE_KMS_VIA_ATTESTATION=1`
-///
-/// When this env var is set to `"1"`, KMS encrypt/decrypt calls use an
-/// attestation-derived federated access token (via the WIF principalSet
-/// binding) instead of the VM service-account metadata token.  The metadata
-/// token path is the **fallback** and remains operational so no cutover is
-/// required before the flag is flipped.
+/// Cloud KMS REST client. KMS encrypt/decrypt calls always use an
+/// attestation-derived federated access token via the WIF principalSet binding.
+/// Startup fails unless `ENCLAVE_KMS_VIA_ATTESTATION=1`; there is intentionally
+/// no VM service-account metadata fallback because that would bypass the image
+/// digest attestation boundary.
 ///
 /// GCS operations (ciphertext blob storage) are never affected — they always
 /// use the metadata SA token because the GCS bucket is not the security
@@ -154,8 +221,7 @@ pub trait KmsClient: Send + Sync {
 pub struct GcpKmsClient {
     http: reqwest::Client,
     key_name: String, // projects/P/locations/L/keyRings/R/cryptoKeys/K
-    /// Present only when ENCLAVE_KMS_VIA_ATTESTATION=1.
-    attestation_creds: Option<AttestationCredentials>,
+    attestation_creds: AttestationCredentials,
 }
 
 #[derive(Deserialize)]
@@ -168,16 +234,10 @@ struct KmsDecryptResponse {
     plaintext: String,
 }
 
-#[derive(Deserialize)]
-struct MetadataTokenResponse {
-    access_token: String,
-}
-
 impl GcpKmsClient {
     /// Construct from environment variables:
     /// - `KMS_PROJECT`, `KMS_LOCATION`, `KMS_KEY_RING`, `KMS_KEY`
-    /// - `ENCLAVE_KMS_VIA_ATTESTATION` (optional, default off): when `"1"`,
-    ///   KMS calls use the attestation-derived federated token.
+    /// - `ENCLAVE_KMS_VIA_ATTESTATION`: must be exactly `"1"`.
     pub fn from_env() -> Result<Self> {
         let project = std::env::var("KMS_PROJECT")
             .map_err(|_| EnclaveError::Kms("KMS_PROJECT not set".into()))?;
@@ -190,51 +250,29 @@ impl GcpKmsClient {
         let key_name =
             format!("projects/{project}/locations/{location}/keyRings/{key_ring}/cryptoKeys/{key}");
 
-        // Attestation credential source — built only when the flag is on.
-        let attestation_creds =
-            if std::env::var("ENCLAVE_KMS_VIA_ATTESTATION").as_deref() == Ok("1") {
-                Some(AttestationCredentials::from_env()?)
-            } else {
-                None
-            };
+        if std::env::var("ENCLAVE_KMS_VIA_ATTESTATION").as_deref() != Ok("1") {
+            return Err(EnclaveError::Kms(
+                "ENCLAVE_KMS_VIA_ATTESTATION must be set to 1; metadata credentials are not permitted"
+                    .into(),
+            ));
+        }
+        let attestation_creds = AttestationCredentials::from_env()?;
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .build()?,
             key_name,
             attestation_creds,
         })
     }
 
-    /// Fetch an access token from the GCE metadata server (VM SA path).
-    /// This is the legacy/fallback credential used when
-    /// `ENCLAVE_KMS_VIA_ATTESTATION` is not set.
-    async fn metadata_token(&self) -> Result<String> {
-        let resp: MetadataTokenResponse = self
-            .http
-            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
-            .header("Metadata-Flavor", "Google")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(resp.access_token)
-    }
-
-    /// Return the KMS access token for this request.
-    ///
-    /// - If `ENCLAVE_KMS_VIA_ATTESTATION=1`: uses the attestation-derived
-    ///   federated token (WIF principalSet path). The security property only
-    ///   holds when the attestation-gated principalSet is the *only* KMS
-    ///   decrypt grant — the deployment must not also bind the VM service
-    ///   account to the key.
-    /// - Otherwise: uses the metadata server SA token (fallback path).
+    /// Return an attestation-derived KMS access token for this request. The
+    /// deployment must keep the attestation-gated principalSet as the only KMS
+    /// decrypt grant and must not grant decrypt to the VM service account.
     async fn kms_token(&self) -> Result<String> {
-        if let Some(ref creds) = self.attestation_creds {
-            creds.kms_access_token().await
-        } else {
-            self.metadata_token().await
-        }
+        self.attestation_creds.kms_access_token().await
     }
 }
 
@@ -412,6 +450,21 @@ mod tests {
             decrypt_blob_with_aad(&dek, &blob, aad2).is_err(),
             "decrypting with wrong AAD must fail"
         );
+    }
+
+    #[test]
+    fn bound_blob_rejects_object_substitution() {
+        let dek = Dek::generate();
+        let alice_context = b"user-db\0indexes/alice.db.enc";
+        let blob =
+            encrypt_bound_blob(&dek, b"alice data", alice_context).expect("encrypt bound blob");
+
+        let opened = decrypt_bound_blob(&dek, &blob, alice_context, None)
+            .expect("open with correct context");
+        assert_eq!(opened.plaintext, b"alice data");
+        assert!(!opened.was_legacy);
+
+        assert!(decrypt_bound_blob(&dek, &blob, b"user-db\0indexes/bob.db.enc", None,).is_err());
     }
 
     #[test]

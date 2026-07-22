@@ -103,8 +103,7 @@ mod tests {
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
-            attestation_cache: None,
-            cert_fingerprint: None,
+            oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             embedding: None,
         });
 

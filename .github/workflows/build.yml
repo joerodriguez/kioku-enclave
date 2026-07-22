@@ -11,24 +11,26 @@ name: Build & push enclave image
 #
 # ── What this workflow does ──────────────────────────────────────────────────
 #
-# Builds the enclave Docker image on main and public release-tag pushes, then pushes it to the deployment's Artifact
-# Registry (us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave).
+# Runs source checks on pull requests. On main and public release-tag pushes it
+# also builds and pushes the enclave image to the operator's Artifact Registry.
 # All security-sensitive config is baked in via --build-arg so it is part of
 # the attested image digest and cannot be overridden at VM launch time.
 #
 # The image digest output is what matters: the operator pins it in their
 # deployment terraform (var.enclave_image_digest) to activate the
 # attestation-gated KMS binding. Rolling the enclave VM is a separate,
-# manually-triggered step in the deployment repo (for the canonical Kioku
-# deployment: the `enclave.yml` workflow in the kioku repo).
+# manually triggered, approval-gated step in an operator-supplied deployment
+# repository.
 #
 # ── Repository variables required ───────────────────────────────────────────
 # (set in repo Settings → Variables/Secrets)
 #
-# Variables (non-secret, visible in logs):
+# Variables (non-secret, potentially visible in logs):
 #   GCP_WIF_PROVIDER          WIF provider resource name (from the operator infra)
 #   GCP_SERVICE_ACCOUNT       Push-only SA email this repo impersonates
 #                             (artifactregistry.writer only — NOT a deployer)
+#   GCP_PROJECT_ID / GCP_REGION / AR_REPOSITORY / IMAGE_NAME
+#                             Destination image coordinates
 #
 #   Build-arg variables (baked into the attested image digest):
 #   ENCLAVE_KMS_PROJECT       GCP project containing the KMS key ring
@@ -41,16 +43,20 @@ name: Build & push enclave image
 #   ENCLAVE_ATTEST_STS_AUDIENCE  WIF provider resource name for attestation STS
 #   GOOGLE_DESKTOP_CLIENT_ID  Google OAuth desktop audience
 #   GOOGLE_WEB_CLIENT_ID      Google OAuth web audience
-#   ALLOWED_EMAILS            Comma-separated production account allow-list
 #   BASE_URL                  Public origin, e.g. https://api.kiokuu.com
+#   WEB_ORIGIN                 Browser application origin, e.g. https://kiokuu.com
 #   VERTEX_PROJECT            GCP project for episode summarization
 #   VERTEX_LOCATION           Vertex region (e.g. us-central1)
 #   VERTEX_MODEL              Vertex model name
 #   ENCLAVE_ACME              Must be 1 for production in-enclave TLS
 #   ENCLAVE_ACME_DIRECTORY    ACME directory URL
+#
+# Privacy-sensitive repository secrets (baked in, but masked in Actions logs):
+#   ALLOWED_EMAILS            Comma-separated production account allow-list
 #   ENCLAVE_ACME_CONTACT      ACME account contact email
 
 on:
+  pull_request:
   push:
     branches:
       - main
@@ -59,52 +65,78 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: enclave-build
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
-  id-token: write
   contents: read
 
 env:
-  PROJECT_ID: kioku-joerodriguez
-  REGION: us-central1
-  IMAGE_NAME: kioku-enclave
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  AR_REPOSITORY: ${{ vars.AR_REPOSITORY }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
 
 jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy && rustup default 1.96.0
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # RUSTSEC-2023-0071 affects RSA private-key operations. This service only
+      # verifies third-party RS256 signatures and holds no RSA private key.
+      - name: Install pinned dependency auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Dependency vulnerability audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
   # ── Build and push the enclave image to Artifact Registry ─────────────────
   # No approval gate here: pushing an image to AR is non-destructive.
   # The content-addressable digest is published in the job summary so the
   # operator can pin it in their deployment terraform to roll the VM.
   build-push:
     name: Build + push enclave image
-    runs-on: ubuntu-latest
+    needs: ci
+    # A manual dispatch from an unreviewed branch must never receive the OIDC
+    # token or Artifact Registry writer identity.
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
     outputs:
       image_tag: ${{ steps.build.outputs.image_tag }}
       image_uri: ${{ steps.build.outputs.image_uri }}
+      image_repository: ${{ steps.build.outputs.image_repository }}
       digest:    ${{ steps.digest.outputs.digest }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Authenticate to GCP (keyless WIF)
-        uses: google-github-actions/auth@v2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-
-      - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-
-      # Configure Docker credential helper for Artifact Registry.
-      # We build on the runner and push directly — we do NOT use
-      # `gcloud builds submit` because its pre-flight bucket check fails
-      # under WIF federated credentials even with storage.admin on the bucket.
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+          persist-credentials: false
 
       - name: Validate baked production configuration
         env:
@@ -118,22 +150,30 @@ jobs:
           ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
           GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
           GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
-          ALLOWED_EMAILS: ${{ vars.ALLOWED_EMAILS }}
+          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           BASE_URL: ${{ vars.BASE_URL }}
+          WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
           VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
           ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
           ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
-          ENCLAVE_ACME_CONTACT: ${{ vars.ENCLAVE_ACME_CONTACT }}
+          ENCLAVE_ACME_CONTACT: ${{ secrets.ENCLAVE_ACME_CONTACT }}
+          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+          REGION: ${{ env.REGION }}
+          AR_REPOSITORY: ${{ env.AR_REPOSITORY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
           REQUIRED=(
             ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING
             ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_RUN_SA_EMAIL
             ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
-            GOOGLE_DESKTOP_CLIENT_ID GOOGLE_WEB_CLIENT_ID ALLOWED_EMAILS BASE_URL
+            GOOGLE_DESKTOP_CLIENT_ID GOOGLE_WEB_CLIENT_ID ALLOWED_EMAILS BASE_URL WEB_ORIGIN
             VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
             ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY ENCLAVE_ACME_CONTACT
+            GCP_WIF_PROVIDER GCP_SERVICE_ACCOUNT PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME
           )
           for name in "${REQUIRED[@]}"; do
             if [[ -z "${!name}" ]]; then
@@ -145,14 +185,95 @@ jobs:
             echo "ENCLAVE_ACME must be 1 for the production image." >&2
             exit 1
           fi
+          python3 - <<'PY'
+          import os
+          import re
+          from urllib.parse import urlsplit
 
-      - name: Build and push image
+          def require_pattern(name, pattern):
+              if not re.fullmatch(pattern, os.environ[name]):
+                  raise SystemExit(f"invalid format for repository configuration: {name}")
+
+          for name in os.environ:
+              if name in {
+                  "ALLOWED_EMAILS", "AR_REPOSITORY", "BASE_URL", "ENCLAVE_ACME_CONTACT",
+                  "ENCLAVE_ACME_DIRECTORY", "ENCLAVE_ATTEST_STS_AUDIENCE", "ENCLAVE_AUDIENCE",
+                  "ENCLAVE_GCS_BUCKET", "ENCLAVE_KMS_KEY", "ENCLAVE_KMS_KEY_RING",
+                  "ENCLAVE_KMS_LOCATION", "ENCLAVE_KMS_PROJECT", "ENCLAVE_RUN_SA_EMAIL",
+                  "GCP_PROJECT_ID", "GCP_REGION", "GCP_SERVICE_ACCOUNT", "GCP_WIF_PROVIDER",
+                  "GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "IMAGE_NAME", "PROJECT_ID",
+                  "REGION", "VERTEX_LOCATION", "VERTEX_MODEL", "VERTEX_PROJECT", "WEB_ORIGIN",
+              } and any(ord(char) < 32 or ord(char) == 127 for char in os.environ[name]):
+                  raise SystemExit(f"control character in repository configuration: {name}")
+
+          require_pattern("PROJECT_ID", r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
+          require_pattern("REGION", r"[a-z]+-[a-z0-9]+[0-9]")
+          require_pattern("AR_REPOSITORY", r"[a-z0-9][a-z0-9._-]{0,126}")
+          require_pattern("IMAGE_NAME", r"[a-z0-9][a-z0-9._-]{0,126}")
+          require_pattern("GCP_SERVICE_ACCOUNT", r"[a-z0-9][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com")
+          require_pattern("ENCLAVE_RUN_SA_EMAIL", r"[a-z0-9][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com")
+          require_pattern("GCP_WIF_PROVIDER", r"projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+")
+          require_pattern("ENCLAVE_ATTEST_STS_AUDIENCE", r"//iam\.googleapis\.com/projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+")
+          for name in ("GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID"):
+              require_pattern(name, r"[A-Za-z0-9._-]+\.apps\.googleusercontent\.com")
+          for name in ("ENCLAVE_KMS_PROJECT", "VERTEX_PROJECT"):
+              require_pattern(name, r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
+          for name in ("ENCLAVE_KMS_LOCATION", "VERTEX_LOCATION"):
+              require_pattern(name, r"[a-z0-9][a-z0-9-]{0,62}")
+          for name in ("ENCLAVE_KMS_KEY_RING", "ENCLAVE_KMS_KEY"):
+              require_pattern(name, r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
+          require_pattern("ENCLAVE_GCS_BUCKET", r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
+          require_pattern("VERTEX_MODEL", r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}")
+
+          def require_https(name, origin_only=False):
+              value = os.environ[name]
+              parsed = urlsplit(value)
+              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+                  raise SystemExit(f"invalid HTTPS URL in repository configuration: {name}")
+              if origin_only and (parsed.query or parsed.path not in ("", "/")):
+                  raise SystemExit(f"expected an HTTPS origin in repository configuration: {name}")
+
+          for name in ("ENCLAVE_AUDIENCE", "BASE_URL", "WEB_ORIGIN"):
+              require_https(name, origin_only=True)
+          require_https("ENCLAVE_ACME_DIRECTORY")
+
+          contact = os.environ["ENCLAVE_ACME_CONTACT"]
+          if not re.fullmatch(r"mailto:[^@,\s]+@[^@,\s]+", contact):
+              raise SystemExit("invalid ACME contact")
+          emails = [email.strip() for email in os.environ["ALLOWED_EMAILS"].split(",")]
+          if not emails or any(not re.fullmatch(r"[^@,\s]+@[^@,\s]+", email) for email in emails):
+              raise SystemExit("invalid ALLOWED_EMAILS")
+          PY
+
+      - name: Build image
         id: build
+        env:
+          ENCLAVE_KMS_PROJECT: ${{ vars.ENCLAVE_KMS_PROJECT }}
+          ENCLAVE_KMS_LOCATION: ${{ vars.ENCLAVE_KMS_LOCATION }}
+          ENCLAVE_KMS_KEY_RING: ${{ vars.ENCLAVE_KMS_KEY_RING }}
+          ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
+          ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
+          ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
+          ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
+          ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
+          GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
+          GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
+          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
+          BASE_URL: ${{ vars.BASE_URL }}
+          WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
+          VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+          VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
+          ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
+          ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
+          ENCLAVE_ACME_CONTACT: ${{ secrets.ENCLAVE_ACME_CONTACT }}
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           TIMESTAMP="$(date +%s)"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "${GITHUB_SHA}")"
           IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
-          IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/kioku/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+          IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
+          IMAGE_URI="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 
           echo "Building image: ${IMAGE_URI}"
 
@@ -160,30 +281,103 @@ jobs:
           # part of the attested image digest and cannot be overridden at VM
           # launch time via tee-env-* metadata.
           docker build --platform linux/amd64 \
-            --build-arg KMS_PROJECT="${{ vars.ENCLAVE_KMS_PROJECT }}" \
-            --build-arg KMS_LOCATION="${{ vars.ENCLAVE_KMS_LOCATION }}" \
-            --build-arg KMS_KEY_RING="${{ vars.ENCLAVE_KMS_KEY_RING }}" \
-            --build-arg KMS_KEY="${{ vars.ENCLAVE_KMS_KEY }}" \
-            --build-arg GCS_BUCKET="${{ vars.ENCLAVE_GCS_BUCKET }}" \
-            --build-arg RUN_SA_EMAIL="${{ vars.ENCLAVE_RUN_SA_EMAIL }}" \
-            --build-arg ENCLAVE_AUDIENCE="${{ vars.ENCLAVE_AUDIENCE }}" \
-            --build-arg ATTEST_STS_AUDIENCE="${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}" \
-            --build-arg GOOGLE_DESKTOP_CLIENT_ID="${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}" \
-            --build-arg GOOGLE_WEB_CLIENT_ID="${{ vars.GOOGLE_WEB_CLIENT_ID }}" \
-            --build-arg ALLOWED_EMAILS="${{ vars.ALLOWED_EMAILS }}" \
-            --build-arg BASE_URL="${{ vars.BASE_URL }}" \
-            --build-arg VERTEX_PROJECT="${{ vars.VERTEX_PROJECT }}" \
-            --build-arg VERTEX_LOCATION="${{ vars.VERTEX_LOCATION }}" \
-            --build-arg VERTEX_MODEL="${{ vars.VERTEX_MODEL }}" \
-            --build-arg ENCLAVE_ACME="${{ vars.ENCLAVE_ACME }}" \
-            --build-arg ENCLAVE_ACME_DIRECTORY="${{ vars.ENCLAVE_ACME_DIRECTORY }}" \
-            --build-arg ENCLAVE_ACME_CONTACT="${{ vars.ENCLAVE_ACME_CONTACT }}" \
+            --build-arg SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+            --build-arg KMS_PROJECT="${ENCLAVE_KMS_PROJECT}" \
+            --build-arg KMS_LOCATION="${ENCLAVE_KMS_LOCATION}" \
+            --build-arg KMS_KEY_RING="${ENCLAVE_KMS_KEY_RING}" \
+            --build-arg KMS_KEY="${ENCLAVE_KMS_KEY}" \
+            --build-arg GCS_BUCKET="${ENCLAVE_GCS_BUCKET}" \
+            --build-arg RUN_SA_EMAIL="${ENCLAVE_RUN_SA_EMAIL}" \
+            --build-arg ENCLAVE_AUDIENCE="${ENCLAVE_AUDIENCE}" \
+            --build-arg ATTEST_STS_AUDIENCE="${ENCLAVE_ATTEST_STS_AUDIENCE}" \
+            --build-arg GOOGLE_DESKTOP_CLIENT_ID="${GOOGLE_DESKTOP_CLIENT_ID}" \
+            --build-arg GOOGLE_WEB_CLIENT_ID="${GOOGLE_WEB_CLIENT_ID}" \
+            --build-arg ALLOWED_EMAILS="${ALLOWED_EMAILS}" \
+            --build-arg BASE_URL="${BASE_URL}" \
+            --build-arg WEB_ORIGIN="${WEB_ORIGIN}" \
+            --build-arg VERTEX_PROJECT="${VERTEX_PROJECT}" \
+            --build-arg VERTEX_LOCATION="${VERTEX_LOCATION}" \
+            --build-arg VERTEX_MODEL="${VERTEX_MODEL}" \
+            --build-arg ENCLAVE_ACME="${ENCLAVE_ACME}" \
+            --build-arg ENCLAVE_ACME_DIRECTORY="${ENCLAVE_ACME_DIRECTORY}" \
+            --build-arg ENCLAVE_ACME_CONTACT="${ENCLAVE_ACME_CONTACT}" \
             -t "${IMAGE_URI}" .
-
-          docker push "${IMAGE_URI}"
 
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "image_repository=${IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.build.outputs.image_uri }}
+          format: spdx-json
+          output-file: enclave-sbom.spdx.json
+          syft-version: v1.49.0
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Verify statically linked Rust dependencies are present in SBOM
+        run: |
+          python3 - <<'PY'
+          import json
+
+          with open("enclave-sbom.spdx.json", encoding="utf-8") as handle:
+              sbom = json.load(handle)
+          names = {
+              package.get("name", "").lower()
+              for package in sbom.get("packages", [])
+          }
+          required = {"kioku-enclave", "jsonwebtoken", "rusqlite", "sqlite-vec", "onig"}
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(
+                  "SBOM is missing auditable Rust packages: " + ", ".join(missing)
+              )
+          print(f"verified {len(names)} SBOM packages, including the embedded Rust graph")
+          PY
+
+      - name: Scan image for fixed high-severity vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          sbom: enclave-sbom.spdx.json
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+          grype-version: v0.116.0
+
+      # Authenticate only after the untrusted build input has been built and
+      # scanned, minimizing how long a GCP credential exists on the runner.
+      - name: Authenticate to GCP (keyless WIF)
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          version: "576.0.0"
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Push scanned image
+        id: push
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image_uri }}
+        run: |
+          PUSH_OUTPUT="$(docker push "${IMAGE_URI}" 2>&1)"
+          printf '%s\n' "${PUSH_OUTPUT}"
+          PUSH_DIGEST="$(printf '%s\n' "${PUSH_OUTPUT}" | sed -nE \
+            's/^.*digest: (sha256:[0-9a-f]{64})( size:.*)?$/\1/p' | tail -n 1)"
+          if [[ ! "${PUSH_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Docker push did not return an immutable image digest."
+            exit 1
+          fi
+          echo "digest=${PUSH_DIGEST}" >> "$GITHUB_OUTPUT"
 
       # Retrieve the content-addressable sha256 digest for the pushed image.
       # This digest is what the operator pins in their deployment terraform
@@ -191,23 +385,25 @@ jobs:
       # binding. The VM roll is triggered separately in the deployment repo.
       - name: Retrieve image digest
         id: digest
+        env:
+          EXPECTED_DIGEST: ${{ steps.push.outputs.digest }}
+          IMAGE_TAGGED_URI: ${{ steps.build.outputs.image_uri }}
         run: |
-          IMAGE_URI="${{ steps.build.outputs.image_uri }}"
-          DIGEST="$(gcloud artifacts docker images describe "${IMAGE_URI}" \
+          REGISTRY_DIGEST="$(gcloud artifacts docker images describe "${IMAGE_TAGGED_URI}" \
             --format='value(image_summary.digest)' 2>/dev/null || echo 'unknown')"
-          if [ "$DIGEST" = "unknown" ]; then
-            echo "::error::Failed to retrieve digest for ${IMAGE_URI}"
+          if [[ "${REGISTRY_DIGEST}" != "${EXPECTED_DIGEST}" ]]; then
+            echo "::error::Registry digest mismatch for ${IMAGE_TAGGED_URI}."
             exit 1
           fi
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "digest=${EXPECTED_DIGEST}" >> "$GITHUB_OUTPUT"
           {
             echo "## Enclave image built"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Image tag | \`${{ steps.build.outputs.image_tag }}\` |"
-            echo "| Image URI | \`${IMAGE_URI}\` |"
-            echo "| **Image digest** | \`${DIGEST}\` |"
+            echo "| Image URI | \`${IMAGE_TAGGED_URI}\` |"
+            echo "| **Image digest** | \`${EXPECTED_DIGEST}\` |"
             echo "| Commit | \`${GITHUB_SHA}\` |"
             echo "| Built at | $(date -u '+%Y-%m-%dT%H:%M:%SZ') |"
             echo ""
@@ -216,6 +412,29 @@ jobs:
             echo "Pin this digest as \`enclave_image_digest\` in the deployment terraform"
             echo "and trigger the deployment repo's VM-roll workflow to replace the VM."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest image provenance
+        id: attest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ steps.build.outputs.image_repository }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          create-storage-record: false
+
+      - name: Preserve provenance bundle
+        run: cp "${{ steps.attest.outputs.bundle-path }}" enclave-provenance.jsonl
+
+      - name: Attest image SBOM
+        id: attest_sbom
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ steps.build.outputs.image_repository }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          sbom-path: enclave-sbom.spdx.json
+          create-storage-record: false
+
+      - name: Preserve SBOM attestation bundle
+        run: cp "${{ steps.attest_sbom.outputs.bundle-path }}" enclave-sbom-attestation.jsonl
 
       # Keep release metadata machine-readable as well as visible in the job
       # summary. scripts/release.sh publishes this file on the public GitHub
@@ -250,8 +469,12 @@ jobs:
           PY
 
       - name: Upload release metadata
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: enclave-release-metadata-${{ github.run_id }}
-          path: enclave-release.json
+          path: |
+            enclave-release.json
+            enclave-provenance.jsonl
+            enclave-sbom.spdx.json
+            enclave-sbom-attestation.jsonl
           retention-days: 90

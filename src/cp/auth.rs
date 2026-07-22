@@ -1,5 +1,5 @@
-//! End-user authentication for the control plane (ports `cloud/src/auth.js`
-//! `requireAuth`): accept either one of our own HS256 access tokens, or a Google
+//! End-user authentication for the control plane: accept either one of our own
+//! HS256 access tokens, or a Google
 //! ID token (device sync / web sign-in) whose `aud` is one of our OAuth client
 //! ids. On success the resolved user id is attached as a request extension.
 
@@ -27,6 +27,8 @@ const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_ISSUERS: &[&str] = &["https://accounts.google.com", "accounts.google.com"];
 const EXP_LEEWAY_SECS: u64 = 30;
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(300);
+const GOOGLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GOOGLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The authenticated user id, attached to the request by [`require_auth`].
 #[derive(Clone)]
@@ -55,7 +57,11 @@ pub struct UserIdTokenVerifier {
 impl UserIdTokenVerifier {
     pub fn new(audiences: Vec<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(GOOGLE_CONNECT_TIMEOUT)
+                .timeout(GOOGLE_REQUEST_TIMEOUT)
+                .build()
+                .expect("static Google JWKS HTTP client configuration"),
             audiences,
             cache: Mutex::new(None),
         }
@@ -153,6 +159,25 @@ fn unauthorized(base_url: &str) -> Response {
         .into_response()
 }
 
+fn unavailable_account() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "forbidden",
+            "error_description": "Account is unavailable",
+        })),
+    )
+        .into_response()
+}
+
+fn auth_store_error() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "temporarily_unavailable"})),
+    )
+        .into_response()
+}
+
 /// axum middleware: resolve the caller to a user id (our JWT, else Google ID
 /// token) and attach [`AuthUser`]. 403 if an otherwise-valid Google account is
 /// not on the `ALLOWED_EMAILS` list.
@@ -162,6 +187,8 @@ pub async fn require_auth(
     next: Next,
 ) -> Response {
     let base = &state.config.base_url;
+    let deletion_retry =
+        req.method() == axum::http::Method::DELETE && req.uri().path() == "/api/account";
     let token = match req
         .headers()
         .get("Authorization")
@@ -176,8 +203,20 @@ pub async fn require_auth(
     if let Ok(user_id) =
         tokens::verify_access_token(&state.config.jwt_secrets, &state.config.base_url, &token)
     {
-        req.extensions_mut().insert(AuthUser(user_id));
-        return next.run(req).await;
+        match state.control.user_status(&user_id).await {
+            Ok(Some(status))
+                if status == "active"
+                    || (deletion_retry && matches!(status.as_str(), "deleting" | "deleted")) =>
+            {
+                req.extensions_mut().insert(AuthUser(user_id));
+                return next.run(req).await;
+            }
+            Ok(_) => return unavailable_account(),
+            Err(e) => {
+                warn!(error = %e, "account-status lookup failed");
+                return auth_store_error();
+            }
+        }
     }
 
     // 2) Google ID token (device sync / web)
@@ -190,11 +229,27 @@ pub async fn require_auth(
                 )
                     .into_response();
             }
+            if deletion_retry {
+                let user_id = tokens::derive_stable_uuid(&google_sub);
+                match state.control.user_status(&user_id).await {
+                    Ok(Some(status)) if matches!(status.as_str(), "deleting" | "deleted") => {
+                        req.extensions_mut().insert(AuthUser(user_id));
+                        return next.run(req).await;
+                    }
+                    Ok(Some(status)) if status == "active" => {}
+                    Ok(_) => return unavailable_account(),
+                    Err(e) => {
+                        warn!(error = %e, "account-status lookup failed");
+                        return auth_store_error();
+                    }
+                }
+            }
             match state.control.upsert_user(&google_sub, &email).await {
                 Ok(user) => {
                     req.extensions_mut().insert(AuthUser(user.id));
                     next.run(req).await
                 }
+                Err(EnclaveError::Auth(_)) => unavailable_account(),
                 Err(e) => {
                     warn!(error = %e, "user upsert failed");
                     (

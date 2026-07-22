@@ -290,7 +290,7 @@ pub(crate) fn ingest_utterances(
                     Ok(utterance_id) => {
                         write_embedding(conn, VecTable::Utterances, utterance_id, emb_b64, true)
                     }
-                    Err(e) => warn!(source_key = %sk, "backfill rowid lookup failed: {e}"),
+                    Err(e) => warn!("utterance backfill rowid lookup failed: {e}"),
                 }
             }
         }
@@ -494,7 +494,7 @@ pub(crate) fn ingest_screenshots(
                     Ok(screenshot_id) => {
                         write_embedding(conn, VecTable::Screenshots, screenshot_id, emb_b64, true)
                     }
-                    Err(e) => warn!(source_key = %sk, "screenshot backfill lookup failed: {e}"),
+                    Err(e) => warn!("screenshot backfill lookup failed: {e}"),
                 }
             }
         }

@@ -1,18 +1,20 @@
-//! Query surface (ports `cloud/src/mcp.js` + `cloud/src/search.js`): the MCP
+//! Query surface: the MCP
 //! server (`POST /mcp`, JSON-RPC 2.0, stateless) and the REST mirrors
-//! (`/api/search`, `/api/episodes`, `/api/episodes/:id/members`) the debugger
+//! (`/api/search`, `/api/episodes`, `/api/episodes/:id`,
+//! `/api/episodes/:id/members`) the debugger
 //! uses. All routes are auth-gated; tool logic calls the data-plane query code
 //! (`search::search_all`, `timeline::fetch_context`) in-process.
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Extension, Router,
 };
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -23,20 +25,34 @@ use super::auth::AuthUser;
 use super::{limits, CpState};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MAX_SCREENSHOT_IMAGE_BYTES: usize = 150 * 1024;
+const MAX_SCREENSHOT_MULTIPART_BYTES: usize = MAX_SCREENSHOT_IMAGE_BYTES + 16 * 1024;
+const MAX_SCREENSHOT_METADATA_FIELD_BYTES: usize = 512;
+const MAX_EPISODE_IMAGE_BYTES: i64 = 600 * 1024;
+const MAX_EPISODE_IMAGES: i64 = 4;
+const MAX_SCREENSHOT_LONG_EDGE: u16 = 960;
+const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
 
 pub fn router() -> Router<Arc<CpState>> {
     Router::new()
         .route("/mcp", post(mcp_endpoint))
         .route("/api/search", get(rest_search))
         .route("/api/episodes", get(rest_episodes))
-        .route("/api/episodes/{id}", delete(rest_episode_delete))
+        .route(
+            "/api/episodes/{id}",
+            get(rest_episode).delete(rest_episode_delete),
+        )
         .route("/api/episodes/{id}/members", get(rest_episode_members))
         .route("/api/feed", get(rest_feed))
         .route(
             "/api/screenshot-images/plan",
             get(rest_screenshot_upload_plan),
         )
-        .route("/api/screenshot-images", post(rest_screenshot_image_upload))
+        .route(
+            "/api/screenshot-images",
+            post(rest_screenshot_image_upload)
+                .layer(DefaultBodyLimit::max(MAX_SCREENSHOT_MULTIPART_BYTES)),
+        )
         .route(
             "/api/screenshot-images/{id}/content",
             get(rest_screenshot_image_content),
@@ -312,6 +328,23 @@ async fn list_episodes_value(
     max: i64,
     include_low: bool,
 ) -> Value {
+    query_episodes_value(s, user_id, from, to, max, include_low, None)
+        .await
+        .unwrap_or_else(|_| json!({ "episode_count": 0, "hidden_count": 0, "episodes": [] }))
+}
+
+/// Shared list/detail query. Keeping the optional id filter here ensures the
+/// direct detail endpoint cannot drift from the list row's fields, visibility
+/// rules, derived counts, or final-brief shape.
+async fn query_episodes_value(
+    s: &CpState,
+    user_id: &str,
+    from: Option<String>,
+    to: Option<String>,
+    max: i64,
+    include_low: bool,
+    episode_id: Option<i64>,
+) -> crate::error::Result<Value> {
     s.store
         .with_user(user_id, move |conn| {
             // Episodes are the ONLY mode (the Mac's local heuristic grouping is
@@ -333,10 +366,13 @@ async fn list_episodes_value(
                  LEFT JOIN episode_final_briefs fb ON fb.episode_id = e.id \
                  WHERE (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
                    AND (?3 = 1 OR e.substance != 'none') \
+                   AND (?5 IS NULL OR e.id = ?5) \
                  ORDER BY e.started_at DESC LIMIT ?4",
             )?;
             let mut episodes: Vec<Value> = stmt
-                .query_map(rusqlite::params![from, to, include_low, max], |r| {
+                .query_map(
+                    rusqlite::params![from, to, include_low, max, episode_id],
+                    |r| {
                     let utt: i64 = r.get(9)?;
                     let scr: i64 = r.get(10)?;
 
@@ -379,7 +415,8 @@ async fn list_episodes_value(
                         "finalization_version": finalization_version,
                         "final_brief": final_brief,
                     }))
-                })?
+                    },
+                )?
                 .filter_map(|x| x.ok())
                 .collect();
 
@@ -403,12 +440,13 @@ async fn list_episodes_value(
                     "SELECT m.episode_id, c.active_app, c.url, count(*) AS n \
                      FROM episode_members m JOIN screenshots c ON c.id = m.record_id \
                      WHERE m.record_type = 'screenshot' \
+                       AND (?1 IS NULL OR m.episode_id = ?1) \
                      GROUP BY m.episode_id, c.active_app, c.url",
                 )?;
                 use std::collections::HashMap;
                 let mut app_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
                 let mut dom_counts: HashMap<i64, HashMap<String, i64>> = HashMap::new();
-                let rows = apps.query_map([], |r| {
+                let rows = apps.query_map([episode_id], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, Option<String>>(1)?,
@@ -447,7 +485,6 @@ async fn list_episodes_value(
             }))
         })
         .await
-        .unwrap_or_else(|_| json!({ "episode_count": 0, "hidden_count": 0, "episodes": [] }))
 }
 
 async fn tool_get_capture_status(s: &CpState, user_id: &str) -> Value {
@@ -717,6 +754,46 @@ async fn rest_episodes(
     .into_response()
 }
 
+#[derive(Deserialize)]
+struct EpisodeParams {
+    include_low: Option<String>,
+}
+
+/// GET /api/episodes/{id} — fetch one episode without depending on its
+/// position in the newest-first list. The default visibility matches browse:
+/// substance=none is indistinguishable from an absent row unless the caller
+/// explicitly opts into `include_low=1`.
+async fn rest_episode(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<i64>,
+    Query(p): Query<EpisodeParams>,
+) -> Response {
+    let include_low = p.include_low.as_deref().is_some_and(string_is_truthy);
+    match query_episodes_value(&s, &user.0, None, None, 1, include_low, Some(id)).await {
+        Ok(data) => match data
+            .get("episodes")
+            .and_then(Value::as_array)
+            .and_then(|episodes| episodes.first())
+        {
+            Some(episode) => Json(episode.clone()).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "episode_not_found"})),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            tracing::error!(error = %e, episode_id = id, "episode detail query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "server_error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// DELETE /api/episodes/{id} — purge an episode AND its member raw records
 /// (utterances, screenshots, emptied segments, vectors, FTS entries). The
 /// response carries the deleted records' source_keys so the caller (the Mac
@@ -727,6 +804,50 @@ async fn rest_episode_delete(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    // Remove encrypted media before dropping its durable DB references. If a
+    // GCS deletion fails, the operation remains retryable and no orphan is
+    // silently left behind.
+    let media_keys = match s
+        .store
+        .with_user(&user.0, |conn| {
+            let table_exists: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
+                [],
+                |row| row.get(0),
+            )?;
+            if table_exists == 0 {
+                return Ok(Vec::new());
+            }
+            let mut stmt =
+                conn.prepare("SELECT object_key FROM screenshot_images WHERE episode_id = ?1")?;
+            let keys = stmt
+                .query_map([id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(keys)
+        })
+        .await
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!(error = %e, episode_id = id, "episode purge media lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "enclave_unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    for object_key in &media_keys {
+        if let Err(e) = s.store.delete_media(object_key).await {
+            tracing::error!(error = %e, episode_id = id, "episode purge media deletion failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "media_delete_failed"})),
+            )
+                .into_response();
+        }
+    }
+
     let result = s
         .store
         .with_user(&user.0, move |conn| {
@@ -1096,10 +1217,436 @@ async fn rest_feed(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredScreenshotImage {
+    id: String,
+    episode_id: i64,
+    captured_at: String,
+    object_key: String,
+    mime_type: String,
+    width: i32,
+    height: i32,
+    byte_length: i64,
+    sha256: String,
+}
+
+impl StoredScreenshotImage {
+    fn response_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object_key": self.object_key,
+            "mime_type": self.mime_type,
+            "width": self.width,
+            "height": self.height,
+            "byte_length": self.byte_length,
+            "sha256": self.sha256,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScreenshotUploadTarget {
+    New {
+        screenshot_id: i64,
+        captured_at: String,
+    },
+    Existing(StoredScreenshotImage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScreenshotRecordOutcome {
+    Created(StoredScreenshotImage),
+    Existing(StoredScreenshotImage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedJpeg {
+    width: i32,
+    height: i32,
+    byte_length: i64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JpegUploadError {
+    PayloadTooLarge,
+    UnsupportedMediaType,
+    Invalid(&'static str),
+}
+
+fn validate_uploaded_jpeg(
+    image_bytes: &[u8],
+    content_type: Option<&str>,
+    claimed_width: i32,
+    claimed_height: i32,
+    requested_sha256: &str,
+) -> std::result::Result<ValidatedJpeg, JpegUploadError> {
+    if image_bytes.len() > MAX_SCREENSHOT_IMAGE_BYTES {
+        return Err(JpegUploadError::PayloadTooLarge);
+    }
+    if content_type != Some("image/jpeg") {
+        return Err(JpegUploadError::UnsupportedMediaType);
+    }
+
+    let requested_sha256 = requested_sha256.trim();
+    if requested_sha256.len() != 64
+        || !requested_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(JpegUploadError::Invalid("invalid SHA-256"));
+    }
+
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(image_bytes);
+    let computed_sha256 = format!("{:x}", hasher.finalize());
+    if !computed_sha256.eq_ignore_ascii_case(requested_sha256) {
+        return Err(JpegUploadError::Invalid("SHA-256 mismatch"));
+    }
+
+    // Read dimensions before decoding so a tiny compressed file cannot cause
+    // an attacker-chosen giant allocation. Decode is still mandatory: a valid
+    // SOF header alone is not proof that the JPEG body is valid.
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(image_bytes));
+    decoder
+        .read_info()
+        .map_err(|_| JpegUploadError::Invalid("invalid JPEG"))?;
+    let info = decoder
+        .info()
+        .ok_or(JpegUploadError::Invalid("invalid JPEG"))?;
+    if info.width.max(info.height) > MAX_SCREENSHOT_LONG_EDGE {
+        return Err(JpegUploadError::Invalid(
+            "JPEG long edge exceeds 960 pixels",
+        ));
+    }
+    if i32::from(info.width) != claimed_width || i32::from(info.height) != claimed_height {
+        return Err(JpegUploadError::Invalid(
+            "JPEG dimensions do not match multipart metadata",
+        ));
+    }
+    decoder.set_max_decoding_buffer_size(
+        usize::from(MAX_SCREENSHOT_LONG_EDGE) * usize::from(MAX_SCREENSHOT_LONG_EDGE) * 4,
+    );
+    decoder
+        .decode()
+        .map_err(|_| JpegUploadError::Invalid("invalid JPEG"))?;
+
+    Ok(ValidatedJpeg {
+        width: i32::from(info.width),
+        height: i32::from(info.height),
+        byte_length: image_bytes.len() as i64,
+        sha256: computed_sha256,
+    })
+}
+
+fn stored_screenshot_image(
+    conn: &Connection,
+    source_key: &str,
+) -> crate::error::Result<Option<StoredScreenshotImage>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, episode_id, captured_at, object_key, mime_type, width, height, byte_length, sha256 \
+             FROM screenshot_images WHERE source_key = ?1",
+            [source_key],
+            |row| {
+                Ok(StoredScreenshotImage {
+                    id: row.get(0)?,
+                    episode_id: row.get(1)?,
+                    captured_at: row.get(2)?,
+                    object_key: row.get(3)?,
+                    mime_type: row.get(4)?,
+                    width: row.get(5)?,
+                    height: row.get(6)?,
+                    byte_length: row.get(7)?,
+                    sha256: row.get(8)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn validate_screenshot_upload_target(
+    conn: &Connection,
+    episode_id: i64,
+    source_key: &str,
+    requested_captured_at: &str,
+    sha256: &str,
+    byte_length: i64,
+) -> crate::error::Result<ScreenshotUploadTarget> {
+    let member = conn
+        .query_row(
+            "SELECT c.id, c.captured_at, c.is_duplicate, e.substance, e.visual_evidence \
+             FROM screenshots c \
+             JOIN episode_members m \
+               ON m.record_type = 'screenshot' AND m.record_id = c.id \
+             JOIN episodes e ON e.id = m.episode_id \
+             WHERE c.source_key = ?1 AND e.id = ?2",
+            rusqlite::params![source_key, episode_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((screenshot_id, captured_at, is_duplicate, substance, visual_evidence)) = member
+    else {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "source_key is not a screenshot member of the claimed episode".into(),
+        ));
+    };
+    if is_duplicate != 0 {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "duplicate screenshots are not eligible for cloud evidence".into(),
+        ));
+    }
+    if substance != "normal" || visual_evidence != "useful" {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "episode is not eligible for cloud screenshot evidence".into(),
+        ));
+    }
+    if captured_at != requested_captured_at {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "captured_at does not match the synced screenshot".into(),
+        ));
+    }
+
+    if let Some(existing) = stored_screenshot_image(conn, source_key)? {
+        if existing.episode_id != episode_id {
+            return Err(crate::error::EnclaveError::Conflict(
+                "source_key is already attached to another episode".into(),
+            ));
+        }
+        if !existing.sha256.eq_ignore_ascii_case(sha256) {
+            return Err(crate::error::EnclaveError::Conflict(
+                "source_key was already uploaded with different bytes".into(),
+            ));
+        }
+        return Ok(ScreenshotUploadTarget::Existing(existing));
+    }
+
+    let (image_count, stored_bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(byte_length), 0) \
+         FROM screenshot_images WHERE episode_id = ?1",
+        [episode_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if image_count >= MAX_EPISODE_IMAGES {
+        return Err(crate::error::EnclaveError::Conflict(
+            "episode already has the maximum of four images".into(),
+        ));
+    }
+    if stored_bytes.saturating_add(byte_length) > MAX_EPISODE_IMAGE_BYTES {
+        return Err(crate::error::EnclaveError::Conflict(
+            "episode image budget exceeds 600 KiB".into(),
+        ));
+    }
+
+    Ok(ScreenshotUploadTarget::New {
+        screenshot_id,
+        captured_at,
+    })
+}
+
+fn install_media_dek_candidate(
+    conn: &Connection,
+    candidate_wrapped_dek: &str,
+) -> crate::error::Result<String> {
+    conn.execute(
+        "INSERT INTO app_metadata (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO NOTHING",
+        rusqlite::params![MEDIA_DEK_METADATA_KEY, candidate_wrapped_dek],
+    )?;
+    Ok(conn.query_row(
+        "SELECT value FROM app_metadata WHERE key = ?1",
+        [MEDIA_DEK_METADATA_KEY],
+        |row| row.get(0),
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_screenshot_image(
+    conn: &Connection,
+    image_id: &str,
+    object_key: &str,
+    episode_id: i64,
+    source_key: &str,
+    requested_captured_at: &str,
+    jpeg: &ValidatedJpeg,
+) -> crate::error::Result<ScreenshotRecordOutcome> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let target = validate_screenshot_upload_target(
+        &tx,
+        episode_id,
+        source_key,
+        requested_captured_at,
+        &jpeg.sha256,
+        jpeg.byte_length,
+    )?;
+
+    let (screenshot_id, captured_at) = match target {
+        ScreenshotUploadTarget::New {
+            screenshot_id,
+            captured_at,
+        } => (screenshot_id, captured_at),
+        ScreenshotUploadTarget::Existing(existing) => {
+            tx.commit()?;
+            return Ok(ScreenshotRecordOutcome::Existing(existing));
+        }
+    };
+
+    tx.execute(
+        "INSERT INTO screenshot_images \
+         (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'image/jpeg', ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            image_id,
+            screenshot_id,
+            episode_id,
+            source_key,
+            captured_at,
+            object_key,
+            jpeg.width,
+            jpeg.height,
+            jpeg.byte_length,
+            jpeg.sha256,
+        ],
+    )?;
+
+    let created = StoredScreenshotImage {
+        id: image_id.to_string(),
+        episode_id,
+        captured_at,
+        object_key: object_key.to_string(),
+        mime_type: "image/jpeg".into(),
+        width: jpeg.width,
+        height: jpeg.height,
+        byte_length: jpeg.byte_length,
+        sha256: jpeg.sha256.clone(),
+    };
+    tx.commit()?;
+    Ok(ScreenshotRecordOutcome::Created(created))
+}
+
 #[derive(Deserialize)]
 struct PlanParams {
     device_id: String,
     after: Option<String>,
+}
+
+fn query_screenshot_upload_plan(conn: &Connection, p: &PlanParams) -> crate::error::Result<Value> {
+    let prefix = format!("{}:", p.device_id);
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.started_at, e.ended_at, c.source_key, e.minute_summaries, \
+                COALESCE(usage.image_count, 0), COALESCE(usage.image_bytes, 0) \
+         FROM episodes e \
+         JOIN episode_members m \
+           ON m.episode_id = e.id AND m.record_type = 'screenshot' \
+         JOIN screenshots c ON c.id = m.record_id \
+         LEFT JOIN ( \
+             SELECT episode_id, COUNT(*) AS image_count, \
+                    COALESCE(SUM(byte_length), 0) AS image_bytes \
+             FROM screenshot_images GROUP BY episode_id \
+         ) usage ON usage.episode_id = e.id \
+         WHERE e.substance = 'normal' AND e.visual_evidence = 'useful' \
+           AND c.source_key LIKE ?1 \
+           AND c.is_duplicate = 0 \
+           AND (?2 IS NULL OR c.captured_at >= ?2) \
+           AND c.source_key NOT IN (SELECT source_key FROM screenshot_images) \
+           AND COALESCE(usage.image_count, 0) < ?3 \
+           AND COALESCE(usage.image_bytes, 0) < ?4 \
+         ORDER BY e.started_at DESC, c.captured_at ASC",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![
+            format!("{}%", prefix),
+            p.after,
+            MAX_EPISODE_IMAGES,
+            MAX_EPISODE_IMAGE_BYTES
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
+
+    #[derive(Debug)]
+    struct PlannedEpisode {
+        started_at: String,
+        ended_at: String,
+        remaining_images: i64,
+        remaining_bytes: i64,
+        gist_boundaries: Vec<String>,
+        source_keys: Vec<String>,
+    }
+
+    let mut episodes = std::collections::BTreeMap::<i64, PlannedEpisode>::new();
+    for row in rows {
+        let (
+            episode_id,
+            started_at,
+            ended_at,
+            source_key,
+            minute_summaries,
+            image_count,
+            image_bytes,
+        ) = row?;
+        let remaining_images = (MAX_EPISODE_IMAGES - image_count).max(0);
+        let remaining_bytes = (MAX_EPISODE_IMAGE_BYTES - image_bytes).max(0);
+        let gist_boundaries = minute_summaries
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<Value>>(raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|minute| minute.get("start")?.as_str().map(str::to_owned))
+            .collect();
+        let episode = episodes
+            .entry(episode_id)
+            .or_insert_with(|| PlannedEpisode {
+                started_at,
+                ended_at,
+                remaining_images,
+                remaining_bytes,
+                gist_boundaries,
+                source_keys: Vec::new(),
+            });
+        // Return the full eligible candidate set so the Mac can rank novelty
+        // and temporal coverage. The explicit remaining budgets bound how
+        // many it may choose; the transactional upload check is authoritative.
+        episode.source_keys.push(source_key);
+    }
+
+    let episodes = episodes
+        .into_iter()
+        .filter_map(|(id, episode)| {
+            (!episode.source_keys.is_empty()).then(|| {
+                json!({
+                    "id": id,
+                    "started_at": episode.started_at,
+                    "ended_at": episode.ended_at,
+                    "source_keys": episode.source_keys,
+                    "remaining_images": episode.remaining_images,
+                    "remaining_bytes": episode.remaining_bytes,
+                    "gist_boundaries": episode.gist_boundaries,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "episodes": episodes }))
 }
 
 async fn rest_screenshot_upload_plan(
@@ -1117,51 +1664,7 @@ async fn rest_screenshot_upload_plan(
 
     let result = s
         .store
-        .with_user(&user.0, move |conn| {
-            let prefix = format!("{}:", p.device_id);
-
-            let mut stmt = conn.prepare(
-                "SELECT e.id, e.started_at, e.ended_at, c.source_key
-             FROM episodes e
-             JOIN episode_members m ON m.episode_id = e.id AND m.record_type = 'screenshot'
-             JOIN screenshots c ON c.id = m.record_id
-             WHERE e.substance = 'normal' AND e.visual_evidence = 'useful'
-               AND c.source_key LIKE ?1
-               AND c.is_duplicate = 0
-               AND (?2 IS NULL OR c.captured_at >= ?2)
-               AND c.source_key NOT IN (SELECT source_key FROM screenshot_images)
-             ORDER BY e.started_at DESC, c.captured_at ASC",
-            )?;
-
-            let rows = stmt.query_map(rusqlite::params![format!("{}%", prefix), p.after], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
-
-            let mut episodes_map = std::collections::BTreeMap::new();
-            for r in rows {
-                let (ep_id, start, end, sk) = r?;
-                let entry = episodes_map.entry(ep_id).or_insert_with(|| {
-                    json!({
-                        "id": ep_id,
-                        "started_at": start,
-                        "ended_at": end,
-                        "source_keys": Vec::<String>::new()
-                    })
-                });
-                entry.as_object_mut().unwrap()["source_keys"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(Value::String(sk));
-            }
-
-            let episodes_list: Vec<Value> = episodes_map.into_values().collect();
-            Ok(json!({ "episodes": episodes_list }))
-        })
+        .with_user(&user.0, move |conn| query_screenshot_upload_plan(conn, &p))
         .await;
 
     match result {
@@ -1192,6 +1695,8 @@ async fn rest_screenshot_image_upload(
     }
 
     let mut image_bytes = Vec::new();
+    let mut image_content_type = None;
+    let mut saw_image = false;
     let mut captured_at = None;
     let mut episode_id = None;
     let mut source_key = None;
@@ -1199,12 +1704,29 @@ async fn rest_screenshot_image_upload(
     let mut height = None;
     let mut req_sha256 = None;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid multipart body").into_response(),
+        };
         let name = field.name().unwrap_or_default().to_string();
         if name == "image" {
+            if saw_image {
+                return (StatusCode::BAD_REQUEST, "multiple image fields").into_response();
+            }
+            saw_image = true;
+            image_content_type = field.content_type().map(str::to_owned);
             let mut stream = field;
-            while let Ok(Some(chunk)) = stream.chunk().await {
-                if image_bytes.len() + chunk.len() > 153_600 {
+            loop {
+                let chunk = match stream.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return (StatusCode::BAD_REQUEST, "invalid image field").into_response()
+                    }
+                };
+                if image_bytes.len() + chunk.len() > MAX_SCREENSHOT_IMAGE_BYTES {
                     return (
                         StatusCode::PAYLOAD_TOO_LARGE,
                         "payload too large (max 150 KiB)",
@@ -1216,16 +1738,35 @@ async fn rest_screenshot_image_upload(
         } else {
             let value = match field.text().await {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "invalid multipart field").into_response()
+                }
             };
+            if value.len() > MAX_SCREENSHOT_METADATA_FIELD_BYTES {
+                return (StatusCode::BAD_REQUEST, "multipart field too long").into_response();
+            }
             match name.as_str() {
-                "captured_at" => captured_at = Some(value),
-                "episode_id" => episode_id = value.parse::<i64>().ok(),
-                "source_key" => source_key = Some(value),
-                "width" => width = value.parse::<i32>().ok(),
-                "height" => height = value.parse::<i32>().ok(),
-                "sha256" => req_sha256 = Some(value),
-                _ => {}
+                "captured_at" if captured_at.is_none() => captured_at = Some(value),
+                "episode_id" if episode_id.is_none() => match value.parse::<i64>() {
+                    Ok(value) => episode_id = Some(value),
+                    Err(_) => {
+                        return (StatusCode::BAD_REQUEST, "invalid episode_id").into_response()
+                    }
+                },
+                "source_key" if source_key.is_none() => source_key = Some(value),
+                "width" if width.is_none() => match value.parse::<i32>() {
+                    Ok(value) => width = Some(value),
+                    Err(_) => return (StatusCode::BAD_REQUEST, "invalid width").into_response(),
+                },
+                "height" if height.is_none() => match value.parse::<i32>() {
+                    Ok(value) => height = Some(value),
+                    Err(_) => return (StatusCode::BAD_REQUEST, "invalid height").into_response(),
+                },
+                "sha256" if req_sha256.is_none() => req_sha256 = Some(value),
+                "captured_at" | "episode_id" | "source_key" | "width" | "height" | "sha256" => {
+                    return (StatusCode::BAD_REQUEST, "duplicate multipart field").into_response()
+                }
+                _ => return (StatusCode::BAD_REQUEST, "unknown multipart field").into_response(),
             }
         }
     }
@@ -1253,35 +1794,90 @@ async fn rest_screenshot_image_upload(
         return (StatusCode::BAD_REQUEST, "missing image bytes").into_response();
     }
 
-    // Verify SHA-256
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(&image_bytes);
-    let computed_hash = format!("{:x}", hasher.finalize());
-    if computed_hash != req_sha256 {
-        return (StatusCode::BAD_REQUEST, "SHA-256 mismatch").into_response();
+    let jpeg = match validate_uploaded_jpeg(
+        &image_bytes,
+        image_content_type.as_deref(),
+        width,
+        height,
+        &req_sha256,
+    ) {
+        Ok(jpeg) => jpeg,
+        Err(JpegUploadError::PayloadTooLarge) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload too large (max 150 KiB)",
+            )
+                .into_response()
+        }
+        Err(JpegUploadError::UnsupportedMediaType) => {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "image must be image/jpeg",
+            )
+                .into_response()
+        }
+        Err(JpegUploadError::Invalid(message)) => {
+            return (StatusCode::BAD_REQUEST, message).into_response()
+        }
+    };
+
+    // Reject ineligible bytes before KMS, encryption, or object storage. The
+    // same predicate runs again under BEGIN IMMEDIATE when recording the row.
+    let user_id_cloned = user_id.clone();
+    let source_key_cloned = source_key.clone();
+    let captured_at_cloned = captured_at.clone();
+    let sha256_cloned = jpeg.sha256.clone();
+    let preflight = s
+        .store
+        .with_user(&user_id_cloned, move |conn| {
+            validate_screenshot_upload_target(
+                conn,
+                episode_id,
+                &source_key_cloned,
+                &captured_at_cloned,
+                &sha256_cloned,
+                jpeg.byte_length,
+            )
+        })
+        .await;
+    match preflight {
+        Ok(ScreenshotUploadTarget::Existing(existing)) => {
+            return (StatusCode::OK, Json(existing.response_json())).into_response()
+        }
+        Ok(ScreenshotUploadTarget::New { .. }) => {}
+        Err(
+            e @ (crate::error::EnclaveError::InvalidRequest(_)
+            | crate::error::EnclaveError::Conflict(_)),
+        ) => return e.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "media upload eligibility check failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
     }
 
-    // 1. Get wrapped DEK or generate one
+    // 1. Load the persisted media DEK. On first upload, insert a candidate
+    // with first-writer-wins semantics, then reload/use the persisted winner.
+    // Two Macs can therefore never encrypt objects under different DEKs while
+    // racing to initialize the same user.
     let user_id_cloned = user_id.clone();
-    let wrapped_opt_res = s
+    let wrapped_opt_res: crate::error::Result<Option<String>> = s
         .store
         .with_user(&user_id_cloned, |conn| {
-            let mut stmt =
-                conn.prepare("SELECT value FROM app_metadata WHERE key = 'wrapped_media_dek'")?;
-            let val: Option<String> = stmt.query_row([], |r| r.get(0)).ok();
-            Ok(val)
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM app_metadata WHERE key = ?1",
+                    [MEDIA_DEK_METADATA_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?)
         })
         .await;
 
     let wrapped_opt = match wrapped_opt_res {
         Ok(w) => w,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database query failed: {}", e),
-            )
-                .into_response()
+            tracing::error!(error = %e, "media upload database lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
         }
     };
 
@@ -1289,142 +1885,151 @@ async fn rest_screenshot_image_upload(
         Some(wrapped) => match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped).await {
             Ok(dek) => (dek, wrapped),
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Load DEK failed: {}", e),
-                )
-                    .into_response()
+                tracing::error!(error = %e, "media upload DEK load failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
             }
         },
-        None => match crate::crypto::generate_and_wrap_dek(s.store.kms.as_ref()).await {
-            Ok((dek, wrapped)) => {
-                let wrapped_clone = wrapped.clone();
-                let user_id_cloned = user_id.clone();
-                let save_res = s.store.with_user(&user_id_cloned, move |conn| {
-                        conn.execute(
-                            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('wrapped_media_dek', ?1)",
-                            [&wrapped_clone],
-                        )?;
-                        Ok(())
-                    }).await;
-                if let Err(e) = save_res {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Save DEK failed: {}", e),
-                    )
+        None => {
+            let (candidate_dek, candidate_wrapped) =
+                match crate::crypto::generate_and_wrap_dek(s.store.kms.as_ref()).await {
+                    Ok(candidate) => candidate,
+                    Err(e) => {
+                        tracing::error!(error = %e, "media upload DEK generation failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
+                            .into_response();
+                    }
+                };
+            let user_id_cloned = user_id.clone();
+            let candidate_wrapped_cloned = candidate_wrapped.clone();
+            let winner = match s
+                .store
+                .with_user(&user_id_cloned, move |conn| {
+                    install_media_dek_candidate(conn, &candidate_wrapped_cloned)
+                })
+                .await
+            {
+                Ok(winner) => winner,
+                Err(e) => {
+                    tracing::error!(error = %e, "media upload DEK persistence failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
                         .into_response();
                 }
-                (dek, wrapped)
+            };
+
+            if winner == candidate_wrapped {
+                (candidate_dek, winner)
+            } else {
+                match crate::crypto::load_dek(s.store.kms.as_ref(), &winner).await {
+                    Ok(dek) => (dek, winner),
+                    Err(e) => {
+                        tracing::error!(error = %e, "media upload winning DEK load failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
+                            .into_response();
+                    }
+                }
             }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Generate DEK failed: {}", e),
-                )
-                    .into_response()
-            }
-        },
+        }
     };
 
-    // 2. Encrypt JPEG bytes using media DEK and user_id as AAD
-    let encrypted_data =
-        match crate::crypto::encrypt_blob_with_aad(&media_dek, &image_bytes, user_id.as_bytes()) {
-            Ok(d) => d,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Encryption failed: {}", e),
-                )
-                    .into_response()
-            }
-        };
-
-    // 3. Generate random 128-bit hex key as opaque ID
+    // 2. Generate a random opaque key before encryption so the AEAD tag can
+    // bind the bytes to their exact user and object identity.
     let mut random_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random_bytes);
     let opaque_key: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
     let object_key = format!("media/{}", opaque_key);
+    let media_context = crate::store::media_blob_context(&user_id, &object_key);
+    let encrypted_data =
+        match crate::crypto::encrypt_bound_blob(&media_dek, &image_bytes, &media_context) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(error = %e, "media upload encryption failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+            }
+        };
 
-    // 4. Upload to GCS
+    // 3. Upload to GCS
     if let Err(e) = s
         .store
         .put_media(&object_key, &encrypted_data, &wrapped_b64)
         .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("GCS upload failed: {}", e),
-        )
-            .into_response();
+        tracing::error!(error = %e, "media upload GCS write failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
     }
 
-    // 5. Insert tracking record in SQLite database
+    // 4. Revalidate eligibility and episode budgets transactionally, then
+    // insert. A concurrent identical retry returns the persisted winner.
     let user_id_cloned = user_id.clone();
-    let insert_res = s.store.with_user(&user_id_cloned, {
-        let object_key_clone = object_key.clone();
-        let source_key_clone = source_key.clone();
-        let captured_at_clone = captured_at.clone();
-        let sha256_clone = req_sha256.clone();
-        let image_len = image_bytes.len() as i64;
-        let opaque_key_clone = opaque_key.clone();
-        move |conn| {
-            let screenshot_id: i64 = conn.query_row(
-                "SELECT id FROM screenshots WHERE source_key = ?1",
-                [&source_key_clone],
-                |r| r.get(0),
-            )?;
-
-            conn.execute(
-                "INSERT INTO screenshot_images (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'image/jpeg', ?7, ?8, ?9, ?10)",
-                rusqlite::params![
-                    opaque_key_clone,
-                    screenshot_id,
+    let insert_res = s
+        .store
+        .with_user(&user_id_cloned, {
+            let object_key_clone = object_key.clone();
+            let source_key_clone = source_key.clone();
+            let captured_at_clone = captured_at.clone();
+            let opaque_key_clone = opaque_key.clone();
+            let jpeg_clone = jpeg.clone();
+            move |conn| {
+                record_screenshot_image(
+                    conn,
+                    &opaque_key_clone,
+                    &object_key_clone,
                     episode_id,
-                    source_key_clone,
-                    captured_at_clone,
-                    object_key_clone,
-                    width,
-                    height,
-                    image_len,
-                    sha256_clone,
-                ],
-            )?;
-            Ok(())
-        }
-    }).await;
+                    &source_key_clone,
+                    &captured_at_clone,
+                    &jpeg_clone,
+                )
+            }
+        })
+        .await;
 
-    if let Err(e) = insert_res {
-        let _ = s.store.delete_media(&object_key).await;
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("Database insert failed: {}", e),
-        )
-            .into_response();
-    }
+    let stored = match insert_res {
+        Ok(ScreenshotRecordOutcome::Created(stored)) => stored,
+        Ok(ScreenshotRecordOutcome::Existing(existing)) => {
+            if let Err(e) = s.store.delete_media(&object_key).await {
+                tracing::error!(error = %e, object_key, "failed to clean up redundant media object");
+            }
+            return (StatusCode::OK, Json(existing.response_json())).into_response();
+        }
+        Err(e) => {
+            if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
+                tracing::error!(error = %cleanup_error, object_key, "failed to clean up rejected media object");
+            }
+            tracing::warn!(error = %e, "media upload database insert failed");
+            return match e {
+                e @ (crate::error::EnclaveError::InvalidRequest(_)
+                | crate::error::EnclaveError::Conflict(_)) => e.into_response(),
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+            };
+        }
+    };
 
     // Save user SQLite database state
     if let Err(e) = s.store.save_user(&user_id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database save failed: {}", e),
-        )
-            .into_response();
+        tracing::error!(error = %e, "media upload database save failed");
+        let rollback = s
+            .store
+            .with_user(&user_id, |conn| {
+                conn.execute("DELETE FROM screenshot_images WHERE id = ?1", [&stored.id])?;
+                Ok(())
+            })
+            .await;
+        match rollback {
+            Ok(()) => {
+                if let Err(rollback_error) = s.store.save_user(&user_id).await {
+                    tracing::error!(error = %rollback_error, "failed to durably roll back screenshot image row");
+                }
+            }
+            Err(rollback_error) => {
+                tracing::error!(error = %rollback_error, "failed to roll back screenshot image row");
+            }
+        }
+        if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
+            tracing::error!(error = %cleanup_error, object_key, "failed to clean up media object after database save failure");
+        }
+        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
     }
 
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "id": opaque_key,
-            "object_key": object_key,
-            "mime_type": "image/jpeg",
-            "width": width,
-            "height": height,
-            "byte_length": image_bytes.len(),
-            "sha256": req_sha256,
-        })),
-    )
-        .into_response()
+    (StatusCode::CREATED, Json(stored.response_json())).into_response()
 }
 
 async fn rest_screenshot_image_content(
@@ -1484,11 +2089,8 @@ async fn rest_screenshot_image_content(
     let wrapped_opt = match wrapped_opt_res {
         Ok(w) => w,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database query failed: {}", e),
-            )
-                .into_response()
+            tracing::error!(error = %e, "media download database lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
@@ -1500,34 +2102,56 @@ async fn rest_screenshot_image_content(
     let media_dek = match crate::crypto::load_dek(s.store.kms.as_ref(), &wrapped_b64).await {
         Ok(dek) => dek,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Load DEK failed: {}", e),
-            )
-                .into_response()
+            tracing::error!(error = %e, "media download DEK load failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
-    // 4. Decrypt object using media DEK and user_id as AAD
-    let decrypted_bytes = match crate::crypto::decrypt_blob_with_aad(
+    // 4. Bind media to both the authenticated user and exact object key.
+    let media_context = crate::store::media_blob_context(&user_id, &object_key);
+    let opened = match crate::crypto::decrypt_bound_blob(
         &media_dek,
         &gcs_resp.ciphertext,
-        user_id.as_bytes(),
+        &media_context,
+        Some(user_id.as_bytes()),
     ) {
         Ok(d) => d,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Decryption failed: {}", e),
-            )
-                .into_response()
+            tracing::error!(error = %e, "media download authentication failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    if opened.was_legacy {
+        let migrated = match crate::crypto::encrypt_bound_blob(
+            &media_dek,
+            &opened.plaintext,
+            &media_context,
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(error = %e, "legacy media migration encryption failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        if let Err(e) = s
+            .store
+            .put_media_at_generation(
+                &object_key,
+                &migrated,
+                &gcs_resp.wrapped_dek_b64,
+                gcs_resp.generation,
+            )
+            .await
+        {
+            tracing::error!(error = %e, "legacy media migration write failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
 
     (
         StatusCode::OK,
         [("Content-Type", "image/jpeg")],
-        decrypted_bytes,
+        opened.plaintext,
     )
         .into_response()
 }
@@ -1617,7 +2241,7 @@ async fn rest_set_preference(
 
         if let Some(token) = refresh_token {
             tokio::spawn(async move {
-                let http = reqwest::Client::new();
+                let http = super::bounded_http_client();
                 let _ = http
                     .post("https://oauth2.googleapis.com/revoke")
                     .header("Content-Type", "application/x-www-form-urlencoded")
@@ -1663,6 +2287,37 @@ mod tests {
     use crate::store::tests::{FakeGcs, FakeKms};
     use crate::store::Store;
 
+    fn query_test_state() -> Arc<CpState> {
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        Arc::new(CpState {
+            store,
+            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs)),
+            config: Arc::new(crate::cp::CpConfig {
+                base_url: "http://localhost:8080".into(),
+                jwt_secrets: vec!["test-secret".into()],
+                google_desktop_client_id: "desktop".into(),
+                google_web_client_id: "web".into(),
+                google_web_client_secret: "secret".into(),
+                allowed_emails: None,
+                scheduler_sa_email: None,
+                vertex_project: "project".into(),
+                vertex_location: "location".into(),
+                vertex_model: "model".into(),
+                quota_utterances_per_day: 1,
+                quota_screenshots_per_day: 1,
+                quota_mcp_calls_per_day: 1,
+                web_origin: "http://localhost:3000".into(),
+            }),
+            user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
+            sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            embedding: None,
+        })
+    }
+
     #[test]
     fn include_low_accepts_documented_and_mcp_truthy_values() {
         assert!(string_is_truthy("1"));
@@ -1671,6 +2326,124 @@ mod tests {
         assert!(value_is_truthy(&json!(1)));
         assert!(!string_is_truthy("0"));
         assert!(!value_is_truthy(&json!(false)));
+    }
+
+    #[tokio::test]
+    async fn episode_detail_matches_list_shape_and_visibility() {
+        let state = query_test_state();
+        let user_id = "episode-detail-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO audio_segments (id, started_at, ended_at, duration_seconds, source_type) \
+                     VALUES (1, '2026-07-21T09:00:00Z', '2026-07-21T09:01:00Z', 60, 'mic')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label) \
+                     VALUES (1, 1, 0, 10, 'Bring proof of insurance', 'Presenter')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO screenshots (id, captured_at, active_app, window_title, url, ocr_text) \
+                     VALUES (1, '2026-07-21T09:00:05Z', 'Chrome', 'Welcome', 'https://welcome.example/apply', 'Apply here')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO episodes (id, started_at, ended_at, title, summary, type, participants, languages, action_items, minute_summaries, substance, visual_evidence, finalized_at, finalization_version) \
+                     VALUES (305, '2026-07-21T09:00:00Z', '2026-07-21T09:01:00Z', 'Student welcome', 'Apply online.', 'presentation', '[\"Presenter\"]', '[\"en\"]', '[\"Apply\"]', '[{\"start\":\"2026-07-21T09:00:00Z\",\"gist\":\"Presenter required proof.\"}]', 'normal', 'useful', '2026-07-21T14:00:00Z', 2)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO episodes (id, started_at, ended_at, title, summary, substance) \
+                     VALUES (6, '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', 'Hidden noise', 'No substance.', 'none')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (305, 'utterance', 1)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (305, 'screenshot', 1)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO episode_final_briefs (episode_id, overview, decisions, action_items, important_links, open_questions) \
+                     VALUES (305, 'Complete the required setup.', '[\"Insurance is required\"]', '[{\"task\":\"Apply\"}]', '[{\"url\":\"https://welcome.example/apply\"}]', '[]')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let listed = query_episodes_value(&state, user_id, None, None, 50, false, None)
+            .await
+            .unwrap();
+        let listed_episode = listed["episodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|episode| episode["id"] == 305)
+            .unwrap()
+            .clone();
+
+        let response = rest_episode(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path(305),
+            Query(EpisodeParams { include_low: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            detail, listed_episode,
+            "detail must reuse the list row shape"
+        );
+        assert_eq!(detail["utterance_count"], 1);
+        assert_eq!(detail["screenshot_count"], 1);
+        assert_eq!(detail["top_apps"], json!(["Chrome"]));
+        assert_eq!(detail["top_domains"], json!(["welcome.example"]));
+        assert_eq!(
+            detail["final_brief"]["overview"],
+            "Complete the required setup."
+        );
+
+        let hidden = rest_episode(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path(6),
+            Query(EpisodeParams { include_low: None }),
+        )
+        .await;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let included = rest_episode(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path(6),
+            Query(EpisodeParams {
+                include_low: Some("1".into()),
+            }),
+        )
+        .await;
+        assert_eq!(included.status(), StatusCode::OK);
+
+        let absent = rest_episode(
+            State(state),
+            Extension(AuthUser(user_id.into())),
+            Path(999_999),
+            Query(EpisodeParams {
+                include_low: Some("1".into()),
+            }),
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1844,15 +2617,25 @@ mod tests {
             conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (2, '2026-01-01T10:01:00Z', 'dev1:2', 0)", [])?;
             conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (3, '2026-01-01T10:02:00Z', 'dev1:3', 1)", [])?;
             conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (4, '2026-01-01T10:03:00Z', 'dev1:4', 0)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (5, '2026-01-01T10:04:00Z', 'dev1:5', 0)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (6, '2026-01-01T10:05:00Z', 'dev1:6', 0)", [])?;
+            conn.execute("INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES (7, '2026-01-01T10:06:00Z', 'dev1:7', 0)", [])?;
 
             conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (10, '2026-01-01T10:00:00Z', '2026-01-01T10:05:00Z', 'normal', 'useful')", [])?;
             conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (11, '2026-01-01T10:05:00Z', '2026-01-01T10:10:00Z', 'low', 'useful')", [])?;
             conn.execute("INSERT INTO episodes (id, started_at, ended_at, substance, visual_evidence) VALUES (12, '2026-01-01T10:10:00Z', '2026-01-01T10:15:00Z', 'normal', 'none')", [])?;
+            conn.execute(
+                "UPDATE episodes SET minute_summaries = '[{\"start\":\"2026-01-01T10:01:00Z\",\"gist\":\"private gist text\"},{\"start\":\"2026-01-01T10:04:00Z\",\"gist\":\"more text\"}]' WHERE id = 10",
+                [],
+            )?;
 
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 1)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 2)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 3)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 4)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 5)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 6)", [])?;
+            conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (10, 'screenshot', 7)", [])?;
 
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (11, 'screenshot', 2)", [])?;
             conn.execute("INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (12, 'screenshot', 2)", [])?;
@@ -1867,38 +2650,348 @@ mod tests {
 
         let result = store
             .with_user(user_id, |conn| {
-                let prefix = "dev1:";
-                let mut stmt = conn.prepare(
-                    "SELECT e.id, e.started_at, e.ended_at, c.source_key
-                 FROM episodes e
-                 JOIN episode_members m ON m.episode_id = e.id AND m.record_type = 'screenshot'
-                 JOIN screenshots c ON c.id = m.record_id
-                 WHERE e.substance = 'normal' AND e.visual_evidence = 'useful'
-                   AND c.source_key LIKE ?1
-                   AND c.is_duplicate = 0
-                   AND c.source_key NOT IN (SELECT source_key FROM screenshot_images)
-                 ORDER BY e.started_at DESC, c.captured_at ASC",
-                )?;
-                let rows = stmt.query_map([format!("{}%", prefix)], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })?;
-                let mut list = Vec::new();
-                for r in rows {
-                    list.push(r?);
-                }
-                Ok(list)
+                query_screenshot_upload_plan(
+                    conn,
+                    &PlanParams {
+                        device_id: "dev1".into(),
+                        after: None,
+                    },
+                )
             })
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, 10);
-        assert_eq!(result[0].3, "dev1:1");
-        assert_eq!(result[1].3, "dev1:2");
+        let episodes = result["episodes"].as_array().unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0]["id"], 10);
+        assert_eq!(episodes[0]["remaining_images"], 3);
+        assert_eq!(
+            episodes[0]["remaining_bytes"],
+            MAX_EPISODE_IMAGE_BYTES - 100
+        );
+        assert_eq!(
+            episodes[0]["gist_boundaries"],
+            json!(["2026-01-01T10:01:00Z", "2026-01-01T10:04:00Z"])
+        );
+        assert!(!episodes[0].to_string().contains("private gist text"));
+        assert_eq!(
+            episodes[0]["source_keys"],
+            json!(["dev1:1", "dev1:2", "dev1:5", "dev1:6", "dev1:7"]),
+            "the Mac receives all candidates plus a separate remaining budget"
+        );
+
+        let capped = store
+            .with_user(user_id, |conn| {
+                for id in 2..=4 {
+                    conn.execute(
+                        "INSERT INTO screenshot_images \
+                         (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
+                         VALUES (?1, 1, 10, ?2, '2026-01-01T10:00:00Z', ?3, 'image/jpeg', 10, 10, 100, 'sha')",
+                        rusqlite::params![
+                            format!("existing-{id}"),
+                            format!("already:{id}"),
+                            format!("media/existing-{id}"),
+                        ],
+                    )?;
+                }
+                query_screenshot_upload_plan(
+                    conn,
+                    &PlanParams {
+                        device_id: "dev1".into(),
+                        after: None,
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert!(capped["episodes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uploaded_jpeg_is_decoded_and_metadata_must_match_bytes() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        use sha2::Digest;
+
+        // A tiny 2x2 baseline JPEG fixture. It exercises a real entropy decode rather
+        // than accepting a multipart filename, MIME claim, or SOF header.
+        const JPEG_2X2_B64: &str = "/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAAqADAAQAAAABAAAAAgAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZjwCyBOmACZjs+EJ+/8AAEQgAAgACAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIBAgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/bAEMAAgICAgICAwICAwUDAwMFBgUFBQUGCAYGBgYGCAoICAgICAgKCgoKCgoKCgwMDAwMDA4ODg4ODw8PDw8PDw8PD//bAEMBAgICBAQEBwQEBxALCQsQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEP/dAAQAAf/aAAwDAQACEQMRAD8A/WD9m/wH4H1L9nj4XajqPh3Trq7uvC2iSzTS2kLySSPYwszuzKSzMSSSTknk17R/wrb4d/8AQraV/wCAMH/xFcF+zF/ybZ8Jv+xS0H/0ghr3GgD/2Q==";
+
+        let bytes = B64.decode(JPEG_2X2_B64).unwrap();
+        let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let validated = validate_uploaded_jpeg(&bytes, Some("image/jpeg"), 2, 2, &sha256).unwrap();
+        assert_eq!((validated.width, validated.height), (2, 2));
+        assert_eq!(validated.byte_length, bytes.len() as i64);
+
+        assert_eq!(
+            validate_uploaded_jpeg(&bytes, Some("image/png"), 2, 2, &sha256),
+            Err(JpegUploadError::UnsupportedMediaType)
+        );
+        assert!(matches!(
+            validate_uploaded_jpeg(&bytes, Some("image/jpeg"), 3, 2, &sha256),
+            Err(JpegUploadError::Invalid(
+                "JPEG dimensions do not match multipart metadata"
+            ))
+        ));
+
+        let truncated = &bytes[..bytes.len() - 8];
+        let truncated_sha = format!("{:x}", sha2::Sha256::digest(truncated));
+        assert_eq!(
+            validate_uploaded_jpeg(truncated, Some("image/jpeg"), 2, 2, &truncated_sha),
+            Err(JpegUploadError::Invalid("invalid JPEG"))
+        );
+        assert_eq!(
+            validate_uploaded_jpeg(
+                &vec![0; MAX_SCREENSHOT_IMAGE_BYTES + 1],
+                Some("image/jpeg"),
+                1,
+                1,
+                &"0".repeat(64),
+            ),
+            Err(JpegUploadError::PayloadTooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_target_enforces_membership_eligibility_and_idempotency() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store
+            .with_user("upload-policy-user", |conn| {
+                conn.execute(
+                    "INSERT INTO episodes (id, started_at, ended_at, title, substance, visual_evidence) \
+                     VALUES (10, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 'eligible', 'normal', 'useful'), \
+                            (11, '2026-01-01T11:00:00Z', '2026-01-01T12:00:00Z', 'low', 'low', 'useful'), \
+                            (12, '2026-01-01T12:00:00Z', '2026-01-01T13:00:00Z', 'no visual', 'normal', 'none')",
+                    [],
+                )?;
+                for (id, captured_at, source_key, duplicate) in [
+                    (1, "2026-01-01T10:01:00Z", "dev:1", 0),
+                    (2, "2026-01-01T10:02:00Z", "dev:2", 1),
+                    (3, "2026-01-01T11:01:00Z", "dev:3", 0),
+                    (4, "2026-01-01T12:01:00Z", "dev:4", 0),
+                ] {
+                    conn.execute(
+                        "INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![id, captured_at, source_key, duplicate],
+                    )?;
+                }
+                for (episode_id, screenshot_id) in [(10, 1), (10, 2), (11, 3), (12, 4)] {
+                    conn.execute(
+                        "INSERT INTO episode_members (episode_id, record_type, record_id) \
+                         VALUES (?1, 'screenshot', ?2)",
+                        rusqlite::params![episode_id, screenshot_id],
+                    )?;
+                }
+
+                let sha = "a".repeat(64);
+                assert!(matches!(
+                    validate_screenshot_upload_target(
+                        conn,
+                        10,
+                        "dev:1",
+                        "2026-01-01T10:01:00Z",
+                        &sha,
+                        100,
+                    )?,
+                    ScreenshotUploadTarget::New { screenshot_id: 1, .. }
+                ));
+                for result in [
+                    validate_screenshot_upload_target(
+                        conn,
+                        99,
+                        "dev:1",
+                        "2026-01-01T10:01:00Z",
+                        &sha,
+                        100,
+                    ),
+                    validate_screenshot_upload_target(
+                        conn,
+                        10,
+                        "dev:2",
+                        "2026-01-01T10:02:00Z",
+                        &sha,
+                        100,
+                    ),
+                    validate_screenshot_upload_target(
+                        conn,
+                        11,
+                        "dev:3",
+                        "2026-01-01T11:01:00Z",
+                        &sha,
+                        100,
+                    ),
+                    validate_screenshot_upload_target(
+                        conn,
+                        12,
+                        "dev:4",
+                        "2026-01-01T12:01:00Z",
+                        &sha,
+                        100,
+                    ),
+                    validate_screenshot_upload_target(
+                        conn,
+                        10,
+                        "dev:1",
+                        "spoofed-time",
+                        &sha,
+                        100,
+                    ),
+                ] {
+                    assert!(matches!(
+                        result,
+                        Err(crate::error::EnclaveError::InvalidRequest(_))
+                    ));
+                }
+
+                conn.execute(
+                    "INSERT INTO screenshot_images \
+                     (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
+                     VALUES ('existing', 1, 10, 'dev:1', '2026-01-01T10:01:00Z', 'media/existing', 'image/jpeg', 2, 3, 100, ?1)",
+                    [&sha],
+                )?;
+                assert!(matches!(
+                    validate_screenshot_upload_target(
+                        conn,
+                        10,
+                        "dev:1",
+                        "2026-01-01T10:01:00Z",
+                        &sha,
+                        100,
+                    )?,
+                    ScreenshotUploadTarget::Existing(StoredScreenshotImage { ref id, .. })
+                        if id == "existing"
+                ));
+                assert!(matches!(
+                    validate_screenshot_upload_target(
+                        conn,
+                        10,
+                        "dev:1",
+                        "2026-01-01T10:01:00Z",
+                        &"b".repeat(64),
+                        100,
+                    ),
+                    Err(crate::error::EnclaveError::Conflict(_))
+                ));
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_record_transaction_rejects_fifth_image_but_keeps_retry_idempotent() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store
+            .with_user("upload-budget-user", |conn| {
+                conn.execute(
+                    "INSERT INTO episodes (id, started_at, ended_at, title, substance, visual_evidence) \
+                     VALUES (10, '2026-01-01T10:00:00Z', '2026-01-01T11:00:00Z', 'eligible', 'normal', 'useful')",
+                    [],
+                )?;
+                for id in 1_i64..=5 {
+                    let captured_at = format!("2026-01-01T10:0{id}:00Z");
+                    let source_key = format!("dev:{id}");
+                    conn.execute(
+                        "INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) \
+                         VALUES (?1, ?2, ?3, 0)",
+                        rusqlite::params![id, captured_at, source_key],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO episode_members (episode_id, record_type, record_id) \
+                         VALUES (10, 'screenshot', ?1)",
+                        [id],
+                    )?;
+                }
+
+                for id in 1_i64..=4 {
+                    let jpeg = ValidatedJpeg {
+                        width: 2,
+                        height: 3,
+                        byte_length: MAX_SCREENSHOT_IMAGE_BYTES as i64,
+                        sha256: format!("{id:064x}"),
+                    };
+                    assert!(matches!(
+                        record_screenshot_image(
+                            conn,
+                            &format!("image-{id}"),
+                            &format!("media/image-{id}"),
+                            10,
+                            &format!("dev:{id}"),
+                            &format!("2026-01-01T10:0{id}:00Z"),
+                            &jpeg,
+                        )?,
+                        ScreenshotRecordOutcome::Created(_)
+                    ));
+                }
+
+                let first = ValidatedJpeg {
+                    width: 2,
+                    height: 3,
+                    byte_length: MAX_SCREENSHOT_IMAGE_BYTES as i64,
+                    sha256: format!("{:064x}", 1),
+                };
+                assert!(matches!(
+                    record_screenshot_image(
+                        conn,
+                        "retry-object-that-will-be-discarded",
+                        "media/retry-object-that-will-be-discarded",
+                        10,
+                        "dev:1",
+                        "2026-01-01T10:01:00Z",
+                        &first,
+                    )?,
+                    ScreenshotRecordOutcome::Existing(_)
+                ));
+
+                let fifth = ValidatedJpeg {
+                    width: 2,
+                    height: 3,
+                    byte_length: 1,
+                    sha256: format!("{:064x}", 5),
+                };
+                assert!(matches!(
+                    record_screenshot_image(
+                        conn,
+                        "image-5",
+                        "media/image-5",
+                        10,
+                        "dev:5",
+                        "2026-01-01T10:05:00Z",
+                        &fifth,
+                    ),
+                    Err(crate::error::EnclaveError::Conflict(_))
+                ));
+                let (count, bytes): (i64, i64) = conn.query_row(
+                    "SELECT COUNT(*), SUM(byte_length) FROM screenshot_images WHERE episode_id = 10",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(count, MAX_EPISODE_IMAGES);
+                assert_eq!(bytes, MAX_EPISODE_IMAGE_BYTES);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_dek_install_is_first_writer_wins() {
+        let store = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store
+            .with_user("media-dek-user", |conn| {
+                assert_eq!(install_media_dek_candidate(conn, "wrapped-a")?, "wrapped-a");
+                assert_eq!(install_media_dek_candidate(conn, "wrapped-b")?, "wrapped-a");
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT value FROM app_metadata WHERE key = ?1",
+                        [MEDIA_DEK_METADATA_KEY],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    "wrapped-a"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }

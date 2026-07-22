@@ -1,15 +1,15 @@
 //! In-enclave control plane (ADR-0001).
 //!
-//! This module subsumes what used to be the Node Cloud Run service (`cloud/`):
-//! OAuth 2.1 + Dynamic Client Registration, device→cloud sync, the MCP server,
-//! account export/delete, per-user quotas, and the LLM episode summarizer. It
-//! runs inside the same attested binary as the data plane, so the code that
+//! It provides OAuth 2.1 and Dynamic Client Registration, device-to-enclave
+//! sync, the MCP server, account export/delete, per-user quotas, and the LLM
+//! episode summarizer. It runs inside the same attested binary as storage and
+//! query, so the code that
 //! terminates TLS and first touches request plaintext is the open-source,
 //! release-digest-pinned enclave — not an un-attested proxy. The build is
 //! dependency-locked but is not yet claimed to be bit-for-bit reproducible.
 //!
-//! Identity + accounting live in [`control_store`] (an encrypted SQLite blob in
-//! GCS), replacing Cloud SQL Postgres. There is no Node.js anywhere in the system.
+//! Identity and accounting live in [`control_store`] as an encrypted SQLite
+//! blob in GCS.
 
 pub mod auth;
 pub mod control_store;
@@ -31,6 +31,17 @@ use std::time::Duration;
 
 use crate::store::Store;
 
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const OUTBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) fn bounded_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(OUTBOUND_CONNECT_TIMEOUT)
+        .timeout(OUTBOUND_REQUEST_TIMEOUT)
+        .build()
+        .expect("static control-plane HTTP client configuration")
+}
+
 /// Control-plane configuration, read from the (image-baked) environment.
 // Some fields (vertex_*, scheduler_sa_email) are consumed by the summarizer,
 // wired in a later commit of this same change.
@@ -42,7 +53,7 @@ pub struct CpConfig {
     pub google_desktop_client_id: String,
     pub google_web_client_id: String,
     pub google_web_client_secret: String,
-    /// `None` = allow any Google account; `Some` = allow-list (lowercased).
+    /// Lowercased allow-list. `None` is permitted only in debug test mode.
     pub allowed_emails: Option<Vec<String>>,
     pub scheduler_sa_email: Option<String>,
     pub vertex_project: String,
@@ -54,8 +65,34 @@ pub struct CpConfig {
     pub web_origin: String,
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+fn config_value(key: &str, test_default: &str) -> crate::error::Result<String> {
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        _ if crate::test_mode_enabled() => Ok(test_default.to_string()),
+        _ => Err(crate::error::EnclaveError::Config(format!(
+            "{key} must be set to a non-empty value"
+        ))),
+    }
+}
+
+fn validate_https_origin(name: &str, value: &str) -> crate::error::Result<String> {
+    let url = reqwest::Url::parse(value).map_err(|e| {
+        crate::error::EnclaveError::Config(format!("{name} is not a valid URL: {e}"))
+    })?;
+    let path_is_origin = url.path().is_empty() || url.path() == "/";
+    if (!crate::test_mode_enabled() && url.scheme() != "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !path_is_origin
+    {
+        return Err(crate::error::EnclaveError::Config(format!(
+            "{name} must be an HTTPS origin without credentials, path, query, or fragment"
+        )));
+    }
+    Ok(value.trim_end_matches('/').to_string())
 }
 
 impl CpConfig {
@@ -76,34 +113,74 @@ impl CpConfig {
             }
         });
 
-        let parse_i64 = |k: &str, d: i64| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
+        if !crate::test_mode_enabled() && allowed_emails.is_none() {
+            return Err(crate::error::EnclaveError::Config(
+                "ALLOWED_EMAILS must contain at least one explicit account".into(),
+            ));
+        }
+        if allowed_emails
+            .as_ref()
+            .is_some_and(|emails| emails.iter().any(|email| email == "*"))
+        {
+            return Err(crate::error::EnclaveError::Config(
+                "ALLOWED_EMAILS does not permit a wildcard".into(),
+            ));
+        }
+
+        if jwt_secrets.is_empty()
+            || (!crate::test_mode_enabled() && jwt_secrets.iter().any(|secret| secret.len() < 32))
+        {
+            return Err(crate::error::EnclaveError::Config(
+                "JWT signing secrets are missing or too short".into(),
+            ));
+        }
+        if !crate::test_mode_enabled() && google_web_client_secret.is_empty() {
+            return Err(crate::error::EnclaveError::Config(
+                "Google web client secret is empty".into(),
+            ));
+        }
+
+        let parse_i64 = |k: &str, d: i64| -> crate::error::Result<i64> {
+            match std::env::var(k) {
+                Ok(value) => value.parse::<i64>().ok().filter(|v| *v > 0).ok_or_else(|| {
+                    crate::error::EnclaveError::Config(format!("{k} must be a positive integer"))
+                }),
+                Err(_) => Ok(d),
+            }
         };
 
+        let base_url = validate_https_origin(
+            "BASE_URL",
+            &config_value("BASE_URL", "http://localhost:8080")?,
+        )?;
+        let web_origin = validate_https_origin(
+            "WEB_ORIGIN",
+            &config_value("WEB_ORIGIN", "http://localhost:3000")?,
+        )?;
+
         Ok(Self {
-            base_url: env_or("BASE_URL", "http://localhost:8080")
-                .trim_end_matches('/')
-                .to_string(),
+            base_url,
             jwt_secrets,
-            google_desktop_client_id: env_or("GOOGLE_DESKTOP_CLIENT_ID", ""),
-            google_web_client_id: env_or("GOOGLE_WEB_CLIENT_ID", ""),
+            google_desktop_client_id: config_value(
+                "GOOGLE_DESKTOP_CLIENT_ID",
+                "test-desktop.apps.googleusercontent.com",
+            )?,
+            google_web_client_id: config_value(
+                "GOOGLE_WEB_CLIENT_ID",
+                "test-web.apps.googleusercontent.com",
+            )?,
             google_web_client_secret,
             allowed_emails,
             scheduler_sa_email: std::env::var("SCHEDULER_SA_EMAIL")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            vertex_project: env_or("VERTEX_PROJECT", ""),
-            vertex_location: env_or("VERTEX_LOCATION", "us-central1"),
-            vertex_model: env_or("VERTEX_MODEL", "gemini-2.5-flash"),
-            quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000),
-            quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000),
-            quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000),
-            web_origin: env_or("WEB_ORIGIN", "https://kiokuu.com")
-                .trim_end_matches('/')
-                .to_string(),
+            vertex_project: config_value("VERTEX_PROJECT", "test-project")?,
+            vertex_location: config_value("VERTEX_LOCATION", "us-central1")?,
+            vertex_model: config_value("VERTEX_MODEL", "gemini-2.5-flash")?,
+            quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000)?,
+            quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000)?,
+            quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000)?,
+            web_origin,
         })
     }
 
@@ -118,7 +195,7 @@ impl CpConfig {
 
     pub fn email_allowed(&self, email: &str) -> bool {
         match &self.allowed_emails {
-            None => true,
+            None => crate::test_mode_enabled(),
             Some(list) => list.contains(&email.to_lowercase()),
         }
     }
@@ -135,8 +212,7 @@ pub struct CpState {
     pub user_verifier: Arc<auth::UserIdTokenVerifier>,
     pub sync_limiter: limits::RateLimiter,
     pub mcp_limiter: limits::RateLimiter,
-    pub attestation_cache: Option<Arc<crate::attestation::AttestationCache>>,
-    pub cert_fingerprint: Option<String>,
+    pub oauth_limiter: limits::RateLimiter,
     /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
     /// (model not baked/downloaded, or failed to load — never fatal).
     pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,
@@ -145,7 +221,7 @@ pub struct CpState {
 /// Helper to fetch a secret from GCP Secret Manager at runtime, using the GCE metadata server token.
 /// Retries with exponential backoff on failure to handle startup network flakes.
 pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result<String, String> {
-    let http = reqwest::Client::new();
+    let http = bounded_http_client();
     let project = std::env::var("KMS_PROJECT").map_err(|_| {
         "KMS_PROJECT environment variable must be set to locate GCP secrets".to_string()
     })?;
@@ -161,6 +237,7 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
         match http
             .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
             .header("Metadata-Flavor", "Google")
+            .timeout(Duration::from_secs(3))
             .send()
             .await
         {

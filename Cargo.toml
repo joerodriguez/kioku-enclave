@@ -1,10 +1,13 @@
 [package]
 name = "kioku-enclave"
-version = "0.1.0"
+version = "0.6.7"
 edition = "2021"
-rust-version = "1.75"
-description = "Kioku data-plane: the only code that touches user plaintext"
+rust-version = "1.96"
+description = "Attested Kioku backend for encrypted personal-memory storage and retrieval"
 license = "Apache-2.0"
+repository = "https://github.com/joerodriguez/kioku-enclave"
+homepage = "https://github.com/joerodriguez/kioku-enclave"
+publish = false
 
 # Vector search: sqlite-vec (C extension, compiled via cc::Build) for KNN
 # storage, plus an in-enclave candle BERT encoder for query embeddings.
@@ -26,12 +29,11 @@ axum = { version = "0.8.4", default-features = false, features = ["http1", "json
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net"] }
 tower = { version = "0.5.2", default-features = false }
 
-# Optional TLS termination inside the enclave (ADR-0001). When ENCLAVE_TLS is set the
-# enclave terminates TLS itself instead of relying on an upstream proxy, so the attested
-# binary is the first code to see plaintext. rustls only (ring provider) — no OpenSSL,
-# keeps the musl FROM-scratch build pure-Rust. hyper + hyper-util drive the TLS accept
-# loop (axum::serve has no TLS path); sha2 computes the cert fingerprint that a later
-# step binds into the attestation token (RA-TLS).
+# Production TLS termination inside the enclave (ADR-0001). The attested binary
+# is the first server-side application code to see request plaintext. rustls only
+# (ring provider) keeps the musl FROM-scratch build free of OpenSSL. hyper +
+# hyper-util drive the TLS accept loop; sha2 computes the live certificate
+# fingerprint bound into the public attestation-token nonce.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 hyper = { version = "1.10", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
@@ -112,16 +114,21 @@ sqlite-vec = "0.1.9"
 # In-enclave query embedding (hybrid search): candle runs the
 # paraphrase-multilingual-MiniLM-L12-v2 BERT encoder on CPU. Pure-Rust
 # compute (gemm), no ONNX runtime, no dynamic libs — musl/FROM-scratch safe.
-# tokenizers with default features OFF drops the onig C regex dependency
-# (falls back to fancy-regex, pure Rust). Model weights are NOT vendored in
-# this repo: the Docker build downloads them with a pinned SHA-256 and bakes
-# them into the attested image; local dev/tests point EMBED_MODEL_DIR at a
-# downloaded copy and skip gracefully when it is absent.
+# Candle 0.11 currently pulls tokenizers 0.22 with its `onig` feature, while
+# our direct tokenizer uses fancy-regex. The native Oniguruma build is therefore
+# an audited transitive component, not a dynamically linked runtime library.
+# Model weights are NOT vendored in this repo: the Docker build downloads them
+# with pinned hashes and bakes them into the attested image; local dev/tests
+# point EMBED_MODEL_DIR at a downloaded copy and skip when it is absent.
 candle-core = { version = "0.11", default-features = false }
 candle-nn = { version = "0.11", default-features = false }
 candle-transformers = { version = "0.11", default-features = false }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 regex = "1.10"
+
+# Decode uploaded visual-evidence JPEGs inside the enclave so multipart MIME,
+# dimensions, and hashes cannot stand in for inspection of the actual bytes.
+jpeg-decoder = { version = "0.3.2", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.45.1", features = ["rt", "macros"] }

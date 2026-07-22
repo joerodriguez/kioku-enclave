@@ -1,7 +1,6 @@
-//! Per-user quotas + rate limits (ports `cloud/src/limits.js`). Rate limiters are
-//! in-memory token buckets (correct for the single-instance enclave; see
-//! ADR-0001 Scaling for the multi-node story). Daily counters live in the
-//! control DB (`usage_daily`).
+//! Per-user quotas and rate limits. Rate limiters are in-memory token buckets,
+//! which is correct for the single-instance enclave. Daily counters live in
+//! the control DB (`usage_daily`).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -47,10 +46,10 @@ impl RateLimiter {
     }
 }
 
-/// Returns true when the account is active (or unknown → treated as active,
-/// matching the Node default).
+/// Returns true only for an existing active account. Unknown/deleted users are
+/// denied so a stale access token cannot recreate content after deletion.
 pub async fn account_active(control: &ControlStore, user_id: &str) -> Result<bool> {
-    Ok(control.user_status(user_id).await? == "active")
+    Ok(control.user_status(user_id).await?.as_deref() == Some("active"))
 }
 
 pub struct QuotaResult {
@@ -125,14 +124,14 @@ pub async fn daily_quota(
         .await
 }
 
-/// Insert a query-log row (best-effort accounting; errors are swallowed by callers).
+/// Insert query accounting without persisting the user's sensitive search text.
 #[allow(dead_code)] // wired by the MCP/search routes in a later commit
 pub async fn log_query(
     control: &ControlStore,
     user_id: &str,
     source: &str,
     tool: &str,
-    query_text: Option<String>,
+    _query_text: Option<String>,
     result_count: i64,
     duration_ms: i64,
 ) -> Result<()> {
@@ -141,8 +140,8 @@ pub async fn log_query(
         .write(move |conn| {
             conn.execute(
                 "INSERT INTO query_log (user_id, source, tool, query_text, result_count, duration_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![user_id, source, tool, query_text, result_count, duration_ms],
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+                rusqlite::params![user_id, source, tool, result_count, duration_ms],
             )?;
             Ok(())
         })

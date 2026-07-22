@@ -4,8 +4,43 @@ use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use tracing::{info, warn};
+
+// Version 2 regenerates historical canonical briefs with concrete requirements,
+// logistics, amounts, dates, and resources. Regeneration never re-enqueues Gmail.
+const FINALIZATION_VERSION: i32 = 2;
+const MIRRORED_UTTERANCE_WINDOW_MS: i64 = 3_000;
+const MAX_FINALIZER_MODEL_INPUT_BYTES: usize = 256 * 1024;
+const MAX_FINALIZER_CANDIDATE_BYTES: usize = 32 * 1024;
+const MAX_FINALIZER_UTTERANCE_CHARS: usize = 4_000;
+const MAX_FINALIZER_OCR_CHARS: usize = 4_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizationMode {
+    Initial,
+    Regeneration,
+    AlreadyCurrent,
+}
+
+fn finalization_mode(
+    finalized_at: Option<&str>,
+    finalization_version: Option<i32>,
+) -> FinalizationMode {
+    if finalized_at.is_none() {
+        FinalizationMode::Initial
+    } else if finalization_version.unwrap_or(1) < FINALIZATION_VERSION {
+        FinalizationMode::Regeneration
+    } else {
+        FinalizationMode::AlreadyCurrent
+    }
+}
+
+impl FinalizationMode {
+    fn should_enqueue_email(self, email_enabled: bool) -> bool {
+        email_enabled && matches!(self, Self::Initial)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UrlCandidate {
@@ -27,6 +62,46 @@ struct EpisodeRow {
     languages: Option<String>,
     action_items: Option<String>,
     model: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UtteranceEvidenceRow {
+    id: i64,
+    at: String,
+    at_ms: i64,
+    speaker: String,
+    source_type: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct ScreenshotEvidenceRow {
+    id: i64,
+    captured_at: String,
+    captured_at_ms: i64,
+    active_app: Option<String>,
+    window_title: Option<String>,
+    url: Option<String>,
+    ocr_text: Option<String>,
+    is_duplicate: bool,
+}
+
+#[derive(Debug)]
+struct UtteranceEvidenceGroup {
+    at: String,
+    at_ms: i64,
+    ids: Vec<i64>,
+    speakers: BTreeSet<String>,
+    source_types: BTreeSet<String>,
+    texts: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RenderedEvidenceEntry {
+    at_ms: i64,
+    record_order: u8,
+    record_id: i64,
+    line: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,7 +169,7 @@ pub fn extract_candidates(
     let url_regex =
         Regex::new(r"(?i)\b(?:https?://|www\.)[a-zA-Z0-9-._~:/?#\[\]@!$&'()*+,;=%]+").unwrap();
     // Regex for bare domains with common TLDs
-    let bare_domain_regex = Regex::new(r"(?i)\b[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.(?:com|org|net|edu|gov|io|co|us|info|biz|me|ly|gl|ai|app|dev|sh)\b(?:/[a-zA-Z0-9-._~:/?#\[\]@!$&'()*+,;=%]*)?").unwrap();
+    let bare_domain_regex = Regex::new(r"(?i)\b[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.(?:com|org|net|edu|gov|io|co|us|fr|info|biz|me|ly|gl|ai|app|dev|sh)\b(?:/[a-zA-Z0-9-._~:/?#\[\]@!$&'()*+,;=%]*)?").unwrap();
 
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
@@ -166,6 +241,310 @@ pub fn extract_candidates(
     }
 
     candidates
+}
+
+fn normalized_mirror_text(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            if pending_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push(ch);
+            pending_space = false;
+        } else {
+            pending_space = true;
+        }
+    }
+    normalized
+}
+
+fn likely_mirrored_text(left: &str, right: &str) -> bool {
+    let left = normalized_mirror_text(left);
+    let right = normalized_mirror_text(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+
+    let left_tokens = left.split_whitespace().collect::<HashSet<_>>();
+    let right_tokens = right.split_whitespace().collect::<HashSet<_>>();
+    let shorter_tokens = left_tokens.len().min(right_tokens.len());
+    let shorter_chars = left.chars().count().min(right.chars().count());
+
+    // Short acknowledgements and stock phrases are often genuinely spoken by
+    // both sides. Never merge them solely because mic/system captured the same
+    // words near each other.
+    if shorter_tokens < 5 || shorter_chars < 24 {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+
+    let overlap = left_tokens.intersection(&right_tokens).count();
+    let union = left_tokens.union(&right_tokens).count();
+    let containment = overlap as f64 / shorter_tokens as f64;
+    let jaccard = overlap as f64 / union.max(1) as f64;
+    let length_ratio = left_tokens.len().max(right_tokens.len()) as f64 / shorter_tokens as f64;
+
+    overlap >= 5 && containment >= 0.75 && jaccard >= 0.50 && length_ratio <= 2.5
+}
+
+fn compact_capture_field(value: &str, max_chars: usize) -> String {
+    let one_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = one_line.chars();
+    let mut compact = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        compact.push('…');
+    }
+    compact
+}
+
+fn dedupe_mirrored_utterances(utterances: &[UtteranceEvidenceRow]) -> Vec<UtteranceEvidenceGroup> {
+    let mut ordered = utterances.to_vec();
+    ordered.sort_by_key(|row| (row.at_ms, row.id));
+
+    let mut groups: Vec<UtteranceEvidenceGroup> = Vec::new();
+    for row in ordered {
+        let mirror_group = groups
+            .iter()
+            .enumerate()
+            .rev()
+            .take_while(|(_, group)| {
+                row.at_ms.abs_diff(group.at_ms) <= MIRRORED_UTTERANCE_WINDOW_MS as u64
+            })
+            .find_map(|(index, group)| {
+                (!group.source_types.contains(&row.source_type)
+                    && group
+                        .texts
+                        .iter()
+                        .any(|text| likely_mirrored_text(text, &row.text)))
+                .then_some(index)
+            });
+
+        if let Some(index) = mirror_group {
+            let group = &mut groups[index];
+            group.ids.push(row.id);
+            group.speakers.insert(row.speaker);
+            group.source_types.insert(row.source_type);
+            if !group.texts.contains(&row.text) {
+                group.texts.push(row.text);
+            }
+        } else {
+            let mut speakers = BTreeSet::new();
+            speakers.insert(row.speaker);
+            let mut source_types = BTreeSet::new();
+            source_types.insert(row.source_type);
+            groups.push(UtteranceEvidenceGroup {
+                at: row.at,
+                at_ms: row.at_ms,
+                ids: vec![row.id],
+                speakers,
+                source_types,
+                texts: vec![row.text],
+            });
+        }
+    }
+
+    groups
+}
+
+fn bounded_chronological_log(mut entries: Vec<RenderedEvidenceEntry>, max_bytes: usize) -> String {
+    const HEADER: &str = "CAPTURE LOG EVIDENCE (chronological):\n";
+    entries.sort_by_key(|entry| (entry.at_ms, entry.record_order, entry.record_id));
+
+    let full_len = HEADER.len()
+        + entries
+            .iter()
+            .map(|entry| entry.line.len() + 1)
+            .sum::<usize>();
+    if full_len <= max_bytes {
+        let mut rendered = String::with_capacity(full_len);
+        rendered.push_str(HEADER);
+        for entry in entries {
+            rendered.push_str(&entry.line);
+            rendered.push('\n');
+        }
+        return rendered;
+    }
+
+    // Keep whole evidence rows from both ends of the episode. This preserves
+    // opening context and end-of-session assignments/outcomes without ever
+    // cutting an evidence ID or URL in half.
+    const MARKER_RESERVE: usize = 128;
+    let content_budget = max_bytes
+        .saturating_sub(HEADER.len())
+        .saturating_sub(MARKER_RESERVE);
+    let front_budget = content_budget / 2;
+    let back_budget = content_budget - front_budget;
+
+    let mut front_count = 0;
+    let mut front_bytes = 0;
+    while front_count < entries.len() {
+        let next = entries[front_count].line.len() + 1;
+        if front_bytes + next > front_budget {
+            break;
+        }
+        front_bytes += next;
+        front_count += 1;
+    }
+
+    let mut back_count = 0;
+    let mut back_bytes = 0;
+    while back_count < entries.len().saturating_sub(front_count) {
+        let index = entries.len() - back_count - 1;
+        let next = entries[index].line.len() + 1;
+        if back_bytes + next > back_budget {
+            break;
+        }
+        back_bytes += next;
+        back_count += 1;
+    }
+
+    let omitted = entries.len().saturating_sub(front_count + back_count);
+    let mut rendered = String::with_capacity(max_bytes);
+    rendered.push_str(HEADER);
+    for entry in entries.iter().take(front_count) {
+        rendered.push_str(&entry.line);
+        rendered.push('\n');
+    }
+    rendered.push_str(&format!(
+        "[capture-log-boundary] {omitted} middle evidence rows omitted to enforce the input bound\n"
+    ));
+    for entry in entries.iter().skip(entries.len() - back_count) {
+        rendered.push_str(&entry.line);
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn render_capture_log(
+    utterances: &[UtteranceEvidenceRow],
+    screenshots: &[ScreenshotEvidenceRow],
+    max_bytes: usize,
+) -> String {
+    let mut entries = Vec::new();
+
+    for group in dedupe_mirrored_utterances(utterances) {
+        let ids = group
+            .ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let speakers = group.speakers.into_iter().collect::<Vec<_>>().join(", ");
+        let source_types = group
+            .source_types
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let texts = group
+            .texts
+            .iter()
+            .map(|text| compact_capture_field(text, MAX_FINALIZER_UTTERANCE_CHARS))
+            .collect::<Vec<_>>();
+        entries.push(RenderedEvidenceEntry {
+            at_ms: group.at_ms,
+            record_order: 0,
+            record_id: group.ids[0],
+            line: format!(
+                "[utterance-evidence] IDs: [{ids}] | At: {} | Speakers: {} | Audio sources: {} | Text variants: {}",
+                group.at,
+                compact_capture_field(&speakers, 500),
+                compact_capture_field(&source_types, 100),
+                serde_json::to_string(&texts).unwrap_or_else(|_| "[]".into()),
+            ),
+        });
+    }
+
+    for screenshot in screenshots.iter().filter(|row| !row.is_duplicate) {
+        let app = compact_capture_field(screenshot.active_app.as_deref().unwrap_or("<none>"), 500);
+        let window = compact_capture_field(
+            screenshot.window_title.as_deref().unwrap_or("<none>"),
+            1_000,
+        );
+        // Candidate URLs are already bounded by the sync contract. Preserve
+        // the complete literal path; truncation can make a resource unusable.
+        let url = screenshot
+            .url
+            .as_deref()
+            .map(|url| compact_capture_field(url, usize::MAX))
+            .unwrap_or_else(|| "<none>".into());
+        let ocr = compact_capture_field(
+            screenshot.ocr_text.as_deref().unwrap_or("<none>"),
+            MAX_FINALIZER_OCR_CHARS,
+        );
+        entries.push(RenderedEvidenceEntry {
+            at_ms: screenshot.captured_at_ms,
+            record_order: 1,
+            record_id: screenshot.id,
+            line: format!(
+                "[screenshot-evidence] ID: {} | At: {} | App: {} | Window: {} | URL: {} | OCR: {}",
+                screenshot.id,
+                screenshot.captured_at,
+                serde_json::to_string(&app).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&window).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&ocr).unwrap_or_else(|_| "\"\"".into()),
+            ),
+        });
+    }
+
+    bounded_chronological_log(entries, max_bytes)
+}
+
+fn render_candidate_urls(
+    candidates: &[UrlCandidate],
+    max_bytes: usize,
+) -> (String, HashSet<String>) {
+    const HEADER: &str = "\nCANDIDATE URLS ALLOWED:\n";
+    const MARKER_RESERVE: usize = 112;
+    if max_bytes < HEADER.len() + MARKER_RESERVE {
+        return (String::new(), HashSet::new());
+    }
+
+    let mut rendered = String::with_capacity(max_bytes);
+    rendered.push_str(HEADER);
+    let mut rendered_urls = HashSet::new();
+    let mut omitted = 0usize;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let line = format!(
+            "Candidate URL {}: {} (from {} id {})\n",
+            index + 1,
+            candidate.url,
+            candidate.record_type,
+            candidate.record_id
+        );
+        if rendered.len() + line.len() + MARKER_RESERVE <= max_bytes {
+            rendered.push_str(&line);
+            rendered_urls.insert(candidate.url.clone());
+        } else {
+            omitted += 1;
+        }
+    }
+    if omitted > 0 {
+        rendered.push_str(&format!(
+            "[candidate-url-boundary] {omitted} candidate URLs omitted to enforce the input bound\n"
+        ));
+    }
+    (rendered, rendered_urls)
+}
+
+fn render_finalizer_model_input(
+    utterances: &[UtteranceEvidenceRow],
+    screenshots: &[ScreenshotEvidenceRow],
+    candidates: &[UrlCandidate],
+    max_bytes: usize,
+) -> (String, HashSet<String>) {
+    let candidate_budget = MAX_FINALIZER_CANDIDATE_BYTES.min(max_bytes / 4);
+    let capture_budget = max_bytes.saturating_sub(candidate_budget);
+    let mut rendered = render_capture_log(utterances, screenshots, capture_budget);
+    let remaining = max_bytes.saturating_sub(rendered.len());
+    let (candidate_section, rendered_urls) = render_candidate_urls(candidates, remaining);
+    rendered.push_str(&candidate_section);
+    debug_assert!(rendered.len() <= max_bytes);
+    (rendered, rendered_urls)
 }
 
 /// The response JSON schema for Gemini final brief.
@@ -256,10 +635,12 @@ You are provided with a chronological capture log of utterances and screenshots,
 
 PRINCIPLES:
 1. Ground all items in evidence: every decision, action item, and link must reference the correct record_type and record_id from the capture log.
-2. Action items: identify specific commitments, who owns them (default to 'Me' or a participant name if known), and a stated due date ('due_at' in YYYY-MM-DD format if explicitly mentioned, or null).
+2. Action items: include both specific commitments and explicit requirements or instructions directed at the user. State the exact task, preserve amounts, dates, deadlines, and named resources, identify who owns it (default to 'Me' for requirements directed at the user, or a participant name if known), and use 'due_at' in YYYY-MM-DD format only when explicitly supported (otherwise null).
 3. Important links: extract links, provide a descriptive label, explain why it matters, and reference evidence.
 4. STRICT LINK RULE: You must ONLY output URLs that are present in the provided list of Candidate URLs. Any URL not in that list is considered a hallucination and is banned.
-5. Overview: a short 2-3 sentence summary of what occurred.";
+5. Overview: write 2-3 sentences that preserve the most useful concrete takeaways, requirements, decisions, outcomes, dates, amounts, logistics, and named resources. Do not produce a topic inventory or vague phrases such as 'X was discussed', 'information was provided', or 'the presentation covered'.
+6. Never invent, correct, or silently normalize a specific fact. If evidence is ambiguous, omit it or put the uncertainty in open_questions.
+7. A mirrored mic/system utterance may appear once with multiple exact evidence IDs. Treat it as one statement, use the listed speaker attribution without guessing, and cite one or more of those IDs as appropriate.";
 
 /// Sweep all eligible episodes for a user and finalize them.
 pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()> {
@@ -285,11 +666,11 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         let mut stmt = conn.prepare(
             "SELECT id, started_at, ended_at, type, title, summary, participants, languages, action_items, model
              FROM episodes
-             WHERE finalized_at IS NULL
+             WHERE (finalized_at IS NULL OR COALESCE(finalization_version, 1) < ?2)
                AND substance != 'none'
                AND ended_at < ?1"
         )?;
-        let rows = stmt.query_map([&horizon_iso], |r| {
+        let rows = stmt.query_map(rusqlite::params![&horizon_iso, FINALIZATION_VERSION], |r| {
             Ok(EpisodeRow {
                 id: r.get(0)?,
                 started_at: r.get(1)?,
@@ -377,28 +758,62 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         // 3. Fetch evidence for final brief model input
         let user_cloned3 = user.clone();
         let ep_id = ep.id;
-        type UtteranceEvidence = Vec<(i64, String)>;
-        type ScreenshotEvidence = Vec<(i64, Option<String>, Option<String>)>;
-        let (utts, scrs): (UtteranceEvidence, ScreenshotEvidence) = state
+        let (utterance_rows, screenshot_rows): (
+            Vec<UtteranceEvidenceRow>,
+            Vec<ScreenshotEvidenceRow>,
+        ) = state
             .store
             .with_user(&user_cloned3, move |conn| {
                 let mut u_stmt = conn.prepare(
-                    "SELECT u.id, u.text FROM utterances u
-                 JOIN episode_members m ON m.record_type = 'utterance' AND m.record_id = u.id
-                 WHERE m.episode_id = ?1",
+                    "SELECT u.id, a.started_at, u.start_offset_seconds, \
+                            u.speaker_label, a.source_type, u.text \
+                     FROM utterances u \
+                     JOIN audio_segments a ON a.id = u.audio_segment_id \
+                     JOIN episode_members m \
+                       ON m.record_type = 'utterance' AND m.record_id = u.id \
+                     WHERE m.episode_id = ?1 \
+                     ORDER BY a.started_at ASC, u.start_offset_seconds ASC, u.id ASC",
                 )?;
                 let utterances = u_stmt
-                    .query_map([ep_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .query_map([ep_id], |row| {
+                        let segment_started_at: String = row.get(1)?;
+                        let start_offset_seconds: f64 = row.get(2)?;
+                        let at = isotime::add_seconds(&segment_started_at, start_offset_seconds);
+                        Ok(UtteranceEvidenceRow {
+                            id: row.get(0)?,
+                            at_ms: isotime::parse_epoch_millis(&at).unwrap_or(0),
+                            at,
+                            speaker: row.get(3)?,
+                            source_type: row.get(4)?,
+                            text: row.get(5)?,
+                        })
+                    })?
                     .filter_map(|x| x.ok())
                     .collect();
 
                 let mut s_stmt = conn.prepare(
-                    "SELECT s.id, s.url, s.ocr_text FROM screenshots s
-                 JOIN episode_members m ON m.record_type = 'screenshot' AND m.record_id = s.id
-                 WHERE m.episode_id = ?1",
+                    "SELECT s.id, s.captured_at, s.active_app, s.window_title, \
+                            s.url, s.ocr_text, s.is_duplicate \
+                     FROM screenshots s \
+                     JOIN episode_members m \
+                       ON m.record_type = 'screenshot' AND m.record_id = s.id \
+                     WHERE m.episode_id = ?1 \
+                     ORDER BY s.captured_at ASC, s.id ASC",
                 )?;
                 let screenshots = s_stmt
-                    .query_map([ep_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .query_map([ep_id], |row| {
+                        let captured_at: String = row.get(1)?;
+                        Ok(ScreenshotEvidenceRow {
+                            id: row.get(0)?,
+                            captured_at_ms: isotime::parse_epoch_millis(&captured_at).unwrap_or(0),
+                            captured_at,
+                            active_app: row.get(2)?,
+                            window_title: row.get(3)?,
+                            url: row.get(4)?,
+                            ocr_text: row.get(5)?,
+                            is_duplicate: row.get::<_, i64>(6)? != 0,
+                        })
+                    })?
                     .filter_map(|x| x.ok())
                     .collect();
 
@@ -407,38 +822,24 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
             .await?;
 
         // 4. Extract URL candidates
+        let utts = utterance_rows
+            .iter()
+            .map(|row| (row.id, row.text.clone()))
+            .collect::<Vec<_>>();
+        let scrs = screenshot_rows
+            .iter()
+            .filter(|row| !row.is_duplicate)
+            .map(|row| (row.id, row.url.clone(), row.ocr_text.clone()))
+            .collect::<Vec<_>>();
         let candidates = extract_candidates(&utts, &scrs);
-        let candidate_urls_set: HashSet<String> =
-            candidates.iter().map(|c| c.url.clone()).collect();
 
         // 5. Build prompt
-        let mut log_text = String::new();
-        log_text.push_str("CAPTURE LOG EVIDENCE:\n");
-        for (id, text) in &utts {
-            log_text.push_str(&format!(
-                "[utterance-evidence] ID: {} | Text: \"{}\"\n",
-                id, text
-            ));
-        }
-        for (id, url_opt, ocr_opt) in &scrs {
-            log_text.push_str(&format!(
-                "[screenshot-evidence] ID: {} | URL: {} | OCR: \"{}\"\n",
-                id,
-                url_opt.as_deref().unwrap_or("<none>"),
-                ocr_opt.as_deref().unwrap_or("<none>")
-            ));
-        }
-
-        log_text.push_str("\nCANDIDATE URLS ALLOWED:\n");
-        for (idx, cand) in candidates.iter().enumerate() {
-            log_text.push_str(&format!(
-                "Candidate URL {}: {} (from {} id {})\n",
-                idx + 1,
-                cand.url,
-                cand.record_type,
-                cand.record_id
-            ));
-        }
+        let (log_text, candidate_urls_set) = render_finalizer_model_input(
+            &utterance_rows,
+            &screenshot_rows,
+            &candidates,
+            MAX_FINALIZER_MODEL_INPUT_BYTES,
+        );
 
         info!(episode_id = ep.id, "generating final brief with Gemini");
 
@@ -469,6 +870,8 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         // 6. Validate & filter evidence references + URLs
         let utterance_ids: HashSet<i64> = utts.iter().map(|u| u.0).collect();
         let screenshot_ids: HashSet<i64> = scrs.iter().map(|s| s.0).collect();
+        let screenshot_member_ids: HashSet<i64> =
+            screenshot_rows.iter().map(|row| row.id).collect();
 
         let is_valid_evidence = |er: &EvidenceRef| -> bool {
             match er.record_type.as_str() {
@@ -553,18 +956,18 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         let commit_res = state.store.with_user(&user_cloned4, move |conn| {
             conn.execute("BEGIN IMMEDIATE TRANSACTION", [])?;
 
-            // Re-verify that finalized_at is still null
-            let is_finalized: Option<String> = conn.query_row(
-                "SELECT finalized_at FROM episodes WHERE id = ?1",
+            // Re-verify the current finalization version. A lower-version brief may
+            // be regenerated, but a concurrent current-version commit wins.
+            let (existing_finalized_at, existing_version): (Option<String>, Option<i32>) = conn.query_row(
+                "SELECT finalized_at, finalization_version FROM episodes WHERE id = ?1",
                 [ep_id],
-                |r| r.get(0)
-            )
-            .optional()?
-            .flatten();
+                |r| Ok((r.get(0)?, r.get(1)?))
+            )?;
 
-            if is_finalized.is_some() {
+            let mode = finalization_mode(existing_finalized_at.as_deref(), existing_version);
+            if mode == FinalizationMode::AlreadyCurrent {
                 conn.execute("ROLLBACK", [])?;
-                return Err(EnclaveError::Config("episode already finalized concurrently".into()));
+                return Err(EnclaveError::Config("episode already finalized at current version".into()));
             }
 
             // Fetch current members to make sure membership hasn't changed
@@ -573,7 +976,7 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
             let mut s_stmt = conn.prepare("SELECT record_id FROM episode_members WHERE episode_id = ?1 AND record_type = 'screenshot'")?;
             let current_scrs: HashSet<i64> = s_stmt.query_map([ep_id], |r| r.get(0))?.filter_map(|x| x.ok()).collect();
 
-            if current_utts != utterance_ids || current_scrs != screenshot_ids {
+            if current_utts != utterance_ids || current_scrs != screenshot_member_ids {
                 conn.execute("ROLLBACK", [])?;
                 return Err(EnclaveError::Config("episode membership changed during finalization".into()));
             }
@@ -585,23 +988,20 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
                 rusqlite::params![ep_id, overview, decisions_json, action_items_json, important_links_json, open_questions_json]
             )?;
 
-            // Get or default finalization version
-            let version: i32 = conn.query_row(
-                "SELECT COALESCE(finalization_version, 1) FROM episodes WHERE id = ?1",
-                [ep_id],
-                |r| r.get(0)
-            )?;
-
-            // If email delivery enabled, insert into outbox
-            if email_enabled {
+            // Only a first finalization may enqueue mail. Versioned repairs update
+            // the canonical web/export brief without surprising the user with a
+            // second message for the same historical episode.
+            let email_enqueued = mode.should_enqueue_email(email_enabled);
+            if email_enqueued {
                 conn.execute(
                     "INSERT OR REPLACE INTO episode_deliveries (episode_id, channel, delivery_version, state)
                      VALUES (?1, 'gmail', ?2, 'pending')",
-                    rusqlite::params![ep_id, version]
+                    rusqlite::params![ep_id, FINALIZATION_VERSION]
                 )?;
             }
 
-            // Mark episode finalized
+            // Mark a new episode finalized, or atomically advance a regenerated
+            // brief while preserving the original finalization timestamp.
             let now_iso = isotime::format_epoch_millis(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -609,20 +1009,23 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
                     .as_millis() as i64
             );
             conn.execute(
-                "UPDATE episodes SET finalized_at = ?1, updated_at = ?1 WHERE id = ?2",
-                rusqlite::params![now_iso, ep_id]
+                "UPDATE episodes
+                 SET finalized_at = COALESCE(finalized_at, ?1),
+                     finalization_version = ?2,
+                     updated_at = ?1
+                 WHERE id = ?3",
+                rusqlite::params![now_iso, FINALIZATION_VERSION, ep_id]
             )?;
 
             conn.execute("COMMIT", [])?;
-            Ok(())
+            Ok(email_enqueued)
         }).await;
 
         match commit_res {
-            Ok(_) => {
+            Ok(email_enqueued) => {
                 info!(
                     episode_id = ep.id,
-                    email_enqueued = email_enabled,
-                    "episode successfully finalized"
+                    email_enqueued, "episode successfully finalized"
                 );
                 let _ = state.store.save_user(&user).await;
             }
@@ -633,4 +1036,223 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_french_resource_domains_from_spoken_and_screen_evidence() {
+        let utterances = vec![(1, "Apply at visa.fr before arrival.".to_string())];
+        let screenshots = vec![(
+            2,
+            None,
+            Some("Book a doctor through doctorly.fr/appointments".to_string()),
+        )];
+
+        let urls: HashSet<String> = extract_candidates(&utterances, &screenshots)
+            .into_iter()
+            .map(|candidate| candidate.url)
+            .collect();
+
+        assert!(urls.contains("https://visa.fr"));
+        assert!(urls.contains("https://doctorly.fr/appointments"));
+    }
+
+    #[test]
+    fn finalizer_v2_requires_concrete_user_directed_takeaways() {
+        assert_eq!(FINALIZATION_VERSION, 2);
+        assert!(FINALIZER_SYSTEM_PROMPT.contains("explicit requirements or instructions"));
+        assert!(FINALIZER_SYSTEM_PROMPT.contains("amounts, dates, deadlines"));
+        assert!(FINALIZER_SYSTEM_PROMPT.contains("Do not produce a topic inventory"));
+        assert!(FINALIZER_SYSTEM_PROMPT.contains("Never invent"));
+    }
+
+    #[test]
+    fn historical_v1_briefs_regenerate_without_reenqueuing_email() {
+        let historical_default = finalization_mode(Some("2026-07-01T12:00:00Z"), None);
+        let historical_v1 = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(1));
+
+        assert_eq!(historical_default, FinalizationMode::Regeneration);
+        assert_eq!(historical_v1, FinalizationMode::Regeneration);
+        assert!(!historical_default.should_enqueue_email(true));
+        assert!(!historical_v1.should_enqueue_email(true));
+    }
+
+    #[test]
+    fn current_briefs_are_terminal_but_initial_finalization_may_enqueue() {
+        let current = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(2));
+        assert_eq!(current, FinalizationMode::AlreadyCurrent);
+        assert!(!current.should_enqueue_email(true));
+
+        let initial = finalization_mode(None, None);
+        assert_eq!(initial, FinalizationMode::Initial);
+        assert!(initial.should_enqueue_email(true));
+        assert!(!initial.should_enqueue_email(false));
+    }
+
+    #[test]
+    fn capture_log_is_chronological_attributed_and_dedupes_mirrored_audio() {
+        let utterances = vec![
+            UtteranceEvidenceRow {
+                id: 1,
+                at: "2026-07-01T10:00:02.000Z".into(),
+                at_ms: isotime::parse_epoch_millis("2026-07-01T10:00:02.000Z").unwrap(),
+                speaker: "Ana".into(),
+                source_type: "system".into(),
+                text: "Submit the visa.fr form by Friday.".into(),
+            },
+            UtteranceEvidenceRow {
+                id: 2,
+                at: "2026-07-01T10:00:02.200Z".into(),
+                at_ms: isotime::parse_epoch_millis("2026-07-01T10:00:02.200Z").unwrap(),
+                speaker: "Me".into(),
+                source_type: "mic".into(),
+                text: "Submit the visa.fr form by Friday!".into(),
+            },
+            UtteranceEvidenceRow {
+                id: 3,
+                at: "2026-07-01T10:00:05.000Z".into(),
+                at_ms: isotime::parse_epoch_millis("2026-07-01T10:00:05.000Z").unwrap(),
+                speaker: "Ana".into(),
+                source_type: "system".into(),
+                text: "Bring the original passport.".into(),
+            },
+        ];
+        let screenshots = vec![
+            ScreenshotEvidenceRow {
+                id: 7,
+                captured_at: "2026-07-01T10:00:03.000Z".into(),
+                captured_at_ms: isotime::parse_epoch_millis("2026-07-01T10:00:03.000Z").unwrap(),
+                active_app: Some("Chrome".into()),
+                window_title: Some("Visa application".into()),
+                url: Some("https://visa.fr/apply?case=123".into()),
+                ocr_text: Some("Fee: 99 EUR".into()),
+                is_duplicate: false,
+            },
+            ScreenshotEvidenceRow {
+                id: 8,
+                captured_at: "2026-07-01T10:00:04.000Z".into(),
+                captured_at_ms: isotime::parse_epoch_millis("2026-07-01T10:00:04.000Z").unwrap(),
+                active_app: Some("Chrome".into()),
+                window_title: Some("Duplicate".into()),
+                url: None,
+                ocr_text: Some("must not appear".into()),
+                is_duplicate: true,
+            },
+        ];
+
+        let log = render_capture_log(&utterances, &screenshots, 20_000);
+        assert!(log.contains("IDs: [1, 2]"));
+        assert!(log.contains("Speakers: Ana, Me"));
+        assert!(log.contains("Audio sources: mic, system"));
+        assert_eq!(log.matches("[utterance-evidence]").count(), 2);
+        assert!(log.contains("Submit the visa.fr form by Friday."));
+        assert!(log.contains("Submit the visa.fr form by Friday!"));
+        assert!(log.contains("https://visa.fr/apply?case=123"));
+        assert!(log.contains("App: \"Chrome\""));
+        assert!(!log.contains("must not appear"));
+
+        let first = log.find("IDs: [1, 2]").unwrap();
+        let screen = log.find("[screenshot-evidence] ID: 7").unwrap();
+        let last = log.find("IDs: [3]").unwrap();
+        assert!(first < screen && screen < last);
+    }
+
+    #[test]
+    fn capture_log_bound_keeps_episode_edges_in_order() {
+        let screenshots = (0..12)
+            .map(|id| ScreenshotEvidenceRow {
+                id,
+                captured_at: format!("2026-07-01T10:00:{id:02}.000Z"),
+                captured_at_ms: id * 1_000,
+                active_app: Some("Chrome".into()),
+                window_title: Some(format!("Window {id}")),
+                url: Some(format!("https://example.com/{id}")),
+                ocr_text: Some("bounded OCR evidence".repeat(4)),
+                is_duplicate: false,
+            })
+            .collect::<Vec<_>>();
+
+        let log = render_capture_log(&[], &screenshots, 1_000);
+        assert!(log.len() <= 1_000);
+        assert!(log.contains("[capture-log-boundary]"));
+        assert!(log.contains("ID: 0"));
+        assert!(log.contains("ID: 11"));
+        assert!(log.find("ID: 0").unwrap() < log.find("ID: 11").unwrap());
+    }
+
+    #[test]
+    fn mirrored_audio_dedupe_handles_minor_asr_differences_but_not_short_phrases() {
+        let at = |timestamp: &str| isotime::parse_epoch_millis(timestamp).unwrap();
+        let utterances = vec![
+            UtteranceEvidenceRow {
+                id: 10,
+                at: "2026-07-01T10:00:10.000Z".into(),
+                at_ms: at("2026-07-01T10:00:10.000Z"),
+                speaker: "Ana".into(),
+                source_type: "system".into(),
+                text: "You need to submit the visa application form before Friday.".into(),
+            },
+            UtteranceEvidenceRow {
+                id: 11,
+                at: "2026-07-01T10:00:10.700Z".into(),
+                at_ms: at("2026-07-01T10:00:10.700Z"),
+                speaker: "Me".into(),
+                source_type: "mic".into(),
+                text: "Please submit the visa application form by Friday.".into(),
+            },
+            UtteranceEvidenceRow {
+                id: 12,
+                at: "2026-07-01T10:00:20.000Z".into(),
+                at_ms: at("2026-07-01T10:00:20.000Z"),
+                speaker: "Ana".into(),
+                source_type: "system".into(),
+                text: "Sounds good.".into(),
+            },
+            UtteranceEvidenceRow {
+                id: 13,
+                at: "2026-07-01T10:00:20.200Z".into(),
+                at_ms: at("2026-07-01T10:00:20.200Z"),
+                speaker: "Me".into(),
+                source_type: "mic".into(),
+                text: "Sounds good!".into(),
+            },
+        ];
+
+        let groups = dedupe_mirrored_utterances(&utterances);
+        assert!(groups.iter().any(|group| group.ids == vec![10, 11]));
+        assert!(groups.iter().any(|group| group.ids == vec![12]));
+        assert!(groups.iter().any(|group| group.ids == vec![13]));
+        assert_eq!(groups.len(), 3);
+    }
+
+    #[test]
+    fn whole_model_input_and_rendered_candidate_allow_list_are_bounded() {
+        let candidates = (0..40)
+            .map(|id| UrlCandidate {
+                url: format!(
+                    "https://example.com/resource/{id}/{}",
+                    "long-path-segment".repeat(8)
+                ),
+                record_type: "screenshot".into(),
+                record_id: id,
+            })
+            .collect::<Vec<_>>();
+
+        let (input, rendered_urls) = render_finalizer_model_input(&[], &[], &candidates, 2_000);
+        let (again, again_urls) = render_finalizer_model_input(&[], &[], &candidates, 2_000);
+
+        assert!(input.len() <= 2_000);
+        assert!(input.contains("[candidate-url-boundary]"));
+        assert!(!rendered_urls.is_empty());
+        assert!(rendered_urls.len() < candidates.len());
+        assert!(rendered_urls.iter().all(|url| input.contains(url)));
+        assert!(candidates
+            .iter()
+            .any(|candidate| !rendered_urls.contains(&candidate.url)));
+        assert_eq!(input, again);
+        assert_eq!(rendered_urls, again_urls);
+    }
 }

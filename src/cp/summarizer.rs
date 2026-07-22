@@ -1,17 +1,17 @@
-//! LLM episode summarizer (ports `cloud/src/summarizer.js`, v2 incremental
-//! upsert + explicit membership). Runs IN the enclave now; the cursor lives in
+//! Incremental LLM episode summarizer with explicit episode membership. It runs
+//! inside the enclave; the cursor lives in
 //! the control DB (`users.summarized_until`) and content I/O is in-process.
 //!
 //! Faithful to v2: incremental window since the cursor, open-episode refs the
 //! model extends, membership by innermost-containing span, significance floor,
-//! window cap. **Simplification vs Node:** the OCR term/name-extraction
+//! window cap. **Simplification versus the legacy service:** the OCR term/name-extraction
 //! heuristics (`blockScreenTerms`/`blockNameCandidates`, which needed Unicode
 //! regex) are dropped — the model still receives the raw OCR excerpts, just
 //! without the pre-computed `[screen-terms]`/`[likely names]` hints. Re-add with
 //! a regex pass if name recall regresses.
 //!
-//! **Divergence from the Node port — live-tail cursor semantics (2026-07-05):**
-//! Node advanced `summarized_until` to the window end even when the model
+//! **Live-tail cursor semantics:** legacy behavior advanced `summarized_until`
+//! to the window end even when the model
 //! returned zero episodes. At the caught-up live tail that is a ratchet bug:
 //! every 10-min tick fed the model ~10 min of capture (which the prompt rightly
 //! refuses to fragment into an episode), got `[]` back, and *consumed the
@@ -57,6 +57,8 @@ const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Clou
 const TRIGGER_COOLDOWN_MS: i64 = 3 * 60 * 1000;
 const SUBSTANCE_BACKFILL_KEY: &str = "adr_0009_substance_backfill_v1";
 const SUBSTANCE_BACKFILL_BATCH: usize = 50;
+const VISUAL_EVIDENCE_BACKFILL_KEY: &str = "adr_0010_visual_evidence_backfill_v1";
+const VISUAL_EVIDENCE_BACKFILL_BATCH: usize = 50;
 
 /// Compute the summarization window ending bound for a run starting at
 /// `new_from` with the live tail at `tail_cutoff` (both epoch ms).
@@ -114,6 +116,7 @@ struct OpenEp {
     title: String,
     summary: Option<String>,
     participants: Vec<String>,
+    action_items: Vec<String>,
     recent_minutes: Option<String>,
     utt_count: i64,
     scr_count: i64,
@@ -232,7 +235,10 @@ fn render_capture_text(utterances: &[UttRow], screenshots: &[ScrRow]) -> String 
                 let url = s
                     .url
                     .as_ref()
-                    .map(|u| format!(" <{}>", &u[..u.len().min(120)]))
+                    // URLs are already bounded by the sync contract. Keep the
+                    // literal value: truncating here can turn a useful resource
+                    // into a different-looking, unusable path in the summary.
+                    .map(|u| format!(" <{u}>"))
                     .unwrap_or_default();
 
                 let time_str = if let Some(until) = &s.visible_until {
@@ -305,6 +311,26 @@ fn substance_backfill_schema() -> Value {
                         "substance": {"type": "STRING", "enum": ["none", "low", "normal"]}
                     },
                     "required": ["id", "substance"]
+                }
+            }
+        },
+        "required": ["classifications"]
+    })
+}
+
+fn visual_evidence_backfill_schema() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "classifications": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": {"type": "INTEGER"},
+                        "visual_evidence": {"type": "STRING", "enum": ["none", "useful"]}
+                    },
+                    "required": ["id", "visual_evidence"]
                 }
             }
         },
@@ -455,6 +481,202 @@ async fn run_substance_backfill(state: &CpState, user_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Repair the historical `visual_evidence='none'` placeholder left by builds
+/// whose Gemini response schema did not expose the field. Classification uses
+/// only already-synced episode text and member screenshot metadata/OCR; image
+/// bytes are never loaded or sent. The per-user marker makes the pass one-shot,
+/// while the completion-after-validation rule makes an interrupted run retryable.
+async fn run_visual_evidence_backfill(state: &CpState, user_id: &str) -> Result<()> {
+    let user = user_id.to_string();
+    let pending: Option<Vec<(i64, String)>> = state
+        .store
+        .with_user(&user, |conn| {
+            let complete: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM app_metadata WHERE key = ?1",
+                    [VISUAL_EVIDENCE_BACKFILL_KEY],
+                    |r| r.get(0),
+                )
+                .ok();
+            if complete.as_deref() == Some("complete") {
+                return Ok(None);
+            }
+
+            // Only normal episodes can be selected for cloud screenshot
+            // evidence, and rows already marked useful need no repair. Keep
+            // the episode query separate from the member query so each
+            // prepared statement has a simple, deterministic lifetime.
+            let episodes: Vec<(i64, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT e.id, e.title, e.summary, e.minutes_text, e.action_items \
+                     FROM episodes e \
+                     WHERE e.substance = 'normal' AND e.visual_evidence = 'none' \
+                       AND EXISTS (SELECT 1 FROM episode_members m \
+                                   WHERE m.episode_id = e.id \
+                                     AND m.record_type = 'screenshot') \
+                     ORDER BY e.id ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        let id: i64 = r.get(0)?;
+                        let parts = [
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                        ];
+                        Ok((
+                            id,
+                            parts.into_iter().flatten().collect::<Vec<_>>().join("\n"),
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+
+            let mut screens = conn.prepare(
+                "SELECT s.captured_at, s.active_app, s.window_title, s.url, \
+                        substr(s.ocr_text, 1, 500) \
+                 FROM episode_members m \
+                 JOIN screenshots s ON s.id = m.record_id \
+                 WHERE m.episode_id = ?1 AND m.record_type = 'screenshot' \
+                   AND s.is_duplicate = 0 \
+                 ORDER BY s.captured_at ASC LIMIT 120",
+            )?;
+            let mut rows = Vec::with_capacity(episodes.len());
+            for (id, episode_text) in episodes {
+                let screen_lines: Vec<String> = screens
+                    .query_map([id], |r| {
+                        let captured_at: String = r.get(0)?;
+                        let app: Option<String> = r.get(1)?;
+                        let title: Option<String> = r.get(2)?;
+                        let url: Option<String> = r.get(3)?;
+                        let ocr: Option<String> = r.get(4)?;
+                        Ok(format!(
+                            "{captured_at} | app={} | title={} | url={} | text={}",
+                            app.as_deref().unwrap_or(""),
+                            title.as_deref().unwrap_or(""),
+                            url.as_deref().unwrap_or(""),
+                            ocr.as_deref().unwrap_or("")
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                if screen_lines.is_empty() {
+                    continue;
+                }
+                let episode_excerpt = episode_text.chars().take(6_000).collect::<String>();
+                let screen_excerpt = screen_lines
+                    .join("\n")
+                    .chars()
+                    .take(10_000)
+                    .collect::<String>();
+                let evidence = format!(
+                    "EPISODE TEXT:\n{episode_excerpt}\n\nSCREEN METADATA (TEXT ONLY; NO PIXELS):\n{screen_excerpt}"
+                );
+                rows.push((id, evidence));
+            }
+            Ok(Some(rows))
+        })
+        .await?;
+
+    let Some(rows) = pending else {
+        return Ok(());
+    };
+
+    let mut distribution: HashMap<String, usize> = HashMap::new();
+    for batch in rows.chunks(VISUAL_EVIDENCE_BACKFILL_BATCH) {
+        let input: Vec<Value> = batch
+            .iter()
+            .map(|(id, evidence)| json!({"id": id, "evidence": evidence}))
+            .collect();
+        let message = format!(
+            "Classify every episode in this JSON array. Preserve each id exactly.\n\n{}",
+            serde_json::to_string(&input)?
+        );
+        let response = super::vertex::generate_custom(
+            &state.config,
+            VISUAL_EVIDENCE_BACKFILL_PROMPT,
+            &message,
+            visual_evidence_backfill_schema(),
+            8_192,
+        )
+        .await?;
+        let parsed = extract_json(&response).ok_or_else(|| {
+            EnclaveError::Config("visual evidence backfill response was not valid JSON".into())
+        })?;
+        let classifications = parsed
+            .get("classifications")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                EnclaveError::Config("visual evidence backfill omitted classifications".into())
+            })?;
+
+        let expected: std::collections::HashSet<i64> = batch.iter().map(|(id, _)| *id).collect();
+        let mut updates: HashMap<i64, String> = HashMap::new();
+        for item in classifications {
+            let Some(id) = item.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if !expected.contains(&id) {
+                continue;
+            }
+            let Some(visual_evidence) = item
+                .get("visual_evidence")
+                .and_then(Value::as_str)
+                .and_then(crate::episodes::validate_visual_evidence)
+            else {
+                continue;
+            };
+            updates.insert(id, visual_evidence.to_string());
+        }
+        if updates.len() != batch.len() {
+            return Err(EnclaveError::Config(format!(
+                "visual evidence backfill classified {}/{} episodes in a batch",
+                updates.len(),
+                batch.len()
+            )));
+        }
+
+        for visual_evidence in updates.values() {
+            *distribution.entry(visual_evidence.clone()).or_default() += 1;
+        }
+        state
+            .store
+            .with_user(&user, move |conn| {
+                for (id, visual_evidence) in updates {
+                    conn.execute(
+                        "UPDATE episodes SET visual_evidence = ?2 WHERE id = ?1",
+                        rusqlite::params![id, visual_evidence],
+                    )?;
+                }
+                Ok(())
+            })
+            .await?;
+    }
+
+    state
+        .store
+        .with_user(&user, |conn| {
+            conn.execute(
+                "INSERT INTO app_metadata (key, value) VALUES (?1, 'complete') \
+                 ON CONFLICT(key) DO UPDATE SET value='complete', \
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                [VISUAL_EVIDENCE_BACKFILL_KEY],
+            )?;
+            Ok(())
+        })
+        .await?;
+    state.store.save_user(&user).await?;
+    info!(
+        user_id,
+        episodes = rows.len(),
+        none = distribution.get("none").copied().unwrap_or(0),
+        useful = distribution.get("useful").copied().unwrap_or(0),
+        "episode visual evidence backfill complete"
+    );
+    Ok(())
+}
+
 /// Membership by innermost-containing span. Returns, per episode index, the
 /// member utterance ids and screenshot ids.
 fn derive_membership(
@@ -507,6 +729,11 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
         // Backfill is corrective and retryable; current capture must continue
         // to summarize even when its separate short Vertex call fails.
         warn!(user_id, error = %e, "episode substance backfill deferred");
+    }
+    if let Err(e) = run_visual_evidence_backfill(state, user_id).await {
+        // Historical screenshot eligibility is also corrective and retryable;
+        // never let it block current-window summarization.
+        warn!(user_id, error = %e, "episode visual evidence backfill deferred");
     }
 
     let summarized_until = state.control.summarized_until(user_id).await?;
@@ -877,8 +1104,13 @@ fn render_open_episodes(open: &[OpenEp]) -> String {
             } else {
                 ep.participants.join(", ")
             };
+            let actions = if ep.action_items.is_empty() {
+                "none".to_string()
+            } else {
+                compact_excerpt(&ep.action_items.join("; "), 600)
+            };
             format!(
-                "[E{i}] type={} \"{}\" ({} → {}, {} utt/{} scr)\n  participants: {}\n  objective/summary: {}\n  recent timeline: {}",
+                "[E{i}] type={} \"{}\" ({} → {}, {} utt/{} scr)\n  participants: {}\n  objective/summary: {}\n  current actions/requirements: {}\n  recent timeline: {}",
                 ep.episode_type.as_deref().unwrap_or("other"),
                 ep.title,
                 ep.started_at,
@@ -887,6 +1119,7 @@ fn render_open_episodes(open: &[OpenEp]) -> String {
                 ep.scr_count,
                 participants,
                 if summary.is_empty() { "unavailable" } else { &summary },
+                actions,
                 if recent.is_empty() { "unavailable" } else { &recent },
             )
         })
@@ -976,7 +1209,7 @@ async fn fetch_open_episodes(
         .with_user(user_id, move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT e.id, e.started_at, e.ended_at, e.type, e.title, e.summary, \
-                        e.participants, e.minutes_text, \
+                        e.participants, e.action_items, e.minutes_text, \
                         (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='utterance'), \
                         (SELECT count(*) FROM episode_members m WHERE m.episode_id=e.id AND m.record_type='screenshot') \
                  FROM episodes e WHERE e.ended_at >= ?1 AND e.started_at <= ?2 \
@@ -989,6 +1222,11 @@ async fn fetch_open_episodes(
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
                         .unwrap_or_default();
+                    let action_items_json: Option<String> = r.get(7)?;
+                    let action_items = action_items_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                        .unwrap_or_default();
                     Ok(OpenEp {
                         id: r.get(0)?,
                         started_at: r.get(1)?,
@@ -997,9 +1235,10 @@ async fn fetch_open_episodes(
                         title: r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "untitled".into()),
                         summary: r.get(5)?,
                         participants,
-                        recent_minutes: r.get(7)?,
-                        utt_count: r.get(8)?,
-                        scr_count: r.get(9)?,
+                        action_items,
+                        recent_minutes: r.get(8)?,
+                        utt_count: r.get(9)?,
+                        scr_count: r.get(10)?,
                     })
                 })?
                 .filter_map(|x| x.ok())
@@ -1151,9 +1390,34 @@ pub fn maybe_trigger(state: Arc<CpState>, user_id: String) {
 
 const SUBSTANCE_BACKFILL_PROMPT: &str = "Classify the substance of stored personal activity episodes from title, summary, and minute gists. substance=none: fragments with no coherent topic, hallucination-like repetition, or content-free filler. substance=low: real but trivial activity such as a few passing remarks or background TV. substance=normal: everything else. When in doubt, prefer the higher tier. Return one classification for every supplied id and do not invent ids.";
 
+const VISUAL_EVIDENCE_BACKFILL_PROMPT: &str = "Classify whether stored screenshot pixels would materially improve recall or verification for each episode, using only the supplied episode text and member screenshot metadata/OCR. visual_evidence=useful when the screens contain material slides, documents, diagrams, errors, designs, settings state, on-screen instructions, resources, or decision evidence. visual_evidence=none when screens are absent, generic app chrome, duplicated state, or would add no material evidence beyond the text. Do not infer unseen pixels and do not classify an episode as useful merely because screenshots exist. Return one classification for every supplied id and do not invent ids.";
+
 const WORKFLOW_CONTINUITY_RULE: &str = "CRITICAL EXTENSION RULE: Define continuity by the person's concrete real-world objective, subject, or workflow — not by session mechanics. Continuation does NOT require the same call connection, participant, app, or document. A goodbye followed by a new greeting, a transfer, hold time, reconnect, or a call to a different person or organization is not a boundary when the person is still pursuing the same task. For example, calling a provider, then an insurer, then the provider again about one bill is ONE episode using the same OPEN EPISODE ref. Prefer EXTEND when the open episode and new log share the same real-world goal; open a NEW episode only when the goal or subject actually changes.";
 
-const SYSTEM_PROMPT: &str = "You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day.\n\nThe log format: timestamped utterances as \"HH:MM:SS [speaker|lang] text\" (speaker \"Me\" is the device owner; \"Speaker N\" are diarized other voices); \"[screen] App — Title <url>\" lines for what was on screen; \"[screen-text]\" OCR excerpts.\n\nEpisode types: meeting | lesson | call | coding | browsing | break | other\n\nYou are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like \"E0\". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.\n\nPRINCIPLES (in priority order):\n1. EXTEND vs NEW. For each episode you output, set \"episode_ref\" to the \"E<n>\" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or \"\") to open a NEW episode. A continuous activity is exactly ONE episode.\n2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between \"Me\" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only \"Me\" speaking sporadically + screen activity → coding/browsing per the apps.\n3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit \"Break\"/\"Idle\"/\"Misc\" filler. A break is the silence between episodes — leave it out.\n4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified (\"Ana (Speaker 2)\"); keep bare \"Speaker N\" otherwise. People search their archive BY NAME.\n5. Titles are concrete: activity + subject + people when known (\"Spanish lesson with Ana: past tense\"), never generic.\n6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.\n7. summary: 3-8 markdown bullets. languages: BCP-47 codes heard. action_items: only real stated commitments; otherwise [].\n8. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span).\n9. minutes: a minute-by-minute timeline of the episode's NEW activity. Bucket the NEW CAPTURE LOG into 1–5-minute buckets and give each a one-line concrete gist naming the subject (\"Kate & Sean arrival plans\", \"Pesto recipe, lobster question\") — never generic filler (\"conversation continues\"). Each bucket: {\"start\":\"<ISO of bucket start>\",\"gist\":\"...\"}. Cover ONLY minutes present in the NEW CAPTURE LOG — for an extension, earlier minutes are already stored; never re-emit or invent them.\n10. substance: none for fragments with no coherent topic, hallucination-like repetition, or content-free filler; low for real but trivial activity (a few passing remarks, background TV); normal for everything else. When in doubt, prefer the higher tier.\n11. visual_evidence: useful if visual state is material (for example a slide, document, diagram, error, design, settings state, or on-screen decision evidence); none if pixels would not materially improve verification.\n\nReturn STRICT JSON only: {\"episodes\":[{\"episode_ref\":\"E0 or omit\",\"started_at\":\"<ISO>\",\"ended_at\":\"<ISO>\",\"type\":\"<type>\",\"title\":\"...\",\"summary\":\"...\",\"participants\":[\"Me\",\"Ana (Speaker 2)\"],\"languages\":[\"fr\"],\"action_items\":[],\"substance\":\"normal\",\"visual_evidence\":\"none\",\"minutes\":[{\"start\":\"<ISO>\",\"gist\":\"...\"}]}]}";
+const SYSTEM_PROMPT: &str = r#"You segment a chronological personal capture log (speech transcripts + screen activity) into episodes a person would recognize as distinct activities in their day. The episode fields must also be a useful, evidence-grounded memory of what the person needs to know or do — not a topic inventory.
+
+The log format: timestamped utterances as "HH:MM:SS [speaker|lang] text" (speaker "Me" is the device owner; "Speaker N" are diarized other voices); "[screen] App — Title <url>" lines for what was on screen; "[screen-text]" OCR excerpts.
+
+Episode types: meeting | lesson | call | coding | browsing | break | other
+
+You are also given OPEN EPISODES: recent episodes that may still be in progress, each with a ref like "E0". The NEW CAPTURE LOG is only the activity SINCE those were last summarized.
+
+PRINCIPLES (in priority order):
+1. EXTEND vs NEW. For each episode you output, set "episode_ref" to the "E<n>" of an OPEN EPISODE when the new log is a continuation of it — give its UPDATED ended_at and a summary covering the whole episode. Otherwise omit episode_ref (or "") to open a NEW episode. A continuous activity is exactly ONE episode. For an extension, preserve still-valid concrete takeaways and current actions/requirements from the open-episode digest while incorporating the new evidence.
+2. SPEECH OUTWEIGHS SCREEN for deciding what an episode IS. Sustained back-and-forth between "Me" and other speakers means a live interaction (meeting/lesson/call) even when the visible app is a browser. Classify by dynamics: instruction/drill/correction → lesson; collaborative discussion → meeting; few-person social/logistic conversation → call. Long stretches with only "Me" speaking sporadically + screen activity → coding/browsing per the apps.
+3. SIGNIFICANCE — not everything is an episode. Idle, empty, or sparse-noise spans are NOT episodes. Do NOT emit "Break"/"Idle"/"Misc" filler. A break is the silence between episodes — leave it out.
+4. ATTENDEES for any episode with conversation: combine names spoken aloud, names visible on screen, and diarized labels. Map labels to names when justified ("Ana (Speaker 2)"); keep bare "Speaker N" otherwise. People search their archive BY NAME. Repeated or mirrored transcript rows are corroboration, not separate statements or takeaways.
+5. Titles identify the activity, purpose, and people when known ("Spanish lesson with Ana: past tense"). Do not make a title a comma-separated sample of topics, and never use a generic title.
+6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.
+7. SUMMARY QUALITY. summary is 1–10 Markdown bullets, one per line and each beginning "- ". Every bullet must state a concrete takeaway, instruction, requirement, decision, result, constraint, or fact that helps the device owner remember or act. Prioritize, in order: (a) steps or requirements directed at the owner, (b) decisions, commitments, owners, deadlines and dates, (c) exact amounts, limits, logistics and named resources, services or URLs, (d) substantive outcomes or explanations. Omit greetings, atmosphere and promotional color before compressing any high-value detail. Never write topic-inventory prose such as "X was discussed", "information was provided/shared", "details about X", or "the conversation covered X"; state the actual detail instead. Do not pad to reach a bullet count.
+8. EVIDENCE BOUNDARY. Names, spellings, dates, times, amounts, requirements, resource names and URLs must be supported literally by the capture log or open-episode digest. Preserve an observed URL exactly. Never invent or complete a domain/path, silently correct an uncertain transcription, infer a missing date/amount, or turn a mentioned resource into a URL that was not captured. If evidence is ambiguous, use the literal supported wording or omit the uncertain specific.
+9. ACTION ITEMS. action_items contains only explicit commitments, requested follow-ups, or requirements/instructions directed at a person; otherwise []. A requirement addressed to "Me" belongs here even if the owner did not verbally promise it. Phrase each item as the concrete action, owner when known, and exact due date or condition when stated. Do not promote optional general information into an action.
+10. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span). languages: BCP-47 codes actually heard.
+11. MINUTE TIMELINE. minutes is a timeline of the episode's NEW activity. Bucket the NEW CAPTURE LOG into 1–5-minute buckets. Each gist is one concrete sentence naming who said/did/decided/required what when speaker identity is supported, and retaining a material date, amount, step, outcome, resource or URL when present. Never use generic filler or topic labels such as "conversation continues" or "transportation discussed". Each bucket: {"start":"<ISO of bucket start>","gist":"..."}. Cover ONLY minutes present in the NEW CAPTURE LOG — for an extension, earlier minutes are already stored; never re-emit or invent them.
+12. substance: none for fragments with no coherent topic, hallucination-like repetition, or content-free filler; low for real but trivial activity (a few passing remarks, background TV); normal for everything else. When in doubt, prefer the higher tier.
+13. visual_evidence: useful if visual state is material (for example a slide, document, diagram, error, design, settings state, or on-screen decision evidence); none if pixels would not materially improve verification.
+
+Return STRICT JSON only: {"episodes":[{"episode_ref":"E0 or omit","started_at":"<ISO>","ended_at":"<ISO>","type":"<type>","title":"...","summary":"- concrete takeaway\n- concrete requirement","participants":["Me","Ana (Speaker 2)"],"languages":["fr"],"action_items":[],"substance":"normal","visual_evidence":"none","minutes":[{"start":"<ISO>","gist":"..."}]}]}"#;
 
 #[cfg(test)]
 mod tests {
@@ -1258,6 +1522,7 @@ mod tests {
                     .into(),
             ),
             participants: vec!["Me".into(), "Provider representative".into()],
+            action_items: vec!["Me: send the insurer's payment reference".into()],
             recent_minutes: Some("12:46 PM: insurer payment and balance billing".into()),
             utt_count: 24,
             scr_count: 80,
@@ -1266,6 +1531,7 @@ mod tests {
         assert!(rendered.contains("[E0] type=call"));
         assert!(rendered.contains("Provider representative"));
         assert!(rendered.contains("outstanding transportation balance"));
+        assert!(rendered.contains("send the insurer's payment reference"));
         assert!(rendered.contains("insurer payment and balance billing"));
     }
 
@@ -1276,5 +1542,68 @@ mod tests {
         ));
         assert!(WORKFLOW_CONTINUITY_RULE
             .contains("A goodbye followed by a new greeting, a transfer, hold time, reconnect"));
+    }
+
+    #[test]
+    fn prompt_requires_concrete_evidence_bound_recall() {
+        assert!(SYSTEM_PROMPT.contains("not a topic inventory"));
+        assert!(SYSTEM_PROMPT.contains("steps or requirements directed at the owner"));
+        assert!(SYSTEM_PROMPT.contains("exact amounts, limits, logistics"));
+        assert!(SYSTEM_PROMPT.contains("Never write topic-inventory prose"));
+        assert!(SYSTEM_PROMPT.contains("Preserve an observed URL exactly"));
+        assert!(SYSTEM_PROMPT.contains("Never invent or complete a domain/path"));
+        assert!(SYSTEM_PROMPT.contains("A requirement addressed to \"Me\" belongs here"));
+    }
+
+    #[test]
+    fn prompt_requires_attributed_specific_minute_gists() {
+        assert!(SYSTEM_PROMPT.contains(
+            "naming who said/did/decided/required what when speaker identity is supported"
+        ));
+        assert!(SYSTEM_PROMPT.contains("retaining a material date, amount, step, outcome"));
+        assert!(SYSTEM_PROMPT.contains("never re-emit or invent them"));
+    }
+
+    #[test]
+    fn capture_prompt_preserves_literal_url_without_truncation() {
+        let url = format!(
+            "https://example.edu/{}?required=true",
+            "orientation/".repeat(14)
+        );
+        assert!(url.len() > 120);
+        let rendered = render_capture_text(
+            &[],
+            &[ScrRow {
+                id: 7,
+                captured_at: "2026-07-21T09:03:00Z".into(),
+                active_app: Some("Browser".into()),
+                window_title: Some("Student setup".into()),
+                ocr_text: None,
+                url: Some(url.clone()),
+                is_duplicate: 0,
+            }],
+        );
+
+        assert!(rendered.contains(&format!("<{url}>")));
+    }
+
+    #[test]
+    fn historical_visual_evidence_backfill_contract_is_constrained_and_text_only() {
+        let schema = visual_evidence_backfill_schema();
+        let item = &schema["properties"]["classifications"]["items"];
+        assert_eq!(
+            item["properties"]["visual_evidence"]["enum"],
+            json!(["none", "useful"])
+        );
+        assert!(item["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field.as_str() == Some("visual_evidence")));
+        assert!(VISUAL_EVIDENCE_BACKFILL_PROMPT.contains("metadata/OCR"));
+        assert!(VISUAL_EVIDENCE_BACKFILL_PROMPT.contains("Do not infer unseen pixels"));
+        assert!(VISUAL_EVIDENCE_BACKFILL_PROMPT
+            .contains("do not classify an episode as useful merely because screenshots exist"));
+        assert_ne!(VISUAL_EVIDENCE_BACKFILL_KEY, SUBSTANCE_BACKFILL_KEY);
     }
 }

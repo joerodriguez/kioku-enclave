@@ -53,6 +53,8 @@ const EXP_LEEWAY_SECS: u64 = 30;
 
 /// Default JWKS cache TTL when the server doesn't send Cache-Control.
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(300); // 5 min
+const GOOGLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GOOGLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── ID-token claims ───────────────────────────────────────────────────────────
 
@@ -95,7 +97,11 @@ impl IdTokenVerifier {
     /// `run_sa_email` = `RUN_SA_EMAIL` env var value.
     pub fn new(enclave_audience: String, run_sa_email: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(GOOGLE_CONNECT_TIMEOUT)
+                .timeout(GOOGLE_REQUEST_TIMEOUT)
+                .build()
+                .expect("static Google JWKS HTTP client configuration"),
             enclave_audience,
             run_sa_email,
             jwks_cache: Mutex::new(None),
@@ -135,10 +141,9 @@ impl IdTokenVerifier {
 
         // Explicit claim checks (belt-and-suspenders on top of jsonwebtoken).
         if claims.email != self.run_sa_email {
-            return Err(EnclaveError::Auth(format!(
-                "ID token email '{}' does not match expected SA '{}'",
-                claims.email, self.run_sa_email
-            )));
+            return Err(EnclaveError::Auth(
+                "ID token email does not match trusted service account".into(),
+            ));
         }
         if !claims.email_verified {
             return Err(EnclaveError::Auth(

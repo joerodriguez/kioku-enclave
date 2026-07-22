@@ -39,20 +39,23 @@
 //! path is derived (defense in depth).
 
 use std::{
-    collections::HashMap,
-    path::PathBuf,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{Arc, Once},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{ffi::sqlite3_auto_extension, Connection};
 use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::{
-    crypto::{decrypt_blob, encrypt_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient},
+    crypto::{
+        decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient,
+    },
     error::{EnclaveError, Result},
 };
 
@@ -116,6 +119,9 @@ pub struct Store {
 
 struct StoreInner {
     handles: HashMap<UserId, UserHandle>,
+    /// Process-local deletion fence. Once set, in-flight requests that passed
+    /// authentication cannot recreate or save this user's content.
+    blocked_users: HashSet<UserId>,
 }
 
 impl Store {
@@ -144,6 +150,7 @@ impl Store {
         Store {
             inner: Mutex::new(StoreInner {
                 handles: HashMap::new(),
+                blocked_users: HashSet::new(),
             }),
             kms,
             gcs,
@@ -153,8 +160,19 @@ impl Store {
     }
 
     pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<()> {
+        self.put_media_at_generation(name, data, wrapped_dek_b64, 0)
+            .await
+    }
+
+    pub async fn put_media_at_generation(
+        &self,
+        name: &str,
+        data: &[u8],
+        wrapped_dek_b64: &str,
+        generation: i64,
+    ) -> Result<()> {
         self.media_gcs
-            .put_object(name, data, wrapped_dek_b64, 0)
+            .put_object(name, data, wrapped_dek_b64, generation)
             .await?;
         Ok(())
     }
@@ -174,6 +192,9 @@ impl Store {
         F: FnOnce(&Connection) -> Result<T>,
     {
         let mut inner = self.inner.lock().await;
+        if inner.blocked_users.contains(user_id) {
+            return Err(EnclaveError::Auth("user account is deleted".into()));
+        }
         // Evict LRU if needed before potentially adding a new entry
         if !inner.handles.contains_key(user_id) && inner.handles.len() >= self.max_open {
             self.evict_lru_locked(&mut inner).await?;
@@ -190,6 +211,9 @@ impl Store {
     /// Persist a user's index back to GCS.
     pub async fn save_user(&self, user_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().await;
+        if inner.blocked_users.contains(user_id) {
+            return Err(EnclaveError::Auth("user account is deleted".into()));
+        }
         let handle = inner
             .handles
             .get_mut(user_id)
@@ -205,27 +229,28 @@ impl Store {
         validate_user_id(user_id)?;
 
         // 1. Query for GCS media keys to clean up
-        let user_str = user_id.to_string();
-        let mut keys_to_delete = Vec::new();
-        if let Ok(keys) = self.with_user(&user_str, |conn| {
-            let table_exists: i64 = conn.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
-                [],
-                |r| r.get(0),
-            )?;
-            if table_exists == 0 {
-                return Ok(Vec::new());
-            }
+        let keys_to_delete = {
+            let mut inner = self.inner.lock().await;
+            let keys = if !inner.handles.contains_key(user_id) {
+                if inner.blocked_users.contains(user_id) {
+                    Vec::new()
+                } else {
+                    let handle = self.load_user(user_id).await?;
+                    inner.handles.insert(user_id.to_string(), handle);
+                    media_keys(&inner.handles.get(user_id).unwrap().conn)?
+                }
+            } else {
+                media_keys(&inner.handles.get(user_id).unwrap().conn)?
+            };
+            inner.blocked_users.insert(user_id.to_string());
+            keys
+        };
 
-            let mut stmt = conn.prepare("SELECT object_key FROM screenshot_images")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            let mut list = Vec::new();
-            for key in rows.flatten() {
-                list.push(key);
-            }
-            Ok(list)
-        }).await {
-            keys_to_delete = keys;
+        // Delete media first and propagate failures. Keeping the database until
+        // every referenced object is gone makes the operation safely retryable.
+        for key in &keys_to_delete {
+            info!(user_id, "deleting associated GCS media object");
+            self.delete_media(key).await?;
         }
 
         // 2. Evict the cached handle (and temp file) without flushing —
@@ -234,10 +259,9 @@ impl Store {
             let mut inner = self.inner.lock().await;
             if let Some(handle) = inner.handles.remove(user_id) {
                 info!(user_id, "evicting user handle for deletion");
-                // Best-effort cleanup of the temp file; ignore errors.
-                let _ = std::fs::remove_file(&handle.temp_path);
-                // Drop the Connection so the file is fully released.
+                let temp_path = handle.temp_path.clone();
                 drop(handle);
+                remove_temp_db_files(&temp_path);
             }
         }
 
@@ -246,12 +270,6 @@ impl Store {
         let object_name = gcs_object_name(user_id);
         info!(user_id, object = %object_name, "deleting GCS object");
         self.gcs.delete_object(&object_name).await?;
-
-        // 4. Delete associated GCS media objects
-        for key in keys_to_delete {
-            info!(user_id, key = %key, "deleting associated GCS media object");
-            let _ = self.delete_media(&key).await;
-        }
 
         Ok(())
     }
@@ -270,11 +288,29 @@ impl Store {
             Ok(resp) => {
                 // Unwrap the DEK from KMS
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
-                let plaintext = decrypt_blob(&dek, &resp.ciphertext)?;
+                let context = user_blob_context(user_id);
+                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, &context, None)?;
+                let mut generation = resp.generation;
+                if opened.was_legacy {
+                    let migrated = encrypt_bound_blob(&dek, &opened.plaintext, &context)?;
+                    generation = self
+                        .gcs
+                        .put_object(
+                            &object_name,
+                            &migrated,
+                            &resp.wrapped_dek_b64,
+                            resp.generation,
+                        )
+                        .await?;
+                    info!(
+                        user_id,
+                        "migrated legacy user blob to context-bound encryption"
+                    );
+                }
                 (
-                    plaintext,
+                    opened.plaintext,
                     BlobMeta {
-                        generation: resp.generation,
+                        generation,
                         wrapped_dek_b64: resp.wrapped_dek_b64,
                     },
                 )
@@ -296,9 +332,14 @@ impl Store {
         };
 
         // Write plaintext to a temp file and open it with rusqlite
-        let temp_path = temp_db_path(user_id);
-        tokio::fs::write(&temp_path, &plaintext_db).await?;
-        let conn = open_db(&temp_path)?;
+        let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
+        let conn = match open_db(&temp_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                remove_temp_db_files(&temp_path);
+                return Err(e);
+            }
+        };
 
         Ok(UserHandle {
             user_id: user_id.to_string(),
@@ -326,9 +367,9 @@ impl Store {
             &handle.blob_meta.wrapped_dek_b64,
         )
         .await?;
-        let ciphertext = encrypt_blob(&dek, &db_bytes)?;
-
         let object_name = gcs_object_name(&handle.user_id);
+        let context = user_blob_context(&handle.user_id);
+        let ciphertext = encrypt_bound_blob(&dek, &db_bytes, &context)?;
         let new_generation = self
             .gcs
             .put_object(
@@ -356,12 +397,16 @@ impl Store {
         if let Some(id) = oldest_id {
             if let Some(mut handle) = inner.handles.remove(&id) {
                 warn!(evicted_user = %id, "LRU eviction");
-                // Best-effort flush; log but don't propagate
+                // A failed flush must keep the live handle and plaintext temp
+                // file available; dropping either here would lose writes.
                 if let Err(e) = self.flush_handle(&mut handle).await {
                     tracing::error!(user_id = %id, error = %e, "eviction flush failed");
+                    inner.handles.insert(id, handle);
+                    return Err(e);
                 }
-                // Clean up temp file
-                let _ = std::fs::remove_file(&handle.temp_path);
+                let temp_path = handle.temp_path.clone();
+                drop(handle);
+                remove_temp_db_files(&temp_path);
             }
         }
         Ok(())
@@ -1063,7 +1108,7 @@ fn create_empty_db(dek: &Dek) -> Result<Vec<u8>> {
     let bytes = std::fs::read(&path)?;
     // Encrypt the empty DB to prove the DEK works, then return plaintext
     // (the caller will re-encrypt when saving — here we just want the raw bytes)
-    let _ = encrypt_blob(dek, &bytes)?; // smoke-test the key
+    let _ = encrypt_bound_blob(dek, &bytes, b"empty-db-self-test")?; // smoke-test the key
     Ok(bytes)
 }
 
@@ -1091,7 +1136,6 @@ pub trait GcsClient: Send + Sync {
         if_generation_match: i64,
     ) -> Result<i64>;
     async fn delete_object(&self, object_name: &str) -> Result<()>;
-    async fn rename_object(&self, source_object: &str, dest_object: &str) -> Result<()>;
 }
 
 // ── Production GCS client ──────────────────────────────────────────────────────
@@ -1118,14 +1162,14 @@ impl GcpGcsClient {
         let bucket = std::env::var("GCS_BUCKET")
             .map_err(|_| EnclaveError::Gcs("GCS_BUCKET not set".into()))?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: gcs_http_client(),
             bucket,
         })
     }
 
     pub fn from_bucket(bucket: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: gcs_http_client(),
             bucket,
         }
     }
@@ -1139,6 +1183,7 @@ impl GcpGcsClient {
             .http
             .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
             .header("Metadata-Flavor", "Google")
+            .timeout(Duration::from_secs(3))
             .send()
             .await?
             .error_for_status()?
@@ -1146,6 +1191,14 @@ impl GcpGcsClient {
             .await?;
         Ok(tok.access_token)
     }
+}
+
+fn gcs_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("static GCS HTTP client configuration is valid")
 }
 
 #[async_trait::async_trait]
@@ -1176,8 +1229,8 @@ impl GcsClient for GcpGcsClient {
 
         // Fetch body (media download)
         let data_url = format!(
-            "https://storage.googleapis.com/download/storage/v1/b/{}/o/{}?alt=media",
-            self.bucket, encoded
+            "https://storage.googleapis.com/download/storage/v1/b/{}/o/{}?alt=media&generation={}",
+            self.bucket, encoded, generation
         );
         let bytes = self
             .http
@@ -1290,40 +1343,6 @@ impl GcsClient for GcpGcsClient {
         resp.error_for_status()?;
         Ok(())
     }
-
-    async fn rename_object(&self, source_object: &str, dest_object: &str) -> Result<()> {
-        let token = self.access_token().await?;
-        let src_encoded = urlencoding::encode(source_object);
-        let dest_encoded = urlencoding::encode(dest_object);
-
-        let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}/copyTo/b/{}/o/{}",
-            self.bucket, src_encoded, self.bucket, dest_encoded
-        );
-
-        // copyTo is a bodiless POST: without an explicit empty body, GCS
-        // rejects the request with 411 Length Required (observed live 2026-07-05
-        // — it broke every sign-in via the stable-id migration path).
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .header(reqwest::header::CONTENT_LENGTH, 0)
-            .body(Vec::new())
-            .send()
-            .await?;
-
-        // Callers treat a missing source as "nothing to rename" (idempotent
-        // migration), so surface 404 as NotFound rather than a generic error.
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(EnclaveError::NotFound);
-        }
-        resp.error_for_status()?;
-
-        // Copy succeeded; now delete source
-        self.delete_object(source_object).await?;
-        Ok(())
-    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1332,14 +1351,58 @@ fn gcs_object_name(user_id: &str) -> String {
     format!("indexes/{user_id}.db.enc")
 }
 
-/// Build the temp-file path for a user's decrypted database.
-/// Callers must have validated `user_id` first (see [`validate_user_id`]).
-fn temp_db_path(user_id: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!("kioku-{user_id}-{nanos}.db"))
+fn media_keys(conn: &Connection) -> Result<Vec<String>> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT object_key FROM screenshot_images")?;
+    let keys = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into);
+    keys
+}
+
+pub(crate) fn user_blob_context(user_id: &str) -> Vec<u8> {
+    format!("user-db\0{}", gcs_object_name(user_id)).into_bytes()
+}
+
+pub(crate) fn media_blob_context(user_id: &str, object_key: &str) -> Vec<u8> {
+    format!("media\0{user_id}\0{object_key}").into_bytes()
+}
+
+/// Persist a decrypted database in an atomically-created, owner-only temp file.
+///
+/// `NamedTempFile` uses an unpredictable suffix and exclusive creation, avoiding
+/// the symlink/race vulnerability of deriving a pathname and writing it later.
+/// The `TempPath` guard removes a partial file if an async write fails; after a
+/// successful write we deliberately persist the pathname for SQLite to manage.
+async fn write_private_temp_db(user_id: &str, plaintext: &[u8]) -> Result<PathBuf> {
+    let named = tempfile::Builder::new()
+        .prefix(&format!("kioku-{user_id}-"))
+        .suffix(".db")
+        .tempfile_in(std::env::temp_dir())?;
+    let (std_file, temp_path) = named.into_parts();
+    let mut file = tokio::fs::File::from_std(std_file);
+    file.write_all(plaintext).await?;
+    file.flush().await?;
+    drop(file);
+    temp_path.keep().map_err(|e| EnclaveError::Io(e.error))
+}
+
+/// Best-effort removal of the plaintext database and SQLite sidecar files.
+fn remove_temp_db_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1693,20 +1756,6 @@ pub(crate) mod tests {
             self.objects.lock().unwrap().remove(object_name);
             Ok(())
         }
-
-        async fn rename_object(
-            &self,
-            source_object: &str,
-            dest_object: &str,
-        ) -> crate::error::Result<()> {
-            let mut store = self.objects.lock().unwrap();
-            if let Some(obj) = store.remove(source_object) {
-                store.insert(dest_object.to_string(), obj);
-                Ok(())
-            } else {
-                Err(crate::error::EnclaveError::NotFound)
-            }
-        }
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1847,8 +1896,8 @@ pub(crate) mod tests {
         assert!(result.contains("budget"));
     }
 
-    /// Write data for a user, delete the user, then load the user again.
-    /// The reloaded index must be a fresh empty database (the old data is gone).
+    /// Write data for a user and delete it. The process-local deletion fence
+    /// must prevent an in-flight stale request from recreating the index.
     #[tokio::test]
     async fn delete_user_clears_data_and_fresh_load_is_empty() {
         let gcs = Arc::new(FakeGcs::new());
@@ -1881,30 +1930,14 @@ pub(crate) mod tests {
         // Delete dave.
         store.delete_user("dave").await.expect("delete_user");
 
-        // Load dave again on the same store; the GCS object is gone so it
-        // creates a fresh empty database.
-        let count_after: i64 = store
-            .with_user("dave", |conn| {
-                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |r| r.get(0))?)
-            })
-            .await
-            .expect("load dave after delete");
-        assert_eq!(count_after, 0, "expected empty index after deletion");
-
-        // FTS search should find nothing.
-        let fts_hits: i64 = store
-            .with_user("dave", |conn| {
-                Ok(conn.query_row(
-                    "SELECT count(*) FROM screenshots WHERE rowid IN (
-                         SELECT rowid FROM screenshots_fts WHERE screenshots_fts MATCH 'secret'
-                     )",
-                    [],
-                    |r| r.get(0),
-                )?)
-            })
-            .await
-            .expect("fts after delete");
-        assert_eq!(fts_hits, 0, "FTS should return nothing after deletion");
+        assert!(matches!(
+            store.with_user("dave", |_| Ok(())).await,
+            Err(EnclaveError::Auth(_))
+        ));
+        assert!(matches!(
+            store.save_user("dave").await,
+            Err(EnclaveError::Auth(_))
+        ));
     }
 
     /// Deleting a user that was never seen must succeed without error (idempotent).
@@ -1916,6 +1949,37 @@ pub(crate) mod tests {
             result.is_ok(),
             "delete_user on never-seen user should be Ok, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn copied_user_blob_cannot_be_opened_as_another_user() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .with_user("alice", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-01-01T00:00:00Z', 'alice secret')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+
+        let alice_object = gcs_object_name("alice");
+        let bob_object = gcs_object_name("bob");
+        {
+            let mut objects = gcs.objects.lock().unwrap();
+            let copied = objects.get(&alice_object).unwrap().clone();
+            objects.insert(bob_object, copied);
+        }
+
+        let fresh = Store::new(Arc::new(FakeKms), gcs);
+        assert!(matches!(
+            fresh.with_user("bob", |_| Ok(())).await,
+            Err(EnclaveError::Crypto(_))
+        ));
     }
 
     // ── user_id validation ─────────────────────────────────────────────────────

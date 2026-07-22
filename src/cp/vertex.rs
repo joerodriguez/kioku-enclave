@@ -1,5 +1,4 @@
-//! Vertex AI client for the episode summarizer (ports the Gemini path of
-//! `callClaude` in `cloud/src/summarizer.js`). Gemini `generateContent` with a
+//! Vertex AI client for the episode summarizer. Gemini `generateContent` uses a
 //! constrained `responseSchema`. Credentials come from the VM metadata server
 //! (cloud-platform scope), same pattern as the GCS/KMS clients.
 //!
@@ -7,7 +6,7 @@
 //! future toggle — `VERTEX_MODEL` defaults to `gemini-2.5-flash` regardless.
 //!
 //! This call sends assembled capture text to Vertex, OUTSIDE the TEE boundary —
-//! the documented summarizer caveat (ADR-0001 / docs/ROADMAP Phase 7). The claim
+//! the documented summarizer caveat. The claim
 //! for episode summaries is "attested enclave + Google Vertex inference under
 //! no-data-retention terms", not enclave-only.
 
@@ -58,6 +57,7 @@ fn response_schema() -> Value {
                         "languages": {"type": "ARRAY", "items": {"type": "STRING"}},
                         "action_items": {"type": "ARRAY", "items": {"type": "STRING"}},
                         "substance": {"type": "STRING", "enum": ["none","low","normal"]},
+                        "visual_evidence": {"type": "STRING", "enum": ["none","useful"]},
                         // ADR-0004: minute-timeline gists, generated eagerly in
                         // this same pass. Constrained decoding emits nothing
                         // that isn't in the schema — without this field the
@@ -74,7 +74,7 @@ fn response_schema() -> Value {
                             }
                         }
                     },
-                    "required": ["started_at","ended_at","title","substance","minutes"]
+                    "required": ["started_at","ended_at","title","summary","action_items","substance","visual_evidence","minutes"]
                 }
             }
         },
@@ -167,4 +167,33 @@ pub async fn generate_custom(
         )));
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episode_schema_requires_recall_fields_and_visual_evidence() {
+        let schema = response_schema();
+        let episode = &schema["properties"]["episodes"]["items"];
+        let properties = episode["properties"]
+            .as_object()
+            .expect("episode properties");
+
+        assert!(properties.contains_key("summary"));
+        assert!(properties.contains_key("action_items"));
+        assert_eq!(
+            properties["visual_evidence"]["enum"],
+            json!(["none", "useful"])
+        );
+
+        let required = episode["required"].as_array().expect("required fields");
+        for field in ["summary", "action_items", "visual_evidence"] {
+            assert!(
+                required.iter().any(|value| value.as_str() == Some(field)),
+                "{field} must be required by constrained decoding"
+            );
+        }
+    }
 }

@@ -136,7 +136,9 @@ rejects unexpected ones before publication. If a public release already exists, 
 script requires GitHub to report it as immutable and does not edit or clobber it.
 Investigate a mismatch; do not delete and recreate provenance to make verification pass.
 
-Publishing creates a verified public release build. The private `kioku-monorepo` automated watcher workflow (`watch-enclave.yml`) automatically detects published releases, updates `infra/terraform.tfvars`, and rolls production with zero downtime.
+Publishing creates a verified public release; it does not change production. An operator
+may then use `--roll` with an explicitly configured `DEPLOYMENT_REPO` to request that
+repository's separate, approval-gated deployment workflow.
 
 ## Verify the release before deployment
 

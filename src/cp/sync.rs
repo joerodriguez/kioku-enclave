@@ -1,5 +1,4 @@
-//! Device→enclave sync + account endpoints (ports `cloud/src/sync.js` and the
-//! join logic from `cloud/src/enclave.js`). All routes are auth-gated by the
+//! Device-to-enclave sync and account endpoints. All routes are auth-gated by the
 //! [`super::auth::require_auth`] middleware applied in `main`.
 //!
 //! `POST /api/sync/batch`  — idempotent ingest (utterances joined to segments).
@@ -345,7 +344,30 @@ async fn delete_account(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let user_id = user.0;
-    // 1. Content first (fail the request if this fails — never half-delete).
+    // 1. Fail closed before touching content: stop every other authenticated
+    // route and revoke pending/renewable OAuth credentials. A retry of this
+    // deletion route remains allowed while status is `deleting`.
+    match s.control.begin_user_deletion(&user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "account_unavailable"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to initialize account deletion");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "deletion_init_failed"})),
+            )
+                .into_response();
+        }
+    }
+
+    // 2. Delete content. On failure the durable `deleting` status remains, so
+    // all non-deletion access stays denied and this endpoint can safely retry.
     if let Err(e) = s.store.delete_user(&user_id).await {
         warn!(error = %e, "enclave delete failed");
         return (
@@ -354,8 +376,8 @@ async fn delete_account(
         )
             .into_response();
     }
-    // 2. Identity rows.
-    match s.control.delete_user(&user_id).await {
+    // 3. Remove identity/accounting rows and leave a stable deletion tombstone.
+    match s.control.finalize_user_deletion(&user_id).await {
         Ok(deleted) => Json(json!({ "deleted": deleted })).into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

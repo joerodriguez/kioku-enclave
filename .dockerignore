@@ -1,0 +1,21 @@
+# Default-deny the Docker build context. Keep this allow-list in sync with
+# Dockerfile COPY instructions so local credentials and build artifacts cannot
+# be sent to the daemon accidentally.
+**
+!Dockerfile
+!.dockerignore
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+
+# Defense in depth for credential-like files placed below an allowed source path.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/gha-creds-*.json
+**/credentials*.json
+**/service-account*.json

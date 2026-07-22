@@ -1,6 +1,4 @@
-//! Token + crypto helpers for the in-enclave control plane (ADR-0001).
-//!
-//! Ports `cloud/src/auth.js` + the PKCE/hash helpers from `cloud/src/oauth.js`:
+//! Token and cryptographic helpers for the in-enclave control plane:
 //! HS256 JWTs (access tokens, OAuth state, OAuth authorization codes), PKCE S256,
 //! sha256-hex (refresh-token hashing), opaque random tokens, and UUIDs.
 //!
@@ -21,6 +19,7 @@ const ACCESS_TOKEN_AUD: &str = "kioku-mcp";
 const ACCESS_TOKEN_TTL_SECS: u64 = 3600; // 1h
 const STATE_TTL_SECS: u64 = 600; // 10m
 const AUTH_CODE_TTL_SECS: u64 = 300; // 5m
+const CONSENT_TTL_SECS: u64 = 300; // 5m
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -225,6 +224,47 @@ pub fn verify_auth_code(secret: &str, token: &str) -> Result<AuthCodeClaims> {
     .map_err(|e| EnclaveError::Auth(format!("invalid auth code: {e}")))
 }
 
+// ── OAuth consent grant (5m) ─────────────────────────────────────────────────────────────────────
+
+/// Signed handoff between the Google callback and Kioku's explicit client
+/// consent page. The raw JWT is also persisted by hash and consumed once.
+#[derive(Serialize, Deserialize)]
+pub struct ConsentClaims {
+    pub user_id: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub client_state: String,
+    pub code_challenge: String,
+    pub exp: u64,
+}
+
+pub fn issue_consent(secret: &str, claims: &ConsentClaims) -> Result<String> {
+    let claims = ConsentClaims {
+        user_id: claims.user_id.clone(),
+        client_id: claims.client_id.clone(),
+        redirect_uri: claims.redirect_uri.clone(),
+        client_state: claims.client_state.clone(),
+        code_challenge: claims.code_challenge.clone(),
+        exp: now_secs() + CONSENT_TTL_SECS,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| EnclaveError::Auth(format!("issue consent: {e}")))
+}
+
+pub fn verify_consent(secret: &str, token: &str) -> Result<ConsentClaims> {
+    decode::<ConsentClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &exp_only_validation(),
+    )
+    .map(|d| d.claims)
+    .map_err(|e| EnclaveError::Auth(format!("invalid consent: {e}")))
+}
+
 /// Validation that checks only HS256 + expiry (no iss/aud) — used for the
 /// internal state and authorization-code JWTs, which carry neither.
 fn exp_only_validation() -> Validation {
@@ -309,6 +349,26 @@ mod tests {
         assert_eq!(claims.user_id, "u1");
         assert_eq!(claims.client_id, "c1");
         assert_eq!(claims.code_challenge, "chal");
+    }
+
+    #[test]
+    fn consent_round_trips_and_rejects_wrong_secret() {
+        let token = issue_consent(
+            "secret",
+            &ConsentClaims {
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+                redirect_uri: "https://client.example/cb".into(),
+                client_state: "state".into(),
+                code_challenge: "challenge".into(),
+                exp: 0,
+            },
+        )
+        .unwrap();
+        let claims = verify_consent("secret", &token).unwrap();
+        assert_eq!(claims.user_id, "u1");
+        assert_eq!(claims.redirect_uri, "https://client.example/cb");
+        assert!(verify_consent("wrong", &token).is_err());
     }
 
     #[test]

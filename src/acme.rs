@@ -61,7 +61,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::{
-    crypto::{decrypt_blob, encrypt_blob, generate_and_wrap_dek, load_dek, KmsClient},
+    crypto::{decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, KmsClient},
     error::{EnclaveError as Error, Result},
     store::GcsClient,
     tls::{CertKeyPair, TlsKeystone},
@@ -69,6 +69,7 @@ use crate::{
 
 /// GCS object holding the encrypted ACME state (account + cert + key).
 const STATE_OBJECT: &str = "acme/tls.json.enc";
+const STATE_CONTEXT: &[u8] = b"acme-state\0acme/tls.json.enc";
 /// Renew at issuance + 60 d (2/3 of Let's Encrypt's 90-d lifetime, certbot's default).
 const RENEW_AFTER: Duration = Duration::from_secs(60 * 24 * 60 * 60);
 /// Past issuance + 85 d, treat the stored cert as unusable and block boot on reissue
@@ -134,7 +135,7 @@ impl AcmeConfig {
     }
 }
 
-/// Extract the host from a URL like `https://136-114-134-221.sslip.io[/...]`.
+/// Extract the host from a URL like `https://203-0-113-10.sslip.io[/...]`.
 fn domain_from_base_url(base_url: &str) -> Result<String> {
     let rest = base_url
         .trim()
@@ -260,7 +261,12 @@ impl HttpClient for ReqwestHttpClient {
 }
 
 fn acme_http_client() -> Box<dyn HttpClient> {
-    Box::new(ReqwestHttpClient(reqwest::Client::new()))
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("static ACME HTTP client configuration is valid");
+    Box::new(ReqwestHttpClient(client))
 }
 
 // ── Persisted state ───────────────────────────────────────────────────────────
@@ -521,9 +527,25 @@ impl Renewer {
         match self.gcs.get_object(STATE_OBJECT).await {
             Ok(rsp) => {
                 let dek = load_dek(self.kms.as_ref(), &rsp.wrapped_dek_b64).await?;
-                let plaintext = decrypt_blob(&dek, &rsp.ciphertext)?;
-                let state: AcmeState = serde_json::from_slice(&plaintext)?;
-                Ok(Some((state, rsp.generation)))
+                let opened = decrypt_bound_blob(&dek, &rsp.ciphertext, STATE_CONTEXT, None)?;
+                let state: AcmeState = serde_json::from_slice(&opened.plaintext)?;
+                let generation = if opened.was_legacy {
+                    let migrated = encrypt_bound_blob(&dek, &opened.plaintext, STATE_CONTEXT)?;
+                    let generation = self
+                        .gcs
+                        .put_object(
+                            STATE_OBJECT,
+                            &migrated,
+                            &rsp.wrapped_dek_b64,
+                            rsp.generation,
+                        )
+                        .await?;
+                    info!("migrated legacy ACME state to context-bound encryption");
+                    generation
+                } else {
+                    rsp.generation
+                };
+                Ok(Some((state, generation)))
             }
             Err(Error::NotFound) => Ok(None),
             Err(e) => Err(e),
@@ -534,7 +556,7 @@ impl Renewer {
     /// Returns the new generation.
     async fn save(&self, state: &AcmeState, if_generation_match: i64) -> Result<i64> {
         let (dek, wrapped) = generate_and_wrap_dek(self.kms.as_ref()).await?;
-        let ciphertext = encrypt_blob(&dek, &serde_json::to_vec(state)?)?;
+        let ciphertext = encrypt_bound_blob(&dek, &serde_json::to_vec(state)?, STATE_CONTEXT)?;
         self.gcs
             .put_object(STATE_OBJECT, &ciphertext, &wrapped, if_generation_match)
             .await
@@ -563,8 +585,8 @@ mod tests {
     #[test]
     fn derives_domain_from_base_url() {
         assert_eq!(
-            domain_from_base_url("https://136-114-134-221.sslip.io").unwrap(),
-            "136-114-134-221.sslip.io"
+            domain_from_base_url("https://203-0-113-10.sslip.io").unwrap(),
+            "203-0-113-10.sslip.io"
         );
         assert_eq!(
             domain_from_base_url("https://Example.COM/path?q=1").unwrap(),
@@ -630,12 +652,9 @@ mod tests {
         // (key bytes are base64url), so a structurally-valid JSON object
         // round-trips fine for storage tests.
         let key_pkcs8_b64url = {
-            use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use base64::Engine as _;
-            let der = STANDARD
-                .decode("MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQguFGp8VQUlYvbcw0sx185058IH6Inx/FXgjoQbrG1/pyhRANCAATMbANhGtwiMCpfjxT52IFLfNvRSJHU6itT3BwJJCjppR43hmnylg6hwkx1zgedn5Xy+haXrpgg/p5irYfTUJNT")
-                .unwrap();
-            URL_SAFE_NO_PAD.encode(der)
+            URL_SAFE_NO_PAD.encode(rcgen::KeyPair::generate().unwrap().serialize_der())
         };
         let account: AccountCredentials = serde_json::from_value(serde_json::json!({
             "id": "https://example.invalid/acct/1",
@@ -658,7 +677,7 @@ mod tests {
     fn test_renewer(gcs: Arc<FakeGcs>) -> Renewer {
         Renewer::new(
             AcmeConfig {
-                domain: "136-114-134-221.sslip.io".into(),
+                domain: "203-0-113-10.sslip.io".into(),
                 directory_url: "https://example.invalid/dir".into(),
                 contact: None,
                 http_port: 80,
@@ -680,13 +699,13 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let state = test_state(now, "136-114-134-221.sslip.io");
+        let state = test_state(now, "203-0-113-10.sslip.io");
         let generation = renewer.save(&state, 0).await.unwrap();
         assert!(generation > 0);
 
         let (loaded, loaded_gen) = renewer.load().await.unwrap().unwrap();
         assert_eq!(loaded_gen, generation);
-        assert_eq!(loaded.domain, "136-114-134-221.sslip.io");
+        assert_eq!(loaded.domain, "203-0-113-10.sslip.io");
         assert_eq!(loaded.key_pem, "KEY");
         assert_eq!(loaded.chain_pem, "CHAIN");
         assert_eq!(loaded.issued_at_unix, now);

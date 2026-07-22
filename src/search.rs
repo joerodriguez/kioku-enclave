@@ -149,8 +149,8 @@ pub async fn handle_search(
     crate::store::validate_user_id(&user_id)?;
     info!(
         user_id = %user_id,
-        query = %req.query,
         has_embedding = req.query_embedding.is_some(),
+        query_len = req.query.len(),
         "search request"
     );
 

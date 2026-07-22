@@ -1,14 +1,14 @@
-//! # kioku-enclave — Kioku data-plane service
+//! # kioku-enclave — attested Kioku backend
 //!
-//! This is the only process that holds plaintext user data. It runs inside a
-//! GCP Confidential Space VM (AMD SEV) where the TEE guarantees that even the
-//! operator cannot inspect memory.
+//! This process terminates TLS and handles server-side user plaintext inside a
+//! GCP Confidential Space VM (AMD SEV). Deliberate Vertex summarization and
+//! opt-in Gmail delivery are documented egresses; encrypted storage and the
+//! workload operator do not otherwise receive plaintext.
 //!
 //! ## Authentication
 //!
-//! Every request (except `/health`) must carry a Google-signed ID token
-//! (RS256, `https://accounts.google.com`) in the `Authorization: Bearer`
-//! header, with:
+//! The compatibility `/v1/*` data routes require a Google-signed service-account
+//! ID token (RS256, `https://accounts.google.com`) with:
 //!
 //! - `aud` == `ENCLAVE_AUDIENCE` env var (baked into the image)
 //! - `email` == `RUN_SA_EMAIL` env var (the trusted control-plane service
@@ -16,27 +16,27 @@
 //! - `email_verified` == true
 //! - `exp` not yet passed
 //!
-//! This is the ONLY authentication path — there is no shared-secret
-//! fallback and no flag to disable ID-token verification.
+//! The integrated `/api/*` and `/mcp` routes accept short-lived Kioku access
+//! tokens or configured end-user Google ID tokens and check active account
+//! state. OAuth discovery/registration/callback routes, `/health`, and the
+//! public verifier-audience `/v1/attestation` route are intentionally public.
+//! There is no shared-secret auth fallback or auth-disable flag.
 //!
-//! By default the listener binds `0.0.0.0` over plain HTTP and is not itself
-//! access-controlled; the network boundary is the private VPC firewall plus
-//! this per-request ID-token check. See SECURITY.md.
+//! Production builds fail closed unless in-enclave TLS is configured. Plain
+//! HTTP is available only from debug builds with `ENCLAVE_TEST_MODE=1`.
 //!
-//! **In-enclave TLS termination (ADR-0001):** when `ENCLAVE_TLS` is set, the
-//! enclave terminates TLS itself (see `tls.rs` and `serve_tls` below) so the
-//! attested binary is the first code to see request plaintext, rather than an
-//! upstream proxy. The cert fingerprint is the channel-binding value a later
-//! step binds into the attestation token (RA-TLS). See
-//! `docs/adr/0001-enclave-as-sole-backend.md` in the monorepo.
+//! The enclave terminates production TLS itself (see `tls.rs` and `serve_tls`),
+//! so the attested binary is the first server-side application code to see a
+//! request. `/v1/attestation` binds the live certificate fingerprint into the
+//! token nonce for verifier-side channel comparison.
 //!
 //! **ACME auto-renewal (ADR-0003):** when `ENCLAVE_ACME` is set, the enclave
 //! obtains and renews that certificate itself from Let's Encrypt — HTTP-01
 //! answered on :80, key generated in-TEE, state persisted KMS-encrypted in GCS,
-//! live cert hot-swapped on renewal. See `acme.rs`. `ENCLAVE_TLS_*` env certs
-//! then serve only as a bootstrap fallback while issuance retries.
+//! live cert hot-swapped on renewal. See `acme.rs`. Static `ENCLAVE_TLS_*`
+//! inputs remain only for debug/custom bootstrap images.
 //!
-//! ## Routes
+//! ## Compatibility routes
 //!
 //! | Method | Path                       | Description                                  |
 //! |--------|----------------------------|----------------------------------------------|
@@ -50,13 +50,13 @@
 //! | POST   | /v1/episodes/delete_range  | Delete episodes in [from, to)                |
 //! | POST   | /v1/stats                  | Per-user row counts + latest timestamps      |
 //! | GET    | /v1/export                 | Full JSON export of user's index             |
-//! | DELETE | /v1/user                   | Hard-delete all user data (GDPR)             |
+//! | DELETE | /v1/user                   | Legacy content-only delete (trusted SA)      |
 
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     extract::{Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
@@ -82,6 +82,13 @@ mod store;
 mod timeline;
 mod tls;
 
+/// Local test mode is deliberately impossible in release binaries. Checking
+/// for the exact value also prevents values such as `0`, `false`, or an empty
+/// variable from accidentally enabling test credentials.
+pub(crate) fn test_mode_enabled() -> bool {
+    cfg!(debug_assertions) && std::env::var("ENCLAVE_TEST_MODE").as_deref() == Ok("1")
+}
+
 use crate::{
     episodes::{
         handle_episodes_delete_range, handle_episodes_list, handle_episodes_members,
@@ -100,7 +107,7 @@ pub struct AppState {
     /// JWKS verifier for Google ID tokens — the only authentication path.
     id_token_verifier: Arc<auth::IdTokenVerifier>,
     pub attestation_cache: Option<Arc<attestation::AttestationCache>>,
-    pub cert_fingerprint: Option<String>,
+    pub tls_keystone: Option<Arc<tls::TlsKeystone>>,
 }
 
 /// In-process full export of a user's index as JSON (utterances, screenshots,
@@ -246,6 +253,9 @@ fn sqlite_value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
 
 // ── Delete handler ────────────────────────────────────────────────────────────
 
+// This legacy route intentionally deletes only the per-user content blob. It
+// is reachable only through the service-account-authenticated router; end-user
+// identity cleanup and tombstoning use DELETE /api/account instead.
 #[derive(Deserialize)]
 struct DeleteBody {
     user_id: String,
@@ -273,28 +283,68 @@ async fn handle_health() -> Json<serde_json::Value> {
     Json(json!({"ok": true, "service": "kioku-enclave"}))
 }
 
+async fn limit_public_oauth(
+    State(state): State<Arc<cp::CpState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.oauth_limiter.consume("public-oauth").await {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", "1")],
+            Json(json!({"error": "temporarily_unavailable"})),
+        )
+            .into_response()
+    }
+}
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    response
+}
+
 // ── Attestation handler ───────────────────────────────────────────────────────
 
 async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match (&state.attestation_cache, &state.cert_fingerprint) {
-        (Some(cache), Some(fingerprint)) => match cache.get_token(fingerprint).await {
-            Ok(token) => (
-                StatusCode::OK,
-                Json(json!({
-                    "token": token,
-                    "fingerprint": fingerprint,
-                })),
-            ),
-            Err(e) => {
-                warn!(error = %e, "failed to fetch attestation token on demand");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+    match (&state.attestation_cache, &state.tls_keystone) {
+        (Some(cache), Some(keystone)) => {
+            let fingerprint = keystone.fingerprint_hex();
+            match cache.get_token(&fingerprint).await {
+                Ok(token) => (
+                    StatusCode::OK,
                     Json(json!({
-                        "error": format!("failed to fetch attestation token: {e}")
+                        "token": token,
+                        "fingerprint": fingerprint,
                     })),
-                )
+                ),
+                Err(e) => {
+                    warn!(error = %e, "failed to fetch attestation token on demand");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "attestation temporarily unavailable"})),
+                    )
+                }
             }
-        },
+        }
         _ => (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
@@ -328,7 +378,7 @@ async fn main() {
     // production they are baked into the image at build time; ENCLAVE_TEST_MODE
     // provides local-dev defaults only.
     let enclave_audience = std::env::var("ENCLAVE_AUDIENCE").unwrap_or_else(|_| {
-        if std::env::var("ENCLAVE_TEST_MODE").is_ok() {
+        if test_mode_enabled() {
             "http://localhost:8080".to_string()
         } else {
             panic!("ENCLAVE_AUDIENCE must be set");
@@ -336,7 +386,7 @@ async fn main() {
     });
 
     let run_sa_email = std::env::var("RUN_SA_EMAIL").unwrap_or_else(|_| {
-        if std::env::var("ENCLAVE_TEST_MODE").is_ok() {
+        if test_mode_enabled() {
             "test@example.com".to_string()
         } else {
             panic!("RUN_SA_EMAIL must be set");
@@ -378,7 +428,7 @@ async fn main() {
     // ── In-enclave control plane (ADR-0001): OAuth, sync, account, MCP. ─────────
     let control_store = Arc::new(cp::control_store::ControlStore::new(kms, gcs));
 
-    let (jwt_secrets, google_web_client_secret) = if std::env::var("ENCLAVE_TEST_MODE").is_ok() {
+    let (jwt_secrets, google_web_client_secret) = if test_mode_enabled() {
         let jwt_secret =
             std::env::var("JWT_SECRET").unwrap_or_else(|_| "test-jwt-secret".to_string());
         let mut secrets = vec![jwt_secret];
@@ -450,7 +500,7 @@ async fn main() {
                 acme_boot_keystone(&renewer, &cp_config.base_url, &enclave_audience).await,
             );
             Arc::clone(&renewer).spawn(Arc::clone(&ks));
-            let fp = ks.cert_fingerprint_hex.clone();
+            let fp = ks.fingerprint_hex();
             (Some(ks), Some(fp))
         }
         None => match tls::from_env(&cp_config.base_url, &enclave_audience)
@@ -458,24 +508,31 @@ async fn main() {
             .expect("TLS config")
         {
             Some(ks) => {
-                let fp = ks.cert_fingerprint_hex.clone();
+                let fp = ks.fingerprint_hex();
                 (Some(Arc::new(ks)), Some(fp))
             }
             None => (None, None),
         },
     };
 
+    // This public token uses a verifier-specific HTTPS audience. It must never
+    // use ATTEST_STS_AUDIENCE: a WIF-audience token is an STS bearer credential.
+    let public_attestation_audience = format!(
+        "{}/v1/attestation",
+        cp_config.base_url.trim_end_matches('/')
+    );
     let attestation_cache = cert_fingerprint.as_ref().map(|_| {
-        Arc::new(attestation::AttestationCache::new(
-            std::env::var("ATTEST_STS_AUDIENCE").unwrap_or_default(),
-        ))
+        Arc::new(
+            attestation::AttestationCache::new(public_attestation_audience.clone())
+                .expect("valid public attestation audience"),
+        )
     });
 
     let state = Arc::new(AppState {
         store: Arc::clone(&store),
         id_token_verifier,
         attestation_cache: attestation_cache.clone(),
-        cert_fingerprint: cert_fingerprint.clone(),
+        tls_keystone: keystone.clone(),
     });
 
     // In-enclave query embedder for hybrid search. Loading is eager (boot
@@ -491,9 +548,8 @@ async fn main() {
         )),
         sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
         mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
+        oauth_limiter: cp::limits::RateLimiter::new(120.0, 2.0),
         config: cp_config,
-        attestation_cache,
-        cert_fingerprint,
         embedding: embedding_engine,
     });
 
@@ -533,7 +589,11 @@ async fn main() {
             Arc::clone(&cp_state),
             cp::cors::cors_middleware,
         ));
-    let control_plane = cp::oauth::router()
+    let public_oauth = cp::oauth::router().layer(middleware::from_fn_with_state(
+        Arc::clone(&cp_state),
+        limit_public_oauth,
+    ));
+    let control_plane = public_oauth
         .merge(cp_authed)
         .with_state(Arc::clone(&cp_state));
 
@@ -542,6 +602,7 @@ async fn main() {
         .route("/v1/attestation", get(handle_attestation))
         .merge(authenticated)
         .merge(control_plane)
+        .layer(middleware::from_fn(security_headers))
         .with_state(Arc::clone(&state));
 
     // Listen
@@ -550,10 +611,11 @@ async fn main() {
             info!(addr = %addr, tls = true, "listening (in-enclave TLS termination)");
             serve_tls(listener, app, ks).await;
         }
-        None => {
-            info!(addr = %addr, tls = false, "listening (plain HTTP behind VPC firewall)");
+        None if test_mode_enabled() => {
+            warn!(addr = %addr, tls = false, "listening over plain HTTP in debug test mode");
             axum::serve(listener, app).await.expect("server error");
         }
+        None => panic!("production startup refused: in-enclave TLS is not configured"),
     }
 }
 

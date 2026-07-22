@@ -1,22 +1,142 @@
-//! OAuth 2.1 facade + Dynamic Client Registration (ports `cloud/src/oauth.js`).
+//! OAuth 2.1 facade and Dynamic Client Registration.
 //! Public endpoints (no auth): discovery, /register, /authorize, the Google
 //! callback, and /token. MCP clients (Claude/ChatGPT) use this to obtain our
 //! HS256 access tokens; Google is the upstream IdP.
 
-use std::sync::Arc;
+use std::{net::IpAddr, str::FromStr, sync::Arc};
 
 use axum::{
-    extract::{Query, State},
-    http::{header::LOCATION, StatusCode},
+    extract::{DefaultBodyLimit, Query, State},
+    http::{header::LOCATION, StatusCode, Uri},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
 
 use super::{tokens, CpState};
+
+const MAX_CLIENT_NAME_BYTES: usize = 128;
+const MAX_REDIRECT_URIS: usize = 5;
+const MAX_REDIRECT_URI_BYTES: usize = 2048;
+// The encrypted control DB is rewritten as one object. With at most five
+// 2-KiB redirects per registration, 256 clients bounds DCR-controlled storage
+// to roughly 2.5 MiB while leaving ample room for this single-owner service.
+const MAX_OAUTH_CLIENTS: i64 = 256;
+// Registrations that were never used can be safely re-created by a dynamic
+// client. Reclaim them after an hour when the cap is reached so anonymous DCR
+// traffic cannot consume the finite registration table permanently.
+const UNUSED_CLIENT_TTL_SECS: i64 = 60 * 60;
+const MAX_CLIENT_STATE_BYTES: usize = 1024;
+const AUTH_CODE_TTL_SECS: i64 = 5 * 60;
+const REFRESH_TTL_SECS: i64 = 90 * 24 * 60 * 60;
+
+fn is_valid_client_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+fn is_valid_pkce_challenge(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn is_valid_pkce_verifier(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn is_valid_redirect_uri(uri: &str) -> bool {
+    if uri.is_empty()
+        || uri.len() > MAX_REDIRECT_URI_BYTES
+        || uri.contains(['#', '\\'])
+        || uri
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return false;
+    }
+
+    let Ok(parsed) = Uri::from_str(uri) else {
+        return false;
+    };
+    let Some(scheme) = parsed.scheme_str() else {
+        return false;
+    };
+    let Some(authority) = parsed.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    let Some(host) = parsed.host() else {
+        return false;
+    };
+
+    match scheme {
+        "https" => uri.starts_with("https://"),
+        "http" => uri.starts_with("http://") && is_loopback_host(host),
+        _ => false,
+    }
+}
+
+fn validated_registration(
+    body: RegisterBody,
+) -> std::result::Result<(Option<String>, Vec<String>), &'static str> {
+    if body.redirect_uris.is_empty() || body.redirect_uris.len() > MAX_REDIRECT_URIS {
+        return Err("redirect_uris must contain between 1 and 5 entries");
+    }
+    if body
+        .redirect_uris
+        .iter()
+        .any(|uri| !is_valid_redirect_uri(uri))
+    {
+        return Err("redirect_uris must be absolute HTTPS URLs or loopback HTTP URLs");
+    }
+
+    let name = match body.client_name {
+        Some(name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty()
+                || trimmed.len() > MAX_CLIENT_NAME_BYTES
+                || trimmed.chars().any(char::is_control)
+            {
+                return Err("client_name is invalid or too long");
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+
+    let mut uris = body.redirect_uris;
+    uris.sort();
+    let original_len = uris.len();
+    uris.dedup();
+    if uris.len() != original_len {
+        return Err("redirect_uris must not contain duplicates");
+    }
+    Ok((name, uris))
+}
 
 pub fn router() -> Router<Arc<CpState>> {
     Router::new()
@@ -31,33 +151,14 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/register", post(register))
         .route("/authorize", get(authorize))
         .route("/oauth/google/callback", get(google_callback))
+        .route("/oauth/consent", post(consent))
         .route("/oauth/gmail/callback", get(gmail_callback))
         .route("/token", post(token))
+        .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
 fn redirect_302(url: &str) -> Response {
     (StatusCode::FOUND, [(LOCATION, url.to_string())]).into_response()
-}
-
-fn is_valid_redirect_uri(uri: &str) -> bool {
-    match url_parts(uri) {
-        Some((scheme, host)) => {
-            scheme == "https" || (scheme == "http" && (host == "localhost" || host == "127.0.0.1"))
-        }
-        None => false,
-    }
-}
-
-/// Minimal scheme+host extraction (avoids a url crate dependency).
-fn url_parts(uri: &str) -> Option<(String, String)> {
-    let (scheme, rest) = uri.split_once("://")?;
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.split('@').next_back().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
-    if scheme.is_empty() || host.is_empty() {
-        return None;
-    }
-    Some((scheme.to_lowercase(), host.to_lowercase()))
 }
 
 // ── Discovery ───────────────────────────────────────────────────────────────────
@@ -90,45 +191,114 @@ struct RegisterBody {
     redirect_uris: Vec<String>,
 }
 
-async fn register(State(s): State<Arc<CpState>>, Json(body): Json<RegisterBody>) -> Response {
-    if body.redirect_uris.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_client_metadata", "error_description": "redirect_uris required"})),
+enum ClientRegistration {
+    Existing(String),
+    Created(String),
+    AtCapacity,
+}
+
+fn register_client_conn(
+    conn: &rusqlite::Connection,
+    proposed_client_id: &str,
+    client_name: Option<&str>,
+    redirect_uris_json: &str,
+) -> crate::error::Result<(ClientRegistration, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT client_id FROM oauth_clients WHERE redirect_uris = ?1 LIMIT 1",
+            [redirect_uris_json],
+            |r| r.get(0),
         )
-            .into_response();
+        .optional()?;
+    if let Some(client_id) = existing {
+        tx.rollback()?;
+        return Ok((ClientRegistration::Existing(client_id), false));
     }
-    for uri in &body.redirect_uris {
-        if !is_valid_redirect_uri(uri) {
+
+    let mut count: i64 = tx.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+    let mut reclaimed = 0;
+    if count >= MAX_OAUTH_CLIENTS {
+        reclaimed = tx.execute(
+            "DELETE FROM oauth_clients \
+             WHERE created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?1) \
+               AND NOT EXISTS (SELECT 1 FROM oauth_consents p \
+                               WHERE p.client_id = oauth_clients.client_id \
+                                 AND p.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+               AND NOT EXISTS (SELECT 1 FROM oauth_authorization_codes a \
+                               WHERE a.client_id = oauth_clients.client_id \
+                                 AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
+               AND NOT EXISTS (SELECT 1 FROM refresh_tokens r \
+                               WHERE r.client_id = oauth_clients.client_id \
+                                 AND r.revoked = 0 \
+                                 AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            [format!("-{UNUSED_CLIENT_TTL_SECS} seconds")],
+        )?;
+        count = tx.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+    }
+    if count >= MAX_OAUTH_CLIENTS {
+        if reclaimed == 0 {
+            tx.rollback()?;
+        } else {
+            tx.commit()?;
+        }
+        return Ok((ClientRegistration::AtCapacity, reclaimed != 0));
+    }
+
+    tx.execute(
+        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, ?2, ?3)",
+        rusqlite::params![proposed_client_id, client_name, redirect_uris_json],
+    )?;
+    tx.commit()?;
+    Ok((
+        ClientRegistration::Created(proposed_client_id.to_string()),
+        true,
+    ))
+}
+
+async fn register(State(s): State<Arc<CpState>>, Json(body): Json<RegisterBody>) -> Response {
+    let (name, redirect_uris) = match validated_registration(body) {
+        Ok(validated) => validated,
+        Err(description) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_redirect_uri", "error_description": format!("bad redirect_uri: {uri}")})),
+                Json(json!({
+                    "error": "invalid_client_metadata",
+                    "error_description": description,
+                })),
             )
-                .into_response();
+                .into_response()
         }
-    }
-    let client_id = tokens::new_uuid();
-    let uris_json = serde_json::to_string(&body.redirect_uris).unwrap_or_else(|_| "[]".into());
-    let name = body.client_name.clone();
+    };
+
+    let proposed_client_id = tokens::new_uuid();
+    let uris_json = match serde_json::to_string(&redirect_uris) {
+        Ok(json) => json,
+        Err(_) => return server_error(),
+    };
     let res = s
         .control
-        .write(move |conn| {
-            conn.execute(
-                "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, ?2, ?3)",
-                rusqlite::params![client_id, name, uris_json],
-            )?;
-            Ok(client_id)
+        .write_if_changed(move |conn| {
+            register_client_conn(conn, &proposed_client_id, name.as_deref(), &uris_json)
         })
         .await;
     match res {
-        Ok(client_id) => (
+        Ok(ClientRegistration::Existing(client_id) | ClientRegistration::Created(client_id)) => (
             StatusCode::CREATED,
             Json(json!({
                 "client_id": client_id,
-                "redirect_uris": body.redirect_uris,
+                "redirect_uris": redirect_uris,
                 "token_endpoint_auth_method": "none",
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
+            })),
+        )
+            .into_response(),
+        Ok(ClientRegistration::AtCapacity) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "invalid_client_metadata",
+                "error_description": "client registration capacity reached",
             })),
         )
             .into_response(),
@@ -162,15 +332,23 @@ async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery
     let Some(code_challenge) = q.code_challenge.clone() else {
         return bad_request_desc("invalid_request", "code_challenge required");
     };
-    if let Some(m) = &q.code_challenge_method {
-        if m != "S256" {
-            return bad_request_desc("invalid_request", "Only S256 supported");
-        }
+    if !is_valid_pkce_challenge(&code_challenge) {
+        return bad_request_desc("invalid_request", "invalid S256 code_challenge");
+    }
+    if q.code_challenge_method.as_deref() != Some("S256") {
+        return bad_request_desc("invalid_request", "code_challenge_method must be S256");
     }
     let (client_id, redirect_uri) = match (q.client_id.clone(), q.redirect_uri.clone()) {
         (Some(c), Some(r)) => (c, r),
         _ => return bad_request_desc("invalid_request", "client_id and redirect_uri required"),
     };
+    if !is_valid_client_id(&client_id) || !is_valid_redirect_uri(&redirect_uri) {
+        return bad_request_desc("invalid_request", "invalid client_id or redirect_uri");
+    }
+    let client_state = q.state.unwrap_or_default();
+    if client_state.len() > MAX_CLIENT_STATE_BYTES || client_state.chars().any(char::is_control) {
+        return bad_request_desc("invalid_request", "state is invalid or too long");
+    }
 
     // Validate client + exact redirect_uri match.
     let cid = client_id.clone();
@@ -183,7 +361,7 @@ async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery
                     [&cid],
                     |r| r.get::<_, String>(0),
                 )
-                .ok())
+                .optional()?)
         })
         .await
     {
@@ -199,7 +377,10 @@ async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery
     let Some(uris_json) = registered else {
         return bad_request("invalid_client");
     };
-    let uris: Vec<String> = serde_json::from_str(&uris_json).unwrap_or_default();
+    let uris: Vec<String> = match serde_json::from_str(&uris_json) {
+        Ok(uris) => uris,
+        Err(_) => return server_error(),
+    };
     if !uris.contains(&redirect_uri) {
         return bad_request_desc("invalid_request", "redirect_uri mismatch");
     }
@@ -209,7 +390,7 @@ async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery
         &tokens::StateClaims {
             client_id: client_id.clone(),
             redirect_uri,
-            client_state: q.state.clone().unwrap_or_default(),
+            client_state,
             code_challenge,
             exp: 0,
         },
@@ -254,23 +435,195 @@ struct GoogleTokenResp {
     id_token: String,
 }
 
+fn callback_error(status: StatusCode, heading: &'static str, message: &'static str) -> Response {
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>{heading}</title><h1>{heading}</h1><p>{message}</p>"
+    );
+    (
+        status,
+        [
+            ("Cache-Control", "no-store"),
+            (
+                "Content-Security-Policy",
+                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            ),
+            ("Referrer-Policy", "no-referrer"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("X-Frame-Options", "DENY"),
+        ],
+        Html(body),
+    )
+        .into_response()
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+fn redirect_origin(redirect_uri: &str) -> Option<String> {
+    let uri = Uri::from_str(redirect_uri).ok()?;
+    Some(format!(
+        "{}://{}",
+        uri.scheme_str()?,
+        uri.authority()?.as_str()
+    ))
+}
+
+struct RegisteredClient {
+    name: Option<String>,
+}
+
+fn registered_client_conn(
+    conn: &rusqlite::Connection,
+    client_id: &str,
+    redirect_uri: &str,
+) -> crate::error::Result<Option<RegisteredClient>> {
+    let row: Option<(Option<String>, String)> = conn
+        .query_row(
+            "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
+            [client_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((name, redirect_uris_json)) = row else {
+        return Ok(None);
+    };
+    let redirect_uris: Vec<String> = serde_json::from_str(&redirect_uris_json)?;
+    if !is_valid_redirect_uri(redirect_uri) || !redirect_uris.iter().any(|uri| uri == redirect_uri)
+    {
+        return Ok(None);
+    }
+    Ok(Some(RegisteredClient { name }))
+}
+
+fn consent_page(client_name: Option<&str>, origin: &str, consent_token: &str) -> Response {
+    let display_name = client_name
+        .map(|name| name.chars().take(MAX_CLIENT_NAME_BYTES).collect::<String>())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Unnamed OAuth client".to_string());
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Authorize Kioku access</title>\
+         <h1>Authorize Kioku access</h1>\
+         <p><strong>{}</strong> at <code>{}</code> is requesting access.</p>\
+         <p>Approval allows this client to search, read, and export your full Kioku archive, \
+         and to keep access with a refresh token until revoked.</p>\
+         <p>Only approve if you trust both the client and redirect origin.</p>\
+         <form method=\"post\" action=\"/oauth/consent\">\
+         <input type=\"hidden\" name=\"consent_token\" value=\"{}\">\
+         <input type=\"hidden\" name=\"decision\" value=\"approve\">\
+         <button type=\"submit\">Approve full archive access</button></form>",
+        html_escape(&display_name),
+        html_escape(origin),
+        html_escape(consent_token),
+    );
+    (
+        StatusCode::OK,
+        [
+            ("Cache-Control", "no-store"),
+            (
+                "Content-Security-Policy",
+                "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            ),
+            ("Referrer-Policy", "no-referrer"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("X-Frame-Options", "DENY"),
+        ],
+        Html(body),
+    )
+        .into_response()
+}
+
+fn store_pending_consent_conn(
+    conn: &rusqlite::Connection,
+    consent_hash: &str,
+    user_id: &str,
+    client_id: &str,
+    redirect_uri: &str,
+) -> crate::error::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM oauth_consents \
+         WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        [],
+    )?;
+    let inserted = tx.execute(
+        "INSERT INTO oauth_consents (consent_hash, user_id, client_id, redirect_uri, expires_at) \
+         SELECT ?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?5) \
+         WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
+           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
+        rusqlite::params![
+            consent_hash,
+            user_id,
+            client_id,
+            redirect_uri,
+            format!("+{AUTH_CODE_TTL_SECS} seconds")
+        ],
+    )?;
+    if inserted != 1 {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+fn approve_consent_conn(
+    conn: &rusqlite::Connection,
+    consent_hash: &str,
+    code_hash: &str,
+    user_id: &str,
+    client_id: &str,
+    redirect_uri: &str,
+) -> crate::error::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let consumed = tx.execute(
+        "DELETE FROM oauth_consents \
+         WHERE consent_hash = ?1 AND user_id = ?2 AND client_id = ?3 AND redirect_uri = ?4 \
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+           AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
+           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
+        rusqlite::params![consent_hash, user_id, client_id, redirect_uri],
+    )?;
+    if consumed != 1 {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO oauth_authorization_codes (code_hash, user_id, client_id, expires_at) \
+         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
+        rusqlite::params![
+            code_hash,
+            user_id,
+            client_id,
+            format!("+{AUTH_CODE_TTL_SECS} seconds")
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 async fn google_callback(
     State(s): State<Arc<CpState>>,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    if let Some(e) = q.error {
-        return (
+    if q.error.is_some() {
+        return callback_error(
             StatusCode::BAD_REQUEST,
-            Html(format!("<h1>Authentication failed</h1><p>{e}</p>")),
-        )
-            .into_response();
+            "Authentication failed",
+            "Authentication was not completed.",
+        );
     }
     let (Some(code), Some(state_jwt)) = (q.code, q.state) else {
-        return (
+        return callback_error(
             StatusCode::BAD_REQUEST,
-            Html("<h1>Missing code/state</h1>".to_string()),
-        )
-            .into_response();
+            "Authentication failed",
+            "The callback was missing required parameters.",
+        );
     };
     let state = match tokens::verify_state(&s.config.jwt_secrets[0], &state_jwt) {
         Ok(st) => st,
@@ -285,11 +638,11 @@ async fn google_callback(
             {
                 Some(st) => st,
                 None => {
-                    return (
+                    return callback_error(
                         StatusCode::BAD_REQUEST,
-                        Html("<h1>Invalid or expired state</h1>".to_string()),
+                        "Authentication failed",
+                        "The authorization request is invalid or expired.",
                     )
-                        .into_response()
                 }
             }
         }
@@ -305,7 +658,7 @@ async fn google_callback(
     ])
     .unwrap_or_default();
 
-    let http = reqwest::Client::new();
+    let http = super::bounded_http_client();
     let resp = http
         .post("https://oauth2.googleapis.com/token")
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -316,85 +669,269 @@ async fn google_callback(
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(t) => t,
             Err(_) => {
-                return (
+                return callback_error(
                     StatusCode::BAD_GATEWAY,
-                    Html("<h1>Google token parse failed</h1>".to_string()),
+                    "Authentication failed",
+                    "The identity provider returned an invalid response.",
                 )
-                    .into_response()
             }
         },
         _ => {
-            return (
+            return callback_error(
                 StatusCode::BAD_GATEWAY,
-                Html("<h1>Google token exchange failed</h1>".to_string()),
+                "Authentication failed",
+                "The identity provider could not complete authentication.",
             )
-                .into_response()
         }
     };
 
     let (google_sub, email) = match s.user_verifier.verify(&token_data.id_token).await {
         Ok(v) => v,
         Err(_) => {
-            return (
+            return callback_error(
                 StatusCode::BAD_GATEWAY,
-                Html("<h1>ID token verification failed</h1>".to_string()),
+                "Authentication failed",
+                "The identity response could not be verified.",
             )
-                .into_response()
         }
     };
     if !s.config.email_allowed(&email) {
-        return (
+        return callback_error(
             StatusCode::FORBIDDEN,
-            Html(format!(
-                "<h1>Access denied</h1><p>{email} is not authorized.</p>"
-            )),
-        )
-            .into_response();
+            "Access denied",
+            "This account is not authorized.",
+        );
     }
 
     let user = match s.control.upsert_user(&google_sub, &email).await {
         Ok(u) => u,
         Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<h1>Internal error</h1>".to_string()),
+            return callback_error(
+                StatusCode::FORBIDDEN,
+                "Access denied",
+                "This account is unavailable.",
             )
-                .into_response()
         }
     };
+
+    let (client_id, redirect_uri) = (state.client_id.clone(), state.redirect_uri.clone());
+    let registered = s
+        .control
+        .read({
+            let client_id = client_id.clone();
+            let redirect_uri = redirect_uri.clone();
+            move |conn| registered_client_conn(conn, &client_id, &redirect_uri)
+        })
+        .await;
+    let RegisteredClient { name } = match registered {
+        Ok(Some(client)) => client,
+        _ => {
+            return callback_error(
+                StatusCode::BAD_REQUEST,
+                "Authentication failed",
+                "The OAuth client registration is unavailable.",
+            )
+        }
+    };
+    let Some(origin) = redirect_origin(&redirect_uri) else {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authentication failed",
+            "The OAuth client redirect is invalid.",
+        );
+    };
+
+    let consent_token = match tokens::issue_consent(
+        &s.config.jwt_secrets[0],
+        &tokens::ConsentClaims {
+            user_id: user.id.clone(),
+            client_id: client_id.clone(),
+            redirect_uri: redirect_uri.clone(),
+            client_state: state.client_state,
+            code_challenge: state.code_challenge,
+            exp: 0,
+        },
+    ) {
+        Ok(token) => token,
+        Err(_) => {
+            return callback_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Authentication failed",
+                "The authorization could not be completed.",
+            )
+        }
+    };
+    let consent_hash = tokens::sha256_hex(&consent_token);
+    let user_id = user.id;
+    let stored = s
+        .control
+        .write_if_changed(move |conn| {
+            let stored = store_pending_consent_conn(
+                conn,
+                &consent_hash,
+                &user_id,
+                &client_id,
+                &redirect_uri,
+            )?;
+            Ok((stored, stored))
+        })
+        .await;
+    if !matches!(stored, Ok(true)) {
+        return callback_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Authentication failed",
+            "The authorization could not be completed.",
+        );
+    }
+    consent_page(name.as_deref(), &origin, &consent_token)
+}
+
+#[derive(Deserialize)]
+struct ConsentForm {
+    consent_token: Option<String>,
+    decision: Option<String>,
+}
+
+async fn consent(State(s): State<Arc<CpState>>, body: String) -> Response {
+    if body.len() > 8192 {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authorization failed",
+            "The consent response is invalid.",
+        );
+    }
+    let form: ConsentForm = match serde_urlencoded::from_str(&body) {
+        Ok(form) => form,
+        Err(_) => {
+            return callback_error(
+                StatusCode::BAD_REQUEST,
+                "Authorization failed",
+                "The consent response is invalid.",
+            )
+        }
+    };
+    if form.decision.as_deref() != Some("approve") {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authorization denied",
+            "Full archive access was not approved.",
+        );
+    }
+    let Some(consent_token) = form.consent_token else {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authorization failed",
+            "The consent response is invalid.",
+        );
+    };
+    if consent_token.len() > 4096 || !consent_token.is_ascii() {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authorization failed",
+            "The consent response is invalid or expired.",
+        );
+    }
+    let claims = match s
+        .config
+        .jwt_secrets
+        .iter()
+        .find_map(|secret| tokens::verify_consent(secret, &consent_token).ok())
+    {
+        Some(claims) => claims,
+        None => {
+            return callback_error(
+                StatusCode::BAD_REQUEST,
+                "Authorization failed",
+                "The consent response is invalid or expired.",
+            )
+        }
+    };
+    if !is_valid_client_id(&claims.client_id)
+        || !is_valid_redirect_uri(&claims.redirect_uri)
+        || !is_valid_pkce_challenge(&claims.code_challenge)
+        || claims.client_state.len() > MAX_CLIENT_STATE_BYTES
+    {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authorization failed",
+            "The consent response is invalid.",
+        );
+    }
+
+    let registered = s
+        .control
+        .read({
+            let client_id = claims.client_id.clone();
+            let redirect_uri = claims.redirect_uri.clone();
+            move |conn| registered_client_conn(conn, &client_id, &redirect_uri)
+        })
+        .await;
+    if !matches!(registered, Ok(Some(_))) {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authorization failed",
+            "The OAuth client registration is unavailable.",
+        );
+    }
 
     let auth_code = match tokens::issue_auth_code(
         &s.config.jwt_secrets[0],
-        &user.id,
-        &state.client_id,
-        &state.code_challenge,
+        &claims.user_id,
+        &claims.client_id,
+        &claims.code_challenge,
     ) {
-        Ok(c) => c,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<h1>Internal error</h1>".to_string()),
-            )
-                .into_response()
-        }
+        Ok(code) => code,
+        Err(_) => return server_error(),
     };
+    let consent_hash = tokens::sha256_hex(&consent_token);
+    let code_hash = tokens::sha256_hex(&auth_code);
+    let (user_id, client_id, redirect_uri) = (
+        claims.user_id.clone(),
+        claims.client_id.clone(),
+        claims.redirect_uri.clone(),
+    );
+    let approved = s
+        .control
+        .write_if_changed(move |conn| {
+            let approved = approve_consent_conn(
+                conn,
+                &consent_hash,
+                &code_hash,
+                &user_id,
+                &client_id,
+                &redirect_uri,
+            )?;
+            Ok((approved, approved))
+        })
+        .await;
+    match approved {
+        Ok(true) => {}
+        Ok(false) => {
+            return callback_error(
+                StatusCode::BAD_REQUEST,
+                "Authorization failed",
+                "This consent response was already used or has expired.",
+            )
+        }
+        Err(_) => return server_error(),
+    }
 
     let mut params = vec![("code", auth_code.as_str())];
-    if !state.client_state.is_empty() {
-        params.push(("state", state.client_state.as_str()));
+    if !claims.client_state.is_empty() {
+        params.push(("state", claims.client_state.as_str()));
     }
-    let sep = if state.redirect_uri.contains('?') {
+    let separator = if claims.redirect_uri.contains('?') {
         '&'
     } else {
         '?'
     };
-    let url = format!(
+    let redirect = format!(
         "{}{}{}",
-        state.redirect_uri,
-        sep,
+        claims.redirect_uri,
+        separator,
         serde_urlencoded::to_string(&params).unwrap_or_default()
     );
-    redirect_302(&url)
+    redirect_302(&redirect)
 }
 
 // ── Gmail OAuth Callback and Connection ──────────────────────────────────────────
@@ -408,19 +945,19 @@ struct GmailTokenResp {
 }
 
 async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQuery>) -> Response {
-    if let Some(e) = q.error {
-        return (
+    if q.error.is_some() {
+        return callback_error(
             StatusCode::BAD_REQUEST,
-            Html(format!("<h1>Gmail authorization failed</h1><p>{e}</p>")),
-        )
-            .into_response();
+            "Gmail authorization failed",
+            "Gmail authorization was not completed.",
+        );
     }
     let (Some(code), Some(state_jwt)) = (q.code, q.state) else {
-        return (
+        return callback_error(
             StatusCode::BAD_REQUEST,
-            Html("<h1>Missing code/state</h1>".to_string()),
-        )
-            .into_response();
+            "Gmail authorization failed",
+            "The callback was missing required parameters.",
+        );
     };
 
     let gmail_state = match tokens::verify_gmail_state(&s.config.jwt_secrets[0], &state_jwt) {
@@ -435,11 +972,11 @@ async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQ
             {
                 Some(st) => st,
                 None => {
-                    return (
+                    return callback_error(
                         StatusCode::BAD_REQUEST,
-                        Html("<h1>Invalid or expired Gmail OAuth state</h1>".to_string()),
+                        "Gmail authorization failed",
+                        "The authorization request is invalid or expired.",
                     )
-                        .into_response()
                 }
             }
         }
@@ -455,7 +992,7 @@ async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQ
     ])
     .unwrap_or_default();
 
-    let http = reqwest::Client::new();
+    let http = super::bounded_http_client();
     let resp = http
         .post("https://oauth2.googleapis.com/token")
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -467,30 +1004,30 @@ async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQ
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(t) => t,
             Err(_) => {
-                return (
+                return callback_error(
                     StatusCode::BAD_GATEWAY,
-                    Html("<h1>Google token parse failed</h1>".to_string()),
+                    "Gmail authorization failed",
+                    "The identity provider returned an invalid response.",
                 )
-                    .into_response()
             }
         },
         _ => {
-            return (
+            return callback_error(
                 StatusCode::BAD_GATEWAY,
-                Html("<h1>Google token exchange failed</h1>".to_string()),
+                "Gmail authorization failed",
+                "The identity provider could not complete authorization.",
             )
-                .into_response()
         }
     };
 
     let (returned_sub, returned_email) = match s.user_verifier.verify(&token_data.id_token).await {
         Ok(v) => v,
         Err(_) => {
-            return (
+            return callback_error(
                 StatusCode::BAD_GATEWAY,
-                Html("<h1>Google ID token verification failed</h1>".to_string()),
+                "Gmail authorization failed",
+                "The identity response could not be verified.",
             )
-                .into_response()
         }
     };
 
@@ -498,40 +1035,37 @@ async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQ
     let expected_email = match s.control.user_email(&user_id).await {
         Ok(Some(email)) => email,
         _ => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<h1>User not found</h1>".to_string()),
+            return callback_error(
+                StatusCode::UNAUTHORIZED,
+                "Gmail authorization failed",
+                "The Kioku account is unavailable.",
             )
-                .into_response()
         }
     };
 
     let dest_lower = returned_email.to_lowercase();
     if !dest_lower.ends_with("@gmail.com") && !dest_lower.ends_with("@googlemail.com") {
-        return (
+        return callback_error(
             StatusCode::BAD_REQUEST,
-            Html("<h1>Feature requires a personal Gmail or Googlemail account</h1>".to_string()),
-        )
-            .into_response();
+            "Gmail authorization failed",
+            "This feature requires a personal Gmail account.",
+        );
     }
 
     if expected_email.to_lowercase() != dest_lower {
-        return (
+        return callback_error(
             StatusCode::BAD_REQUEST,
-            Html(
-                "<h1>Account mismatch: authorized Google account does not match Kioku account</h1>"
-                    .to_string(),
-            ),
-        )
-            .into_response();
+            "Gmail authorization failed",
+            "The authorized Google account does not match the Kioku account.",
+        );
     }
 
     let Some(refresh_token) = token_data.refresh_token else {
-        return (
+        return callback_error(
             StatusCode::BAD_REQUEST,
-            Html("<h1>Failed to obtain refresh token. Please disconnect and reconnect Gmail with offline access permitted.</h1>".to_string()),
-        )
-            .into_response();
+            "Gmail authorization failed",
+            "Reconnect Gmail and allow offline access.",
+        );
     };
 
     let now_iso = crate::cp::isotime::format_epoch_millis(
@@ -552,11 +1086,11 @@ async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQ
 
     if let Err(e) = s.control.upsert_gmail_config(config).await {
         tracing::error!(error = %e, "failed to save Gmail configuration");
-        return (
+        return callback_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Html("<h1>Failed to save configuration</h1>".to_string()),
-        )
-            .into_response();
+            "Gmail authorization failed",
+            "The authorization could not be saved.",
+        );
     }
 
     let redirect_url = format!("{}/app#settings", s.config.web_origin);
@@ -633,9 +1167,10 @@ struct TokenForm {
     refresh_token: Option<String>,
 }
 
-const REFRESH_TTL_SECS: i64 = 90 * 24 * 60 * 60;
-
 async fn token(State(s): State<Arc<CpState>>, body: String) -> Response {
+    if body.len() > 8192 {
+        return bad_request("invalid_request");
+    }
     let form: TokenForm = match serde_urlencoded::from_str(&body) {
         Ok(f) => f,
         Err(_) => return bad_request("invalid_request"),
@@ -651,10 +1186,93 @@ async fn token(State(s): State<Arc<CpState>>, body: String) -> Response {
     }
 }
 
+fn exchange_authorization_code_conn(
+    conn: &rusqlite::Connection,
+    code_hash: &str,
+    user_id: &str,
+    client_id: &str,
+    refresh_hash: &str,
+) -> crate::error::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let consumed = tx.execute(
+        "DELETE FROM oauth_authorization_codes \
+         WHERE code_hash = ?1 AND user_id = ?2 AND client_id = ?3 \
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+           AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
+           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
+        rusqlite::params![code_hash, user_id, client_id],
+    )?;
+    if consumed != 1 {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
+         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
+        rusqlite::params![
+            refresh_hash,
+            user_id,
+            client_id,
+            format!("+{REFRESH_TTL_SECS} seconds")
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn rotate_refresh_token_conn(
+    conn: &rusqlite::Connection,
+    old_hash: &str,
+    client_id: &str,
+    new_hash: &str,
+) -> crate::error::Result<Option<String>> {
+    let tx = conn.unchecked_transaction()?;
+    let user_id: Option<String> = tx
+        .query_row(
+            "SELECT r.user_id FROM refresh_tokens r \
+             JOIN users u ON u.id = r.user_id AND u.status = 'active' \
+             JOIN oauth_clients c ON c.client_id = r.client_id \
+             WHERE r.token_hash = ?1 AND r.client_id = ?2 AND r.revoked = 0 \
+               AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            rusqlite::params![old_hash, client_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(user_id) = user_id else {
+        tx.rollback()?;
+        return Ok(None);
+    };
+
+    let updated = tx.execute(
+        "UPDATE refresh_tokens SET revoked = 1 \
+         WHERE token_hash = ?1 AND client_id = ?2 AND revoked = 0",
+        rusqlite::params![old_hash, client_id],
+    )?;
+    if updated != 1 {
+        tx.rollback()?;
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
+         VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
+        rusqlite::params![
+            new_hash,
+            user_id,
+            client_id,
+            format!("+{REFRESH_TTL_SECS} seconds")
+        ],
+    )?;
+    tx.commit()?;
+    Ok(Some(user_id))
+}
+
 async fn token_auth_code(s: Arc<CpState>, form: TokenForm) -> Response {
     let Some(code) = form.code else {
         return bad_request_desc("invalid_request", "code required");
     };
+    if code.len() > 4096 || !code.is_ascii() {
+        return bad_request_desc("invalid_grant", "Invalid or expired code");
+    }
     let claims = match s
         .config
         .jwt_secrets
@@ -667,10 +1285,19 @@ async fn token_auth_code(s: Arc<CpState>, form: TokenForm) -> Response {
     let Some(verifier) = form.code_verifier else {
         return bad_request_desc("invalid_request", "code_verifier required");
     };
+    if !is_valid_pkce_verifier(&verifier) {
+        return bad_request_desc("invalid_request", "invalid code_verifier");
+    }
     if tokens::pkce_s256(&verifier) != claims.code_challenge {
         return bad_request_desc("invalid_grant", "PKCE verification failed");
     }
-    if form.client_id.as_deref() != Some(claims.client_id.as_str()) {
+    let Some(client_id) = form.client_id else {
+        return bad_request_desc("invalid_request", "client_id required");
+    };
+    if !is_valid_client_id(&client_id)
+        || client_id != claims.client_id
+        || !is_valid_pkce_challenge(&claims.code_challenge)
+    {
         return bad_request_desc("invalid_grant", "client_id mismatch");
     }
 
@@ -683,99 +1310,82 @@ async fn token_auth_code(s: Arc<CpState>, form: TokenForm) -> Response {
         Err(_) => return server_error(),
     };
     let raw_refresh = tokens::random_token_hex();
-    let hash = tokens::sha256_hex(&raw_refresh);
-    let (uid, cid) = (claims.user_id.clone(), claims.client_id.clone());
-    if s.control
-        .write(move |conn| {
-            conn.execute(
-                "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
-                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
-                rusqlite::params![hash, uid, cid, format!("+{REFRESH_TTL_SECS} seconds")],
+    let refresh_hash = tokens::sha256_hex(&raw_refresh);
+    let code_hash = tokens::sha256_hex(&code);
+    let (user_id, stored_client_id) = (claims.user_id, client_id);
+    let exchanged = s
+        .control
+        .write_if_changed(move |conn| {
+            let exchanged = exchange_authorization_code_conn(
+                conn,
+                &code_hash,
+                &user_id,
+                &stored_client_id,
+                &refresh_hash,
             )?;
-            Ok(())
+            Ok((exchanged, exchanged))
         })
-        .await
-        .is_err()
-    {
-        return server_error();
+        .await;
+    match exchanged {
+        Ok(true) => token_response(&access, &raw_refresh),
+        Ok(false) => bad_request_desc("invalid_grant", "Invalid or already-used code"),
+        Err(_) => server_error(),
     }
-    token_response(&access, &raw_refresh)
 }
 
 async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
     let Some(incoming) = form.refresh_token else {
         return bad_request_desc("invalid_request", "refresh_token required");
     };
-    let hash = tokens::sha256_hex(&incoming);
-
-    // Read the row, validate, rotate (revoke old + insert new) atomically.
-    let hash_for_read = hash.clone();
-    let row: Option<(String, String, bool, bool)> = match s
-        .control
-        .read(move |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT user_id, client_id, revoked, (expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
-                     FROM refresh_tokens WHERE token_hash = ?1",
-                    [&hash_for_read],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? != 0, r.get::<_, i64>(3)? != 0)),
-                )
-                .ok())
-        })
-        .await
+    let Some(client_id) = form.client_id else {
+        return bad_request_desc("invalid_request", "client_id required");
+    };
+    if incoming.len() != 64
+        || !incoming.bytes().all(|b| b.is_ascii_hexdigit())
+        || !is_valid_client_id(&client_id)
     {
-        Ok(v) => v,
+        return bad_request_desc("invalid_grant", "Invalid refresh token");
+    }
+
+    let old_hash = tokens::sha256_hex(&incoming);
+    let raw_refresh = tokens::random_token_hex();
+    let new_hash = tokens::sha256_hex(&raw_refresh);
+    let rotated = s
+        .control
+        .write_if_changed(move |conn| {
+            let user_id = rotate_refresh_token_conn(conn, &old_hash, &client_id, &new_hash)?;
+            Ok((user_id.clone(), user_id.is_some()))
+        })
+        .await;
+    let user_id = match rotated {
+        Ok(Some(user_id)) => user_id,
+        Ok(None) => return bad_request_desc("invalid_grant", "Invalid refresh token"),
         Err(_) => return server_error(),
     };
-
-    let Some((user_id, client_id, revoked, expired)) = row else {
-        return bad_request_desc("invalid_grant", "Refresh token not found");
-    };
-    if revoked {
-        return bad_request_desc("invalid_grant", "Refresh token revoked");
-    }
-    if expired {
-        return bad_request_desc("invalid_grant", "Refresh token expired");
-    }
-
     let access =
         match tokens::issue_access_token(&s.config.jwt_secrets[0], &s.config.base_url, &user_id) {
             Ok(t) => t,
             Err(_) => return server_error(),
         };
-    let raw_refresh = tokens::random_token_hex();
-    let new_hash = tokens::sha256_hex(&raw_refresh);
-    let (uid, cid) = (user_id.clone(), client_id.clone());
-    if s.control
-        .write(move |conn| {
-            conn.execute(
-                "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?1",
-                [&hash],
-            )?;
-            conn.execute(
-                "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
-                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
-                rusqlite::params![new_hash, uid, cid, format!("+{REFRESH_TTL_SECS} seconds")],
-            )?;
-            Ok(())
-        })
-        .await
-        .is_err()
-    {
-        return server_error();
-    }
     token_response(&access, &raw_refresh)
 }
 
 fn token_response(access: &str, refresh: &str) -> Response {
-    Json(json!({
-        "access_token": access,
-        "token_type": "bearer",
-        "expires_in": 3600,
-        "refresh_token": refresh,
-        "scope": "",
-    }))
-    .into_response()
+    (
+        [
+            ("Cache-Control", "no-store"),
+            ("Pragma", "no-cache"),
+            ("X-Content-Type-Options", "nosniff"),
+        ],
+        Json(json!({
+            "access_token": access,
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "refresh_token": refresh,
+            "scope": "",
+        })),
+    )
+        .into_response()
 }
 
 fn bad_request(err: &str) -> Response {
@@ -794,4 +1404,279 @@ fn server_error() -> Response {
         Json(json!({"error": "server_error"})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use rusqlite::Connection;
+
+    const CLIENT: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER_CLIENT: &str = "22222222-2222-4222-8222-222222222222";
+    const USER: &str = "33333333-3333-4333-8333-333333333333";
+    const REDIRECT: &str = "https://client.example/oauth/callback";
+
+    fn oauth_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, status TEXT NOT NULL); \
+             CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL); \
+             CREATE TABLE oauth_consents (consent_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE oauth_authorization_codes (code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE refresh_tokens (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (id, status) VALUES (?1, 'active')",
+            [USER],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, 'Test Client', ?2)",
+            rusqlite::params![CLIENT, serde_json::to_string(&vec![REDIRECT]).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, 'Other Client', ?2)",
+            rusqlite::params![OTHER_CLIENT, serde_json::to_string(&vec!["https://other.example/cb"]).unwrap()],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn redirect_validation_is_strict() {
+        assert!(is_valid_redirect_uri(REDIRECT));
+        assert!(is_valid_redirect_uri("http://127.0.0.1:49152/callback"));
+        assert!(is_valid_redirect_uri("http://localhost:8080/callback"));
+        assert!(is_valid_redirect_uri("http://[::1]:8080/callback"));
+
+        for invalid in [
+            "http://client.example/callback",
+            "https://user@client.example/callback",
+            "https://client.example/callback#fragment",
+            "http://evil.example\\@localhost/callback",
+            "javascript:alert(1)",
+            "https://client.example/callback\nSet-Cookie:x",
+        ] {
+            assert!(!is_valid_redirect_uri(invalid), "accepted {invalid:?}");
+        }
+        assert!(!is_valid_redirect_uri(&format!(
+            "https://client.example/{}",
+            "x".repeat(MAX_REDIRECT_URI_BYTES)
+        )));
+    }
+
+    #[test]
+    fn registration_validation_bounds_and_canonicalizes() {
+        let (_, uris) = validated_registration(RegisterBody {
+            client_name: Some("  Client  ".into()),
+            redirect_uris: vec!["https://b.example/cb".into(), "https://a.example/cb".into()],
+        })
+        .unwrap();
+        assert_eq!(uris[0], "https://a.example/cb");
+
+        assert!(validated_registration(RegisterBody {
+            client_name: Some("x".repeat(MAX_CLIENT_NAME_BYTES + 1)),
+            redirect_uris: vec![REDIRECT.into()],
+        })
+        .is_err());
+        assert!(validated_registration(RegisterBody {
+            client_name: None,
+            redirect_uris: vec![REDIRECT.into(), REDIRECT.into()],
+        })
+        .is_err());
+        assert!(validated_registration(RegisterBody {
+            client_name: None,
+            redirect_uris: (0..=MAX_REDIRECT_URIS)
+                .map(|i| format!("https://client{i}.example/cb"))
+                .collect(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn registration_is_idempotent_for_the_same_redirect_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL);",
+        )
+        .unwrap();
+        let json = serde_json::to_string(&vec![REDIRECT]).unwrap();
+        let (first, changed) = register_client_conn(&conn, CLIENT, Some("Client"), &json).unwrap();
+        assert!(matches!(first, ClientRegistration::Created(_)));
+        assert!(changed);
+        let (second, changed) =
+            register_client_conn(&conn, OTHER_CLIENT, Some("Spoof"), &json).unwrap();
+        assert!(matches!(second, ClientRegistration::Existing(ref id) if id == CLIENT));
+        assert!(!changed);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM oauth_clients", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn registration_cap_bounds_control_database_growth() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
+             CREATE TABLE oauth_consents (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE oauth_authorization_codes (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE refresh_tokens (client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); \
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 256) \
+             INSERT INTO oauth_clients (client_id, redirect_uris) \
+             SELECT printf('client-%d', x), printf('[\"https://client-%d.example/cb\"]', x) FROM n;",
+        )
+        .unwrap();
+        let (result, changed) = register_client_conn(
+            &conn,
+            CLIENT,
+            Some("Overflow"),
+            "[\"https://overflow.example/cb\"]",
+        )
+        .unwrap();
+        assert!(matches!(result, ClientRegistration::AtCapacity));
+        assert!(!changed);
+    }
+
+    #[test]
+    fn registration_reclaims_only_stale_unreferenced_clients() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
+             CREATE TABLE oauth_consents (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE oauth_authorization_codes (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE refresh_tokens (client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); \
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 256) \
+             INSERT INTO oauth_clients (client_id, redirect_uris, created_at) \
+             SELECT printf('client-%d', x), printf('[\"https://client-%d.example/cb\"]', x), \
+                    '2000-01-01T00:00:00.000Z' FROM n; \
+             INSERT INTO refresh_tokens (client_id, expires_at, revoked) \
+             VALUES ('client-1', '2099-01-01T00:00:00.000Z', 0);",
+        )
+        .unwrap();
+
+        let (result, changed) = register_client_conn(
+            &conn,
+            CLIENT,
+            Some("Replacement"),
+            "[\"https://replacement.example/cb\"]",
+        )
+        .unwrap();
+        assert!(matches!(result, ClientRegistration::Created(ref id) if id == CLIENT));
+        assert!(changed);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM oauth_clients", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM oauth_clients WHERE client_id = 'client-1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn consent_and_authorization_code_are_each_single_use() {
+        let conn = oauth_conn();
+        assert!(store_pending_consent_conn(&conn, "consent", USER, CLIENT, REDIRECT).unwrap());
+        assert!(approve_consent_conn(&conn, "consent", "code", USER, CLIENT, REDIRECT).unwrap());
+        assert!(
+            !approve_consent_conn(&conn, "consent", "other-code", USER, CLIENT, REDIRECT).unwrap()
+        );
+
+        assert!(exchange_authorization_code_conn(&conn, "code", USER, CLIENT, "refresh").unwrap());
+        assert!(
+            !exchange_authorization_code_conn(&conn, "code", USER, CLIENT, "other-refresh")
+                .unwrap()
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM refresh_tokens", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn refresh_rotation_is_atomic_single_use_and_client_bound() {
+        let conn = oauth_conn();
+        conn.execute(
+            "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
+             VALUES ('old', ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day'))",
+            rusqlite::params![USER, CLIENT],
+        )
+        .unwrap();
+
+        assert_eq!(
+            rotate_refresh_token_conn(&conn, "old", OTHER_CLIENT, "wrong").unwrap(),
+            None
+        );
+        assert_eq!(
+            rotate_refresh_token_conn(&conn, "old", CLIENT, "new").unwrap(),
+            Some(USER.to_string())
+        );
+        assert_eq!(
+            rotate_refresh_token_conn(&conn, "old", CLIENT, "replay").unwrap(),
+            None
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM refresh_tokens WHERE revoked = 0 AND token_hash = 'new'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn inactive_user_cannot_exchange_or_refresh() {
+        let conn = oauth_conn();
+        assert!(store_pending_consent_conn(&conn, "consent", USER, CLIENT, REDIRECT).unwrap());
+        conn.execute("UPDATE users SET status = 'deleting' WHERE id = ?1", [USER])
+            .unwrap();
+        assert!(!approve_consent_conn(&conn, "consent", "code", USER, CLIENT, REDIRECT).unwrap());
+        conn.execute(
+            "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
+             VALUES ('old', ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day'))",
+            rusqlite::params![USER, CLIENT],
+        )
+        .unwrap();
+        assert_eq!(
+            rotate_refresh_token_conn(&conn, "old", CLIENT, "new").unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_page_escapes_client_metadata_and_is_not_cacheable() {
+        let response = consent_page(
+            Some("<script>alert(1)</script>"),
+            "https://client.example",
+            "token\" autofocus onfocus=alert(1)",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["Cache-Control"], "no-store");
+        assert!(response.headers()["Content-Security-Policy"]
+            .to_str()
+            .unwrap()
+            .contains("form-action 'self'"));
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("<script>"));
+        assert!(body.contains("&lt;script&gt;"));
+        assert!(body.contains("&quot; autofocus"));
+    }
 }

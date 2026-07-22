@@ -44,6 +44,8 @@ use crate::error::{EnclaveError, Result};
 // ── Token-server socket ───────────────────────────────────────────────────────
 
 const TEE_SOCKET: &str = "/run/container_launcher/teeserver.sock";
+const LAUNCHER_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_LAUNCHER_RESPONSE_BYTES: u64 = 64 * 1024;
 
 // ── STS exchange endpoint ─────────────────────────────────────────────────────
 
@@ -83,7 +85,10 @@ impl AttestationCredentials {
             )
         })?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(20))
+                .build()?,
             sts_audience,
             cache: Arc::new(Mutex::new(None)),
         })
@@ -121,32 +126,59 @@ impl AttestationCredentials {
     }
 }
 
-/// A cache for the Confidential Space OIDC attestation token.
-/// Fetches on demand and caches for up to 5 minutes to avoid overloading the launcher.
+/// A cache for a public, non-credential Confidential Space OIDC attestation token.
+///
+/// The audience passed here must identify the public verifier, never the WIF
+/// provider audience used by [`AttestationCredentials`]. A token minted for a
+/// WIF audience is a bearer credential that can be exchanged at Google STS and
+/// must never be returned by a public endpoint.
 pub struct AttestationCache {
-    sts_audience: String,
-    cached: Mutex<Option<(String, Instant)>>,
+    audience: String,
+    cached: Mutex<Option<CachedAttestation>>,
+}
+
+struct CachedAttestation {
+    token: String,
+    nonce: String,
+    expires: Instant,
 }
 
 impl AttestationCache {
-    pub fn new(sts_audience: String) -> Self {
-        Self {
-            sts_audience,
-            cached: Mutex::new(None),
+    pub fn new(audience: String) -> Result<Self> {
+        let parsed = reqwest::Url::parse(&audience).map_err(|e| {
+            EnclaveError::Attestation(format!("invalid public attestation audience: {e}"))
+        })?;
+        if parsed.scheme() != "https" {
+            return Err(EnclaveError::Attestation(
+                "public attestation audience must use https".into(),
+            ));
         }
+        if audience.starts_with("//iam.googleapis.com/")
+            || audience.contains("/workloadIdentityPools/")
+        {
+            return Err(EnclaveError::Attestation(
+                "public attestation audience must not be a WIF provider".into(),
+            ));
+        }
+        Ok(Self {
+            audience,
+            cached: Mutex::new(None),
+        })
     }
 
     pub async fn get_token(&self, nonce: &str) -> Result<String> {
         let mut guard = self.cached.lock().await;
-        if let Some((ref token, expiry)) = *guard {
-            if Instant::now() < expiry {
-                return Ok(token.clone());
+        if let Some(ref cached) = *guard {
+            if cached.nonce == nonce && Instant::now() < cached.expires {
+                return Ok(cached.token.clone());
             }
         }
-        // Fetch fresh
-        let token = fetch_attestation_token(&self.sts_audience, Some(nonce)).await?;
-        let expiry = Instant::now() + Duration::from_secs(300); // 5-minute TTL cache
-        *guard = Some((token.clone(), expiry));
+        let token = fetch_attestation_token(&self.audience, Some(nonce)).await?;
+        *guard = Some(CachedAttestation {
+            token: token.clone(),
+            nonce: nonce.to_string(),
+            expires: Instant::now() + Duration::from_secs(300),
+        });
         Ok(token)
     }
 }
@@ -177,27 +209,43 @@ pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Res
     );
 
     // Connect and send.
-    let mut stream = UnixStream::connect(TEE_SOCKET).await.map_err(|e| {
-        EnclaveError::Attestation(format!(
-            "cannot connect to launcher socket {TEE_SOCKET}: {e}"
-        ))
-    })?;
-
-    stream
-        .write_all(request.as_bytes())
+    let mut stream = tokio::time::timeout(LAUNCHER_IO_TIMEOUT, UnixStream::connect(TEE_SOCKET))
         .await
+        .map_err(|_| EnclaveError::Attestation("launcher socket connect timed out".into()))?
+        .map_err(|e| {
+            EnclaveError::Attestation(format!(
+                "cannot connect to launcher socket {TEE_SOCKET}: {e}"
+            ))
+        })?;
+
+    tokio::time::timeout(LAUNCHER_IO_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| EnclaveError::Attestation("launcher socket write timed out".into()))?
         .map_err(|e| EnclaveError::Attestation(format!("socket write error: {e}")))?;
 
-    // Read the full response (small — just a JWT).
+    // Read a bounded response (normally only a few KiB). The host can deny
+    // availability, but it must not be able to grow enclave memory without bound.
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
+    let mut limited = stream.take(MAX_LAUNCHER_RESPONSE_BYTES + 1);
+    tokio::time::timeout(LAUNCHER_IO_TIMEOUT, limited.read_to_end(&mut response))
         .await
+        .map_err(|_| EnclaveError::Attestation("launcher socket read timed out".into()))?
         .map_err(|e| EnclaveError::Attestation(format!("socket read error: {e}")))?;
+    if response.len() as u64 > MAX_LAUNCHER_RESPONSE_BYTES {
+        return Err(EnclaveError::Attestation(
+            "launcher response exceeded size limit".into(),
+        ));
+    }
 
     // Locate the body: split on the blank line that separates headers from body.
     let response_str = std::str::from_utf8(&response)
         .map_err(|e| EnclaveError::Attestation(format!("non-UTF-8 response: {e}")))?;
+    let status_line = response_str.lines().next().unwrap_or_default();
+    if !(status_line.starts_with("HTTP/1.1 200 ") || status_line.starts_with("HTTP/1.0 200 ")) {
+        return Err(EnclaveError::Attestation(
+            "launcher returned a non-success response".into(),
+        ));
+    }
 
     let body = split_http_body(response_str)?;
 
@@ -219,9 +267,9 @@ pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Res
     let jwt = decoded.trim().trim_matches('"').to_string();
 
     if jwt.is_empty() || !jwt.contains('.') {
-        return Err(EnclaveError::Attestation(format!(
-            "launcher returned an unexpected token body: {decoded:?}"
-        )));
+        return Err(EnclaveError::Attestation(
+            "launcher returned an unexpected token response".into(),
+        ));
     }
 
     Ok(jwt)
@@ -230,27 +278,39 @@ pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Res
 /// Decode an HTTP/1.1 chunked-transfer body into its payload.
 /// Each chunk is `<hex-size>\r\n<data>\r\n`, terminated by a `0\r\n` chunk.
 fn dechunk_http_body(body: &str) -> Result<String> {
-    let mut out = String::new();
-    let mut rest = body;
-    while let Some(nl) = rest.find("\r\n") {
-        let size_str = rest[..nl].trim();
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let relative_line_end = bytes[offset..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| EnclaveError::Attestation("chunk size line is truncated".into()))?;
+        let line_end = offset + relative_line_end;
+        let size_str = std::str::from_utf8(&bytes[offset..line_end])
+            .map_err(|_| EnclaveError::Attestation("chunk size is not ASCII".into()))?
+            .trim();
         // Chunk-size may carry extensions after ';'; ignore them.
         let size_hex = size_str.split(';').next().unwrap_or("");
         let size = usize::from_str_radix(size_hex, 16)
             .map_err(|e| EnclaveError::Attestation(format!("bad chunk size {size_hex:?}: {e}")))?;
+        offset = line_end + 2;
         if size == 0 {
-            break; // final chunk
+            return String::from_utf8(out)
+                .map_err(|_| EnclaveError::Attestation("chunked body is not UTF-8".into()));
         }
-        let data_start = nl + 2;
-        let data_end = data_start + size;
-        if data_end > rest.len() {
+        let data_end = offset
+            .checked_add(size)
+            .ok_or_else(|| EnclaveError::Attestation("chunk size overflow".into()))?;
+        let trailer_end = data_end
+            .checked_add(2)
+            .ok_or_else(|| EnclaveError::Attestation("chunk size overflow".into()))?;
+        if trailer_end > bytes.len() || &bytes[data_end..trailer_end] != b"\r\n" {
             return Err(EnclaveError::Attestation("chunked body truncated".into()));
         }
-        out.push_str(&rest[data_start..data_end]);
-        // Skip the trailing CRLF after the chunk data.
-        rest = &rest[(data_end + 2).min(rest.len())..];
+        out.extend_from_slice(&bytes[offset..data_end]);
+        offset = trailer_end;
     }
-    Ok(out)
 }
 
 /// Split an HTTP/1.1 response string on `\r\n\r\n` and return the body part.
@@ -302,18 +362,14 @@ async fn exchange_at_sts(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        // STS encodes the real reason in the body (e.g. invalid_grant /
-        // invalid_target / invalid_request). Surface it — error_for_status()
-        // alone hides it and made a 400 undiagnosable.
         return Err(EnclaveError::Attestation(format!(
-            "STS token exchange failed ({status}): {}",
-            text.chars().take(500).collect::<String>()
+            "STS token exchange failed ({status})"
         )));
     }
     let parsed: StsTokenResponse = serde_json::from_str(&text).map_err(|e| {
-        EnclaveError::Attestation(format!(
-            "could not parse STS response: {e}; body={text:.300}"
-        ))
+        // Never include the body: a partially valid response can contain a
+        // live access token even when another field is malformed.
+        EnclaveError::Attestation(format!("could not parse STS response: {e}"))
     })?;
 
     Ok((parsed.access_token, parsed.expires_in))

@@ -536,8 +536,8 @@ pub struct EpisodePurge {
     pub screenshot_source_keys: Vec<String>,
 }
 
-/// Delete an episode AND the raw records behind it (user-initiated purge;
-/// PRODUCT-SPEC §4.4: delete must be complete). Removes:
+/// Delete an episode AND the raw records behind it. A user-initiated purge must
+/// remove the content completely. This removes:
 /// - member utterances + screenshots (fixed 'delete'-command triggers keep
 ///   the external-content FTS indexes consistent), their vec0 vectors, and
 ///   any episode_members rows referencing them from OTHER episodes;
@@ -628,6 +628,17 @@ pub(crate) fn purge_episode(
 
     if !scrs.is_empty() {
         let ids = id_list(&scrs);
+        let image_table_exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
+            [],
+            |row| row.get(0),
+        )?;
+        if image_table_exists != 0 {
+            conn.execute(
+                &format!("DELETE FROM screenshot_images WHERE screenshot_id IN ({ids})"),
+                [],
+            )?;
+        }
         conn.execute_batch(&format!(
             "DELETE FROM vec_screenshots WHERE screenshot_id IN ({ids});
              DELETE FROM episode_members WHERE record_type='screenshot' AND record_id IN ({ids});
