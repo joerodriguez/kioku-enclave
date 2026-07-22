@@ -527,25 +527,10 @@ impl Renewer {
         match self.gcs.get_object(STATE_OBJECT).await {
             Ok(rsp) => {
                 let dek = load_dek(self.kms.as_ref(), &rsp.wrapped_dek_b64).await?;
-                let opened = decrypt_bound_blob(&dek, &rsp.ciphertext, STATE_CONTEXT, None)?;
+                let opened = decrypt_bound_blob(&dek, &rsp.ciphertext, STATE_CONTEXT)?;
                 let state: AcmeState = serde_json::from_slice(&opened.plaintext)?;
-                let generation = if opened.was_legacy {
-                    let migrated = encrypt_bound_blob(&dek, &opened.plaintext, STATE_CONTEXT)?;
-                    let generation = self
-                        .gcs
-                        .put_object(
-                            STATE_OBJECT,
-                            &migrated,
-                            &rsp.wrapped_dek_b64,
-                            rsp.generation,
-                        )
-                        .await?;
-                    info!("migrated legacy ACME state to context-bound encryption");
-                    generation
-                } else {
-                    rsp.generation
-                };
-                Ok(Some((state, generation)))
+                Ok(Some((state, rsp.generation)))
+
             }
             Err(Error::NotFound) => Ok(None),
             Err(e) => Err(e),

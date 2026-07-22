@@ -289,31 +289,15 @@ impl Store {
                 // Unwrap the DEK from KMS
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
                 let context = user_blob_context(user_id);
-                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, &context, None)?;
-                let mut generation = resp.generation;
-                if opened.was_legacy {
-                    let migrated = encrypt_bound_blob(&dek, &opened.plaintext, &context)?;
-                    generation = self
-                        .gcs
-                        .put_object(
-                            &object_name,
-                            &migrated,
-                            &resp.wrapped_dek_b64,
-                            resp.generation,
-                        )
-                        .await?;
-                    info!(
-                        user_id,
-                        "migrated legacy user blob to context-bound encryption"
-                    );
-                }
+                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, &context)?;
                 (
                     opened.plaintext,
                     BlobMeta {
-                        generation,
+                        generation: resp.generation,
                         wrapped_dek_b64: resp.wrapped_dek_b64,
                     },
                 )
+
             }
             Err(EnclaveError::NotFound) => {
                 // New user — generate a fresh DEK and an empty database

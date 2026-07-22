@@ -46,13 +46,11 @@ use crate::error::{EnclaveError, Result};
 const BOUND_BLOB_V2_MAGIC: &[u8] = b"KIOKU-BLOB\x02";
 const BOUND_BLOB_V2_DOMAIN: &[u8] = b"kioku-enclave:bound-blob:v2\0";
 
-/// Result of opening a context-bound blob. `was_legacy` is true only during
-/// the explicitly enabled one-time migration window; callers should rewrite
-/// the object immediately in the v2 format.
+/// Result of opening a context-bound blob.
 pub struct OpenedBoundBlob {
     pub plaintext: Vec<u8>,
-    pub was_legacy: bool,
 }
+
 
 // ── DEK type ──────────────────────────────────────────────────────────────────
 
@@ -159,42 +157,25 @@ pub fn encrypt_bound_blob(dek: &Dek, plaintext: &[u8], context: &[u8]) -> Result
     Ok(out)
 }
 
-/// Open a context-bound blob. Legacy input is rejected by default. A deployment
-/// may temporarily bake `ENCLAVE_ALLOW_LEGACY_BLOBS=1` into a migration image;
-/// callers must rewrite every successfully opened legacy object before rolling
-/// back to a strict image.
-///
-/// `legacy_aad` describes the old format: `None` for database/ACME blobs that
-/// had no AAD, or `Some(user_id)` for the former media format.
+/// Open a context-bound blob. Enforces v2 context-bound encryption.
 pub fn decrypt_bound_blob(
     dek: &Dek,
     blob: &[u8],
     context: &[u8],
-    legacy_aad: Option<&[u8]>,
 ) -> Result<OpenedBoundBlob> {
     if let Some(encrypted) = blob.strip_prefix(BOUND_BLOB_V2_MAGIC) {
         let aad = bound_blob_aad(context);
         return Ok(OpenedBoundBlob {
             plaintext: decrypt_blob_with_aad(dek, encrypted, &aad)?,
-            was_legacy: false,
         });
     }
 
-    if std::env::var("ENCLAVE_ALLOW_LEGACY_BLOBS").as_deref() != Ok("1") {
-        return Err(EnclaveError::Crypto(
-            "legacy encrypted blob rejected; use a controlled one-time migration image".into(),
-        ));
-    }
-
-    let plaintext = match legacy_aad {
-        Some(aad) => decrypt_blob_with_aad(dek, blob, aad)?,
-        None => decrypt_blob(dek, blob)?,
-    };
-    Ok(OpenedBoundBlob {
-        plaintext,
-        was_legacy: true,
-    })
+    Err(EnclaveError::Crypto(
+        "invalid context-bound blob header".into(),
+    ))
 }
+
+
 
 // ── KMS trait (seam for testing) ──────────────────────────────────────────────
 
@@ -459,12 +440,12 @@ mod tests {
         let blob =
             encrypt_bound_blob(&dek, b"alice data", alice_context).expect("encrypt bound blob");
 
-        let opened = decrypt_bound_blob(&dek, &blob, alice_context, None)
+        let opened = decrypt_bound_blob(&dek, &blob, alice_context)
             .expect("open with correct context");
         assert_eq!(opened.plaintext, b"alice data");
-        assert!(!opened.was_legacy);
 
-        assert!(decrypt_bound_blob(&dek, &blob, b"user-db\0indexes/bob.db.enc", None,).is_err());
+        assert!(decrypt_bound_blob(&dek, &blob, b"user-db\0indexes/bob.db.enc").is_err());
+
     }
 
     #[test]

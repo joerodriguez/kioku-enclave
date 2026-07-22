@@ -390,28 +390,15 @@ impl ControlStore {
         let (plaintext, meta) = match self.gcs.get_object(CONTROL_OBJECT).await {
             Ok(resp) => {
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
-                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, CONTROL_CONTEXT, None)?;
-                let mut generation = resp.generation;
-                if opened.was_legacy {
-                    let migrated = encrypt_bound_blob(&dek, &opened.plaintext, CONTROL_CONTEXT)?;
-                    generation = self
-                        .gcs
-                        .put_object(
-                            CONTROL_OBJECT,
-                            &migrated,
-                            &resp.wrapped_dek_b64,
-                            resp.generation,
-                        )
-                        .await?;
-                    info!("migrated legacy control DB to context-bound encryption");
-                }
+                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, CONTROL_CONTEXT)?;
                 (
                     opened.plaintext,
                     BlobMeta {
-                        generation,
+                        generation: resp.generation,
                         wrapped_dek_b64: resp.wrapped_dek_b64,
                     },
                 )
+
             }
             Err(EnclaveError::NotFound) => {
                 info!("creating new control DB");
@@ -499,14 +486,15 @@ impl ControlStore {
         let old = self.gcs.get_object(&old_object).await?;
         let dek = load_dek(self.kms.as_ref(), &old.wrapped_dek_b64).await?;
         let old_context = crate::store::user_blob_context(old_user_id);
-        let opened = decrypt_bound_blob(&dek, &old.ciphertext, &old_context, None)?;
+        let opened = decrypt_bound_blob(&dek, &old.ciphertext, &old_context)?;
 
         match self.gcs.get_object(&new_object).await {
             Ok(existing) => {
                 let existing_dek = load_dek(self.kms.as_ref(), &existing.wrapped_dek_b64).await?;
                 let new_context = crate::store::user_blob_context(new_user_id);
                 let existing_opened =
-                    decrypt_bound_blob(&existing_dek, &existing.ciphertext, &new_context, None)?;
+                    decrypt_bound_blob(&existing_dek, &existing.ciphertext, &new_context)?;
+
                 if existing_opened.plaintext != opened.plaintext {
                     return Err(EnclaveError::Conflict(
                         "stable user object already exists with different content".into(),

@@ -82,10 +82,8 @@ authenticated data binds each ciphertext to its logical purpose and location:
 - the control database and ACME state use separate fixed contexts.
 
 Copying ciphertext and its wrapped DEK to another user or object therefore fails
-authentication. Strict production images reject the older unbound format by default.
-Existing deployments must follow the explicit, one-way
-[legacy-blob migration procedure](RELEASING.md#one-time-legacy-blob-migration); never
-enable `ENCLAVE_ALLOW_LEGACY_BLOBS` as a permanent compatibility setting.
+authentication. All production images enforce context-bound v2 encryption unconditionally.
+
 
 ### Authentication and control plane
 

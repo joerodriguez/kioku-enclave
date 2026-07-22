@@ -101,7 +101,7 @@ ARG VERTEX_MODEL
 ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
-ARG ENCLAVE_ALLOW_LEGACY_BLOBS=0
+
 RUN set -eu \
     && case "${SOURCE_DATE_EPOCH}" in ''|*[!0-9]*) false;; *) true;; esac \
     && for value in \
@@ -114,7 +114,7 @@ RUN set -eu \
        do [ -n "${value}" ]; done \
     && [ "${ENCLAVE_ACME}" = "1" ] \
     && [ "${ALLOWED_EMAILS}" != "*" ] \
-    && [ "${ENCLAVE_ALLOW_LEGACY_BLOBS}" = "0" -o "${ENCLAVE_ALLOW_LEGACY_BLOBS}" = "1" ] \
+
     && case "${ENCLAVE_AUDIENCE}" in https://*) true;; *) false;; esac \
     && case "${BASE_URL}" in https://*) true;; *) false;; esac \
     && case "${WEB_ORIGIN}" in https://*) true;; *) false;; esac \
@@ -277,8 +277,8 @@ ARG VERTEX_MODEL
 ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
-ARG ENCLAVE_ALLOW_LEGACY_BLOBS=0
 ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
+
     GOOGLE_WEB_CLIENT_ID=${GOOGLE_WEB_CLIENT_ID} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
     BASE_URL=${BASE_URL} \
@@ -288,8 +288,9 @@ ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     VERTEX_MODEL=${VERTEX_MODEL} \
     ENCLAVE_ACME=${ENCLAVE_ACME} \
     ENCLAVE_ACME_DIRECTORY=${ENCLAVE_ACME_DIRECTORY} \
-    ENCLAVE_ACME_CONTACT=${ENCLAVE_ACME_CONTACT} \
-    ENCLAVE_ALLOW_LEGACY_BLOBS=${ENCLAVE_ALLOW_LEGACY_BLOBS}
+    ENCLAVE_ACME_CONTACT=${ENCLAVE_ACME_CONTACT}
+
+
 
 # ── Security flags — hardcoded, not operator-supplied ─────────────────────────
 #

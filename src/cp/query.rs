@@ -2113,7 +2113,6 @@ async fn rest_screenshot_image_content(
         &media_dek,
         &gcs_resp.ciphertext,
         &media_context,
-        Some(user_id.as_bytes()),
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -2121,32 +2120,7 @@ async fn rest_screenshot_image_content(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if opened.was_legacy {
-        let migrated = match crate::crypto::encrypt_bound_blob(
-            &media_dek,
-            &opened.plaintext,
-            &media_context,
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!(error = %e, "legacy media migration encryption failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        if let Err(e) = s
-            .store
-            .put_media_at_generation(
-                &object_key,
-                &migrated,
-                &gcs_resp.wrapped_dek_b64,
-                gcs_resp.generation,
-            )
-            .await
-        {
-            tracing::error!(error = %e, "legacy media migration write failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    }
+
 
     (
         StatusCode::OK,
