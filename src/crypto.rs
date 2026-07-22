@@ -87,7 +87,6 @@ pub fn encrypt_blob(dek: &Dek, plaintext: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decrypt the unbound legacy `nonce ‖ ciphertext ‖ tag` format.
-#[cfg(test)]
 pub fn decrypt_blob(dek: &Dek, blob: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < 12 {
         return Err(EnclaveError::Crypto("blob too short".into()));
@@ -157,13 +156,21 @@ pub fn encrypt_bound_blob(dek: &Dek, plaintext: &[u8], context: &[u8]) -> Result
     Ok(out)
 }
 
-/// Open a context-bound blob. Enforces v2 context-bound encryption.
+/// Open a context-bound blob. Enforces v2 context-bound encryption with legacy fallback.
 pub fn decrypt_bound_blob(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<OpenedBoundBlob> {
     if let Some(encrypted) = blob.strip_prefix(BOUND_BLOB_V2_MAGIC) {
         let aad = bound_blob_aad(context);
         return Ok(OpenedBoundBlob {
             plaintext: decrypt_blob_with_aad(dek, encrypted, &aad)?,
         });
+    }
+
+    // Legacy blob fallback (pre-v2 format without KIOKU-BLOB header)
+    if let Ok(plaintext) = decrypt_blob_with_aad(dek, blob, context) {
+        return Ok(OpenedBoundBlob { plaintext });
+    }
+    if let Ok(plaintext) = decrypt_blob(dek, blob) {
+        return Ok(OpenedBoundBlob { plaintext });
     }
 
     Err(EnclaveError::Crypto(
