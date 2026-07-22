@@ -87,6 +87,7 @@ pub fn encrypt_blob(dek: &Dek, plaintext: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decrypt the unbound legacy `nonce ‖ ciphertext ‖ tag` format.
+#[cfg(test)]
 pub fn decrypt_blob(dek: &Dek, blob: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < 12 {
         return Err(EnclaveError::Crypto("blob too short".into()));
