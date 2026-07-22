@@ -62,6 +62,17 @@ impact**. Run the four checks above first.
 
 Only commit/push when the user asks. Default branch is `main`.
 
+- **Zero-Click PR & Auto-Merge Queue Workflow**: To land changes cleanly without manual UI clicking, agents create PRs and enable auto-merge rebase via CLI:
+  ```bash
+  git checkout -b feat/feature-name
+  git commit -m "feat(scope): detailed description"
+  git push -u origin HEAD
+  gh pr create --fill --base main
+  gh pr merge --auto --rebase
+  ```
+  This automatically queues the PR for merge once CI passes, rebasing it onto `main` as a single clean commit with the full PR description.
+
+
 ## Security reminders specific to this repo
 
 - Plaintext lives only in this process and SEV-encrypted tmpfs (`/tmp`); never write it
