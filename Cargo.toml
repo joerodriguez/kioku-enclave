@@ -1,6 +1,6 @@
 [package]
 name = "kioku-enclave"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2021"
 rust-version = "1.96"
 description = "Attested Kioku backend for encrypted personal-memory storage and retrieval"

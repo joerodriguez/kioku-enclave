@@ -163,6 +163,7 @@ async fn sync_batch(
     };
 
     // 5. If watermarks are provided, upsert them and save the DB
+    let mut trigger_finalization = false;
     if let Some(w) = &batch.settled_watermarks {
         let user_id_cloned = user_id.clone();
         let device_id = batch.device_id.clone();
@@ -195,7 +196,27 @@ async fn sync_batch(
             warn!(error = %e, "failed to save settled watermarks");
         } else if let Err(e) = s.store.save_user(&user_id).await {
             warn!(error = %e, "failed to save user DB after watermark update");
+        } else {
+            trigger_finalization = w.audio.is_some() || w.screen.is_some();
         }
+    }
+
+    // A newly persisted settled watermark can make a pending episode eligible
+    // immediately. Keep this detached from the sync response: the periodic
+    // scheduler remains the retry path if finalization itself fails.
+    if trigger_finalization {
+        let state = Arc::clone(&s);
+        let finalizer_user = user_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = super::finalizer::finalize_user_episodes(&state, &finalizer_user).await
+            {
+                warn!(
+                    user_id = %finalizer_user,
+                    error = %e,
+                    "post-sync episode finalization failed"
+                );
+            }
+        });
     }
 
     Json(json!({

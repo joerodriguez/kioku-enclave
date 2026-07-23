@@ -94,6 +94,43 @@ struct GroundingRequirement {
     entities: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsettledWatermark {
+    device_id: String,
+    modality: String,
+    actual_at: Option<String>,
+}
+
+impl UnsettledWatermark {
+    fn state(&self) -> &'static str {
+        if self.actual_at.is_some() {
+            "stale"
+        } else {
+            "missing"
+        }
+    }
+}
+
+fn unsettled_watermark(
+    device_id: String,
+    modality: String,
+    required_at: &str,
+    actual_at: Option<String>,
+) -> Option<UnsettledWatermark> {
+    if actual_at
+        .as_deref()
+        .is_some_and(|actual| actual >= required_at)
+    {
+        None
+    } else {
+        Some(UnsettledWatermark {
+            device_id,
+            modality,
+            actual_at,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct UtteranceEvidenceGroup {
     at: String,
@@ -969,12 +1006,14 @@ async fn finalize_user_episodes_scoped(
             Ok(rows)
         }).await?;
 
-        let mut settled = true;
-        if !devices.is_empty() {
+        let unsettled = if devices.is_empty() {
+            Vec::new()
+        } else {
             let user_cloned2 = user.clone();
             let ended_at_val = ended_at_cloned.clone();
             let device_list = devices.clone();
-            let watermarks_ok = state.store.with_user(&user_cloned2, move |conn| {
+            state.store.with_user(&user_cloned2, move |conn| {
+                let mut gaps = Vec::new();
                 for (dev_id, modality) in device_list {
                     let watermark: Option<String> = conn.query_row(
                         "SELECT watermark_at FROM device_watermarks WHERE device_id = ?1 AND modality = ?2",
@@ -982,24 +1021,31 @@ async fn finalize_user_episodes_scoped(
                         |r| r.get(0)
                     )
                     .optional()?;
-                    match watermark {
-                        Some(w) if w >= ended_at_val => {}
-                        _ => return Ok(false),
+                    if let Some(gap) =
+                        unsettled_watermark(dev_id, modality, &ended_at_val, watermark)
+                    {
+                        gaps.push(gap);
                     }
                 }
-                Ok(true)
-            }).await?;
-            settled = watermarks_ok;
-        }
+                Ok(gaps)
+            }).await?
+        };
 
-        if !settled {
+        if !unsettled.is_empty() {
             let _ =
                 set_finalization_status(state, user_id, ep.id, "pending_watermark", None, false)
                     .await;
-            info!(
-                episode_id = ep.id,
-                "episode finalization deferred: devices not settled yet"
-            );
+            for gap in &unsettled {
+                info!(
+                    episode_id = ep.id,
+                    device_id = %gap.device_id,
+                    modality = %gap.modality,
+                    watermark_state = gap.state(),
+                    required_cutoff_at = %ended_at_cloned,
+                    actual_cutoff_at = gap.actual_at.as_deref().unwrap_or("<missing>"),
+                    "episode finalization deferred: device modality not settled"
+                );
+            }
             continue;
         }
 
@@ -1449,6 +1495,41 @@ mod tests {
         assert_eq!(initial, FinalizationMode::Initial);
         assert!(initial.should_enqueue_email(true));
         assert!(!initial.should_enqueue_email(false));
+    }
+
+    #[test]
+    fn watermark_diagnostics_distinguish_missing_stale_and_settled_modalities() {
+        let required = "2026-07-22T12:40:39Z";
+
+        let missing =
+            unsettled_watermark("macbook".into(), "screen".into(), required, None).unwrap();
+        assert_eq!(missing.state(), "missing");
+        assert_eq!(missing.actual_at, None);
+
+        let stale = unsettled_watermark(
+            "macbook".into(),
+            "audio".into(),
+            required,
+            Some("2026-07-22T12:40:38Z".into()),
+        )
+        .unwrap();
+        assert_eq!(stale.state(), "stale");
+        assert_eq!(stale.actual_at.as_deref(), Some("2026-07-22T12:40:38Z"));
+
+        assert!(unsettled_watermark(
+            "macbook".into(),
+            "screen".into(),
+            required,
+            Some(required.into()),
+        )
+        .is_none());
+        assert!(unsettled_watermark(
+            "macbook".into(),
+            "screen".into(),
+            required,
+            Some("2026-07-22T12:40:40Z".into()),
+        )
+        .is_none());
     }
 
     #[test]
