@@ -67,6 +67,10 @@ pub type UserId = String;
 /// leaves generous headroom without allowing pathological inputs.
 pub const MAX_USER_ID_LEN: usize = 128;
 
+/// Canonical brief schema/prompt version. Keeping it beside the persistence
+/// migration prevents a worker bump from forgetting to queue stored briefs.
+pub(crate) const EPISODE_FINALIZATION_VERSION: i32 = 3;
+
 /// Validate a caller-supplied `user_id` before it is used to derive any
 /// filesystem path or GCS object name.
 ///
@@ -474,6 +478,7 @@ CREATE TABLE IF NOT EXISTS screenshots (
     active_app   TEXT,
     window_title TEXT,
     ocr_text     TEXT,
+    salient_ocr_text TEXT, -- bounded chrome-reduced projection; ocr_text remains lossless
     url          TEXT,
     ocr_status   TEXT NOT NULL DEFAULT 'done',
     image_hash   TEXT,
@@ -522,7 +527,10 @@ CREATE TABLE IF NOT EXISTS episodes (
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at    TEXT,
     finalized_at  TEXT,
-    finalization_version INTEGER
+    finalization_version INTEGER,
+    finalization_status TEXT NOT NULL DEFAULT 'pending_horizon',
+    finalization_error TEXT,
+    finalization_attempted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_started_at ON episodes(started_at);
 
@@ -718,6 +726,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_screenshots_source_key
              ON screenshots(source_key) WHERE source_key IS NOT NULL;",
     )?;
+
+    // Lossy projection for summaries/UI; ocr_text remains lossless and is the
+    // only screenshot text indexed by FTS.
+    if let Err(e) = conn.execute_batch("ALTER TABLE screenshots ADD COLUMN salient_ocr_text TEXT;")
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(e.into());
+        }
+    }
 
     // ── v2 episodes migration: id-keyed episodes + explicit membership ──────────
     //
@@ -1027,6 +1045,39 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             return Err(e.into());
         }
     }
+    for col_def in &[
+        "ALTER TABLE episodes ADD COLUMN finalization_status TEXT NOT NULL DEFAULT 'pending_horizon';",
+        "ALTER TABLE episodes ADD COLUMN finalization_error TEXT;",
+        "ALTER TABLE episodes ADD COLUMN finalization_attempted_at TEXT;",
+    ] {
+        if let Err(e) = conn.execute_batch(col_def) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e.into());
+            }
+        }
+    }
+    // Version 3 introduces OCR salience and deictic entity retention. Existing
+    // briefs remain readable while their status makes the queued regeneration
+    // visible. Unfinalized rows retain the horizon default.
+    conn.execute(
+        "UPDATE episodes
+         SET finalization_status = 'regeneration_queued',
+             finalization_error = NULL
+         WHERE finalized_at IS NOT NULL
+           AND COALESCE(finalization_version, 1) < ?1
+           AND finalization_status IN ('complete', 'pending_horizon')",
+        [EPISODE_FINALIZATION_VERSION],
+    )?;
+    conn.execute(
+        "UPDATE episodes
+         SET finalization_status = 'complete',
+             finalization_error = NULL
+         WHERE finalized_at IS NOT NULL
+           AND COALESCE(finalization_version, 1) >= ?1
+           AND finalization_status != 'complete'",
+        [EPISODE_FINALIZATION_VERSION],
+    )?;
 
     // ADR-0011: Create new tables for canonical briefs, outbox deliveries, and watermarks
     conn.execute_batch(
@@ -1507,6 +1558,44 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "re-running migrations must not re-drop v2 episodes");
+    }
+
+    #[test]
+    fn finalization_v3_migration_queues_stale_briefs_and_keeps_current_complete() {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO episodes
+             (id, started_at, ended_at, title, finalized_at, finalization_version,
+              finalization_status, finalization_error)
+             VALUES
+             (1, '2026-07-01T09:00:00Z', '2026-07-01T10:00:00Z', 'stale',
+              '2026-07-01T14:00:00Z', 2, 'complete', 'old error'),
+             (2, '2026-07-02T09:00:00Z', '2026-07-02T10:00:00Z', 'current',
+              '2026-07-02T14:00:00Z', 3, 'processing', 'old error')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let stale: (String, Option<String>) = conn
+            .query_row(
+                "SELECT finalization_status, finalization_error FROM episodes WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let current: (String, Option<String>) = conn
+            .query_row(
+                "SELECT finalization_status, finalization_error FROM episodes WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stale, ("regeneration_queued".into(), None));
+        assert_eq!(current, ("complete".into(), None));
     }
 
     /// ADR-0004 §G.3: a blob whose episodes_fts predates minutes_text must be
