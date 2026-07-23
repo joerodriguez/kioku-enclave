@@ -4,12 +4,13 @@ use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tracing::{info, warn};
 
-// Version 2 regenerates historical canonical briefs with concrete requirements,
-// logistics, amounts, dates, and resources. Regeneration never re-enqueues Gmail.
-const FINALIZATION_VERSION: i32 = 2;
+// Version 3 regenerates canonical briefs with salient screen OCR and explicit
+// deictic entity retention. Regeneration never re-enqueues Gmail.
+pub(crate) const FINALIZATION_VERSION: i32 = crate::store::EPISODE_FINALIZATION_VERSION;
 const MIRRORED_UTTERANCE_WINDOW_MS: i64 = 3_000;
 const MAX_FINALIZER_MODEL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_FINALIZER_CANDIDATE_BYTES: usize = 32 * 1024;
@@ -83,7 +84,14 @@ struct ScreenshotEvidenceRow {
     window_title: Option<String>,
     url: Option<String>,
     ocr_text: Option<String>,
+    salient_ocr_text: Option<String>,
     is_duplicate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroundingRequirement {
+    at_ms: i64,
+    entities: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -419,6 +427,33 @@ fn bounded_chronological_log(mut entries: Vec<RenderedEvidenceEntry>, max_bytes:
     rendered
 }
 
+fn bounded_text_edges(text: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "\n[bounded-text] middle omitted\n";
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    if max_bytes <= MARKER.len() {
+        let mut end = max_bytes.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return text[..end].to_string();
+    }
+
+    let content = max_bytes - MARKER.len();
+    let front_budget = content / 2;
+    let back_budget = content - front_budget;
+    let mut front_end = front_budget.min(text.len());
+    while front_end > 0 && !text.is_char_boundary(front_end) {
+        front_end -= 1;
+    }
+    let mut back_start = text.len().saturating_sub(back_budget);
+    while back_start < text.len() && !text.is_char_boundary(back_start) {
+        back_start += 1;
+    }
+    format!("{}{}{}", &text[..front_end], MARKER, &text[back_start..])
+}
+
 fn render_capture_log(
     utterances: &[UtteranceEvidenceRow],
     screenshots: &[ScreenshotEvidenceRow],
@@ -471,27 +506,142 @@ fn render_capture_log(
             .as_deref()
             .map(|url| compact_capture_field(url, usize::MAX))
             .unwrap_or_else(|| "<none>".into());
+        let salient = crate::ocr::select_salient_ocr(
+            screenshot.ocr_text.as_deref(),
+            screenshot.salient_ocr_text.as_deref(),
+        );
         let ocr = compact_capture_field(
-            screenshot.ocr_text.as_deref().unwrap_or("<none>"),
+            salient.as_deref().unwrap_or("<none>"),
             MAX_FINALIZER_OCR_CHARS,
         );
+        let screen_facts = salient
+            .as_deref()
+            .map(crate::ocr::extract_screen_facts)
+            .unwrap_or_default();
         entries.push(RenderedEvidenceEntry {
             at_ms: screenshot.captured_at_ms,
             record_order: 1,
             record_id: screenshot.id,
             line: format!(
-                "[screenshot-evidence] ID: {} | At: {} | App: {} | Window: {} | URL: {} | OCR: {}",
+                "[screenshot-evidence] ID: {} | At: {} | App: {} | Window: {} | URL: {} | Salient OCR: {} | Screen facts: {}",
                 screenshot.id,
                 screenshot.captured_at,
                 serde_json::to_string(&app).unwrap_or_else(|_| "\"\"".into()),
                 serde_json::to_string(&window).unwrap_or_else(|_| "\"\"".into()),
                 serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".into()),
                 serde_json::to_string(&ocr).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&screen_facts).unwrap_or_else(|_| "[]".into()),
             ),
         });
     }
 
     bounded_chronological_log(entries, max_bytes)
+}
+
+fn grounding_requirements(
+    utterances: &[UtteranceEvidenceRow],
+    screenshots: &[ScreenshotEvidenceRow],
+) -> Vec<GroundingRequirement> {
+    let mut requirements = Vec::new();
+    for utterance in utterances {
+        let singular_sequence = crate::ocr::contains_singular_deictic(&utterance.text)
+            && utterances
+                .iter()
+                .filter(|candidate| {
+                    crate::ocr::contains_singular_deictic(&candidate.text)
+                        && (candidate.at_ms - utterance.at_ms).abs() <= 20_000
+                })
+                .count()
+                >= 2;
+        if !crate::ocr::contains_plural_deictic(&utterance.text) && !singular_sequence {
+            continue;
+        }
+        if requirements
+            .iter()
+            .any(|requirement: &GroundingRequirement| {
+                (requirement.at_ms - utterance.at_ms).abs() <= 30_000
+            })
+        {
+            continue;
+        }
+        let mut all_entities = Vec::new();
+        let mut all_seen = HashSet::new();
+        let mut primary_entities = Vec::new();
+        let mut primary_seen = HashSet::new();
+        for screenshot in screenshots.iter().filter(|row| {
+            !row.is_duplicate && (row.captured_at_ms - utterance.at_ms).abs() <= 45_000
+        }) {
+            let Some(salient) = crate::ocr::select_salient_ocr(
+                screenshot.ocr_text.as_deref(),
+                screenshot.salient_ocr_text.as_deref(),
+            ) else {
+                continue;
+            };
+            let facts = crate::ocr::extract_screen_facts(&salient);
+            if facts.len() == 1 {
+                let entity = facts[0].clone();
+                if primary_seen.insert(entity.to_lowercase()) {
+                    primary_entities.push(entity);
+                }
+            }
+            for entity in facts {
+                if all_seen.insert(entity.to_lowercase()) {
+                    all_entities.push(entity);
+                }
+            }
+        }
+        let entities = if primary_entities.len() == 2 {
+            primary_entities
+        } else {
+            all_entities
+        };
+        if entities.len() == 2 {
+            requirements.push(GroundingRequirement {
+                at_ms: utterance.at_ms,
+                entities,
+            });
+        }
+    }
+    requirements
+}
+
+fn render_grounding_requirements(requirements: &[GroundingRequirement]) -> String {
+    if requirements.is_empty() {
+        return String::new();
+    }
+    let requirements = requirements
+        .iter()
+        .map(|requirement| {
+            format!(
+                "- At {}, the pointing language refers to exactly these literal screen facts: {}. Name both in the overview.",
+                isotime::format_epoch_millis(requirement.at_ms),
+                requirement
+                    .entities
+                    .iter()
+                    .map(|entity| format!("{entity:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\nGROUNDING REQUIREMENTS:\n{requirements}\n")
+}
+
+fn missing_grounded_entities(
+    brief: &GeminiBriefResponse,
+    requirements: &[GroundingRequirement],
+) -> Vec<String> {
+    let overview = brief.overview.to_lowercase();
+    let mut missing = requirements
+        .iter()
+        .flat_map(|requirement| requirement.entities.iter())
+        .filter(|entity| !overview.contains(&entity.to_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing.sort_by_key(|entity| entity.to_lowercase());
+    missing.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    missing
 }
 
 fn render_candidate_urls(
@@ -640,10 +790,83 @@ PRINCIPLES:
 4. STRICT LINK RULE: You must ONLY output URLs that are present in the provided list of Candidate URLs. Any URL not in that list is considered a hallucination and is banned.
 5. Overview: write 2-3 sentences that preserve the most useful concrete takeaways, requirements, decisions, outcomes, dates, amounts, logistics, and named resources. Do not produce a topic inventory or vague phrases such as 'X was discussed', 'information was provided', or 'the presentation covered'.
 6. Never invent, correct, or silently normalize a specific fact. If evidence is ambiguous, omit it or put the uncertainty in open_questions.
-7. A mirrored mic/system utterance may appear once with multiple exact evidence IDs. Treat it as one statement, use the listed speaker attribution without guessing, and cite one or more of those IDs as appropriate.";
+7. A mirrored mic/system utterance may appear once with multiple exact evidence IDs. Treat it as one statement, use the listed speaker attribution without guessing, and cite one or more of those IDs as appropriate.
+8. Screen facts are conservative literal labels visible on screen. When a GROUNDING REQUIREMENT binds pointing language such as 'these two' to exact screen facts, the overview MUST name every bound entity; never compress them to 'the two items/movies'. Without a requirement, do not guess a pronoun's referent.";
+
+async fn set_finalization_status(
+    state: &CpState,
+    user_id: &str,
+    episode_id: i64,
+    status: &str,
+    error: Option<&str>,
+    attempted: bool,
+) -> Result<()> {
+    let user = user_id.to_string();
+    let status = status.to_string();
+    let error = error.map(|value| value.chars().take(1_000).collect::<String>());
+    let now = isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let changed = state
+        .store
+        .with_user(&user, move |conn| {
+            let changed = conn.execute(
+                "UPDATE episodes
+                 SET finalization_status = ?1,
+                     finalization_error = ?2,
+                     finalization_attempted_at =
+                         CASE WHEN ?3 = 1 THEN ?4 ELSE finalization_attempted_at END,
+                     updated_at = ?4
+                 WHERE id = ?5
+                   AND (?3 = 1
+                        OR finalization_status != ?1
+                        OR COALESCE(finalization_error, '') != COALESCE(?2, ''))",
+                rusqlite::params![status, error, i64::from(attempted), now, episode_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await?;
+    if changed {
+        state.store.save_user(&user).await?;
+    }
+    Ok(())
+}
 
 /// Sweep all eligible episodes for a user and finalize them.
 pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()> {
+    finalize_user_episodes_scoped(state, user_id, None).await
+}
+
+/// Retry/finalize one episode without sweeping unrelated history.
+pub async fn finalize_user_episode(state: &CpState, user_id: &str, episode_id: i64) -> Result<()> {
+    finalize_user_episodes_scoped(state, user_id, Some(episode_id)).await
+}
+
+async fn finalize_user_episodes_scoped(
+    state: &CpState,
+    user_id: &str,
+    target_episode_id: Option<i64>,
+) -> Result<()> {
+    // Scheduler sweeps and user-triggered scoped retries can overlap. Serialize
+    // per user so only one model call can target a given episode history at a
+    // time, without making one account wait behind another account's sweep.
+    static USER_LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let user_lock = {
+        let mut locks = USER_LOCKS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _user_guard = user_lock.lock().await;
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -653,24 +876,39 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
     let horizon_ms = now - 4 * 60 * 60 * 1000;
     let horizon_iso = isotime::format_epoch_millis(horizon_ms);
 
+    let user = user_id.to_string();
+
     // Get the summarizer cursor
     let summarized_until = match state.control.summarized_until(user_id).await? {
         Some(c) => c,
-        None => return Ok(()), // Summarizer hasn't run or has no cursor
+        None => {
+            if let Some(episode_id) = target_episode_id {
+                let _ = set_finalization_status(
+                    state,
+                    user_id,
+                    episode_id,
+                    "pending_cursor",
+                    None,
+                    false,
+                )
+                .await;
+            }
+            return Ok(());
+        }
     };
     let summarized_until_ms = isotime::parse_epoch_millis(&summarized_until).unwrap_or(0);
 
     // Fetch candidates from user content DB
-    let user = user_id.to_string();
     let candidates: Vec<EpisodeRow> = state.store.with_user(&user, move |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, started_at, ended_at, type, title, summary, participants, languages, action_items, model
              FROM episodes
              WHERE (finalized_at IS NULL OR COALESCE(finalization_version, 1) < ?2)
                AND substance != 'none'
-               AND ended_at < ?1"
+               AND (ended_at < ?1 OR ?3 IS NOT NULL)
+               AND (?3 IS NULL OR id = ?3)"
         )?;
-        let rows = stmt.query_map(rusqlite::params![&horizon_iso, FINALIZATION_VERSION], |r| {
+        let rows = stmt.query_map(rusqlite::params![&horizon_iso, FINALIZATION_VERSION, target_episode_id], |r| {
             Ok(EpisodeRow {
                 id: r.get(0)?,
                 started_at: r.get(1)?,
@@ -691,8 +929,15 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
 
     for ep in candidates {
         let ended_ms = isotime::parse_epoch_millis(&ep.ended_at).unwrap_or(0);
+        if ended_ms >= horizon_ms {
+            let _ = set_finalization_status(state, user_id, ep.id, "pending_horizon", None, false)
+                .await;
+            continue;
+        }
         // 1. Cursor check: summarized_until must be >= ended_at + 4h
         if summarized_until_ms < ended_ms + 4 * 60 * 60 * 1000 {
+            let _ =
+                set_finalization_status(state, user_id, ep.id, "pending_cursor", None, false).await;
             continue;
         }
 
@@ -748,12 +993,17 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         }
 
         if !settled {
+            let _ =
+                set_finalization_status(state, user_id, ep.id, "pending_watermark", None, false)
+                    .await;
             info!(
                 episode_id = ep.id,
                 "episode finalization deferred: devices not settled yet"
             );
             continue;
         }
+
+        let _ = set_finalization_status(state, user_id, ep.id, "processing", None, true).await;
 
         // 3. Fetch evidence for final brief model input
         let user_cloned3 = user.clone();
@@ -793,7 +1043,7 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
 
                 let mut s_stmt = conn.prepare(
                     "SELECT s.id, s.captured_at, s.active_app, s.window_title, \
-                            s.url, s.ocr_text, s.is_duplicate \
+                            s.url, s.ocr_text, s.salient_ocr_text, s.is_duplicate \
                      FROM screenshots s \
                      JOIN episode_members m \
                        ON m.record_type = 'screenshot' AND m.record_id = s.id \
@@ -811,7 +1061,8 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
                             window_title: row.get(3)?,
                             url: row.get(4)?,
                             ocr_text: row.get(5)?,
-                            is_duplicate: row.get::<_, i64>(6)? != 0,
+                            salient_ocr_text: row.get(6)?,
+                            is_duplicate: row.get::<_, i64>(7)? != 0,
                         })
                     })?
                     .filter_map(|x| x.ok())
@@ -834,12 +1085,19 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
         let candidates = extract_candidates(&utts, &scrs);
 
         // 5. Build prompt
-        let (log_text, candidate_urls_set) = render_finalizer_model_input(
+        let grounding = grounding_requirements(&utterance_rows, &screenshot_rows);
+        let grounding_text = render_grounding_requirements(&grounding)
+            .chars()
+            .take(MAX_FINALIZER_MODEL_INPUT_BYTES / 4)
+            .collect::<String>();
+        let grounding_bytes = grounding_text.len();
+        let (mut log_text, candidate_urls_set) = render_finalizer_model_input(
             &utterance_rows,
             &screenshot_rows,
             &candidates,
-            MAX_FINALIZER_MODEL_INPUT_BYTES,
+            MAX_FINALIZER_MODEL_INPUT_BYTES - grounding_bytes,
         );
+        log_text.push_str(&grounding_text);
 
         info!(episode_id = ep.id, "generating final brief with Gemini");
 
@@ -855,17 +1113,98 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
             Ok(r) => r,
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "Gemini call for final brief failed");
+                let _ = set_finalization_status(
+                    state,
+                    user_id,
+                    ep.id,
+                    "retry_model",
+                    Some(&e.to_string()),
+                    false,
+                )
+                .await;
                 continue;
             }
         };
 
-        let parsed: GeminiBriefResponse = match serde_json::from_str(&model_resp) {
+        let mut parsed: GeminiBriefResponse = match serde_json::from_str(&model_resp) {
             Ok(p) => p,
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "Gemini final brief response unparseable");
+                let _ = set_finalization_status(
+                    state,
+                    user_id,
+                    ep.id,
+                    "retry_model",
+                    Some("final brief response was not valid JSON"),
+                    false,
+                )
+                .await;
                 continue;
             }
         };
+
+        let missing = missing_grounded_entities(&parsed, &grounding);
+        if !missing.is_empty() {
+            let correction = format!(
+                "\n\nCORRECTION REQUIRED: the overview omitted these literal grounded screen titles: {}. \
+                 Return the complete corrected JSON and preserve all evidence boundaries.",
+                missing
+                    .iter()
+                    .map(|entity| format!("{entity:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let prior = bounded_text_edges(&model_resp, 32 * 1024);
+            let prior_header = "\n\nPRIOR JSON RESPONSE:\n";
+            let evidence_budget = MAX_FINALIZER_MODEL_INPUT_BYTES
+                .saturating_sub(prior_header.len() + prior.len() + correction.len());
+            let repair_log = bounded_text_edges(&log_text, evidence_budget);
+            let repair_input = format!("{repair_log}{prior_header}{prior}{correction}");
+            debug_assert!(repair_input.len() <= MAX_FINALIZER_MODEL_INPUT_BYTES);
+            match vertex::generate_custom(
+                &state.config,
+                FINALIZER_SYSTEM_PROMPT,
+                &repair_input,
+                brief_response_schema(),
+                16_384,
+            )
+            .await
+            {
+                Ok(repaired_text) => {
+                    match serde_json::from_str::<GeminiBriefResponse>(&repaired_text) {
+                        Ok(repaired)
+                            if missing_grounded_entities(&repaired, &grounding).is_empty() =>
+                        {
+                            parsed = repaired;
+                        }
+                        _ => {
+                            let _ = set_finalization_status(
+                                state,
+                                user_id,
+                                ep.id,
+                                "retry_model",
+                                Some("grounded screen titles were omitted after one repair"),
+                                false,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = set_finalization_status(
+                        state,
+                        user_id,
+                        ep.id,
+                        "retry_model",
+                        Some(&error.to_string()),
+                        false,
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        }
 
         // 6. Validate & filter evidence references + URLs
         let utterance_ids: HashSet<i64> = utts.iter().map(|u| u.0).collect();
@@ -1012,6 +1351,8 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
                 "UPDATE episodes
                  SET finalized_at = COALESCE(finalized_at, ?1),
                      finalization_version = ?2,
+                     finalization_status = 'complete',
+                     finalization_error = NULL,
                      updated_at = ?1
                  WHERE id = ?3",
                 rusqlite::params![now_iso, FINALIZATION_VERSION, ep_id]
@@ -1031,6 +1372,22 @@ pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()
             }
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "failed to commit finalized episode transaction");
+                if e.to_string()
+                    .contains("episode already finalized at current version")
+                {
+                    let _ = set_finalization_status(state, user_id, ep.id, "complete", None, false)
+                        .await;
+                } else {
+                    let _ = set_finalization_status(
+                        state,
+                        user_id,
+                        ep.id,
+                        "retry_model",
+                        Some(&e.to_string()),
+                        false,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1061,12 +1418,14 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_v2_requires_concrete_user_directed_takeaways() {
-        assert_eq!(FINALIZATION_VERSION, 2);
+    fn finalizer_v3_requires_concrete_user_directed_and_grounded_takeaways() {
+        assert_eq!(FINALIZATION_VERSION, 3);
         assert!(FINALIZER_SYSTEM_PROMPT.contains("explicit requirements or instructions"));
         assert!(FINALIZER_SYSTEM_PROMPT.contains("amounts, dates, deadlines"));
         assert!(FINALIZER_SYSTEM_PROMPT.contains("Do not produce a topic inventory"));
         assert!(FINALIZER_SYSTEM_PROMPT.contains("Never invent"));
+        assert!(FINALIZER_SYSTEM_PROMPT.contains("GROUNDING REQUIREMENT"));
+        assert!(FINALIZER_SYSTEM_PROMPT.contains("never compress them"));
     }
 
     #[test]
@@ -1082,7 +1441,7 @@ mod tests {
 
     #[test]
     fn current_briefs_are_terminal_but_initial_finalization_may_enqueue() {
-        let current = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(2));
+        let current = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(3));
         assert_eq!(current, FinalizationMode::AlreadyCurrent);
         assert!(!current.should_enqueue_email(true));
 
@@ -1090,6 +1449,80 @@ mod tests {
         assert_eq!(initial, FinalizationMode::Initial);
         assert!(initial.should_enqueue_email(true));
         assert!(!initial.should_enqueue_email(false));
+    }
+
+    #[test]
+    fn episode_312_final_brief_requires_both_grounded_movie_titles() {
+        let utterances = vec![UtteranceEvidenceRow {
+            id: 1,
+            at: "2026-07-22T12:39:59Z".into(),
+            at_ms: isotime::parse_epoch_millis("2026-07-22T12:39:59Z").unwrap(),
+            speaker: "Speaker 2".into(),
+            source_type: "system".into(),
+            text: "these are the two movies".into(),
+        }];
+        let screenshot = |id, at: &str, title: &str| ScreenshotEvidenceRow {
+            id,
+            captured_at: at.into(),
+            captured_at_ms: isotime::parse_epoch_millis(at).unwrap(),
+            active_app: Some("TV".into()),
+            window_title: Some(title.into()),
+            url: None,
+            ocr_text: Some(format!(
+                "TV File Edit Actions View Controls Account Window Help\n{title}\nMovie • Family"
+            )),
+            salient_ocr_text: None,
+            is_duplicate: false,
+        };
+        let screenshots = vec![
+            ScreenshotEvidenceRow {
+                id: 6,
+                captured_at: "2026-07-22T12:40:27Z".into(),
+                captured_at_ms: isotime::parse_epoch_millis("2026-07-22T12:40:27Z").unwrap(),
+                active_app: Some("TV".into()),
+                window_title: Some("Search".into()),
+                url: None,
+                ocr_text: Some(
+                    "MARY POPPINS\nMovie • Comedy\nMARY POPPINS RETURNS\nMovie • Musical\n\
+                     SAVING MR BANKS\nMovie • Drama"
+                        .into(),
+                ),
+                salient_ocr_text: None,
+                is_duplicate: false,
+            },
+            screenshot(7, "2026-07-22T12:40:29Z", "MARY POPPINS"),
+            screenshot(8, "2026-07-22T12:40:35Z", "MARY POPPINS RETURNS"),
+        ];
+        let requirements = grounding_requirements(&utterances, &screenshots);
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].entities,
+            vec!["MARY POPPINS", "MARY POPPINS RETURNS"]
+        );
+
+        let generic = GeminiBriefResponse {
+            overview: "Download the two specified movies for the car trip.".into(),
+            decisions: vec![],
+            action_items: vec![],
+            important_links: vec![],
+            open_questions: vec![],
+        };
+        assert_eq!(
+            missing_grounded_entities(&generic, &requirements),
+            vec!["MARY POPPINS", "MARY POPPINS RETURNS"]
+        );
+
+        let grounded = GeminiBriefResponse {
+            overview:
+                "Download Mary Poppins (1964) and Mary Poppins Returns (2018) for the car trip."
+                    .into(),
+            ..generic
+        };
+        assert!(missing_grounded_entities(&grounded, &requirements).is_empty());
+
+        let log = render_capture_log(&utterances, &screenshots, 20_000);
+        assert!(log.contains("Screen facts: [\"MARY POPPINS\"]"));
+        assert!(!log.contains("File Edit Actions"));
     }
 
     #[test]
@@ -1129,6 +1562,7 @@ mod tests {
                 window_title: Some("Visa application".into()),
                 url: Some("https://visa.fr/apply?case=123".into()),
                 ocr_text: Some("Fee: 99 EUR".into()),
+                salient_ocr_text: None,
                 is_duplicate: false,
             },
             ScreenshotEvidenceRow {
@@ -1139,6 +1573,7 @@ mod tests {
                 window_title: Some("Duplicate".into()),
                 url: None,
                 ocr_text: Some("must not appear".into()),
+                salient_ocr_text: None,
                 is_duplicate: true,
             },
         ];
@@ -1171,6 +1606,7 @@ mod tests {
                 window_title: Some(format!("Window {id}")),
                 url: Some(format!("https://example.com/{id}")),
                 ocr_text: Some("bounded OCR evidence".repeat(4)),
+                salient_ocr_text: None,
                 is_duplicate: false,
             })
             .collect::<Vec<_>>();
@@ -1181,6 +1617,16 @@ mod tests {
         assert!(log.contains("ID: 0"));
         assert!(log.contains("ID: 11"));
         assert!(log.find("ID: 0").unwrap() < log.find("ID: 11").unwrap());
+    }
+
+    #[test]
+    fn repair_text_bound_preserves_utf8_edges() {
+        let text = format!("START-{}-END", "é記".repeat(100));
+        let bounded = bounded_text_edges(&text, 80);
+        assert!(bounded.len() <= 80);
+        assert!(bounded.starts_with("START-"));
+        assert!(bounded.ends_with("-END"));
+        assert!(bounded.contains("[bounded-text]"));
     }
 
     #[test]

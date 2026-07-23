@@ -4,6 +4,8 @@
 //! `/api/episodes/:id/members`) the debugger
 //! uses. All routes are auth-gated; tool logic calls the data-plane query code
 //! (`search::search_all`, `timeline::fetch_context`) in-process.
+//! `POST /api/episodes/:id/finalize` queues a scoped retry for an incomplete
+//! or version-stale canonical brief.
 
 use std::sync::Arc;
 
@@ -43,6 +45,7 @@ pub fn router() -> Router<Arc<CpState>> {
             get(rest_episode).delete(rest_episode_delete),
         )
         .route("/api/episodes/{id}/members", get(rest_episode_members))
+        .route("/api/episodes/{id}/finalize", post(rest_episode_finalize))
         .route("/api/feed", get(rest_feed))
         .route(
             "/api/screenshot-images/plan",
@@ -361,6 +364,7 @@ async fn query_episodes_value(
                           WHERE m.episode_id = e.id AND m.record_type = 'screenshot'), \
                         e.minute_summaries, e.substance, e.visual_evidence, \
                         e.finalized_at, e.finalization_version, \
+                        e.finalization_status, e.finalization_attempted_at, \
                         fb.overview, fb.decisions, fb.action_items, fb.important_links, fb.open_questions \
                  FROM episodes e \
                  LEFT JOIN episode_final_briefs fb ON fb.episode_id = e.id \
@@ -378,14 +382,16 @@ async fn query_episodes_value(
 
                     let finalized_at: Option<String> = r.get(14)?;
                     let finalization_version: Option<i32> = r.get(15)?;
+                    let finalization_status: String = r.get(16)?;
+                    let finalization_attempted_at: Option<String> = r.get(17)?;
 
-                    let final_brief = if let Some(overview) = r.get::<_, Option<String>>(16)? {
+                    let final_brief = if let Some(overview) = r.get::<_, Option<String>>(18)? {
                         Some(json!({
                             "overview": overview,
-                            "decisions": serde_json::from_str::<Value>(&r.get::<_, String>(17)?).unwrap_or(json!([])),
-                            "action_items": serde_json::from_str::<Value>(&r.get::<_, String>(18)?).unwrap_or(json!([])),
-                            "important_links": serde_json::from_str::<Value>(&r.get::<_, String>(19)?).unwrap_or(json!([])),
-                            "open_questions": serde_json::from_str::<Value>(&r.get::<_, String>(20)?).unwrap_or(json!([])),
+                            "decisions": serde_json::from_str::<Value>(&r.get::<_, String>(19)?).unwrap_or(json!([])),
+                            "action_items": serde_json::from_str::<Value>(&r.get::<_, String>(20)?).unwrap_or(json!([])),
+                            "important_links": serde_json::from_str::<Value>(&r.get::<_, String>(21)?).unwrap_or(json!([])),
+                            "open_questions": serde_json::from_str::<Value>(&r.get::<_, String>(22)?).unwrap_or(json!([])),
                         }))
                     } else {
                         None
@@ -413,6 +419,12 @@ async fn query_episodes_value(
                         "source": "summarized",
                         "finalized_at": finalized_at,
                         "finalization_version": finalization_version,
+                        "finalization_status": finalization_status,
+                        "finalization_attempted_at": finalization_attempted_at,
+                        "finalization_retryable": matches!(
+                            finalization_status.as_str(),
+                            "retry_model" | "regeneration_queued"
+                        ),
                         "final_brief": final_brief,
                     }))
                     },
@@ -947,7 +959,9 @@ async fn rest_episode_members(
 
             let mut ss = conn.prepare(
                 "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
-                        substr(c.ocr_text,1,2000), c.source_key, img.id \
+                        substr(c.ocr_text,1,4000), substr(c.salient_ocr_text,1,4000), \
+                        CASE WHEN length(c.ocr_text) > 4000 THEN 1 ELSE 0 END, \
+                        c.source_key, img.id \
                  FROM episode_members m \
                  JOIN screenshots c ON c.id = m.record_id \
                  LEFT JOIN screenshot_images img ON img.source_key = c.source_key \
@@ -956,6 +970,16 @@ async fn rest_episode_members(
             members.extend(
                 ss.query_map([id], |r| {
                     let ts: String = r.get(1)?;
+                    let raw_ocr: Option<String> = r.get(5)?;
+                    let supplied_salient: Option<String> = r.get(6)?;
+                    let salient = crate::ocr::select_salient_ocr(
+                        raw_ocr.as_deref(),
+                        supplied_salient.as_deref(),
+                    );
+                    let screen_facts = salient
+                        .as_deref()
+                        .map(crate::ocr::extract_screen_facts)
+                        .unwrap_or_default();
                     Ok((
                         ts.clone(),
                         json!({
@@ -965,9 +989,12 @@ async fn rest_episode_members(
                             "active_app": r.get::<_, Option<String>>(2)?,
                             "window_title": r.get::<_, Option<String>>(3)?,
                             "url": r.get::<_, Option<String>>(4)?,
-                            "ocr_excerpt": r.get::<_, Option<String>>(5)?,
-                            "source_key": r.get::<_, Option<String>>(6)?,
-                            "cloud_image_id": r.get::<_, Option<String>>(7)?,
+                            "ocr_excerpt": raw_ocr,
+                            "ocr_truncated": r.get::<_, i64>(7)? != 0,
+                            "salient_ocr_excerpt": salient,
+                            "screen_facts": screen_facts,
+                            "source_key": r.get::<_, Option<String>>(8)?,
+                            "cloud_image_id": r.get::<_, Option<String>>(9)?,
                         }),
                     ))
                 })?
@@ -987,6 +1014,118 @@ async fn rest_episode_members(
         )
             .into_response(),
     }
+}
+
+async fn rest_episode_finalize(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<i64>,
+) -> Response {
+    let eligibility = s
+        .store
+        .with_user(&user.0, move |conn| {
+            conn.query_row(
+                "SELECT substance, finalized_at, finalization_version, finalization_status
+                 FROM episodes WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i32>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await;
+    let Some((substance, finalized_at, version, status)) = (match eligibility {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, episode_id = id, "finalization retry lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "enclave_unavailable"})),
+            )
+                .into_response();
+        }
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "episode_not_found"})),
+        )
+            .into_response();
+    };
+
+    if substance == "none" {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "low_signal_episode"})),
+        )
+            .into_response();
+    }
+    if finalized_at.is_some() && version.unwrap_or(1) >= super::finalizer::FINALIZATION_VERSION {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "already_complete", "status": status})),
+        )
+            .into_response();
+    }
+    if matches!(status.as_str(), "queued" | "processing") {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"queued": true, "episode_id": id, "status": status})),
+        )
+            .into_response();
+    }
+
+    let user_id = user.0;
+    let queued = s
+        .store
+        .with_user(&user_id, move |conn| {
+            conn.execute(
+                "UPDATE episodes
+                 SET finalization_status = 'queued',
+                     finalization_error = NULL,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1",
+                [id],
+            )?;
+            Ok(())
+        })
+        .await;
+    if let Err(error) = queued {
+        tracing::warn!(%error, episode_id = id, "failed to queue episode finalization");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "enclave_unavailable"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = s.store.save_user(&user_id).await {
+        tracing::warn!(%error, episode_id = id, "failed to persist episode finalization queue");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "save_failed"})),
+        )
+            .into_response();
+    }
+
+    let state = s.clone();
+    let worker_user = user_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = super::finalizer::finalize_user_episode(&state, &worker_user, id).await
+        {
+            tracing::warn!(%error, episode_id = id, "scoped episode finalization failed");
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"queued": true, "episode_id": id, "status": "queued"})),
+    )
+        .into_response()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1076,7 +1215,8 @@ fn query_feed(
 
     // 2. Fetch screenshots
     let mut s_sql = r#"
-        SELECT id, captured_at, active_app, window_title, url, ocr_text, source_key
+        SELECT id, captured_at, active_app, window_title, url, ocr_text,
+               salient_ocr_text, source_key
         FROM screenshots
         WHERE captured_at IS NOT NULL AND is_duplicate = 0
     "#
@@ -1103,13 +1243,17 @@ fn query_feed(
 
     while let Some(row) = rows.next()? {
         let ocr_text: Option<String> = row.get(5)?;
-        let ocr_excerpt = ocr_text.map(|t| {
-            if t.chars().count() > 300 {
-                t.chars().take(300).collect::<String>()
-            } else {
-                t
-            }
-        });
+        let supplied_salient: Option<String> = row.get(6)?;
+        let ocr_excerpt =
+            crate::ocr::select_salient_ocr(ocr_text.as_deref(), supplied_salient.as_deref()).map(
+                |t| {
+                    if t.chars().count() > 300 {
+                        t.chars().take(300).collect::<String>()
+                    } else {
+                        t
+                    }
+                },
+            );
         records.push(FeedRecord {
             kind: "screenshot".to_string(),
             id: row.get(0)?,
@@ -1120,7 +1264,7 @@ fn query_feed(
             window_title: row.get(3)?,
             url: row.get(4)?,
             ocr_excerpt,
-            source_key: row.get(6)?,
+            source_key: row.get(7)?,
             episode_id: None,
         });
     }

@@ -617,25 +617,44 @@ impl ControlStore {
                     }
                     let row = conn
                         .query_row(
-                            "SELECT id, status FROM users WHERE google_sub = ?1",
+                            "SELECT id, email, status FROM users WHERE google_sub = ?1",
                             [&google_sub],
-                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                ))
+                            },
                         )
                         .optional()?;
                     match row {
-                        Some((_, ref status)) if status != "active" => {
+                        Some((_, _, ref status)) if status != "active" => {
                             Err(EnclaveError::Auth("account inactive".into()))
                         }
-                        Some((id, _)) => Ok(Some(id)),
+                        Some((id, current_email, _)) => Ok(Some((id, current_email))),
                         None => Ok(None),
                     }
                 }
             })
             .await?;
 
+        // Google ID tokens authenticate every web/API request. Avoid rewriting
+        // the encrypted control DB for the overwhelmingly common no-op case;
+        // screenshot upload bursts otherwise exceed GCS's per-object write
+        // rate and turn valid image requests into intermittent 500 responses.
+        if let Some((existing_id, existing_email)) = existing.as_ref() {
+            if existing_id == &stable_id && existing_email == &email {
+                return Ok(User {
+                    id: stable_id,
+                    email,
+                });
+            }
+        }
+
         // 2. If it has an old ID, authenticate and re-encrypt the GCS blob under
         // the stable object's context before updating the identity row.
-        if let Some(ref old_id) = existing {
+        if let Some((old_id, _)) = existing.as_ref() {
             if old_id != &stable_id {
                 info!(
                     old_id = %old_id,
@@ -660,7 +679,7 @@ impl ControlStore {
                 if is_deleted_user_conn(conn, &stable_id)? {
                     return Err(EnclaveError::Auth("account deleted".into()));
                 }
-                if let Some(ref old_id) = existing_cloned {
+                if let Some((ref old_id, _)) = existing_cloned {
                     let status: Option<String> = conn
                         .query_row(
                             "SELECT status FROM users WHERE google_sub = ?1",
@@ -1022,6 +1041,30 @@ mod tests {
         );
         assert!(begin_user_deletion_conn(&conn, &stable_id).unwrap());
         assert!(delete_user_identity_conn(&conn, &stable_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn unchanged_user_upsert_does_not_rewrite_control_object() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let store = ControlStore::new(kms, gcs.clone());
+
+        let first = store
+            .upsert_user(GOOGLE_SUB, "owner@example.com")
+            .await
+            .unwrap();
+        let first_generation = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
+
+        let second = store
+            .upsert_user(GOOGLE_SUB, "owner@example.com")
+            .await
+            .unwrap();
+        let second_generation = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first_generation, second_generation);
     }
 
     #[test]

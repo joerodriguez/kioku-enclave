@@ -4,11 +4,11 @@
 //!
 //! Faithful to v2: incremental window since the cursor, open-episode refs the
 //! model extends, membership by innermost-containing span, significance floor,
-//! window cap. **Simplification versus the legacy service:** the OCR term/name-extraction
-//! heuristics (`blockScreenTerms`/`blockNameCandidates`, which needed Unicode
-//! regex) are dropped — the model still receives the raw OCR excerpts, just
-//! without the pre-computed `[screen-terms]`/`[likely names]` hints. Re-add with
-//! a regex pass if name recall regresses.
+//! window cap. Full screenshot OCR remains indexed, while prompts use the
+//! bounded salient projection in [`crate::ocr`] plus conservative
+//! `[screen-facts]` title labels. This replaces the legacy service's broad
+//! `blockScreenTerms`/`blockNameCandidates` hints with evidence that is less
+//! likely to promote menu chrome or neighboring search results.
 //!
 //! **Live-tail cursor semantics:** legacy behavior advanced `summarized_until`
 //! to the window end even when the model
@@ -26,7 +26,7 @@
 //! The Vertex call sends text outside the TEE (documented caveat — see
 //! [`super::vertex`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -104,6 +104,7 @@ struct ScrRow {
     active_app: Option<String>,
     window_title: Option<String>,
     ocr_text: Option<String>,
+    salient_ocr_text: Option<String>,
     url: Option<String>,
     is_duplicate: i64,
 }
@@ -159,6 +160,7 @@ struct CollapsedScr {
     active_app: Option<String>,
     window_title: Option<String>,
     ocr_text: Option<String>,
+    salient_ocr_text: Option<String>,
     url: Option<String>,
 }
 
@@ -182,6 +184,7 @@ fn collapse_screenshots(screenshots: &[ScrRow]) -> Vec<CollapsedScr> {
                 active_app: s.active_app.clone(),
                 window_title: s.window_title.clone(),
                 ocr_text: s.ocr_text.clone(),
+                salient_ocr_text: s.salient_ocr_text.clone(),
                 url: s.url.clone(),
             });
         }
@@ -248,24 +251,179 @@ fn render_capture_text(utterances: &[UttRow], screenshots: &[ScrRow]) -> String 
                 };
 
                 lines.push(format!("{} [screen] {}{}{}", time_str, app, title, url));
-                if let Some(ocr) = &s.ocr_text {
+                let salient = crate::ocr::select_salient_ocr(
+                    s.ocr_text.as_deref(),
+                    s.salient_ocr_text.as_deref(),
+                );
+                if let Some(ocr) = salient {
                     if ocr_budget > 0 {
                         let collapsed: String =
                             ocr.split_whitespace().collect::<Vec<_>>().join(" ");
                         let excerpt: String = collapsed
                             .chars()
-                            .take(250.min(ocr_budget as usize))
+                            .take(1_200.min(ocr_budget as usize))
                             .collect();
                         if !excerpt.is_empty() {
                             ocr_budget -= excerpt.len() as i64;
                             lines.push(format!("         [screen-text] {excerpt}"));
                         }
                     }
+                    let facts = crate::ocr::extract_screen_facts(&ocr);
+                    if !facts.is_empty() {
+                        lines.push(format!(
+                            "         [screen-facts] {}",
+                            facts
+                                .iter()
+                                .map(|fact| format!("{fact:?}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
                 }
             }
         }
     }
     lines.join("\n")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroundingRequirement {
+    at_ms: i64,
+    entities: Vec<String>,
+}
+
+/// Bind deictic speech only when the evidence is unusually constrained:
+/// explicit plural pointing language (or a pair of nearby "this one" turns)
+/// plus exactly two conservative title-like facts on screens within 45
+/// seconds. More/fewer candidates means no binding.
+fn grounding_requirements(
+    utterances: &[UttRow],
+    screenshots: &[ScrRow],
+) -> Vec<GroundingRequirement> {
+    let mut requirements = Vec::new();
+    for utterance in utterances {
+        let at_ms = ms(&utterance.started_at);
+        let singular_sequence = crate::ocr::contains_singular_deictic(&utterance.text)
+            && utterances
+                .iter()
+                .filter(|candidate| {
+                    crate::ocr::contains_singular_deictic(&candidate.text)
+                        && (ms(&candidate.started_at) - at_ms).abs() <= 20_000
+                })
+                .count()
+                >= 2;
+        if !crate::ocr::contains_plural_deictic(&utterance.text) && !singular_sequence {
+            continue;
+        }
+        if requirements
+            .iter()
+            .any(|requirement: &GroundingRequirement| (requirement.at_ms - at_ms).abs() <= 30_000)
+        {
+            continue;
+        }
+        let mut all_entities = Vec::new();
+        let mut all_seen = HashSet::new();
+        let mut primary_entities = Vec::new();
+        let mut primary_seen = HashSet::new();
+        for screenshot in screenshots {
+            if (ms(&screenshot.captured_at) - at_ms).abs() > 45_000 {
+                continue;
+            }
+            let Some(salient) = crate::ocr::select_salient_ocr(
+                screenshot.ocr_text.as_deref(),
+                screenshot.salient_ocr_text.as_deref(),
+            ) else {
+                continue;
+            };
+            let facts = crate::ocr::extract_screen_facts(&salient);
+            if facts.len() == 1 {
+                let fact = facts[0].clone();
+                if primary_seen.insert(fact.to_lowercase()) {
+                    primary_entities.push(fact);
+                }
+            }
+            for fact in facts {
+                if all_seen.insert(fact.to_lowercase()) {
+                    all_entities.push(fact);
+                }
+            }
+        }
+        // A detail screen with one title is stronger than a search-results
+        // grid containing many neighboring titles. Prefer the exact set of
+        // singleton-frame titles, then fall back to an overall exact pair.
+        let entities = if primary_entities.len() == 2 {
+            primary_entities
+        } else {
+            all_entities
+        };
+        if entities.len() == 2 {
+            requirements.push(GroundingRequirement { at_ms, entities });
+        }
+    }
+    requirements
+}
+
+fn render_grounding_requirements(requirements: &[GroundingRequirement]) -> String {
+    if requirements.is_empty() {
+        return String::new();
+    }
+    let lines = requirements
+        .iter()
+        .map(|requirement| {
+            format!(
+                "- At {}, deictic speech points to exactly these literal on-screen titles: {}. \
+                 The summary bullet for the episode containing this moment MUST name both titles.",
+                format_epoch_millis(requirement.at_ms),
+                requirement
+                    .entities
+                    .iter()
+                    .map(|entity| format!("{entity:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "GROUNDING REQUIREMENTS (literal screen evidence; do not infer beyond it):\n{lines}\n\n"
+    )
+}
+
+fn missing_grounded_entities(parsed: &Value, requirements: &[GroundingRequirement]) -> Vec<String> {
+    let episodes = parsed
+        .get("episodes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut missing = Vec::new();
+    for requirement in requirements {
+        let containing = episodes.iter().find(|episode| {
+            let start = episode
+                .get("started_at")
+                .and_then(Value::as_str)
+                .map(ms)
+                .unwrap_or(i64::MAX);
+            let end = episode
+                .get("ended_at")
+                .and_then(Value::as_str)
+                .map(ms)
+                .unwrap_or(i64::MIN);
+            requirement.at_ms >= start - 10_000 && requirement.at_ms <= end + 10_000
+        });
+        let summary = containing
+            .and_then(|episode| episode.get("summary"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        for entity in &requirement.entities {
+            if !summary.contains(&entity.to_lowercase()) {
+                missing.push(entity.clone());
+            }
+        }
+    }
+    missing.sort_by_key(|entity| entity.to_lowercase());
+    missing.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    missing
 }
 
 /// Extract the first JSON object (Gemini JSON mode usually returns it bare).
@@ -788,6 +946,8 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
 
     let capture_text = render_capture_text(&utterances, &screenshots);
     let open_text = render_open_episodes(&open_episodes);
+    let grounding = grounding_requirements(&utterances, &screenshots);
+    let grounding_text = render_grounding_requirements(&grounding);
 
     let range_from = utterances
         .first()
@@ -796,7 +956,7 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     let range_to = format_epoch_millis(effective_cutoff);
 
     let user_message = format!(
-        "Range: {range_from} → {range_to}\n\n{}NEW CAPTURE LOG:\n{capture_text}",
+        "Range: {range_from} → {range_to}\n\n{}{grounding_text}NEW CAPTURE LOG:\n{capture_text}",
         if open_text.is_empty() {
             String::new()
         } else {
@@ -821,7 +981,7 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
             return Ok(serde_json::json!({ "error": e.to_string(), "window_to": new_to_iso }));
         }
     };
-    let Some(parsed) = extract_json(&response) else {
+    let Some(mut parsed) = extract_json(&response) else {
         // Length only — the response paraphrases user content, never log it.
         warn!(
             response_len = response.len(),
@@ -831,6 +991,37 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
             serde_json::json!({ "error": "unparseable LLM response", "window_to": new_to_iso }),
         );
     };
+    let missing = missing_grounded_entities(&parsed, &grounding);
+    if !missing.is_empty() {
+        // One bounded repair call. It may only repair the supplied JSON using
+        // the same evidence; if it remains incomplete, retain the original
+        // response rather than synthesizing or guessing names in code.
+        let repair_message = format!(
+            "{user_message}\n\nPRIOR JSON RESPONSE:\n{response}\n\n\
+             CORRECTION REQUIRED: the summary for the episode containing the grounded moment \
+             omitted these literal on-screen titles: {}. Return the complete corrected JSON, \
+             preserving all other evidence boundaries.",
+            missing
+                .iter()
+                .map(|entity| format!("{entity:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        match super::vertex::generate(&state.config, &system_prompt, &repair_message).await {
+            Ok(repaired_text) => {
+                if let Some(repaired) = extract_json(&repaired_text) {
+                    if missing_grounded_entities(&repaired, &grounding).is_empty() {
+                        parsed = repaired;
+                    } else {
+                        warn!("summarizer grounding repair remained incomplete");
+                    }
+                } else {
+                    warn!("summarizer grounding repair was unparseable");
+                }
+            }
+            Err(error) => warn!(%error, "summarizer grounding repair deferred"),
+        }
+    }
     let episodes_json = parsed
         .get("episodes")
         .and_then(|e| e.as_array())
@@ -1173,7 +1364,8 @@ async fn fetch_range(
                 .filter_map(|x| x.ok())
                 .collect();
             let mut ss = conn.prepare(
-                "SELECT id, captured_at, active_app, window_title, substr(ocr_text,1,4000), url, is_duplicate \
+                "SELECT id, captured_at, active_app, window_title, substr(ocr_text,1,4000), \
+                        substr(salient_ocr_text,1,4000), url, is_duplicate \
                  FROM screenshots WHERE captured_at >= ?1 AND captured_at < ?2 \
                  ORDER BY captured_at ASC LIMIT ?3",
             )?;
@@ -1185,8 +1377,9 @@ async fn fetch_range(
                         active_app: r.get(2)?,
                         window_title: r.get(3)?,
                         ocr_text: r.get(4)?,
-                        url: r.get(5)?,
-                        is_duplicate: r.get(6)?,
+                        salient_ocr_text: r.get(5)?,
+                        url: r.get(6)?,
+                        is_duplicate: r.get(7)?,
                     })
                 })?
                 .filter_map(|x| x.ok())
@@ -1411,6 +1604,7 @@ PRINCIPLES (in priority order):
 6. Boundaries follow the activity, not the apps. DO NOT FRAGMENT: an episode shorter than ~10 minutes is usually wrong — merge brief pauses. A short distinct activity nested in a longer one IS its own episode.
 7. SUMMARY QUALITY. summary is 1–10 Markdown bullets, one per line and each beginning "- ". Every bullet must state a concrete takeaway, instruction, requirement, decision, result, constraint, or fact that helps the device owner remember or act. Prioritize, in order: (a) steps or requirements directed at the owner, (b) decisions, commitments, owners, deadlines and dates, (c) exact amounts, limits, logistics and named resources, services or URLs, (d) substantive outcomes or explanations. Omit greetings, atmosphere and promotional color before compressing any high-value detail. Never write topic-inventory prose such as "X was discussed", "information was provided/shared", "details about X", or "the conversation covered X"; state the actual detail instead. Do not pad to reach a bullet count.
 8. EVIDENCE BOUNDARY. Names, spellings, dates, times, amounts, requirements, resource names and URLs must be supported literally by the capture log or open-episode digest. Preserve an observed URL exactly. Never invent or complete a domain/path, silently correct an uncertain transcription, infer a missing date/amount, or turn a mentioned resource into a URL that was not captured. If evidence is ambiguous, use the literal supported wording or omit the uncertain specific.
+8a. DEICTIC SCREEN GROUNDING. `[screen-facts]` are conservative literal labels visible on screen. When a GROUNDING REQUIREMENT binds pointing language such as "these two" or "this one" to exact screen facts, name every bound entity in the episode's summary bullet; never replace them with "the two items/movies" or another generic reference. If no requirement is supplied, do not guess what a pronoun refers to.
 9. ACTION ITEMS. action_items contains only explicit commitments, requested follow-ups, or requirements/instructions directed at a person; otherwise []. A requirement addressed to "Me" belongs here even if the owner did not verbally promise it. Phrase each item as the concrete action, owner when known, and exact due date or condition when stated. Do not promote optional general information into an action.
 10. started_at/ended_at: ISO 8601 within the provided range (for an extension, the FULL span). languages: BCP-47 codes actually heard.
 11. MINUTE TIMELINE. minutes is a timeline of the episode's NEW activity. Bucket the NEW CAPTURE LOG into 1–5-minute buckets. Each gist is one concrete sentence naming who said/did/decided/required what when speaker identity is supported, and retaining a material date, amount, step, outcome, resource or URL when present. Never use generic filler or topic labels such as "conversation continues" or "transportation discussed". Each bucket: {"start":"<ISO of bucket start>","gist":"..."}. Cover ONLY minutes present in the NEW CAPTURE LOG — for an extension, earlier minutes are already stored; never re-emit or invent them.
@@ -1463,6 +1657,7 @@ mod tests {
                 active_app: Some("Finder".to_string()),
                 window_title: Some("Desktop".to_string()),
                 ocr_text: Some("foo".to_string()),
+                salient_ocr_text: None,
                 url: None,
                 is_duplicate: 0,
             },
@@ -1472,6 +1667,7 @@ mod tests {
                 active_app: Some("Finder".to_string()),
                 window_title: Some("Desktop".to_string()),
                 ocr_text: Some("foo".to_string()),
+                salient_ocr_text: None,
                 url: None,
                 is_duplicate: 1,
             },
@@ -1481,6 +1677,7 @@ mod tests {
                 active_app: Some("Finder".to_string()),
                 window_title: Some("Desktop".to_string()),
                 ocr_text: Some("foo".to_string()),
+                salient_ocr_text: None,
                 url: None,
                 is_duplicate: 1,
             },
@@ -1490,6 +1687,7 @@ mod tests {
                 active_app: Some("Xcode".to_string()),
                 window_title: Some("main.swift".to_string()),
                 ocr_text: Some("bar".to_string()),
+                salient_ocr_text: None,
                 url: None,
                 is_duplicate: 0,
             },
@@ -1579,12 +1777,153 @@ mod tests {
                 active_app: Some("Browser".into()),
                 window_title: Some("Student setup".into()),
                 ocr_text: None,
+                salient_ocr_text: None,
                 url: Some(url.clone()),
                 is_duplicate: 0,
             }],
         );
 
         assert!(rendered.contains(&format!("<{url}>")));
+    }
+
+    fn episode_312_fixture() -> (Vec<UttRow>, Vec<ScrRow>) {
+        let utterances = vec![UttRow {
+            id: 1,
+            started_at: "2026-07-22T12:39:59Z".into(),
+            speaker_label: "Speaker 2".into(),
+            language: Some("en".into()),
+            text: "these are the two movies".into(),
+        }];
+        let screenshots = vec![
+            ScrRow {
+                id: 9,
+                captured_at: "2026-07-22T12:40:27Z".into(),
+                active_app: Some("TV".into()),
+                window_title: Some("Search".into()),
+                ocr_text: Some(
+                    "Top Results\nMARY POPPINS\nMovie • Comedy - 1964\n\
+                     MARY POPPINS RETURNS\nMovie • Musical - 2018\n\
+                     SAVING MR BANKS\nMovie • Drama - 2013"
+                        .into(),
+                ),
+                salient_ocr_text: None,
+                url: None,
+                is_duplicate: 0,
+            },
+            ScrRow {
+                id: 10,
+                captured_at: "2026-07-22T12:40:29Z".into(),
+                active_app: Some("TV".into()),
+                window_title: Some("Mary Poppins".into()),
+                ocr_text: Some(
+                    "TV File Edit Actions View Controls Account Window Help\n\
+                     MARY POPPINS\nMovie • Comedy - Kids & Family\n1964 • 2 hr 19 min"
+                        .into(),
+                ),
+                salient_ocr_text: None,
+                url: None,
+                is_duplicate: 0,
+            },
+            ScrRow {
+                id: 11,
+                captured_at: "2026-07-22T12:40:35Z".into(),
+                active_app: Some("TV".into()),
+                window_title: Some("Mary Poppins Returns".into()),
+                ocr_text: Some(
+                    "TV File Edit Actions View Controls Account Window Help\n\
+                     MARY POPPINS RETURNS\nMovie • Musical - Adventure\n2018 • 2 hr 10 min"
+                        .into(),
+                ),
+                salient_ocr_text: None,
+                url: None,
+                is_duplicate: 0,
+            },
+        ];
+        (utterances, screenshots)
+    }
+
+    #[test]
+    fn episode_312_deictic_grounding_requires_both_titles_in_takeaway() {
+        let (utterances, screenshots) = episode_312_fixture();
+        let requirements = grounding_requirements(&utterances, &screenshots);
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].entities,
+            vec!["MARY POPPINS", "MARY POPPINS RETURNS"]
+        );
+
+        let generic = json!({
+            "episodes": [{
+                "started_at": "2026-07-22T12:39:59Z",
+                "ended_at": "2026-07-22T12:40:39Z",
+                "summary": "- Ensure the two specified movies are downloaded."
+            }]
+        });
+        assert_eq!(
+            missing_grounded_entities(&generic, &requirements),
+            vec!["MARY POPPINS", "MARY POPPINS RETURNS"]
+        );
+
+        let grounded = json!({
+            "episodes": [{
+                "started_at": "2026-07-22T12:39:59Z",
+                "ended_at": "2026-07-22T12:40:39Z",
+                "summary": "- Download Mary Poppins (1964) and Mary Poppins Returns (2018) for the car trip."
+            }]
+        });
+        assert!(missing_grounded_entities(&grounded, &requirements).is_empty());
+    }
+
+    #[test]
+    fn ambiguous_screen_facts_do_not_create_a_grounding_requirement() {
+        let (utterances, mut screenshots) = episode_312_fixture();
+        screenshots.push(ScrRow {
+            id: 12,
+            captured_at: "2026-07-22T12:40:20Z".into(),
+            active_app: Some("TV".into()),
+            window_title: Some("Search".into()),
+            ocr_text: Some("SAVING MR BANKS\nMovie • Drama - 2013".into()),
+            salient_ocr_text: None,
+            url: None,
+            is_duplicate: 0,
+        });
+        assert!(grounding_requirements(&utterances, &screenshots).is_empty());
+    }
+
+    #[test]
+    fn two_nearby_this_one_utterances_form_one_grounding_requirement() {
+        let (_, screenshots) = episode_312_fixture();
+        let utterances = vec![
+            UttRow {
+                id: 1,
+                started_at: "2026-07-22T12:39:59Z".into(),
+                speaker_label: "Speaker 2".into(),
+                language: Some("en".into()),
+                text: "This one here".into(),
+            },
+            UttRow {
+                id: 2,
+                started_at: "2026-07-22T12:40:04Z".into(),
+                speaker_label: "Speaker 2".into(),
+                language: Some("en".into()),
+                text: "And also this one right here".into(),
+            },
+        ];
+        let requirements = grounding_requirements(&utterances, &screenshots);
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].entities,
+            vec!["MARY POPPINS", "MARY POPPINS RETURNS"]
+        );
+    }
+
+    #[test]
+    fn capture_prompt_uses_salient_ocr_but_keeps_screen_facts() {
+        let (utterances, screenshots) = episode_312_fixture();
+        let rendered = render_capture_text(&utterances, &screenshots);
+        assert!(rendered.contains("[screen-facts] \"MARY POPPINS\""));
+        assert!(rendered.contains("\"MARY POPPINS RETURNS\""));
+        assert!(!rendered.contains("File Edit Actions"));
     }
 
     #[test]
