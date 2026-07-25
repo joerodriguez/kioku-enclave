@@ -5,7 +5,8 @@
 //! uses. All routes are auth-gated; tool logic calls the data-plane query code
 //! (`search::search_all`, `timeline::fetch_context`) in-process.
 //! `POST /api/episodes/:id/finalize` queues a scoped retry for an incomplete
-//! or version-stale canonical brief.
+//! or version-stale canonical brief. `/api/webhooks` manages signed,
+//! user-configured finalized-episode event destinations.
 
 use std::sync::Arc;
 
@@ -61,13 +62,14 @@ pub fn router() -> Router<Arc<CpState>> {
             get(rest_screenshot_image_content),
         )
         .route(
-            "/api/preferences/episode-email",
-            get(rest_get_preference).post(rest_set_preference),
+            "/api/webhooks",
+            get(rest_list_webhooks).post(rest_create_webhook),
         )
         .route(
-            "/api/preferences/episode-email/connect",
-            post(rest_connect_preference),
+            "/api/webhooks/{id}",
+            axum::routing::delete(rest_delete_webhook),
         )
+        .route("/api/webhooks/{id}/test", post(rest_test_webhook))
 }
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
@@ -2271,128 +2273,187 @@ async fn rest_screenshot_image_content(
 }
 
 #[derive(Deserialize)]
-struct SetPreferenceRequest {
-    enabled: bool,
+struct CreateWebhookRequest {
+    name: String,
+    endpoint_url: String,
+    #[serde(default)]
+    include_content: bool,
 }
 
-async fn rest_get_preference(
+fn webhook_json(
+    subscription: &crate::cp::control_store::WebhookSubscription,
+    signing_secret: Option<&str>,
+) -> Value {
+    let mut value = json!({
+        "id": subscription.id,
+        "name": subscription.name,
+        "endpoint_display": super::webhook_worker::endpoint_display(&subscription.endpoint_url),
+        "include_content": subscription.include_content,
+        "enabled": subscription.enabled,
+        "created_at": subscription.created_at,
+    });
+    if let Some(secret) = signing_secret {
+        value["signing_secret"] = json!(secret);
+    }
+    value
+}
+
+async fn rest_list_webhooks(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    let user_id = user.0;
-    let cfg = match s.control.get_gmail_config(&user_id).await {
-        Ok(c) => c,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    match cfg {
-        Some(c) => Json(json!({
-            "enabled": c.enabled,
-            "recipient": c.gmail_email,
-            "gmail_connected": c.refresh_token.is_some(),
-            "reconnect_required": c.reconnect_required,
-            "enabled_at": c.enabled_at,
+    match s.control.list_webhook_subscriptions(&user.0).await {
+        Ok(subscriptions) => Json(json!({
+            "webhooks": subscriptions
+                .iter()
+                .map(|subscription| webhook_json(subscription, None))
+                .collect::<Vec<_>>()
         }))
         .into_response(),
-        None => {
-            // Check user email
-            let email = match s.control.user_email(&user_id).await {
-                Ok(Some(e)) => e,
-                _ => return StatusCode::UNAUTHORIZED.into_response(),
-            };
-            Json(json!({
-                "enabled": false,
-                "recipient": Some(email),
-                "gmail_connected": false,
-                "reconnect_required": false,
-                "enabled_at": None::<String>,
-            }))
-            .into_response()
-        }
+        Err(error) => error.into_response(),
     }
 }
 
-async fn rest_set_preference(
+async fn rest_create_webhook(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
-    Json(req): Json<SetPreferenceRequest>,
+    Json(req): Json<CreateWebhookRequest>,
 ) -> Response {
-    let user_id = user.0;
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "name must be between 1 and 80 characters"})),
+        )
+            .into_response();
+    }
+    let endpoint_url = req.endpoint_url.trim();
+    if let Err(error) = super::webhook_worker::validate_endpoint_syntax(endpoint_url) {
+        return error.into_response();
+    }
 
-    // Check if configuration exists
-    let mut cfg = match s.control.get_gmail_config(&user_id).await {
-        Ok(Some(c)) => c,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "reconnect_required", "message": "Gmail account not connected"})),
-            )
-                .into_response();
-        }
+    let now = crate::cp::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let subscription = crate::cp::control_store::WebhookSubscription {
+        id: super::tokens::new_uuid(),
+        user_id: user.0,
+        name: name.to_string(),
+        endpoint_url: endpoint_url.to_string(),
+        signing_secret: super::webhook_worker::new_signing_secret(),
+        include_content: req.include_content,
+        enabled: true,
+        created_at: now,
     };
-
-    if req.enabled {
-        if cfg.refresh_token.is_none() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    json!({"error": "reconnect_required", "message": "Gmail credentials missing"}),
-                ),
-            )
-                .into_response();
-        }
-        cfg.enabled = true;
-        let now_iso = crate::cp::isotime::format_epoch_millis(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
-        );
-        cfg.enabled_at = Some(now_iso);
-    } else {
-        cfg.enabled = false;
-        let refresh_token = cfg.refresh_token.take();
-
-        if let Some(token) = refresh_token {
-            tokio::spawn(async move {
-                let http = super::bounded_http_client();
-                let _ = http
-                    .post("https://oauth2.googleapis.com/revoke")
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body(format!("token={}", token))
-                    .send()
-                    .await;
-            });
-        }
-
-        let user_id_cloned = user_id.clone();
-        let db_res = s.store.with_user(&user_id_cloned, |conn| {
-            conn.execute(
-                "UPDATE episode_deliveries SET state = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE state IN ('pending', 'retry')",
-                [],
-            )?;
-            Ok(())
-        }).await;
-        if let Err(e) = db_res {
-            tracing::warn!(user_id = %user_id, error = %e, "failed to cancel pending deliveries on disable");
-        } else {
-            let _ = s.store.save_user(&user_id).await;
-        }
+    match s
+        .control
+        .create_webhook_subscription(subscription.clone())
+        .await
+    {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(webhook_json(
+                &subscription,
+                Some(&subscription.signing_secret),
+            )),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
     }
-
-    if let Err(e) = s.control.upsert_gmail_config(cfg).await {
-        tracing::warn!(error = %e, "failed to update preference");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    StatusCode::OK.into_response()
 }
 
-async fn rest_connect_preference(
-    state: State<Arc<CpState>>,
-    user: Extension<AuthUser>,
+async fn rest_delete_webhook(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(subscription_id): Path<String>,
 ) -> Response {
-    super::oauth::connect_gmail_url(state, user).await
+    let user_id = user.0;
+    match s
+        .control
+        .delete_webhook_subscription(&user_id, &subscription_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return error.into_response(),
+    }
+    let user_for_db = user_id.clone();
+    let id_for_db = subscription_id.clone();
+    match s
+        .store
+        .with_user(&user_for_db, move |conn| {
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'cancelled', error_code = 'subscription_deleted',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE subscription_id = ?1 AND state IN ('pending', 'retry')",
+                [id_for_db],
+            )?;
+            Ok(())
+        })
+        .await
+    {
+        Ok(()) => {
+            if let Err(error) = s.store.save_user(&user_id).await {
+                return error.into_response();
+            }
+        }
+        Err(error) => return error.into_response(),
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn rest_test_webhook(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(subscription_id): Path<String>,
+) -> Response {
+    let subscription = match s
+        .control
+        .get_webhook_subscription(&user.0, &subscription_id)
+        .await
+    {
+        Ok(Some(subscription)) if subscription.enabled => subscription,
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "webhook is disabled"})),
+            )
+                .into_response()
+        }
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return error.into_response(),
+    };
+    match super::webhook_worker::send_test_webhook(&subscription).await {
+        Ok(status) if (200..300).contains(&status) => {
+            Json(json!({"delivered": true, "response_status": status})).into_response()
+        }
+        Ok(status) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "delivered": false,
+                "response_status": status,
+                "error": "destination rejected the test event"
+            })),
+        )
+            .into_response(),
+        Err(crate::error::EnclaveError::InvalidRequest(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"delivered": false, "error": message})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "delivered": false,
+                "error": "destination could not be reached"
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -2440,6 +2501,29 @@ mod tests {
         assert!(value_is_truthy(&json!(1)));
         assert!(!string_is_truthy("0"));
         assert!(!value_is_truthy(&json!(false)));
+    }
+
+    #[test]
+    fn webhook_list_projection_never_returns_endpoint_credentials() {
+        let subscription = crate::cp::control_store::WebhookSubscription {
+            id: "hook-1".into(),
+            user_id: "user-1".into(),
+            name: "Automation".into(),
+            endpoint_url: "https://hooks.example.com/path-secret?token=query-secret".into(),
+            signing_secret: "whsec_signing-secret".into(),
+            include_content: false,
+            enabled: true,
+            created_at: "2026-07-24T12:00:00.000Z".into(),
+        };
+
+        let listed = webhook_json(&subscription, None);
+        assert_eq!(listed["endpoint_display"], "https://hooks.example.com/…");
+        assert!(listed.get("endpoint_url").is_none());
+        assert!(listed.get("signing_secret").is_none());
+
+        let created = webhook_json(&subscription, Some(&subscription.signing_secret));
+        assert_eq!(created["signing_secret"], "whsec_signing-secret");
+        assert!(created.get("endpoint_url").is_none());
     }
 
     #[tokio::test]

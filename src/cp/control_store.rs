@@ -1,9 +1,9 @@
 //! Control-plane state store: identity and accounting in an encrypted SQLite
 //! blob in GCS, replacing the legacy managed SQL store.
 //!
-//! Tables: `users`, `usage_daily`, `oauth_clients`,
-//! `refresh_tokens`, `query_log`. No user *content* — that stays in the per-user
-//! index blobs ([`crate::store`]). One small control blob,
+//! Tables: `users`, `usage_daily`, `oauth_clients`, `refresh_tokens`,
+//! `query_log`, and user-configured webhook destinations. No captured user
+//! *content* — that stays in the per-user index blobs ([`crate::store`]). One small control blob,
 //! `control/control.db.enc`, encrypted under its own KMS-wrapped DEK exactly like
 //! a user index, so identity state survives VM rolls without a managed database.
 //!
@@ -100,16 +100,21 @@ CREATE TABLE IF NOT EXISTS config (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS user_gmail_configs (
-    user_id            TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    enabled            INTEGER NOT NULL DEFAULT 0,
-    enabled_at         TEXT,
-    gmail_email        TEXT,
-    google_sub         TEXT,
-    refresh_token      TEXT,
-    reconnect_required INTEGER NOT NULL DEFAULT 0,
-    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    endpoint_url    TEXT NOT NULL,
+    signing_secret  TEXT NOT NULL,
+    include_content INTEGER NOT NULL DEFAULT 0,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+CREATE INDEX IF NOT EXISTS webhook_subscriptions_user_idx
+    ON webhook_subscriptions(user_id);
+-- ADR-0012 removes Gmail delivery and its stored OAuth credentials.
+DROP TABLE IF EXISTS user_gmail_configs;
 "#;
 
 struct BlobMeta {
@@ -177,14 +182,15 @@ pub struct User {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GmailConfig {
+pub struct WebhookSubscription {
+    pub id: String,
     pub user_id: String,
+    pub name: String,
+    pub endpoint_url: String,
+    pub signing_secret: String,
+    pub include_content: bool,
     pub enabled: bool,
-    pub enabled_at: Option<String>,
-    pub gmail_email: Option<String>,
-    pub google_sub: Option<String>,
-    pub refresh_token: Option<String>,
-    pub reconnect_required: bool,
+    pub created_at: String,
 }
 
 #[cfg(test)]
@@ -266,7 +272,7 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<bool> {
     tx.execute("DELETE FROM usage_daily WHERE user_id = ?1", [user_id])?;
     tx.execute("DELETE FROM query_log WHERE user_id = ?1", [user_id])?;
     tx.execute(
-        "DELETE FROM user_gmail_configs WHERE user_id = ?1",
+        "DELETE FROM webhook_subscriptions WHERE user_id = ?1",
         [user_id],
     )?;
     let deleted = tx.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
@@ -303,7 +309,7 @@ fn begin_user_deletion_conn(conn: &Connection, user_id: &str) -> Result<bool> {
     tx.execute("DELETE FROM oauth_consents WHERE user_id = ?1", [user_id])?;
     tx.execute("DELETE FROM refresh_tokens WHERE user_id = ?1", [user_id])?;
     tx.execute(
-        "UPDATE user_gmail_configs SET enabled = 0, refresh_token = NULL, \
+        "UPDATE webhook_subscriptions SET enabled = 0, \
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
         [user_id],
     )?;
@@ -715,6 +721,10 @@ impl ControlStore {
                             "UPDATE query_log SET user_id = ?1 WHERE user_id = ?2",
                             rusqlite::params![stable_id, old_id],
                         )?;
+                        conn.execute(
+                            "UPDATE webhook_subscriptions SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
                     } else {
                         conn.execute(
                             "UPDATE users SET email = ?1 WHERE google_sub = ?2",
@@ -823,53 +833,92 @@ impl ControlStore {
         .await
     }
 
-    pub async fn get_gmail_config(&self, user_id: &str) -> Result<Option<GmailConfig>> {
+    pub async fn list_webhook_subscriptions(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<WebhookSubscription>> {
         let user_id = user_id.to_string();
         self.read(move |conn| {
-            let row = conn
-                .query_row(
-                    "SELECT enabled, enabled_at, gmail_email, google_sub, refresh_token, reconnect_required
-                     FROM user_gmail_configs WHERE user_id = ?1",
-                    [&user_id],
-                    |r| {
-                        Ok(GmailConfig {
-                            user_id: user_id.clone(),
-                            enabled: r.get::<_, i32>(0)? != 0,
-                            enabled_at: r.get(1)?,
-                            gmail_email: r.get(2)?,
-                            google_sub: r.get(3)?,
-                            refresh_token: r.get(4)?,
-                            reconnect_required: r.get::<_, i32>(5)? != 0,
-                        })
-                    },
-                )
-                .optional()?;
-            Ok(row)
+            let mut stmt = conn.prepare(
+                "SELECT id, name, endpoint_url, signing_secret, include_content, enabled, created_at
+                 FROM webhook_subscriptions WHERE user_id = ?1 ORDER BY created_at, id",
+            )?;
+            let rows = stmt.query_map([&user_id], |r| {
+                Ok(WebhookSubscription {
+                    id: r.get(0)?,
+                    user_id: user_id.clone(),
+                    name: r.get(1)?,
+                    endpoint_url: r.get(2)?,
+                    signing_secret: r.get(3)?,
+                    include_content: r.get::<_, i32>(4)? != 0,
+                    enabled: r.get::<_, i32>(5)? != 0,
+                    created_at: r.get(6)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
         })
         .await
     }
 
-    pub async fn upsert_gmail_config(&self, config: GmailConfig) -> Result<()> {
+    pub async fn get_webhook_subscription(
+        &self,
+        user_id: &str,
+        subscription_id: &str,
+    ) -> Result<Option<WebhookSubscription>> {
+        let user_id = user_id.to_string();
+        let subscription_id = subscription_id.to_string();
+        self.read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT name, endpoint_url, signing_secret, include_content, enabled, created_at
+                     FROM webhook_subscriptions WHERE id = ?1 AND user_id = ?2",
+                    rusqlite::params![subscription_id, user_id],
+                    |r| {
+                        Ok(WebhookSubscription {
+                            id: subscription_id.clone(),
+                            user_id: user_id.clone(),
+                            name: r.get(0)?,
+                            endpoint_url: r.get(1)?,
+                            signing_secret: r.get(2)?,
+                            include_content: r.get::<_, i32>(3)? != 0,
+                            enabled: r.get::<_, i32>(4)? != 0,
+                            created_at: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    pub async fn create_webhook_subscription(
+        &self,
+        subscription: WebhookSubscription,
+    ) -> Result<()> {
         self.write(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM webhook_subscriptions WHERE user_id = ?1",
+                [&subscription.user_id],
+                |r| r.get(0),
+            )?;
+            if count >= 5 {
+                return Err(EnclaveError::Conflict(
+                    "at most five webhook destinations are allowed".into(),
+                ));
+            }
             conn.execute(
-                "INSERT INTO user_gmail_configs (user_id, enabled, enabled_at, gmail_email, google_sub, refresh_token, reconnect_required)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(user_id) DO UPDATE SET
-                    enabled = excluded.enabled,
-                    enabled_at = excluded.enabled_at,
-                    gmail_email = excluded.gmail_email,
-                    google_sub = excluded.google_sub,
-                    refresh_token = excluded.refresh_token,
-                    reconnect_required = excluded.reconnect_required,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                "INSERT INTO webhook_subscriptions
+                    (id, user_id, name, endpoint_url, signing_secret, include_content, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
-                    config.user_id,
-                    if config.enabled { 1 } else { 0 },
-                    config.enabled_at,
-                    config.gmail_email,
-                    config.google_sub,
-                    config.refresh_token,
-                    if config.reconnect_required { 1 } else { 0 }
+                    subscription.id,
+                    subscription.user_id,
+                    subscription.name,
+                    subscription.endpoint_url,
+                    subscription.signing_secret,
+                    if subscription.include_content { 1 } else { 0 },
+                    if subscription.enabled { 1 } else { 0 },
                 ],
             )?;
             Ok(())
@@ -877,17 +926,35 @@ impl ControlStore {
         .await
     }
 
-    #[allow(dead_code)]
-    pub async fn disable_gmail_config(&self, user_id: &str) -> Result<()> {
+    pub async fn delete_webhook_subscription(
+        &self,
+        user_id: &str,
+        subscription_id: &str,
+    ) -> Result<bool> {
         let user_id = user_id.to_string();
+        let subscription_id = subscription_id.to_string();
+        self.write(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM webhook_subscriptions WHERE id = ?1 AND user_id = ?2",
+                rusqlite::params![subscription_id, user_id],
+            )? == 1)
+        })
+        .await
+    }
+
+    pub async fn disable_webhook_subscription(
+        &self,
+        user_id: &str,
+        subscription_id: &str,
+    ) -> Result<()> {
+        let user_id = user_id.to_string();
+        let subscription_id = subscription_id.to_string();
         self.write(move |conn| {
             conn.execute(
-                "UPDATE user_gmail_configs SET
-                    enabled = 0,
-                    refresh_token = NULL,
+                "UPDATE webhook_subscriptions SET enabled = 0,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE user_id = ?1",
-                [&user_id],
+                 WHERE id = ?1 AND user_id = ?2",
+                rusqlite::params![subscription_id, user_id],
             )?;
             Ok(())
         })
@@ -944,7 +1011,9 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO user_gmail_configs (user_id, enabled, refresh_token) VALUES (?1, 1, 'gmail-secret')",
+            "INSERT INTO webhook_subscriptions
+             (id, user_id, name, endpoint_url, signing_secret, include_content)
+             VALUES ('hook-1', ?1, 'Automation', 'https://example.com/hook', 'whsec_test', 1)",
             [USER_ID],
         )
         .unwrap();
@@ -956,6 +1025,40 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         assert!(!is_active_user_conn(&conn, "missing").unwrap());
+    }
+
+    #[test]
+    fn control_schema_removes_legacy_gmail_credentials() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE user_gmail_configs (
+                user_id TEXT PRIMARY KEY,
+                refresh_token TEXT
+             );
+             INSERT INTO user_gmail_configs VALUES ('owner', 'secret');",
+        )
+        .unwrap();
+
+        conn.execute_batch(SCHEMA).unwrap();
+
+        let gmail_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'user_gmail_configs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let webhook_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'webhook_subscriptions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(gmail_table, 0);
+        assert_eq!(webhook_table, 1);
     }
 
     #[test]
@@ -985,14 +1088,14 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "{table} was not revoked");
         }
-        let gmail: (i64, Option<String>) = conn
+        let webhook_enabled: i64 = conn
             .query_row(
-                "SELECT enabled, refresh_token FROM user_gmail_configs WHERE user_id = ?1",
+                "SELECT enabled FROM webhook_subscriptions WHERE user_id = ?1",
                 [USER_ID],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(gmail, (0, None));
+        assert_eq!(webhook_enabled, 0);
 
         assert!(delete_user_identity_conn(&conn, USER_ID).unwrap());
         assert!(!is_active_user_conn(&conn, USER_ID).unwrap());

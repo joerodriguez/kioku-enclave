@@ -1637,6 +1637,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "hmac",
  "http-body",
  "hyper",
  "hyper-util",

@@ -1538,8 +1538,8 @@ pub async fn summarize_all(state: &CpState) {
         if let Err(e) = super::finalizer::finalize_user_episodes(state, &id).await {
             warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
         }
-        if let Err(e) = super::email_worker::deliver_user_emails(state, &id).await {
-            warn!(user_id = %id, error = %e, "deliver_user_emails failed");
+        if let Err(e) = super::webhook_worker::deliver_user_webhooks(state, &id).await {
+            warn!(user_id = %id, error = %e, "deliver_user_webhooks failed");
         }
     }
 }

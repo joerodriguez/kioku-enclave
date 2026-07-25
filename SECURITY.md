@@ -30,8 +30,10 @@ surfaces.
 - **Vertex Gemini inference confidentiality.** Summarisation sends selected text from
   this process to Vertex under Google's no-data-retention API terms. The privacy claim is
   “attested enclave + Google no-data-retention terms,” not enclave-only inference.
-- **Opt-in Gmail delivery.** When enabled by a user, final-brief MIME content leaves the
-  TEE for Gmail under that user's OAuth grant.
+- **User-configured webhooks.** A finalized-episode event leaves the TEE only after a
+  user adds an HTTPS destination. Events are content-free by default; full brief content
+  is a separate opt-in and is then processed by that destination outside Kioku's trust
+  boundary.
 
 ## Security invariants
 
@@ -203,13 +205,16 @@ Release notes must say “publicly auditable with signed build provenance,” no
 snapshot-pinned OS packages, deterministic build inputs/timestamps, network-disabled
 compilation, and independent rebuild comparison.
 
-### Vertex and opt-in Gmail delivery cross the TEE boundary
+### Vertex and user-configured webhooks cross the TEE boundary
 
 Episode summarisation and evidence verification send selected text to Google Vertex
 Gemini from this process. Google's no-data-retention terms apply, but the data is outside
-the Confidential Space boundary while Vertex processes it. When enabled, episode-email
-delivery similarly sends final-brief content to Gmail using the connected user's OAuth
-grant.
+the Confidential Space boundary while Vertex processes it. Webhook events similarly
+leave Confidential Space for the user-selected destination. They are content-free by
+default and carry final-brief content only when that destination's explicit option is
+enabled. The sender revalidates public DNS addresses on every attempt, pins the validated
+address, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
+signatures, or response bodies.
 
 ### Stable user identifiers are linkable
 

@@ -2,7 +2,7 @@
 //!
 //! This process terminates TLS and handles server-side user plaintext inside a
 //! GCP Confidential Space VM (AMD SEV). Deliberate Vertex summarization and
-//! opt-in Gmail delivery are documented egresses; encrypted storage and the
+//! user-configured webhook delivery are documented egresses; encrypted storage and the
 //! workload operator do not otherwise receive plaintext.
 //!
 //! ## Authentication
@@ -137,14 +137,15 @@ pub(crate) async fn dump_user_export(
             };
             let episodes = dump_table(conn, "SELECT * FROM episodes ORDER BY id")?;
             let final_briefs = dump_table(conn, "SELECT * FROM episode_final_briefs ORDER BY episode_id")?;
-            let deliveries = dump_table(conn, "SELECT * FROM episode_deliveries ORDER BY episode_id")?;
+            let webhook_deliveries =
+                dump_table(conn, "SELECT * FROM webhook_deliveries ORDER BY episode_id, subscription_id")?;
             Ok(json!({
                 "utterances": utterances,
                 "screenshots": screenshots,
                 "screenshot_images": screenshot_images,
                 "episodes": episodes,
                 "episode_final_briefs": final_briefs,
-                "episode_deliveries": deliveries,
+                "webhook_deliveries": webhook_deliveries,
             }))
         })
         .await

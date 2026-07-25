@@ -669,20 +669,24 @@ CREATE TABLE IF NOT EXISTS episode_final_briefs (
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- Email delivery outbox
-CREATE TABLE IF NOT EXISTS episode_deliveries (
-    episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-    channel             TEXT NOT NULL CHECK (channel IN ('gmail')),
-    delivery_version    INTEGER NOT NULL,
-    state               TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'sent', 'retry', 'cancelled', 'reconnect_required')),
-    attempt_count       INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at     TEXT, -- ISO 8601
-    gmail_message_id    TEXT,
-    error_message       TEXT,
-    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    PRIMARY KEY (episode_id, channel, delivery_version)
+-- Per-destination signed-webhook outbox. Endpoint URLs and signing secrets
+-- remain in the encrypted control DB; content blobs keep only opaque ids.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    episode_id       INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    subscription_id  TEXT NOT NULL,
+    delivery_version INTEGER NOT NULL,
+    event_id          TEXT NOT NULL UNIQUE,
+    state             TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'retry', 'cancelled', 'failed')),
+    attempt_count     INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at   TEXT, -- ISO 8601
+    response_status   INTEGER,
+    error_code        TEXT,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (episode_id, subscription_id, delivery_version)
 );
+CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx
+    ON webhook_deliveries(state, next_attempt_at);
 
 -- Device sync watermarks per modality
 CREATE TABLE IF NOT EXISTS device_watermarks (
@@ -1079,7 +1083,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         [EPISODE_FINALIZATION_VERSION],
     )?;
 
-    // ADR-0011: Create new tables for canonical briefs, outbox deliveries, and watermarks
+    // ADR-0011/0012: canonical briefs, generic webhook outbox, and watermarks.
+    // The Gmail-specific table is deliberately dropped so old message ids and
+    // error details do not linger after the feature and its credentials are removed.
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS episode_final_briefs (
@@ -1091,19 +1097,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             open_questions    TEXT NOT NULL,
             created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
-        CREATE TABLE IF NOT EXISTS episode_deliveries (
-            episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-            channel             TEXT NOT NULL CHECK (channel IN ('gmail')),
-            delivery_version    INTEGER NOT NULL,
-            state               TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'sent', 'retry', 'cancelled', 'reconnect_required')),
-            attempt_count       INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at     TEXT,
-            gmail_message_id    TEXT,
-            error_message       TEXT,
-            created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            PRIMARY KEY (episode_id, channel, delivery_version)
+        DROP TABLE IF EXISTS episode_deliveries;
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            episode_id       INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            subscription_id  TEXT NOT NULL,
+            delivery_version INTEGER NOT NULL,
+            event_id          TEXT NOT NULL UNIQUE,
+            state             TEXT NOT NULL CHECK (state IN ('pending', 'sent', 'retry', 'cancelled', 'failed')),
+            attempt_count     INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at   TEXT,
+            response_status   INTEGER,
+            error_code        TEXT,
+            created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (episode_id, subscription_id, delivery_version)
         );
+        CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx
+            ON webhook_deliveries(state, next_attempt_at);
         CREATE TABLE IF NOT EXISTS device_watermarks (
             device_id    TEXT NOT NULL,
             modality     TEXT NOT NULL CHECK (modality IN ('audio','screen')),
@@ -1596,6 +1606,47 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(stale, ("regeneration_queued".into(), None));
         assert_eq!(current, ("complete".into(), None));
+    }
+
+    #[test]
+    fn webhook_migration_removes_the_gmail_outbox() {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE episode_deliveries (
+                episode_id INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                delivery_version INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                gmail_message_id TEXT,
+                error_message TEXT
+            );
+            "#,
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let gmail_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'episode_deliveries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let webhook_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'webhook_deliveries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(gmail_table, 0);
+        assert_eq!(webhook_table, 1);
     }
 
     /// ADR-0004 §G.3: a blob whose episodes_fts predates minutes_text must be

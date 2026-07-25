@@ -44,11 +44,12 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
   from inside the service.
-- Optionally delivers final briefs through the user's connected Gmail account.
+- Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
 the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Selected
-text leaves the TEE only through the documented Vertex and opt-in Gmail delivery paths.
+text leaves the TEE only through the documented Vertex and explicit, user-configured
+webhook paths.
 
 ## Security and trust model
 
@@ -133,9 +134,13 @@ under Google's
 [no-data-retention terms](https://cloud.google.com/vertex-ai/docs/generative-ai/data-governance).
 This is an explicit external trust boundary, not an enclave-only inference claim.
 
-If a user opts into episode-email delivery and connects Gmail, the service also sends the
-final-brief MIME content to the Gmail API using that user's OAuth grant. Gmail delivery is
-an explicit egress boundary; disabling the preference prevents new deliveries.
+Users can add HTTPS webhook destinations for finalized-episode events. Notifications are
+content-free by default; including a final brief is a separate per-destination opt-in.
+Webhook endpoints and signing secrets are encrypted in the control store, destination
+paths are redacted from API responses and logs, and each request is signed with the
+Standard Webhooks headers. Delivery rejects redirects and private, local, link-local,
+documentation, and other non-public network addresses. A configured destination remains
+an explicit egress boundary outside Kioku's enclave and attestation.
 
 ## API surfaces
 
@@ -148,6 +153,7 @@ The same binary serves all of these surfaces:
 | Device and account API | `/api/sync/*`, `/api/export`, `/api/account` | Kioku access token or accepted Google ID token |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
 | Screenshot evidence | `/api/screenshot-images*` | Kioku access token or accepted Google ID token |
+| Webhook automation | `/api/webhooks*` | Kioku access token or accepted Google ID token |
 | Legacy data plane | `/v1/*` below | Google service identity token |
 
 Legacy compatibility routes are:
@@ -343,12 +349,12 @@ crate sources, apt installs unversioned packages from mutable repositories, and 
 not perform an independent bit-for-bit rebuild. Trust in GitHub Actions and dependency
 delivery therefore remains. Do not describe releases as independently reproducible.
 
-### Vertex and opt-in Gmail delivery leave Confidential Space
+### Vertex and user-configured webhooks leave Confidential Space
 
 Selected text is sent to Vertex Gemini. Attestation covers the Kioku service and its
-storage/retrieval behavior, not Vertex's internal execution. When episode-email delivery
-is enabled, final-brief content is also sent to Gmail under the connected user's OAuth
-grant.
+storage/retrieval behavior, not Vertex's internal execution. A webhook destination is
+also outside the attested boundary. Finalized-episode webhooks are content-free unless
+the user explicitly enables full brief content for that destination.
 
 ## Reporting vulnerabilities
 

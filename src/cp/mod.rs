@@ -14,7 +14,6 @@
 pub mod auth;
 pub mod control_store;
 pub mod cors;
-pub mod email_worker;
 pub mod finalizer;
 pub mod isotime;
 pub mod limits;
@@ -24,6 +23,7 @@ pub mod summarizer;
 pub mod sync;
 pub mod tokens;
 pub mod vertex;
+pub mod webhook_worker;
 
 use serde::Deserialize;
 use std::sync::Arc;
