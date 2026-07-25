@@ -1423,6 +1423,7 @@ mod tests {
                         active_app: Some("zoom.us".to_string()),
                         window_title: None,
                         ocr_text: Some("participant panel names list".to_string()),
+                        salient_ocr_text: None,
                         url: None,
                         image_hash: None,
                         is_duplicate: None,
