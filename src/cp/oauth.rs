@@ -161,6 +161,391 @@ fn redirect_302(url: &str) -> Response {
     (StatusCode::FOUND, [(LOCATION, url.to_string())]).into_response()
 }
 
+const OAUTH_PAGE_STYLE: &str = r#"
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  --bg: #080c16;
+  --surface: rgba(17, 24, 39, 0.92);
+  --surface-soft: rgba(255, 255, 255, 0.045);
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: #f4f7ff;
+  --muted: #a3aec4;
+  --faint: #78849c;
+  --amber: #f5a623;
+  --amber-bright: #ffc45c;
+  --amber-soft: rgba(245, 166, 35, 0.13);
+  --red: #ff817a;
+  --red-soft: rgba(255, 105, 97, 0.12);
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: var(--bg);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 50% -15%, rgba(245, 166, 35, 0.16), transparent 38rem),
+    radial-gradient(circle at 8% 90%, rgba(54, 83, 134, 0.12), transparent 27rem),
+    var(--bg);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+body::before {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  content: "";
+  opacity: 0.32;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, black, transparent 74%);
+}
+
+.shell {
+  position: relative;
+  z-index: 1;
+  width: min(100% - 32px, 640px);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 44px 0 32px;
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 720;
+  letter-spacing: -0.02em;
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 11px;
+  color: white;
+  background: linear-gradient(145deg, var(--amber-bright), #e88e12);
+  box-shadow: 0 8px 26px rgba(245, 166, 35, 0.22);
+  font-family: "Hiragino Sans", "Yu Gothic", sans-serif;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.card {
+  position: relative;
+  overflow: hidden;
+  margin: auto 0;
+  padding: 40px;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: var(--surface);
+  box-shadow:
+    0 28px 80px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  backdrop-filter: blur(18px);
+}
+
+.card::before {
+  position: absolute;
+  top: 0;
+  left: 32px;
+  right: 32px;
+  height: 1px;
+  content: "";
+  background: linear-gradient(90deg, transparent, rgba(245, 166, 35, 0.7), transparent);
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: var(--amber-bright);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+h1 {
+  max-width: 520px;
+  margin: 0;
+  color: var(--text);
+  font-size: clamp(29px, 7vw, 40px);
+  font-weight: 740;
+  letter-spacing: -0.04em;
+  line-height: 1.08;
+}
+
+.lede {
+  max-width: 520px;
+  margin: 17px 0 0;
+  color: var(--muted);
+  font-size: 16px;
+}
+
+.status-icon {
+  width: 48px;
+  height: 48px;
+  margin-bottom: 26px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 129, 122, 0.28);
+  border-radius: 15px;
+  color: var(--red);
+  background: var(--red-soft);
+  font-size: 23px;
+  font-weight: 700;
+}
+
+.context {
+  margin: 30px 0 0;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  background: var(--surface-soft);
+}
+
+.context-row {
+  display: grid;
+  grid-template-columns: 124px minmax(0, 1fr);
+  gap: 14px;
+  align-items: baseline;
+}
+
+.context-row + .context-row {
+  margin-top: 13px;
+  padding-top: 13px;
+  border-top: 1px solid var(--border);
+}
+
+.context-label {
+  color: var(--faint);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.context-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 620;
+}
+
+code {
+  color: #c8d2e7;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.permission {
+  margin-top: 18px;
+  padding: 20px;
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 14px;
+  border: 1px solid rgba(245, 166, 35, 0.2);
+  border-radius: 16px;
+  background: var(--amber-soft);
+}
+
+.permission-icon {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  color: var(--amber-bright);
+  background: rgba(245, 166, 35, 0.14);
+  font-size: 18px;
+}
+
+.permission strong {
+  display: block;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 680;
+}
+
+.permission p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.trust-note {
+  margin: 18px 0 0;
+  display: flex;
+  gap: 10px;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.trust-note-symbol {
+  flex: 0 0 auto;
+  color: var(--amber);
+}
+
+.actions {
+  margin-top: 28px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+button {
+  min-height: 48px;
+  padding: 0 20px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 720;
+  cursor: pointer;
+}
+
+button:focus-visible {
+  outline: 3px solid rgba(245, 166, 35, 0.28);
+  outline-offset: 3px;
+}
+
+.primary {
+  color: #171005;
+  background: linear-gradient(180deg, var(--amber-bright), var(--amber));
+  box-shadow: 0 10px 28px rgba(245, 166, 35, 0.18);
+}
+
+.primary:hover {
+  filter: brightness(1.06);
+}
+
+.secondary {
+  color: var(--muted);
+  border-color: var(--border);
+  background: transparent;
+}
+
+.secondary:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-soft);
+}
+
+.error-note {
+  margin: 28px 0 0;
+  padding: 15px 16px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  color: var(--muted);
+  background: var(--surface-soft);
+  font-size: 13px;
+}
+
+.footer {
+  align-self: center;
+  margin-top: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #67738a;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.footer-lock {
+  color: var(--amber);
+  font-size: 10px;
+}
+
+@media (max-width: 560px) {
+  .shell {
+    width: min(100% - 24px, 640px);
+    padding: 24px 0 20px;
+  }
+
+  .card {
+    padding: 28px 22px;
+    border-radius: 20px;
+  }
+
+  .context-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .actions {
+    grid-template-columns: 1fr;
+  }
+
+  .primary {
+    order: -1;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .card {
+    background: #111827;
+    backdrop-filter: none;
+  }
+}
+"#;
+
+fn oauth_page(title: &str, content: &str) -> String {
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080c16">
+  <meta name="color-scheme" content="dark">
+  <title>{title} · Kioku</title>
+  <style>{OAUTH_PAGE_STYLE}</style>
+</head>
+<body>
+  <main class="shell">
+    <div class="brand" aria-label="Kioku">
+      <span class="brand-mark" aria-hidden="true">記</span>
+      <span>Kioku</span>
+    </div>
+    {content}
+    <div class="footer">
+      <span class="footer-lock" aria-hidden="true">◆</span>
+      <span>Protected by Kioku’s confidential cloud</span>
+    </div>
+  </main>
+</body>
+</html>"##,
+        title = html_escape(title),
+    )
+}
+
 // ── Discovery ───────────────────────────────────────────────────────────────────
 
 async fn authz_metadata(State(s): State<Arc<CpState>>) -> Json<serde_json::Value> {
@@ -436,16 +821,25 @@ struct GoogleTokenResp {
 }
 
 fn callback_error(status: StatusCode, heading: &'static str, message: &'static str) -> Response {
-    let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>{heading}</title><h1>{heading}</h1><p>{message}</p>"
+    let content = format!(
+        r#"<section class="card" aria-labelledby="page-title">
+      <div class="status-icon" aria-hidden="true">!</div>
+      <p class="eyebrow">Connection interrupted</p>
+      <h1 id="page-title">{}</h1>
+      <p class="lede">{}</p>
+      <p class="error-note">You can close this window and return to the app that started the connection.</p>
+    </section>"#,
+        html_escape(heading),
+        html_escape(message),
     );
+    let body = oauth_page(heading, &content);
     (
         status,
         [
             ("Cache-Control", "no-store"),
             (
                 "Content-Security-Policy",
-                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                "default-src 'none'; style-src 'sha256-DVNu+rDXsiq2UWPkz03Yd5TzilN7mANE0PgSufIM2Is='; base-uri 'none'; frame-ancestors 'none'",
             ),
             ("Referrer-Policy", "no-referrer"),
             ("X-Content-Type-Options", "nosniff"),
@@ -506,32 +900,60 @@ fn consent_page(client_name: Option<&str>, origin: &str, consent_token: &str) ->
         .map(|name| name.chars().take(MAX_CLIENT_NAME_BYTES).collect::<String>())
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "Unnamed OAuth client".to_string());
-    let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Authorize Kioku access</title>\
-         <h1>Authorize Kioku access</h1>\
-         <p><strong>{}</strong> at <code>{}</code> is requesting access.</p>\
-         <p>Approval allows this client to search, read, and export your full Kioku archive, \
-         and to keep access with a refresh token until revoked.</p>\
-         <p>Only approve if you trust both the client and redirect origin.</p>\
-         <form method=\"post\" action=\"/oauth/consent\">\
-         <input type=\"hidden\" name=\"consent_token\" value=\"{}\">\
-         <input type=\"hidden\" name=\"decision\" value=\"approve\">\
-         <button type=\"submit\">Approve full archive access</button></form>",
+    let content = format!(
+        r#"<section class="card" aria-labelledby="page-title">
+      <p class="eyebrow">MCP connection request</p>
+      <h1 id="page-title">Connect this app to your memory?</h1>
+      <p class="lede">Review the app and destination before giving it access to your Kioku archive.</p>
+      <div class="context">
+        <div class="context-row">
+          <span class="context-label">Requesting app</span>
+          <span class="context-value">{}</span>
+        </div>
+        <div class="context-row">
+          <span class="context-label">Redirects to</span>
+          <code>{}</code>
+        </div>
+      </div>
+      <div class="permission">
+        <span class="permission-icon" aria-hidden="true">↗</span>
+        <div>
+          <strong>Full archive access</strong>
+          <p>Search, read, and export your Kioku archive. The app can stay connected until you revoke access.</p>
+        </div>
+      </div>
+      <p class="trust-note">
+        <span class="trust-note-symbol" aria-hidden="true">◆</span>
+        <span>Only continue if you recognize this app and trust the redirect destination above.</span>
+      </p>
+      <form method="post" action="/oauth/consent">
+        <input type="hidden" name="consent_token" value="{}">
+        <div class="actions">
+          <button class="primary" type="submit" name="decision" value="approve">Allow archive access</button>
+          <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
+        </div>
+      </form>
+    </section>"#,
         html_escape(&display_name),
         html_escape(origin),
         html_escape(consent_token),
     );
+    let body = oauth_page("Connect to Kioku", &content);
+    // Browsers enforce `form-action` across redirects from a submitted form.
+    // Allow the already-validated registered client origin so the consent POST's
+    // 302 can complete without permitting arbitrary form destinations.
+    let content_security_policy = format!(
+        "default-src 'none'; style-src 'sha256-DVNu+rDXsiq2UWPkz03Yd5TzilN7mANE0PgSufIM2Is='; \
+         form-action 'self' {origin}; base-uri 'none'; frame-ancestors 'none'"
+    );
     (
         StatusCode::OK,
         [
-            ("Cache-Control", "no-store"),
-            (
-                "Content-Security-Policy",
-                "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-            ),
-            ("Referrer-Policy", "no-referrer"),
-            ("X-Content-Type-Options", "nosniff"),
-            ("X-Frame-Options", "DENY"),
+            ("Cache-Control", "no-store".to_string()),
+            ("Content-Security-Policy", content_security_policy),
+            ("Referrer-Policy", "no-referrer".to_string()),
+            ("X-Content-Type-Options", "nosniff".to_string()),
+            ("X-Frame-Options", "DENY".to_string()),
         ],
         Html(body),
     )
@@ -1410,12 +1832,23 @@ fn server_error() -> Response {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use base64::Engine as _;
     use rusqlite::Connection;
+    use sha2::{Digest, Sha256};
 
     const CLIENT: &str = "11111111-1111-4111-8111-111111111111";
     const OTHER_CLIENT: &str = "22222222-2222-4222-8222-222222222222";
     const USER: &str = "33333333-3333-4333-8333-333333333333";
     const REDIRECT: &str = "https://client.example/oauth/callback";
+
+    fn assert_exact_style_hash(csp: &str) {
+        let digest = Sha256::digest(OAUTH_PAGE_STYLE.as_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
+        assert!(
+            csp.contains(&format!("style-src 'sha256-{encoded}'")),
+            "CSP must authorize the exact embedded OAuth stylesheet"
+        );
+    }
 
     fn oauth_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1672,11 +2105,42 @@ mod tests {
         assert!(response.headers()["Content-Security-Policy"]
             .to_str()
             .unwrap()
-            .contains("form-action 'self'"));
+            .contains("form-action 'self' https://client.example;"));
+        let csp = response.headers()["Content-Security-Policy"]
+            .to_str()
+            .unwrap();
+        assert_exact_style_hash(csp);
+        assert!(!csp.contains("'unsafe-inline'"));
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body.contains("<script>"));
         assert!(body.contains("&lt;script&gt;"));
         assert!(body.contains("&quot; autofocus"));
+        assert!(body.contains("MCP connection request"));
+        assert!(body.contains("Protected by Kioku’s confidential cloud"));
+        assert!(body.contains("name=\"decision\" value=\"approve\""));
+        assert!(body.contains("name=\"decision\" value=\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn callback_error_uses_the_branded_private_shell() {
+        let response = callback_error(
+            StatusCode::BAD_REQUEST,
+            "Authentication failed",
+            "The callback was missing required parameters.",
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["Cache-Control"], "no-store");
+        let csp = response.headers()["Content-Security-Policy"]
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert_exact_style_hash(csp);
+        assert!(!csp.contains("'unsafe-inline'"));
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<title>Authentication failed · Kioku</title>"));
+        assert!(body.contains("Connection interrupted"));
+        assert!(body.contains("class=\"brand-mark\""));
     }
 }
