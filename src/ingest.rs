@@ -25,7 +25,8 @@
 //! dedup) and the payload carries an embedding, the embedding is still
 //! upserted against the existing rowid. This is how the Mac retrofits vectors
 //! onto historical rows: it re-sends already-synced rows with embeddings
-//! attached, the text dedups, the vector lands.
+//! attached, the text dedups, the vector lands. Screenshot retries can likewise
+//! fill an absent `salient_ocr_text` projection without replacing lossless OCR.
 //!
 //! **Model gate:** batches carry `embedding_model` naming the embedding space.
 //! If it doesn't match this build's [`crate::embedding::MODEL_ID`] (or is
@@ -97,6 +98,7 @@ pub struct ScreenshotInput {
     pub active_app: Option<String>,
     pub window_title: Option<String>,
     pub ocr_text: Option<String>,
+    pub salient_ocr_text: Option<String>,
     pub url: Option<String>,
     pub image_hash: Option<String>,
     pub is_duplicate: Option<i64>,
@@ -441,16 +443,19 @@ pub(crate) fn ingest_screenshots(
 ) -> Result<usize> {
     let mut inserted = 0usize;
     for s in items {
+        let salient_ocr_text =
+            crate::ocr::select_salient_ocr(s.ocr_text.as_deref(), s.salient_ocr_text.as_deref());
         if let Some(ref sk) = s.source_key {
             conn.execute(
                 r#"INSERT OR IGNORE INTO screenshots
-                   (captured_at, active_app, window_title, ocr_text, url, image_hash, is_duplicate, source_key)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                   (captured_at, active_app, window_title, ocr_text, salient_ocr_text, url, image_hash, is_duplicate, source_key)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                 rusqlite::params![
                     s.captured_at,
                     s.active_app,
                     s.window_title,
                     s.ocr_text,
+                    salient_ocr_text,
                     s.url,
                     s.image_hash,
                     s.is_duplicate.unwrap_or(0),
@@ -460,13 +465,14 @@ pub(crate) fn ingest_screenshots(
         } else {
             conn.execute(
                 r#"INSERT INTO screenshots
-                   (captured_at, active_app, window_title, ocr_text, url, image_hash, is_duplicate)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                   (captured_at, active_app, window_title, ocr_text, salient_ocr_text, url, image_hash, is_duplicate)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
                 rusqlite::params![
                     s.captured_at,
                     s.active_app,
                     s.window_title,
                     s.ocr_text,
+                    salient_ocr_text,
                     s.url,
                     s.image_hash,
                     s.is_duplicate.unwrap_or(0),
@@ -475,6 +481,23 @@ pub(crate) fn ingest_screenshots(
         }
         let row_inserted = conn.changes() as usize;
         inserted += row_inserted;
+
+        // Re-sent source-key rows may backfill the projection independently of
+        // embeddings. This updates only the non-indexed additive column.
+        if row_inserted == 0 {
+            if let (Some(sk), Some(salient)) =
+                (s.source_key.as_deref(), salient_ocr_text.as_deref())
+            {
+                if !salient.trim().is_empty() {
+                    conn.execute(
+                        "UPDATE screenshots SET salient_ocr_text = ?1
+                         WHERE source_key = ?2
+                           AND COALESCE(TRIM(salient_ocr_text), '') = ''",
+                        rusqlite::params![salient, sk],
+                    )?;
+                }
+            }
+        }
 
         if !accept_embeddings {
             continue;
@@ -556,6 +579,7 @@ mod tests {
             active_app: Some("Finder".to_string()),
             window_title: Some("Desktop".to_string()),
             ocr_text: Some("hello".to_string()),
+            salient_ocr_text: None,
             url: None,
             image_hash: None,
             is_duplicate: None,
@@ -826,6 +850,42 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(vecs, 2, "both screenshots should have vectors");
+    }
+
+    #[tokio::test]
+    async fn screenshot_salient_ocr_backfills_without_replacing_raw_ocr() {
+        let store = make_store();
+        store
+            .with_user("scr_salient_u", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots
+                     (captured_at, ocr_text, source_key)
+                     VALUES ('2026-07-22T12:40:29Z', 'lossless raw OCR', 'dev:312')",
+                    [],
+                )?;
+                let mut resent = scr(Some("dev:312"));
+                resent.ocr_text = Some("different resent OCR".into());
+                resent.salient_ocr_text = Some("MARY POPPINS".into());
+                let inserted = ingest_screenshots(conn, &[resent], true)?;
+                assert_eq!(inserted, 0);
+                Ok(())
+            })
+            .await
+            .expect("salient backfill");
+
+        let (raw, salient): (String, Option<String>) = store
+            .with_user("scr_salient_u", |conn| {
+                Ok(conn.query_row(
+                    "SELECT ocr_text, salient_ocr_text
+                     FROM screenshots WHERE source_key = 'dev:312'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .expect("stored OCR");
+        assert_eq!(raw, "lossless raw OCR");
+        assert_eq!(salient.as_deref(), Some("MARY POPPINS"));
     }
 
     /// Model gate: a batch whose embedding_model doesn't match MODEL_ID keeps
