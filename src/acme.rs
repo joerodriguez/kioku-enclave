@@ -530,7 +530,6 @@ impl Renewer {
                 let opened = decrypt_bound_blob(&dek, &rsp.ciphertext, STATE_CONTEXT)?;
                 let state: AcmeState = serde_json::from_slice(&opened.plaintext)?;
                 Ok(Some((state, rsp.generation)))
-
             }
             Err(Error::NotFound) => Ok(None),
             Err(e) => Err(e),

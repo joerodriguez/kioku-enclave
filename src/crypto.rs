@@ -51,7 +51,6 @@ pub struct OpenedBoundBlob {
     pub plaintext: Vec<u8>,
 }
 
-
 // ── DEK type ──────────────────────────────────────────────────────────────────
 
 /// 256-bit data-encryption key.  Plain bytes; lives only in enclave memory.
@@ -157,12 +156,8 @@ pub fn encrypt_bound_blob(dek: &Dek, plaintext: &[u8], context: &[u8]) -> Result
     Ok(out)
 }
 
-/// Open a context-bound blob. Enforces v2 context-bound encryption.
-pub fn decrypt_bound_blob(
-    dek: &Dek,
-    blob: &[u8],
-    context: &[u8],
-) -> Result<OpenedBoundBlob> {
+/// Open a context-bound blob. Enforces v2 context-bound encryption with legacy fallback.
+pub fn decrypt_bound_blob(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<OpenedBoundBlob> {
     if let Some(encrypted) = blob.strip_prefix(BOUND_BLOB_V2_MAGIC) {
         let aad = bound_blob_aad(context);
         return Ok(OpenedBoundBlob {
@@ -170,12 +165,18 @@ pub fn decrypt_bound_blob(
         });
     }
 
+    // Legacy blob fallback (pre-v2 format without KIOKU-BLOB header)
+    if let Ok(plaintext) = decrypt_blob_with_aad(dek, blob, context) {
+        return Ok(OpenedBoundBlob { plaintext });
+    }
+    if let Ok(plaintext) = decrypt_blob(dek, blob) {
+        return Ok(OpenedBoundBlob { plaintext });
+    }
+
     Err(EnclaveError::Crypto(
         "invalid context-bound blob header".into(),
     ))
 }
-
-
 
 // ── KMS trait (seam for testing) ──────────────────────────────────────────────
 
@@ -440,12 +441,11 @@ mod tests {
         let blob =
             encrypt_bound_blob(&dek, b"alice data", alice_context).expect("encrypt bound blob");
 
-        let opened = decrypt_bound_blob(&dek, &blob, alice_context)
-            .expect("open with correct context");
+        let opened =
+            decrypt_bound_blob(&dek, &blob, alice_context).expect("open with correct context");
         assert_eq!(opened.plaintext, b"alice data");
 
         assert!(decrypt_bound_blob(&dek, &blob, b"user-db\0indexes/bob.db.enc").is_err());
-
     }
 
     #[test]
