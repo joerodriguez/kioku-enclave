@@ -390,25 +390,11 @@ impl ControlStore {
         let (plaintext, meta) = match self.gcs.get_object(CONTROL_OBJECT).await {
             Ok(resp) => {
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
-                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, CONTROL_CONTEXT, None)?;
-                let mut generation = resp.generation;
-                if opened.was_legacy {
-                    let migrated = encrypt_bound_blob(&dek, &opened.plaintext, CONTROL_CONTEXT)?;
-                    generation = self
-                        .gcs
-                        .put_object(
-                            CONTROL_OBJECT,
-                            &migrated,
-                            &resp.wrapped_dek_b64,
-                            resp.generation,
-                        )
-                        .await?;
-                    info!("migrated legacy control DB to context-bound encryption");
-                }
+                let opened = decrypt_bound_blob(&dek, &resp.ciphertext, CONTROL_CONTEXT)?;
                 (
                     opened.plaintext,
                     BlobMeta {
-                        generation,
+                        generation: resp.generation,
                         wrapped_dek_b64: resp.wrapped_dek_b64,
                     },
                 )
@@ -499,14 +485,15 @@ impl ControlStore {
         let old = self.gcs.get_object(&old_object).await?;
         let dek = load_dek(self.kms.as_ref(), &old.wrapped_dek_b64).await?;
         let old_context = crate::store::user_blob_context(old_user_id);
-        let opened = decrypt_bound_blob(&dek, &old.ciphertext, &old_context, None)?;
+        let opened = decrypt_bound_blob(&dek, &old.ciphertext, &old_context)?;
 
         match self.gcs.get_object(&new_object).await {
             Ok(existing) => {
                 let existing_dek = load_dek(self.kms.as_ref(), &existing.wrapped_dek_b64).await?;
                 let new_context = crate::store::user_blob_context(new_user_id);
                 let existing_opened =
-                    decrypt_bound_blob(&existing_dek, &existing.ciphertext, &new_context, None)?;
+                    decrypt_bound_blob(&existing_dek, &existing.ciphertext, &new_context)?;
+
                 if existing_opened.plaintext != opened.plaintext {
                     return Err(EnclaveError::Conflict(
                         "stable user object already exists with different content".into(),
@@ -630,25 +617,44 @@ impl ControlStore {
                     }
                     let row = conn
                         .query_row(
-                            "SELECT id, status FROM users WHERE google_sub = ?1",
+                            "SELECT id, email, status FROM users WHERE google_sub = ?1",
                             [&google_sub],
-                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                            |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                ))
+                            },
                         )
                         .optional()?;
                     match row {
-                        Some((_, ref status)) if status != "active" => {
+                        Some((_, _, ref status)) if status != "active" => {
                             Err(EnclaveError::Auth("account inactive".into()))
                         }
-                        Some((id, _)) => Ok(Some(id)),
+                        Some((id, current_email, _)) => Ok(Some((id, current_email))),
                         None => Ok(None),
                     }
                 }
             })
             .await?;
 
+        // Google ID tokens authenticate every web/API request. Avoid rewriting
+        // the encrypted control DB for the overwhelmingly common no-op case;
+        // screenshot upload bursts otherwise exceed GCS's per-object write
+        // rate and turn valid image requests into intermittent 500 responses.
+        if let Some((existing_id, existing_email)) = existing.as_ref() {
+            if existing_id == &stable_id && existing_email == &email {
+                return Ok(User {
+                    id: stable_id,
+                    email,
+                });
+            }
+        }
+
         // 2. If it has an old ID, authenticate and re-encrypt the GCS blob under
         // the stable object's context before updating the identity row.
-        if let Some(ref old_id) = existing {
+        if let Some((old_id, _)) = existing.as_ref() {
             if old_id != &stable_id {
                 info!(
                     old_id = %old_id,
@@ -673,7 +679,7 @@ impl ControlStore {
                 if is_deleted_user_conn(conn, &stable_id)? {
                     return Err(EnclaveError::Auth("account deleted".into()));
                 }
-                if let Some(ref old_id) = existing_cloned {
+                if let Some((ref old_id, _)) = existing_cloned {
                     let status: Option<String> = conn
                         .query_row(
                             "SELECT status FROM users WHERE google_sub = ?1",
@@ -1035,6 +1041,30 @@ mod tests {
         );
         assert!(begin_user_deletion_conn(&conn, &stable_id).unwrap());
         assert!(delete_user_identity_conn(&conn, &stable_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn unchanged_user_upsert_does_not_rewrite_control_object() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let store = ControlStore::new(kms, gcs.clone());
+
+        let first = store
+            .upsert_user(GOOGLE_SUB, "owner@example.com")
+            .await
+            .unwrap();
+        let first_generation = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
+
+        let second = store
+            .upsert_user(GOOGLE_SUB, "owner@example.com")
+            .await
+            .unwrap();
+        let second_generation = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first_generation, second_generation);
     }
 
     #[test]

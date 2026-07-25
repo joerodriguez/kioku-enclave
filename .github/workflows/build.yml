@@ -62,7 +62,10 @@ on:
       - main
     tags:
       - "v*"
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
+
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

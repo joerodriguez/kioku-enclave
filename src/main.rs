@@ -77,6 +77,7 @@ mod embedding;
 mod episodes;
 mod error;
 mod ingest;
+mod ocr;
 mod search;
 mod store;
 mod timeline;
