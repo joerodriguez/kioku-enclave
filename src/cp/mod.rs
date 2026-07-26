@@ -14,9 +14,12 @@
 pub mod auth;
 pub mod control_store;
 pub mod cors;
+pub mod dlp;
 pub mod finalizer;
 pub mod isotime;
 pub mod limits;
+pub mod mcp_projection;
+pub mod mcp_query;
 pub(crate) mod mcp_safety;
 pub mod oauth;
 pub mod query;
