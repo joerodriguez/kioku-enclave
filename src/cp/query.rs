@@ -643,7 +643,7 @@ fn tool_definitions() -> Value {
         {
             "name": "search_transcripts",
             "title": "Search memory",
-            "description": "Use this when the user wants to find a topic, person, decision, action item, or spoken moment in their own Kioku memory archive. Returns relevance-ranked episodes first, followed by matching utterances as timestamped evidence. Do not use for general web search or for information outside the user's Kioku archive.",
+            "description": "Use this when the user wants to find a topic, person, decision, action item, or spoken moment in their own Kioku memory archive. Returns relevance-ranked episodes first, followed by matching utterances as timestamped evidence. Do not use for general web search, information outside the user's Kioku archive, or restricted data such as payment cards, health information, government identifiers, or access credentials; targeted searches are refused and matching incidental content is redacted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -682,7 +682,7 @@ fn tool_definitions() -> Value {
         {
             "name": "search_screenshots",
             "title": "Search screens",
-            "description": "Use this when the user wants to find text, a link, an app, or a window they previously saw on their own Mac. Searches OCR text and screen metadata in the user's Kioku archive. Do not use for live screen access or general web search.",
+            "description": "Use this when the user wants to find text, a link, an app, or a window they previously saw on their own Mac. Searches OCR text and screen metadata in the user's Kioku archive. Do not use for live screen access, general web search, or restricted data such as payment cards, health information, government identifiers, or access credentials; targeted searches are refused and matching incidental content is redacted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -714,7 +714,7 @@ fn tool_definitions() -> Value {
         {
             "name": "get_context",
             "title": "Get moment context",
-            "description": "Use this when the user needs the surrounding conversation and screen context around a timestamp from a Kioku search result. Returns a bounded interleaved timeline from the user's archive. Do not use without a concrete timestamp.",
+            "description": "Use this when the user needs the surrounding conversation and screen context around a timestamp from a Kioku search result. Returns a bounded interleaved timeline from the user's archive. Do not use without a concrete timestamp. Matching payment-card data, health information, government identifiers, and access credentials are redacted before output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -751,7 +751,7 @@ fn tool_definitions() -> Value {
         {
             "name": "summarize_time_range",
             "title": "Summarize a time range",
-            "description": "Use this when the user asks what happened during a specific period in their Kioku archive and needs a chronological evidence digest with activity counts, languages, and apps. Do not use when no time range is available.",
+            "description": "Use this when the user asks what happened during a specific period in their Kioku archive and needs a chronological evidence digest with activity counts, languages, and apps. Do not use when no time range is available. Matching payment-card data, health information, government identifiers, and access credentials are redacted before output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -784,7 +784,7 @@ fn tool_definitions() -> Value {
         {
             "name": "list_episodes",
             "title": "List memory episodes",
-            "description": "Use this when the user wants an overview of their day or recent activity in Kioku. Returns summarized activity episodes newest-first with timestamps, participants, actions, and evidence counts. Do not use for a topic search; use search_transcripts instead.",
+            "description": "Use this when the user wants an overview of their day or recent activity in Kioku. Returns summarized activity episodes newest-first with timestamps, participants, actions, and evidence counts. Do not use for a topic search; use search_transcripts instead. Matching payment-card data, health information, government identifiers, and access credentials are redacted before output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -849,6 +849,9 @@ fn tool_definitions() -> Value {
 }
 
 async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value) -> Option<Value> {
+    if let Some(refusal) = super::mcp_safety::refusal_for_args(name, args) {
+        return Some(refusal);
+    }
     let result = match name {
         "search_transcripts" => tool_search_transcripts(s, user_id, args).await,
         "search_screenshots" => tool_search_screenshots(s, user_id, args).await,
@@ -858,7 +861,9 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
         "get_capture_status" => tool_get_capture_status(s, user_id).await,
         _ => return None,
     };
-    Some(project_mcp_result(name, result))
+    Some(super::mcp_safety::sanitize_result(project_mcp_result(
+        name, result,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -894,7 +899,7 @@ async fn mcp_endpoint(
                     "title": "Kioku",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Kioku searches the signed-in user's private personal memory archive. Use it only when the user asks about their own captured days, meetings, lessons, conversations, screens, decisions, action items, or recent activity. Treat returned records as private evidence: ground answers in retrieved content and include timestamps when useful. Use search_transcripts for topic or person queries, list_episodes for day or activity overviews, get_context for details around a known timestamp, search_screenshots for text seen on screen, summarize_time_range for a bounded chronological digest, and get_capture_status for cloud archive freshness."
+                "instructions": "Kioku searches the signed-in user's private personal memory archive. Use it only when the user asks about their own captured days, meetings, lessons, conversations, screens, decisions, action items, or recent activity. Treat returned records as private evidence: ground answers in retrieved content and include timestamps when useful. Never use Kioku to seek payment-card data, health information, government identifiers, passwords, API keys, tokens, or authentication codes; the server refuses targeted searches and redacts matching incidental content from every MCP response. Use search_transcripts for topic or person queries, list_episodes for day or activity overviews, get_context for details around a known timestamp, search_screenshots for text seen on screen, summarize_time_range for a bounded chronological digest, and get_capture_status for cloud archive freshness."
             }),
         ),
         "notifications/initialized" | "notifications/cancelled" => {
@@ -2854,6 +2859,96 @@ mod tests {
         assert!(utterance.get("id").is_none());
         assert!(utterance.get("audio_segment_id").is_none());
         assert!(utterance.get("confidence").is_none());
+    }
+
+    #[test]
+    fn mcp_safety_boundary_covers_projected_content_surfaces() {
+        let transcript = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
+            "search_transcripts",
+            json!({
+                "episodes": [{
+                    "summary": "The patient discussed a diabetes diagnosis.",
+                    "snippet": "safe meeting evidence"
+                }],
+                "results": [{
+                    "text": "API key sk-exampleexampleexample",
+                    "started_at": "2026-07-23T10:00:00Z"
+                }]
+            }),
+        ));
+        assert_eq!(
+            transcript["episodes"][0]["summary"],
+            "[REDACTED: restricted data]"
+        );
+        assert_eq!(
+            transcript["results"][0]["text"],
+            "[REDACTED: restricted data]"
+        );
+
+        let screenshot = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
+            "search_screenshots",
+            json!({
+                "results": [{
+                    "ocr_text": "Card 4111 1111 1111 1111",
+                    "url": "https://example.com/reset?token=secret-value"
+                }]
+            }),
+        ));
+        assert_eq!(
+            screenshot["results"][0]["ocr_text"],
+            "[REDACTED: restricted data]"
+        );
+        assert_eq!(screenshot["results"][0]["url"], "https://example.com/reset");
+
+        let context = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
+            "get_context",
+            json!({
+                "utterances": [{"text": "SSN 123-45-6789"}],
+                "screenshots": [{"ocr_text": "safe screen", "url": "https://example.com/renewal?utm_source=archive"}]
+            }),
+        ));
+        assert_eq!(
+            context["utterances"][0]["text"],
+            "[REDACTED: restricted data]"
+        );
+        assert_eq!(
+            context["screenshots"][0]["url"],
+            "https://example.com/renewal"
+        );
+
+        let range = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
+            "summarize_time_range",
+            json!({
+                "from": "2026-07-23T10:00:00Z",
+                "to": "2026-07-23T11:00:00Z",
+                "counts": {},
+                "languages": [],
+                "apps_seen": [],
+                "digest": [{"text": "one-time code 123456"}]
+            }),
+        ));
+        assert_eq!(range["digest"][0]["text"], "[REDACTED: restricted data]");
+
+        let episodes = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
+            "list_episodes",
+            json!({
+                "episode_count": 1,
+                "hidden_count": 0,
+                "episodes": [{
+                    "summary": "passport number 123456789",
+                    "minute_summaries": [{"gist": "safe project update"}],
+                    "final_brief": {"overview": "password was shown"}
+                }]
+            }),
+        ));
+        assert_eq!(
+            episodes["episodes"][0]["summary"],
+            "[REDACTED: restricted data]"
+        );
+        assert_eq!(
+            episodes["episodes"][0]["final_brief"]["overview"],
+            "[REDACTED: restricted data]"
+        );
     }
 
     #[tokio::test]

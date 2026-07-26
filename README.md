@@ -141,6 +141,15 @@ under Google's
 [no-data-retention terms](https://cloud.google.com/vertex-ai/docs/generative-ai/data-governance).
 This is an explicit external trust boundary, not an enclave-only inference claim.
 
+The assistant-facing MCP surface has an additional boundary that does not alter the
+private archive. Searches aimed at payment-card data, health information, government
+identifiers, passwords, API keys, tokens, or authentication codes are refused before
+archive retrieval. After each tool's minimal response projection, matching incidental
+content is replaced inside the enclave across transcripts, OCR, URLs, surrounding
+context, time-range digests, episode summaries, action items, and final briefs. URL query
+strings and fragments are omitted, malformed URLs and oversized text fail closed, and
+the REST/debugger surfaces retain their normal owner-authorized behavior.
+
 Users can add HTTPS webhook destinations for finalized-episode events. Notifications are
 content-free by default; including a final brief is a separate per-destination opt-in.
 Webhook endpoints and signing secrets are encrypted in the control store, destination

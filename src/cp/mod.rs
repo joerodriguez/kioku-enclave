@@ -17,6 +17,7 @@ pub mod cors;
 pub mod finalizer;
 pub mod isotime;
 pub mod limits;
+pub(crate) mod mcp_safety;
 pub mod oauth;
 pub mod query;
 pub mod reviewer;
