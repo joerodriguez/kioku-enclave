@@ -25,11 +25,11 @@
 //! since the binary already minimises dependencies. The response is a quoted
 //! JSON string (the raw JWT).
 //!
-//! Uncertainty note: Google's public documentation for the token server
-//! endpoint format is sparse. The path `POST /v1/token` with JSON body
-//! `{"audience":"…","token_type":"OIDC"}` matches the Confidential Space
-//! launcher's documented contract as of 2025. If Google changes this ABI the
-//! `fetch_attestation_token` function is the only place to update.
+//! The path `POST /v1/token` with JSON body
+//! `{"audience":"…","token_type":"OIDC","nonces":["…"]}` matches the
+//! Confidential Space launcher's documented contract. If Google changes this
+//! ABI, [`launcher_token_request_body`] is the single request-shape boundary to
+//! update.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -193,14 +193,7 @@ impl AttestationCache {
 ///
 /// Expected response: a JSON-quoted string, e.g. `"eyJ…"` (the raw JWT).
 pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Result<String> {
-    let mut body_json = serde_json::json!({
-        "audience": audience,
-        "token_type": "OIDC",
-    });
-    if let Some(n) = nonce {
-        body_json["nonce"] = serde_json::json!(n);
-    }
-    let request_body = body_json.to_string();
+    let request_body = launcher_token_request_body(audience, nonce).to_string();
 
     let request = format!(
         "POST /v1/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -273,6 +266,22 @@ pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Res
     }
 
     Ok(jwt)
+}
+
+/// Build the JSON contract accepted by the Confidential Space launcher.
+///
+/// Google represents nonce values as a plural `nonces` array even when there
+/// is only one channel-binding value. Omitting the field entirely is important
+/// for WIF credential tokens, which do not need a custom nonce.
+fn launcher_token_request_body(audience: &str, nonce: Option<&str>) -> serde_json::Value {
+    let mut body_json = serde_json::json!({
+        "audience": audience,
+        "token_type": "OIDC",
+    });
+    if let Some(n) = nonce {
+        body_json["nonces"] = serde_json::json!([n]);
+    }
+    body_json
 }
 
 /// Decode an HTTP/1.1 chunked-transfer body into its payload.
@@ -424,6 +433,33 @@ mod tests {
     fn split_body_missing_separator_errors() {
         let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n";
         assert!(split_http_body(resp).is_err());
+    }
+
+    // ── Launcher request shape ────────────────────────────────────────────────
+
+    #[test]
+    fn launcher_request_uses_plural_nonces_array() {
+        let body = launcher_token_request_body(
+            "https://api.kiokuu.com/v1/attestation",
+            Some("0123456789abcdef"),
+        );
+
+        assert_eq!(body["audience"], "https://api.kiokuu.com/v1/attestation");
+        assert_eq!(body["token_type"], "OIDC");
+        assert_eq!(body["nonces"], serde_json::json!(["0123456789abcdef"]));
+        assert!(body.get("nonce").is_none(), "singular nonce is unsupported");
+    }
+
+    #[test]
+    fn launcher_request_omits_nonces_for_wif_token() {
+        let body = launcher_token_request_body(
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/provider",
+            None,
+        );
+
+        assert_eq!(body["token_type"], "OIDC");
+        assert!(body.get("nonces").is_none());
+        assert!(body.get("nonce").is_none());
     }
 
     // ── STS request shape ─────────────────────────────────────────────────────
