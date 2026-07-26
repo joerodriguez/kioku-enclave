@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "kioku-enclave"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "aes-gcm",
  "async-trait",

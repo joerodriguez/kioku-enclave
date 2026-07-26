@@ -15,7 +15,7 @@ usage() {
   echo ""
   echo "  Publishes a source tag, waits for the public image build, and creates"
   echo "  a GitHub Release containing the exact image digest and build metadata."
-  echo "  --roll also dispatches the deployment repo's approval-gated VM roll."
+  echo "  --roll also dispatches the deployment repo's confirmed VM roll."
 }
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
@@ -516,16 +516,17 @@ echo "Public release: https://github.com/${REPOSITORY}/releases/tag/${RELEASE_TA
 echo "Digest-pinned image: $DIGEST_URI"
 
 if [[ "$ROLL" == "true" ]]; then
-  echo "Dispatching the approval-gated production roll in $DEPLOYMENT_REPO..."
+  echo "Dispatching the explicitly confirmed production roll in $DEPLOYMENT_REPO..."
   gh workflow run enclave.yml \
     --repo "$DEPLOYMENT_REPO" \
     --ref main \
     -f "release_tag=$RELEASE_TAG" \
     -f "enclave_image=$DIGEST_URI" \
-    -f "enclave_image_digest=$DIGEST"
-  echo "Roll requested. Approve and monitor it at:"
+    -f "enclave_image_digest=$DIGEST" \
+    -f "confirm=deploy"
+  echo "Confirmed roll requested. Monitor it at:"
   echo "https://github.com/${DEPLOYMENT_REPO}/actions/workflows/enclave.yml"
 else
-  echo "Production was not changed. To request the gated roll:"
+  echo "Production was not changed. To request an explicitly confirmed roll:"
   echo "  $0 $RELEASE_TAG --roll"
 fi
