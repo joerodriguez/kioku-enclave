@@ -46,6 +46,9 @@
 #   GOOGLE_DESKTOP_CLIENT_ID / GOOGLE_WEB_CLIENT_ID  Google OAuth audiences
 #   ALLOWED_EMAILS       Comma-separated account allow-list
 #   BASE_URL / WEB_ORIGIN  Public API issuer and browser application origin
+#   REVIEWER_AUTH_API_KEY / REVIEWER_AUTH_UID / REVIEWER_AUTH_EMAIL
+#                        Optional exact Google Identity Platform review account;
+#                        set all three or none. The password is never built in.
 #   VERTEX_PROJECT / VERTEX_LOCATION / VERTEX_MODEL  Summarizer configuration
 #   ENCLAVE_ACME         Set to 1 for production in-enclave TLS
 #   ENCLAVE_ACME_DIRECTORY / ENCLAVE_ACME_CONTACT  ACME endpoint and contact
@@ -95,6 +98,9 @@ ARG GOOGLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
 ARG BASE_URL
 ARG WEB_ORIGIN
+ARG REVIEWER_AUTH_API_KEY
+ARG REVIEWER_AUTH_UID
+ARG REVIEWER_AUTH_EMAIL
 ARG VERTEX_PROJECT
 ARG VERTEX_LOCATION
 ARG VERTEX_MODEL
@@ -119,6 +125,12 @@ RUN set -eu \
     && case "${BASE_URL}" in https://*) true;; *) false;; esac \
     && case "${WEB_ORIGIN}" in https://*) true;; *) false;; esac \
     && case "${ATTEST_STS_AUDIENCE}" in //iam.googleapis.com/*/workloadIdentityPools/*/providers/*) true;; *) false;; esac
+RUN set -eu \
+    && if [ -n "${REVIEWER_AUTH_API_KEY}${REVIEWER_AUTH_UID}${REVIEWER_AUTH_EMAIL}" ]; then \
+         [ -n "${REVIEWER_AUTH_API_KEY}" ] \
+         && [ -n "${REVIEWER_AUTH_UID}" ] \
+         && [ -n "${REVIEWER_AUTH_EMAIL}" ]; \
+       fi
 
 # Install musl toolchain (+ curl for the embedding-model download below)
 RUN rustup target add x86_64-unknown-linux-musl \
@@ -271,6 +283,9 @@ ARG GOOGLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
 ARG BASE_URL
 ARG WEB_ORIGIN
+ARG REVIEWER_AUTH_API_KEY
+ARG REVIEWER_AUTH_UID
+ARG REVIEWER_AUTH_EMAIL
 ARG VERTEX_PROJECT
 ARG VERTEX_LOCATION
 ARG VERTEX_MODEL
@@ -283,6 +298,9 @@ ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
     BASE_URL=${BASE_URL} \
     WEB_ORIGIN=${WEB_ORIGIN} \
+    REVIEWER_AUTH_API_KEY=${REVIEWER_AUTH_API_KEY} \
+    REVIEWER_AUTH_UID=${REVIEWER_AUTH_UID} \
+    REVIEWER_AUTH_EMAIL=${REVIEWER_AUTH_EMAIL} \
     VERTEX_PROJECT=${VERTEX_PROJECT} \
     VERTEX_LOCATION=${VERTEX_LOCATION} \
     VERTEX_MODEL=${VERTEX_MODEL} \

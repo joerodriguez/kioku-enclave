@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tracing::{info, warn};
 
 // Version 3 regenerates canonical briefs with salient screen OCR and explicit
-// deictic entity retention. Regeneration never re-enqueues Gmail.
+// deictic entity retention. Regeneration never re-enqueues outbound events.
 pub(crate) const FINALIZATION_VERSION: i32 = crate::store::EPISODE_FINALIZATION_VERSION;
 const MIRRORED_UTTERANCE_WINDOW_MS: i64 = 3_000;
 const MAX_FINALIZER_MODEL_INPUT_BYTES: usize = 256 * 1024;
@@ -38,8 +38,8 @@ fn finalization_mode(
 }
 
 impl FinalizationMode {
-    fn should_enqueue_email(self, email_enabled: bool) -> bool {
-        email_enabled && matches!(self, Self::Initial)
+    fn should_enqueue_delivery(self, has_subscriptions: bool) -> bool {
+        has_subscriptions && matches!(self, Self::Initial)
     }
 }
 
@@ -1325,9 +1325,17 @@ async fn finalize_user_episodes_scoped(
             })
             .collect();
 
-        // 7. Check if user has email configured & enabled
-        let gmail_config = state.control.get_gmail_config(user_id).await?;
-        let email_enabled = gmail_config.as_ref().map(|c| c.enabled).unwrap_or(false);
+        // 7. Snapshot enabled webhook destinations. A destination deleted
+        // after this point is still fail-closed: the worker re-checks it and
+        // cancels the opaque outbox row before any network request.
+        let webhook_destinations: Vec<(String, String)> = state
+            .control
+            .list_webhook_subscriptions(user_id)
+            .await?
+            .into_iter()
+            .filter(|subscription| subscription.enabled)
+            .map(|subscription| (subscription.id, super::webhook_worker::new_event_id()))
+            .collect();
 
         // 8. Optimistic commit transaction
         let user_cloned4 = user.clone();
@@ -1373,16 +1381,25 @@ async fn finalize_user_episodes_scoped(
                 rusqlite::params![ep_id, overview, decisions_json, action_items_json, important_links_json, open_questions_json]
             )?;
 
-            // Only a first finalization may enqueue mail. Versioned repairs update
-            // the canonical web/export brief without surprising the user with a
-            // second message for the same historical episode.
-            let email_enqueued = mode.should_enqueue_email(email_enabled);
-            if email_enqueued {
-                conn.execute(
-                    "INSERT OR REPLACE INTO episode_deliveries (episode_id, channel, delivery_version, state)
-                     VALUES (?1, 'gmail', ?2, 'pending')",
-                    rusqlite::params![ep_id, FINALIZATION_VERSION]
-                )?;
+            // Only a first finalization may enqueue outbound events. Versioned
+            // repairs update the canonical web/export brief without replaying
+            // the same historical episode to external automations.
+            let deliveries_enqueued =
+                mode.should_enqueue_delivery(!webhook_destinations.is_empty());
+            if deliveries_enqueued {
+                for (subscription_id, event_id) in &webhook_destinations {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO webhook_deliveries
+                            (episode_id, subscription_id, delivery_version, event_id, state)
+                         VALUES (?1, ?2, ?3, ?4, 'pending')",
+                        rusqlite::params![
+                            ep_id,
+                            subscription_id,
+                            FINALIZATION_VERSION,
+                            event_id
+                        ]
+                    )?;
+                }
             }
 
             // Mark a new episode finalized, or atomically advance a regenerated
@@ -1405,14 +1422,18 @@ async fn finalize_user_episodes_scoped(
             )?;
 
             conn.execute("COMMIT", [])?;
-            Ok(email_enqueued)
+            Ok(if deliveries_enqueued {
+                webhook_destinations.len()
+            } else {
+                0
+            })
         }).await;
 
         match commit_res {
-            Ok(email_enqueued) => {
+            Ok(webhook_delivery_count) => {
                 info!(
                     episode_id = ep.id,
-                    email_enqueued, "episode successfully finalized"
+                    webhook_delivery_count, "episode successfully finalized"
                 );
                 let _ = state.store.save_user(&user).await;
             }
@@ -1475,26 +1496,26 @@ mod tests {
     }
 
     #[test]
-    fn historical_v1_briefs_regenerate_without_reenqueuing_email() {
+    fn historical_v1_briefs_regenerate_without_reenqueuing_webhooks() {
         let historical_default = finalization_mode(Some("2026-07-01T12:00:00Z"), None);
         let historical_v1 = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(1));
 
         assert_eq!(historical_default, FinalizationMode::Regeneration);
         assert_eq!(historical_v1, FinalizationMode::Regeneration);
-        assert!(!historical_default.should_enqueue_email(true));
-        assert!(!historical_v1.should_enqueue_email(true));
+        assert!(!historical_default.should_enqueue_delivery(true));
+        assert!(!historical_v1.should_enqueue_delivery(true));
     }
 
     #[test]
     fn current_briefs_are_terminal_but_initial_finalization_may_enqueue() {
         let current = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(3));
         assert_eq!(current, FinalizationMode::AlreadyCurrent);
-        assert!(!current.should_enqueue_email(true));
+        assert!(!current.should_enqueue_delivery(true));
 
         let initial = finalization_mode(None, None);
         assert_eq!(initial, FinalizationMode::Initial);
-        assert!(initial.should_enqueue_email(true));
-        assert!(!initial.should_enqueue_email(false));
+        assert!(initial.should_enqueue_delivery(true));
+        assert!(!initial.should_enqueue_delivery(false));
     }
 
     #[test]

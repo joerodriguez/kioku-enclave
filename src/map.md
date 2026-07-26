@@ -3,8 +3,8 @@
 The entire attested Kioku backend: it terminates TLS and serves OAuth, sync, MCP/REST,
 account, quotas, and the summarizer—see [`cp/`](cp/map.md)—alongside the legacy `/v1/*`
 query/storage API. Plaintext databases exist only here and in SEV tmpfs, never on
-persistent disk; selected summarisation text and opted-in final-brief email leave the TEE
-through the documented Vertex/Gmail trust boundaries.
+persistent disk; selected summarisation text and explicitly configured webhook events
+leave the TEE through the documented Vertex/webhook trust boundaries.
 
 | File | Role |
 |---|---|

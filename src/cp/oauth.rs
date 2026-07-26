@@ -1,13 +1,14 @@
 //! OAuth 2.1 facade and Dynamic Client Registration.
 //! Public endpoints (no auth): discovery, /register, /authorize, the Google
-//! callback, and /token. MCP clients (Claude/ChatGPT) use this to obtain our
-//! HS256 access tokens; Google is the upstream IdP.
+//! callback, the exact-match reviewer bridge, and /token. MCP clients
+//! (Claude/ChatGPT) use this to obtain our HS256 access tokens; Google is the
+//! upstream IdP for both normal and reviewer identities.
 
 use std::{net::IpAddr, str::FromStr, sync::Arc};
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::{header::LOCATION, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -33,6 +34,7 @@ const UNUSED_CLIENT_TTL_SECS: i64 = 60 * 60;
 const MAX_CLIENT_STATE_BYTES: usize = 1024;
 const AUTH_CODE_TTL_SECS: i64 = 5 * 60;
 const REFRESH_TTL_SECS: i64 = 90 * 24 * 60 * 60;
+const MCP_SCOPE: &str = "kioku:read";
 
 fn is_valid_client_id(value: &str) -> bool {
     value.len() == 36
@@ -150,15 +152,18 @@ pub fn router() -> Router<Arc<CpState>> {
         )
         .route("/register", post(register))
         .route("/authorize", get(authorize))
+        .route(
+            "/oauth/reviewer",
+            post(reviewer_login).options(reviewer_preflight),
+        )
         .route("/oauth/google/callback", get(google_callback))
         .route("/oauth/consent", post(consent))
-        .route("/oauth/gmail/callback", get(gmail_callback))
         .route("/token", post(token))
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
 fn redirect_302(url: &str) -> Response {
-    (StatusCode::FOUND, [(LOCATION, url.to_string())]).into_response()
+    (StatusCode::FOUND, [(header::LOCATION, url.to_string())]).into_response()
 }
 
 const OAUTH_PAGE_STYLE: &str = r#"
@@ -552,19 +557,25 @@ async fn authz_metadata(State(s): State<Arc<CpState>>) -> Json<serde_json::Value
     let base = &s.config.base_url;
     Json(json!({
         "issuer": base,
-        "authorization_endpoint": format!("{base}/authorize"),
+        "authorization_endpoint": format!("{}/app/login", s.config.web_origin),
         "token_endpoint": format!("{base}/token"),
         "registration_endpoint": format!("{base}/register"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": [MCP_SCOPE],
     }))
 }
 
 async fn resource_metadata(State(s): State<Arc<CpState>>) -> Json<serde_json::Value> {
     let base = &s.config.base_url;
-    Json(json!({ "resource": base, "authorization_servers": [base] }))
+    Json(json!({
+        "resource": base,
+        "authorization_servers": [base],
+        "scopes_supported": [MCP_SCOPE],
+        "resource_documentation": "https://kiokuu.com/privacy"
+    }))
 }
 
 // ── Dynamic Client Registration ─────────────────────────────────────────────────
@@ -708,86 +719,107 @@ struct AuthorizeQuery {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     response_type: Option<String>,
+    scope: Option<String>,
+    resource: Option<String>,
 }
 
-async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery>) -> Response {
+async fn validated_authorization_request(
+    s: &Arc<CpState>,
+    q: AuthorizeQuery,
+) -> std::result::Result<tokens::StateClaims, Response> {
     if q.response_type.as_deref() != Some("code") {
-        return bad_request("unsupported_response_type");
+        return Err(bad_request("unsupported_response_type"));
     }
-    let Some(code_challenge) = q.code_challenge.clone() else {
-        return bad_request_desc("invalid_request", "code_challenge required");
+    let Some(code_challenge) = q.code_challenge else {
+        return Err(bad_request_desc(
+            "invalid_request",
+            "code_challenge required",
+        ));
     };
     if !is_valid_pkce_challenge(&code_challenge) {
-        return bad_request_desc("invalid_request", "invalid S256 code_challenge");
+        return Err(bad_request_desc(
+            "invalid_request",
+            "invalid S256 code_challenge",
+        ));
     }
     if q.code_challenge_method.as_deref() != Some("S256") {
-        return bad_request_desc("invalid_request", "code_challenge_method must be S256");
+        return Err(bad_request_desc(
+            "invalid_request",
+            "code_challenge_method must be S256",
+        ));
     }
-    let (client_id, redirect_uri) = match (q.client_id.clone(), q.redirect_uri.clone()) {
+    if q.scope
+        .as_deref()
+        .is_some_and(|scope| scope.split_whitespace().collect::<Vec<_>>() != [MCP_SCOPE])
+    {
+        return Err(bad_request_desc(
+            "invalid_scope",
+            "only kioku:read is supported",
+        ));
+    }
+    let (client_id, redirect_uri) = match (q.client_id, q.redirect_uri) {
         (Some(c), Some(r)) => (c, r),
-        _ => return bad_request_desc("invalid_request", "client_id and redirect_uri required"),
+        _ => {
+            return Err(bad_request_desc(
+                "invalid_request",
+                "client_id and redirect_uri required",
+            ))
+        }
     };
     if !is_valid_client_id(&client_id) || !is_valid_redirect_uri(&redirect_uri) {
-        return bad_request_desc("invalid_request", "invalid client_id or redirect_uri");
+        return Err(bad_request_desc(
+            "invalid_request",
+            "invalid client_id or redirect_uri",
+        ));
     }
     let client_state = q.state.unwrap_or_default();
     if client_state.len() > MAX_CLIENT_STATE_BYTES || client_state.chars().any(char::is_control) {
-        return bad_request_desc("invalid_request", "state is invalid or too long");
+        return Err(bad_request_desc(
+            "invalid_request",
+            "state is invalid or too long",
+        ));
+    }
+    let resource = q.resource.unwrap_or_else(|| s.config.base_url.to_string());
+    if resource != s.config.base_url {
+        return Err(bad_request_desc(
+            "invalid_target",
+            "resource must match the Kioku MCP server",
+        ));
     }
 
-    // Validate client + exact redirect_uri match.
-    let cid = client_id.clone();
-    let registered: Option<String> = match s
+    let registered = s
         .control
-        .read(move |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT redirect_uris FROM oauth_clients WHERE client_id = ?1",
-                    [&cid],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?)
+        .read({
+            let client_id = client_id.clone();
+            let redirect_uri = redirect_uri.clone();
+            move |conn| registered_client_conn(conn, &client_id, &redirect_uri)
         })
-        .await
-    {
-        Ok(v) => v,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "server_error"})),
-            )
-                .into_response()
-        }
-    };
-    let Some(uris_json) = registered else {
-        return bad_request("invalid_client");
-    };
-    let uris: Vec<String> = match serde_json::from_str(&uris_json) {
-        Ok(uris) => uris,
-        Err(_) => return server_error(),
-    };
-    if !uris.contains(&redirect_uri) {
-        return bad_request_desc("invalid_request", "redirect_uri mismatch");
+        .await;
+    match registered {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(bad_request("invalid_client")),
+        Err(_) => return Err(server_error()),
     }
 
-    let state_jwt = match tokens::issue_state(
-        &s.config.jwt_secrets[0],
-        &tokens::StateClaims {
-            client_id: client_id.clone(),
-            redirect_uri,
-            client_state,
-            code_challenge,
-            exp: 0,
-        },
-    ) {
+    Ok(tokens::StateClaims {
+        client_id,
+        redirect_uri,
+        client_state,
+        code_challenge,
+        resource,
+        exp: 0,
+    })
+}
+
+async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery>) -> Response {
+    let state = match validated_authorization_request(&s, q).await {
+        Ok(state) => state,
+        Err(response) => return response,
+    };
+
+    let state_jwt = match tokens::issue_state(&s.config.jwt_secrets[0], &state) {
         Ok(t) => t,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "server_error"})),
-            )
-                .into_response()
-        }
+        Err(_) => return server_error(),
     };
 
     let base = &s.config.base_url;
@@ -804,6 +836,179 @@ async fn authorize(State(s): State<Arc<CpState>>, Query(q): Query<AuthorizeQuery
         .unwrap_or_default(),
     );
     redirect_302(&url)
+}
+
+// ── Reviewer bridge ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ReviewerLoginBody {
+    id_token: Option<String>,
+    #[serde(flatten)]
+    authorization: AuthorizeQuery,
+}
+
+fn reviewer_origin_allowed(s: &CpState, headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        == Some(s.config.web_origin.as_str())
+}
+
+fn attach_reviewer_cors(s: &CpState, headers: &HeaderMap, response: &mut Response) {
+    if !reviewer_origin_allowed(s, headers) {
+        return;
+    }
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_str(&s.config.web_origin).expect("validated WEB_ORIGIN header"),
+    );
+    response_headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+}
+
+fn reviewer_json(
+    s: &CpState,
+    headers: &HeaderMap,
+    status: StatusCode,
+    value: serde_json::Value,
+) -> Response {
+    let mut response = (status, Json(value)).into_response();
+    attach_reviewer_cors(s, headers, &mut response);
+    response
+}
+
+async fn reviewer_preflight(State(s): State<Arc<CpState>>, headers: HeaderMap) -> Response {
+    if !reviewer_origin_allowed(&s, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    attach_reviewer_cors(&s, &headers, &mut response);
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("POST, OPTIONS"),
+    );
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Content-Type"),
+    );
+    response
+}
+
+async fn reviewer_login(
+    State(s): State<Arc<CpState>>,
+    headers: HeaderMap,
+    Json(body): Json<ReviewerLoginBody>,
+) -> Response {
+    if !reviewer_origin_allowed(&s, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let state = match validated_authorization_request(&s, body.authorization).await {
+        Ok(state) => state,
+        Err(mut response) => {
+            attach_reviewer_cors(&s, &headers, &mut response);
+            return response;
+        }
+    };
+    let Some(id_token) = body.id_token else {
+        return reviewer_json(
+            &s,
+            &headers,
+            StatusCode::BAD_REQUEST,
+            json!({"error": "invalid_request"}),
+        );
+    };
+    let Some(verifier) = s.reviewer_verifier.as_ref() else {
+        return reviewer_json(
+            &s,
+            &headers,
+            StatusCode::FORBIDDEN,
+            json!({"error": "review_access_denied"}),
+        );
+    };
+    let (reviewer_uid, reviewer_email) = match verifier.verify(&id_token).await {
+        Ok(identity) => identity,
+        Err(_) => {
+            return reviewer_json(
+                &s,
+                &headers,
+                StatusCode::FORBIDDEN,
+                json!({"error": "review_access_denied"}),
+            )
+        }
+    };
+
+    // Namespace the Identity Platform UID so it can never collide with a
+    // consumer Google `sub` stored in the same legacy identity column.
+    let identity_subject = format!("reviewer:identity-platform:{reviewer_uid}");
+    let user = match s
+        .control
+        .upsert_user(&identity_subject, &reviewer_email)
+        .await
+    {
+        Ok(user) => user,
+        Err(_) => {
+            return reviewer_json(
+                &s,
+                &headers,
+                StatusCode::FORBIDDEN,
+                json!({"error": "review_access_denied"}),
+            )
+        }
+    };
+    if super::reviewer::ensure_demo_archive(&s.store, &user.id)
+        .await
+        .is_err()
+    {
+        return reviewer_json(
+            &s,
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "temporarily_unavailable"}),
+        );
+    }
+
+    let auth_code = match tokens::issue_auth_code(
+        &s.config.jwt_secrets[0],
+        &user.id,
+        &state.client_id,
+        &state.code_challenge,
+        &state.resource,
+    ) {
+        Ok(code) => code,
+        Err(_) => {
+            return reviewer_json(
+                &s,
+                &headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "server_error"}),
+            )
+        }
+    };
+    let code_hash = tokens::sha256_hex(&auth_code);
+    let (user_id, client_id) = (user.id, state.client_id.clone());
+    let stored = s
+        .control
+        .write_if_changed(move |conn| {
+            let stored =
+                store_direct_authorization_code_conn(conn, &code_hash, &user_id, &client_id)?;
+            Ok((stored, stored))
+        })
+        .await;
+    if !matches!(stored, Ok(true)) {
+        return reviewer_json(
+            &s,
+            &headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "server_error"}),
+        );
+    }
+
+    reviewer_json(
+        &s,
+        &headers,
+        StatusCode::OK,
+        json!({"redirect_to": authorization_redirect_url(&state, &auth_code)}),
+    )
 }
 
 // ── Google callback ─────────────────────────────────────────────────────────────
@@ -1029,6 +1234,54 @@ fn approve_consent_conn(
     Ok(true)
 }
 
+fn store_direct_authorization_code_conn(
+    conn: &rusqlite::Connection,
+    code_hash: &str,
+    user_id: &str,
+    client_id: &str,
+) -> crate::error::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM oauth_authorization_codes \
+         WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        [],
+    )?;
+    let inserted = tx.execute(
+        "INSERT INTO oauth_authorization_codes (code_hash, user_id, client_id, expires_at) \
+         SELECT ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4) \
+         WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2 AND status = 'active') \
+           AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?3)",
+        rusqlite::params![
+            code_hash,
+            user_id,
+            client_id,
+            format!("+{AUTH_CODE_TTL_SECS} seconds")
+        ],
+    )?;
+    if inserted != 1 {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+fn authorization_redirect(redirect_uri: &str, client_state: &str, auth_code: &str) -> String {
+    let mut params = vec![("code", auth_code)];
+    if !client_state.is_empty() {
+        params.push(("state", client_state));
+    }
+    let separator = if redirect_uri.contains('?') { '&' } else { '?' };
+    format!(
+        "{redirect_uri}{separator}{}",
+        serde_urlencoded::to_string(&params).unwrap_or_default()
+    )
+}
+
+fn authorization_redirect_url(state: &tokens::StateClaims, auth_code: &str) -> String {
+    authorization_redirect(&state.redirect_uri, &state.client_state, auth_code)
+}
+
 async fn google_callback(
     State(s): State<Arc<CpState>>,
     Query(q): Query<CallbackQuery>,
@@ -1171,6 +1424,7 @@ async fn google_callback(
             redirect_uri: redirect_uri.clone(),
             client_state: state.client_state,
             code_challenge: state.code_challenge,
+            resource: state.resource,
             exp: 0,
         },
     ) {
@@ -1272,6 +1526,7 @@ async fn consent(State(s): State<Arc<CpState>>, body: String) -> Response {
         || !is_valid_redirect_uri(&claims.redirect_uri)
         || !is_valid_pkce_challenge(&claims.code_challenge)
         || claims.client_state.len() > MAX_CLIENT_STATE_BYTES
+        || (!claims.resource.is_empty() && claims.resource != s.config.base_url)
     {
         return callback_error(
             StatusCode::BAD_REQUEST,
@@ -1301,6 +1556,7 @@ async fn consent(State(s): State<Arc<CpState>>, body: String) -> Response {
         &claims.user_id,
         &claims.client_id,
         &claims.code_challenge,
+        &claims.resource,
     ) {
         Ok(code) => code,
         Err(_) => return server_error(),
@@ -1338,244 +1594,8 @@ async fn consent(State(s): State<Arc<CpState>>, body: String) -> Response {
         Err(_) => return server_error(),
     }
 
-    let mut params = vec![("code", auth_code.as_str())];
-    if !claims.client_state.is_empty() {
-        params.push(("state", claims.client_state.as_str()));
-    }
-    let separator = if claims.redirect_uri.contains('?') {
-        '&'
-    } else {
-        '?'
-    };
-    let redirect = format!(
-        "{}{}{}",
-        claims.redirect_uri,
-        separator,
-        serde_urlencoded::to_string(&params).unwrap_or_default()
-    );
+    let redirect = authorization_redirect(&claims.redirect_uri, &claims.client_state, &auth_code);
     redirect_302(&redirect)
-}
-
-// ── Gmail OAuth Callback and Connection ──────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct GmailTokenResp {
-    #[serde(rename = "access_token")]
-    _access_token: String,
-    refresh_token: Option<String>,
-    id_token: String,
-}
-
-async fn gmail_callback(State(s): State<Arc<CpState>>, Query(q): Query<CallbackQuery>) -> Response {
-    if q.error.is_some() {
-        return callback_error(
-            StatusCode::BAD_REQUEST,
-            "Gmail authorization failed",
-            "Gmail authorization was not completed.",
-        );
-    }
-    let (Some(code), Some(state_jwt)) = (q.code, q.state) else {
-        return callback_error(
-            StatusCode::BAD_REQUEST,
-            "Gmail authorization failed",
-            "The callback was missing required parameters.",
-        );
-    };
-
-    let gmail_state = match tokens::verify_gmail_state(&s.config.jwt_secrets[0], &state_jwt) {
-        Ok(st) => st,
-        Err(_) => {
-            match s
-                .config
-                .jwt_secrets
-                .iter()
-                .skip(1)
-                .find_map(|sec| tokens::verify_gmail_state(sec, &state_jwt).ok())
-            {
-                Some(st) => st,
-                None => {
-                    return callback_error(
-                        StatusCode::BAD_REQUEST,
-                        "Gmail authorization failed",
-                        "The authorization request is invalid or expired.",
-                    )
-                }
-            }
-        }
-    };
-
-    let base = &s.config.base_url;
-    let body = serde_urlencoded::to_string([
-        ("code", code.as_str()),
-        ("client_id", s.config.google_web_client_id.as_str()),
-        ("client_secret", s.config.google_web_client_secret.as_str()),
-        ("redirect_uri", &format!("{base}/oauth/gmail/callback")),
-        ("grant_type", "authorization_code"),
-    ])
-    .unwrap_or_default();
-
-    let http = super::bounded_http_client();
-    let resp = http
-        .post("https://oauth2.googleapis.com/token")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await;
-
-    let token_data: GmailTokenResp = match resp {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(t) => t,
-            Err(_) => {
-                return callback_error(
-                    StatusCode::BAD_GATEWAY,
-                    "Gmail authorization failed",
-                    "The identity provider returned an invalid response.",
-                )
-            }
-        },
-        _ => {
-            return callback_error(
-                StatusCode::BAD_GATEWAY,
-                "Gmail authorization failed",
-                "The identity provider could not complete authorization.",
-            )
-        }
-    };
-
-    let (returned_sub, returned_email) = match s.user_verifier.verify(&token_data.id_token).await {
-        Ok(v) => v,
-        Err(_) => {
-            return callback_error(
-                StatusCode::BAD_GATEWAY,
-                "Gmail authorization failed",
-                "The identity response could not be verified.",
-            )
-        }
-    };
-
-    let user_id = gmail_state.user_id;
-    let expected_email = match s.control.user_email(&user_id).await {
-        Ok(Some(email)) => email,
-        _ => {
-            return callback_error(
-                StatusCode::UNAUTHORIZED,
-                "Gmail authorization failed",
-                "The Kioku account is unavailable.",
-            )
-        }
-    };
-
-    let dest_lower = returned_email.to_lowercase();
-    if !dest_lower.ends_with("@gmail.com") && !dest_lower.ends_with("@googlemail.com") {
-        return callback_error(
-            StatusCode::BAD_REQUEST,
-            "Gmail authorization failed",
-            "This feature requires a personal Gmail account.",
-        );
-    }
-
-    if expected_email.to_lowercase() != dest_lower {
-        return callback_error(
-            StatusCode::BAD_REQUEST,
-            "Gmail authorization failed",
-            "The authorized Google account does not match the Kioku account.",
-        );
-    }
-
-    let Some(refresh_token) = token_data.refresh_token else {
-        return callback_error(
-            StatusCode::BAD_REQUEST,
-            "Gmail authorization failed",
-            "Reconnect Gmail and allow offline access.",
-        );
-    };
-
-    let now_iso = crate::cp::isotime::format_epoch_millis(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64,
-    );
-    let config = crate::cp::control_store::GmailConfig {
-        user_id: user_id.clone(),
-        enabled: true,
-        enabled_at: Some(now_iso),
-        gmail_email: Some(returned_email),
-        google_sub: Some(returned_sub),
-        refresh_token: Some(refresh_token),
-        reconnect_required: false,
-    };
-
-    if let Err(e) = s.control.upsert_gmail_config(config).await {
-        tracing::error!(error = %e, "failed to save Gmail configuration");
-        return callback_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Gmail authorization failed",
-            "The authorization could not be saved.",
-        );
-    }
-
-    let redirect_url = format!("{}/app#settings", s.config.web_origin);
-    redirect_302(&redirect_url)
-}
-
-pub async fn connect_gmail_url(
-    State(s): State<Arc<CpState>>,
-    axum::Extension(user): axum::Extension<crate::cp::auth::AuthUser>,
-) -> Response {
-    let user_id = user.0;
-
-    let email = match s.control.user_email(&user_id).await {
-        Ok(Some(email)) => email,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "unauthorized"})),
-            )
-                .into_response()
-        }
-    };
-
-    let email_lower = email.to_lowercase();
-    if !email_lower.ends_with("@gmail.com") && !email_lower.ends_with("@googlemail.com") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "gmail_only", "message": "Only personal Gmail accounts support this feature"})),
-        )
-            .into_response();
-    }
-
-    let state_jwt = match tokens::issue_gmail_state(&s.config.jwt_secrets[0], &user_id) {
-        Ok(t) => t,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "server_error"})),
-            )
-                .into_response()
-        }
-    };
-
-    let base = &s.config.base_url;
-    let mut url = String::from("https://accounts.google.com/o/oauth2/v2/auth?");
-    url.push_str(
-        &serde_urlencoded::to_string([
-            ("client_id", s.config.google_web_client_id.as_str()),
-            ("redirect_uri", &format!("{base}/oauth/gmail/callback")),
-            ("response_type", "code"),
-            (
-                "scope",
-                "openid email https://www.googleapis.com/auth/gmail.send",
-            ),
-            ("state", &state_jwt),
-            ("access_type", "offline"),
-            ("prompt", "consent"),
-            ("include_granted_scopes", "true"),
-        ])
-        .unwrap_or_default(),
-    );
-
-    Json(json!({ "url": url })).into_response()
 }
 
 // ── /token ──────────────────────────────────────────────────────────────────────
@@ -1587,6 +1607,7 @@ struct TokenForm {
     code_verifier: Option<String>,
     client_id: Option<String>,
     refresh_token: Option<String>,
+    resource: Option<String>,
 }
 
 async fn token(State(s): State<Arc<CpState>>, body: String) -> Response {
@@ -1722,6 +1743,19 @@ async fn token_auth_code(s: Arc<CpState>, form: TokenForm) -> Response {
     {
         return bad_request_desc("invalid_grant", "client_id mismatch");
     }
+    let code_resource = if claims.resource.is_empty() {
+        s.config.base_url.as_str()
+    } else {
+        claims.resource.as_str()
+    };
+    if code_resource != s.config.base_url
+        || form
+            .resource
+            .as_deref()
+            .is_some_and(|resource| resource != s.config.base_url)
+    {
+        return bad_request_desc("invalid_target", "resource must match the Kioku MCP server");
+    }
 
     let access = match tokens::issue_access_token(
         &s.config.jwt_secrets[0],
@@ -1768,6 +1802,13 @@ async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
     {
         return bad_request_desc("invalid_grant", "Invalid refresh token");
     }
+    if form
+        .resource
+        .as_deref()
+        .is_some_and(|resource| resource != s.config.base_url)
+    {
+        return bad_request_desc("invalid_target", "resource must match the Kioku MCP server");
+    }
 
     let old_hash = tokens::sha256_hex(&incoming);
     let raw_refresh = tokens::random_token_hex();
@@ -1802,9 +1843,9 @@ fn token_response(access: &str, refresh: &str) -> Response {
         Json(json!({
             "access_token": access,
             "token_type": "bearer",
-            "expires_in": 3600,
+            "expires_in": 900,
             "refresh_token": refresh,
-            "scope": "",
+            "scope": MCP_SCOPE,
         })),
     )
         .into_response()
@@ -2038,6 +2079,52 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn reviewer_authorization_code_is_client_bound_and_single_use() {
+        let conn = oauth_conn();
+        assert!(store_direct_authorization_code_conn(&conn, "review-code", USER, CLIENT).unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM oauth_authorization_codes \
+                 WHERE code_hash = 'review-code' AND user_id = ?1 AND client_id = ?2",
+                rusqlite::params![USER, CLIENT],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        assert!(exchange_authorization_code_conn(
+            &conn,
+            "review-code",
+            USER,
+            CLIENT,
+            "review-refresh"
+        )
+        .unwrap());
+        assert!(!exchange_authorization_code_conn(
+            &conn,
+            "review-code",
+            USER,
+            CLIENT,
+            "replay-refresh"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn reviewer_redirect_preserves_client_state_without_open_redirect_logic() {
+        let redirect = authorization_redirect(
+            "https://client.example/oauth/callback?existing=1",
+            "opaque state",
+            "authorization code",
+        );
+        assert_eq!(
+            redirect,
+            "https://client.example/oauth/callback?existing=1&code=authorization+code&state=opaque+state"
         );
     }
 

@@ -38,6 +38,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 hyper = { version = "1.10", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 sha2 = "0.10"
+hmac = "0.12"
 
 # ACME (RFC 8555) client for in-enclave TLS certificate issuance/renewal
 # (ADR-0003): the enclave answers HTTP-01 itself and generates the key inside

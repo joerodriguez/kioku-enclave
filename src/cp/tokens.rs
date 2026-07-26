@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{EnclaveError, Result};
 
-const ACCESS_TOKEN_AUD: &str = "kioku-mcp";
-const ACCESS_TOKEN_TTL_SECS: u64 = 3600; // 1h
+const LEGACY_ACCESS_TOKEN_AUD: &str = "kioku-mcp";
+const ACCESS_TOKEN_TTL_SECS: u64 = 15 * 60;
 const STATE_TTL_SECS: u64 = 600; // 10m
 const AUTH_CODE_TTL_SECS: u64 = 300; // 5m
 const CONSENT_TTL_SECS: u64 = 300; // 5m
@@ -107,7 +107,7 @@ pub fn issue_access_token(secret: &str, base_url: &str, user_id: &str) -> Result
     let claims = AccessClaims {
         sub: user_id.to_string(),
         iss: base_url.to_string(),
-        aud: ACCESS_TOKEN_AUD.to_string(),
+        aud: base_url.to_string(),
         exp: now_secs() + ACCESS_TOKEN_TTL_SECS,
     };
     encode(
@@ -123,7 +123,10 @@ pub fn issue_access_token(secret: &str, base_url: &str, user_id: &str) -> Result
 pub fn verify_access_token(secrets: &[String], base_url: &str, token: &str) -> Result<String> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_issuer(&[base_url]);
-    validation.set_audience(&[ACCESS_TOKEN_AUD]);
+    // The canonical resource URL is the MCP authorization audience. Keep the
+    // legacy audience valid until already-issued tokens naturally
+    // expire during the production rollout.
+    validation.set_audience(&[base_url, LEGACY_ACCESS_TOKEN_AUD]);
 
     let mut last_err = None;
     for secret in secrets {
@@ -152,6 +155,8 @@ pub struct StateClaims {
     pub redirect_uri: String,
     pub client_state: String,
     pub code_challenge: String,
+    #[serde(default)]
+    pub resource: String,
     pub exp: u64,
 }
 
@@ -161,6 +166,7 @@ pub fn issue_state(secret: &str, claims: &StateClaims) -> Result<String> {
         redirect_uri: claims.redirect_uri.clone(),
         client_state: claims.client_state.clone(),
         code_challenge: claims.code_challenge.clone(),
+        resource: claims.resource.clone(),
         exp: now_secs() + STATE_TTL_SECS,
     };
     if claims.exp != 0 {
@@ -191,6 +197,8 @@ pub struct AuthCodeClaims {
     pub user_id: String,
     pub client_id: String,
     pub code_challenge: String,
+    #[serde(default)]
+    pub resource: String,
     pub exp: u64,
 }
 
@@ -199,11 +207,13 @@ pub fn issue_auth_code(
     user_id: &str,
     client_id: &str,
     code_challenge: &str,
+    resource: &str,
 ) -> Result<String> {
     let claims = AuthCodeClaims {
         user_id: user_id.to_string(),
         client_id: client_id.to_string(),
         code_challenge: code_challenge.to_string(),
+        resource: resource.to_string(),
         exp: now_secs() + AUTH_CODE_TTL_SECS,
     };
     encode(
@@ -235,6 +245,8 @@ pub struct ConsentClaims {
     pub redirect_uri: String,
     pub client_state: String,
     pub code_challenge: String,
+    #[serde(default)]
+    pub resource: String,
     pub exp: u64,
 }
 
@@ -245,6 +257,7 @@ pub fn issue_consent(secret: &str, claims: &ConsentClaims) -> Result<String> {
         redirect_uri: claims.redirect_uri.clone(),
         client_state: claims.client_state.clone(),
         code_challenge: claims.code_challenge.clone(),
+        resource: claims.resource.clone(),
         exp: now_secs() + CONSENT_TTL_SECS,
     };
     encode(
@@ -273,35 +286,6 @@ fn exp_only_validation() -> Validation {
     v.required_spec_claims = std::collections::HashSet::new();
     v.validate_exp = true;
     v
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct GmailOAuthStateClaims {
-    pub user_id: String,
-    pub exp: u64,
-}
-
-pub fn issue_gmail_state(secret: &str, user_id: &str) -> Result<String> {
-    let claims = GmailOAuthStateClaims {
-        user_id: user_id.to_string(),
-        exp: now_secs() + STATE_TTL_SECS,
-    };
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(|e| EnclaveError::Auth(format!("issue gmail state: {e}")))
-}
-
-pub fn verify_gmail_state(secret: &str, token: &str) -> Result<GmailOAuthStateClaims> {
-    decode::<GmailOAuthStateClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &exp_only_validation(),
-    )
-    .map(|data| data.claims)
-    .map_err(|e| EnclaveError::Auth(format!("verify gmail state: {e}")))
 }
 
 #[cfg(test)]
@@ -344,11 +328,12 @@ mod tests {
 
     #[test]
     fn auth_code_round_trips() {
-        let c = issue_auth_code("s", "u1", "c1", "chal").unwrap();
+        let c = issue_auth_code("s", "u1", "c1", "chal", "https://kioku.example").unwrap();
         let claims = verify_auth_code("s", &c).unwrap();
         assert_eq!(claims.user_id, "u1");
         assert_eq!(claims.client_id, "c1");
         assert_eq!(claims.code_challenge, "chal");
+        assert_eq!(claims.resource, "https://kioku.example");
     }
 
     #[test]
@@ -361,6 +346,7 @@ mod tests {
                 redirect_uri: "https://client.example/cb".into(),
                 client_state: "state".into(),
                 code_challenge: "challenge".into(),
+                resource: "https://kioku.example".into(),
                 exp: 0,
             },
         )
@@ -368,6 +354,7 @@ mod tests {
         let claims = verify_consent("secret", &token).unwrap();
         assert_eq!(claims.user_id, "u1");
         assert_eq!(claims.redirect_uri, "https://client.example/cb");
+        assert_eq!(claims.resource, "https://kioku.example");
         assert!(verify_consent("wrong", &token).is_err());
     }
 
