@@ -5,7 +5,8 @@
 //! uses. All routes are auth-gated; tool logic calls the data-plane query code
 //! (`search::search_all`, `timeline::fetch_context`) in-process.
 //! `POST /api/episodes/:id/finalize` queues a scoped retry for an incomplete
-//! or version-stale canonical brief.
+//! or version-stale canonical brief. `/api/webhooks` manages signed,
+//! user-configured finalized-episode event destinations.
 
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use crate::search::{search_all, SearchRequest};
 use crate::timeline::ContextRequest;
 
 use super::auth::AuthUser;
-use super::{limits, CpState};
+use super::CpState;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_SCREENSHOT_IMAGE_BYTES: usize = 150 * 1024;
@@ -61,13 +62,14 @@ pub fn router() -> Router<Arc<CpState>> {
             get(rest_screenshot_image_content),
         )
         .route(
-            "/api/preferences/episode-email",
-            get(rest_get_preference).post(rest_set_preference),
+            "/api/webhooks",
+            get(rest_list_webhooks).post(rest_create_webhook),
         )
         .route(
-            "/api/preferences/episode-email/connect",
-            post(rest_connect_preference),
+            "/api/webhooks/{id}",
+            axum::routing::delete(rest_delete_webhook),
         )
+        .route("/api/webhooks/{id}/test", post(rest_test_webhook))
 }
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
@@ -101,7 +103,11 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
     let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
     let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
 
@@ -163,7 +169,11 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
     let query_embedding = embed_query(s, &query).await;
     let req = SearchRequest {
         user_id: user_id.to_string(),
@@ -193,7 +203,8 @@ async fn tool_get_context(s: &CpState, user_id: &str, args: &Value) -> Value {
     let window_secs = args
         .get("window_seconds")
         .and_then(|v| v.as_u64())
-        .unwrap_or(300);
+        .unwrap_or(300)
+        .clamp(60, 3600);
     let minutes = ((window_secs / 2) / 60).max(1) as u32;
     let req = ContextRequest {
         user_id: user_id.to_string(),
@@ -223,7 +234,8 @@ async fn tool_summarize_time_range(s: &CpState, user_id: &str, args: &Value) -> 
     let max_items = args
         .get("max_items")
         .and_then(|v| v.as_u64())
-        .unwrap_or(200) as i64;
+        .unwrap_or(200)
+        .clamp(1, 500) as i64;
     let (f, t) = (from.clone(), to.clone());
     s.store
         .with_user(user_id, move |conn| {
@@ -284,14 +296,13 @@ async fn tool_summarize_time_range(s: &CpState, user_id: &str, args: &Value) -> 
 }
 
 async fn tool_list_episodes(s: &Arc<CpState>, user_id: &str, args: &Value) -> Value {
-    // Fire-and-forget freshness (matches the Node maybeTriggerSummarize).
-    super::summarizer::maybe_trigger(Arc::clone(s), user_id.to_string());
     let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
     let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
     let max = args
         .get("max_episodes")
         .and_then(|v| v.as_u64())
-        .unwrap_or(20) as i64;
+        .unwrap_or(20)
+        .clamp(1, 50) as i64;
     let include_low = args.get("include_low").is_some_and(value_is_truthy);
     list_episodes_value(s, user_id, from, to, max, include_low).await
 }
@@ -525,85 +536,320 @@ async fn tool_get_capture_status(s: &CpState, user_id: &str) -> Value {
 
 // ── MCP JSON-RPC endpoint ───────────────────────────────────────────────────────
 
+fn project_fields(value: &Value, fields: &[&str]) -> Value {
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        if let Some(field_value) = value.get(*field) {
+            projected.insert((*field).to_string(), field_value.clone());
+        }
+    }
+    Value::Object(projected)
+}
+
+fn project_array(value: &Value, fields: &[&str]) -> Value {
+    Value::Array(
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| project_fields(item, fields))
+            .collect(),
+    )
+}
+
+/// The REST/debugger surfaces keep operational fields used by Kioku itself.
+/// MCP responses deliberately expose only user-relevant evidence: no database
+/// ids, hashes, ranking scores, source keys, model confidence, or internal
+/// finalization state.
+fn project_mcp_result(name: &str, result: Value) -> Value {
+    if result.get("error").is_some() {
+        return result;
+    }
+    match name {
+        "search_transcripts" => json!({
+            "episodes": project_array(
+                &result["episodes"],
+                &["kind", "started_at", "ended_at", "title", "summary", "minute_summaries", "snippet"],
+            ),
+            "results": project_array(
+                &result["results"],
+                &["kind", "text", "speaker_label", "started_at"],
+            ),
+        }),
+        "search_screenshots" => json!({
+            "results": project_array(
+                &result["results"],
+                &["kind", "captured_at", "active_app", "window_title", "ocr_text", "url"],
+            ),
+        }),
+        "get_context" => json!({
+            "utterances": project_array(
+                &result["utterances"],
+                &["started_at", "ended_at", "speaker_label", "language", "text", "source_type"],
+            ),
+            "screenshots": project_array(
+                &result["screenshots"],
+                &["captured_at", "active_app", "window_title", "ocr_text", "url"],
+            ),
+        }),
+        "list_episodes" => json!({
+            "episode_count": result["episode_count"],
+            "hidden_count": result["hidden_count"],
+            "episodes": project_array(
+                &result["episodes"],
+                &[
+                    "started_at",
+                    "ended_at",
+                    "title",
+                    "summary",
+                    "type",
+                    "participants",
+                    "languages",
+                    "action_items",
+                    "minute_summaries",
+                    "utterance_count",
+                    "screenshot_count",
+                    "top_apps",
+                    "top_domains",
+                    "final_brief",
+                ],
+            ),
+        }),
+        _ => result,
+    }
+}
+
+fn read_only_annotations() -> Value {
+    json!({
+        "readOnlyHint": true,
+        "openWorldHint": false,
+        "destructiveHint": false
+    })
+}
+
+fn object_array_schema(properties: Value) -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": false
+        }
+    })
+}
+
 fn tool_definitions() -> Value {
     json!([
         {
             "name": "search_transcripts",
-            "description": "Search your archive. Returns matching EPISODES first (relevance-ranked, each with its executive summary, minute-by-minute timeline gists, and a matched snippet — usually enough to answer without raw transcripts), then matching utterances as drill-down evidence.",
+            "title": "Search memory",
+            "description": "Use this when the user wants to find a topic, person, decision, action item, or spoken moment in their own Kioku memory archive. Returns relevance-ranked episodes first, followed by matching utterances as timestamped evidence. Do not use for general web search or for information outside the user's Kioku archive.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "from": {"type": "string", "description": "ISO-8601 lower bound"},
-                    "to": {"type": "string", "description": "ISO-8601 upper bound"},
-                    "limit": {"type": "number", "default": 10}
+                    "query": {"type": "string", "description": "Natural-language search query. A speaker filter may be included as speaker:Name."},
+                    "from": {"type": "string", "description": "Optional inclusive RFC 3339 lower timestamp bound."},
+                    "to": {"type": "string", "description": "Optional inclusive RFC 3339 upper timestamp bound."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "Maximum episode and utterance matches to return."}
                 },
-                "required": ["query"]
-            }
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "episodes": object_array_schema(json!({
+                        "kind": {"type": "string"},
+                        "started_at": {"type": "string"},
+                        "ended_at": {"type": "string"},
+                        "title": {"type": ["string", "null"]},
+                        "summary": {"type": ["string", "null"]},
+                        "minute_summaries": {"type": "array"},
+                        "snippet": {"type": "string"}
+                    })),
+                    "results": object_array_schema(json!({
+                        "kind": {"type": "string"},
+                        "text": {"type": "string"},
+                        "speaker_label": {"type": "string"},
+                        "started_at": {"type": "string"}
+                    }))
+                },
+                "required": ["episodes", "results"],
+                "additionalProperties": false
+            },
+            "annotations": read_only_annotations()
         },
         {
             "name": "search_screenshots",
-            "description": "Full-text search over OCR'd screen text, app names, and window titles.",
+            "title": "Search screens",
+            "description": "Use this when the user wants to find text, a link, an app, or a window they previously saw on their own Mac. Searches OCR text and screen metadata in the user's Kioku archive. Do not use for live screen access or general web search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "from": {"type": "string"},
-                    "to": {"type": "string"},
-                    "limit": {"type": "number", "default": 10}
+                    "query": {"type": "string", "description": "Text, application name, window title, or URL to find."},
+                    "from": {"type": "string", "description": "Optional inclusive RFC 3339 lower timestamp bound."},
+                    "to": {"type": "string", "description": "Optional inclusive RFC 3339 upper timestamp bound."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "Maximum matches to return."}
                 },
-                "required": ["query"]
-            }
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "results": object_array_schema(json!({
+                        "kind": {"type": "string"},
+                        "captured_at": {"type": "string"},
+                        "active_app": {"type": ["string", "null"]},
+                        "window_title": {"type": ["string", "null"]},
+                        "ocr_text": {"type": ["string", "null"]},
+                        "url": {"type": ["string", "null"]}
+                    }))
+                },
+                "required": ["results"],
+                "additionalProperties": false
+            },
+            "annotations": read_only_annotations()
         },
         {
             "name": "get_context",
-            "description": "Interleaved timeline (utterances + screenshot OCR) centered on a moment.",
+            "title": "Get moment context",
+            "description": "Use this when the user needs the surrounding conversation and screen context around a timestamp from a Kioku search result. Returns a bounded interleaved timeline from the user's archive. Do not use without a concrete timestamp.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "at": {"type": "string", "description": "ISO-8601 timestamp"},
-                    "window_seconds": {"type": "number", "default": 300}
+                    "at": {"type": "string", "description": "RFC 3339 timestamp at the center of the requested context."},
+                    "window_seconds": {"type": "integer", "minimum": 60, "maximum": 3600, "default": 300, "description": "Total context window in seconds."}
                 },
-                "required": ["at"]
-            }
+                "required": ["at"],
+                "additionalProperties": false
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "utterances": object_array_schema(json!({
+                        "started_at": {"type": "string"},
+                        "ended_at": {"type": "string"},
+                        "speaker_label": {"type": "string"},
+                        "language": {"type": ["string", "null"]},
+                        "text": {"type": "string"},
+                        "source_type": {"type": "string"}
+                    })),
+                    "screenshots": object_array_schema(json!({
+                        "captured_at": {"type": "string"},
+                        "active_app": {"type": ["string", "null"]},
+                        "window_title": {"type": ["string", "null"]},
+                        "ocr_text": {"type": ["string", "null"]},
+                        "url": {"type": ["string", "null"]}
+                    }))
+                },
+                "required": ["utterances", "screenshots"],
+                "additionalProperties": true
+            },
+            "annotations": read_only_annotations()
         },
         {
             "name": "summarize_time_range",
-            "description": "Counts, languages, apps, and a chronological digest for a time range.",
+            "title": "Summarize a time range",
+            "description": "Use this when the user asks what happened during a specific period in their Kioku archive and needs a chronological evidence digest with activity counts, languages, and apps. Do not use when no time range is available.",
             "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": {"type": "string", "description": "Inclusive RFC 3339 start timestamp."},
+                    "to": {"type": "string", "description": "Exclusive RFC 3339 end timestamp."},
+                    "max_items": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200, "description": "Maximum chronological utterance evidence items."}
+                },
+                "required": ["from", "to"],
+                "additionalProperties": false
+            },
+            "outputSchema": {
                 "type": "object",
                 "properties": {
                     "from": {"type": "string"},
                     "to": {"type": "string"},
-                    "max_items": {"type": "number", "default": 200}
+                    "counts": {"type": "object", "additionalProperties": true},
+                    "languages": {"type": "array", "items": {"type": "string"}},
+                    "apps_seen": {"type": "array", "items": {"type": "string"}},
+                    "digest": object_array_schema(json!({
+                        "at": {"type": "string"},
+                        "speaker": {"type": "string"},
+                        "text": {"type": "string"}
+                    }))
                 },
-                "required": ["from", "to"]
-            }
+                "required": ["from", "to", "counts", "languages", "apps_seen", "digest"],
+                "additionalProperties": false
+            },
+            "annotations": read_only_annotations()
         },
         {
             "name": "list_episodes",
-            "description": "Activity-block overview: summarized episodes newest-first.",
+            "title": "List memory episodes",
+            "description": "Use this when the user wants an overview of their day or recent activity in Kioku. Returns summarized activity episodes newest-first with timestamps, participants, actions, and evidence counts. Do not use for a topic search; use search_transcripts instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "from": {"type": "string"},
-                    "to": {"type": "string"},
-                    "gap_minutes": {"type": "number", "default": 15},
-                    "max_episodes": {"type": "number", "default": 20},
+                    "from": {"type": "string", "description": "Optional inclusive RFC 3339 lower timestamp bound."},
+                    "to": {"type": "string", "description": "Optional inclusive RFC 3339 upper timestamp bound."},
+                    "max_episodes": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Maximum episodes to return."},
                     "include_low": {"type": "boolean", "default": false, "description": "Include substance=none episodes normally hidden from browse."}
-                }
-            }
+                },
+                "additionalProperties": false
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "episode_count": {"type": "integer"},
+                    "hidden_count": {"type": "integer"},
+                    "episodes": object_array_schema(json!({
+                        "started_at": {"type": "string"},
+                        "ended_at": {"type": "string"},
+                        "title": {"type": ["string", "null"]},
+                        "summary": {"type": ["string", "null"]},
+                        "type": {"type": ["string", "null"]},
+                        "participants": {"type": "array"},
+                        "languages": {"type": "array"},
+                        "action_items": {"type": "array"},
+                        "minute_summaries": {"type": "array"},
+                        "utterance_count": {"type": "integer"},
+                        "screenshot_count": {"type": "integer"},
+                        "top_apps": {"type": "array", "items": {"type": "string"}},
+                        "top_domains": {"type": "array", "items": {"type": "string"}},
+                        "final_brief": {"type": ["object", "null"]}
+                    }))
+                },
+                "required": ["episode_count", "hidden_count", "episodes"],
+                "additionalProperties": false
+            },
+            "annotations": read_only_annotations()
         },
         {
             "name": "get_capture_status",
-            "description": "Per-user totals and latest captured timestamps.",
-            "inputSchema": {"type": "object", "properties": {}}
+            "title": "Get capture status",
+            "description": "Use this when the user asks whether Kioku has recent cloud-synced memory data or wants archive totals. Returns per-user counts and the latest synced utterance and screenshot timestamps. Do not use to start, stop, or inspect live capture.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "total_utterances": {"type": "integer"},
+                    "total_screenshots": {"type": "integer"},
+                    "episode_count": {"type": "integer"},
+                    "last_utterance_at": {"type": ["string", "null"]},
+                    "last_screenshot_at": {"type": ["string", "null"]}
+                },
+                "required": ["total_utterances", "total_screenshots", "episode_count", "last_utterance_at", "last_screenshot_at"],
+                "additionalProperties": false
+            },
+            "annotations": read_only_annotations()
         }
     ])
 }
 
 async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value) -> Option<Value> {
-    Some(match name {
+    let result = match name {
         "search_transcripts" => tool_search_transcripts(s, user_id, args).await,
         "search_screenshots" => tool_search_screenshots(s, user_id, args).await,
         "get_context" => tool_get_context(s, user_id, args).await,
@@ -611,7 +857,8 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
         "list_episodes" => tool_list_episodes(s, user_id, args).await,
         "get_capture_status" => tool_get_capture_status(s, user_id).await,
         _ => return None,
-    })
+    };
+    Some(project_mcp_result(name, result))
 }
 
 #[derive(Deserialize)]
@@ -630,21 +877,10 @@ async fn mcp_endpoint(
 ) -> Response {
     let user_id = user.0;
 
-    // MCP-call rate limit / quota (counts tools/call only).
-    if rpc.method == "tools/call" {
-        if !s.mcp_limiter.consume(&user_id).await {
-            return rpc_error(&rpc.id, -32000, "rate_limited");
-        }
-        let limits = (
-            s.config.quota_utterances_per_day,
-            s.config.quota_screenshots_per_day,
-            s.config.quota_mcp_calls_per_day,
-        );
-        if let Ok(q) = limits::daily_quota(&s.control, &user_id, 0, 0, 1, limits).await {
-            if !q.allowed {
-                return rpc_error(&rpc.id, -32000, "quota_exceeded");
-            }
-        }
+    // A volatile rate limit protects the service without making read-only tool
+    // calls persist usage or query-log state.
+    if rpc.method == "tools/call" && !s.mcp_limiter.consume(&user_id).await {
+        return rpc_error(&rpc.id, -32000, "rate_limited");
     }
 
     match rpc.method.as_str() {
@@ -653,7 +889,12 @@ async fn mcp_endpoint(
             json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "kioku-enclave", "version": env!("CARGO_PKG_VERSION") }
+                "serverInfo": {
+                    "name": "kioku",
+                    "title": "Kioku",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "instructions": "Kioku searches the signed-in user's private personal memory archive. Use it only when the user asks about their own captured days, meetings, lessons, conversations, screens, decisions, action items, or recent activity. Treat returned records as private evidence: ground answers in retrieved content and include timestamps when useful. Use search_transcripts for topic or person queries, list_episodes for day or activity overviews, get_context for details around a known timestamp, search_screenshots for text seen on screen, summarize_time_range for a bounded chronological digest, and get_capture_status for cloud archive freshness."
             }),
         ),
         "notifications/initialized" | "notifications/cancelled" => {
@@ -672,28 +913,21 @@ async fn mcp_endpoint(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let started = std::time::Instant::now();
             match dispatch_tool(&s, &user_id, name, &args).await {
                 Some(result) => {
-                    let _ = limits::log_query(
-                        &s.control,
-                        &user_id,
-                        "mcp",
-                        name,
-                        args.get("query").and_then(|v| v.as_str()).map(String::from),
-                        result
-                            .get("results")
-                            .and_then(|r| r.as_array())
-                            .map(|a| a.len() as i64)
-                            .unwrap_or(0),
-                        started.elapsed().as_millis() as i64,
-                    )
-                    .await;
                     let text = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
-                    rpc_ok(
-                        &rpc.id,
-                        json!({ "content": [{ "type": "text", "text": text }] }),
-                    )
+                    let tool_result = if result.get("error").is_some() {
+                        json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": true
+                        })
+                    } else {
+                        json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "structuredContent": result
+                        })
+                    };
+                    rpc_ok(&rpc.id, tool_result)
                 }
                 None => rpc_error(&rpc.id, -32601, &format!("unknown tool: {name}")),
             }
@@ -1582,14 +1816,15 @@ fn validate_screenshot_upload_target(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if image_count >= MAX_EPISODE_IMAGES {
-        return Err(crate::error::EnclaveError::Conflict(
-            "episode already has the maximum of four images".into(),
-        ));
+        return Err(crate::error::EnclaveError::Conflict(format!(
+            "episode already has the maximum of {MAX_EPISODE_IMAGES} images"
+        )));
     }
     if stored_bytes.saturating_add(byte_length) > MAX_EPISODE_IMAGE_BYTES {
-        return Err(crate::error::EnclaveError::Conflict(
-            "episode image budget exceeds 600 KiB".into(),
-        ));
+        return Err(crate::error::EnclaveError::Conflict(format!(
+            "episode image budget exceeds {} KiB",
+            MAX_EPISODE_IMAGE_BYTES / 1024
+        )));
     }
 
     Ok(ScreenshotUploadTarget::New {
@@ -2271,128 +2506,187 @@ async fn rest_screenshot_image_content(
 }
 
 #[derive(Deserialize)]
-struct SetPreferenceRequest {
-    enabled: bool,
+struct CreateWebhookRequest {
+    name: String,
+    endpoint_url: String,
+    #[serde(default)]
+    include_content: bool,
 }
 
-async fn rest_get_preference(
+fn webhook_json(
+    subscription: &crate::cp::control_store::WebhookSubscription,
+    signing_secret: Option<&str>,
+) -> Value {
+    let mut value = json!({
+        "id": subscription.id,
+        "name": subscription.name,
+        "endpoint_display": super::webhook_worker::endpoint_display(&subscription.endpoint_url),
+        "include_content": subscription.include_content,
+        "enabled": subscription.enabled,
+        "created_at": subscription.created_at,
+    });
+    if let Some(secret) = signing_secret {
+        value["signing_secret"] = json!(secret);
+    }
+    value
+}
+
+async fn rest_list_webhooks(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
 ) -> Response {
-    let user_id = user.0;
-    let cfg = match s.control.get_gmail_config(&user_id).await {
-        Ok(c) => c,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    match cfg {
-        Some(c) => Json(json!({
-            "enabled": c.enabled,
-            "recipient": c.gmail_email,
-            "gmail_connected": c.refresh_token.is_some(),
-            "reconnect_required": c.reconnect_required,
-            "enabled_at": c.enabled_at,
+    match s.control.list_webhook_subscriptions(&user.0).await {
+        Ok(subscriptions) => Json(json!({
+            "webhooks": subscriptions
+                .iter()
+                .map(|subscription| webhook_json(subscription, None))
+                .collect::<Vec<_>>()
         }))
         .into_response(),
-        None => {
-            // Check user email
-            let email = match s.control.user_email(&user_id).await {
-                Ok(Some(e)) => e,
-                _ => return StatusCode::UNAUTHORIZED.into_response(),
-            };
-            Json(json!({
-                "enabled": false,
-                "recipient": Some(email),
-                "gmail_connected": false,
-                "reconnect_required": false,
-                "enabled_at": None::<String>,
-            }))
-            .into_response()
-        }
+        Err(error) => error.into_response(),
     }
 }
 
-async fn rest_set_preference(
+async fn rest_create_webhook(
     State(s): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
-    Json(req): Json<SetPreferenceRequest>,
+    Json(req): Json<CreateWebhookRequest>,
 ) -> Response {
-    let user_id = user.0;
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "name must be between 1 and 80 characters"})),
+        )
+            .into_response();
+    }
+    let endpoint_url = req.endpoint_url.trim();
+    if let Err(error) = super::webhook_worker::validate_endpoint_syntax(endpoint_url) {
+        return error.into_response();
+    }
 
-    // Check if configuration exists
-    let mut cfg = match s.control.get_gmail_config(&user_id).await {
-        Ok(Some(c)) => c,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "reconnect_required", "message": "Gmail account not connected"})),
-            )
-                .into_response();
-        }
+    let now = crate::cp::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let subscription = crate::cp::control_store::WebhookSubscription {
+        id: super::tokens::new_uuid(),
+        user_id: user.0,
+        name: name.to_string(),
+        endpoint_url: endpoint_url.to_string(),
+        signing_secret: super::webhook_worker::new_signing_secret(),
+        include_content: req.include_content,
+        enabled: true,
+        created_at: now,
     };
-
-    if req.enabled {
-        if cfg.refresh_token.is_none() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    json!({"error": "reconnect_required", "message": "Gmail credentials missing"}),
-                ),
-            )
-                .into_response();
-        }
-        cfg.enabled = true;
-        let now_iso = crate::cp::isotime::format_epoch_millis(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
-        );
-        cfg.enabled_at = Some(now_iso);
-    } else {
-        cfg.enabled = false;
-        let refresh_token = cfg.refresh_token.take();
-
-        if let Some(token) = refresh_token {
-            tokio::spawn(async move {
-                let http = super::bounded_http_client();
-                let _ = http
-                    .post("https://oauth2.googleapis.com/revoke")
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body(format!("token={}", token))
-                    .send()
-                    .await;
-            });
-        }
-
-        let user_id_cloned = user_id.clone();
-        let db_res = s.store.with_user(&user_id_cloned, |conn| {
-            conn.execute(
-                "UPDATE episode_deliveries SET state = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE state IN ('pending', 'retry')",
-                [],
-            )?;
-            Ok(())
-        }).await;
-        if let Err(e) = db_res {
-            tracing::warn!(user_id = %user_id, error = %e, "failed to cancel pending deliveries on disable");
-        } else {
-            let _ = s.store.save_user(&user_id).await;
-        }
+    match s
+        .control
+        .create_webhook_subscription(subscription.clone())
+        .await
+    {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(webhook_json(
+                &subscription,
+                Some(&subscription.signing_secret),
+            )),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
     }
-
-    if let Err(e) = s.control.upsert_gmail_config(cfg).await {
-        tracing::warn!(error = %e, "failed to update preference");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    StatusCode::OK.into_response()
 }
 
-async fn rest_connect_preference(
-    state: State<Arc<CpState>>,
-    user: Extension<AuthUser>,
+async fn rest_delete_webhook(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(subscription_id): Path<String>,
 ) -> Response {
-    super::oauth::connect_gmail_url(state, user).await
+    let user_id = user.0;
+    match s
+        .control
+        .delete_webhook_subscription(&user_id, &subscription_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return error.into_response(),
+    }
+    let user_for_db = user_id.clone();
+    let id_for_db = subscription_id.clone();
+    match s
+        .store
+        .with_user(&user_for_db, move |conn| {
+            conn.execute(
+                "UPDATE webhook_deliveries
+                 SET state = 'cancelled', error_code = 'subscription_deleted',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE subscription_id = ?1 AND state IN ('pending', 'retry')",
+                [id_for_db],
+            )?;
+            Ok(())
+        })
+        .await
+    {
+        Ok(()) => {
+            if let Err(error) = s.store.save_user(&user_id).await {
+                return error.into_response();
+            }
+        }
+        Err(error) => return error.into_response(),
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn rest_test_webhook(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(subscription_id): Path<String>,
+) -> Response {
+    let subscription = match s
+        .control
+        .get_webhook_subscription(&user.0, &subscription_id)
+        .await
+    {
+        Ok(Some(subscription)) if subscription.enabled => subscription,
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "webhook is disabled"})),
+            )
+                .into_response()
+        }
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return error.into_response(),
+    };
+    match super::webhook_worker::send_test_webhook(&subscription).await {
+        Ok(status) if (200..300).contains(&status) => {
+            Json(json!({"delivered": true, "response_status": status})).into_response()
+        }
+        Ok(status) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "delivered": false,
+                "response_status": status,
+                "error": "destination rejected the test event"
+            })),
+        )
+            .into_response(),
+        Err(crate::error::EnclaveError::InvalidRequest(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"delivered": false, "error": message})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "delivered": false,
+                "error": "destination could not be reached"
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -2423,8 +2717,10 @@ mod tests {
                 quota_screenshots_per_day: 1,
                 quota_mcp_calls_per_day: 1,
                 web_origin: "http://localhost:3000".into(),
+                reviewer_auth: None,
             }),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
+            reviewer_verifier: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
@@ -2440,6 +2736,124 @@ mod tests {
         assert!(value_is_truthy(&json!(1)));
         assert!(!string_is_truthy("0"));
         assert!(!value_is_truthy(&json!(false)));
+    }
+
+    #[test]
+    fn webhook_list_projection_never_returns_endpoint_credentials() {
+        let subscription = crate::cp::control_store::WebhookSubscription {
+            id: "hook-1".into(),
+            user_id: "user-1".into(),
+            name: "Automation".into(),
+            endpoint_url: "https://hooks.example.com/path-secret?token=query-secret".into(),
+            signing_secret: "whsec_signing-secret".into(),
+            include_content: false,
+            enabled: true,
+            created_at: "2026-07-24T12:00:00.000Z".into(),
+        };
+
+        let listed = webhook_json(&subscription, None);
+        assert_eq!(listed["endpoint_display"], "https://hooks.example.com/…");
+        assert!(listed.get("endpoint_url").is_none());
+        assert!(listed.get("signing_secret").is_none());
+
+        let created = webhook_json(&subscription, Some(&subscription.signing_secret));
+        assert_eq!(created["signing_secret"], "whsec_signing-secret");
+        assert!(created.get("endpoint_url").is_none());
+    }
+
+    #[test]
+    fn mcp_tool_metadata_is_submission_ready_and_read_only() {
+        let tools = tool_definitions();
+        let tools = tools.as_array().expect("tool definitions must be an array");
+        assert_eq!(tools.len(), 6);
+        for tool in tools {
+            assert!(tool["title"]
+                .as_str()
+                .is_some_and(|title| !title.is_empty()));
+            assert!(tool["description"]
+                .as_str()
+                .is_some_and(|description| description.starts_with("Use this when")));
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+            assert_eq!(tool["annotations"]["openWorldHint"], false);
+            assert_eq!(tool["annotations"]["destructiveHint"], false);
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert_eq!(tool["outputSchema"]["type"], "object");
+            for field_schema in tool["outputSchema"]["properties"]
+                .as_object()
+                .into_iter()
+                .flat_map(|properties| properties.values())
+            {
+                if field_schema["items"]["type"] == "object" {
+                    assert_eq!(
+                        field_schema["items"]["additionalProperties"], false,
+                        "MCP object arrays must enumerate their response fields"
+                    );
+                }
+            }
+        }
+        let list_episodes = tools
+            .iter()
+            .find(|tool| tool["name"] == "list_episodes")
+            .expect("list_episodes definition");
+        assert!(
+            list_episodes["inputSchema"]["properties"]
+                .get("gap_minutes")
+                .is_none(),
+            "unused inputs must not be advertised"
+        );
+    }
+
+    #[test]
+    fn mcp_projection_removes_internal_search_and_timeline_fields() {
+        let search = project_mcp_result(
+            "search_screenshots",
+            json!({
+                "results": [{
+                    "kind": "Screenshot",
+                    "id": 42,
+                    "captured_at": "2026-07-23T10:00:00Z",
+                    "active_app": "Safari",
+                    "window_title": "Kioku",
+                    "ocr_text": "visible evidence",
+                    "url": "https://kiokuu.com",
+                    "score": 0.99,
+                    "image_hash": "private-hash",
+                    "source_key": "device:42",
+                    "created_at": "2026-07-23T10:00:01Z"
+                }]
+            }),
+        );
+        let hit = &search["results"][0];
+        assert_eq!(hit["ocr_text"], "visible evidence");
+        for internal in ["id", "score", "image_hash", "source_key", "created_at"] {
+            assert!(
+                hit.get(internal).is_none(),
+                "MCP search output must not expose {internal}"
+            );
+        }
+
+        let context = project_mcp_result(
+            "get_context",
+            json!({
+                "utterances": [{
+                    "id": 7,
+                    "audio_segment_id": 3,
+                    "started_at": "2026-07-23T10:00:00Z",
+                    "ended_at": "2026-07-23T10:01:00Z",
+                    "speaker_label": "Me",
+                    "language": "en",
+                    "text": "bounded context",
+                    "source_type": "mic",
+                    "confidence": 0.8
+                }],
+                "screenshots": []
+            }),
+        );
+        let utterance = &context["utterances"][0];
+        assert_eq!(utterance["text"], "bounded context");
+        assert!(utterance.get("id").is_none());
+        assert!(utterance.get("audio_segment_id").is_none());
+        assert!(utterance.get("confidence").is_none());
     }
 
     #[tokio::test]

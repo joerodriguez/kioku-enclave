@@ -54,7 +54,6 @@ const SIG_MIN_SUBSTANTIVE_UTT: i64 = 3;
 const SIG_MIN_SCREEN_MS: i64 = 2 * 60 * 1000;
 const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
 const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
-const TRIGGER_COOLDOWN_MS: i64 = 3 * 60 * 1000;
 const SUBSTANCE_BACKFILL_KEY: &str = "adr_0009_substance_backfill_v1";
 const SUBSTANCE_BACKFILL_BATCH: usize = 50;
 const VISUAL_EVIDENCE_BACKFILL_KEY: &str = "adr_0010_visual_evidence_backfill_v1";
@@ -1538,8 +1537,8 @@ pub async fn summarize_all(state: &CpState) {
         if let Err(e) = super::finalizer::finalize_user_episodes(state, &id).await {
             warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
         }
-        if let Err(e) = super::email_worker::deliver_user_emails(state, &id).await {
-            warn!(user_id = %id, error = %e, "deliver_user_emails failed");
+        if let Err(e) = super::webhook_worker::deliver_user_webhooks(state, &id).await {
+            warn!(user_id = %id, error = %e, "deliver_user_webhooks failed");
         }
     }
 }
@@ -1552,31 +1551,6 @@ pub fn spawn_scheduler(state: Arc<CpState>) {
         loop {
             tick.tick().await;
             summarize_all(&state).await;
-        }
-    });
-}
-
-/// Fire-and-forget freshness trigger from `list_episodes` (3-min cooldown).
-pub fn maybe_trigger(state: Arc<CpState>, user_id: String) {
-    static LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
-    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
-    tokio::spawn(async move {
-        {
-            let mut guard = map.lock().await;
-            let last = guard.get(&user_id).copied().unwrap_or(0);
-            if now_ms() - last < TRIGGER_COOLDOWN_MS {
-                return;
-            }
-            guard.insert(user_id.clone(), now_ms());
-        }
-        // Only run if stale (>10 min since cursor).
-        let stale = match state.control.summarized_until(&user_id).await {
-            Ok(Some(c)) => now_ms() - ms(&c) > 10 * 60 * 1000,
-            Ok(None) => true,
-            Err(_) => false,
-        };
-        if stale {
-            let _ = summarize_user(&state, &user_id).await;
         }
     });
 }

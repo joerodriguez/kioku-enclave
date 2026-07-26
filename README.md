@@ -44,11 +44,12 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
   from inside the service.
-- Optionally delivers final briefs through the user's connected Gmail account.
+- Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
 the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Selected
-text leaves the TEE only through the documented Vertex and opt-in Gmail delivery paths.
+text leaves the TEE only through the documented Vertex and explicit, user-configured
+webhook paths.
 
 ## Security and trust model
 
@@ -92,6 +93,13 @@ audiences, enforces a non-wildcard account allow-list, and issues Kioku tokens f
 query, MCP, and account routes. OAuth authorization uses PKCE, explicit consent,
 persisted single-use authorization codes, and client-bound refresh-token rotation.
 
+The published authorization endpoint is the operator's
+`WEB_ORIGIN/app/login`. Its normal path forwards to Google OAuth. An optional
+reviewer-only path accepts a short-lived Google Identity Platform token for one exact
+image-baked UID/email pair, creates only a namespaced synthetic account, and seeds that
+account with non-sensitive fixture data. Reviewer passwords are verified by Google and
+never reach this service, its source tree, or its image.
+
 Legacy `/v1/*` compatibility routes retain Google-signed service-identity-token
 authentication. The expected service-account email and token audience are baked into the
 image. There is no shared-secret bypass or flag that disables authentication.
@@ -133,9 +141,13 @@ under Google's
 [no-data-retention terms](https://cloud.google.com/vertex-ai/docs/generative-ai/data-governance).
 This is an explicit external trust boundary, not an enclave-only inference claim.
 
-If a user opts into episode-email delivery and connects Gmail, the service also sends the
-final-brief MIME content to the Gmail API using that user's OAuth grant. Gmail delivery is
-an explicit egress boundary; disabling the preference prevents new deliveries.
+Users can add HTTPS webhook destinations for finalized-episode events. Notifications are
+content-free by default; including a final brief is a separate per-destination opt-in.
+Webhook endpoints and signing secrets are encrypted in the control store, destination
+paths are redacted from API responses and logs, and each request is signed with the
+Standard Webhooks headers. Delivery rejects redirects and private, local, link-local,
+documentation, and other non-public network addresses. A configured destination remains
+an explicit egress boundary outside Kioku's enclave and attestation.
 
 ## API surfaces
 
@@ -144,10 +156,11 @@ The same binary serves all of these surfaces:
 | Surface | Representative paths | Authentication |
 |---|---|---|
 | Health and attestation | `/health`, `/v1/attestation` | Public |
-| OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/google/callback`, `/token` | Protocol-specific validation |
+| OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/token` | Protocol-specific validation |
 | Device and account API | `/api/sync/*`, `/api/export`, `/api/account` | Kioku access token or accepted Google ID token |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
 | Screenshot evidence | `/api/screenshot-images*` | Kioku access token or accepted Google ID token |
+| Webhook automation | `/api/webhooks*` | Kioku access token or accepted Google ID token |
 | Legacy data plane | `/v1/*` below | Google service identity token |
 
 Legacy compatibility routes are:
@@ -198,6 +211,9 @@ docker build --platform linux/amd64 \
   --build-arg ALLOWED_EMAILS=owner@example.com \
   --build-arg BASE_URL=https://api.example.com \
   --build-arg WEB_ORIGIN=https://app.example.com \
+  --build-arg REVIEWER_AUTH_API_KEY=public-identity-platform-api-key \
+  --build-arg REVIEWER_AUTH_UID=precreated_reviewer_uid \
+  --build-arg REVIEWER_AUTH_EMAIL=reviewer@example.com \
   --build-arg VERTEX_PROJECT=my-project \
   --build-arg VERTEX_LOCATION=us-central1 \
   --build-arg VERTEX_MODEL=gemini-2.5-flash \
@@ -228,17 +244,20 @@ binding.
 | `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
+| `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
 | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex inference configuration |
 | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
 
-The web OAuth client secret is fetched at runtime from Secret Manager. JWT signing
-secrets are generated and stored in the KMS-protected control database; neither is a
-Docker build argument or launch metadata value. Static `ENCLAVE_TLS*` variables exist for
-debug/custom bootstrap paths but are neither accepted production build arguments nor
-launch-policy overrides.
+The web OAuth client secret is fetched at runtime from Secret Manager. The reviewer
+password remains only in Google Identity Platform, the review portal, and the operator's
+versioned `kioku-openai-reviewer-password` secret in project `kioku-joerodriguez`. JWT
+signing secrets are generated and stored in the KMS-protected control database; neither
+password nor signing secret is a Docker build argument or launch metadata value. Static
+`ENCLAVE_TLS*` variables exist for debug/custom bootstrap paths but are neither accepted
+production build arguments nor launch-policy overrides.
 
 ## CI and release evidence
 
@@ -343,12 +362,12 @@ crate sources, apt installs unversioned packages from mutable repositories, and 
 not perform an independent bit-for-bit rebuild. Trust in GitHub Actions and dependency
 delivery therefore remains. Do not describe releases as independently reproducible.
 
-### Vertex and opt-in Gmail delivery leave Confidential Space
+### Vertex and user-configured webhooks leave Confidential Space
 
 Selected text is sent to Vertex Gemini. Attestation covers the Kioku service and its
-storage/retrieval behavior, not Vertex's internal execution. When episode-email delivery
-is enabled, final-brief content is also sent to Gmail under the connected user's OAuth
-grant.
+storage/retrieval behavior, not Vertex's internal execution. A webhook destination is
+also outside the attested boundary. Finalized-episode webhooks are content-free unless
+the user explicitly enables full brief content for that destination.
 
 ## Reporting vulnerabilities
 

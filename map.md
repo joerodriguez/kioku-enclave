@@ -22,12 +22,13 @@ OAuth clients and legacy service-identity integrations
    THIS SERVICE (Confidential Space VM, SEV)
         ├── context-bound AES-256-GCM blobs ──► GCS (ciphertext only)
         ├── attestation-derived credentials ─► Cloud KMS
-        └── documented plaintext egress ─────► Vertex / opt-in Gmail delivery
+        └── documented plaintext egress ─────► Vertex / user-configured webhooks
 ```
 
 The control plane is part of this process. Plaintext databases live only in process memory
 and SEV-protected tmpfs (`/tmp`), never on persistent disk. Selected summarisation text
-and opt-in final-brief email cross the TEE boundary as documented in `SECURITY.md`.
+and explicitly configured webhook events cross the TEE boundary as documented in
+`SECURITY.md`.
 
 ## Layout
 

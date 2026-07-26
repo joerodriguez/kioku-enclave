@@ -14,16 +14,17 @@
 pub mod auth;
 pub mod control_store;
 pub mod cors;
-pub mod email_worker;
 pub mod finalizer;
 pub mod isotime;
 pub mod limits;
 pub mod oauth;
 pub mod query;
+pub mod reviewer;
 pub mod summarizer;
 pub mod sync;
 pub mod tokens;
 pub mod vertex;
+pub mod webhook_worker;
 
 use serde::Deserialize;
 use std::sync::Arc;
@@ -63,6 +64,16 @@ pub struct CpConfig {
     pub quota_screenshots_per_day: i64,
     pub quota_mcp_calls_per_day: i64,
     pub web_origin: String,
+    /// Optional exact-match Google Identity Platform account used only by the
+    /// public plugin-review login page. The password never enters this config.
+    pub reviewer_auth: Option<ReviewerAuthConfig>,
+}
+
+#[derive(Clone)]
+pub struct ReviewerAuthConfig {
+    pub api_key: String,
+    pub uid: String,
+    pub email: String,
 }
 
 fn config_value(key: &str, test_default: &str) -> crate::error::Result<String> {
@@ -157,6 +168,63 @@ impl CpConfig {
             "WEB_ORIGIN",
             &config_value("WEB_ORIGIN", "http://localhost:3000")?,
         )?;
+        let reviewer_values = [
+            std::env::var("REVIEWER_AUTH_API_KEY")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("REVIEWER_AUTH_UID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("REVIEWER_AUTH_EMAIL")
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase(),
+        ];
+        let reviewer_auth = if reviewer_values.iter().all(String::is_empty) {
+            None
+        } else if reviewer_values.iter().any(String::is_empty) {
+            return Err(crate::error::EnclaveError::Config(
+                "REVIEWER_AUTH_API_KEY, REVIEWER_AUTH_UID, and REVIEWER_AUTH_EMAIL must be set together"
+                    .into(),
+            ));
+        } else {
+            let [api_key, uid, email] = reviewer_values;
+            if api_key.len() > 256
+                || !api_key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                return Err(crate::error::EnclaveError::Config(
+                    "REVIEWER_AUTH_API_KEY has an invalid format".into(),
+                ));
+            }
+            if uid.len() > 128
+                || !uid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                return Err(crate::error::EnclaveError::Config(
+                    "REVIEWER_AUTH_UID has an invalid format".into(),
+                ));
+            }
+            if email.len() > 254
+                || email
+                    .bytes()
+                    .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+                || email.matches('@').count() != 1
+            {
+                return Err(crate::error::EnclaveError::Config(
+                    "REVIEWER_AUTH_EMAIL has an invalid format".into(),
+                ));
+            }
+            Some(ReviewerAuthConfig {
+                api_key,
+                uid,
+                email,
+            })
+        };
 
         Ok(Self {
             base_url,
@@ -181,6 +249,7 @@ impl CpConfig {
             quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000)?,
             quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000)?,
             web_origin,
+            reviewer_auth,
         })
     }
 
@@ -210,6 +279,7 @@ pub struct CpState {
     pub control: Arc<control_store::ControlStore>,
     pub config: Arc<CpConfig>,
     pub user_verifier: Arc<auth::UserIdTokenVerifier>,
+    pub reviewer_verifier: Option<Arc<auth::ReviewerIdentityVerifier>>,
     pub sync_limiter: limits::RateLimiter,
     pub mcp_limiter: limits::RateLimiter,
     pub oauth_limiter: limits::RateLimiter,

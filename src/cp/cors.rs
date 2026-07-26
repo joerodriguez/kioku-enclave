@@ -88,6 +88,7 @@ mod tests {
             quota_screenshots_per_day: 0,
             quota_mcp_calls_per_day: 0,
             web_origin: web_origin.to_string(),
+            reviewer_auth: None,
         });
 
         use crate::store::tests::{FakeGcs, FakeKms};
@@ -101,6 +102,7 @@ mod tests {
             control,
             config,
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
+            reviewer_verifier: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),

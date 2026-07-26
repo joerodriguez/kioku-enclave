@@ -123,27 +123,3 @@ pub async fn daily_quota(
         })
         .await
 }
-
-/// Insert query accounting without persisting the user's sensitive search text.
-#[allow(dead_code)] // wired by the MCP/search routes in a later commit
-pub async fn log_query(
-    control: &ControlStore,
-    user_id: &str,
-    source: &str,
-    tool: &str,
-    _query_text: Option<String>,
-    result_count: i64,
-    duration_ms: i64,
-) -> Result<()> {
-    let (user_id, source, tool) = (user_id.to_string(), source.to_string(), tool.to_string());
-    control
-        .write(move |conn| {
-            conn.execute(
-                "INSERT INTO query_log (user_id, source, tool, query_text, result_count, duration_ms) \
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
-                rusqlite::params![user_id, source, tool, result_count, duration_ms],
-            )?;
-            Ok(())
-        })
-        .await
-}

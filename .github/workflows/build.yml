@@ -45,6 +45,9 @@ name: Build & push enclave image
 #   GOOGLE_WEB_CLIENT_ID      Google OAuth web audience
 #   BASE_URL                  Public origin, e.g. https://api.kiokuu.com
 #   WEB_ORIGIN                 Browser application origin, e.g. https://kiokuu.com
+#   REVIEWER_AUTH_API_KEY     Public Firebase/Identity Platform web API key
+#   REVIEWER_AUTH_UID         Exact precreated synthetic reviewer account UID
+#   REVIEWER_AUTH_EMAIL       Exact precreated synthetic reviewer account email
 #   VERTEX_PROJECT            GCP project for episode summarization
 #   VERTEX_LOCATION           Vertex region (e.g. us-central1)
 #   VERTEX_MODEL              Vertex model name
@@ -156,6 +159,9 @@ jobs:
           ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           BASE_URL: ${{ vars.BASE_URL }}
           WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
+          REVIEWER_AUTH_API_KEY: ${{ vars.REVIEWER_AUTH_API_KEY }}
+          REVIEWER_AUTH_UID: ${{ vars.REVIEWER_AUTH_UID }}
+          REVIEWER_AUTH_EMAIL: ${{ vars.REVIEWER_AUTH_EMAIL }}
           VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
@@ -174,6 +180,7 @@ jobs:
             ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_RUN_SA_EMAIL
             ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
             GOOGLE_DESKTOP_CLIENT_ID GOOGLE_WEB_CLIENT_ID ALLOWED_EMAILS BASE_URL WEB_ORIGIN
+            REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL
             VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
             ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY ENCLAVE_ACME_CONTACT
             GCP_WIF_PROVIDER GCP_SERVICE_ACCOUNT PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME
@@ -205,7 +212,8 @@ jobs:
                   "ENCLAVE_KMS_LOCATION", "ENCLAVE_KMS_PROJECT", "ENCLAVE_RUN_SA_EMAIL",
                   "GCP_PROJECT_ID", "GCP_REGION", "GCP_SERVICE_ACCOUNT", "GCP_WIF_PROVIDER",
                   "GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "IMAGE_NAME", "PROJECT_ID",
-                  "REGION", "VERTEX_LOCATION", "VERTEX_MODEL", "VERTEX_PROJECT", "WEB_ORIGIN",
+                  "REGION", "REVIEWER_AUTH_API_KEY", "REVIEWER_AUTH_EMAIL", "REVIEWER_AUTH_UID",
+                  "VERTEX_LOCATION", "VERTEX_MODEL", "VERTEX_PROJECT", "WEB_ORIGIN",
               } and any(ord(char) < 32 or ord(char) == 127 for char in os.environ[name]):
                   raise SystemExit(f"control character in repository configuration: {name}")
 
@@ -219,6 +227,9 @@ jobs:
           require_pattern("ENCLAVE_ATTEST_STS_AUDIENCE", r"//iam\.googleapis\.com/projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+")
           for name in ("GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID"):
               require_pattern(name, r"[A-Za-z0-9._-]+\.apps\.googleusercontent\.com")
+          require_pattern("REVIEWER_AUTH_API_KEY", r"[A-Za-z0-9_-]{20,256}")
+          require_pattern("REVIEWER_AUTH_UID", r"[A-Za-z0-9_-]{1,128}")
+          require_pattern("REVIEWER_AUTH_EMAIL", r"[^@,\s]+@[^@,\s]+")
           for name in ("ENCLAVE_KMS_PROJECT", "VERTEX_PROJECT"):
               require_pattern(name, r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
           for name in ("ENCLAVE_KMS_LOCATION", "VERTEX_LOCATION"):
@@ -264,6 +275,9 @@ jobs:
           ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           BASE_URL: ${{ vars.BASE_URL }}
           WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
+          REVIEWER_AUTH_API_KEY: ${{ vars.REVIEWER_AUTH_API_KEY }}
+          REVIEWER_AUTH_UID: ${{ vars.REVIEWER_AUTH_UID }}
+          REVIEWER_AUTH_EMAIL: ${{ vars.REVIEWER_AUTH_EMAIL }}
           VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
@@ -298,6 +312,9 @@ jobs:
             --build-arg ALLOWED_EMAILS="${ALLOWED_EMAILS}" \
             --build-arg BASE_URL="${BASE_URL}" \
             --build-arg WEB_ORIGIN="${WEB_ORIGIN}" \
+            --build-arg REVIEWER_AUTH_API_KEY="${REVIEWER_AUTH_API_KEY}" \
+            --build-arg REVIEWER_AUTH_UID="${REVIEWER_AUTH_UID}" \
+            --build-arg REVIEWER_AUTH_EMAIL="${REVIEWER_AUTH_EMAIL}" \
             --build-arg VERTEX_PROJECT="${VERTEX_PROJECT}" \
             --build-arg VERTEX_LOCATION="${VERTEX_LOCATION}" \
             --build-arg VERTEX_MODEL="${VERTEX_MODEL}" \

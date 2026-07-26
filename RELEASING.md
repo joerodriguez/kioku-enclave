@@ -44,6 +44,7 @@ The public build validates these non-secret GitHub Actions variables before Dock
 | KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
 | Internal KMS attestation exchange | `ENCLAVE_ATTEST_STS_AUDIENCE` |
 | OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
+| Synthetic plugin reviewer | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` |
 | Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
 | Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |
 
@@ -69,7 +70,11 @@ Production requirements are fail-closed:
 Repository variables may appear in public logs. Do not put
 credentials, OAuth client secrets, JWT secrets, TLS private keys, or other secret values
 in them. The web OAuth secret comes from Secret Manager and JWT secrets live in the
-KMS-protected control database.
+KMS-protected control database. The reviewer variables contain only the public Identity
+Platform API key and exact account identifiers. The reviewer password belongs only in
+Google Identity Platform, the plugin review portal, and GCP Secret Manager secret
+`kioku-openai-reviewer-password` in project `kioku-joerodriguez`; it is never a repository
+variable or build input.
 
 The GitHub-to-GCP WIF provider is itself part of the release boundary. Map and constrain
 immutable GitHub OIDC claims such as `repository_id` and `repository_owner_id`, require

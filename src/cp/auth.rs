@@ -21,7 +21,7 @@ use tracing::warn;
 
 use crate::error::{EnclaveError, Result};
 
-use super::{tokens, CpState};
+use super::{tokens, CpState, ReviewerAuthConfig};
 
 const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_ISSUERS: &[&str] = &["https://accounts.google.com", "accounts.google.com"];
@@ -29,6 +29,7 @@ const EXP_LEEWAY_SECS: u64 = 30;
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(300);
 const GOOGLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const GOOGLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REVIEWER_TOKEN_MAX_BYTES: usize = 8192;
 
 /// The authenticated user id, attached to the request by [`require_auth`].
 #[derive(Clone)]
@@ -134,6 +135,85 @@ impl UserIdTokenVerifier {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerIdentity {
+    local_id: String,
+    email: String,
+    #[serde(default)]
+    disabled: bool,
+}
+
+#[derive(Deserialize)]
+struct ReviewerLookupResponse {
+    #[serde(default)]
+    users: Vec<ReviewerIdentity>,
+}
+
+/// Verifies the short-lived Identity Platform token produced by
+/// `kiokuu.com/app/login`. Google performs the signature/account lookup; Kioku
+/// then enforces an exact preconfigured UID + email match.
+pub struct ReviewerIdentityVerifier {
+    http: reqwest::Client,
+    config: ReviewerAuthConfig,
+}
+
+impl ReviewerIdentityVerifier {
+    pub fn new(config: ReviewerAuthConfig) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .connect_timeout(GOOGLE_CONNECT_TIMEOUT)
+                .timeout(GOOGLE_REQUEST_TIMEOUT)
+                .build()
+                .expect("static reviewer identity HTTP client configuration"),
+            config,
+        }
+    }
+
+    pub async fn verify(&self, token: &str) -> Result<(String, String)> {
+        if token.is_empty() || token.len() > REVIEWER_TOKEN_MAX_BYTES || !token.is_ascii() {
+            return Err(EnclaveError::Auth("invalid reviewer identity token".into()));
+        }
+        let mut url =
+            reqwest::Url::parse("https://identitytoolkit.googleapis.com/v1/accounts:lookup")
+                .expect("static Identity Platform lookup URL");
+        url.query_pairs_mut()
+            .append_pair("key", &self.config.api_key);
+        let response = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({"idToken": token}))
+            .send()
+            .await
+            .map_err(|_| EnclaveError::Auth("review identity provider unavailable".into()))?;
+        if !response.status().is_success() {
+            return Err(EnclaveError::Auth("review identity rejected".into()));
+        }
+        let lookup: ReviewerLookupResponse = response
+            .json()
+            .await
+            .map_err(|_| EnclaveError::Auth("invalid review identity response".into()))?;
+        exact_reviewer_identity(&self.config, lookup.users)
+    }
+}
+
+fn exact_reviewer_identity(
+    config: &ReviewerAuthConfig,
+    mut users: Vec<ReviewerIdentity>,
+) -> Result<(String, String)> {
+    if users.len() != 1 {
+        return Err(EnclaveError::Auth("review identity rejected".into()));
+    }
+    let user = users.pop().expect("one reviewer identity");
+    if user.disabled
+        || user.local_id != config.uid
+        || !user.email.eq_ignore_ascii_case(&config.email)
+    {
+        return Err(EnclaveError::Auth("review identity rejected".into()));
+    }
+    Ok((user.local_id, user.email.to_lowercase()))
+}
+
 fn parse_max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::CACHE_CONTROL)?.to_str().ok()?;
     for part in value.split(',') {
@@ -146,13 +226,66 @@ fn parse_max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     None
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod reviewer_tests {
+    use super::*;
+
+    fn config() -> ReviewerAuthConfig {
+        ReviewerAuthConfig {
+            api_key: "public-api-key".into(),
+            uid: "reviewer_uid".into(),
+            email: "reviewer@kiokuu.com".into(),
+        }
+    }
+
+    #[test]
+    fn reviewer_identity_requires_exact_enabled_account() {
+        let accepted = exact_reviewer_identity(
+            &config(),
+            vec![ReviewerIdentity {
+                local_id: "reviewer_uid".into(),
+                email: "Reviewer@Kiokuu.com".into(),
+                disabled: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            accepted,
+            ("reviewer_uid".into(), "reviewer@kiokuu.com".into())
+        );
+
+        for rejected in [
+            ReviewerIdentity {
+                local_id: "other".into(),
+                email: "reviewer@kiokuu.com".into(),
+                disabled: false,
+            },
+            ReviewerIdentity {
+                local_id: "reviewer_uid".into(),
+                email: "other@kiokuu.com".into(),
+                disabled: false,
+            },
+            ReviewerIdentity {
+                local_id: "reviewer_uid".into(),
+                email: "reviewer@kiokuu.com".into(),
+                disabled: true,
+            },
+        ] {
+            assert!(exact_reviewer_identity(&config(), vec![rejected]).is_err());
+        }
+    }
+}
+
 /// 401 with the MCP discovery hint, matching the Node behaviour.
 fn unauthorized(base_url: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(
             "WWW-Authenticate",
-            format!("Bearer resource_metadata=\"{base_url}/.well-known/oauth-protected-resource\""),
+            format!(
+                "Bearer resource_metadata=\"{base_url}/.well-known/oauth-protected-resource\", scope=\"kioku:read\""
+            ),
         )],
         Json(json!({"error": "unauthorized"})),
     )
