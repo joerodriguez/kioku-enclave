@@ -6,6 +6,20 @@ validated image metadata, GitHub-signed build provenance, an SPDX SBOM, and a si
 attestation. The image digest is the value authorized by the deployment's KMS
 attestation condition.
 
+## Automated Release Workflow (Primary Method)
+
+Releasing a new enclave version requires **bumping `version` in `Cargo.toml`**.
+
+### For AI/LLM Agents & Developers:
+To cut a new release:
+1. Run `./scripts/bump_version.sh <NEW_VERSION>` (e.g. `./scripts/bump_version.sh 0.6.15`), or update `version = "X.Y.Z"` in `Cargo.toml` and run `cargo check`.
+2. Commit `Cargo.toml` & `Cargo.lock` and push to `main` (or merge your PR to `main`).
+3. GitHub Actions (`.github/workflows/build.yml`) will automatically:
+   - Create git tag `vX.Y.Z` on `main`.
+   - Build the container image and bake configuration into the attested image digest.
+   - Generate Sigstore build provenance and SPDX SBOM attestations.
+   - Publish the public GitHub Release for `vX.Y.Z` with all attestation assets attached.
+
 ## Prerequisites
 
 - Work on a clean `main` synchronized with `origin/main`.
