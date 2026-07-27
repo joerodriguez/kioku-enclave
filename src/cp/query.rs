@@ -22,12 +22,69 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::search::{search_all, SearchRequest};
-use crate::timeline::ContextRequest;
 
 use super::auth::AuthUser;
 use super::CpState;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Value {
+    let raw_query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
+    let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
+    let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
+
+    let (query, speaker) = crate::search::extract_speaker_filter(&raw_query);
+    let query_embedding = if query.trim().is_empty() {
+        None
+    } else {
+        embed_query(s, &query).await
+    };
+    let ep_req = SearchRequest {
+        user_id: user_id.to_string(),
+        query: query.clone(),
+        speaker: speaker.clone(),
+        time_start: from.clone(),
+        time_end: to.clone(),
+        limit,
+        offset: 0,
+        kinds: vec!["episode".into()],
+        query_embedding: query_embedding.clone(),
+    };
+    let utt_req = SearchRequest {
+        user_id: user_id.to_string(),
+        query,
+        speaker,
+        time_start: from,
+        time_end: to,
+        limit,
+        offset: 0,
+        kinds: vec!["utterance".into()],
+        query_embedding,
+    };
+    let (episodes, utterances) = s
+        .store
+        .with_user(user_id, |conn| {
+            Ok((
+                crate::search::search_episodes(conn, &ep_req)?,
+                search_all(conn, &utt_req)?,
+            ))
+        })
+        .await
+        .unwrap_or_default();
+    json!({
+        "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| json!([])),
+        "results": serde_json::to_value(&utterances).unwrap_or_else(|_| json!([])),
+    })
+}
 const MAX_SCREENSHOT_IMAGE_BYTES: usize = 150 * 1024;
 const MAX_SCREENSHOT_MULTIPART_BYTES: usize = MAX_SCREENSHOT_IMAGE_BYTES + 16 * 1024;
 const MAX_SCREENSHOT_METADATA_FIELD_BYTES: usize = 512;
@@ -97,72 +154,6 @@ async fn embed_query(s: &CpState, query: &str) -> Option<Vec<f32>> {
     }
 }
 
-async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Value {
-    let raw_query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10)
-        .clamp(1, 50) as usize;
-    let from = args.get("from").and_then(|v| v.as_str()).map(String::from);
-    let to = args.get("to").and_then(|v| v.as_str()).map(String::from);
-
-    // Strip a `speaker:Name` token BEFORE embedding so the vector reflects
-    // only the content query (ADR-0006 Phase 3).
-    let (query, speaker) = crate::search::extract_speaker_filter(&raw_query);
-    let query_embedding = if query.trim().is_empty() {
-        None
-    } else {
-        embed_query(s, &query).await
-    };
-    // Episodes are the PRIMARY result entity (ADR-0004): each carries its
-    // exec summary + minute-timeline gists + a matched snippet, so an
-    // assistant gets the high-level picture without digesting raw
-    // transcripts. Utterance hits follow as `results` (drill-down evidence;
-    // shape unchanged for existing clients). Episodes come back in relevance
-    // order (rank / RRF), not time order.
-    let ep_req = SearchRequest {
-        user_id: user_id.to_string(),
-        query: query.clone(),
-        speaker: speaker.clone(),
-        time_start: from.clone(),
-        time_end: to.clone(),
-        limit,
-        offset: 0,
-        kinds: vec!["episode".into()],
-        query_embedding: query_embedding.clone(),
-    };
-    let utt_req = SearchRequest {
-        user_id: user_id.to_string(),
-        query,
-        speaker,
-        time_start: from,
-        time_end: to,
-        limit,
-        offset: 0,
-        kinds: vec!["utterance".into()],
-        query_embedding,
-    };
-    let (episodes, utterances) = s
-        .store
-        .with_user(user_id, |conn| {
-            Ok((
-                crate::search::search_episodes(conn, &ep_req)?,
-                search_all(conn, &utt_req)?,
-            ))
-        })
-        .await
-        .unwrap_or_default();
-    json!({
-        "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| json!([])),
-        "results": serde_json::to_value(&utterances).unwrap_or_else(|_| json!([])),
-    })
-}
-
 async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Value {
     let query = args
         .get("query")
@@ -192,107 +183,6 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
         .await
         .unwrap_or_default();
     json!({ "results": serde_json::to_value(&hits).unwrap_or_else(|_| json!([])) })
-}
-
-async fn tool_get_context(s: &CpState, user_id: &str, args: &Value) -> Value {
-    let at = args
-        .get("at")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let window_secs = args
-        .get("window_seconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(300)
-        .clamp(60, 3600);
-    let minutes = ((window_secs / 2) / 60).max(1) as u32;
-    let req = ContextRequest {
-        user_id: user_id.to_string(),
-        center: at,
-        before_minutes: minutes,
-        after_minutes: minutes,
-        max_utterances: 200,
-        max_screenshots: 100,
-    };
-    s.store
-        .with_user(user_id, |conn| crate::timeline::fetch_context(conn, &req))
-        .await
-        .unwrap_or_else(|_| json!({ "utterances": [], "screenshots": [] }))
-}
-
-async fn tool_summarize_time_range(s: &CpState, user_id: &str, args: &Value) -> Value {
-    let from = args
-        .get("from")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let to = args
-        .get("to")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let max_items = args
-        .get("max_items")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(200)
-        .clamp(1, 500) as i64;
-    let (f, t) = (from.clone(), to.clone());
-    s.store
-        .with_user(user_id, move |conn| {
-            let utt: i64 = conn.query_row(
-                "SELECT count(*) FROM utterances u JOIN audio_segments s ON s.id=u.audio_segment_id \
-                 WHERE s.started_at >= ?1 AND s.started_at < ?2",
-                rusqlite::params![f, t],
-                |r| r.get(0),
-            )?;
-            let scr: i64 = conn.query_row(
-                "SELECT count(*) FROM screenshots WHERE captured_at >= ?1 AND captured_at < ?2",
-                rusqlite::params![f, t],
-                |r| r.get(0),
-            )?;
-            let mut langs_stmt = conn.prepare(
-                "SELECT DISTINCT language FROM utterances u JOIN audio_segments s ON s.id=u.audio_segment_id \
-                 WHERE s.started_at >= ?1 AND s.started_at < ?2 AND language IS NOT NULL",
-            )?;
-            let languages: Vec<String> = langs_stmt
-                .query_map(rusqlite::params![f, t], |r| r.get(0))?
-                .filter_map(|x| x.ok())
-                .collect();
-            let mut apps_stmt = conn.prepare(
-                "SELECT DISTINCT active_app FROM screenshots \
-                 WHERE captured_at >= ?1 AND captured_at < ?2 AND active_app IS NOT NULL",
-            )?;
-            let apps: Vec<String> = apps_stmt
-                .query_map(rusqlite::params![f, t], |r| r.get(0))?
-                .filter_map(|x| x.ok())
-                .collect();
-            // Chronological digest of utterances.
-            let mut dig_stmt = conn.prepare(
-                "SELECT s.started_at, u.speaker_label, u.text \
-                 FROM utterances u JOIN audio_segments s ON s.id=u.audio_segment_id \
-                 WHERE s.started_at >= ?1 AND s.started_at < ?2 \
-                 ORDER BY s.started_at ASC LIMIT ?3",
-            )?;
-            let digest: Vec<Value> = dig_stmt
-                .query_map(rusqlite::params![f, t, max_items], |r| {
-                    Ok(json!({
-                        "at": r.get::<_, String>(0)?,
-                        "speaker": r.get::<_, String>(1)?,
-                        "text": r.get::<_, String>(2)?,
-                    }))
-                })?
-                .filter_map(|x| x.ok())
-                .collect();
-            Ok(json!({
-                "from": f, "to": t,
-                "counts": { "utterances": utt, "screenshots": scr },
-                "languages": languages,
-                "apps_seen": apps,
-                "digest": digest,
-            }))
-        })
-        .await
-        .unwrap_or_else(|_| json!({ "error": "range query failed" }))
 }
 
 async fn tool_list_episodes(s: &Arc<CpState>, user_id: &str, args: &Value) -> Value {
@@ -853,10 +743,54 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
         return Some(refusal);
     }
     let result = match name {
-        "search_transcripts" => tool_search_transcripts(s, user_id, args).await,
+        "search_transcripts" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            s.store
+                .with_user(user_id, |conn| {
+                    Ok(super::mcp_query::search_safe_transcripts(
+                        conn, query, limit,
+                    )?)
+                })
+                .await
+                .unwrap_or_else(|_| json!({ "results": [] }))
+        }
+        "get_context" => {
+            let at = args.get("at").and_then(|v| v.as_str()).unwrap_or("");
+            let window = args
+                .get("window_seconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            s.store
+                .with_user(user_id, |conn| {
+                    Ok(super::mcp_query::fetch_safe_context(
+                        conn, at, window, limit,
+                    )?)
+                })
+                .await
+                .unwrap_or_else(|_| json!({ "utterances": [] }))
+        }
+        "summarize_time_range" => {
+            let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            s.store
+                .with_user(user_id, |conn| {
+                    Ok(super::mcp_query::summarize_safe_time_range(
+                        conn, from, to, limit,
+                    )?)
+                })
+                .await
+                .unwrap_or_else(|_| json!({ "episodes": [] }))
+        }
         "search_screenshots" => tool_search_screenshots(s, user_id, args).await,
-        "get_context" => tool_get_context(s, user_id, args).await,
-        "summarize_time_range" => tool_summarize_time_range(s, user_id, args).await,
         "list_episodes" => tool_list_episodes(s, user_id, args).await,
         "get_capture_status" => tool_get_capture_status(s, user_id).await,
         _ => return None,

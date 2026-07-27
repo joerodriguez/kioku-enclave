@@ -706,6 +706,7 @@ CREATE TABLE IF NOT EXISTS device_watermarks (
 ///
 /// `CREATE UNIQUE INDEX IF NOT EXISTS` is truly idempotent.
 fn run_migrations(conn: &Connection) -> Result<()> {
+    crate::cp::mcp_projection::init_projection_schema(conn)?;
     // utterances.source_key (sync idempotency key)
     if let Err(e) = conn.execute_batch("ALTER TABLE utterances ADD COLUMN source_key TEXT;") {
         // SQLite returns "duplicate column name: source_key" — ignore it.

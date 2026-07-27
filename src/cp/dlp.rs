@@ -75,6 +75,10 @@ pub fn local_deterministic_redact(input: &str) -> RedactionResult {
         regex::Regex::new(r"\b(?:sk|pk|api|key)_[live|test|prod]_[A-Za-z0-9]{16,}\b").unwrap();
     let bearer_regex = regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*\b").unwrap();
     let ssn_regex = regex::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap();
+    let spaced_digits_regex = regex::Regex::new(
+        r"(?i)\b(?:numbers?|code|claim|billing|id|ssn|card)?\s*(?:\d[\s,.-]*){4,16}\b",
+    )
+    .unwrap();
 
     for re in &[&jwt_regex, &api_key_regex, &bearer_regex, &ssn_regex] {
         let mut spans = Vec::new();
@@ -82,6 +86,23 @@ pub fn local_deterministic_redact(input: &str) -> RedactionResult {
             spans.push((mat.start(), mat.end()));
         }
         for (start, end) in spans.into_iter().rev() {
+            text.replace_range(start..end, REDACTION_MARKER);
+            redaction_count += 1;
+        }
+    }
+
+    // Spaced numbers/code sequences with context
+    let lower = text.to_lowercase();
+    if lower.contains("billing")
+        || lower.contains("code")
+        || lower.contains("numbers")
+        || lower.contains("claim")
+    {
+        let mut digit_spans = Vec::new();
+        for mat in spaced_digits_regex.find_iter(&text) {
+            digit_spans.push((mat.start(), mat.end()));
+        }
+        for (start, end) in digit_spans.into_iter().rev() {
             text.replace_range(start..end, REDACTION_MARKER);
             redaction_count += 1;
         }
@@ -359,7 +380,11 @@ pub async fn run_full_pipeline(client: &DlpClient, input: &str) -> Result<Redact
             || lower.contains("member")
             || lower.contains("dr.")
             || lower.contains("hospital")
-            || lower.contains("clinic");
+            || lower.contains("clinic")
+            || lower.contains("knee")
+            || lower.contains("injured")
+            || lower.contains("insurance")
+            || lower.contains("billing");
 
         if has_identifying {
             // Replace with generic safe action
