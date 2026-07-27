@@ -97,6 +97,7 @@ async fn embed_query(s: &CpState, query: &str) -> Option<Vec<f32>> {
     }
 }
 
+#[allow(dead_code)]
 async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Value {
     let raw_query = args
         .get("query")
@@ -194,6 +195,7 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
     json!({ "results": serde_json::to_value(&hits).unwrap_or_else(|_| json!([])) })
 }
 
+#[allow(dead_code)]
 async fn tool_get_context(s: &CpState, user_id: &str, args: &Value) -> Value {
     let at = args
         .get("at")
@@ -220,6 +222,7 @@ async fn tool_get_context(s: &CpState, user_id: &str, args: &Value) -> Value {
         .unwrap_or_else(|_| json!({ "utterances": [], "screenshots": [] }))
 }
 
+#[allow(dead_code)]
 async fn tool_summarize_time_range(s: &CpState, user_id: &str, args: &Value) -> Value {
     let from = args
         .get("from")
@@ -853,10 +856,24 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
         return Some(refusal);
     }
     let result = match name {
-        "search_transcripts" => tool_search_transcripts(s, user_id, args).await,
+        "search_transcripts" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            s.store.with_user(user_id, |conn| Ok(super::mcp_query::search_safe_transcripts(conn, query, limit)?)).await.unwrap_or_else(|_| json!({ "results": [] }))
+        }
+        "get_context" => {
+            let at = args.get("at").and_then(|v| v.as_str()).unwrap_or("");
+            let window = args.get("window_seconds").and_then(|v| v.as_u64()).unwrap_or(300);
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+            s.store.with_user(user_id, |conn| Ok(super::mcp_query::fetch_safe_context(conn, at, window, limit)?)).await.unwrap_or_else(|_| json!({ "utterances": [] }))
+        }
+        "summarize_time_range" => {
+            let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+            s.store.with_user(user_id, |conn| Ok(super::mcp_query::summarize_safe_time_range(conn, from, to, limit)?)).await.unwrap_or_else(|_| json!({ "episodes": [] }))
+        }
         "search_screenshots" => tool_search_screenshots(s, user_id, args).await,
-        "get_context" => tool_get_context(s, user_id, args).await,
-        "summarize_time_range" => tool_summarize_time_range(s, user_id, args).await,
         "list_episodes" => tool_list_episodes(s, user_id, args).await,
         "get_capture_status" => tool_get_capture_status(s, user_id).await,
         _ => return None,
