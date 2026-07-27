@@ -461,10 +461,6 @@ jobs:
       # Release, giving auditors a stable source commit -> image digest record.
       - name: Write release metadata
         id: metadata
-        permissions:
-          attestations: write
-          contents: write
-          id-token: write
         run: |
           VERSION="$(grep '^version =' Cargo.toml | head -1 | cut -d '"' -f 2)"
           TAG_NAME="v${VERSION}"
