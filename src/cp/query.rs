@@ -859,19 +859,49 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
         "search_transcripts" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            s.store.with_user(user_id, |conn| Ok(super::mcp_query::search_safe_transcripts(conn, query, limit)?)).await.unwrap_or_else(|_| json!({ "results": [] }))
+            s.store
+                .with_user(user_id, |conn| {
+                    Ok(super::mcp_query::search_safe_transcripts(
+                        conn, query, limit,
+                    )?)
+                })
+                .await
+                .unwrap_or_else(|_| json!({ "results": [] }))
         }
         "get_context" => {
             let at = args.get("at").and_then(|v| v.as_str()).unwrap_or("");
-            let window = args.get("window_seconds").and_then(|v| v.as_u64()).unwrap_or(300);
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            s.store.with_user(user_id, |conn| Ok(super::mcp_query::fetch_safe_context(conn, at, window, limit)?)).await.unwrap_or_else(|_| json!({ "utterances": [] }))
+            let window = args
+                .get("window_seconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            s.store
+                .with_user(user_id, |conn| {
+                    Ok(super::mcp_query::fetch_safe_context(
+                        conn, at, window, limit,
+                    )?)
+                })
+                .await
+                .unwrap_or_else(|_| json!({ "utterances": [] }))
         }
         "summarize_time_range" => {
             let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("");
             let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            s.store.with_user(user_id, |conn| Ok(super::mcp_query::summarize_safe_time_range(conn, from, to, limit)?)).await.unwrap_or_else(|_| json!({ "episodes": [] }))
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            s.store
+                .with_user(user_id, |conn| {
+                    Ok(super::mcp_query::summarize_safe_time_range(
+                        conn, from, to, limit,
+                    )?)
+                })
+                .await
+                .unwrap_or_else(|_| json!({ "episodes": [] }))
         }
         "search_screenshots" => tool_search_screenshots(s, user_id, args).await,
         "list_episodes" => tool_list_episodes(s, user_id, args).await,
