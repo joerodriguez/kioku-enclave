@@ -62,6 +62,8 @@ impact**. Run the four checks above first.
 
 Only commit/push when the user asks. Default branch is `main`.
 
+**STRICT PR RULE: NEVER PUSH DIRECTLY TO `main`**. All changes — including features, bug fixes, documentation, and version bumps — MUST be committed on a branch and submitted via Pull Request. Never push directly to `main`.
+
 - **Zero-Click PR & Auto-Merge Queue Workflow**: To land changes cleanly without manual UI clicking, agents create PRs and enable auto-merge rebase via CLI:
   ```bash
   git checkout -b feat/feature-name
