@@ -72,6 +72,32 @@ Only commit/push when the user asks. Default branch is `main`.
   ```
   This automatically queues the PR for merge once CI passes, rebasing it onto `main` as a single clean commit with the full PR description.
 
+## Release & GCP Deployment Checklist
+
+When releasing a new version or deploying changes to production, follow these steps to guarantee code completeness and live VM state agreement:
+
+1. **Version Bump & Staging Completeness**:
+   - Always run `git status` before running `./scripts/bump_version.sh <version>`.
+   - `./scripts/bump_version.sh` executes `git add -A` to ensure all source code changes, migrations, tests, and documentation are committed together with `Cargo.toml` and `Cargo.lock`. Never commit version files in isolation while source modifications remain unstaged.
+
+2. **GCP Confidential Space Live VM Roll**:
+   - Pushing a release tag `vX.Y.Z` triggers the enclave image build on GitHub Actions.
+   - The monorepo deployment watcher (`deploy.yml` in `joerodriguez/kioku`) updates `infra/terraform.tfvars` with the new pinned digest.
+   - **CRITICAL**: GCP Confidential Space TEE VMs do **not** automatically reload container images in-place. After Terraform updates the instance metadata, force the VM to boot the new image digest by running:
+     ```bash
+     gcloud compute instances reset kioku-enclave --project=kioku-joerodriguez --zone=us-central1-b
+     ```
+   - Verify boot and version startup by inspecting serial console logs:
+     ```bash
+     gcloud compute instances get-serial-port-output kioku-enclave --project=kioku-joerodriguez --zone=us-central1-b | tail -n 30
+     ```
+     Confirm `kioku-enclave starting version X.Y.Z` and ACME TLS certificate initialization.
+
+3. **Timezone & Query Type-Affinity Rules**:
+   - Database timestamps are stored in UTC ISO 8601 strings (`2026-07-26T23:51:39.450Z`).
+   - SQLite `strftime('%s', ...)` returns a `TEXT` string. Comparing `strftime` outputs to numeric integer offsets (e.g. `+ 14400`) causes SQLite type-affinity failures where `TEXT > INTEGER` evaluates to `FALSE`.
+   - Always wrap `strftime('%s', ...)` expressions in `CAST(strftime('%s', ...) AS INTEGER)`.
+   - Ensure timestamp queries evaluate exact UTC bounds **and** US local timezone offsets (+4h EDT, +5h EST/CDT, +7h PDT) so wall-clock time queries from assistant callers match UTC database records.
 
 ## Security reminders specific to this repo
 
