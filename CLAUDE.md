@@ -64,15 +64,16 @@ Only commit/push when the user asks. Default branch is `main`.
 
 **STRICT PR RULE: NEVER PUSH DIRECTLY TO `main`**. All changes — including features, bug fixes, documentation, and version bumps — MUST be committed on a branch and submitted via Pull Request. Never push directly to `main`.
 
-- **Zero-Click PR & Auto-Merge Queue Workflow**: To land changes cleanly without manual UI clicking, agents create PRs and enable auto-merge rebase via CLI:
+- **Zero-Click PR & Auto-Merge Queue Workflow**: To land changes cleanly, agents create PRs, wait for all GitHub Actions checks to pass green, and merge via rebase:
   ```bash
   git checkout -b feat/feature-name
   git commit -m "feat(scope): detailed description"
   git push -u origin HEAD
   gh pr create --fill --base main
-  gh pr merge --auto --rebase
+  gh pr checks --watch                             # MUST wait for all CI checks to pass green
+  gh pr merge --rebase                             # Merge cleanly only after CI passes
   ```
-  This automatically queues the PR for merge once CI passes, rebasing it onto `main` as a single clean commit with the full PR description.
+  **STRICT CI MANDATE: NEVER USE `--admin` TO BYPASS RUNNING CI CHECKS OR MERGE PREMATURELY**. Always run `gh pr checks --watch` and wait for every check (`CI`, `Security analysis`, `Build + push enclave image`) to complete green (`✓`) before merging.
 
 ## Release & GCP Deployment Checklist
 
