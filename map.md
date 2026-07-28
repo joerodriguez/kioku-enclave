@@ -2,7 +2,7 @@
 
 > **What `map.md` files are:** one per directory, describing what it's for and how it
 > fits the whole, so agents can orient quickly. **Keep them current** when you add/
-> remove/rename files or change a directory's role. See [CLAUDE.md](CLAUDE.md).
+> remove/rename files or change a directory's role. See [AGENTS.md](AGENTS.md).
 
 ## What this repo is
 
