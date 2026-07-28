@@ -26,11 +26,15 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Parse an ISO-8601 UTC timestamp to epoch milliseconds. Returns `None` on a
+/// Parse an ISO-8601 timestamp to epoch milliseconds. Handles both `Z`-suffixed
+/// UTC timestamps and `±HH:MM` offset-bearing timestamps. Returns `None` on a
 /// shape we don't recognise.
 pub fn parse_epoch_millis(ts: &str) -> Option<i64> {
-    let (date, time) = ts.split_once('T')?;
-    let time = time.trim_end_matches('Z');
+    let (date, time_part) = ts.split_once('T')?;
+
+    // Strip and parse the timezone suffix: Z, +HH:MM, or -HH:MM
+    let (time, offset_secs) = parse_time_and_offset(time_part)?;
+
     let mut dp = date.split('-');
     let y: i64 = dp.next()?.parse().ok()?;
     let mo: i64 = dp.next()?.parse().ok()?;
@@ -53,7 +57,30 @@ pub fn parse_epoch_millis(ts: &str) -> Option<i64> {
         millis = d0 * 100 + d1 * 10 + d2;
     }
     let days = days_from_civil(y, mo, d);
-    Some((days * 86400 + h * 3600 + mi * 60 + s) * 1000 + millis)
+    // Subtract offset to convert local wall-clock to UTC
+    Some((days * 86400 + h * 3600 + mi * 60 + s - offset_secs) * 1000 + millis)
+}
+
+/// Parse the time portion after 'T', returning (time_without_offset, offset_seconds).
+/// `Z` → offset 0, `+05:30` → +19800, `-04:00` → -14400.
+fn parse_time_and_offset(time_part: &str) -> Option<(&str, i64)> {
+    if let Some(t) = time_part.strip_suffix('Z') {
+        return Some((t, 0));
+    }
+    // Look for +HH:MM or -HH:MM at the end (always 6 chars: ±HH:MM)
+    if time_part.len() >= 6 {
+        let (rest, offset_str) = time_part.split_at(time_part.len() - 6);
+        let sign_byte = offset_str.as_bytes()[0];
+        if sign_byte == b'+' || sign_byte == b'-' {
+            let mut parts = offset_str[1..].split(':');
+            let oh: i64 = parts.next()?.parse().ok()?;
+            let om: i64 = parts.next()?.parse().ok()?;
+            let sign: i64 = if sign_byte == b'+' { 1 } else { -1 };
+            return Some((rest, sign * (oh * 3600 + om * 60)));
+        }
+    }
+    // No recognised offset — treat as UTC (backward compat with bare timestamps)
+    Some((time_part, 0))
 }
 
 /// Format epoch milliseconds back to `YYYY-MM-DDTHH:MM:SS.fffZ`.
@@ -73,6 +100,17 @@ pub fn add_seconds(start: &str, secs: f64) -> String {
     match parse_epoch_millis(start) {
         Some(ms) => format_epoch_millis(ms + (secs * 1000.0) as i64),
         None => start.to_string(),
+    }
+}
+
+/// Normalize any ISO-8601 timestamp to canonical UTC `YYYY-MM-DDTHH:MM:SS.fffZ`.
+/// If the input is already `Z`-suffixed, it is re-formatted for consistency.
+/// If the input has a `±HH:MM` offset, it is converted to UTC.
+/// Unparseable inputs are returned unchanged.
+pub fn normalize_to_utc(ts: &str) -> String {
+    match parse_epoch_millis(ts) {
+        Some(ms) => format_epoch_millis(ms),
+        None => ts.to_string(),
     }
 }
 
@@ -106,5 +144,63 @@ mod tests {
             add_seconds("2026-06-09T23:59:59.000Z", 2.0),
             "2026-06-10T00:00:01.000Z"
         );
+    }
+
+    #[test]
+    fn normalize_utc_passthrough() {
+        // Z-suffixed timestamps must pass through unchanged
+        assert_eq!(
+            normalize_to_utc("2026-07-26T23:51:39.450Z"),
+            "2026-07-26T23:51:39.450Z"
+        );
+        assert_eq!(
+            normalize_to_utc("2026-07-26T00:00:00Z"),
+            "2026-07-26T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn normalize_edt_offset() {
+        // -04:00 (EDT): 19:00 local = 23:00 UTC
+        assert_eq!(
+            normalize_to_utc("2026-07-26T19:00:00-04:00"),
+            "2026-07-26T23:00:00.000Z"
+        );
+        // 20:00 EDT = 00:00 next day UTC
+        assert_eq!(
+            normalize_to_utc("2026-07-26T20:00:00-04:00"),
+            "2026-07-27T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn normalize_positive_offset() {
+        // +05:30 (IST): 05:30 local = 00:00 UTC same day
+        assert_eq!(
+            normalize_to_utc("2026-07-26T05:30:00+05:30"),
+            "2026-07-26T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn normalize_zero_offset() {
+        assert_eq!(
+            normalize_to_utc("2026-07-26T12:00:00+00:00"),
+            "2026-07-26T12:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn normalize_with_fractional_seconds() {
+        assert_eq!(
+            normalize_to_utc("2026-07-26T19:51:39.450-04:00"),
+            "2026-07-26T23:51:39.450Z"
+        );
+    }
+
+    #[test]
+    fn normalize_unparseable_returns_unchanged() {
+        assert_eq!(normalize_to_utc("not-a-timestamp"), "not-a-timestamp");
+        assert_eq!(normalize_to_utc(""), "");
     }
 }
