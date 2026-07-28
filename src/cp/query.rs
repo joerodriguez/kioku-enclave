@@ -249,6 +249,12 @@ async fn query_episodes_value(
     include_low: bool,
     episode_id: Option<i64>,
 ) -> crate::error::Result<Value> {
+    // Normalize offset-bearing timestamps (e.g. -04:00) to UTC before SQL.
+    // DB stores UTC Z-suffixed strings; after normalization both sides are UTC
+    // and simple string comparison works correctly.
+    let from = from.map(|s| super::isotime::normalize_to_utc(&s));
+    let to = to.map(|s| super::isotime::normalize_to_utc(&s));
+
     s.store
         .with_user(user_id, move |conn| {
             // Episodes are the ONLY mode (the Mac's local heuristic grouping is
@@ -269,17 +275,8 @@ async fn query_episodes_value(
                         fb.overview, fb.decisions, fb.action_items, fb.important_links, fb.open_questions \
                  FROM episodes e \
                  LEFT JOIN episode_final_briefs fb ON fb.episode_id = e.id \
-                 WHERE ( \
+                 WHERE \
                    (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
-                   OR \
-                   (?1 IS NOT NULL AND ?2 IS NOT NULL AND ( \
-                     (CAST(strftime('%s', replace(replace(e.ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 14400 AND CAST(strftime('%s', replace(replace(e.started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 14400) \
-                     OR \
-                     (CAST(strftime('%s', replace(replace(e.ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 18000 AND CAST(strftime('%s', replace(replace(e.started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 18000) \
-                     OR \
-                     (CAST(strftime('%s', replace(replace(e.ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 25200 AND CAST(strftime('%s', replace(replace(e.started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 25200) \
-                   )) \
-                 ) \
                    AND (?3 = 1 OR e.substance != 'none') \
                    AND (?5 IS NULL OR e.id = ?5) \
                  ORDER BY e.started_at DESC LIMIT ?4",
@@ -288,6 +285,7 @@ async fn query_episodes_value(
                 .query_map(
                     rusqlite::params![from, to, include_low, max, episode_id],
                     |r| {
+
                     let utt: i64 = r.get(9)?;
                     let scr: i64 = r.get(10)?;
 
@@ -3598,12 +3596,13 @@ mod tests {
             embedding: None,
         });
 
-        // Query using local EDT time bounds (19:30:00Z to 20:15:00Z) for 7:30 PM - 8:15 PM EDT
+        // Query using correct UTC bounds for 7:30 PM - 8:15 PM EDT
+        // 7:30 PM EDT = 23:30 UTC, 8:15 PM EDT = 00:15 next day UTC
         let res = query_episodes_value(
             &s,
             "tz-user",
-            Some("2026-07-26T19:30:00Z".into()),
-            Some("2026-07-26T20:15:00Z".into()),
+            Some("2026-07-26T23:30:00Z".into()),
+            Some("2026-07-27T00:15:00Z".into()),
             10,
             false,
             None,
@@ -3611,8 +3610,85 @@ mod tests {
         .await
         .unwrap();
 
-        println!("TEST RESULT: {:?}", res);
         assert_eq!(res["episode_count"], 1);
         assert_eq!(res["episodes"][0]["id"], 322);
+
+        // Also verify that EDT offset notation works identically
+        let res2 = query_episodes_value(
+            &s,
+            "tz-user",
+            Some("2026-07-26T19:30:00-04:00".into()),
+            Some("2026-07-26T20:15:00-04:00".into()),
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            res2["episode_count"], 1,
+            "EDT offset notation should find the same episode"
+        );
+        assert_eq!(res2["episodes"][0]["id"], 322);
+    }
+
+    #[tokio::test]
+    async fn test_query_episodes_with_offset_timestamps() {
+        // This is the ACTUAL bug: MCP clients send -04:00 offset timestamps,
+        // and the SQL string comparison + hardcoded offset fallbacks both fail.
+        std::env::set_var("ENCLAVE_TEST_MODE", "1");
+        std::env::set_var("ALLOWED_EMAILS", "test@example.com");
+        let store = Arc::new(Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new())));
+        store
+            .with_user("tz-offset-user", |conn| {
+                conn.execute_batch(
+                    "\
+                    INSERT INTO episodes (id, started_at, ended_at, title, summary, substance) \
+                    VALUES (500, '2026-07-26T23:51:39.450Z', '2026-07-26T23:52:21.684Z', \
+                            'Offset Test', 'Testing offset queries', 'normal');\
+                    ",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let s = Arc::new(CpState {
+            store: Arc::clone(&store),
+            control: Arc::new(crate::cp::control_store::ControlStore::new(
+                Arc::new(FakeKms),
+                Arc::new(FakeGcs::new()),
+            )),
+            user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
+            reviewer_verifier: None,
+            sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
+            mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
+            oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
+            config: Arc::new(
+                crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
+            ),
+            embedding: None,
+        });
+
+        // Query with EDT offset timestamps: 7:00 PM to 8:00 PM EDT = 23:00-00:00 UTC
+        // Episode at 23:51 UTC should be found
+        let res = query_episodes_value(
+            &s,
+            "tz-offset-user",
+            Some("2026-07-26T19:00:00-04:00".into()),
+            Some("2026-07-26T20:00:00-04:00".into()),
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            res["episode_count"], 1,
+            "Offset -04:00 query should find the episode at 23:51 UTC"
+        );
+        assert_eq!(res["episodes"][0]["id"], 500);
     }
 }

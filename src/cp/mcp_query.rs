@@ -108,21 +108,19 @@ pub fn fetch_safe_context(
         .unwrap_or(DEFAULT_MINIMIZED_PAGE_SIZE)
         .clamp(1, MAX_MINIMIZED_PAGE_SIZE);
 
+    // Normalize offset-bearing center_time to UTC before SQL distance calculation.
+    let center_time = super::isotime::normalize_to_utc(center_time);
+
     let mut utterances = Vec::new();
 
-    // 1. Try safe projection table first with ISO string normalization and timezone-resilient distance matching
+    // 1. Try safe projection table first with epoch-based distance sorting
     if let Ok(mut stmt) = conn.prepare(
         "
         SELECT id, sanitized_text, speaker_label, started_at, ended_at
         FROM mcp_safe_utterances
         WHERE disposition != 'blocked'
-        ORDER BY min(
-            abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)),
-            abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 14400)),
-            abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) - 14400)),
-            abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 25200)),
-            abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) - 25200))
-        ) ASC
+        ORDER BY abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER)
+                   - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)) ASC
         LIMIT ?2
         ",
     ) {
@@ -148,13 +146,8 @@ pub fn fetch_safe_context(
             SELECT u.id, u.text, u.speaker_label, s.started_at, s.ended_at
             FROM utterances u
             JOIN audio_segments s ON s.id = u.audio_segment_id
-            ORDER BY min(
-                abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER) - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)),
-                abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 14400)),
-                abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) - 14400)),
-                abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 25200)),
-                abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER) - (CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) - 25200))
-            ) ASC
+            ORDER BY abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER)
+                       - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)) ASC
             LIMIT ?2
             ",
         ) {
@@ -197,21 +190,19 @@ pub fn summarize_safe_time_range(
         .unwrap_or(DEFAULT_MINIMIZED_PAGE_SIZE)
         .clamp(1, MAX_MINIMIZED_PAGE_SIZE);
 
+    // Normalize offset-bearing timestamps to UTC before SQL comparison.
+    let from = super::isotime::normalize_to_utc(from);
+    let to = super::isotime::normalize_to_utc(to);
+
     let mut episodes = Vec::new();
 
-    // 1. Try mcp_safe_episodes first with timezone-resilient matching
+    // 1. Try mcp_safe_episodes first
     if let Ok(mut stmt) = conn.prepare(
         "
         SELECT episode_ref, sanitized_title, sanitized_summary, started_at, ended_at
         FROM mcp_safe_episodes
-        WHERE disposition != 'blocked' AND (
-            (started_at <= ?2 AND ended_at >= ?1)
-            OR (
-                (CAST(strftime('%s', replace(replace(ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 14400 AND CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 14400)
-                OR (CAST(strftime('%s', replace(replace(ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 18000 AND CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 18000)
-                OR (CAST(strftime('%s', replace(replace(ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 25200 AND CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 25200)
-            )
-        )
+        WHERE disposition != 'blocked'
+          AND started_at <= ?2 AND ended_at >= ?1
         ORDER BY started_at ASC
         LIMIT ?3
         ",
@@ -237,14 +228,8 @@ pub fn summarize_safe_time_range(
             "
             SELECT CAST(id AS TEXT), title, summary, started_at, ended_at
             FROM episodes
-            WHERE substance != 'none' AND (
-                (started_at <= ?2 AND ended_at >= ?1)
-                OR (
-                    (CAST(strftime('%s', replace(replace(ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 14400 AND CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 14400)
-                    OR (CAST(strftime('%s', replace(replace(ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 18000 AND CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 18000)
-                    OR (CAST(strftime('%s', replace(replace(ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 25200 AND CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 25200)
-                )
-            )
+            WHERE substance != 'none'
+              AND started_at <= ?2 AND ended_at >= ?1
             ORDER BY started_at ASC
             LIMIT ?3
             ",
@@ -363,5 +348,65 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("growth on my knee had to get removed"));
+    }
+
+    #[test]
+    fn test_summarize_with_offset_timestamps() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_projection_schema(&conn).unwrap();
+
+        // Create base episodes table (init_projection_schema only creates MCP tables)
+        conn.execute_batch(
+            "\
+            CREATE TABLE IF NOT EXISTS episodes (\
+                id INTEGER PRIMARY KEY, started_at TEXT, ended_at TEXT, \
+                title TEXT, summary TEXT, substance TEXT\
+            );\
+            INSERT INTO episodes (id, started_at, ended_at, title, summary, substance) \
+            VALUES (400, '2026-07-26T23:51:39.450Z', '2026-07-26T23:52:21.684Z', \
+                    'UTC Episode', 'Stored in UTC', 'normal');\
+            ",
+        )
+        .unwrap();
+
+        // Query with EDT offset bounds: 7 PM to 8 PM EDT = 23:00-00:00 UTC
+        let res = summarize_safe_time_range(
+            &conn,
+            "2026-07-26T19:00:00-04:00",
+            "2026-07-26T20:00:00-04:00",
+            Some(10),
+        )
+        .unwrap();
+
+        let episodes = res["episodes"].as_array().unwrap();
+        assert_eq!(
+            episodes.len(),
+            1,
+            "Offset -04:00 bounds should find the UTC episode at 23:51Z"
+        );
+    }
+
+    #[test]
+    fn test_fetch_context_with_offset_center() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "\
+            CREATE TABLE audio_segments (id INTEGER PRIMARY KEY, started_at TEXT, ended_at TEXT);\
+            CREATE TABLE utterances (id INTEGER PRIMARY KEY, audio_segment_id INTEGER, text TEXT, speaker_label TEXT);\
+            INSERT INTO audio_segments VALUES (1, '2026-07-26T23:51:39.450Z', '2026-07-26T23:52:19.950Z');\
+            INSERT INTO utterances VALUES (1, 1, 'test utterance', 'Me');\
+            ",
+        )
+        .unwrap();
+
+        // Center at 7:51 PM EDT = 23:51 UTC, should find the utterance
+        let res = fetch_safe_context(&conn, "2026-07-26T19:51:39-04:00", 300, Some(10)).unwrap();
+
+        let utterances = res["utterances"].as_array().unwrap();
+        assert_eq!(
+            utterances.len(),
+            1,
+            "Offset -04:00 center should find the UTC utterance"
+        );
     }
 }
