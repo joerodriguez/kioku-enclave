@@ -3583,13 +3583,18 @@ mod tests {
 
         let s = Arc::new(CpState {
             store: Arc::clone(&store),
-            control: Arc::new(crate::cp::control_store::ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()))),
+            control: Arc::new(crate::cp::control_store::ControlStore::new(
+                Arc::new(FakeKms),
+                Arc::new(FakeGcs::new()),
+            )),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
-            config: Arc::new(crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap()),
+            config: Arc::new(
+                crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
+            ),
             embedding: None,
         });
 

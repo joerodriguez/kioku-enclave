@@ -343,10 +343,25 @@ mod tests {
         let ctx = fetch_safe_context(&conn, "2026-07-26T23:51:39.450Z", 300, Some(10)).unwrap();
         let utterances = ctx["utterances"].as_array().unwrap();
         assert_eq!(utterances.len(), 4);
-        assert!(utterances[0]["text"].as_str().unwrap().contains("sensitive data is not available via the mcp"));
-        assert!(utterances[1]["text"].as_str().unwrap().contains("[REDACTED FOR OPENAI]"));
-        assert!(utterances[1]["text"].as_str().unwrap().contains("my credit card number is"));
-        assert!(!utterances[1]["text"].as_str().unwrap().contains("918743299419188"));
-        assert!(utterances[3]["text"].as_str().unwrap().contains("growth on my knee had to get removed"));
+        assert!(utterances[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("sensitive data is not available via the mcp"));
+        assert!(utterances[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED FOR OPENAI]"));
+        assert!(utterances[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("my credit card number is"));
+        assert!(!utterances[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("918743299419188"));
+        assert!(utterances[3]["text"]
+            .as_str()
+            .unwrap()
+            .contains("growth on my knee had to get removed"));
     }
 }
