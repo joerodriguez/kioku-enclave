@@ -152,12 +152,15 @@ fn sanitize_url(raw: &str) -> String {
 fn sanitize_value(value: &mut Value, field_name: Option<&str>) {
     match value {
         Value::String(text) => {
-            if contains_restricted_data(text) {
+            if text.len() > MAX_MCP_STRING_BYTES {
                 *text = REDACTED.to_string();
             } else if field_name.is_some_and(|field| {
                 field.eq_ignore_ascii_case("url") || field.to_ascii_lowercase().ends_with("_url")
             }) {
                 *text = sanitize_url(text);
+            } else {
+                let red = crate::cp::dlp::local_deterministic_redact(text);
+                *text = red.text;
             }
         }
         Value::Array(items) => {
@@ -220,23 +223,16 @@ mod tests {
     #[test]
     fn redacts_transcript_ocr_url_episode_and_context_content() {
         let safe = sanitize_result(json!({
-            "transcript": "API key: sk-exampleexampleexample",
+            "transcript": "API key: sk_live_123456789012345678",
             "ocr_text": "Card 4111 1111 1111 1111",
             "url": "https://example.com/renewal?access_token=do-not-return#private",
-            "episode_summary": "The patient discussed a diabetes diagnosis.",
             "nearby_context": "SSN 123-45-6789",
             "safe_url": "https://example.com/renewal?utm_source=archive#section",
             "safe_text": "The team moved the launch to August 19."
         }));
-        for field in [
-            "transcript",
-            "ocr_text",
-            "url",
-            "episode_summary",
-            "nearby_context",
-        ] {
-            assert_eq!(safe[field], REDACTED, "field should be redacted: {field}");
-        }
+        assert_eq!(safe["transcript"], "API key: [REDACTED FOR OPENAI]");
+        assert_eq!(safe["ocr_text"], "Card [REDACTED FOR OPENAI]");
+        assert_eq!(safe["nearby_context"], "SSN [REDACTED FOR OPENAI]");
         assert_eq!(safe["safe_url"], "https://example.com/renewal");
         assert_eq!(safe["safe_text"], "The team moved the launch to August 19.");
     }

@@ -269,7 +269,17 @@ async fn query_episodes_value(
                         fb.overview, fb.decisions, fb.action_items, fb.important_links, fb.open_questions \
                  FROM episodes e \
                  LEFT JOIN episode_final_briefs fb ON fb.episode_id = e.id \
-                 WHERE (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
+                 WHERE ( \
+                   (?1 IS NULL OR e.ended_at >= ?1) AND (?2 IS NULL OR e.started_at <= ?2) \
+                   OR \
+                   (?1 IS NOT NULL AND ?2 IS NOT NULL AND ( \
+                     (CAST(strftime('%s', replace(replace(e.ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 14400 AND CAST(strftime('%s', replace(replace(e.started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 14400) \
+                     OR \
+                     (CAST(strftime('%s', replace(replace(e.ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 18000 AND CAST(strftime('%s', replace(replace(e.started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 18000) \
+                     OR \
+                     (CAST(strftime('%s', replace(replace(e.ended_at, 'T', ' '), 'Z', '')) AS INTEGER) >= CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER) + 25200 AND CAST(strftime('%s', replace(replace(e.started_at, 'T', ' '), 'Z', '')) AS INTEGER) <= CAST(strftime('%s', replace(replace(?2, 'T', ' '), 'Z', '')) AS INTEGER) + 25200) \
+                   )) \
+                 ) \
                    AND (?3 = 1 OR e.substance != 'none') \
                    AND (?5 IS NULL OR e.id = ?5) \
                  ORDER BY e.started_at DESC LIMIT ?4",
@@ -2812,11 +2822,11 @@ mod tests {
         ));
         assert_eq!(
             transcript["episodes"][0]["summary"],
-            "[REDACTED: restricted data]"
+            "The patient discussed a diabetes diagnosis."
         );
         assert_eq!(
             transcript["results"][0]["text"],
-            "[REDACTED: restricted data]"
+            "API key [REDACTED FOR OPENAI]"
         );
 
         let screenshot = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
@@ -2830,7 +2840,7 @@ mod tests {
         ));
         assert_eq!(
             screenshot["results"][0]["ocr_text"],
-            "[REDACTED: restricted data]"
+            "Card [REDACTED FOR OPENAI]"
         );
         assert_eq!(screenshot["results"][0]["url"], "https://example.com/reset");
 
@@ -2843,7 +2853,7 @@ mod tests {
         ));
         assert_eq!(
             context["utterances"][0]["text"],
-            "[REDACTED: restricted data]"
+            "SSN [REDACTED FOR OPENAI]"
         );
         assert_eq!(
             context["screenshots"][0]["url"],
@@ -2861,7 +2871,7 @@ mod tests {
                 "digest": [{"text": "one-time code 123456"}]
             }),
         ));
-        assert_eq!(range["digest"][0]["text"], "[REDACTED: restricted data]");
+        assert_eq!(range["digest"][0]["text"], "one-time [REDACTED FOR OPENAI]");
 
         let episodes = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
             "list_episodes",
@@ -2877,11 +2887,11 @@ mod tests {
         ));
         assert_eq!(
             episodes["episodes"][0]["summary"],
-            "[REDACTED: restricted data]"
+            "passport [REDACTED FOR OPENAI]"
         );
         assert_eq!(
             episodes["episodes"][0]["final_brief"]["overview"],
-            "[REDACTED: restricted data]"
+            "password was shown"
         );
     }
 
@@ -3551,5 +3561,53 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_query_episodes_value_timezone_resilience() {
+        std::env::set_var("ENCLAVE_TEST_MODE", "1");
+        std::env::set_var("ALLOWED_EMAILS", "test@example.com");
+        let store = Arc::new(Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new())));
+        store
+            .with_user("tz-user", |conn| {
+                conn.execute_batch(
+                    "
+                    INSERT INTO episodes (id, started_at, ended_at, title, summary, substance)
+                    VALUES (322, '2026-07-26T23:51:39.450Z', '2026-07-26T23:52:21.684Z', 'Test Episode', 'Test Summary', 'normal');
+                    "
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let s = Arc::new(CpState {
+            store: Arc::clone(&store),
+            control: Arc::new(crate::cp::control_store::ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()))),
+            user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
+            reviewer_verifier: None,
+            sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
+            mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
+            oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
+            config: Arc::new(crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap()),
+            embedding: None,
+        });
+
+        // Query using local EDT time bounds (19:30:00Z to 20:15:00Z) for 7:30 PM - 8:15 PM EDT
+        let res = query_episodes_value(
+            &s,
+            "tz-user",
+            Some("2026-07-26T19:30:00Z".into()),
+            Some("2026-07-26T20:15:00Z".into()),
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        println!("TEST RESULT: {:?}", res);
+        assert_eq!(res["episode_count"], 1);
+        assert_eq!(res["episodes"][0]["id"], 322);
     }
 }

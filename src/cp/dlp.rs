@@ -71,12 +71,14 @@ pub fn local_deterministic_redact(input: &str) -> RedactionResult {
     let jwt_regex =
         regex::Regex::new(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
             .unwrap();
-    let api_key_regex =
-        regex::Regex::new(r"\b(?:sk|pk|api|key)_[live|test|prod]_[A-Za-z0-9]{16,}\b").unwrap();
+    let api_key_regex = regex::Regex::new(
+        r"(?i)\b(?:sk|pk|api|key)[_-](?:live|test|prod)?[_-]?[A-Za-z0-9_-]{10,}\b",
+    )
+    .unwrap();
     let bearer_regex = regex::Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*\b").unwrap();
     let ssn_regex = regex::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap();
     let spaced_digits_regex = regex::Regex::new(
-        r"(?i)\b(?:numbers?|code|claim|billing|id|ssn|card)?\s*(?:\d[\s,.-]*){4,16}\b",
+        r"(?i)\b(?:numbers?|code|claim|billing|id|ssn|card|passport|pin)?\s*(?:\d[\s,.-]*){4,16}\b",
     )
     .unwrap();
 
@@ -95,8 +97,12 @@ pub fn local_deterministic_redact(input: &str) -> RedactionResult {
     let lower = text.to_lowercase();
     if lower.contains("billing")
         || lower.contains("code")
-        || lower.contains("numbers")
+        || lower.contains("number")
         || lower.contains("claim")
+        || lower.contains("passport")
+        || lower.contains("card")
+        || lower.contains("ssn")
+        || lower.contains("pin")
     {
         let mut digit_spans = Vec::new();
         for mat in spaced_digits_regex.find_iter(&text) {

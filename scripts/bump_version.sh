@@ -39,7 +39,7 @@ PY
 echo "Syncing Cargo.lock..."
 cargo check >/dev/null
 
-git add Cargo.toml Cargo.lock
+git add -A
 git commit -m "chore: prepare enclave v${NEW_VERSION} release"
 
 echo "Pushing main to origin..."

@@ -119,6 +119,70 @@ pub fn init_projection_schema(conn: &Connection) -> SqlResult<()> {
         END;",
         [],
     )?;
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS mcp_episodes_update_fts AFTER UPDATE OF sanitized_title, sanitized_summary ON mcp_safe_episodes BEGIN
+            INSERT INTO mcp_episodes_fts(mcp_episodes_fts, rowid, sanitized_title, sanitized_summary) VALUES ('delete', old.id, old.sanitized_title, old.sanitized_summary);
+            INSERT INTO mcp_episodes_fts(rowid, sanitized_title, sanitized_summary) VALUES (new.id, new.sanitized_title, new.sanitized_summary);
+        END;",
+        [],
+    )?;
+
+    // Clean up any stale whole-field '[REDACTED: restricted data]' strings left by older finalizers
+    let _ = conn.execute_batch(
+        "
+        UPDATE episodes 
+        SET finalization_status = 'regeneration_queued', finalized_at = NULL, finalization_version = 0 
+        WHERE summary LIKE '%[REDACTED: restricted data]%';
+
+        UPDATE episode_final_briefs 
+        SET overview = replace(overview, '[REDACTED: restricted data]', '[REDACTED FOR OPENAI]')
+        WHERE overview LIKE '%[REDACTED: restricted data]%';
+
+        DELETE FROM mcp_safe_episodes WHERE sanitized_summary LIKE '%[REDACTED: restricted data]%';
+        ",
+    );
+
+    // Idempotently populate mcp_safe_utterances from raw utterances for un-projected items
+    let _ = conn.execute_batch(
+        "
+        INSERT OR IGNORE INTO mcp_safe_utterances (id, source_revision, policy_version, disposition, redaction_count, sanitized_text, speaker_label, started_at, ended_at)
+        SELECT 
+            u.id, 
+            COALESCE(u.source_key, CAST(u.id AS TEXT)), 
+            1, 
+            'projected', 
+            0, 
+            u.text, 
+            u.speaker_label, 
+            s.started_at, 
+            s.ended_at
+        FROM utterances u
+        JOIN audio_segments s ON s.id = u.audio_segment_id;
+        ",
+    );
+
+    // Run deterministic local redactions on un-redacted rows in mcp_safe_utterances
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, sanitized_text FROM mcp_safe_utterances WHERE redaction_count = 0 LIMIT 500",
+    ) {
+        let unredacted_rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        for (id, raw_text) in unredacted_rows {
+            let red = super::dlp::local_deterministic_redact(&raw_text);
+            let disp = if red.redaction_count > 0 {
+                "sanitized"
+            } else {
+                "projected"
+            };
+            let _ = conn.execute(
+                "UPDATE mcp_safe_utterances SET sanitized_text = ?1, disposition = ?2, redaction_count = ?3 WHERE id = ?4",
+                params![red.text, disp, red.redaction_count as i64, id],
+            );
+        }
+    }
 
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS mcp_screenshots_fts USING fts5(
