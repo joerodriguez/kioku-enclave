@@ -376,7 +376,11 @@ mod tests {
         assert!(utterances[3]["text"]
             .as_str()
             .unwrap()
-            .contains("growth on my knee had to get removed"));
+            .contains("[REDACTED]"));
+        assert!(!utterances[3]["text"]
+            .as_str()
+            .unwrap()
+            .contains("growth on my knee"));
     }
 
     #[test]
