@@ -28,8 +28,17 @@ pub struct SafeContextResponse {
 
 /// Minimum-sized safe transcript search querying `mcp_safe_utterances` and `mcp_utterances_fts`.
 /// Minimum-sized safe transcript search querying `mcp_safe_utterances` and `mcp_utterances_fts`.
-pub fn search_safe_transcripts(conn: &Connection, query: &str, limit: usize) -> SqlResult<Value> {
+pub fn search_safe_transcripts(
+    conn: &Connection,
+    query: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    limit: usize,
+) -> SqlResult<Value> {
     let effective_limit = limit.clamp(1, MAX_MINIMIZED_PAGE_SIZE);
+
+    let from_utc = from.map(super::isotime::normalize_to_utc);
+    let to_utc = to.map(super::isotime::normalize_to_utc);
 
     let mut results = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
@@ -38,19 +47,24 @@ pub fn search_safe_transcripts(conn: &Connection, query: &str, limit: usize) -> 
         FROM mcp_safe_utterances u
         JOIN mcp_utterances_fts fts ON fts.rowid = u.id
         WHERE mcp_utterances_fts MATCH ?1 AND u.disposition != 'blocked'
+          AND (?2 IS NULL OR u.started_at >= ?2)
+          AND (?3 IS NULL OR u.started_at <= ?3)
         ORDER BY u.started_at DESC
-        LIMIT ?2
+        LIMIT ?4
         ",
     ) {
-        if let Ok(rows) = stmt.query_map(params![query, effective_limit as i64], |row| {
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "text": row.get::<_, String>(1)?,
-                "speaker": row.get::<_, Option<String>>(2)?,
-                "started_at": row.get::<_, String>(3)?,
-                "ended_at": row.get::<_, String>(4)?,
-            }))
-        }) {
+        if let Ok(rows) = stmt.query_map(
+            params![query, from_utc, to_utc, effective_limit as i64],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "text": row.get::<_, String>(1)?,
+                    "speaker": row.get::<_, Option<String>>(2)?,
+                    "started_at": row.get::<_, String>(3)?,
+                    "ended_at": row.get::<_, String>(4)?,
+                }))
+            },
+        ) {
             for r in rows.filter_map(|x| x.ok()) {
                 results.push(r);
             }
@@ -65,22 +79,27 @@ pub fn search_safe_transcripts(conn: &Connection, query: &str, limit: usize) -> 
             FROM utterances u
             JOIN audio_segments s ON s.id = u.audio_segment_id
             WHERE u.text LIKE ?1
+              AND (?2 IS NULL OR s.started_at >= ?2)
+              AND (?3 IS NULL OR s.started_at <= ?3)
             ORDER BY s.started_at DESC
-            LIMIT ?2
+            LIMIT ?4
             ",
         ) {
             let pattern = format!("%{query}%");
-            if let Ok(rows) = stmt.query_map(params![pattern, effective_limit as i64], |row| {
-                let raw_text: String = row.get(1)?;
-                let red = super::dlp::local_deterministic_redact(&raw_text);
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "text": red.text,
-                    "speaker": row.get::<_, Option<String>>(2)?,
-                    "started_at": row.get::<_, String>(3)?,
-                    "ended_at": row.get::<_, String>(4)?,
-                }))
-            }) {
+            if let Ok(rows) = stmt.query_map(
+                params![pattern, from_utc, to_utc, effective_limit as i64],
+                |row| {
+                    let raw_text: String = row.get(1)?;
+                    let red = super::dlp::local_deterministic_redact(&raw_text);
+                    Ok(json!({
+                        "id": row.get::<_, i64>(0)?,
+                        "text": red.text,
+                        "speaker": row.get::<_, Option<String>>(2)?,
+                        "started_at": row.get::<_, String>(3)?,
+                        "ended_at": row.get::<_, String>(4)?,
+                    }))
+                },
+            ) {
                 for r in rows.filter_map(|x| x.ok()) {
                     results.push(r);
                 }
@@ -113,26 +132,31 @@ pub fn fetch_safe_context(
 
     let mut utterances = Vec::new();
 
-    // 1. Try safe projection table first with epoch-based distance sorting
+    // 1. Try safe projection table first with epoch distance sorting and window boundary filtering
     if let Ok(mut stmt) = conn.prepare(
         "
         SELECT id, sanitized_text, speaker_label, started_at, ended_at
         FROM mcp_safe_utterances
         WHERE disposition != 'blocked'
+          AND abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER)
+                - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)) <= ?2
         ORDER BY abs(CAST(strftime('%s', replace(replace(started_at, 'T', ' '), 'Z', '')) AS INTEGER)
                    - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)) ASC
-        LIMIT ?2
+        LIMIT ?3
         ",
     ) {
-        if let Ok(rows) = stmt.query_map(params![center_time, effective_limit as i64], |row| {
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "text": row.get::<_, String>(1)?,
-                "speaker": row.get::<_, Option<String>>(2)?,
-                "started_at": row.get::<_, String>(3)?,
-                "ended_at": row.get::<_, String>(4)?,
-            }))
-        }) {
+        if let Ok(rows) = stmt.query_map(
+            params![center_time, window_secs as i64, effective_limit as i64],
+            |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "text": row.get::<_, String>(1)?,
+                    "speaker": row.get::<_, Option<String>>(2)?,
+                    "started_at": row.get::<_, String>(3)?,
+                    "ended_at": row.get::<_, String>(4)?,
+                }))
+            },
+        ) {
             for r in rows.filter_map(|x| x.ok()) {
                 utterances.push(r);
             }
@@ -146,22 +170,27 @@ pub fn fetch_safe_context(
             SELECT u.id, u.text, u.speaker_label, s.started_at, s.ended_at
             FROM utterances u
             JOIN audio_segments s ON s.id = u.audio_segment_id
+            WHERE abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER)
+                    - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)) <= ?2
             ORDER BY abs(CAST(strftime('%s', replace(replace(s.started_at, 'T', ' '), 'Z', '')) AS INTEGER)
                        - CAST(strftime('%s', replace(replace(?1, 'T', ' '), 'Z', '')) AS INTEGER)) ASC
-            LIMIT ?2
+            LIMIT ?3
             ",
         ) {
-            if let Ok(rows) = stmt.query_map(params![center_time, effective_limit as i64], |row| {
-                let raw_text: String = row.get(1)?;
-                let red = super::dlp::local_deterministic_redact(&raw_text);
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "text": red.text,
-                    "speaker": row.get::<_, Option<String>>(2)?,
-                    "started_at": row.get::<_, String>(3)?,
-                    "ended_at": row.get::<_, String>(4)?,
-                }))
-            }) {
+            if let Ok(rows) = stmt.query_map(
+                params![center_time, window_secs as i64, effective_limit as i64],
+                |row| {
+                    let raw_text: String = row.get(1)?;
+                    let red = super::dlp::local_deterministic_redact(&raw_text);
+                    Ok(json!({
+                        "id": row.get::<_, i64>(0)?,
+                        "text": red.text,
+                        "speaker": row.get::<_, Option<String>>(2)?,
+                        "started_at": row.get::<_, String>(3)?,
+                        "ended_at": row.get::<_, String>(4)?,
+                    }))
+                },
+            ) {
                 for r in rows.filter_map(|x| x.ok()) {
                     utterances.push(r);
                 }
@@ -293,7 +322,7 @@ mod tests {
         )
         .unwrap();
 
-        let search_res = search_safe_transcripts(&conn, "roadmap", 5).unwrap();
+        let search_res = search_safe_transcripts(&conn, "roadmap", None, None, 5).unwrap();
         assert_eq!(search_res["count"], 1);
 
         let ctx_res = fetch_safe_context(&conn, "2026-07-26T10:00:00Z", 300, Some(5)).unwrap();
@@ -408,5 +437,70 @@ mod tests {
             1,
             "Offset -04:00 center should find the UTC utterance"
         );
+    }
+
+    #[test]
+    fn test_context_respects_window_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE audio_segments (id INTEGER PRIMARY KEY, started_at TEXT, ended_at TEXT);
+            CREATE TABLE utterances (id INTEGER PRIMARY KEY, audio_segment_id INTEGER, text TEXT, speaker_label TEXT);
+            INSERT INTO audio_segments VALUES 
+            (1, '2026-07-26T23:51:39.450Z', '2026-07-26T23:52:19.950Z'),
+            (2, '2026-07-24T01:30:05.555Z', '2026-07-24T01:31:00.000Z');
+            INSERT INTO utterances VALUES 
+            (1, 1, 'matching moment', 'Me'),
+            (2, 2, 'old moment from 2 days ago', 'Me');
+            ",
+        )
+        .unwrap();
+
+        // Query context centered at 23:52:00Z on July 26 with a 60-second window
+        // Limit is 10, but item from July 24 MUST NOT be returned!
+        let res = fetch_safe_context(&conn, "2026-07-26T23:52:00.000Z", 60, Some(10)).unwrap();
+        let utterances = res["utterances"].as_array().unwrap();
+        assert_eq!(
+            utterances.len(),
+            1,
+            "Context with 60s window must NOT include utterances from 2 days ago"
+        );
+        assert_eq!(utterances[0]["text"], "matching moment");
+    }
+
+    #[test]
+    fn test_search_transcripts_respects_from_to_bounds() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE audio_segments (id INTEGER PRIMARY KEY, started_at TEXT, ended_at TEXT);
+            CREATE TABLE utterances (id INTEGER PRIMARY KEY, audio_segment_id INTEGER, text TEXT, speaker_label TEXT);
+            INSERT INTO audio_segments VALUES 
+            (1, '2026-07-26T23:51:39.450Z', '2026-07-26T23:52:19.950Z'),
+            (2, '2026-07-06T13:40:48.057Z', '2026-07-06T13:41:00.000Z');
+            INSERT INTO utterances VALUES 
+            (1, 1, 'testing MCP server redaction', 'Me'),
+            (2, 2, 'old MCP project discussion', 'Me');
+            ",
+        )
+        .unwrap();
+
+        // Search for 'MCP' within July 26 (7 PM - 8 PM EDT = 23:00 - 00:00 UTC)
+        let res = search_safe_transcripts(
+            &conn,
+            "MCP",
+            Some("2026-07-26T19:00:00-04:00"),
+            Some("2026-07-26T20:00:00-04:00"),
+            10,
+        )
+        .unwrap();
+
+        let results = res["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "Search with from/to bounds must NOT include matches from 3 weeks ago"
+        );
+        assert_eq!(results[0]["text"], "testing MCP server redaction");
     }
 }
