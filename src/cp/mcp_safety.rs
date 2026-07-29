@@ -230,9 +230,9 @@ mod tests {
             "safe_url": "https://example.com/renewal?utm_source=archive#section",
             "safe_text": "The team moved the launch to August 19."
         }));
-        assert_eq!(safe["transcript"], "API key: [REDACTED FOR OPENAI]");
-        assert_eq!(safe["ocr_text"], "Card [REDACTED FOR OPENAI]");
-        assert_eq!(safe["nearby_context"], "SSN [REDACTED FOR OPENAI]");
+        assert_eq!(safe["transcript"], "API key: [REDACTED]");
+        assert_eq!(safe["ocr_text"], "Card [REDACTED]");
+        assert_eq!(safe["nearby_context"], "SSN [REDACTED]");
         assert_eq!(safe["safe_url"], "https://example.com/renewal");
         assert_eq!(safe["safe_text"], "The team moved the launch to August 19.");
     }

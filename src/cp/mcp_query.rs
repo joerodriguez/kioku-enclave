@@ -364,7 +364,7 @@ mod tests {
         assert!(utterances[1]["text"]
             .as_str()
             .unwrap()
-            .contains("[REDACTED FOR OPENAI]"));
+            .contains("[REDACTED]"));
         assert!(utterances[1]["text"]
             .as_str()
             .unwrap()

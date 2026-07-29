@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::error::Result;
 
-pub const REDACTION_MARKER: &str = "[REDACTED FOR OPENAI]";
+pub const REDACTION_MARKER: &str = "[REDACTED]";
 
 /// Verification disposition for a projected text field or record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,7 +491,7 @@ mod tests {
                         .pointer("/item/value")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let replaced = val.replace("John Doe", "[REDACTED FOR OPENAI]");
+                    let replaced = val.replace("John Doe", "[REDACTED]");
                     Json(json!({
                         "item": {
                             "value": replaced

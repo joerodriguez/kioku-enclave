@@ -2824,10 +2824,7 @@ mod tests {
             transcript["episodes"][0]["summary"],
             "The patient discussed a diabetes diagnosis."
         );
-        assert_eq!(
-            transcript["results"][0]["text"],
-            "API key [REDACTED FOR OPENAI]"
-        );
+        assert_eq!(transcript["results"][0]["text"], "API key [REDACTED]");
 
         let screenshot = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
             "search_screenshots",
@@ -2838,10 +2835,7 @@ mod tests {
                 }]
             }),
         ));
-        assert_eq!(
-            screenshot["results"][0]["ocr_text"],
-            "Card [REDACTED FOR OPENAI]"
-        );
+        assert_eq!(screenshot["results"][0]["ocr_text"], "Card [REDACTED]");
         assert_eq!(screenshot["results"][0]["url"], "https://example.com/reset");
 
         let context = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
@@ -2851,10 +2845,7 @@ mod tests {
                 "screenshots": [{"ocr_text": "safe screen", "url": "https://example.com/renewal?utm_source=archive"}]
             }),
         ));
-        assert_eq!(
-            context["utterances"][0]["text"],
-            "SSN [REDACTED FOR OPENAI]"
-        );
+        assert_eq!(context["utterances"][0]["text"], "SSN [REDACTED]");
         assert_eq!(
             context["screenshots"][0]["url"],
             "https://example.com/renewal"
@@ -2871,7 +2862,7 @@ mod tests {
                 "digest": [{"text": "one-time code 123456"}]
             }),
         ));
-        assert_eq!(range["digest"][0]["text"], "one-time [REDACTED FOR OPENAI]");
+        assert_eq!(range["digest"][0]["text"], "one-time [REDACTED]");
 
         let episodes = crate::cp::mcp_safety::sanitize_result(project_mcp_result(
             "list_episodes",
@@ -2885,10 +2876,7 @@ mod tests {
                 }]
             }),
         ));
-        assert_eq!(
-            episodes["episodes"][0]["summary"],
-            "passport [REDACTED FOR OPENAI]"
-        );
+        assert_eq!(episodes["episodes"][0]["summary"], "passport [REDACTED]");
         assert_eq!(
             episodes["episodes"][0]["final_brief"]["overview"],
             "password was shown"
