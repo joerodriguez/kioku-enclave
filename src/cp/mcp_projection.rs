@@ -135,8 +135,8 @@ pub fn init_projection_schema(conn: &Connection) -> SqlResult<()> {
         WHERE summary LIKE '%[REDACTED: restricted data]%';
 
         UPDATE episode_final_briefs 
-        SET overview = replace(overview, '[REDACTED: restricted data]', '[REDACTED FOR OPENAI]')
-        WHERE overview LIKE '%[REDACTED: restricted data]%';
+        SET overview = replace(replace(overview, '[REDACTED: restricted data]', '[REDACTED]'), '[REDACTED FOR OPENAI]', '[REDACTED]')
+        WHERE overview LIKE '%[REDACTED: restricted data]%' OR overview LIKE '%[REDACTED FOR OPENAI]%';
 
         DELETE FROM mcp_safe_episodes WHERE sanitized_summary LIKE '%[REDACTED: restricted data]%';
         ",
