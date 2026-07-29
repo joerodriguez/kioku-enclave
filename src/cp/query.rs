@@ -753,11 +753,13 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
     let result = match name {
         "search_transcripts" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let from = args.get("from").and_then(|v| v.as_str());
+            let to = args.get("to").and_then(|v| v.as_str());
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             s.store
                 .with_user(user_id, |conn| {
                     Ok(super::mcp_query::search_safe_transcripts(
-                        conn, query, limit,
+                        conn, query, from, to, limit,
                     )?)
                 })
                 .await
