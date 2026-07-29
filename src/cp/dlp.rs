@@ -109,12 +109,20 @@ pub fn local_deterministic_redact(input: &str) -> RedactionResult {
     )
     .unwrap();
 
+    let standalone_spaced_digits_regex =
+        regex::Regex::new(r"\b\d(?:\s*[\s,.-]\s*\d){2,15}\b").unwrap();
+    let health_narrative_regex = regex::Regex::new(
+        r"(?i)\b(?:growth|tumor|lesion|biopsy|surgery|knee|elbow|ankle|shoulder|spine|wound|injury|injured|diagnosis|prescription|medication|treatment)\b(?:\s+(?:on|in|of|to|for|with|at|had|was|were|get|removed|my|the|a|an)\s+[a-z]+)*",
+    )
+    .unwrap();
+
     for re in &[
         &jwt_regex,
         &api_key_regex,
         &bearer_regex,
         &ssn_regex,
         &cvv_regex,
+        &standalone_spaced_digits_regex,
     ] {
         let mut spans = Vec::new();
         for mat in re.find_iter(&text) {
@@ -147,6 +155,41 @@ pub fn local_deterministic_redact(input: &str) -> RedactionResult {
             digit_spans.push((mat.start(), mat.end()));
         }
         for (start, end) in digit_spans.into_iter().rev() {
+            replace_span_smart(&mut text, start, end);
+            redaction_count += 1;
+        }
+    }
+
+    // Health narrative redaction when medical condition terms are present with identifying/claim context
+    let has_health_term = lower.contains("growth")
+        || lower.contains("knee")
+        || lower.contains("surgery")
+        || lower.contains("tumor")
+        || lower.contains("biopsy")
+        || lower.contains("injury")
+        || lower.contains("injured")
+        || lower.contains("diagnosis")
+        || lower.contains("prescription")
+        || lower.contains("medication")
+        || lower.contains("treatment")
+        || lower.contains("hospital")
+        || lower.contains("clinic")
+        || lower.contains("doctor");
+
+    let has_health_context = lower.contains("insurance")
+        || lower.contains("claim")
+        || lower.contains("billing")
+        || lower.contains("patient")
+        || lower.contains("removed")
+        || lower.contains("pay")
+        || lower.contains("my ");
+
+    if has_health_term && has_health_context {
+        let mut health_spans = Vec::new();
+        for mat in health_narrative_regex.find_iter(&text) {
+            health_spans.push((mat.start(), mat.end()));
+        }
+        for (start, end) in health_spans.into_iter().rev() {
             replace_span_smart(&mut text, start, end);
             redaction_count += 1;
         }
@@ -573,5 +616,35 @@ mod tests {
             "Redaction marker must have space separation from succeeding words: got '{}'",
             res.text
         );
+    }
+
+    #[test]
+    fn test_redact_standalone_spaced_digits() {
+        let input1 = "4 4 1 2";
+        let res1 = local_deterministic_redact(input1);
+        assert_eq!(
+            res1.text, REDACTION_MARKER,
+            "Standalone spaced 4-digit fragment '4 4 1 2' must be redacted"
+        );
+
+        let input2 = "code was 5 7 8 9.";
+        let res2 = local_deterministic_redact(input2);
+        assert!(
+            !res2.text.contains("5 7 8 9"),
+            "Spaced 4-digit fragment '5 7 8 9' must be redacted: got '{}'",
+            res2.text
+        );
+    }
+
+    #[test]
+    fn test_redact_health_narrative() {
+        let input = "growth on my knee had to get removed and insurance is saying they're not going to pay for it my claim";
+        let res = local_deterministic_redact(input);
+        assert!(
+            !res.text.contains("growth on my knee"),
+            "Descriptive health condition 'growth on my knee' must be redacted: got '{}'",
+            res.text
+        );
+        assert!(res.text.contains(REDACTION_MARKER));
     }
 }

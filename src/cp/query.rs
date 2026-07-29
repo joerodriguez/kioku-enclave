@@ -2822,7 +2822,7 @@ mod tests {
         ));
         assert_eq!(
             transcript["episodes"][0]["summary"],
-            "The patient discussed a diabetes diagnosis."
+            "The patient discussed a diabetes [REDACTED]."
         );
         assert_eq!(transcript["results"][0]["text"], "API key [REDACTED]");
 
