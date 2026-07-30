@@ -161,27 +161,50 @@ pub fn init_projection_schema(conn: &Connection) -> SqlResult<()> {
         ",
     );
 
-    // Run deterministic local redactions on un-redacted rows in mcp_safe_utterances
+    // Run deterministic local redactions on un-redacted rows in mcp_safe_utterances using windowed segment context
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, sanitized_text FROM mcp_safe_utterances WHERE redaction_count = 0 LIMIT 500",
+        "SELECT m.id, m.sanitized_text, u.audio_segment_id 
+         FROM mcp_safe_utterances m 
+         JOIN utterances u ON u.id = m.id 
+         WHERE m.redaction_count = 0 
+         ORDER BY u.audio_segment_id ASC, m.id ASC 
+         LIMIT 500",
     ) {
-        let unredacted_rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        let unredacted_rows: Vec<(i64, String, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
 
-        for (id, raw_text) in unredacted_rows {
-            let red = super::dlp::local_deterministic_redact(&raw_text);
-            let disp = if red.redaction_count > 0 {
-                "sanitized"
-            } else {
-                "projected"
-            };
-            let _ = conn.execute(
-                "UPDATE mcp_safe_utterances SET sanitized_text = ?1, disposition = ?2, redaction_count = ?3 WHERE id = ?4",
-                params![red.text, disp, red.redaction_count as i64, id],
-            );
+        let mut current_segment_id: Option<i64> = None;
+        let mut current_batch: Vec<(i64, String)> = Vec::new();
+
+        let process_batch = |conn: &Connection, batch: &[(i64, String)]| {
+            if batch.is_empty() {
+                return;
+            }
+            let redacted_results = super::dlp::redact_utterance_window(batch);
+            for (id, red) in redacted_results {
+                let disp = if red.redaction_count > 0 {
+                    "sanitized"
+                } else {
+                    "projected"
+                };
+                let _ = conn.execute(
+                    "UPDATE mcp_safe_utterances SET sanitized_text = ?1, disposition = ?2, redaction_count = ?3 WHERE id = ?4",
+                    params![red.text, disp, red.redaction_count as i64, id],
+                );
+            }
+        };
+
+        for (id, text, seg_id) in unredacted_rows {
+            if current_segment_id.is_some_and(|s| s != seg_id) {
+                process_batch(conn, &current_batch);
+                current_batch.clear();
+            }
+            current_segment_id = Some(seg_id);
+            current_batch.push((id, text));
         }
+        process_batch(conn, &current_batch);
     }
 
     conn.execute(

@@ -71,7 +71,7 @@ pub fn search_safe_transcripts(
         }
     }
 
-    // Fallback: If safe projection search yields empty results, query raw utterances with deterministic local redaction
+    // Fallback: If safe projection search yields empty results, query raw utterances with windowed deterministic local redaction
     if results.is_empty() {
         if let Ok(mut stmt) = conn.prepare(
             "
@@ -86,23 +86,44 @@ pub fn search_safe_transcripts(
             ",
         ) {
             let pattern = format!("%{query}%");
+            let mut raw_batch: Vec<(i64, String, Option<String>, String, String)> = Vec::new();
             if let Ok(rows) = stmt.query_map(
                 params![pattern, from_utc, to_utc, effective_limit as i64],
                 |row| {
-                    let raw_text: String = row.get(1)?;
-                    let red = super::dlp::local_deterministic_redact(&raw_text);
-                    Ok(json!({
-                        "id": row.get::<_, i64>(0)?,
-                        "text": red.text,
-                        "speaker": row.get::<_, Option<String>>(2)?,
-                        "started_at": row.get::<_, String>(3)?,
-                        "ended_at": row.get::<_, String>(4)?,
-                    }))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
                 },
             ) {
                 for r in rows.filter_map(|x| x.ok()) {
-                    results.push(r);
+                    raw_batch.push(r);
                 }
+            }
+
+            let input_utterances: Vec<(i64, String)> = raw_batch
+                .iter()
+                .map(|(id, text, _, _, _)| (*id, text.clone()))
+                .collect();
+
+            let redacted_results = super::dlp::redact_utterance_window(&input_utterances);
+            let redacted_map: std::collections::HashMap<i64, String> = redacted_results
+                .into_iter()
+                .map(|(id, red)| (id, red.text))
+                .collect();
+
+            for (id, _orig_text, speaker, started_at, ended_at) in raw_batch {
+                let sanitized_text = redacted_map.get(&id).cloned().unwrap_or_default();
+                results.push(json!({
+                    "id": id,
+                    "text": sanitized_text,
+                    "speaker": speaker,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                }));
             }
         }
     }
@@ -163,7 +184,7 @@ pub fn fetch_safe_context(
         }
     }
 
-    // 2. Fallback to raw utterances table with deterministic local redaction if safe table is empty or unpopulated
+    // 2. Fallback to raw utterances table with windowed deterministic local redaction if safe table is empty or unpopulated
     if utterances.is_empty() {
         if let Ok(mut stmt) = conn.prepare(
             "
@@ -177,23 +198,44 @@ pub fn fetch_safe_context(
             LIMIT ?3
             ",
         ) {
+            let mut raw_batch: Vec<(i64, String, Option<String>, String, String)> = Vec::new();
             if let Ok(rows) = stmt.query_map(
                 params![center_time, window_secs as i64, effective_limit as i64],
                 |row| {
-                    let raw_text: String = row.get(1)?;
-                    let red = super::dlp::local_deterministic_redact(&raw_text);
-                    Ok(json!({
-                        "id": row.get::<_, i64>(0)?,
-                        "text": red.text,
-                        "speaker": row.get::<_, Option<String>>(2)?,
-                        "started_at": row.get::<_, String>(3)?,
-                        "ended_at": row.get::<_, String>(4)?,
-                    }))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
                 },
             ) {
                 for r in rows.filter_map(|x| x.ok()) {
-                    utterances.push(r);
+                    raw_batch.push(r);
                 }
+            }
+
+            let input_utterances: Vec<(i64, String)> = raw_batch
+                .iter()
+                .map(|(id, text, _, _, _)| (*id, text.clone()))
+                .collect();
+
+            let redacted_results = super::dlp::redact_utterance_window(&input_utterances);
+            let redacted_map: std::collections::HashMap<i64, String> = redacted_results
+                .into_iter()
+                .map(|(id, red)| (id, red.text))
+                .collect();
+
+            for (id, _orig_text, speaker, started_at, ended_at) in raw_batch {
+                let sanitized_text = redacted_map.get(&id).cloned().unwrap_or_default();
+                utterances.push(json!({
+                    "id": id,
+                    "text": sanitized_text,
+                    "speaker": speaker,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                }));
             }
         }
     }

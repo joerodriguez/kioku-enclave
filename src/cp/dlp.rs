@@ -219,6 +219,55 @@ pub fn local_deterministic_redact(input: &str) -> RedactionResult {
     }
 }
 
+/// Redacts a window/sequence of utterances belonging to an audio segment or time window.
+///
+/// Concatenates the utterances using newline separators, runs deterministic local redaction
+/// over the full window text (allowing cross-utterance context evaluation), and re-slices
+/// the sanitized text back into individual utterance outputs.
+pub fn redact_utterance_window(utterances: &[(i64, String)]) -> Vec<(i64, RedactionResult)> {
+    if utterances.is_empty() {
+        return Vec::new();
+    }
+
+    let joined_text = utterances
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let window_red = local_deterministic_redact(&joined_text);
+    let sanitized_lines: Vec<&str> = window_red.text.split('\n').collect();
+
+    utterances
+        .iter()
+        .enumerate()
+        .map(|(idx, (id, orig_text))| {
+            let sanitized_text = if idx < sanitized_lines.len() {
+                sanitized_lines[idx].trim_end_matches('\r').to_string()
+            } else {
+                orig_text.clone()
+            };
+
+            let is_sanitized = sanitized_text != *orig_text;
+            let count = if is_sanitized { 1 } else { 0 };
+            let disp = if is_sanitized {
+                ProjectionDisposition::Sanitized
+            } else {
+                ProjectionDisposition::Safe
+            };
+
+            (
+                *id,
+                RedactionResult {
+                    text: sanitized_text,
+                    disposition: disp,
+                    redaction_count: count,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Google DLP API Client for content.deidentify and content.inspect.
 #[derive(Clone)]
 pub struct DlpClient {
@@ -646,5 +695,45 @@ mod tests {
             res.text
         );
         assert!(res.text.contains(REDACTION_MARKER));
+    }
+
+    #[test]
+    fn test_windowed_utterance_redaction_cross_boundary_context() {
+        let utterances = vec![
+            (
+                1i64,
+                "so I can say something like my credit card number is".to_string(),
+            ),
+            (2i64, "9 1 8 7 4 3 2 9 9 4 1 9 1 8 8".to_string()),
+            (3i64, "and the CVV for that is".to_string()),
+            (4i64, "1 4 5".to_string()),
+        ];
+
+        let results = redact_utterance_window(&utterances);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[1].0, 2);
+        assert_eq!(results[2].0, 3);
+        assert_eq!(results[3].0, 4);
+
+        assert!(
+            !results[1].1.text.contains("9 1 8 7 4 3"),
+            "Card digits in utterance 2 must be redacted via window context: got '{}'",
+            results[1].1.text
+        );
+        assert!(
+            results[1].1.text.contains(REDACTION_MARKER),
+            "Utterance 2 must contain REDACTION_MARKER"
+        );
+
+        assert!(
+            !results[3].1.text.contains("1 4 5"),
+            "CVV in utterance 4 must be redacted via window context: got '{}'",
+            results[3].1.text
+        );
+        assert!(
+            results[3].1.text.contains(REDACTION_MARKER),
+            "Utterance 4 must contain REDACTION_MARKER"
+        );
     }
 }
