@@ -13,12 +13,12 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use reqwest::Url;
 use rusqlite::OptionalExtension;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use tracing::{info, warn};
 
 use crate::cp::control_store::WebhookSubscription;
+use crate::cp::delivery;
 use crate::cp::{isotime, CpState};
 use crate::error::{EnclaveError, Result};
 
@@ -47,40 +47,6 @@ struct DeliveryStateUpdate<'a> {
 enum SendFailure {
     InvalidEndpoint,
     Network,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DecisionDetail {
-    text: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ActionItemDetail {
-    text: String,
-    owner: String,
-    due_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LinkDetail {
-    url: String,
-    label: String,
-    why_it_matters: String,
-}
-
-#[derive(Debug)]
-struct BriefDetails {
-    title: String,
-    started_at: String,
-    ended_at: String,
-    finalized_at: String,
-    episode_type: Option<String>,
-    participants: Vec<String>,
-    overview: String,
-    decisions: Vec<DecisionDetail>,
-    action_items: Vec<ActionItemDetail>,
-    important_links: Vec<LinkDetail>,
-    open_questions: Vec<String>,
 }
 
 pub fn new_signing_secret() -> String {
@@ -329,55 +295,14 @@ pub async fn send_test_webhook(subscription: &WebhookSubscription) -> Result<u16
         })
 }
 
-fn parse_string_list(raw: Option<String>) -> Vec<String> {
-    raw.and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_default()
-}
-
 async fn load_event(
     state: &CpState,
     user_id: &str,
     outbox: &OutboxRow,
     include_content: bool,
 ) -> Result<Option<Vec<u8>>> {
-    let user = user_id.to_string();
-    let episode_id = outbox.episode_id;
-    let details: Option<BriefDetails> = state
-        .store
-        .with_user(&user, move |conn| {
-            let row = conn
-                .query_row(
-                    "SELECT e.title, e.started_at, e.ended_at, e.finalized_at, e.type,
-                            e.participants, b.overview, b.decisions, b.action_items,
-                            b.important_links, b.open_questions
-                     FROM episodes e
-                     JOIN episode_final_briefs b ON b.episode_id = e.id
-                     WHERE e.id = ?1",
-                    [episode_id],
-                    |r| {
-                        Ok(BriefDetails {
-                            title: r.get(0)?,
-                            started_at: r.get(1)?,
-                            ended_at: r.get(2)?,
-                            finalized_at: r.get(3)?,
-                            episode_type: r.get(4)?,
-                            participants: parse_string_list(r.get(5)?),
-                            overview: r.get(6)?,
-                            decisions: serde_json::from_str(&r.get::<_, String>(7)?)
-                                .unwrap_or_default(),
-                            action_items: serde_json::from_str(&r.get::<_, String>(8)?)
-                                .unwrap_or_default(),
-                            important_links: serde_json::from_str(&r.get::<_, String>(9)?)
-                                .unwrap_or_default(),
-                            open_questions: parse_string_list(r.get(10)?),
-                        })
-                    },
-                )
-                .optional()?;
-            Ok(row)
-        })
-        .await?;
-    let Some(details) = details else {
+    let Some(details) = delivery::load_finalized_episode(state, user_id, outbox.episode_id).await?
+    else {
         return Ok(None);
     };
 
@@ -696,5 +621,51 @@ mod tests {
         }
         assert!(is_public_ip("8.8.8.8".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn signature_fixed_vector() {
+        // Known secret key: 32 bytes of 0x01
+        let key_bytes = [1_u8; 32];
+        let secret = format!(
+            "whsec_{}",
+            base64::engine::general_purpose::STANDARD.encode(key_bytes)
+        );
+        let sig = signature(&secret, "evt_test123", 1700000000, b"{\"test\":true}").unwrap();
+        assert!(sig.starts_with("v1,"));
+        let sig2 = signature(&secret, "evt_test123", 1700000000, b"{\"test\":true}").unwrap();
+        assert_eq!(sig, sig2);
+    }
+
+    #[test]
+    fn parse_string_list_handles_malformed_and_missing_json() {
+        assert_eq!(delivery::parse_string_list(None), Vec::<String>::new());
+        assert_eq!(
+            delivery::parse_string_list(Some("not json".into())),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            delivery::parse_string_list(Some("[\"alice\", \"bob\"]".into())),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+    }
+
+    #[test]
+    fn cloud_event_structure_matches_specification() {
+        let event = cloud_event(
+            "evt_123",
+            "com.kiokuu.episode.finalized.v1",
+            "episode/42",
+            "2026-07-30T12:00:00Z",
+            json!({"episode_id": 42}),
+        );
+        assert_eq!(event["specversion"], "1.0");
+        assert_eq!(event["id"], "evt_123");
+        assert_eq!(event["source"], WEBHOOK_SOURCE);
+        assert_eq!(event["type"], "com.kiokuu.episode.finalized.v1");
+        assert_eq!(event["subject"], "episode/42");
+        assert_eq!(event["time"], "2026-07-30T12:00:00Z");
+        assert_eq!(event["datacontenttype"], "application/json");
+        assert_eq!(event["data"]["episode_id"], 42);
     }
 }

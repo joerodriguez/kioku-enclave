@@ -1540,6 +1540,13 @@ pub async fn summarize_all(state: &CpState) {
         if let Err(e) = super::webhook_worker::deliver_user_webhooks(state, &id).await {
             warn!(user_id = %id, error = %e, "deliver_user_webhooks failed");
         }
+        if let Some(ref transport) = state.email_transport {
+            if let Err(e) =
+                super::email_worker::deliver_user_emails(state, transport.as_ref(), &id).await
+            {
+                warn!(user_id = %id, error = %e, "deliver_user_emails failed");
+            }
+        }
     }
 }
 

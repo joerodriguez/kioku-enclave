@@ -255,6 +255,30 @@ async fn sync_batch(
                     "post-sync episode finalization failed"
                 );
             }
+            if let Err(e) =
+                super::webhook_worker::deliver_user_webhooks(&state, &finalizer_user).await
+            {
+                warn!(
+                    user_id = %finalizer_user,
+                    error = %e,
+                    "post-sync webhook delivery failed"
+                );
+            }
+            if let Some(ref transport) = state.email_transport {
+                if let Err(e) = super::email_worker::deliver_user_emails(
+                    &state,
+                    transport.as_ref(),
+                    &finalizer_user,
+                )
+                .await
+                {
+                    warn!(
+                        user_id = %finalizer_user,
+                        error = %e,
+                        "post-sync email delivery failed"
+                    );
+                }
+            }
         });
     }
 

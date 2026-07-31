@@ -14,7 +14,10 @@
 pub mod auth;
 pub mod control_store;
 pub mod cors;
+pub mod delivery;
 pub mod dlp;
+pub mod email_renderer;
+pub mod email_worker;
 pub mod finalizer;
 pub mod isotime;
 pub mod limits;
@@ -290,6 +293,8 @@ pub struct CpState {
     pub sync_limiter: limits::RateLimiter,
     pub mcp_limiter: limits::RateLimiter,
     pub oauth_limiter: limits::RateLimiter,
+    pub test_email_limiter: limits::RateLimiter,
+    pub email_transport: Option<Arc<dyn email_worker::EmailTransport>>,
     /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
     /// (model not baked/downloaded, or failed to load — never fatal).
     pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,
