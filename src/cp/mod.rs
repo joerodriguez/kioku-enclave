@@ -24,6 +24,7 @@ pub(crate) mod mcp_safety;
 pub mod oauth;
 pub mod query;
 pub mod reviewer;
+pub mod screen_understanding;
 pub mod summarizer;
 pub mod sync;
 pub mod tokens;

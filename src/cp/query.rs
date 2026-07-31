@@ -103,6 +103,10 @@ pub fn router() -> Router<Arc<CpState>> {
             get(rest_episode).delete(rest_episode_delete),
         )
         .route("/api/episodes/{id}/members", get(rest_episode_members))
+        .route(
+            "/api/browser-snapshots/{source_key}",
+            get(rest_browser_snapshot),
+        )
         .route("/api/episodes/{id}/finalize", post(rest_episode_finalize))
         .route("/api/feed", get(rest_feed))
         .route(
@@ -477,7 +481,8 @@ fn project_mcp_result(name: &str, result: Value) -> Value {
         "search_screenshots" => json!({
             "results": project_array(
                 &result["results"],
-                &["kind", "captured_at", "active_app", "window_title", "ocr_text", "url"],
+                &["kind", "captured_at", "active_app", "window_title", "ocr_text", "url",
+                  "observation_status", "literal_description", "screen_state", "content_type"],
             ),
         }),
         "get_context" => json!({
@@ -487,7 +492,8 @@ fn project_mcp_result(name: &str, result: Value) -> Value {
             ),
             "screenshots": project_array(
                 &result["screenshots"],
-                &["captured_at", "active_app", "window_title", "ocr_text", "url"],
+                &["captured_at", "active_app", "window_title", "ocr_text", "url",
+                  "observation_status", "literal_description", "screen_state", "content_type"],
             ),
         }),
         "list_episodes" => json!({
@@ -1144,10 +1150,18 @@ async fn rest_episode_members(
                 "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
                         substr(c.ocr_text,1,4000), substr(c.salient_ocr_text,1,4000), \
                         CASE WHEN length(c.ocr_text) > 4000 THEN 1 ELSE 0 END, \
-                        c.source_key, img.id \
+                        c.source_key, img.id, \
+                        o.status, o.generation_method, o.literal_description, o.screen_state, \
+                        o.content_type, o.visible_text_summary, o.notable_items_json, \
+                        i.activity_summary, i.relevance_level, i.relevance_reason, i.key_rank, \
+                        i.is_key_screen, i.semantic_group, c.capture_status, c.primary_bundle_id, \
+                        c.visible_until, c.browser_snapshot_source_key \
                  FROM episode_members m \
                  JOIN screenshots c ON c.id = m.record_id \
                  LEFT JOIN screenshot_images img ON img.source_key = c.source_key \
+                 LEFT JOIN screen_observations o ON o.screenshot_id = c.id \
+                 LEFT JOIN episode_screen_interpretations i \
+                   ON i.episode_id = m.episode_id AND i.screenshot_id = c.id \
                  WHERE m.episode_id = ?1 AND m.record_type = 'screenshot' AND c.is_duplicate = 0",
             )?;
             members.extend(
@@ -1163,6 +1177,10 @@ async fn rest_episode_members(
                         .as_deref()
                         .map(crate::ocr::extract_screen_facts)
                         .unwrap_or_default();
+                    let notable_items: Value = r
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or_else(|| json!([]));
                     Ok((
                         ts.clone(),
                         json!({
@@ -1178,6 +1196,23 @@ async fn rest_episode_members(
                             "screen_facts": screen_facts,
                             "source_key": r.get::<_, Option<String>>(8)?,
                             "cloud_image_id": r.get::<_, Option<String>>(9)?,
+                            "observation_status": r.get::<_, Option<String>>(10)?,
+                            "observation_method": r.get::<_, Option<String>>(11)?,
+                            "literal_description": r.get::<_, Option<String>>(12)?,
+                            "screen_state": r.get::<_, Option<String>>(13)?,
+                            "content_type": r.get::<_, Option<String>>(14)?,
+                            "visible_text_summary": r.get::<_, Option<String>>(15)?,
+                            "notable_items": notable_items,
+                            "activity_summary": r.get::<_, Option<String>>(17)?,
+                            "relevance_level": r.get::<_, Option<i64>>(18)?,
+                            "relevance_reason": r.get::<_, Option<String>>(19)?,
+                            "key_rank": r.get::<_, Option<i64>>(20)?,
+                            "is_key_screen": r.get::<_, Option<i64>>(21)?.unwrap_or(0) != 0,
+                            "semantic_group": r.get::<_, Option<String>>(22)?,
+                            "capture_status": r.get::<_, Option<String>>(23)?,
+                            "primary_bundle_id": r.get::<_, Option<String>>(24)?,
+                            "visible_until": r.get::<_, Option<String>>(25)?,
+                            "browser_snapshot_source_key": r.get::<_, Option<String>>(26)?,
                         }),
                     ))
                 })?
@@ -1191,6 +1226,84 @@ async fn rest_episode_members(
         .await;
     match result {
         Ok(v) => Json(v).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "enclave_unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn rest_browser_snapshot(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(source_key): Path<String>,
+) -> Response {
+    let result = s
+        .store
+        .with_user(&user.0, move |conn| {
+            let snapshot = conn
+                .query_row(
+                    "SELECT id, source_key, captured_at, browser_bundle_id, browser_name,
+                            permission_status, active_window_index, active_tab_index,
+                            reported_tab_count, truncated
+                     FROM browser_snapshots WHERE source_key=?1",
+                    [&source_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)? != 0,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some(snapshot) = snapshot else {
+                return Ok(None);
+            };
+            let mut statement = conn.prepare(
+                "SELECT window_index, tab_index, title, url, url_scheme, is_active, is_loading
+                 FROM browser_tabs WHERE browser_snapshot_id=?1
+                 ORDER BY window_index, tab_index LIMIT 500",
+            )?;
+            let tabs: Vec<Value> = statement
+                .query_map([snapshot.0], |row| {
+                    Ok(json!({
+                        "window_index": row.get::<_, i64>(0)?,
+                        "tab_index": row.get::<_, i64>(1)?,
+                        "title": row.get::<_, Option<String>>(2)?,
+                        "url": row.get::<_, Option<String>>(3)?,
+                        "url_scheme": row.get::<_, Option<String>>(4)?,
+                        "is_active": row.get::<_, i64>(5)? != 0,
+                        "is_loading": row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+                    }))
+                })?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            Ok(Some(json!({
+                "source_key": snapshot.1,
+                "captured_at": snapshot.2,
+                "browser_bundle_id": snapshot.3,
+                "browser_name": snapshot.4,
+                "permission_status": snapshot.5,
+                "active_window_index": snapshot.6,
+                "active_tab_index": snapshot.7,
+                "reported_tab_count": snapshot.8,
+                "truncated": snapshot.9,
+                "tabs": tabs,
+            })))
+        })
+        .await;
+    match result {
+        Ok(Some(snapshot)) => Json(snapshot).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "enclave_unavailable"})),
@@ -1337,6 +1450,12 @@ struct FeedRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     ocr_excerpt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    observation_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    literal_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screen_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     source_key: Option<String>,
     episode_id: Option<i64>,
 }
@@ -1391,6 +1510,9 @@ fn query_feed(
             window_title: None,
             url: None,
             ocr_excerpt: None,
+            observation_status: None,
+            literal_description: None,
+            screen_state: None,
             source_key: row.get(4)?,
             episode_id: None,
         });
@@ -1398,10 +1520,10 @@ fn query_feed(
 
     // 2. Fetch screenshots
     let mut s_sql = r#"
-        SELECT id, captured_at, active_app, window_title, url, ocr_text,
-               salient_ocr_text, source_key
-        FROM screenshots
-        WHERE captured_at IS NOT NULL AND is_duplicate = 0
+        SELECT s.id, s.captured_at, s.active_app, s.window_title, s.url, s.ocr_text,
+               s.salient_ocr_text, s.source_key, o.status, o.literal_description, o.screen_state
+        FROM screenshots s LEFT JOIN screen_observations o ON o.screenshot_id=s.id
+        WHERE s.captured_at IS NOT NULL AND s.is_duplicate = 0
     "#
     .to_string();
 
@@ -1447,6 +1569,9 @@ fn query_feed(
             window_title: row.get(3)?,
             url: row.get(4)?,
             ocr_excerpt,
+            observation_status: row.get(8)?,
+            literal_description: row.get(9)?,
+            screen_state: row.get(10)?,
             source_key: row.get(7)?,
             episode_id: None,
         });

@@ -108,6 +108,10 @@ pub enum SearchHit {
         window_title: Option<String>,
         ocr_text: Option<String>,
         url: Option<String>,
+        observation_status: Option<String>,
+        literal_description: Option<String>,
+        screen_state: Option<String>,
+        content_type: Option<String>,
         /// Combined RRF score (hybrid). Absent in FTS-only mode — older
         /// clients never see the field (skip_serializing_if), so the response
         /// shape is backward compatible.
@@ -496,15 +500,18 @@ fn search_screenshots_fts(
     req: &SearchRequest,
 ) -> Result<Vec<SearchHit>> {
     let sql = r#"
-        SELECT id, captured_at, active_app, window_title, ocr_text, url
-        FROM screenshots
-        WHERE id IN (
+        SELECT s.id, s.captured_at, s.active_app, s.window_title, s.ocr_text, s.url,
+               o.status, o.literal_description, o.screen_state, o.content_type
+        FROM screenshots s LEFT JOIN screen_observations o ON o.screenshot_id=s.id
+        WHERE (s.id IN (
             SELECT rowid FROM screenshots_fts WHERE screenshots_fts MATCH ?1
-        )
-        AND is_duplicate = 0
-        AND (?2 IS NULL OR captured_at >= ?2)
-        AND (?3 IS NULL OR captured_at <= ?3)
-        ORDER BY captured_at DESC
+        ) OR o.literal_description LIKE '%' || ?1 || '%' COLLATE NOCASE
+          OR o.visible_text_summary LIKE '%' || ?1 || '%' COLLATE NOCASE
+          OR s.url LIKE '%' || ?1 || '%' COLLATE NOCASE)
+        AND s.is_duplicate = 0
+        AND (?2 IS NULL OR s.captured_at >= ?2)
+        AND (?3 IS NULL OR s.captured_at <= ?3)
+        ORDER BY s.captured_at DESC
         LIMIT ?4 OFFSET ?5
     "#;
 
@@ -525,6 +532,10 @@ fn search_screenshots_fts(
                 window_title: r.get(3)?,
                 ocr_text: r.get(4)?,
                 url: r.get(5)?,
+                observation_status: r.get(6)?,
+                literal_description: r.get(7)?,
+                screen_state: r.get(8)?,
+                content_type: r.get(9)?,
                 score: None,
             })
         },
@@ -592,9 +603,11 @@ fn search_screenshots_hybrid(
         r#"
         WITH ranked(screenshot_id, rrf_score) AS (VALUES {values_clause})
         SELECT sc.id, sc.captured_at, sc.active_app, sc.window_title,
-               sc.ocr_text, sc.url, r.rrf_score
+               sc.ocr_text, sc.url, r.rrf_score, o.status,
+               o.literal_description, o.screen_state, o.content_type
         FROM ranked r
         JOIN screenshots sc ON sc.id = r.screenshot_id
+        LEFT JOIN screen_observations o ON o.screenshot_id=sc.id
         WHERE (?1 IS NULL OR sc.captured_at >= ?1)
           AND (?2 IS NULL OR sc.captured_at <= ?2)
           AND sc.is_duplicate = 0
@@ -611,6 +624,10 @@ fn search_screenshots_hybrid(
             window_title: r.get(3)?,
             ocr_text: r.get(4)?,
             url: r.get(5)?,
+            observation_status: r.get(7)?,
+            literal_description: r.get(8)?,
+            screen_state: r.get(9)?,
+            content_type: r.get(10)?,
             score: Some(r.get::<_, f64>(6)?),
         })
     })?;
@@ -1427,6 +1444,21 @@ mod tests {
                         url: None,
                         image_hash: None,
                         is_duplicate: None,
+                        display_id: None,
+                        capture_context_version: None,
+                        capture_status: None,
+                        primary_bundle_id: None,
+                        primary_window_id: None,
+                        capture_group_id: None,
+                        visible_windows: None,
+                        visible_windows_truncated: None,
+                        visual_signals: None,
+                        semantic_context_hash: None,
+                        browser_snapshot_source_key: None,
+                        browser_snapshot: None,
+                        duplicate_of_source_key: None,
+                        visible_until: None,
+                        dedupe_version: None,
                         source_key: Some("dev:9".to_string()),
                         embedding_b64: Some(make_embedding_b64(1.0)),
                     }],

@@ -248,16 +248,9 @@ pub fn extract_candidates(
                     });
                 }
             }
-            for m in bare_domain_regex.find_iter(ocr) {
-                let cleaned = clean_url(m.as_str());
-                if seen.insert(cleaned.clone()) {
-                    candidates.push(UrlCandidate {
-                        url: cleaned,
-                        record_type: "screenshot".to_string(),
-                        record_id: id,
-                    });
-                }
-            }
+            // OCR-only bare domains are ambiguous with application/file names
+            // (for example `Antigravity.app`). Only explicit http(s)/www OCR
+            // is navigable. Exact browser URLs are handled above.
         }
     }
 
@@ -1472,7 +1465,7 @@ mod tests {
         let screenshots = vec![(
             2,
             None,
-            Some("Book a doctor through doctorly.fr/appointments".to_string()),
+            Some("Book a doctor through https://doctorly.fr/appointments".to_string()),
         )];
 
         let urls: HashSet<String> = extract_candidates(&utterances, &screenshots)
@@ -1482,6 +1475,16 @@ mod tests {
 
         assert!(urls.contains("https://visa.fr"));
         assert!(urls.contains("https://doctorly.fr/appointments"));
+    }
+
+    #[test]
+    fn screenshot_app_name_is_not_promoted_to_a_link() {
+        let screenshots = vec![(
+            2,
+            None,
+            Some("Antigravity.app in the Applications folder".to_string()),
+        )];
+        assert!(extract_candidates(&[], &screenshots).is_empty());
     }
 
     #[test]
