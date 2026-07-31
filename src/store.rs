@@ -45,7 +45,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{ffi::sqlite3_auto_extension, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, Connection, OptionalExtension};
 use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
 use tokio::io::AsyncWriteExt;
@@ -69,7 +69,7 @@ pub const MAX_USER_ID_LEN: usize = 128;
 
 /// Canonical brief schema/prompt version. Keeping it beside the persistence
 /// migration prevents a worker bump from forgetting to queue stored briefs.
-pub(crate) const EPISODE_FINALIZATION_VERSION: i32 = 3;
+pub(crate) const EPISODE_FINALIZATION_VERSION: i32 = 5;
 
 /// Validate a caller-supplied `user_id` before it is used to derive any
 /// filesystem path or GCS object name.
@@ -126,6 +126,22 @@ struct StoreInner {
     /// Process-local deletion fence. Once set, in-flight requests that passed
     /// authentication cannot recreate or save this user's content.
     blocked_users: HashSet<UserId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmailDeliveryRow {
+    pub episode_id: i64,
+    pub delivery_version: i32,
+    pub delivery_id: String,
+    pub include_content: bool,
+    pub state: String,
+    pub attempt_count: i32,
+    pub next_attempt_at: String,
+    pub provider_message_id: Option<String>,
+    pub response_status: Option<u16>,
+    pub error_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl Store {
@@ -276,6 +292,187 @@ impl Store {
         self.gcs.delete_object(&object_name).await?;
 
         Ok(())
+    }
+
+    // ── Email Outbox ───────────────────────────────────────────────────────────
+
+    pub async fn enqueue_email_delivery(
+        &self,
+        user_id: &str,
+        episode_id: i64,
+        delivery_version: i32,
+        include_content: bool,
+    ) -> Result<String> {
+        let user = user_id.to_string();
+        let delivery_id = format!("deliv_{}", crate::cp::tokens::random_token_hex());
+        let now = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+
+        let id = delivery_id.clone();
+        self.with_user(&user, move |conn| {
+            conn.execute(
+                "INSERT INTO email_deliveries
+                 (episode_id, delivery_version, delivery_id, include_content, state, attempt_count, next_attempt_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5, ?5)",
+                rusqlite::params![
+                    episode_id,
+                    delivery_version,
+                    id,
+                    if include_content { 1 } else { 0 },
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?;
+        self.save_user(user_id).await?;
+        Ok(delivery_id)
+    }
+
+    pub async fn next_email_delivery(&self, user_id: &str) -> Result<Option<EmailDeliveryRow>> {
+        let user = user_id.to_string();
+        let now = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+
+        self.with_user(&user, move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT episode_id, delivery_version, delivery_id, include_content, state,
+                            attempt_count, next_attempt_at, provider_message_id, response_status,
+                            error_code, created_at, updated_at
+                     FROM email_deliveries
+                     WHERE state IN ('pending', 'retry') AND next_attempt_at <= ?1
+                     ORDER BY created_at, episode_id
+                     LIMIT 1",
+                    [&now],
+                    |r| {
+                        let include_num: i64 = r.get(3)?;
+                        let resp_status: Option<i64> = r.get(8)?;
+                        Ok(EmailDeliveryRow {
+                            episode_id: r.get(0)?,
+                            delivery_version: r.get(1)?,
+                            delivery_id: r.get(2)?,
+                            include_content: include_num != 0,
+                            state: r.get(4)?,
+                            attempt_count: r.get(5)?,
+                            next_attempt_at: r.get(6)?,
+                            provider_message_id: r.get(7)?,
+                            response_status: resp_status.map(|s| s as u16),
+                            error_code: r.get(9)?,
+                            created_at: r.get(10)?,
+                            updated_at: r.get(11)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_email_delivery_state(
+        &self,
+        user_id: &str,
+        episode_id: i64,
+        delivery_version: i32,
+        state: &str,
+        attempt_count: i32,
+        provider_message_id: Option<&str>,
+        response_status: Option<u16>,
+        error_code: Option<&str>,
+    ) -> Result<()> {
+        let user = user_id.to_string();
+        let state = state.to_string();
+        let provider_message_id = provider_message_id.map(str::to_string);
+        let error_code = error_code.map(str::to_string);
+        let now = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+
+        self.with_user(&user, move |conn| {
+            conn.execute(
+                "UPDATE email_deliveries
+                 SET state = ?1, attempt_count = ?2, provider_message_id = ?3,
+                     response_status = ?4, error_code = ?5, updated_at = ?6
+                 WHERE episode_id = ?7 AND delivery_version = ?8",
+                rusqlite::params![
+                    state,
+                    attempt_count,
+                    provider_message_id,
+                    response_status.map(i64::from),
+                    error_code,
+                    now,
+                    episode_id,
+                    delivery_version,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?;
+        self.save_user(user_id).await
+    }
+
+    pub async fn set_email_delivery_next_attempt(
+        &self,
+        user_id: &str,
+        episode_id: i64,
+        delivery_version: i32,
+        next_attempt_at: &str,
+    ) -> Result<()> {
+        let user = user_id.to_string();
+        let next_attempt_at = next_attempt_at.to_string();
+        let now = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+
+        self.with_user(&user, move |conn| {
+            conn.execute(
+                "UPDATE email_deliveries
+                 SET next_attempt_at = ?1, updated_at = ?2
+                 WHERE episode_id = ?3 AND delivery_version = ?4",
+                rusqlite::params![next_attempt_at, now, episode_id, delivery_version],
+            )?;
+            Ok(())
+        })
+        .await?;
+        self.save_user(user_id).await
+    }
+
+    pub async fn cancel_pending_email_deliveries(&self, user_id: &str, reason: &str) -> Result<()> {
+        let user = user_id.to_string();
+        let reason = reason.to_string();
+        let now = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+
+        self.with_user(&user, move |conn| {
+            conn.execute(
+                "UPDATE email_deliveries
+                 SET state = 'cancelled', error_code = ?1, updated_at = ?2
+                 WHERE state IN ('pending', 'retry')",
+                rusqlite::params![reason, now],
+            )?;
+            Ok(())
+        })
+        .await?;
+        self.save_user(user_id).await
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
@@ -484,7 +681,100 @@ CREATE TABLE IF NOT EXISTS screenshots (
     image_hash   TEXT,
     is_duplicate INTEGER NOT NULL DEFAULT 0,
     source_key   TEXT,
-    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    display_id INTEGER,
+    capture_context_version INTEGER,
+    capture_status TEXT,
+    primary_bundle_id TEXT,
+    primary_window_id INTEGER,
+    capture_group_id TEXT,
+    visible_windows_json TEXT,
+    visible_windows_truncated INTEGER NOT NULL DEFAULT 0,
+    visual_signals_json TEXT,
+    semantic_context_hash TEXT,
+    browser_snapshot_source_key TEXT,
+    duplicate_of_id INTEGER REFERENCES screenshots(id) ON DELETE SET NULL,
+    visible_until TEXT,
+    dedupe_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS browser_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key TEXT NOT NULL UNIQUE,
+    captured_at TEXT NOT NULL,
+    browser_bundle_id TEXT NOT NULL,
+    browser_name TEXT NOT NULL,
+    permission_status TEXT NOT NULL,
+    active_window_index INTEGER,
+    active_tab_index INTEGER,
+    reported_tab_count INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS browser_tabs (
+    browser_snapshot_id INTEGER NOT NULL REFERENCES browser_snapshots(id) ON DELETE CASCADE,
+    window_index INTEGER NOT NULL,
+    tab_index INTEGER NOT NULL,
+    title TEXT,
+    url TEXT,
+    url_scheme TEXT,
+    is_active INTEGER NOT NULL,
+    is_loading INTEGER,
+    PRIMARY KEY (browser_snapshot_id, window_index, tab_index)
+);
+CREATE TABLE IF NOT EXISTS screen_observation_jobs (
+    screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
+    input_revision TEXT NOT NULL,
+    observation_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','ready','fallback')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS screen_observations (
+    screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
+    input_revision TEXT NOT NULL,
+    observation_version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready','fallback')),
+    generation_method TEXT NOT NULL,
+    literal_description TEXT NOT NULL,
+    screen_state TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    visible_text_summary TEXT,
+    notable_items_json TEXT NOT NULL DEFAULT '[]',
+    model_name TEXT,
+    prompt_version INTEGER NOT NULL,
+    completed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS episode_screen_interpretations (
+    episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+    episode_revision TEXT NOT NULL,
+    interpretation_version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready','fallback')),
+    activity_summary TEXT,
+    relevance_level INTEGER NOT NULL CHECK (relevance_level BETWEEN 0 AND 3),
+    relevance_reason TEXT,
+    milestone_type TEXT NOT NULL DEFAULT 'none',
+    base_score INTEGER NOT NULL DEFAULT 0,
+    key_rank INTEGER,
+    is_key_screen INTEGER NOT NULL DEFAULT 0,
+    semantic_group TEXT,
+    model_name TEXT,
+    prompt_version INTEGER NOT NULL,
+    completed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (episode_id, screenshot_id)
+);
+CREATE TABLE IF NOT EXISTS episode_screen_interpretation_jobs (
+    episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+    episode_revision TEXT NOT NULL,
+    interpretation_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','ready','fallback')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- FTS5 index over screenshot OCR text
@@ -688,6 +978,24 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx
     ON webhook_deliveries(state, next_attempt_at);
 
+CREATE TABLE IF NOT EXISTS email_deliveries (
+    episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    delivery_version    INTEGER NOT NULL,
+    delivery_id         TEXT NOT NULL UNIQUE,
+    include_content     INTEGER NOT NULL,
+    state               TEXT NOT NULL CHECK ( state IN ('pending', 'retry', 'accepted', 'cancelled', 'failed') ),
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     TEXT NOT NULL,
+    provider_message_id TEXT,
+    response_status     INTEGER,
+    error_code          TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (episode_id, delivery_version)
+);
+CREATE INDEX IF NOT EXISTS email_deliveries_due_idx
+    ON email_deliveries(state, next_attempt_at);
+
 -- Device sync watermarks per modality
 CREATE TABLE IF NOT EXISTS device_watermarks (
     device_id    TEXT NOT NULL,
@@ -741,6 +1049,85 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             return Err(e.into());
         }
     }
+
+    for definition in [
+        "display_id INTEGER",
+        "capture_context_version INTEGER",
+        "capture_status TEXT",
+        "primary_bundle_id TEXT",
+        "primary_window_id INTEGER",
+        "capture_group_id TEXT",
+        "visible_windows_json TEXT",
+        "visible_windows_truncated INTEGER NOT NULL DEFAULT 0",
+        "visual_signals_json TEXT",
+        "semantic_context_hash TEXT",
+        "browser_snapshot_source_key TEXT",
+        "duplicate_of_id INTEGER REFERENCES screenshots(id) ON DELETE SET NULL",
+        "visible_until TEXT",
+        "dedupe_version INTEGER NOT NULL DEFAULT 1",
+    ] {
+        if let Err(error) =
+            conn.execute_batch(&format!("ALTER TABLE screenshots ADD COLUMN {definition};"))
+        {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error.into());
+            }
+        }
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS browser_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_key TEXT NOT NULL UNIQUE,
+            captured_at TEXT NOT NULL,
+            browser_bundle_id TEXT NOT NULL,
+            browser_name TEXT NOT NULL,
+            permission_status TEXT NOT NULL,
+            active_window_index INTEGER,
+            active_tab_index INTEGER,
+            reported_tab_count INTEGER NOT NULL DEFAULT 0,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS browser_tabs (
+            browser_snapshot_id INTEGER NOT NULL REFERENCES browser_snapshots(id) ON DELETE CASCADE,
+            window_index INTEGER NOT NULL,
+            tab_index INTEGER NOT NULL,
+            title TEXT,
+            url TEXT,
+            url_scheme TEXT,
+            is_active INTEGER NOT NULL,
+            is_loading INTEGER,
+            PRIMARY KEY (browser_snapshot_id, window_index, tab_index)
+        );
+        CREATE TABLE IF NOT EXISTS screen_observation_jobs (
+            screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
+            input_revision TEXT NOT NULL,
+            observation_version INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','ready','fallback')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            error_code TEXT,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS screen_observations (
+            screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
+            input_revision TEXT NOT NULL,
+            observation_version INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('ready','fallback')),
+            generation_method TEXT NOT NULL,
+            literal_description TEXT NOT NULL,
+            screen_state TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            visible_text_summary TEXT,
+            notable_items_json TEXT NOT NULL DEFAULT '[]',
+            model_name TEXT,
+            prompt_version INTEGER NOT NULL,
+            completed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_observation_jobs_state ON screen_observation_jobs(state, screenshot_id);
+        "#,
+    )?;
 
     // ── v2 episodes migration: id-keyed episodes + explicit membership ──────────
     //
@@ -1115,6 +1502,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx
             ON webhook_deliveries(state, next_attempt_at);
+        CREATE TABLE IF NOT EXISTS email_deliveries (
+            episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            delivery_version    INTEGER NOT NULL,
+            delivery_id         TEXT NOT NULL UNIQUE,
+            include_content     INTEGER NOT NULL,
+            state               TEXT NOT NULL CHECK ( state IN ('pending', 'retry', 'accepted', 'cancelled', 'failed') ),
+            attempt_count       INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at     TEXT NOT NULL,
+            provider_message_id TEXT,
+            response_status     INTEGER,
+            error_code          TEXT,
+            created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (episode_id, delivery_version)
+        );
+        CREATE INDEX IF NOT EXISTS email_deliveries_due_idx
+            ON email_deliveries(state, next_attempt_at);
         CREATE TABLE IF NOT EXISTS device_watermarks (
             device_id    TEXT NOT NULL,
             modality     TEXT NOT NULL CHECK (modality IN ('audio','screen')),
@@ -1122,8 +1526,58 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             PRIMARY KEY (device_id, modality)
         );
+        CREATE TABLE IF NOT EXISTS episode_screen_interpretations (
+            episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+            episode_revision TEXT NOT NULL DEFAULT '',
+            interpretation_version INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'fallback' CHECK (status IN ('ready','fallback')),
+            activity_summary TEXT,
+            relevance_level INTEGER NOT NULL CHECK (relevance_level BETWEEN 0 AND 3),
+            relevance_reason TEXT,
+            milestone_type TEXT NOT NULL DEFAULT 'none',
+            base_score INTEGER NOT NULL DEFAULT 0,
+            key_rank INTEGER,
+            is_key_screen INTEGER NOT NULL DEFAULT 0,
+            semantic_group TEXT,
+            model_name TEXT,
+            prompt_version INTEGER NOT NULL DEFAULT 1,
+            completed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (episode_id, screenshot_id)
+        );
+        CREATE TABLE IF NOT EXISTS episode_screen_interpretation_jobs (
+            episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+            episode_revision TEXT NOT NULL,
+            interpretation_version INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','ready','fallback')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            error_code TEXT,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_screen_rank
+            ON episode_screen_interpretations(episode_id, is_key_screen, key_rank);
         "#,
     )?;
+
+    for definition in [
+        "episode_revision TEXT NOT NULL DEFAULT ''",
+        "interpretation_version INTEGER NOT NULL DEFAULT 1",
+        "status TEXT NOT NULL DEFAULT 'fallback' CHECK (status IN ('ready','fallback'))",
+        "milestone_type TEXT NOT NULL DEFAULT 'none'",
+        "base_score INTEGER NOT NULL DEFAULT 0",
+        "model_name TEXT",
+        "prompt_version INTEGER NOT NULL DEFAULT 1",
+        "completed_at TEXT",
+    ] {
+        if let Err(error) = conn.execute_batch(&format!(
+            "ALTER TABLE episode_screen_interpretations ADD COLUMN {definition};"
+        )) {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error.into());
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1572,7 +2026,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn finalization_v3_migration_queues_stale_briefs_and_keeps_current_complete() {
+    fn finalization_v5_migration_queues_stale_briefs_and_keeps_current_complete() {
         init_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -1582,9 +2036,9 @@ pub(crate) mod tests {
               finalization_status, finalization_error)
              VALUES
              (1, '2026-07-01T09:00:00Z', '2026-07-01T10:00:00Z', 'stale',
-              '2026-07-01T14:00:00Z', 2, 'complete', 'old error'),
+              '2026-07-01T14:00:00Z', 4, 'complete', 'old error'),
              (2, '2026-07-02T09:00:00Z', '2026-07-02T10:00:00Z', 'current',
-              '2026-07-02T14:00:00Z', 3, 'processing', 'old error')",
+              '2026-07-02T14:00:00Z', 5, 'processing', 'old error')",
             [],
         )
         .unwrap();
@@ -2186,5 +2640,66 @@ pub(crate) mod tests {
             objects.keys().collect::<Vec<_>>()
         );
         assert_eq!(objects.len(), 1, "no stray objects should be written");
+    }
+
+    #[tokio::test]
+    async fn email_deliveries_outbox_operations() {
+        let store = make_store();
+        let user_id = "test-email-outbox-user";
+
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO episodes (id, started_at, ended_at, title, summary, substance)
+                     VALUES (100, '2026-07-30T10:00:00Z', '2026-07-30T10:30:00Z', 'Test Title', 'Test Summary', 'normal')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Enqueue delivery
+        let id1 = store
+            .enqueue_email_delivery(user_id, 100, 1, false)
+            .await
+            .unwrap();
+        assert!(id1.starts_with("deliv_"));
+
+        // Duplicate episode_id & delivery_version cannot enqueue twice
+        assert!(store
+            .enqueue_email_delivery(user_id, 100, 1, true)
+            .await
+            .is_err());
+
+        // Query due row
+        let due = store
+            .next_email_delivery(user_id)
+            .await
+            .unwrap()
+            .expect("due row");
+        assert_eq!(due.episode_id, 100);
+        assert_eq!(due.delivery_version, 1);
+        assert_eq!(due.delivery_id, id1);
+        assert!(!due.include_content);
+        assert_eq!(due.state, "pending");
+
+        // Update state to accepted
+        store
+            .update_email_delivery_state(
+                user_id,
+                100,
+                1,
+                "accepted",
+                1,
+                Some("msg_resend_1"),
+                Some(200),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // No more due rows
+        assert!(store.next_email_delivery(user_id).await.unwrap().is_none());
     }
 }

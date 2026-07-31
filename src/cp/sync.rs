@@ -68,6 +68,21 @@ struct Screenshot {
     url: Option<String>,
     image_hash: Option<String>,
     is_duplicate: Option<i64>,
+    display_id: Option<i64>,
+    capture_context_version: Option<i64>,
+    capture_status: Option<String>,
+    primary_bundle_id: Option<String>,
+    primary_window_id: Option<i64>,
+    capture_group_id: Option<String>,
+    visible_windows: Option<serde_json::Value>,
+    visible_windows_truncated: Option<bool>,
+    visual_signals: Option<serde_json::Value>,
+    semantic_context_hash: Option<String>,
+    browser_snapshot_source_key: Option<String>,
+    browser_snapshot: Option<crate::ingest::BrowserSnapshotInput>,
+    duplicate_of_local_id: Option<i64>,
+    visible_until: Option<String>,
+    dedupe_version: Option<i64>,
     /// Optional 384-dim OCR-text embedding (see `crate::embedding::MODEL_ID`).
     embedding_b64: Option<String>,
 }
@@ -152,10 +167,34 @@ async fn sync_batch(
     }
 
     // 4. Join utterances → segments, build the in-process ingest request.
+    let browser_prefix = format!("{}:browser-v1:", batch.device_id);
+    if batch.screenshots.iter().any(|screenshot| {
+        screenshot
+            .browser_snapshot_source_key
+            .as_deref()
+            .is_some_and(|key| !key.starts_with(&browser_prefix))
+            || screenshot
+                .browser_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    !snapshot.source_key.starts_with(&browser_prefix)
+                        || screenshot.browser_snapshot_source_key.as_deref()
+                            != Some(snapshot.source_key.as_str())
+                })
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_browser_snapshot_namespace"})),
+        )
+            .into_response();
+    }
     let req = build_ingest(&user_id, &batch);
 
     let ingest_resp = match crate::ingest::ingest_batch(&s.store, &req).await {
         Ok(r) => r,
+        Err(crate::error::EnclaveError::InvalidRequest(message)) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
+        }
         Err(e) => {
             warn!(error = %e, "enclave ingest failed");
             return err503();
@@ -215,6 +254,30 @@ async fn sync_batch(
                     error = %e,
                     "post-sync episode finalization failed"
                 );
+            }
+            if let Err(e) =
+                super::webhook_worker::deliver_user_webhooks(&state, &finalizer_user).await
+            {
+                warn!(
+                    user_id = %finalizer_user,
+                    error = %e,
+                    "post-sync webhook delivery failed"
+                );
+            }
+            if let Some(ref transport) = state.email_transport {
+                if let Err(e) = super::email_worker::deliver_user_emails(
+                    &state,
+                    transport.as_ref(),
+                    &finalizer_user,
+                )
+                .await
+                {
+                    warn!(
+                        user_id = %finalizer_user,
+                        error = %e,
+                        "post-sync email delivery failed"
+                    );
+                }
             }
         });
     }
@@ -278,6 +341,23 @@ fn build_ingest(user_id: &str, batch: &Batch) -> IngestRequest {
             url: sc.url.clone(),
             image_hash: sc.image_hash.clone(),
             is_duplicate: sc.is_duplicate,
+            display_id: sc.display_id,
+            capture_context_version: sc.capture_context_version,
+            capture_status: sc.capture_status.clone(),
+            primary_bundle_id: sc.primary_bundle_id.clone(),
+            primary_window_id: sc.primary_window_id,
+            capture_group_id: sc.capture_group_id.clone(),
+            visible_windows: sc.visible_windows.clone(),
+            visible_windows_truncated: sc.visible_windows_truncated,
+            visual_signals: sc.visual_signals.clone(),
+            semantic_context_hash: sc.semantic_context_hash.clone(),
+            browser_snapshot_source_key: sc.browser_snapshot_source_key.clone(),
+            browser_snapshot: sc.browser_snapshot.clone(),
+            duplicate_of_source_key: sc
+                .duplicate_of_local_id
+                .map(|local_id| format!("{}:{}", batch.device_id, local_id)),
+            visible_until: sc.visible_until.clone(),
+            dedupe_version: sc.dedupe_version,
             source_key: Some(format!("{}:{}", batch.device_id, sc.local_id)),
             embedding_b64: sc.embedding_b64.clone(),
         })

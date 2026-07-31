@@ -5,11 +5,15 @@
 //! 1. Opens (or LRU-hits) the user's decrypted SQLite index via `Store::with_user`.
 //! 2. Inserts rows into `audio_segments` + `utterances` (for transcripts) or
 //!    `screenshots` (for screen captures). FTS5 triggers fire automatically.
-//! 3. Saves the index back to GCS via `Store::save_user`.
+//! 3. Gives every canonical nonduplicate screen an immediate deterministic observation
+//!    fallback. The asynchronous control-plane worker later sends complete OCR and
+//!    textual app/window/URL/browser metadata to Vertex for model enrichment. It never
+//!    loads or serializes screenshot pixels.
+//! 4. Saves the index back to GCS via `Store::save_user`.
 //!
 //! # Idempotency
 //! When a `source_key` is present on an utterance or screenshot the handler uses
-//! `INSERT OR IGNORE` so retried sync batches are harmless.  Rows without a
+//! an additive conflict update so retried sync batches are harmless. Rows without a
 //! `source_key` (legacy senders) are inserted unconditionally.  The
 //! response counts only rows that were actually written (`changes()`).
 //!
@@ -102,12 +106,55 @@ pub struct ScreenshotInput {
     pub url: Option<String>,
     pub image_hash: Option<String>,
     pub is_duplicate: Option<i64>,
+    pub display_id: Option<i64>,
+    pub capture_context_version: Option<i64>,
+    pub capture_status: Option<String>,
+    pub primary_bundle_id: Option<String>,
+    pub primary_window_id: Option<i64>,
+    pub capture_group_id: Option<String>,
+    pub visible_windows: Option<serde_json::Value>,
+    pub visible_windows_truncated: Option<bool>,
+    pub visual_signals: Option<serde_json::Value>,
+    pub semantic_context_hash: Option<String>,
+    pub browser_snapshot_source_key: Option<String>,
+    pub browser_snapshot: Option<BrowserSnapshotInput>,
+    pub duplicate_of_source_key: Option<String>,
+    pub visible_until: Option<String>,
+    pub dedupe_version: Option<i64>,
     /// Idempotency key: `device_id:screenshot_local_id`.
     /// When present, `INSERT OR IGNORE` is used so re-sent batches are no-ops.
     pub source_key: Option<String>,
     /// Optional 384-dim embedding of `ocr_text` (capped at 10k chars on the
     /// Mac; chunked + mean-pooled). Same model/space rules as utterances.
     pub embedding_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrowserSnapshotInput {
+    pub schema_version: i64,
+    pub source_key: String,
+    pub captured_at: String,
+    pub browser_bundle_id: String,
+    pub browser_name: String,
+    pub permission_status: String,
+    pub active_window_index: Option<i64>,
+    pub active_tab_index: Option<i64>,
+    pub reported_tab_count: i64,
+    pub truncated: bool,
+    pub content_hash: String,
+    #[serde(default)]
+    pub tabs: Vec<BrowserTabInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrowserTabInput {
+    pub window_index: i64,
+    pub tab_index: i64,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub url_scheme: Option<String>,
+    pub is_active: bool,
+    pub is_loading: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,8 +208,10 @@ pub(crate) async fn ingest_batch(
 
     let (utterances_inserted, screenshots_inserted) = store
         .with_user(&req.user_id, |conn| {
-            let u = ingest_utterances(conn, &req.utterances, accept_embeddings)?;
-            let s = ingest_screenshots(conn, &req.screenshots, accept_embeddings)?;
+            let transaction = conn.unchecked_transaction()?;
+            let u = ingest_utterances(&transaction, &req.utterances, accept_embeddings)?;
+            let s = ingest_screenshots(&transaction, &req.screenshots, accept_embeddings)?;
+            transaction.commit()?;
             Ok((u, s))
         })
         .await?;
@@ -443,13 +492,41 @@ pub(crate) fn ingest_screenshots(
 ) -> Result<usize> {
     let mut inserted = 0usize;
     for s in items {
+        if let Some(snapshot) = s.browser_snapshot.as_ref() {
+            ingest_browser_snapshot(conn, snapshot, s.browser_snapshot_source_key.as_deref())?;
+        } else if s.browser_snapshot_source_key.is_some() {
+            return Err(crate::error::EnclaveError::InvalidRequest(
+                "browser snapshot reference missing payload".into(),
+            ));
+        }
+        let duplicate_of_id = match s.duplicate_of_source_key.as_deref() {
+            Some(source_key) => Some(conn.query_row(
+                "SELECT id FROM screenshots WHERE source_key = ?1",
+                [source_key],
+                |row| row.get::<_, i64>(0),
+            )?),
+            None => None,
+        };
         let salient_ocr_text =
             crate::ocr::select_salient_ocr(s.ocr_text.as_deref(), s.salient_ocr_text.as_deref());
+        let visible_windows_json = s
+            .visible_windows
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let visual_signals_json = s
+            .visual_signals
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         if let Some(ref sk) = s.source_key {
             conn.execute(
                 r#"INSERT OR IGNORE INTO screenshots
-                   (captured_at, active_app, window_title, ocr_text, salient_ocr_text, url, image_hash, is_duplicate, source_key)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                   (captured_at, active_app, window_title, ocr_text, salient_ocr_text, url, image_hash, is_duplicate, source_key,
+                    display_id, capture_context_version, capture_status, primary_bundle_id, primary_window_id,
+                    capture_group_id, visible_windows_json, visible_windows_truncated, visual_signals_json,
+                    semantic_context_hash, browser_snapshot_source_key, duplicate_of_id, visible_until, dedupe_version)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)"#,
                 rusqlite::params![
                     s.captured_at,
                     s.active_app,
@@ -460,13 +537,30 @@ pub(crate) fn ingest_screenshots(
                     s.image_hash,
                     s.is_duplicate.unwrap_or(0),
                     sk,
+                    s.display_id,
+                    s.capture_context_version,
+                    s.capture_status,
+                    s.primary_bundle_id,
+                    s.primary_window_id,
+                    s.capture_group_id,
+                    visible_windows_json,
+                    s.visible_windows_truncated.unwrap_or(false) as i64,
+                    visual_signals_json,
+                    s.semantic_context_hash,
+                    s.browser_snapshot_source_key,
+                    duplicate_of_id,
+                    s.visible_until,
+                    s.dedupe_version.unwrap_or(1),
                 ],
             )?;
         } else {
             conn.execute(
                 r#"INSERT INTO screenshots
-                   (captured_at, active_app, window_title, ocr_text, salient_ocr_text, url, image_hash, is_duplicate)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                   (captured_at, active_app, window_title, ocr_text, salient_ocr_text, url, image_hash, is_duplicate,
+                    display_id, capture_context_version, capture_status, primary_bundle_id, primary_window_id,
+                    capture_group_id, visible_windows_json, visible_windows_truncated, visual_signals_json,
+                    semantic_context_hash, browser_snapshot_source_key, duplicate_of_id, visible_until, dedupe_version)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"#,
                 rusqlite::params![
                     s.captured_at,
                     s.active_app,
@@ -476,11 +570,40 @@ pub(crate) fn ingest_screenshots(
                     s.url,
                     s.image_hash,
                     s.is_duplicate.unwrap_or(0),
+                    s.display_id,
+                    s.capture_context_version,
+                    s.capture_status,
+                    s.primary_bundle_id,
+                    s.primary_window_id,
+                    s.capture_group_id,
+                    visible_windows_json,
+                    s.visible_windows_truncated.unwrap_or(false) as i64,
+                    visual_signals_json,
+                    s.semantic_context_hash,
+                    s.browser_snapshot_source_key,
+                    duplicate_of_id,
+                    s.visible_until,
+                    s.dedupe_version.unwrap_or(1),
                 ],
             )?;
         }
         let row_inserted = conn.changes() as usize;
         inserted += row_inserted;
+
+        let screenshot_id = if row_inserted > 0 {
+            conn.last_insert_rowid()
+        } else if let Some(source_key) = s.source_key.as_deref() {
+            conn.query_row(
+                "SELECT id FROM screenshots WHERE source_key = ?1",
+                [source_key],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else {
+            conn.last_insert_rowid()
+        };
+        if s.is_duplicate.unwrap_or(0) == 0 {
+            ensure_fallback_observation(conn, screenshot_id, s, salient_ocr_text.as_deref())?;
+        }
 
         // Re-sent source-key rows may backfill the projection independently of
         // embeddings. This updates only the non-indexed additive column.
@@ -523,6 +646,218 @@ pub(crate) fn ingest_screenshots(
         }
     }
     Ok(inserted)
+}
+
+fn ingest_browser_snapshot(
+    conn: &rusqlite::Connection,
+    snapshot: &BrowserSnapshotInput,
+    expected_source_key: Option<&str>,
+) -> Result<()> {
+    if snapshot.schema_version != 1
+        || expected_source_key != Some(snapshot.source_key.as_str())
+        || !snapshot.source_key.contains(":browser-v1:")
+        || snapshot.tabs.len() > 500
+        || snapshot.reported_tab_count < snapshot.tabs.len() as i64
+        || snapshot.reported_tab_count > 100_000
+        || (!snapshot.truncated && snapshot.reported_tab_count != snapshot.tabs.len() as i64)
+        || snapshot.content_hash.len() != 64
+        || !snapshot
+            .content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || !snapshot.source_key.ends_with(&snapshot.content_hash)
+        || snapshot.captured_at.len() > 40
+        || !snapshot.captured_at.contains('T')
+        || snapshot.browser_bundle_id.is_empty()
+        || snapshot.browser_bundle_id.len() > 256
+        || snapshot.browser_name.is_empty()
+        || snapshot.browser_name.chars().count() > 256
+        || !matches!(
+            snapshot.permission_status.as_str(),
+            "granted"
+                | "not_determined"
+                | "denied"
+                | "unsupported"
+                | "browser_not_running"
+                | "timed_out"
+                | "script_error"
+        )
+    {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "invalid browser snapshot".into(),
+        ));
+    }
+    let active_count = snapshot.tabs.iter().filter(|tab| tab.is_active).count();
+    let active_tab = snapshot.tabs.iter().find(|tab| tab.is_active);
+    if (snapshot.permission_status == "granted"
+        && (active_count != 1
+            || active_tab.is_none()
+            || active_tab.is_some_and(|tab| {
+                snapshot.active_window_index != Some(tab.window_index)
+                    || snapshot.active_tab_index != Some(tab.tab_index)
+            })))
+        || (snapshot.permission_status != "granted"
+            && (!snapshot.tabs.is_empty()
+                || active_count != 0
+                || snapshot.active_window_index.is_some()
+                || snapshot.active_tab_index.is_some()))
+    {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "invalid browser active tab".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO browser_snapshots
+         (source_key, captured_at, browser_bundle_id, browser_name, permission_status,
+          active_window_index, active_tab_index, reported_tab_count, truncated, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(source_key) DO NOTHING",
+        rusqlite::params![
+            snapshot.source_key,
+            snapshot.captured_at,
+            snapshot.browser_bundle_id,
+            snapshot.browser_name,
+            snapshot.permission_status,
+            snapshot.active_window_index,
+            snapshot.active_tab_index,
+            snapshot.reported_tab_count,
+            snapshot.truncated as i64,
+            snapshot.content_hash
+        ],
+    )?;
+    let (snapshot_id, stored_hash): (i64, String) = conn.query_row(
+        "SELECT id, content_hash FROM browser_snapshots WHERE source_key = ?1",
+        [&snapshot.source_key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if stored_hash != snapshot.content_hash {
+        return Err(crate::error::EnclaveError::InvalidRequest(
+            "browser snapshot source collision".into(),
+        ));
+    }
+    for tab in &snapshot.tabs {
+        if tab.window_index <= 0
+            || tab.tab_index <= 0
+            || tab
+                .title
+                .as_ref()
+                .is_some_and(|value| value.chars().count() > 1_000)
+            || tab
+                .url
+                .as_ref()
+                .is_some_and(|value| value.chars().count() > 4_096)
+            || tab
+                .url_scheme
+                .as_ref()
+                .is_some_and(|value| value.len() > 64)
+        {
+            return Err(crate::error::EnclaveError::InvalidRequest(
+                "invalid browser tab".into(),
+            ));
+        }
+        if let Some(url) = tab.url.as_deref() {
+            let parsed = reqwest::Url::parse(url).map_err(|_| {
+                crate::error::EnclaveError::InvalidRequest("invalid browser tab URL".into())
+            })?;
+            if tab.url_scheme.as_deref() != Some(parsed.scheme()) {
+                return Err(crate::error::EnclaveError::InvalidRequest(
+                    "browser tab URL scheme mismatch".into(),
+                ));
+            }
+        } else if tab.url_scheme.is_some() {
+            return Err(crate::error::EnclaveError::InvalidRequest(
+                "browser tab URL scheme without URL".into(),
+            ));
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO browser_tabs
+             (browser_snapshot_id, window_index, tab_index, title, url, url_scheme, is_active, is_loading)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![snapshot_id, tab.window_index, tab.tab_index, tab.title, tab.url,
+                tab.url_scheme, tab.is_active as i64, tab.is_loading.map(i64::from)],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_fallback_observation(
+    conn: &rusqlite::Connection,
+    screenshot_id: i64,
+    screenshot: &ScreenshotInput,
+    salient_ocr_text: Option<&str>,
+) -> Result<()> {
+    let input = crate::cp::screen_understanding::ScreenObservationInput {
+        screenshot_id,
+        source_key: screenshot
+            .source_key
+            .clone()
+            .unwrap_or_else(|| screenshot_id.to_string()),
+        captured_at: screenshot.captured_at.clone(),
+        capture_status: screenshot
+            .capture_status
+            .clone()
+            .unwrap_or_else(|| "legacy".into()),
+        primary_app: screenshot.active_app.clone(),
+        window_title: screenshot.window_title.clone(),
+        salient_ocr_text: salient_ocr_text.map(str::to_string),
+        ocr_text: screenshot.ocr_text.clone(),
+        active_url: screenshot.url.clone(),
+        visual_signals_json: screenshot
+            .visual_signals
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+        display_id: screenshot.display_id,
+        primary_bundle_id: screenshot.primary_bundle_id.clone(),
+        visible_windows_json: screenshot
+            .visible_windows
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+        // The asynchronous model worker resolves the complete, persisted
+        // browser snapshot after transactional ingest.
+        browser_context_json: None,
+    };
+    let revision = crate::cp::screen_understanding::compute_observation_input_revision(&input);
+    let fallback = crate::cp::screen_understanding::build_deterministic_fallback(&input, &revision);
+    conn.execute(
+        "INSERT INTO screen_observations
+         (screenshot_id, input_revision, observation_version, status, generation_method,
+          literal_description, screen_state, content_type, visible_text_summary,
+          notable_items_json, model_name, prompt_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(screenshot_id) DO UPDATE SET
+           input_revision=excluded.input_revision, status=excluded.status,
+           generation_method=excluded.generation_method,
+           literal_description=excluded.literal_description, screen_state=excluded.screen_state,
+           content_type=excluded.content_type, visible_text_summary=excluded.visible_text_summary,
+           notable_items_json=excluded.notable_items_json
+         WHERE screen_observations.input_revision != excluded.input_revision",
+        rusqlite::params![
+            fallback.screenshot_id,
+            fallback.input_revision,
+            fallback.observation_version,
+            fallback.status,
+            fallback.generation_method,
+            fallback.literal_description,
+            fallback.screen_state,
+            fallback.content_type,
+            fallback.visible_text_summary,
+            fallback.notable_items_json,
+            fallback.model_name,
+            fallback.prompt_version
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO screen_observation_jobs
+         (screenshot_id, input_revision, observation_version, state)
+         VALUES (?1, ?2, 1, 'fallback')
+         ON CONFLICT(screenshot_id) DO UPDATE SET input_revision=excluded.input_revision,
+           state='fallback', attempt_count=0, error_code=NULL
+         WHERE screen_observation_jobs.input_revision != excluded.input_revision",
+        rusqlite::params![screenshot_id, revision],
+    )?;
+    Ok(())
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────────
@@ -583,9 +918,94 @@ mod tests {
             url: None,
             image_hash: None,
             is_duplicate: None,
+            display_id: None,
+            capture_context_version: None,
+            capture_status: None,
+            primary_bundle_id: None,
+            primary_window_id: None,
+            capture_group_id: None,
+            visible_windows: None,
+            visible_windows_truncated: None,
+            visual_signals: None,
+            semantic_context_hash: None,
+            browser_snapshot_source_key: None,
+            browser_snapshot: None,
+            duplicate_of_source_key: None,
+            visible_until: None,
+            dedupe_version: None,
             source_key: source_key.map(String::from),
             embedding_b64: None,
         }
+    }
+
+    fn browser_snapshot() -> BrowserSnapshotInput {
+        let content_hash = "a".repeat(64);
+        BrowserSnapshotInput {
+            schema_version: 1,
+            source_key: format!("device-1:browser-v1:{content_hash}"),
+            captured_at: "2026-07-31T12:00:00Z".into(),
+            browser_bundle_id: "com.apple.Safari".into(),
+            browser_name: "Safari".into(),
+            permission_status: "granted".into(),
+            active_window_index: Some(1),
+            active_tab_index: Some(2),
+            reported_tab_count: 1,
+            truncated: false,
+            content_hash,
+            tabs: vec![BrowserTabInput {
+                window_index: 1,
+                tab_index: 2,
+                title: Some("Kioku".into()),
+                url: Some("https://kioku.dev/design".into()),
+                url_scheme: Some("https".into()),
+                is_active: true,
+                is_loading: Some(false),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_snapshot_validates_and_persists_active_tab() {
+        let store = make_store();
+        let snapshot = browser_snapshot();
+        let source_key = snapshot.source_key.clone();
+        store
+            .with_user("browser_snapshot", |conn| {
+                ingest_browser_snapshot(conn, &snapshot, Some(&source_key))
+            })
+            .await
+            .unwrap();
+
+        let stored: (String, String, i64) = store
+            .with_user("browser_snapshot", |conn| {
+                Ok(conn.query_row(
+                    "SELECT bs.permission_status, bt.url, bt.is_active
+                     FROM browser_snapshots bs
+                     JOIN browser_tabs bt ON bt.browser_snapshot_id=bs.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            ("granted".into(), "https://kioku.dev/design".into(), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_snapshot_rejects_claimed_scheme_mismatch() {
+        let store = make_store();
+        let mut snapshot = browser_snapshot();
+        snapshot.tabs[0].url_scheme = Some("http".into());
+        let source_key = snapshot.source_key.clone();
+        let result = store
+            .with_user("browser_snapshot_bad_scheme", |conn| {
+                ingest_browser_snapshot(conn, &snapshot, Some(&source_key))
+            })
+            .await;
+        assert!(result.is_err());
     }
 
     /// Inserting the same source_key twice: second call must be ignored (0 rows inserted).
@@ -641,6 +1061,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second, 0, "duplicate screenshot source_key must be ignored");
+
+        let observation: (i64, String, String) = store
+            .with_user("dedup_s", |conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*), status, screen_state FROM screen_observations",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(observation, (1, "fallback".into(), "content".into()));
+    }
+
+    #[tokio::test]
+    async fn duplicate_screen_has_no_independent_observation() {
+        let store = make_store();
+        let mut duplicate = scr(Some("dev:duplicate"));
+        duplicate.is_duplicate = Some(1);
+        store
+            .with_user("duplicate_screen", |conn| {
+                ingest_screenshots(conn, &[duplicate], true)
+            })
+            .await
+            .unwrap();
+        let count = store
+            .with_user("duplicate_screen", |conn| {
+                Ok(
+                    conn.query_row("SELECT count(*) FROM screen_observations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     /// Schema upgrade path: opening a fresh store twice must not error even
