@@ -1642,11 +1642,10 @@ async fn finalize_user_episodes_scoped(
             .collect::<Vec<_>>();
         let mut candidates = extract_candidates(&utts, &scrs);
         for candidate in browser_tab_candidates(&screenshot_rows) {
-            if !candidates.iter().any(|existing| {
-                existing.url == candidate.url
-                    && existing.record_type == candidate.record_type
-                    && existing.record_id == candidate.record_id
-            }) {
+            if !candidates
+                .iter()
+                .any(|existing| existing.url == candidate.url)
+            {
                 candidates.push(candidate);
             }
         }
