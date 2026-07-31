@@ -1,4 +1,4 @@
-//! Vertex AI client for episode summarization and semantic screen memory. Gemini
+//! Vertex AI client for episode summarization and unified episode analysis. Gemini
 //! `generateContent` uses a
 //! constrained `responseSchema`. Credentials come from the VM metadata server
 //! (cloud-platform scope), same pattern as the GCS/KMS clients.
@@ -97,28 +97,7 @@ pub async fn generate_custom(
     schema: Value,
     max_output_tokens: u32,
 ) -> Result<String> {
-    generate_custom_with_model(
-        config,
-        &config.vertex_model,
-        system,
-        user_message,
-        schema,
-        max_output_tokens,
-    )
-    .await
-}
-
-/// Call Gemini with an explicitly selected configured model. This exists so
-/// always-on screen enrichment can use a lower-cost model without becoming a
-/// feature flag or changing the episode summarizer model.
-pub async fn generate_custom_with_model(
-    config: &CpConfig,
-    model: &str,
-    system: &str,
-    user_message: &str,
-    schema: Value,
-    max_output_tokens: u32,
-) -> Result<String> {
+    let model = &config.vertex_model;
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }

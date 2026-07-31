@@ -2791,7 +2791,6 @@ mod tests {
                 vertex_project: "project".into(),
                 vertex_location: "location".into(),
                 vertex_model: "model".into(),
-                vertex_screen_model: "screen-model".into(),
                 quota_utterances_per_day: 1,
                 quota_screenshots_per_day: 1,
                 quota_mcp_calls_per_day: 1,

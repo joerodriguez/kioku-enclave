@@ -44,9 +44,9 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
   from inside the service. Synced OCR, app/window/URL and browser-tab metadata,
-  deterministic visual statistics, transcript context, and derived text are always sent
-  for literal screen observations and contextual episode-screen interpretations; raw
-  audio and screenshot pixels are never included.
+  deterministic visual statistics, transcript context, and derived text are sent together
+  for holistic episode analysis once an episode is settled; raw audio and screenshot
+  pixels are never included.
 - Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
@@ -229,7 +229,6 @@ docker build --platform linux/amd64 \
   --build-arg VERTEX_PROJECT=my-project \
   --build-arg VERTEX_LOCATION=us-central1 \
   --build-arg VERTEX_MODEL=gemini-2.5-flash \
-  --build-arg VERTEX_SCREEN_MODEL=gemini-2.5-flash-lite \
   --build-arg ENCLAVE_ACME=1 \
   --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
   --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
@@ -259,7 +258,6 @@ binding.
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
 | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
 | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration |
-| `VERTEX_SCREEN_MODEL` | Optional low-cost model for always-on screen observation/interpretation; defaults to `VERTEX_MODEL` and never disables processing |
 | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
