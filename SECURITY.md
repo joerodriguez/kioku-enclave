@@ -27,9 +27,12 @@ surfaces.
 - Payment processing; no billing provider is implemented here.
 - CPU-level microarchitectural side channels. Confidential Space provides VM memory
   encryption, not complete Spectre-class protection.
-- **Vertex Gemini inference confidentiality.** Summarisation sends selected text from
-  this process to Vertex under Google's no-data-retention API terms. The privacy claim is
-  “attested enclave + Google no-data-retention terms,” not enclave-only inference.
+- **Vertex Gemini inference confidentiality.** Core processing always sends synced
+  settled-episode transcripts, complete OCR, app/window/URL and browser-tab metadata,
+  deterministic visual statistics, and derived text together from this process to Vertex under Google's applicable
+  enterprise terms. Raw audio and screenshot pixels are excluded by typed request DTOs
+  and serialization tests. The privacy claim is “attested enclave + Google Vertex
+  inference,” not enclave-only inference.
 - **User-configured webhooks.** A finalized-episode event leaves the TEE only after a
   user adds an HTTPS destination. Events are content-free by default; full brief content
   is a separate opt-in and is then processed by that destination outside Kioku's trust
@@ -54,6 +57,9 @@ surfaces.
   memory. User content and key material must never be logged.
 - Legacy encrypted blobs are rejected unless a reviewed migration image explicitly
   bakes in `ENCLAVE_ALLOW_LEGACY_BLOBS=1`.
+- Unified episode-analysis requests contain text and metadata only. Code that builds a Vertex
+  request must not load an image object, image bytes, a signed image URL, or a local image
+  path. Cloud Screenshot Evidence consent controls pixel sync, not text inference.
 
 ## Key hierarchy and encrypted objects
 
@@ -207,7 +213,7 @@ compilation, and independent rebuild comparison.
 
 ### Vertex and user-configured webhooks cross the TEE boundary
 
-Episode summarisation and evidence verification send selected text to Google Vertex
+Episode summarisation and holistic settled-episode analysis send text and metadata to Google Vertex
 Gemini from this process. Google's no-data-retention terms apply, but the data is outside
 the Confidential Space boundary while Vertex processes it. Webhook events similarly
 leave Confidential Space for the user-selected destination. They are content-free by

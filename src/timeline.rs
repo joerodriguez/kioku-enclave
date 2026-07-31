@@ -130,17 +130,19 @@ fn fetch_context_screenshots(
 ) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT id, captured_at, active_app, window_title, ocr_text, url,
-               ocr_status, image_hash, is_duplicate, source_key, created_at
+        SELECT s.id, s.captured_at, s.active_app, s.window_title, s.ocr_text, s.url,
+               s.ocr_status, s.image_hash, s.is_duplicate, s.source_key, s.created_at,
+               o.status, o.literal_description, o.screen_state, o.content_type
         FROM (
             SELECT id
             FROM screenshots
-            WHERE captured_at >= ?1 AND captured_at < ?2
+            WHERE captured_at >= ?1 AND captured_at < ?2 AND is_duplicate = 0
             ORDER BY ABS(julianday(captured_at) - julianday(?3))
             LIMIT ?4
         ) AS nearest
-        JOIN screenshots USING (id)
-        ORDER BY captured_at ASC
+        JOIN screenshots s USING (id)
+        LEFT JOIN screen_observations o ON o.screenshot_id=s.id
+        ORDER BY s.captured_at ASC
     "#,
     )?;
 
@@ -220,11 +222,12 @@ fn fetch_range(conn: &rusqlite::Connection, req: &RangeRequest) -> Result<Value>
     if want_screenshots {
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, captured_at, active_app, window_title, ocr_text, url,
-                   ocr_status, image_hash, is_duplicate, source_key, created_at
-            FROM screenshots
-            WHERE captured_at >= ?1 AND captured_at < ?2
-            ORDER BY captured_at ASC
+            SELECT s.id, s.captured_at, s.active_app, s.window_title, s.ocr_text, s.url,
+                   s.ocr_status, s.image_hash, s.is_duplicate, s.source_key, s.created_at,
+                   o.status, o.literal_description, o.screen_state, o.content_type
+            FROM screenshots s LEFT JOIN screen_observations o ON o.screenshot_id=s.id
+            WHERE s.captured_at >= ?1 AND s.captured_at < ?2 AND s.is_duplicate = 0
+            ORDER BY s.captured_at ASC
             LIMIT ?3
         "#,
         )?;
@@ -312,7 +315,7 @@ fn utterance_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     }))
 }
 
-/// Deserialise a screenshots row (11 columns) to JSON.
+/// Deserialise a screenshot plus its literal observation to JSON.
 fn screenshot_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(json!({
         "id":           row.get::<_, i64>(0)?,
@@ -326,6 +329,10 @@ fn screenshot_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "is_duplicate": row.get::<_, i64>(8)?,
         "source_key":   row.get::<_, Option<String>>(9)?,
         "created_at":   row.get::<_, String>(10)?,
+        "observation_status": row.get::<_, Option<String>>(11)?,
+        "literal_description": row.get::<_, Option<String>>(12)?,
+        "screen_state": row.get::<_, Option<String>>(13)?,
+        "content_type": row.get::<_, Option<String>>(14)?,
     }))
 }
 

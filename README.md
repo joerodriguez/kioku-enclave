@@ -43,7 +43,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
-  from inside the service.
+  from inside the service. Synced OCR, app/window/URL and browser-tab metadata,
+  deterministic visual statistics, transcript context, and derived text are sent together
+  for holistic episode analysis once an episode is settled; raw audio and screenshot
+  pixels are never included.
 - Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
@@ -254,7 +257,7 @@ binding.
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
 | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
-| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex inference configuration |
+| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration |
 | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |

@@ -27,6 +27,7 @@ pub(crate) mod mcp_safety;
 pub mod oauth;
 pub mod query;
 pub mod reviewer;
+pub mod screen_understanding;
 pub mod summarizer;
 pub mod sync;
 pub mod tokens;
@@ -233,6 +234,8 @@ impl CpConfig {
             })
         };
 
+        let vertex_model = config_value("VERTEX_MODEL", "gemini-2.5-flash")?;
+
         Ok(Self {
             base_url,
             jwt_secrets,
@@ -251,7 +254,7 @@ impl CpConfig {
                 .filter(|s| !s.is_empty()),
             vertex_project: config_value("VERTEX_PROJECT", "test-project")?,
             vertex_location: config_value("VERTEX_LOCATION", "us-central1")?,
-            vertex_model: config_value("VERTEX_MODEL", "gemini-2.5-flash")?,
+            vertex_model,
             quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000)?,
             quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000)?,
             quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000)?,
