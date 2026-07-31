@@ -69,7 +69,7 @@ pub const MAX_USER_ID_LEN: usize = 128;
 
 /// Canonical brief schema/prompt version. Keeping it beside the persistence
 /// migration prevents a worker bump from forgetting to queue stored briefs.
-pub(crate) const EPISODE_FINALIZATION_VERSION: i32 = 4;
+pub(crate) const EPISODE_FINALIZATION_VERSION: i32 = 5;
 
 /// Validate a caller-supplied `user_id` before it is used to derive any
 /// filesystem path or GCS object name.
@@ -1794,7 +1794,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn finalization_v4_migration_queues_stale_briefs_and_keeps_current_complete() {
+    fn finalization_v5_migration_queues_stale_briefs_and_keeps_current_complete() {
         init_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -1804,9 +1804,9 @@ pub(crate) mod tests {
               finalization_status, finalization_error)
              VALUES
              (1, '2026-07-01T09:00:00Z', '2026-07-01T10:00:00Z', 'stale',
-              '2026-07-01T14:00:00Z', 3, 'complete', 'old error'),
+              '2026-07-01T14:00:00Z', 4, 'complete', 'old error'),
              (2, '2026-07-02T09:00:00Z', '2026-07-02T10:00:00Z', 'current',
-              '2026-07-02T14:00:00Z', 4, 'processing', 'old error')",
+              '2026-07-02T14:00:00Z', 5, 'processing', 'old error')",
             [],
         )
         .unwrap();

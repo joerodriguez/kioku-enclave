@@ -243,43 +243,17 @@ async fn sync_batch(
     // A newly persisted settled watermark can make a pending episode eligible
     // immediately. Keep this detached from the sync response: the periodic
     // scheduler remains the retry path if finalization itself fails.
-    let trigger_screen_enrichment = ingest_resp.screenshots_inserted > 0;
-    if trigger_finalization || trigger_screen_enrichment {
+    if trigger_finalization {
         let state = Arc::clone(&s);
         let finalizer_user = user_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = super::screen_understanding::process_pending_screen_observations(
-                &state,
-                &finalizer_user,
-            )
-            .await
+            if let Err(e) = super::finalizer::finalize_user_episodes(&state, &finalizer_user).await
             {
                 warn!(
                     user_id = %finalizer_user,
                     error = %e,
-                    "post-sync screen observation enrichment failed"
+                    "post-sync episode finalization failed"
                 );
-            }
-            if let Err(e) =
-                super::screen_understanding::ensure_episode_interpretations(&state, &finalizer_user)
-                    .await
-            {
-                warn!(
-                    user_id = %finalizer_user,
-                    error = %e,
-                    "post-sync screen interpretation failed"
-                );
-            }
-            if trigger_finalization {
-                if let Err(e) =
-                    super::finalizer::finalize_user_episodes(&state, &finalizer_user).await
-                {
-                    warn!(
-                        user_id = %finalizer_user,
-                        error = %e,
-                        "post-sync episode finalization failed"
-                    );
-                }
             }
         });
     }

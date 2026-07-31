@@ -59,7 +59,7 @@ The public build validates these non-secret GitHub Actions variables before Dock
 | Internal KMS attestation exchange | `ENCLAVE_ATTEST_STS_AUDIENCE` |
 | OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
 | Synthetic plugin reviewer | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` |
-| Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL`; optional `VERTEX_SCREEN_MODEL` defaults to `VERTEX_MODEL` |
+| Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
 | Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |
 
 Set them in GitHub Settings → Secrets and variables → Actions or with

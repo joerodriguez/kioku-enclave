@@ -51,7 +51,6 @@ name: Build & push enclave image
 #   VERTEX_PROJECT            GCP project for episode summarization
 #   VERTEX_LOCATION           Vertex region (e.g. us-central1)
 #   VERTEX_MODEL              Vertex model name
-#   VERTEX_SCREEN_MODEL       Optional semantic-screen model; empty uses VERTEX_MODEL
 #   ENCLAVE_ACME              Must be 1 for production in-enclave TLS
 #   ENCLAVE_ACME_DIRECTORY    ACME directory URL
 #
@@ -166,7 +165,6 @@ jobs:
           VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
-          VERTEX_SCREEN_MODEL: ${{ vars.VERTEX_SCREEN_MODEL }}
           ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
           ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
           ENCLAVE_ACME_CONTACT: ${{ secrets.ENCLAVE_ACME_CONTACT }}
@@ -216,7 +214,6 @@ jobs:
                   "GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "IMAGE_NAME", "PROJECT_ID",
                   "REGION", "REVIEWER_AUTH_API_KEY", "REVIEWER_AUTH_EMAIL", "REVIEWER_AUTH_UID",
                   "VERTEX_LOCATION", "VERTEX_MODEL", "VERTEX_PROJECT", "WEB_ORIGIN",
-                  "VERTEX_SCREEN_MODEL",
               } and any(ord(char) < 32 or ord(char) == 127 for char in os.environ[name]):
                   raise SystemExit(f"control character in repository configuration: {name}")
 
@@ -241,8 +238,6 @@ jobs:
               require_pattern(name, r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
           require_pattern("ENCLAVE_GCS_BUCKET", r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
           require_pattern("VERTEX_MODEL", r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}")
-          if os.environ.get("VERTEX_SCREEN_MODEL"):
-              require_pattern("VERTEX_SCREEN_MODEL", r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}")
 
           def require_https(name, origin_only=False):
               value = os.environ[name]
@@ -286,7 +281,6 @@ jobs:
           VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
-          VERTEX_SCREEN_MODEL: ${{ vars.VERTEX_SCREEN_MODEL }}
           ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
           ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
           ENCLAVE_ACME_CONTACT: ${{ secrets.ENCLAVE_ACME_CONTACT }}
@@ -324,7 +318,6 @@ jobs:
             --build-arg VERTEX_PROJECT="${VERTEX_PROJECT}" \
             --build-arg VERTEX_LOCATION="${VERTEX_LOCATION}" \
             --build-arg VERTEX_MODEL="${VERTEX_MODEL}" \
-            --build-arg VERTEX_SCREEN_MODEL="${VERTEX_SCREEN_MODEL}" \
             --build-arg ENCLAVE_ACME="${ENCLAVE_ACME}" \
             --build-arg ENCLAVE_ACME_DIRECTORY="${ENCLAVE_ACME_DIRECTORY}" \
             --build-arg ENCLAVE_ACME_CONTACT="${ENCLAVE_ACME_CONTACT}" \

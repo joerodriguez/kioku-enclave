@@ -1472,11 +1472,6 @@ pub async fn summarize_all(state: &CpState) {
     let failing = FAILING.get_or_init(|| Mutex::new(HashMap::new()));
 
     for id in ids {
-        if let Err(e) =
-            super::screen_understanding::process_pending_screen_observations(state, &id).await
-        {
-            warn!(user_id = %id, error = %e, "screen observation enrichment failed");
-        }
         for _ in 0..MAX_WINDOWS_PER_SWEEP {
             match summarize_user(state, &id).await {
                 // Cursor advanced (episodes emitted or empty span consumed) —
@@ -1539,11 +1534,6 @@ pub async fn summarize_all(state: &CpState) {
             }
         }
 
-        if let Err(e) =
-            super::screen_understanding::ensure_episode_interpretations(state, &id).await
-        {
-            warn!(user_id = %id, error = %e, "screen interpretation materialization failed");
-        }
         if let Err(e) = super::finalizer::finalize_user_episodes(state, &id).await {
             warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
         }
