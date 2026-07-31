@@ -139,6 +139,18 @@ pub(crate) async fn dump_user_export(
             let final_briefs = dump_table(conn, "SELECT * FROM episode_final_briefs ORDER BY episode_id")?;
             let webhook_deliveries =
                 dump_table(conn, "SELECT * FROM webhook_deliveries ORDER BY episode_id, subscription_id")?;
+            let email_deliveries = {
+                let table_exists: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='email_deliveries'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if table_exists > 0 {
+                    dump_table(conn, "SELECT * FROM email_deliveries ORDER BY episode_id, delivery_version")?
+                } else {
+                    Vec::new()
+                }
+            };
             Ok(json!({
                 "utterances": utterances,
                 "screenshots": screenshots,
@@ -146,6 +158,7 @@ pub(crate) async fn dump_user_export(
                 "episodes": episodes,
                 "episode_final_briefs": final_briefs,
                 "webhook_deliveries": webhook_deliveries,
+                "email_deliveries": email_deliveries,
             }))
         })
         .await
@@ -542,6 +555,18 @@ async fn main() {
     // eat the cold start; absence is non-fatal (FTS-only mode).
     let embedding_engine = embedding::EmbeddingEngine::from_env();
 
+    let resend_api_key = std::env::var("RESEND_API_KEY").ok();
+    let email_from_address = std::env::var("EMAIL_FROM_ADDRESS")
+        .unwrap_or_else(|_| "Kioku <notifications@notify.kiokuu.com>".to_string());
+
+    let email_transport: Option<Arc<dyn cp::email_worker::EmailTransport>> =
+        resend_api_key.map(|key| {
+            Arc::new(cp::email_worker::ResendTransport::new(
+                key,
+                email_from_address,
+            )) as Arc<dyn cp::email_worker::EmailTransport>
+        });
+
     let cp_state = Arc::new(cp::CpState {
         store: Arc::clone(&store),
         control: control_store,
@@ -555,6 +580,8 @@ async fn main() {
         sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
         mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
         oauth_limiter: cp::limits::RateLimiter::new(120.0, 2.0),
+        test_email_limiter: cp::limits::RateLimiter::new(3.0, 0.05),
+        email_transport,
         config: cp_config,
         embedding: embedding_engine,
     });

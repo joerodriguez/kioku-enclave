@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::{
+    cp::isotime,
     crypto::{decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, KmsClient},
     error::{EnclaveError, Result},
     store::GcsClient,
@@ -113,6 +114,13 @@ CREATE TABLE IF NOT EXISTS webhook_subscriptions (
 );
 CREATE INDEX IF NOT EXISTS webhook_subscriptions_user_idx
     ON webhook_subscriptions(user_id);
+CREATE TABLE IF NOT EXISTS episode_email_preferences (
+    user_id          TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    enabled          INTEGER NOT NULL DEFAULT 0,
+    include_content  INTEGER NOT NULL DEFAULT 0,
+    consented_at     TEXT,
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 -- ADR-0012 removes Gmail delivery and its stored OAuth credentials.
 DROP TABLE IF EXISTS user_gmail_configs;
 "#;
@@ -191,6 +199,15 @@ pub struct WebhookSubscription {
     pub include_content: bool,
     pub enabled: bool,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EpisodeEmailPreference {
+    pub enabled: bool,
+    pub include_content: bool,
+    pub recipient_email: String,
+    pub consented_at: Option<String>,
+    pub updated_at: String,
 }
 
 #[cfg(test)]
@@ -275,6 +292,10 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<bool> {
         "DELETE FROM webhook_subscriptions WHERE user_id = ?1",
         [user_id],
     )?;
+    tx.execute(
+        "DELETE FROM episode_email_preferences WHERE user_id = ?1",
+        [user_id],
+    )?;
     let deleted = tx.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
     tx.commit()?;
     Ok(deleted == 1)
@@ -311,6 +332,11 @@ fn begin_user_deletion_conn(conn: &Connection, user_id: &str) -> Result<bool> {
     tx.execute(
         "UPDATE webhook_subscriptions SET enabled = 0, \
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "UPDATE episode_email_preferences SET enabled = 0, include_content = 0, \
+         consented_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
         [user_id],
     )?;
     tx.commit()?;
@@ -725,6 +751,10 @@ impl ControlStore {
                             "UPDATE webhook_subscriptions SET user_id = ?1 WHERE user_id = ?2",
                             rusqlite::params![stable_id, old_id],
                         )?;
+                        conn.execute(
+                            "UPDATE episode_email_preferences SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
                     } else {
                         conn.execute(
                             "UPDATE users SET email = ?1 WHERE google_sub = ?2",
@@ -960,6 +990,137 @@ impl ControlStore {
         })
         .await
     }
+
+    pub async fn get_email_preference(&self, user_id: &str) -> Result<EpisodeEmailPreference> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            let (email, status): (String, String) = conn
+                .query_row(
+                    "SELECT email, status FROM users WHERE id = ?1",
+                    [&user_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| EnclaveError::Auth("unknown user".into()))?;
+
+            if status != "active" {
+                return Err(EnclaveError::Auth("account inactive or deleting".into()));
+            }
+
+            let pref = conn
+                .query_row(
+                    "SELECT enabled, include_content, consented_at, updated_at \
+                     FROM episode_email_preferences WHERE user_id = ?1",
+                    [&user_id],
+                    |r| {
+                        let enabled_num: i64 = r.get(0)?;
+                        let include_num: i64 = r.get(1)?;
+                        Ok(EpisodeEmailPreference {
+                            enabled: enabled_num != 0,
+                            include_content: include_num != 0,
+                            recipient_email: email.clone(),
+                            consented_at: r.get(2)?,
+                            updated_at: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+
+            Ok(pref.unwrap_or_else(|| EpisodeEmailPreference {
+                enabled: false,
+                include_content: false,
+                recipient_email: email,
+                consented_at: None,
+                updated_at: isotime::format_epoch_millis(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                ),
+            }))
+        })
+        .await
+    }
+
+    pub async fn set_email_preference(
+        &self,
+        user_id: &str,
+        enabled: bool,
+        mut include_content: bool,
+    ) -> Result<EpisodeEmailPreference> {
+        let user_id = user_id.to_string();
+        self.write(move |conn| {
+            let (email, status): (String, String) = conn
+                .query_row("SELECT email, status FROM users WHERE id = ?1", [&user_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?
+                .ok_or_else(|| EnclaveError::Auth("unknown user".into()))?;
+
+            if status != "active" {
+                return Err(EnclaveError::InvalidRequest(
+                    "cannot update email preferences for inactive or deleting user".into(),
+                ));
+            }
+
+            if !enabled {
+                include_content = false;
+            }
+
+            let now = isotime::format_epoch_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+            );
+
+            let existing_consent: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT consented_at FROM episode_email_preferences WHERE user_id = ?1",
+                    [&user_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            let consented_at = match (enabled, include_content) {
+                (false, _) => None,
+                (true, true) => {
+                    if let Some(Some(prev)) = existing_consent {
+                        Some(prev)
+                    } else {
+                        Some(now.clone())
+                    }
+                }
+                (true, false) => existing_consent.flatten(),
+            };
+
+            conn.execute(
+                "INSERT INTO episode_email_preferences (user_id, enabled, include_content, consented_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    include_content = excluded.include_content,
+                    consented_at = excluded.consented_at,
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    user_id,
+                    if enabled { 1 } else { 0 },
+                    if include_content { 1 } else { 0 },
+                    consented_at,
+                    now,
+                ],
+            )?;
+
+            Ok(EpisodeEmailPreference {
+                enabled,
+                include_content,
+                recipient_email: email,
+                consented_at,
+                updated_at: now,
+            })
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1186,5 +1347,63 @@ mod tests {
         assert!(!path.exists());
         assert!(!wal.exists());
         assert!(!shm.exists());
+    }
+
+    #[tokio::test]
+    async fn email_preference_lifecycle_and_deletion() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let store = ControlStore::new(kms, gcs);
+
+        let user = store
+            .upsert_user("google-sub-email-test", "user@example.com")
+            .await
+            .unwrap();
+
+        // 1. Missing row is disabled by default
+        let default_pref = store.get_email_preference(&user.id).await.unwrap();
+        assert!(!default_pref.enabled);
+        assert!(!default_pref.include_content);
+        assert_eq!(default_pref.recipient_email, "user@example.com");
+        assert!(default_pref.consented_at.is_none());
+
+        // 2. Enable notification-only
+        let notif_pref = store
+            .set_email_preference(&user.id, true, false)
+            .await
+            .unwrap();
+        assert!(notif_pref.enabled);
+        assert!(!notif_pref.include_content);
+        assert!(notif_pref.consented_at.is_none());
+
+        // 3. Enable full content sets consent timestamp
+        let full_pref = store
+            .set_email_preference(&user.id, true, true)
+            .await
+            .unwrap();
+        assert!(full_pref.enabled);
+        assert!(full_pref.include_content);
+        assert!(full_pref.consented_at.is_some());
+
+        // 4. Disable clears include_content and consent
+        let disabled_pref = store
+            .set_email_preference(&user.id, false, true)
+            .await
+            .unwrap();
+        assert!(!disabled_pref.enabled);
+        assert!(!disabled_pref.include_content);
+        assert!(disabled_pref.consented_at.is_none());
+
+        // 5. Inactive / deleting user cannot be enabled
+        store.begin_user_deletion(&user.id).await.unwrap();
+        assert!(store
+            .set_email_preference(&user.id, true, false)
+            .await
+            .is_err());
+
+        let pref_during_deletion = store.get_email_preference(&user.id).await;
+        assert!(pref_during_deletion.is_err());
     }
 }

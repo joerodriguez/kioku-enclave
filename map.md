@@ -22,7 +22,7 @@ OAuth clients and legacy service-identity integrations
    THIS SERVICE (Confidential Space VM, SEV)
         ├── context-bound AES-256-GCM blobs ──► GCS (ciphertext only)
         ├── attestation-derived credentials ─► Cloud KMS
-        └── documented plaintext egress ─────► Vertex / user-configured webhooks
+        └── documented plaintext egress ─────► Vertex / Resend transactional email / user-configured webhooks
 ```
 
 The control plane is part of this process. Plaintext databases live only in process memory

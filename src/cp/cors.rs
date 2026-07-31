@@ -106,6 +106,8 @@ mod tests {
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
+            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
+            email_transport: None,
             embedding: None,
         });
 

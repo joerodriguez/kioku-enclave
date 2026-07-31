@@ -1337,6 +1337,13 @@ async fn finalize_user_episodes_scoped(
             .map(|subscription| (subscription.id, super::webhook_worker::new_event_id()))
             .collect();
 
+        let email_preference = state
+            .control
+            .get_email_preference(user_id)
+            .await
+            .ok()
+            .filter(|pref| pref.enabled);
+
         // 8. Optimistic commit transaction
         let user_cloned4 = user.clone();
         let ep_id = ep.id;
@@ -1385,7 +1392,7 @@ async fn finalize_user_episodes_scoped(
             // repairs update the canonical web/export brief without replaying
             // the same historical episode to external automations.
             let deliveries_enqueued =
-                mode.should_enqueue_delivery(!webhook_destinations.is_empty());
+                mode.should_enqueue_delivery(!webhook_destinations.is_empty() || email_preference.is_some());
             if deliveries_enqueued {
                 for (subscription_id, event_id) in &webhook_destinations {
                     conn.execute(
@@ -1398,6 +1405,28 @@ async fn finalize_user_episodes_scoped(
                             FINALIZATION_VERSION,
                             event_id
                         ]
+                    )?;
+                }
+
+                if let Some(ref pref) = email_preference {
+                    let delivery_id = format!("deliv_{}", super::tokens::random_token_hex());
+                    let now = isotime::format_epoch_millis(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                    );
+                    conn.execute(
+                        "INSERT OR IGNORE INTO email_deliveries
+                            (episode_id, delivery_version, delivery_id, include_content, state, attempt_count, next_attempt_at, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5, ?5)",
+                        rusqlite::params![
+                            ep_id,
+                            FINALIZATION_VERSION,
+                            delivery_id,
+                            if pref.include_content { 1 } else { 0 },
+                            now,
+                        ],
                     )?;
                 }
             }

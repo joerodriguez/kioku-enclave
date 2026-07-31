@@ -127,6 +127,14 @@ pub fn router() -> Router<Arc<CpState>> {
             axum::routing::delete(rest_delete_webhook),
         )
         .route("/api/webhooks/{id}/test", post(rest_test_webhook))
+        .route(
+            "/api/preferences/episode-email",
+            get(rest_get_episode_email_preference).put(rest_put_episode_email_preference),
+        )
+        .route(
+            "/api/preferences/episode-email/test",
+            post(rest_test_episode_email),
+        )
 }
 
 // ── Tool implementations (shared by MCP + REST) ─────────────────────────────────
@@ -2638,6 +2646,147 @@ async fn rest_test_webhook(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateEpisodeEmailPreferenceRequest {
+    enabled: bool,
+    #[serde(default)]
+    include_content: bool,
+}
+
+async fn rest_get_episode_email_preference(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let available = s.email_transport.is_some();
+    match s.control.get_email_preference(&user.0).await {
+        Ok(pref) => (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "enabled": pref.enabled,
+                "include_content": pref.include_content,
+                "recipient_email": pref.recipient_email,
+                "available": available,
+            })),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn rest_put_episode_email_preference(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<UpdateEpisodeEmailPreferenceRequest>,
+) -> Response {
+    let available = s.email_transport.is_some();
+    match s
+        .control
+        .set_email_preference(&user.0, req.enabled, req.include_content)
+        .await
+    {
+        Ok(pref) => (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "enabled": pref.enabled,
+                "include_content": pref.include_content,
+                "recipient_email": pref.recipient_email,
+                "available": available,
+            })),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn rest_test_episode_email(
+    State(s): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let Some(ref transport) = s.email_transport else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "error": "native email delivery is unavailable",
+                "code": "email_unavailable"
+            })),
+        )
+            .into_response();
+    };
+
+    if !s.test_email_limiter.consume(&user.0).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "error": "rate limit exceeded for test emails",
+                "code": "rate_limited"
+            })),
+        )
+            .into_response();
+    }
+
+    let pref = match s.control.get_email_preference(&user.0).await {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+
+    let now_iso = crate::cp::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+
+    let synthetic_episode = crate::cp::delivery::FinalizedEpisode {
+        episode_id: 0,
+        title: "Test Message".into(),
+        started_at: now_iso.clone(),
+        ended_at: now_iso.clone(),
+        finalized_at: now_iso,
+        episode_type: None,
+        participants: Vec::new(),
+        overview: "".into(),
+        decisions: Vec::new(),
+        action_items: Vec::new(),
+        important_links: Vec::new(),
+        open_questions: Vec::new(),
+    };
+
+    let subject = super::email_renderer::render_email_subject(&synthetic_episode, false);
+    let (text_body, html_body) =
+        super::email_renderer::render_email_body(&synthetic_episode, false, &s.config.web_origin);
+
+    let req = super::email_worker::EmailRequest {
+        to: pref.recipient_email,
+        subject,
+        text_body,
+        html_body,
+        idempotency_key: format!("test_{}", super::tokens::random_token_hex()),
+    };
+
+    match transport.send(req).await {
+        Ok(_) => (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(json!({"ok": true, "message": "Test email sent"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "error": "failed to send test email",
+                "code": "email_unavailable"
+            })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2673,6 +2822,8 @@ mod tests {
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
+            email_transport: None,
             embedding: None,
         })
     }
@@ -3580,6 +3731,8 @@ mod tests {
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
+            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
+            email_transport: None,
             config: Arc::new(
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
@@ -3655,6 +3808,8 @@ mod tests {
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
+            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
+            email_transport: None,
             config: Arc::new(
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
@@ -3680,5 +3835,61 @@ mod tests {
             "Offset -04:00 query should find the episode at 23:51 UTC"
         );
         assert_eq!(res["episodes"][0]["id"], 500);
+    }
+
+    #[tokio::test]
+    async fn rest_episode_email_preferences_get_put_test() {
+        let store = Arc::new(Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new())));
+        let control = Arc::new(crate::cp::control_store::ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
+
+        let user = control
+            .upsert_user("google-sub-query-test", "query_user@example.com")
+            .await
+            .unwrap();
+
+        let s = Arc::new(CpState {
+            store,
+            control,
+            config: Arc::new(
+                crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
+            ),
+            user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
+            reviewer_verifier: None,
+            sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
+            mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
+            oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
+            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
+            email_transport: Some(Arc::new(crate::cp::email_worker::FakeEmailTransport::new())),
+            embedding: None,
+        });
+
+        // 1. GET default preference
+        let resp = rest_get_episode_email_preference(
+            State(s.clone()),
+            Extension(AuthUser(user.id.clone())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 2. PUT enable notification-only
+        let put_req = UpdateEpisodeEmailPreferenceRequest {
+            enabled: true,
+            include_content: false,
+        };
+        let resp_put = rest_put_episode_email_preference(
+            State(s.clone()),
+            Extension(AuthUser(user.id.clone())),
+            Json(put_req),
+        )
+        .await;
+        assert_eq!(resp_put.status(), StatusCode::OK);
+
+        // 3. POST test email
+        let resp_test =
+            rest_test_episode_email(State(s.clone()), Extension(AuthUser(user.id.clone()))).await;
+        assert_eq!(resp_test.status(), StatusCode::OK);
     }
 }
