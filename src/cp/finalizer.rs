@@ -86,6 +86,11 @@ struct ScreenshotEvidenceRow {
     ocr_text: Option<String>,
     salient_ocr_text: Option<String>,
     is_duplicate: bool,
+    literal_description: Option<String>,
+    activity_summary: Option<String>,
+    relevance_reason: Option<String>,
+    milestone_type: Option<String>,
+    key_rank: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,17 +553,37 @@ fn render_capture_log(
             .as_deref()
             .map(crate::ocr::extract_screen_facts)
             .unwrap_or_default();
+        let observation = compact_capture_field(
+            screenshot
+                .literal_description
+                .as_deref()
+                .unwrap_or("<none>"),
+            1_000,
+        );
+        let activity = compact_capture_field(
+            screenshot.activity_summary.as_deref().unwrap_or("<none>"),
+            1_000,
+        );
+        let relevance = compact_capture_field(
+            screenshot.relevance_reason.as_deref().unwrap_or("<none>"),
+            500,
+        );
         entries.push(RenderedEvidenceEntry {
             at_ms: screenshot.captured_at_ms,
             record_order: 1,
             record_id: screenshot.id,
             line: format!(
-                "[screenshot-evidence] ID: {} | At: {} | App: {} | Window: {} | URL: {} | Salient OCR: {} | Screen facts: {}",
+                "[screenshot-evidence] ID: {} | At: {} | App: {} | Window: {} | URL: {} | Literal observation: {} | Episode activity: {} | Relevance: {} | Milestone: {} | Key rank: {} | Salient OCR: {} | Screen facts: {}",
                 screenshot.id,
                 screenshot.captured_at,
                 serde_json::to_string(&app).unwrap_or_else(|_| "\"\"".into()),
                 serde_json::to_string(&window).unwrap_or_else(|_| "\"\"".into()),
                 serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&observation).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&activity).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&relevance).unwrap_or_else(|_| "\"\"".into()),
+                screenshot.milestone_type.as_deref().unwrap_or("none"),
+                screenshot.key_rank.map(|rank| rank.to_string()).unwrap_or_else(|| "<none>".into()),
                 serde_json::to_string(&ocr).unwrap_or_else(|_| "\"\"".into()),
                 serde_json::to_string(&screen_facts).unwrap_or_else(|_| "[]".into()),
             ),
@@ -880,6 +905,13 @@ async fn finalize_user_episodes_scoped(
     user_id: &str,
     target_episode_id: Option<i64>,
 ) -> Result<()> {
+    // Final briefs must consume the best available semantic screen memory.
+    // Both workers are always-on for synced text/metadata and retain bounded
+    // deterministic fallbacks when Vertex is unavailable. Neither reads
+    // screenshot image objects or sends pixels.
+    super::screen_understanding::process_pending_screen_observations(state, user_id).await?;
+    super::screen_understanding::ensure_episode_interpretations(state, user_id).await?;
+
     // Scheduler sweeps and user-triggered scoped retries can overlap. Serialize
     // per user so only one model call can target a given episode history at a
     // time, without making one account wait behind another account's sweep.
@@ -1082,10 +1114,15 @@ async fn finalize_user_episodes_scoped(
 
                 let mut s_stmt = conn.prepare(
                     "SELECT s.id, s.captured_at, s.active_app, s.window_title, \
-                            s.url, s.ocr_text, s.salient_ocr_text, s.is_duplicate \
+                            s.url, s.ocr_text, s.salient_ocr_text, s.is_duplicate, \
+                            o.literal_description, i.activity_summary, i.relevance_reason, \
+                            i.milestone_type, i.key_rank \
                      FROM screenshots s \
                      JOIN episode_members m \
                        ON m.record_type = 'screenshot' AND m.record_id = s.id \
+                     LEFT JOIN screen_observations o ON o.screenshot_id=s.id \
+                     LEFT JOIN episode_screen_interpretations i \
+                       ON i.episode_id=m.episode_id AND i.screenshot_id=s.id \
                      WHERE m.episode_id = ?1 \
                      ORDER BY s.captured_at ASC, s.id ASC",
                 )?;
@@ -1102,6 +1139,11 @@ async fn finalize_user_episodes_scoped(
                             ocr_text: row.get(5)?,
                             salient_ocr_text: row.get(6)?,
                             is_duplicate: row.get::<_, i64>(7)? != 0,
+                            literal_description: row.get(8)?,
+                            activity_summary: row.get(9)?,
+                            relevance_reason: row.get(10)?,
+                            milestone_type: row.get(11)?,
+                            key_rank: row.get(12)?,
                         })
                     })?
                     .filter_map(|x| x.ok())
@@ -1488,8 +1530,8 @@ mod tests {
     }
 
     #[test]
-    fn finalizer_v3_requires_concrete_user_directed_and_grounded_takeaways() {
-        assert_eq!(FINALIZATION_VERSION, 3);
+    fn finalizer_v4_requires_semantic_screens_and_grounded_takeaways() {
+        assert_eq!(FINALIZATION_VERSION, 4);
         assert!(FINALIZER_SYSTEM_PROMPT.contains("explicit requirements or instructions"));
         assert!(FINALIZER_SYSTEM_PROMPT.contains("amounts, dates, deadlines"));
         assert!(FINALIZER_SYSTEM_PROMPT.contains("Do not produce a topic inventory"));
@@ -1511,7 +1553,7 @@ mod tests {
 
     #[test]
     fn current_briefs_are_terminal_but_initial_finalization_may_enqueue() {
-        let current = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(3));
+        let current = finalization_mode(Some("2026-07-01T12:00:00Z"), Some(4));
         assert_eq!(current, FinalizationMode::AlreadyCurrent);
         assert!(!current.should_enqueue_delivery(true));
 
@@ -1578,6 +1620,11 @@ mod tests {
             )),
             salient_ocr_text: None,
             is_duplicate: false,
+            literal_description: None,
+            activity_summary: None,
+            relevance_reason: None,
+            milestone_type: None,
+            key_rank: None,
         };
         let screenshots = vec![
             ScreenshotEvidenceRow {
@@ -1594,6 +1641,11 @@ mod tests {
                 ),
                 salient_ocr_text: None,
                 is_duplicate: false,
+                literal_description: None,
+                activity_summary: None,
+                relevance_reason: None,
+                milestone_type: None,
+                key_rank: None,
             },
             screenshot(7, "2026-07-22T12:40:29Z", "MARY POPPINS"),
             screenshot(8, "2026-07-22T12:40:35Z", "MARY POPPINS RETURNS"),
@@ -1669,6 +1721,11 @@ mod tests {
                 ocr_text: Some("Fee: 99 EUR".into()),
                 salient_ocr_text: None,
                 is_duplicate: false,
+                literal_description: None,
+                activity_summary: None,
+                relevance_reason: None,
+                milestone_type: None,
+                key_rank: None,
             },
             ScreenshotEvidenceRow {
                 id: 8,
@@ -1680,6 +1737,11 @@ mod tests {
                 ocr_text: Some("must not appear".into()),
                 salient_ocr_text: None,
                 is_duplicate: true,
+                literal_description: None,
+                activity_summary: None,
+                relevance_reason: None,
+                milestone_type: None,
+                key_rank: None,
             },
         ];
 
@@ -1713,6 +1775,11 @@ mod tests {
                 ocr_text: Some("bounded OCR evidence".repeat(4)),
                 salient_ocr_text: None,
                 is_duplicate: false,
+                literal_description: None,
+                activity_summary: None,
+                relevance_reason: None,
+                milestone_type: None,
+                key_rank: None,
             })
             .collect::<Vec<_>>();
 

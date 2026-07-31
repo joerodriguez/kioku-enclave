@@ -50,6 +50,7 @@
 #                        Optional exact Google Identity Platform review account;
 #                        set all three or none. The password is never built in.
 #   VERTEX_PROJECT / VERTEX_LOCATION / VERTEX_MODEL  Summarizer configuration
+#   VERTEX_SCREEN_MODEL  Optional low-cost semantic-screen model (defaults to VERTEX_MODEL)
 #   ENCLAVE_ACME         Set to 1 for production in-enclave TLS
 #   ENCLAVE_ACME_DIRECTORY / ENCLAVE_ACME_CONTACT  ACME endpoint and contact
 #
@@ -72,6 +73,7 @@
 #     --build-arg VERTEX_PROJECT=my-project \
 #     --build-arg VERTEX_LOCATION=us-central1 \
 #     --build-arg VERTEX_MODEL=gemini-2.5-flash \
+#     --build-arg VERTEX_SCREEN_MODEL=gemini-2.5-flash-lite \
 #     --build-arg ENCLAVE_ACME=1 \
 #     --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
 #     --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
@@ -104,6 +106,7 @@ ARG REVIEWER_AUTH_EMAIL
 ARG VERTEX_PROJECT
 ARG VERTEX_LOCATION
 ARG VERTEX_MODEL
+ARG VERTEX_SCREEN_MODEL
 ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
@@ -289,6 +292,7 @@ ARG REVIEWER_AUTH_EMAIL
 ARG VERTEX_PROJECT
 ARG VERTEX_LOCATION
 ARG VERTEX_MODEL
+ARG VERTEX_SCREEN_MODEL
 ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
@@ -304,6 +308,7 @@ ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     VERTEX_PROJECT=${VERTEX_PROJECT} \
     VERTEX_LOCATION=${VERTEX_LOCATION} \
     VERTEX_MODEL=${VERTEX_MODEL} \
+    VERTEX_SCREEN_MODEL=${VERTEX_SCREEN_MODEL} \
     ENCLAVE_ACME=${ENCLAVE_ACME} \
     ENCLAVE_ACME_DIRECTORY=${ENCLAVE_ACME_DIRECTORY} \
     ENCLAVE_ACME_CONTACT=${ENCLAVE_ACME_CONTACT}

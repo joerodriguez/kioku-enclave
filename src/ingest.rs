@@ -5,11 +5,15 @@
 //! 1. Opens (or LRU-hits) the user's decrypted SQLite index via `Store::with_user`.
 //! 2. Inserts rows into `audio_segments` + `utterances` (for transcripts) or
 //!    `screenshots` (for screen captures). FTS5 triggers fire automatically.
-//! 3. Saves the index back to GCS via `Store::save_user`.
+//! 3. Gives every canonical nonduplicate screen an immediate deterministic observation
+//!    fallback. The asynchronous control-plane worker later sends complete OCR and
+//!    textual app/window/URL/browser metadata to Vertex for model enrichment. It never
+//!    loads or serializes screenshot pixels.
+//! 4. Saves the index back to GCS via `Store::save_user`.
 //!
 //! # Idempotency
 //! When a `source_key` is present on an utterance or screenshot the handler uses
-//! `INSERT OR IGNORE` so retried sync batches are harmless.  Rows without a
+//! an additive conflict update so retried sync batches are harmless. Rows without a
 //! `source_key` (legacy senders) are inserted unconditionally.  The
 //! response counts only rows that were actually written (`changes()`).
 //!
@@ -803,6 +807,16 @@ fn ensure_fallback_observation(
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?,
+        display_id: screenshot.display_id,
+        primary_bundle_id: screenshot.primary_bundle_id.clone(),
+        visible_windows_json: screenshot
+            .visible_windows
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+        // The asynchronous model worker resolves the complete, persisted
+        // browser snapshot after transactional ingest.
+        browser_context_json: None,
     };
     let revision = crate::cp::screen_understanding::compute_observation_input_revision(&input);
     let fallback = crate::cp::screen_understanding::build_deterministic_fallback(&input, &revision);
