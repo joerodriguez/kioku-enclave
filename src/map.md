@@ -3,8 +3,9 @@
 The entire attested Kioku backend: it terminates TLS and serves OAuth, sync, MCP/REST,
 account, quotas, and the summarizer—see [`cp/`](cp/map.md)—alongside the legacy `/v1/*`
 query/storage API. Plaintext databases exist only here and in SEV tmpfs, never on
-persistent disk; selected summarisation text and explicitly configured webhook events
-leave the TEE through the documented Vertex/webhook trust boundaries.
+persistent disk; synced transcript/screen text and metadata always leave the TEE through
+the documented Vertex inference boundary, while explicitly configured webhook events use
+the separate webhook boundary. Raw audio and screenshot pixels never enter Vertex.
 
 | File | Role |
 |---|---|
@@ -16,7 +17,7 @@ leave the TEE through the documented Vertex/webhook trust boundaries.
 | `auth.rs` | Legacy caller auth — verifies the control-plane SA ID token for the `/v1/*` routes |
 | `crypto.rs` | KMS/DEK handling plus versioned, context-bound AES-256-GCM v2 blobs. Legacy formats fail closed unless a migration image bakes `ENCLAVE_ALLOW_LEGACY_BLOBS=1` |
 | `store.rs` | Per-user encrypted SQLite storage in GCS (load → authenticate/decrypt → mutate → context-bound encrypt → generation-checked persist); a migration image rewrites legacy user blobs on first open |
-| `ingest.rs` | Transactional ingest for transcripts and canonical screenshot provenance/browser dependencies; every nonduplicate screen gets a deterministic observation fallback, while Mac-computed embeddings retain their model gate and source-key idempotency |
+| `ingest.rs` | Transactional ingest for transcripts and canonical screenshot provenance/browser dependencies; every nonduplicate screen immediately gets a deterministic observation fallback and is then eligible for always-on text/metadata Vertex enrichment, while Mac-computed embeddings retain their model gate and source-key idempotency |
 | `search.rs` | Search (SQLite FTS5 + hybrid RRF with vec0 KNN over utterances, screenshots, AND episodes when a query embedding is present). Episode hits are the primary result entity (ADR-0004): relevance-ranked, with FTS snippets + minute_summaries; ADR-0009 excludes `substance=none` before FTS/speaker/hybrid ranking while retaining `low`. Speaker filter (ADR-0006 P3): `SearchRequest.speaker` or inline `speaker:Name` token — utterance `speaker_label` match, episode `participants` via json_each, empty-query browse modes. `search_all` / `search_episodes` are called in-process by `cp::query` |
 | `embedding.rs` | **In-enclave query embedding (hybrid search).** candle BERT encoder (`paraphrase-multilingual-MiniLM-L12-v2`, 384-dim, pinned `MODEL_ID`) loaded from `EMBED_MODEL_DIR` (baked into the image). Chunked mean-pooling for long text (10k-char cap). Absent/failed engine → FTS-only, never fatal. Any client that precomputes document embeddings MUST use the identical model and configuration |
 | `timeline.rs` | Context / time-range queries; `fetch_context` called in-process by MCP `get_context` |

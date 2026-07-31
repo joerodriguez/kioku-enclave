@@ -69,7 +69,7 @@ pub const MAX_USER_ID_LEN: usize = 128;
 
 /// Canonical brief schema/prompt version. Keeping it beside the persistence
 /// migration prevents a worker bump from forgetting to queue stored briefs.
-pub(crate) const EPISODE_FINALIZATION_VERSION: i32 = 3;
+pub(crate) const EPISODE_FINALIZATION_VERSION: i32 = 4;
 
 /// Validate a caller-supplied `user_id` before it is used to derive any
 /// filesystem path or GCS object name.
@@ -553,14 +553,31 @@ CREATE TABLE IF NOT EXISTS screen_observations (
 CREATE TABLE IF NOT EXISTS episode_screen_interpretations (
     episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
     screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+    episode_revision TEXT NOT NULL,
+    interpretation_version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ready','fallback')),
     activity_summary TEXT,
     relevance_level INTEGER NOT NULL CHECK (relevance_level BETWEEN 0 AND 3),
     relevance_reason TEXT,
+    milestone_type TEXT NOT NULL DEFAULT 'none',
+    base_score INTEGER NOT NULL DEFAULT 0,
     key_rank INTEGER,
     is_key_screen INTEGER NOT NULL DEFAULT 0,
     semantic_group TEXT,
+    model_name TEXT,
+    prompt_version INTEGER NOT NULL,
+    completed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (episode_id, screenshot_id)
+);
+CREATE TABLE IF NOT EXISTS episode_screen_interpretation_jobs (
+    episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+    episode_revision TEXT NOT NULL,
+    interpretation_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','ready','fallback')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- FTS5 index over screenshot OCR text
@@ -1280,19 +1297,55 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS episode_screen_interpretations (
             episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
             screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+            episode_revision TEXT NOT NULL DEFAULT '',
+            interpretation_version INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'fallback' CHECK (status IN ('ready','fallback')),
             activity_summary TEXT,
             relevance_level INTEGER NOT NULL CHECK (relevance_level BETWEEN 0 AND 3),
             relevance_reason TEXT,
+            milestone_type TEXT NOT NULL DEFAULT 'none',
+            base_score INTEGER NOT NULL DEFAULT 0,
             key_rank INTEGER,
             is_key_screen INTEGER NOT NULL DEFAULT 0,
             semantic_group TEXT,
+            model_name TEXT,
+            prompt_version INTEGER NOT NULL DEFAULT 1,
+            completed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             PRIMARY KEY (episode_id, screenshot_id)
+        );
+        CREATE TABLE IF NOT EXISTS episode_screen_interpretation_jobs (
+            episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+            episode_revision TEXT NOT NULL,
+            interpretation_version INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','ready','fallback')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            error_code TEXT,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         CREATE INDEX IF NOT EXISTS idx_episode_screen_rank
             ON episode_screen_interpretations(episode_id, is_key_screen, key_rank);
         "#,
     )?;
+
+    for definition in [
+        "episode_revision TEXT NOT NULL DEFAULT ''",
+        "interpretation_version INTEGER NOT NULL DEFAULT 1",
+        "status TEXT NOT NULL DEFAULT 'fallback' CHECK (status IN ('ready','fallback'))",
+        "milestone_type TEXT NOT NULL DEFAULT 'none'",
+        "base_score INTEGER NOT NULL DEFAULT 0",
+        "model_name TEXT",
+        "prompt_version INTEGER NOT NULL DEFAULT 1",
+        "completed_at TEXT",
+    ] {
+        if let Err(error) = conn.execute_batch(&format!(
+            "ALTER TABLE episode_screen_interpretations ADD COLUMN {definition};"
+        )) {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(error.into());
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1741,7 +1794,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn finalization_v3_migration_queues_stale_briefs_and_keeps_current_complete() {
+    fn finalization_v4_migration_queues_stale_briefs_and_keeps_current_complete() {
         init_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -1751,9 +1804,9 @@ pub(crate) mod tests {
               finalization_status, finalization_error)
              VALUES
              (1, '2026-07-01T09:00:00Z', '2026-07-01T10:00:00Z', 'stale',
-              '2026-07-01T14:00:00Z', 2, 'complete', 'old error'),
+              '2026-07-01T14:00:00Z', 3, 'complete', 'old error'),
              (2, '2026-07-02T09:00:00Z', '2026-07-02T10:00:00Z', 'current',
-              '2026-07-02T14:00:00Z', 3, 'processing', 'old error')",
+              '2026-07-02T14:00:00Z', 4, 'processing', 'old error')",
             [],
         )
         .unwrap();

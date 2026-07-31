@@ -1,14 +1,13 @@
-//! Vertex AI client for the episode summarizer. Gemini `generateContent` uses a
+//! Vertex AI client for episode summarization and semantic screen memory. Gemini
+//! `generateContent` uses a
 //! constrained `responseSchema`. Credentials come from the VM metadata server
 //! (cloud-platform scope), same pattern as the GCS/KMS clients.
 //!
 //! NOTE: only the Gemini path is ported. Anthropic-on-Vertex (`rawPredict`) is a
 //! future toggle — `VERTEX_MODEL` defaults to `gemini-2.5-flash` regardless.
 //!
-//! This call sends assembled capture text to Vertex, OUTSIDE the TEE boundary —
-//! the documented summarizer caveat. The claim
-//! for episode summaries is "attested enclave + Google Vertex inference under
-//! no-data-retention terms", not enclave-only.
+//! These calls send assembled capture text and metadata to Vertex, OUTSIDE the
+//! TEE boundary. Raw audio and screenshot pixels are never part of a request.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -98,6 +97,28 @@ pub async fn generate_custom(
     schema: Value,
     max_output_tokens: u32,
 ) -> Result<String> {
+    generate_custom_with_model(
+        config,
+        &config.vertex_model,
+        system,
+        user_message,
+        schema,
+        max_output_tokens,
+    )
+    .await
+}
+
+/// Call Gemini with an explicitly selected configured model. This exists so
+/// always-on screen enrichment can use a lower-cost model without becoming a
+/// feature flag or changing the episode summarizer model.
+pub async fn generate_custom_with_model(
+    config: &CpConfig,
+    model: &str,
+    system: &str,
+    user_message: &str,
+    schema: Value,
+    max_output_tokens: u32,
+) -> Result<String> {
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }
@@ -111,7 +132,7 @@ pub async fn generate_custom(
 
     let url = format!(
         "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
-        config.vertex_project, config.vertex_model
+        config.vertex_project, model
     );
     let body = json!({
         "contents": [{ "role": "user", "parts": [{ "text": user_message }] }],

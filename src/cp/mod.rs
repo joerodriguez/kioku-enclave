@@ -65,6 +65,9 @@ pub struct CpConfig {
     pub vertex_project: String,
     pub vertex_location: String,
     pub vertex_model: String,
+    /// Low-cost model for always-on literal screen observations and episode-screen
+    /// interpretations. This selects a model; it never disables enrichment.
+    pub vertex_screen_model: String,
     pub quota_utterances_per_day: i64,
     pub quota_screenshots_per_day: i64,
     pub quota_mcp_calls_per_day: i64,
@@ -231,6 +234,12 @@ impl CpConfig {
             })
         };
 
+        let vertex_model = config_value("VERTEX_MODEL", "gemini-2.5-flash")?;
+        let vertex_screen_model = std::env::var("VERTEX_SCREEN_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| vertex_model.clone());
+
         Ok(Self {
             base_url,
             jwt_secrets,
@@ -249,7 +258,8 @@ impl CpConfig {
                 .filter(|s| !s.is_empty()),
             vertex_project: config_value("VERTEX_PROJECT", "test-project")?,
             vertex_location: config_value("VERTEX_LOCATION", "us-central1")?,
-            vertex_model: config_value("VERTEX_MODEL", "gemini-2.5-flash")?,
+            vertex_model,
+            vertex_screen_model,
             quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000)?,
             quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000)?,
             quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000)?,

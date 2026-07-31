@@ -1155,7 +1155,8 @@ async fn rest_episode_members(
                         o.content_type, o.visible_text_summary, o.notable_items_json, \
                         i.activity_summary, i.relevance_level, i.relevance_reason, i.key_rank, \
                         i.is_key_screen, i.semantic_group, c.capture_status, c.primary_bundle_id, \
-                        c.visible_until, c.browser_snapshot_source_key \
+                        c.visible_until, c.browser_snapshot_source_key, i.status, \
+                        i.milestone_type, i.base_score \
                  FROM episode_members m \
                  JOIN screenshots c ON c.id = m.record_id \
                  LEFT JOIN screenshot_images img ON img.source_key = c.source_key \
@@ -1213,6 +1214,9 @@ async fn rest_episode_members(
                             "primary_bundle_id": r.get::<_, Option<String>>(24)?,
                             "visible_until": r.get::<_, Option<String>>(25)?,
                             "browser_snapshot_source_key": r.get::<_, Option<String>>(26)?,
+                            "interpretation_status": r.get::<_, Option<String>>(27)?,
+                            "milestone_type": r.get::<_, Option<String>>(28)?,
+                            "key_score": r.get::<_, Option<i64>>(29)?,
                         }),
                     ))
                 })?
@@ -2787,6 +2791,7 @@ mod tests {
                 vertex_project: "project".into(),
                 vertex_location: "location".into(),
                 vertex_model: "model".into(),
+                vertex_screen_model: "screen-model".into(),
                 quota_utterances_per_day: 1,
                 quota_screenshots_per_day: 1,
                 quota_mcp_calls_per_day: 1,

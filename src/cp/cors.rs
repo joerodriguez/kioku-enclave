@@ -84,6 +84,7 @@ mod tests {
             vertex_project: "".to_string(),
             vertex_location: "".to_string(),
             vertex_model: "".to_string(),
+            vertex_screen_model: "".to_string(),
             quota_utterances_per_day: 0,
             quota_screenshots_per_day: 0,
             quota_mcp_calls_per_day: 0,
