@@ -10,8 +10,9 @@ surfaces.
 
 ### In scope
 
-- Confidentiality and integrity of transcripts, OCR text, opted-in screenshot evidence,
-  episode data, identity state, and OAuth credentials handled by this service.
+- Confidentiality and integrity of uploaded audio, screenshots, timestamped capture and
+  browser metadata, transcripts, OCR text, episode data, learned identity/voice state,
+  and OAuth credentials handled by this service.
 - TLS transport to public clients and to Google APIs.
 - OAuth, bearer-token, and legacy service-identity authentication and authorization.
 - Per-user isolation, export, deletion, quotas, and abuse controls.
@@ -27,12 +28,12 @@ surfaces.
 - Payment processing; no billing provider is implemented here.
 - CPU-level microarchitectural side channels. Confidential Space provides VM memory
   encryption, not complete Spectre-class protection.
-- **Vertex Gemini inference confidentiality.** Core processing always sends synced
-  settled-episode transcripts, complete OCR, app/window/URL and browser-tab metadata,
-  deterministic visual statistics, and derived text together from this process to Vertex under Google's applicable
-  enterprise terms. Raw audio and screenshot pixels are excluded by typed request DTOs
-  and serialization tests. The privacy claim is “attested enclave + Google Vertex
-  inference,” not enclave-only inference.
+- **Vertex Gemini inference confidentiality.** Audio transcription/diarization,
+  screenshot understanding, profile learning, settled-episode transcripts, OCR,
+  app/window/URL metadata, browser-tab metadata, and summarisation send bounded user
+  content from this process to Vertex under Google's applicable enterprise terms. The
+  privacy claim is “attested enclave + Google Vertex inference,” not enclave-only
+  inference.
 - **User-configured webhooks.** A finalized-episode event leaves the TEE only after a
   user adds an HTTPS destination. Events are content-free by default; full brief content
   is a separate opt-in and is then processed by that destination outside Kioku's trust
@@ -80,12 +81,13 @@ Cloud KMS KEK
 
 Version 2 uses AES-GCM Additional Authenticated Data containing a domain separator and
 the object's logical identity. User databases are bound to their exact
-`indexes/{user_id}.db.enc` name, screenshot evidence is bound to both the authenticated
-user and exact media object key, and control/ACME state uses fixed, distinct contexts.
+`indexes/{user_id}.db.enc` name, raw capture and screenshot evidence objects are bound to
+both the authenticated user and exact media object key, and control/ACME state uses fixed,
+distinct contexts.
 Moving ciphertext and its wrapped DEK to another object or user therefore fails
 authentication.
 
-User databases, the control database, ACME state, and screenshot evidence are rewritten
+User databases, the control database, ACME state, and media evidence are rewritten
 to v2 immediately when successfully opened by an explicitly enabled migration image.
 Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-way; see
 [`RELEASING.md`](RELEASING.md#one-time-legacy-blob-migration) before upgrading a
@@ -213,7 +215,8 @@ compilation, and independent rebuild comparison.
 
 ### Vertex and user-configured webhooks cross the TEE boundary
 
-Episode summarisation and holistic settled-episode analysis send text and metadata to Google Vertex
+Audio transcription/diarization, screenshot understanding, profile evidence extraction,
+episode summarisation, and evidence verification send bounded content to Google Vertex
 Gemini from this process. Google's no-data-retention terms apply, but the data is outside
 the Confidential Space boundary while Vertex processes it. Webhook events similarly
 leave Confidential Space for the user-selected destination. They are content-free by

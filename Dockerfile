@@ -35,6 +35,7 @@
 #   KMS_KEY_RING         KMS key ring name
 #   KMS_KEY              KMS crypto key name
 #   GCS_BUCKET           GCS bucket holding encrypted index blobs
+#   GCS_MEDIA_BUCKET     GCS bucket holding encrypted bounded-retention media
 #   RUN_SA_EMAIL         Service account email the control plane presents in its
 #                        Google ID token (format: name@project.iam.gserviceaccount.com)
 #   ENCLAVE_AUDIENCE     The enclave's own URL, used to validate the 'aud' claim
@@ -43,7 +44,8 @@
 #                        exchange (format:
 #                        //iam.googleapis.com/projects/<NUM>/locations/global/
 #                        workloadIdentityPools/<POOL>/providers/<PROVIDER>)
-#   GOOGLE_DESKTOP_CLIENT_ID / GOOGLE_WEB_CLIENT_ID  Google OAuth audiences
+#   GOOGLE_DESKTOP_CLIENT_ID / GOOGLE_IOS_CLIENT_ID / GOOGLE_WEB_CLIENT_ID
+#                                                 Google OAuth audiences
 #   ALLOWED_EMAILS       Comma-separated account allow-list
 #   BASE_URL / WEB_ORIGIN  Public API issuer and browser application origin
 #   REVIEWER_AUTH_API_KEY / REVIEWER_AUTH_UID / REVIEWER_AUTH_EMAIL
@@ -61,17 +63,19 @@
 #     --build-arg KMS_KEY_RING=my-keyring \
 #     --build-arg KMS_KEY=my-kek \
 #     --build-arg GCS_BUCKET=my-enclave-indexes \
+#     --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
 #     --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
 #     --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
 #     --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/123.../... \
 #     --build-arg GOOGLE_DESKTOP_CLIENT_ID=...apps.googleusercontent.com \
+#     --build-arg GOOGLE_IOS_CLIENT_ID=...apps.googleusercontent.com \
 #     --build-arg GOOGLE_WEB_CLIENT_ID=...apps.googleusercontent.com \
 #     --build-arg ALLOWED_EMAILS=owner@example.com \
 #     --build-arg BASE_URL=https://api.example.com \
 #     --build-arg WEB_ORIGIN=https://app.example.com \
 #     --build-arg VERTEX_PROJECT=my-project \
 #     --build-arg VERTEX_LOCATION=us-central1 \
-#     --build-arg VERTEX_MODEL=gemini-2.5-flash \
+#     --build-arg VERTEX_MODEL=gemini-3.5-flash \
 #     --build-arg ENCLAVE_ACME=1 \
 #     --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
 #     --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
@@ -90,10 +94,12 @@ ARG KMS_LOCATION
 ARG KMS_KEY_RING
 ARG KMS_KEY
 ARG GCS_BUCKET
+ARG GCS_MEDIA_BUCKET
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
 ARG GOOGLE_DESKTOP_CLIENT_ID
+ARG GOOGLE_IOS_CLIENT_ID
 ARG GOOGLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
 ARG BASE_URL
@@ -112,8 +118,8 @@ RUN set -eu \
     && case "${SOURCE_DATE_EPOCH}" in ''|*[!0-9]*) false;; *) true;; esac \
     && for value in \
         "${KMS_PROJECT}" "${KMS_LOCATION}" "${KMS_KEY_RING}" "${KMS_KEY}" \
-        "${GCS_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
-        "${ATTEST_STS_AUDIENCE}" "${GOOGLE_DESKTOP_CLIENT_ID}" \
+        "${GCS_BUCKET}" "${GCS_MEDIA_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
+        "${ATTEST_STS_AUDIENCE}" "${GOOGLE_DESKTOP_CLIENT_ID}" "${GOOGLE_IOS_CLIENT_ID}" \
         "${GOOGLE_WEB_CLIENT_ID}" "${ALLOWED_EMAILS}" "${BASE_URL}" "${WEB_ORIGIN}" \
         "${VERTEX_PROJECT}" "${VERTEX_LOCATION}" "${VERTEX_MODEL}" \
         "${ENCLAVE_ACME_DIRECTORY}" "${ENCLAVE_ACME_CONTACT}"; \
@@ -143,7 +149,7 @@ RUN rustup target add x86_64-unknown-linux-musl \
 # tool's own lockfile are pinned; this is build tooling, not runtime content.
 RUN cargo install cargo-auditable --version 0.7.4 --locked
 
-# ── Embedding model (hybrid search) ────────────────────────────────────────────
+# ── Embedding models (hybrid search + persistent voice memory) ────────────────
 #
 # paraphrase-multilingual-MiniLM-L12-v2 — the pinned query/document embedding
 # model (see src/embedding.rs MODEL_ID; the Mac client MUST ship the same
@@ -169,6 +175,14 @@ RUN mkdir -p /models \
     && echo "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8  /models/tokenizer.json" | sha256sum -c - \
     && echo "eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b  /models/model.safetensors" | sha256sum -c - \
     && echo "1e98ea05b0de579fcaad3d625b62ea55647142ed674d5f5ebf1440e4bbbb6f23  /models/MODEL_CARD.md" | sha256sum -c -
+
+# WeSpeaker ResNet34-LM (VoxCeleb) for independent server-side voiceprints.
+# The Rust binary supplies decoding, Kaldi fbank, inference, and matching; no
+# Python, sherpa process, or dynamic ONNX runtime is present in the image.
+RUN mkdir -p /models/voice \
+    && curl -fsSL -o /models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx \
+       "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx" \
+    && echo "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012  /models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx" | sha256sum -c -
 
 # musl does not define the BSD-style u_int*_t aliases that sqlite-vec.c's
 # bundled C uses (typedef u_int8_t uint8_t; ...). glibc/macOS provide them, musl
@@ -242,6 +256,7 @@ ARG KMS_LOCATION
 ARG KMS_KEY_RING
 ARG KMS_KEY
 ARG GCS_BUCKET
+ARG GCS_MEDIA_BUCKET
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -257,6 +272,7 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
     KMS_KEY_RING=${KMS_KEY_RING} \
     KMS_KEY=${KMS_KEY} \
     GCS_BUCKET=${GCS_BUCKET} \
+    GCS_MEDIA_BUCKET=${GCS_MEDIA_BUCKET} \
     RUN_SA_EMAIL=${RUN_SA_EMAIL} \
     ENCLAVE_AUDIENCE=${ENCLAVE_AUDIENCE} \
     ATTEST_STS_AUDIENCE=${ATTEST_STS_AUDIENCE}
@@ -279,6 +295,7 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
 # logs. Those env vars remain honored at runtime only as a bootstrap fallback
 # and for local testing; do not reintroduce them as build args.
 ARG GOOGLE_DESKTOP_CLIENT_ID
+ARG GOOGLE_IOS_CLIENT_ID
 ARG GOOGLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
 ARG BASE_URL
@@ -293,6 +310,7 @@ ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
 ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
+    GOOGLE_IOS_CLIENT_ID=${GOOGLE_IOS_CLIENT_ID} \
 
     GOOGLE_WEB_CLIENT_ID=${GOOGLE_WEB_CLIENT_ID} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
@@ -328,6 +346,7 @@ COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/kioku-enclav
 # if the model fails to load the enclave serves FTS-only (never fatal).
 COPY --from=builder /models /models
 ENV EMBED_MODEL_DIR=/models
+ENV VOICE_MODEL_PATH=/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx
 
 # Root, deliberately: the Confidential Space launcher mounts the /tmp tmpfs
 # root-owned with no mode/uid knobs in the tee-mount spec, and a FROM-scratch

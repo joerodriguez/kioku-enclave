@@ -449,6 +449,7 @@ mod tests {
             jwt_secrets: vec!["test-secret".into()],
             google_desktop_client_id: "desktop".into(),
             google_web_client_id: "web".into(),
+            google_ios_client_id: "ios".into(),
             google_web_client_secret: "secret".into(),
             allowed_emails: None,
             scheduler_sa_email: None,
@@ -509,6 +510,7 @@ mod tests {
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
             embedding: None,
+            voice: None,
         });
 
         let fake_transport = FakeEmailTransport::new();
@@ -579,6 +581,7 @@ mod tests {
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
             embedding: None,
+            voice: None,
         });
 
         let fake_transport = FakeEmailTransport::new();
@@ -637,6 +640,7 @@ mod tests {
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
             embedding: None,
+            voice: None,
         });
 
         let fake_transport = FakeEmailTransport::new();

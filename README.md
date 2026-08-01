@@ -16,12 +16,13 @@ for the signed source-tag, provenance, SBOM, image-digest, and deployment proced
 
 Kioku's privacy claim is:
 
-> Raw audio and full-resolution screenshot originals stay on your Mac. If you enable
-> Cloud Screenshot Evidence, Kioku uploads a small set of selected, downscaled,
-> compressed screenshots from meaningful episodes to the hardware-attested Kioku Cloud
-> Core. They are encrypted per user, are never sent to the episode-summary model, and are
-> included in export and deletion. Text and metadata that sync are handled by sealed
-> hardware running the open-source code you can inspect.
+> Kioku's macOS and iOS clients are capture-only: bounded audio snippets, screenshots,
+> authoritative timestamps, foreground-app state, and available browser URLs are sent to
+> the hardware-attested Kioku Cloud Core as the product's standard processing path. Raw
+> objects are encrypted per user, processed by Vertex Gemini from inside the enclave,
+> retained for a bounded retry/voice-learning window, and then deleted. Derived records,
+> evidence, and voice profiles remain in the encrypted user archive and are covered by
+> export and deletion. The server code handling that plaintext is open source.
 
 The exact deployed image digest is public. A Confidential Space attestation token reports
 the running container digest; a signed GitHub build attestation connects that digest to a
@@ -38,8 +39,11 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   ACME without exporting the private key.
 - Verifies Google identity, runs OAuth 2.1-style authorization with PKCE, and issues Kioku
   access and refresh tokens.
-- Receives pre-transcribed utterances, OCR text, and opted-in compressed screenshot
-  evidence from Kioku clients.
+- Receives raw bounded audio/screenshots plus timestamped application, window, display,
+  and browser metadata from pure-Swift Kioku clients.
+- Runs Gemini 3.5 Flash transcription, timestamped speaker-turn extraction, screenshot
+  understanding, evidence-backed person learning, and independent WeSpeaker voiceprint
+  matching in the cloud; no Python runtime is present.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
@@ -50,9 +54,9 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 - Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
-the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Selected
-text leaves the TEE only through the documented Vertex and explicit, user-configured
-webhook paths.
+the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Audio,
+screenshots, and selected text leave the TEE through the documented Vertex boundary;
+explicitly configured webhook paths are a separate egress boundary.
 
 ## Security and trust model
 
@@ -82,7 +86,7 @@ Version 2 blobs are prefixed with `KIOKU-BLOB\x02` and encrypted with AES-256-GC
 authenticated data binds each ciphertext to its logical purpose and location:
 
 - user databases bind to `indexes/{user_id}.db.enc`;
-- screenshot evidence binds to both the authenticated user and opaque media object key;
+- raw capture and screenshot evidence bind to both the authenticated user and opaque media object key;
 - the control database and ACME state use separate fixed contexts.
 
 Copying ciphertext and its wrapped DEK to another user or object therefore fails
@@ -138,8 +142,9 @@ digest; decoding a JWT without verification is insufficient.
 
 ### External processing caveats
 
-Episode summarisation and evidence verification send selected text outside the TEE to
-Google Vertex Gemini. The request originates inside this service, but Vertex processes it
+Audio transcription/diarization, screenshot understanding, episode summarisation, and
+evidence verification send selected content outside the TEE to Google Vertex Gemini. The
+request originates inside this service, but Vertex processes it
 under Google's
 [no-data-retention terms](https://cloud.google.com/vertex-ai/docs/generative-ai/data-governance).
 This is an explicit external trust boundary, not an enclave-only inference claim.
@@ -170,6 +175,7 @@ The same binary serves all of these surfaces:
 | Health and attestation | `/health`, `/v1/attestation` | Public |
 | OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/token` | Protocol-specific validation |
 | Device and account API | `/api/sync/*`, `/api/export`, `/api/account` | Kioku access token or accepted Google ID token |
+| Cloud Capture v2 | `/api/v2/capture/*`, `/api/v2/people*` | Kioku access token or accepted Google ID token |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
 | Screenshot evidence | `/api/screenshot-images*` | Kioku access token or accepted Google ID token |
 | Webhook automation | `/api/webhooks*` | Kioku access token or accepted Google ID token |
@@ -215,10 +221,12 @@ docker build --platform linux/amd64 \
   --build-arg KMS_KEY_RING=my-keyring \
   --build-arg KMS_KEY=my-kek \
   --build-arg GCS_BUCKET=my-enclave-indexes \
+  --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
   --build-arg RUN_SA_EMAIL=legacy-caller@my-project.iam.gserviceaccount.com \
   --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
   --build-arg ATTEST_STS_AUDIENCE='//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/confidential-space' \
   --build-arg GOOGLE_DESKTOP_CLIENT_ID=desktop-id.apps.googleusercontent.com \
+  --build-arg GOOGLE_IOS_CLIENT_ID=ios-id.apps.googleusercontent.com \
   --build-arg GOOGLE_WEB_CLIENT_ID=web-id.apps.googleusercontent.com \
   --build-arg ALLOWED_EMAILS=owner@example.com \
   --build-arg BASE_URL=https://api.example.com \
@@ -228,7 +236,7 @@ docker build --platform linux/amd64 \
   --build-arg REVIEWER_AUTH_EMAIL=reviewer@example.com \
   --build-arg VERTEX_PROJECT=my-project \
   --build-arg VERTEX_LOCATION=us-central1 \
-  --build-arg VERTEX_MODEL=gemini-2.5-flash \
+  --build-arg VERTEX_MODEL=gemini-3.5-flash \
   --build-arg ENCLAVE_ACME=1 \
   --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
   --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
@@ -248,11 +256,12 @@ binding.
 | Variable | Purpose |
 |---|---|
 | `KMS_PROJECT`, `KMS_LOCATION`, `KMS_KEY_RING`, `KMS_KEY` | KMS KEK coordinates |
-| `GCS_BUCKET` | Encrypted database and default media bucket |
+| `GCS_BUCKET` | Encrypted database bucket |
+| `GCS_MEDIA_BUCKET` | Encrypted bounded-retention raw-media bucket |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
-| `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
+| `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
 | `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
@@ -376,7 +385,7 @@ delivery therefore remains. Do not describe releases as independently reproducib
 
 ### Vertex and user-configured webhooks leave Confidential Space
 
-Selected text is sent to Vertex Gemini. Attestation covers the Kioku service and its
+Bounded audio, screenshots, and selected text are sent to Vertex Gemini. Attestation covers the Kioku service and its
 storage/retrieval behavior, not Vertex's internal execution. A webhook destination is
 also outside the attested boundary. Finalized-episode webhooks are content-free unless
 the user explicitly enables full brief content for that destination.

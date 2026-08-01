@@ -111,9 +111,10 @@ pub struct AppState {
     pub tls_keystone: Option<Arc<tls::TlsKeystone>>,
 }
 
-/// In-process full export of a user's index as JSON (utterances, screenshots,
-/// episodes). Shared by the legacy `/v1/export` handler and the control-plane
-/// `/api/export` route (ADR-0001).
+/// In-process full export of a user's searchable index, capture provenance,
+/// learned people, and voice-memory records. Encrypted raw object bytes remain
+/// represented by their media-object inventory; the export never exposes KMS
+/// wrapping keys or reusable authentication material.
 pub(crate) async fn dump_user_export(
     store: &Store,
     user_id: &str,
@@ -139,18 +140,6 @@ pub(crate) async fn dump_user_export(
             let final_briefs = dump_table(conn, "SELECT * FROM episode_final_briefs ORDER BY episode_id")?;
             let webhook_deliveries =
                 dump_table(conn, "SELECT * FROM webhook_deliveries ORDER BY episode_id, subscription_id")?;
-            let email_deliveries = {
-                let table_exists: i64 = conn.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='email_deliveries'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if table_exists > 0 {
-                    dump_table(conn, "SELECT * FROM email_deliveries ORDER BY episode_id, delivery_version")?
-                } else {
-                    Vec::new()
-                }
-            };
             Ok(json!({
                 "utterances": utterances,
                 "screenshots": screenshots,
@@ -158,7 +147,20 @@ pub(crate) async fn dump_user_export(
                 "episodes": episodes,
                 "episode_final_briefs": final_briefs,
                 "webhook_deliveries": webhook_deliveries,
-                "email_deliveries": email_deliveries,
+                "email_deliveries": dump_optional_table(conn, "email_deliveries", "episode_id, delivery_version")?,
+                "capture_sessions": dump_optional_table(conn, "capture_sessions", "created_at")?,
+                "capture_streams": dump_optional_table(conn, "capture_streams", "created_at")?,
+                "capture_events": dump_optional_table(conn, "capture_events", "started_at, event_id")?,
+                "media_objects": dump_optional_table(conn, "media_objects", "created_at, event_id")?,
+                "browser_states": dump_optional_table(conn, "browser_states_v2", "created_at, state_key")?,
+                "browser_observations": dump_optional_table(conn, "browser_observations_v2", "observed_at, event_id")?,
+                "media_processing_jobs": dump_optional_table(conn, "media_processing_jobs", "updated_at, event_id")?,
+                "speaker_observations": dump_optional_table(conn, "speaker_observations", "started_at, event_id, id")?,
+                "people": dump_optional_table(conn, "people", "display_name, id")?,
+                "voice_profiles": dump_optional_table(conn, "voice_profiles", "person_id, id")?,
+                "voice_samples": dump_optional_table(conn, "voice_samples", "speaker_observation_id, id")?,
+                "identity_evidence": dump_optional_table(conn, "identity_evidence", "created_at, id")?,
+                "person_facts": dump_optional_table(conn, "person_facts", "person_id, created_at, id")?,
             }))
         })
         .await
@@ -250,6 +252,22 @@ fn dump_table(
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn dump_optional_table(
+    conn: &rusqlite::Connection,
+    name: &str,
+    order: &str,
+) -> crate::error::Result<Vec<serde_json::Value>> {
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+    dump_table(conn, &format!("SELECT * FROM {name} ORDER BY {order}"))
 }
 
 fn sqlite_value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
@@ -554,6 +572,11 @@ async fn main() {
     // warm-up: ~470 MB of weights, seconds) so the first MCP query doesn't
     // eat the cold start; absence is non-fatal (FTS-only mode).
     let embedding_engine = embedding::EmbeddingEngine::from_env();
+    let voice_engine = cp::voice_memory::VoiceEngine::from_env();
+    assert!(
+        voice_engine.is_some() || test_mode_enabled(),
+        "the pinned voice embedding model is required in production"
+    );
 
     let resend_api_key = std::env::var("RESEND_API_KEY").ok();
     let email_from_address = std::env::var("EMAIL_FROM_ADDRESS")
@@ -584,10 +607,12 @@ async fn main() {
         email_transport,
         config: cp_config,
         embedding: embedding_engine,
+        voice: voice_engine,
     });
 
     // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
     cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
+    cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
 
     // ── Legacy data-plane routes ──────────────────────────────────────────────
     let authenticated = Router::new()
@@ -613,6 +638,7 @@ async fn main() {
 
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
     let cp_authed = cp::sync::router()
+        .merge(cp::media::router())
         .merge(cp::query::router())
         .layer(middleware::from_fn_with_state(
             Arc::clone(&cp_state),

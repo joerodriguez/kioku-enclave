@@ -39,6 +39,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image; remaining rebuild limits are documented in `SECURITY.md` |
 | `Cargo.toml` / `Cargo.lock` | Crate manifest |
 | `README.md` | What the enclave does + the attestation/privacy claim |
+| `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, retry semantics, browser metadata, processing status, and learned people profiles |
 | `SECURITY.md` | **Threat model + residual risks — read before touching crypto/auth/attestation** |
 | `CONTRIBUTING.md` | PR rules; the three pre-commit checks |
 | `rust-toolchain.toml` | Pinned toolchain |
@@ -49,7 +50,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
   `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`.
 - Treat every change as security-sensitive; explain threat-model impact for auth/crypto/
   attestation changes.
-- The `/v1/*` API is a public compatibility boundary; keep handler behavior and public
+- The `/api/v2/capture/*`, `/api/v2/people*`, and `/v1/*` APIs are public compatibility boundaries; keep handler behavior and public
   documentation in sync, and coordinate breaking changes with downstream clients.
 - Record the enclave commit SHA + deployed image digest in the operator's deployment
   record.
