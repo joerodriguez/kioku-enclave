@@ -172,7 +172,8 @@ seconds. Do not retry malformed requests (HTTP 400) without correcting them.
 
 The acknowledgement advances only across a contiguous prefix. If sequences 42
 and 44 arrived but 43 did not, the value remains 42. This makes recovery after
-termination or background suspension deterministic.
+termination or background suspension deterministic. A well-formed stream ID that does
+not belong to the authenticated account returns HTTP `404`.
 
 ## Check cloud processing
 
@@ -189,7 +190,8 @@ termination or background suspension deterministic.
 
 States are `queued`, `processing`, `retry_wait`, `ready`, `failed`, or
 `pruned`. `pruned` means the bounded raw-media retention window elapsed; the
-derived searchable records and timestamped evidence remain.
+derived searchable records and timestamped evidence remain. A well-formed event ID
+that does not belong to the authenticated account returns HTTP `404`.
 
 ## People learned automatically
 
