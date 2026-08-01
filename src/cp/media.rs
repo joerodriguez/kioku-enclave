@@ -676,27 +676,32 @@ async fn capture_status(
     }
     match state
         .store
-        .with_user(&user.0, |conn| {
-            Ok(conn.query_row(
-                "SELECT e.event_id,m.processing_state,j.error_code,j.attempt_count \
-                 FROM capture_events e JOIN media_objects m USING(event_id) \
-                 JOIN media_processing_jobs j USING(event_id) WHERE e.event_id=?1",
-                [&event_id],
-                |row| {
-                    Ok(CaptureStatus {
-                        event_id: row.get(0)?,
-                        processing_state: row.get(1)?,
-                        error_code: row.get(2)?,
-                        attempt_count: row.get(3)?,
-                    })
-                },
-            )?)
-        })
+        .with_user(&user.0, |conn| load_capture_status(conn, &event_id))
         .await
     {
-        Ok(status) => Json(status).into_response(),
+        Ok(Some(status)) => Json(status).into_response(),
+        Ok(None) => EnclaveError::NotFound.into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<CaptureStatus>> {
+    conn.query_row(
+        "SELECT e.event_id,m.processing_state,j.error_code,j.attempt_count \
+         FROM capture_events e JOIN media_objects m USING(event_id) \
+         JOIN media_processing_jobs j USING(event_id) WHERE e.event_id=?1",
+        [event_id],
+        |row| {
+            Ok(CaptureStatus {
+                event_id: row.get(0)?,
+                processing_state: row.get(1)?,
+                error_code: row.get(2)?,
+                attempt_count: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 async fn list_people(
@@ -843,11 +848,13 @@ fn preflight_source_event(
 }
 
 fn committed_through_sequence(conn: &Connection, stream_id: &str) -> Result<i64> {
-    Ok(conn.query_row(
+    conn.query_row(
         "SELECT committed_through_sequence FROM capture_streams WHERE id=?1",
         [stream_id],
         |row| row.get(0),
-    )?)
+    )
+    .optional()?
+    .ok_or(EnclaveError::NotFound)
 }
 
 fn install_media_dek_candidate(conn: &Connection, candidate: &str) -> Result<String> {
@@ -1643,6 +1650,44 @@ mod tests {
         let conflict =
             record_source_event(&conn, "account-1", &manifest, &digest_2, "object-2").unwrap_err();
         assert!(conflict.to_string().contains("idempotency"));
+    }
+
+    #[test]
+    fn capture_status_distinguishes_an_unknown_event_from_a_store_failure() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(
+            load_capture_status(&conn, "019fbab2-8413-7053-9117-eb249b72b15b")
+                .unwrap()
+                .is_none()
+        );
+
+        let manifest = valid_manifest();
+        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
+        let status = load_capture_status(&conn, &manifest.event_id)
+            .unwrap()
+            .expect("recorded event has status");
+        assert_eq!(status.event_id, manifest.event_id);
+        assert_eq!(status.processing_state, "queued");
+        assert_eq!(status.attempt_count, 0);
+        assert!(status.error_code.is_none());
+    }
+
+    #[test]
+    fn stream_ack_returns_not_found_only_for_an_unknown_stream() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(matches!(
+            committed_through_sequence(&conn, "system-1"),
+            Err(EnclaveError::NotFound)
+        ));
+
+        let manifest = valid_manifest();
+        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
+        assert_eq!(
+            committed_through_sequence(&conn, &manifest.stream_id).unwrap(),
+            -1
+        );
     }
 
     #[test]
