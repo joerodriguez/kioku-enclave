@@ -101,6 +101,37 @@ use crate::{
     timeline::{handle_context, handle_range, handle_stats},
 };
 
+async fn resolve_resend_api_key<F, Fut>(
+    test_mode: bool,
+    local_key: Option<String>,
+    fetch_production_key: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if test_mode {
+        local_key.map(validate_resend_api_key).transpose()
+    } else {
+        fetch_production_key()
+            .await
+            .and_then(validate_resend_api_key)
+            .map(Some)
+    }
+}
+
+fn validate_resend_api_key(api_key: String) -> Result<String, String> {
+    if !api_key.starts_with("re_")
+        || !(8..=256).contains(&api_key.len())
+        || !api_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("Resend API key has an invalid format".into());
+    }
+    Ok(api_key)
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct AppState {
@@ -578,7 +609,17 @@ async fn main() {
         "the pinned voice embedding model is required in production"
     );
 
-    let resend_api_key = std::env::var("RESEND_API_KEY").ok();
+    // Production always reads the credential from Secret Manager. It is never
+    // accepted as a launch-time environment override, which keeps it out of
+    // the Confidential Space attestation token and VM configuration. Local
+    // test mode may opt into Resend with RESEND_API_KEY or omit it entirely.
+    let resend_api_key = resolve_resend_api_key(
+        test_mode_enabled(),
+        std::env::var("RESEND_API_KEY").ok(),
+        || cp::fetch_secret_from_manager("kioku-resend-api-key", "latest"),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("Failed to configure Resend API key: {error}"));
     let email_from_address = std::env::var("EMAIL_FROM_ADDRESS")
         .unwrap_or_else(|_| "Kioku <notifications@notify.kiokuu.com>".to_string());
 
@@ -761,5 +802,59 @@ async fn serve_tls(
                 tracing::debug!(error = %e, "connection closed with error");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod email_startup_tests {
+    use super::resolve_resend_api_key;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn local_test_mode_can_omit_email_without_fetching_a_secret() {
+        let fetched = Arc::new(AtomicBool::new(false));
+        let fetched_in_closure = Arc::clone(&fetched);
+
+        let key = resolve_resend_api_key(true, None, move || async move {
+            fetched_in_closure.store(true, Ordering::SeqCst);
+            Ok("re_production_key".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(key, None);
+        assert!(!fetched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn production_ignores_environment_key_and_fetches_secret_manager() {
+        let key = resolve_resend_api_key(false, Some("re_environment_key".into()), || async {
+            Ok("re_secret_manager_key".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(key.as_deref(), Some("re_secret_manager_key"));
+    }
+
+    #[tokio::test]
+    async fn production_fails_closed_for_missing_or_malformed_secret() {
+        let missing = resolve_resend_api_key(false, None, || async {
+            Err("secret version unavailable".to_string())
+        })
+        .await;
+        assert_eq!(missing.unwrap_err(), "secret version unavailable");
+
+        let malformed = resolve_resend_api_key(false, None, || async {
+            Ok("re_bad\r\nInjected: value".to_string())
+        })
+        .await;
+        assert_eq!(
+            malformed.unwrap_err(),
+            "Resend API key has an invalid format"
+        );
     }
 }
