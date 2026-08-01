@@ -272,13 +272,13 @@ binding.
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
 
-The web OAuth client secret is fetched at runtime from Secret Manager. The reviewer
-password remains only in Google Identity Platform, the review portal, and the operator's
-versioned `kioku-openai-reviewer-password` secret in project `kioku-joerodriguez`. JWT
-signing secrets are generated and stored in the KMS-protected control database; neither
-password nor signing secret is a Docker build argument or launch metadata value. Static
-`ENCLAVE_TLS*` variables exist for debug/custom bootstrap paths but are neither accepted
-production build arguments nor launch-policy overrides.
+The web OAuth client secret and Resend API key are fetched at runtime from Secret Manager.
+The reviewer password remains only in Google Identity Platform, the review portal, and the
+operator's versioned `kioku-openai-reviewer-password` secret in project
+`kioku-joerodriguez`. JWT signing secrets are generated and stored in the KMS-protected
+control database; none of these credentials are Docker build arguments or launch metadata
+values. Static `ENCLAVE_TLS*` variables exist for debug/custom bootstrap paths but are
+neither accepted production build arguments nor launch-policy overrides.
 
 ## CI and release evidence
 

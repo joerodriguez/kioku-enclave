@@ -7,7 +7,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderValue, AUTHORIZATION},
+    Client,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
@@ -61,23 +64,42 @@ pub trait EmailTransport: Send + Sync {
 
 /// Production Resend API client (`https://api.resend.com/emails`).
 pub struct ResendTransport {
-    api_key: String,
+    authorization: HeaderValue,
     from_address: String,
     client: Client,
 }
 
 impl ResendTransport {
-    pub fn new(api_key: String, from_address: String) -> Self {
+    pub fn new(api_key: String, from_address: String) -> Result<Self> {
+        // Secret creation from a shell commonly captures one final newline.
+        // Remove that line ending while rejecting other surrounding whitespace
+        // and bytes that cannot safely appear in an HTTP header.
+        let api_key = api_key
+            .strip_suffix("\r\n")
+            .or_else(|| api_key.strip_suffix('\n'))
+            .unwrap_or(&api_key);
+        if api_key.is_empty() || api_key.trim() != api_key {
+            return Err(crate::error::EnclaveError::Config(
+                "Resend API key is empty or contains surrounding whitespace".into(),
+            ));
+        }
+        let mut authorization =
+            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
+                crate::error::EnclaveError::Config(
+                    "Resend API key cannot be used in an Authorization header".into(),
+                )
+            })?;
+        authorization.set_sensitive(true);
+
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-        Self {
-            api_key,
+            .build()?;
+        Ok(Self {
+            authorization,
             from_address,
             client,
-        }
+        })
     }
 
     pub fn build_request_payload(&self, request: &EmailRequest) -> serde_json::Value {
@@ -113,7 +135,7 @@ impl EmailTransport for ResendTransport {
         let resp = self
             .client
             .post("https://api.resend.com/emails")
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(AUTHORIZATION, self.authorization.clone())
             .header("Idempotency-Key", &request.idempotency_key)
             .header("Content-Type", "application/json")
             .header("User-Agent", "Kioku-Enclave-Email/1.0")
@@ -406,7 +428,8 @@ mod tests {
         let transport = ResendTransport::new(
             "re_123456789".into(),
             "Kioku <notifications@notify.kiokuu.com>".into(),
-        );
+        )
+        .unwrap();
 
         let req = EmailRequest {
             to: "user@example.com".into(),
@@ -422,6 +445,19 @@ mod tests {
         assert_eq!(payload["subject"], "Your Kioku brief is ready");
         assert_eq!(payload["text"], "Brief text");
         assert_eq!(payload["html"], "<p>Brief html</p>");
+    }
+
+    #[test]
+    fn resend_transport_validates_the_authorization_header() {
+        let from = "Kioku <notifications@notify.kiokuu.com>".to_string();
+
+        let transport = ResendTransport::new("re_valid-key\n".into(), from.clone()).unwrap();
+        assert_eq!(transport.authorization, "Bearer re_valid-key");
+        assert!(transport.authorization.is_sensitive());
+
+        assert!(ResendTransport::new(String::new(), from.clone()).is_err());
+        assert!(ResendTransport::new(" re_key".into(), from.clone()).is_err());
+        assert!(ResendTransport::new("re_bad\r\nInjected: value".into(), from).is_err());
     }
 
     #[tokio::test]

@@ -225,6 +225,15 @@ enabled. The sender revalidates public DNS addresses on every attempt, pins the 
 address, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
 signatures, or response bodies.
 
+### Runtime provider credentials use the VM service account
+
+The web OAuth client secret and Resend API key are fetched from Secret Manager on every
+production boot. Secret Manager authorizes the attached VM service account; unlike KMS
+decryption, this access is not bound to the attested workload digest. These provider
+credentials cannot decrypt stored user data. Production startup fails closed if either
+required credential cannot be loaded, and neither credential is accepted through a
+launch-time environment override.
+
 ### Stable user identifiers are linkable
 
 User IDs are deterministically derived from the Google subject identifier. Anyone who
