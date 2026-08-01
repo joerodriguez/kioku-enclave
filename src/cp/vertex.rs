@@ -9,6 +9,7 @@
 //! These calls send assembled capture text and metadata to Vertex, OUTSIDE the
 //! TEE boundary. Raw audio and screenshot pixels are never part of a request.
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -169,6 +170,97 @@ pub async fn generate_custom(
     Ok(text)
 }
 
+fn media_request_body(
+    prompt: &str,
+    mime_type: &str,
+    media: &[u8],
+    schema: Value,
+    audio_timestamp: bool,
+) -> Value {
+    json!({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inlineData": {"mimeType": mime_type, "data": B64.encode(media)}},
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {
+            "maxOutputTokens": 16_384,
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "audioTimestamp": audio_timestamp,
+            "thinkingConfig": {"thinkingBudget": 0}
+        }
+    })
+}
+
+/// Send one bounded audio or screenshot asset to Gemini using inline data.
+/// `audioTimestamp` is enabled for audio-only inputs as required by Vertex's
+/// audio understanding API. The caller supplies a constrained JSON schema and
+/// validates the returned timestamps again before persistence.
+pub async fn generate_media_custom(
+    config: &CpConfig,
+    prompt: &str,
+    mime_type: &str,
+    media: &[u8],
+    schema: Value,
+    audio_timestamp: bool,
+) -> Result<String> {
+    if config.vertex_project.is_empty() {
+        return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
+    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
+    let token = access_token(&http).await?;
+    let url = format!(
+        "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
+        config.vertex_project, config.vertex_model
+    );
+    let response = http
+        .post(&url)
+        .bearer_auth(token)
+        .json(&media_request_body(
+            prompt,
+            mime_type,
+            media,
+            schema,
+            audio_timestamp,
+        ))
+        .send()
+        .await?;
+    if response.status().as_u16() == 429 {
+        return Err(EnclaveError::Config("quota".into()));
+    }
+    let data: Value = response.error_for_status()?.json().await?;
+    let text = data
+        .get("candidates")
+        .and_then(|candidates| candidates.get(0))
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    if text.is_empty() {
+        let finish = data
+            .get("candidates")
+            .and_then(|candidates| candidates.get(0))
+            .and_then(|candidate| candidate.get("finishReason"))
+            .and_then(Value::as_str)
+            .unwrap_or("<no candidates>");
+        return Err(EnclaveError::Config(format!(
+            "unexpected Vertex media response shape (finishReason: {finish})"
+        )));
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +287,24 @@ mod tests {
                 "{field} must be required by constrained decoding"
             );
         }
+    }
+
+    #[test]
+    fn audio_request_inlines_bytes_and_enables_timestamp_understanding() {
+        let body = media_request_body(
+            "transcribe",
+            "audio/m4a",
+            b"test-audio",
+            json!({"type":"OBJECT"}),
+            true,
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][0]["inlineData"]["mimeType"],
+            "audio/m4a"
+        );
+        assert_eq!(body["generationConfig"]["audioTimestamp"], true);
+        assert!(body["contents"][0]["parts"][0]["inlineData"]["data"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
     }
 }

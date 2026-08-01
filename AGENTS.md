@@ -25,9 +25,11 @@ get a `map.md` linked from their parent. Treat a stale `map.md` like stale docs.
   auth, crypto, attestation, or key handling.
 - `CONTRIBUTING.md` — contribution + PR rules (summarized below).
 - **Product + security ground truth: `README.md` and `SECURITY.md` in this repo.** Preserve
-  the security invariants they document: raw media stays local by default; plaintext only
-  enters this attested process; data is encrypted per user; key access is bound to the
-  attested digest; no new plaintext sink is introduced; and export/delete remain complete.
+  the security invariants they document: bounded raw media follows the authenticated
+  Cloud Capture path by default; persistent objects are encrypted per user; plaintext
+  stays in the attested process except for the documented Vertex inference boundary;
+  key access is bound to the attested digest; no undocumented plaintext sink is
+  introduced; and export/delete remain complete.
   A change that weakens an invariant is wrong by default.
 - Client applications, capture pipelines, and deployment automation are downstream
   consumers of the public interfaces documented in this repository. Coordinate breaking

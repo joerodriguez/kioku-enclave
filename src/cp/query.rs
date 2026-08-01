@@ -2933,6 +2933,7 @@ mod tests {
                 base_url: "http://localhost:8080".into(),
                 jwt_secrets: vec!["test-secret".into()],
                 google_desktop_client_id: "desktop".into(),
+                google_ios_client_id: "ios".into(),
                 google_web_client_id: "web".into(),
                 google_web_client_secret: "secret".into(),
                 allowed_emails: None,
@@ -2954,6 +2955,7 @@ mod tests {
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
             embedding: None,
+            voice: None,
         })
     }
 
@@ -3866,6 +3868,7 @@ mod tests {
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
             embedding: None,
+            voice: None,
         });
 
         // Query using correct UTC bounds for 7:30 PM - 8:15 PM EDT
@@ -3943,6 +3946,7 @@ mod tests {
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
             embedding: None,
+            voice: None,
         });
 
         // Query with EDT offset timestamps: 7:00 PM to 8:00 PM EDT = 23:00-00:00 UTC
@@ -3991,6 +3995,7 @@ mod tests {
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: Some(Arc::new(crate::cp::email_worker::FakeEmailTransport::new())),
             embedding: None,
+            voice: None,
         });
 
         // 1. GET default preference

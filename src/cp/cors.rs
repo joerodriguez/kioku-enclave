@@ -77,6 +77,7 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             jwt_secrets: vec!["secret".to_string()],
             google_desktop_client_id: "".to_string(),
+            google_ios_client_id: "".to_string(),
             google_web_client_id: "".to_string(),
             google_web_client_secret: "".to_string(),
             allowed_emails: None,
@@ -109,6 +110,7 @@ mod tests {
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
             embedding: None,
+            voice: None,
         });
 
         Router::new()

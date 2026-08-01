@@ -24,6 +24,8 @@ pub mod limits;
 pub mod mcp_projection;
 pub mod mcp_query;
 pub(crate) mod mcp_safety;
+pub mod media;
+pub mod media_worker;
 pub mod oauth;
 pub mod query;
 pub mod reviewer;
@@ -32,6 +34,7 @@ pub mod summarizer;
 pub mod sync;
 pub mod tokens;
 pub mod vertex;
+pub mod voice_memory;
 pub mod webhook_worker;
 
 use serde::Deserialize;
@@ -60,6 +63,7 @@ pub struct CpConfig {
     /// JWT signing secrets: current first, then rotation-fallback(s).
     pub jwt_secrets: Vec<String>,
     pub google_desktop_client_id: String,
+    pub google_ios_client_id: String,
     pub google_web_client_id: String,
     pub google_web_client_secret: String,
     /// Lowercased allow-list. `None` is permitted only in debug test mode.
@@ -234,7 +238,7 @@ impl CpConfig {
             })
         };
 
-        let vertex_model = config_value("VERTEX_MODEL", "gemini-2.5-flash")?;
+        let vertex_model = config_value("VERTEX_MODEL", "gemini-3.5-flash")?;
 
         Ok(Self {
             base_url,
@@ -246,6 +250,10 @@ impl CpConfig {
             google_web_client_id: config_value(
                 "GOOGLE_WEB_CLIENT_ID",
                 "test-web.apps.googleusercontent.com",
+            )?,
+            google_ios_client_id: config_value(
+                "GOOGLE_IOS_CLIENT_ID",
+                "test-ios.apps.googleusercontent.com",
             )?,
             google_web_client_secret,
             allowed_emails,
@@ -265,11 +273,15 @@ impl CpConfig {
 
     /// Google ID-token audiences accepted for end-user (device + web) sign-in.
     pub fn user_audiences(&self) -> Vec<String> {
-        [&self.google_desktop_client_id, &self.google_web_client_id]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
+        [
+            &self.google_desktop_client_id,
+            &self.google_ios_client_id,
+            &self.google_web_client_id,
+        ]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
     }
 
     pub fn email_allowed(&self, email: &str) -> bool {
@@ -298,6 +310,9 @@ pub struct CpState {
     /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
     /// (model not baked/downloaded, or failed to load — never fatal).
     pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,
+    /// Python-free WeSpeaker voiceprint engine. The production image bakes the
+    /// pinned ONNX model; local tests may run without it.
+    pub voice: Option<Arc<voice_memory::VoiceEngine>>,
 }
 
 /// Helper to fetch a secret from GCP Secret Manager at runtime, using the GCE metadata server token.

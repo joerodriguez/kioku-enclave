@@ -1015,6 +1015,7 @@ CREATE TABLE IF NOT EXISTS device_watermarks (
 /// `CREATE UNIQUE INDEX IF NOT EXISTS` is truly idempotent.
 fn run_migrations(conn: &Connection) -> Result<()> {
     crate::cp::mcp_projection::init_projection_schema(conn)?;
+    crate::cp::media::init_schema(conn)?;
     // utterances.source_key (sync idempotency key)
     if let Err(e) = conn.execute_batch("ALTER TABLE utterances ADD COLUMN source_key TEXT;") {
         // SQLite returns "duplicate column name: source_key" — ignore it.
@@ -1851,20 +1852,25 @@ fn gcs_object_name(user_id: &str) -> String {
 }
 
 fn media_keys(conn: &Connection) -> Result<Vec<String>> {
-    let table_exists: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
-        [],
-        |row| row.get(0),
-    )?;
-    if table_exists == 0 {
-        return Ok(Vec::new());
+    let mut keys = Vec::new();
+    for table in ["screenshot_images", "media_objects"] {
+        let table_exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if table_exists == 0 {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!("SELECT object_key FROM {table}"))?;
+        keys.extend(
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
     }
-    let mut stmt = conn.prepare("SELECT object_key FROM screenshot_images")?;
-    let keys = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into);
-    keys
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 pub(crate) fn user_blob_context(user_id: &str) -> Vec<u8> {
@@ -2589,6 +2595,59 @@ pub(crate) mod tests {
             );
         }
         assert!(validate_user_id(&"a".repeat(MAX_USER_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn migrations_install_cloud_capture_schema_and_media_cleanup_finds_every_object() {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let media_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_objects'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(media_table, 1);
+
+        conn.execute(
+            "INSERT INTO capture_sessions \
+             (id,device_id,install_id,started_at,last_event_at,schema_version) \
+             VALUES ('session','device','install','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z',2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_streams (id,capture_session_id,device_id,stream_kind) \
+             VALUES ('stream','session','device','mic')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_events \
+             (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
+              source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes, \
+              clock_uncertainty_ms,asset_id,manifest_digest) \
+             VALUES ('event','device','install','session','stream','mic',0, \
+                     '2026-01-01T00:00:00Z','1','2026-01-01T00:00:00Z', \
+                     '2026-01-01T00:00:01Z','UTC',0,1,'asset', \
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_objects \
+             (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256) \
+             VALUES ('asset','event','raw/cloud','audio/m4a','aac',1, \
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(media_keys(&conn).unwrap(), vec!["raw/cloud".to_string()]);
     }
 
     /// A traversal-style user_id must be rejected by the store itself before

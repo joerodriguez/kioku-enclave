@@ -38,10 +38,12 @@ name: Build & push enclave image
 #   ENCLAVE_KMS_KEY_RING      KMS key ring name
 #   ENCLAVE_KMS_KEY           KMS crypto key name
 #   ENCLAVE_GCS_BUCKET        GCS bucket for encrypted index blobs
+#   ENCLAVE_GCS_MEDIA_BUCKET  GCS bucket for encrypted, bounded-retention media
 #   ENCLAVE_RUN_SA_EMAIL      Control-plane service account email
 #   ENCLAVE_AUDIENCE          Enclave's own URL (for ID-token aud validation)
 #   ENCLAVE_ATTEST_STS_AUDIENCE  WIF provider resource name for attestation STS
 #   GOOGLE_DESKTOP_CLIENT_ID  Google OAuth desktop audience
+#   GOOGLE_IOS_CLIENT_ID      Google OAuth iOS audience
 #   GOOGLE_WEB_CLIENT_ID      Google OAuth web audience
 #   BASE_URL                  Public origin, e.g. https://api.kiokuu.com
 #   WEB_ORIGIN                 Browser application origin, e.g. https://kiokuu.com
@@ -151,10 +153,12 @@ jobs:
           ENCLAVE_KMS_KEY_RING: ${{ vars.ENCLAVE_KMS_KEY_RING }}
           ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
           ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
+          ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
           ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
           ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
           ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
           GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
+          GOOGLE_IOS_CLIENT_ID: ${{ vars.GOOGLE_IOS_CLIENT_ID }}
           GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
           ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           BASE_URL: ${{ vars.BASE_URL }}
@@ -177,9 +181,9 @@ jobs:
         run: |
           REQUIRED=(
             ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING
-            ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_RUN_SA_EMAIL
+            ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_RUN_SA_EMAIL
             ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
-            GOOGLE_DESKTOP_CLIENT_ID GOOGLE_WEB_CLIENT_ID ALLOWED_EMAILS BASE_URL WEB_ORIGIN
+            GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID ALLOWED_EMAILS BASE_URL WEB_ORIGIN
             REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL
             VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
             ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY ENCLAVE_ACME_CONTACT
@@ -208,10 +212,10 @@ jobs:
               if name in {
                   "ALLOWED_EMAILS", "AR_REPOSITORY", "BASE_URL", "ENCLAVE_ACME_CONTACT",
                   "ENCLAVE_ACME_DIRECTORY", "ENCLAVE_ATTEST_STS_AUDIENCE", "ENCLAVE_AUDIENCE",
-                  "ENCLAVE_GCS_BUCKET", "ENCLAVE_KMS_KEY", "ENCLAVE_KMS_KEY_RING",
+                  "ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET", "ENCLAVE_KMS_KEY", "ENCLAVE_KMS_KEY_RING",
                   "ENCLAVE_KMS_LOCATION", "ENCLAVE_KMS_PROJECT", "ENCLAVE_RUN_SA_EMAIL",
                   "GCP_PROJECT_ID", "GCP_REGION", "GCP_SERVICE_ACCOUNT", "GCP_WIF_PROVIDER",
-                  "GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "IMAGE_NAME", "PROJECT_ID",
+                  "GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_IOS_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "IMAGE_NAME", "PROJECT_ID",
                   "REGION", "REVIEWER_AUTH_API_KEY", "REVIEWER_AUTH_EMAIL", "REVIEWER_AUTH_UID",
                   "VERTEX_LOCATION", "VERTEX_MODEL", "VERTEX_PROJECT", "WEB_ORIGIN",
               } and any(ord(char) < 32 or ord(char) == 127 for char in os.environ[name]):
@@ -225,7 +229,7 @@ jobs:
           require_pattern("ENCLAVE_RUN_SA_EMAIL", r"[a-z0-9][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com")
           require_pattern("GCP_WIF_PROVIDER", r"projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+")
           require_pattern("ENCLAVE_ATTEST_STS_AUDIENCE", r"//iam\.googleapis\.com/projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+")
-          for name in ("GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID"):
+          for name in ("GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_IOS_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID"):
               require_pattern(name, r"[A-Za-z0-9._-]+\.apps\.googleusercontent\.com")
           require_pattern("REVIEWER_AUTH_API_KEY", r"[A-Za-z0-9_-]{20,256}")
           require_pattern("REVIEWER_AUTH_UID", r"[A-Za-z0-9_-]{1,128}")
@@ -237,6 +241,7 @@ jobs:
           for name in ("ENCLAVE_KMS_KEY_RING", "ENCLAVE_KMS_KEY"):
               require_pattern(name, r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
           require_pattern("ENCLAVE_GCS_BUCKET", r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
+          require_pattern("ENCLAVE_GCS_MEDIA_BUCKET", r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
           require_pattern("VERTEX_MODEL", r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}")
 
           def require_https(name, origin_only=False):
@@ -267,10 +272,12 @@ jobs:
           ENCLAVE_KMS_KEY_RING: ${{ vars.ENCLAVE_KMS_KEY_RING }}
           ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
           ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
+          ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
           ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
           ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
           ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
           GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
+          GOOGLE_IOS_CLIENT_ID: ${{ vars.GOOGLE_IOS_CLIENT_ID }}
           GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
           ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           BASE_URL: ${{ vars.BASE_URL }}
@@ -304,10 +311,12 @@ jobs:
             --build-arg KMS_KEY_RING="${ENCLAVE_KMS_KEY_RING}" \
             --build-arg KMS_KEY="${ENCLAVE_KMS_KEY}" \
             --build-arg GCS_BUCKET="${ENCLAVE_GCS_BUCKET}" \
+            --build-arg GCS_MEDIA_BUCKET="${ENCLAVE_GCS_MEDIA_BUCKET}" \
             --build-arg RUN_SA_EMAIL="${ENCLAVE_RUN_SA_EMAIL}" \
             --build-arg ENCLAVE_AUDIENCE="${ENCLAVE_AUDIENCE}" \
             --build-arg ATTEST_STS_AUDIENCE="${ENCLAVE_ATTEST_STS_AUDIENCE}" \
             --build-arg GOOGLE_DESKTOP_CLIENT_ID="${GOOGLE_DESKTOP_CLIENT_ID}" \
+            --build-arg GOOGLE_IOS_CLIENT_ID="${GOOGLE_IOS_CLIENT_ID}" \
             --build-arg GOOGLE_WEB_CLIENT_ID="${GOOGLE_WEB_CLIENT_ID}" \
             --build-arg ALLOWED_EMAILS="${ALLOWED_EMAILS}" \
             --build-arg BASE_URL="${BASE_URL}" \
