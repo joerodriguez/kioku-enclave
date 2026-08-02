@@ -2,7 +2,7 @@
 
 | File | Role |
 |---|---|
-| `README.md` | Aggregate case contract, required real-corpus coverage, licensing/hash rules, slice baselines, canonical release artifacts, and fail-closed release policy |
+| `README.md` | Aggregate case contract, denominator-visible per-slice identity/abstention metrics, required real-corpus coverage, licensing/hash rules, slice baselines, canonical release artifacts, and fail-closed release policy |
 | `synthetic-contract-v1.json` | Redistributable content-free cases that pin scorer arithmetic and prove synthetic evidence can never pass release gates |
 | `run-evidence-schema-v1.json` | Strict private run-input contract for pipeline/version identity, hash-bound source recordings and labels, opaque diarization intervals, identity decisions, fact provenance, and exact create/export/delete record sets |
 

@@ -50,8 +50,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   applied and reversed without deleting source observations or prior derivations.
 - Publishes the ADR-0016 voice evaluation reducer and schema. Release CI recomputes
   overlap-aware diarization and identity/fact/export/delete metrics from hash-bound,
-  content-free schema-v2 evidence; synthetic or hand-authored legacy aggregates cannot
-  authorize a quality release.
+  content-free schema-v2 evidence. Identity decisions include denominator-visible
+  precision, wrong-binding, cross-meeting, after-three-sample, and abstention metrics
+  for every corpus slice; synthetic or hand-authored legacy aggregates cannot authorize
+  a quality release.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini

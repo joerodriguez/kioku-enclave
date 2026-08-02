@@ -29,6 +29,16 @@ checked-in regression report; a synthetic-only report always has
 `corpus_kind: "real_audio"` cases, so synthetic cases cannot pad precision or
 recall.
 
+The report emits `identity_metrics_by_slice` for every evaluated slice. Each
+entry exposes the case, prediction, and abstention counts; accepted-name correct
+and wrong counts; cross-meeting correct counts; after-three-sample recognized
+counts; and the corresponding rates. Zero denominators remain visible as zero
+counts and zero rates instead of disappearing. Global gates are computed from
+the same shared counter implementation, not by averaging slice percentages.
+This makes a model or threshold comparison reviewable for every device,
+language, noise, overlap, and adversarial slice without publishing raw voice
+scores or private content.
+
 The private run input conforms to `run-evidence-schema-v1.json`. It binds the
 evaluated enclave image digest, source commit, Vertex model, exact voice-model
 hash, embedding/scorer/quality versions, exact match/new-profile/margin/outlier
