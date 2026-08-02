@@ -72,6 +72,7 @@ pub struct EvaluationReport {
     pub cross_meeting_link_precision: f64,
     pub after_three_sample_count: u64,
     pub recognition_recall_after_three: f64,
+    pub identity_metrics_by_slice: BTreeMap<String, SliceIdentityMetrics>,
     pub clean_remote_speech_ms: u64,
     pub clean_remote_diarization_error: f64,
     pub diarization_error_by_slice: BTreeMap<String, f64>,
@@ -90,6 +91,26 @@ pub struct EvaluationReport {
     pub missing_metric_evidence: Vec<String>,
     pub missing_required_slices: Vec<String>,
     pub release_gates_pass: bool,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SliceIdentityMetrics {
+    pub case_count: u64,
+    pub predicted_person_count: u64,
+    pub abstention_count: u64,
+    pub abstention_rate: f64,
+    pub accepted_name_decision_count: u64,
+    pub correct_accepted_name_count: u64,
+    pub accepted_name_precision: f64,
+    pub wrong_person_accepted_binding_count: u64,
+    pub wrong_person_accepted_binding_rate: f64,
+    pub cross_meeting_link_count: u64,
+    pub correct_cross_meeting_link_count: u64,
+    pub cross_meeting_link_precision: f64,
+    pub after_three_sample_count: u64,
+    pub recognized_after_three_count: u64,
+    pub recognition_recall_after_three: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,6 +416,63 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+fn score_identity<'a>(cases: impl IntoIterator<Item = &'a EvaluationCase>) -> SliceIdentityMetrics {
+    let mut metrics = SliceIdentityMetrics::default();
+    for case in cases {
+        metrics.case_count = metrics.case_count.saturating_add(1);
+        let correct = case.predicted_person.as_deref() == Some(case.expected_person.as_str());
+        if case.predicted_person.is_some() {
+            metrics.predicted_person_count = metrics.predicted_person_count.saturating_add(1);
+        } else {
+            metrics.abstention_count = metrics.abstention_count.saturating_add(1);
+        }
+        if case.accepted_name {
+            metrics.accepted_name_decision_count =
+                metrics.accepted_name_decision_count.saturating_add(1);
+            if correct {
+                metrics.correct_accepted_name_count =
+                    metrics.correct_accepted_name_count.saturating_add(1);
+            } else {
+                metrics.wrong_person_accepted_binding_count = metrics
+                    .wrong_person_accepted_binding_count
+                    .saturating_add(1);
+            }
+        }
+        if case.cross_meeting_link && case.predicted_person.is_some() {
+            metrics.cross_meeting_link_count = metrics.cross_meeting_link_count.saturating_add(1);
+            if correct {
+                metrics.correct_cross_meeting_link_count =
+                    metrics.correct_cross_meeting_link_count.saturating_add(1);
+            }
+        }
+        if case.after_three_high_quality_samples {
+            metrics.after_three_sample_count = metrics.after_three_sample_count.saturating_add(1);
+            if correct {
+                metrics.recognized_after_three_count =
+                    metrics.recognized_after_three_count.saturating_add(1);
+            }
+        }
+    }
+    metrics.abstention_rate = ratio(metrics.abstention_count, metrics.case_count);
+    metrics.accepted_name_precision = ratio(
+        metrics.correct_accepted_name_count,
+        metrics.accepted_name_decision_count,
+    );
+    metrics.wrong_person_accepted_binding_rate = ratio(
+        metrics.wrong_person_accepted_binding_count,
+        metrics.accepted_name_decision_count,
+    );
+    metrics.cross_meeting_link_precision = ratio(
+        metrics.correct_cross_meeting_link_count,
+        metrics.cross_meeting_link_count,
+    );
+    metrics.recognition_recall_after_three = ratio(
+        metrics.recognized_after_three_count,
+        metrics.after_three_sample_count,
+    );
+    metrics
+}
+
 pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
     let unique_case_ids = corpus
         .cases
@@ -416,32 +494,10 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
     } else {
         real_cases.clone()
     };
-    let accepted = quality_cases
-        .iter()
-        .copied()
-        .filter(|case| case.accepted_name);
-    let accepted_count = accepted.clone().count() as u64;
-    let correct_accepted = accepted
-        .clone()
-        .filter(|case| case.predicted_person.as_deref() == Some(case.expected_person.as_str()))
-        .count() as u64;
-    let wrong_accepted = accepted_count - correct_accepted;
-    let cross = quality_cases
-        .iter()
-        .copied()
-        .filter(|case| case.cross_meeting_link && case.predicted_person.is_some());
-    let cross_count = cross.clone().count() as u64;
-    let correct_cross = cross
-        .filter(|case| case.predicted_person.as_deref() == Some(case.expected_person.as_str()))
-        .count() as u64;
-    let after_three = quality_cases
-        .iter()
-        .copied()
-        .filter(|case| case.after_three_high_quality_samples);
-    let after_three_count = after_three.clone().count() as u64;
-    let recognized_after_three = after_three
-        .filter(|case| case.predicted_person.as_deref() == Some(case.expected_person.as_str()))
-        .count() as u64;
+    let identity_metrics = score_identity(quality_cases.iter().copied());
+    let accepted_count = identity_metrics.accepted_name_decision_count;
+    let cross_count = identity_metrics.cross_meeting_link_count;
+    let after_three_count = identity_metrics.after_three_sample_count;
     let facts = quality_cases
         .iter()
         .map(|case| case.fact_count)
@@ -481,10 +537,21 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         .flat_map(HashMap::values)
         .filter(|expected_people| expected_people.len() > 1)
         .count();
-    let accepted_name_precision = ratio(correct_accepted, accepted_count);
-    let wrong_person_accepted_binding_rate = ratio(wrong_accepted, accepted_count);
-    let cross_meeting_link_precision = ratio(correct_cross, cross_count);
-    let recognition_recall_after_three = ratio(recognized_after_three, after_three_count);
+    let accepted_name_precision = identity_metrics.accepted_name_precision;
+    let wrong_person_accepted_binding_rate = identity_metrics.wrong_person_accepted_binding_rate;
+    let cross_meeting_link_precision = identity_metrics.cross_meeting_link_precision;
+    let recognition_recall_after_three = identity_metrics.recognition_recall_after_three;
+    let mut cases_by_slice = BTreeMap::<String, Vec<&EvaluationCase>>::new();
+    for case in &quality_cases {
+        cases_by_slice
+            .entry(case.slice.clone())
+            .or_default()
+            .push(case);
+    }
+    let identity_metrics_by_slice = cases_by_slice
+        .into_iter()
+        .map(|(slice, cases)| (slice, score_identity(cases)))
+        .collect::<BTreeMap<_, _>>();
     let fact_provenance_coverage = ratio(facts_with_provenance, facts);
     let export_coverage = ratio(exported_new_records, new_records);
     let delete_coverage = ratio(deleted_new_records, new_records);
@@ -606,6 +673,7 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         cross_meeting_link_precision,
         after_three_sample_count: after_three_count,
         recognition_recall_after_three,
+        identity_metrics_by_slice,
         clean_remote_speech_ms: clean_speech,
         clean_remote_diarization_error,
         diarization_error_by_slice,
@@ -702,6 +770,11 @@ mod tests {
         assert!(report.clean_remote_diarization_error <= 0.15);
         assert_eq!(report.same_display_name_merges, 0);
         assert_eq!(report.fact_provenance_coverage, 1.0);
+        let overlap = &report.identity_metrics_by_slice["overlap"];
+        assert_eq!(overlap.case_count, 1);
+        assert_eq!(overlap.abstention_count, 1);
+        assert_eq!(overlap.accepted_name_decision_count, 0);
+        assert_eq!(overlap.accepted_name_precision, 0.0);
         assert!(!report.missing_required_slices.is_empty());
         assert!(!report.release_gates_pass);
         assert!(score_json(SYNTHETIC)
@@ -807,7 +880,60 @@ mod tests {
         assert_eq!(report.fact_provenance_coverage, 1.0);
         assert_eq!(report.export_coverage, 1.0);
         assert_eq!(report.delete_coverage, 1.0);
+        assert_eq!(
+            report.identity_metrics_by_slice["clean_remote_call"].case_count,
+            1
+        );
         assert!(!report.release_gates_pass);
+    }
+
+    #[test]
+    fn identity_decisions_are_reported_per_slice_with_explicit_denominators() {
+        let mut corpus = passing_real_corpus();
+        let mut same_name_cases = corpus
+            .cases
+            .iter_mut()
+            .filter(|case| case.slice == "same_display_name")
+            .collect::<Vec<_>>();
+        same_name_cases[1].predicted_person = Some("person-dddddddddddddddd".into());
+
+        corpus.cases.push(EvaluationCase {
+            id: "case-cccccccccccccccc".into(),
+            corpus_kind: "real_audio".into(),
+            slice: "same_display_name".into(),
+            expected_person: "person-cccccccccccccccc".into(),
+            predicted_person: None,
+            accepted_name: false,
+            cross_meeting_link: false,
+            after_three_high_quality_samples: true,
+            speech_ms: 10_000,
+            diarization_error_ms: 0,
+            fact_count: 0,
+            facts_with_provenance: 0,
+            display_name_collision_group: Some("collision-aaaaaaaaaaaaaaaa".into()),
+            new_record_count: 0,
+            exported_new_record_count: 0,
+            deleted_new_record_count: 0,
+            evidence: None,
+        });
+
+        let report = score(&corpus);
+        let metrics = &report.identity_metrics_by_slice["same_display_name"];
+        assert_eq!(metrics.case_count, 3);
+        assert_eq!(metrics.predicted_person_count, 2);
+        assert_eq!(metrics.abstention_count, 1);
+        assert_eq!(metrics.abstention_rate, 1.0 / 3.0);
+        assert_eq!(metrics.accepted_name_decision_count, 2);
+        assert_eq!(metrics.correct_accepted_name_count, 1);
+        assert_eq!(metrics.accepted_name_precision, 0.5);
+        assert_eq!(metrics.wrong_person_accepted_binding_count, 1);
+        assert_eq!(metrics.wrong_person_accepted_binding_rate, 0.5);
+        assert_eq!(metrics.cross_meeting_link_count, 2);
+        assert_eq!(metrics.correct_cross_meeting_link_count, 1);
+        assert_eq!(metrics.cross_meeting_link_precision, 0.5);
+        assert_eq!(metrics.after_three_sample_count, 3);
+        assert_eq!(metrics.recognized_after_three_count, 1);
+        assert_eq!(metrics.recognition_recall_after_three, 1.0 / 3.0);
     }
 
     #[test]
