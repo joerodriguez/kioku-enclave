@@ -11,7 +11,7 @@ const MIN_EMBEDDING_MS: i64 = 1_000;
 const MIN_ENROLLMENT_MS: i64 = 3_000;
 const MIN_SPEECH_RATIO: f64 = 0.50;
 const MAX_CLIPPING_RATIO: f64 = 0.01;
-const OUTLIER_SIMILARITY: f32 = 0.50;
+pub(crate) const OUTLIER_SIMILARITY: f32 = 0.50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -1,11 +1,12 @@
 # Voice and identity evaluation
 
-This directory is the public ADR-0016 scoring and release contract.
-`voice_eval.rs` reads strict aggregate JSON, computes every release metric,
-and refuses to mark a corpus release-ready without complete real-audio
-coverage. Synthetic cases pin arithmetic, same-name collision handling,
-abstention, and fact/export/delete coverage, but never contribute to release
-metrics once real cases exist and can never substantiate a quality claim.
+This directory is the public ADR-0016 evidence, scoring, and release contract.
+`voice_eval_evidence.rs` turns a strict private run export into content-free
+schema-v2 release cases, while `voice_eval.rs` independently recomputes every
+metric and refuses incomplete or modified evidence. Synthetic schema-v1 cases
+pin arithmetic, same-name collision handling, abstention, and
+fact/export/delete coverage, but can never substantiate a quality claim. A
+hand-authored schema-v1 `real_audio` aggregate can no longer pass release gates.
 
 A real-corpus run emits one content-free case per scored source interval. It
 must cover clean two-person calls, 3+ speakers, overlap, introductions,
@@ -15,10 +16,11 @@ English, mixed language, active-speaker evidence, roster-only names, and
 conflicting evidence. Restricted media stays outside the repository. Its
 acquisition manifest must record the authoritative source, license, immutable
 archive SHA-256, selected speaker/clip IDs, and derivation command. Generated
-case JSON contains hash-shaped opaque case/person/collision labels and aggregate
-timing/count decisions only. It
-must not contain names, transcript text, URLs, image text, embeddings, raw
-scores, media paths, or source-system identifiers.
+case JSON contains hash-shaped opaque case/person/collision/record labels,
+source hashes, and timestamp intervals. It must not contain names, transcript
+text, URLs, image text, embeddings, raw scores, media paths, or source-system
+identifiers. Unknown fields are rejected, so prohibited content cannot be
+smuggled alongside otherwise valid evidence.
 
 The release report must pass all ADR gates. A model, scorer, quality threshold,
 codec/domain mapping, or fixture change requires a new corpus/report ID and a
@@ -27,15 +29,29 @@ checked-in regression report; a synthetic-only report always has
 `corpus_kind: "real_audio"` cases, so synthetic cases cannot pad precision or
 recall.
 
-Each aggregate case records:
+The private run input conforms to `run-evidence-schema-v1.json`. It binds the
+evaluated enclave image digest, source commit, Vertex model, exact voice-model
+hash, embedding/scorer/quality versions, exact match/new-profile/margin/outlier
+thresholds, account-export artifact hash, and post-delete storage-scan hash. It records opaque reference and predicted
+speaker intervals plus raw identity/fact/record decisions. The reducer derives,
+rather than trusts, every metric-bearing case field.
 
-- an opaque unique case ID, slice, expected/predicted opaque person IDs, and
-  accepted-name/cross-meeting/after-three-samples decisions;
-- reference speech and diarization-error milliseconds;
-- accepted fact and provenance counts; and
-- total, exported, and deleted counts for the ADR-0016 records created by the
-  test. The last three counts come from an export assertion followed by an
-  account-delete/storage assertion, not from a model response.
+Each schema-v2 case records:
+
+- opaque unique case, recording, meeting, expected-person, predicted-person,
+  collision, fact, evidence, source-record, and created-record IDs;
+- the actual binding lifecycle state and prior high-quality sample count, from
+  which accepted-name, cross-meeting, and after-three-sample decisions derive;
+- accepted fact rows and their evidence/source-record bindings; and
+- exact created, exported, and deleted record-ID sets. Export/delete IDs must
+  be subsets of the created set and record IDs must be globally unique.
+
+Each recording contains opaque reference and predicted speaker intervals. The
+scorer computes overlap-aware diarization error after finding the optimal
+one-to-one mapping between the two opaque speaker namespaces. Reference speech,
+misses, false alarms, confusion, and overlapping speaker-time are therefore
+not operator-supplied counters. Every recording must support a scored case, and
+same-display-name evidence must include at least two distinct expected people.
 
 The record totals include profile proposals, append-only profile revisions,
 active/superseded sample assignments, and proposal source/result membership.
@@ -60,10 +76,11 @@ The manifest must cover every required slice, and owner fixtures specifically
 must cover Mac system audio, Mac microphone, iPhone microphone, Bluetooth,
 active-speaker UI, and same-display-name separation.
 
-The aggregate cases include the exact raw-byte SHA-256 of the checked-in
-manifest, and the report repeats that binding. Changing a source selection,
-license, fixture, hash, or derivation command therefore makes the release
-bundle stale until the real run and report are regenerated.
+The case builder computes the exact raw-byte SHA-256 of both the checked-in
+manifest and private run evidence. The cases and report repeat those bindings.
+Changing a source selection, license, fixture, hash, derivation command, run
+record, or pipeline identity therefore makes the release bundle stale until
+the real run and report are regenerated.
 
 Suitable authoritative inputs include the
 [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) for licensed
@@ -91,14 +108,22 @@ the repository:
 
 - `eval/voice/release-manifest-v1.json` — licensed-source hashes/selections and
   opaque owner-fixture media/label/authorization bindings;
-- `eval/voice/release-cases-v1.json` — content-free aggregates produced from
-  the licensed real corpus and owner-controlled export/delete assertions;
+- `eval/voice/release-cases-v1.json` — schema-v2 content-free evidence and
+  derived cases produced from the licensed real corpus and owner-controlled
+  export/delete assertions;
 - `eval/voice/release-report-v1.json` — the deterministic scorer output for
   those exact cases.
 
-After a real run, generate and validate the report with:
+After a real run, generate the canonical cases from the reviewed manifest and
+the private run export, then generate and validate the report:
 
 ```sh
+cargo run --locked -- \
+  --build-voice-eval-cases \
+  eval/voice/release-manifest-v1.json \
+  /absolute/private/path/kioku-voice-run-evidence-v1.json \
+  > eval/voice/release-cases-v1.json
+
 cargo run --locked -- \
   --score-voice-eval eval/voice/release-cases-v1.json \
   > eval/voice/release-report-v1.json
@@ -122,9 +147,9 @@ cargo run --locked -- \
   /absolute/private/path/kioku-voice-eval-assets
 ```
 
-Copy the validator's raw-byte SHA-256 into the aggregate cases as
-`source_manifest_sha256` before scoring. Any later manifest edit deliberately
-invalidates that binding.
+The case builder inserts the manifest and private run raw-byte SHA-256 bindings
+automatically. They are not operator-entered fields. Any later input edit
+deliberately invalidates the generated bundle.
 
 The fetcher refuses an in-repository destination, uses HTTPS only, never
 replaces an existing mismatched archive, and verifies SHA-256 before making a

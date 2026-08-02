@@ -48,6 +48,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   matching in the cloud; no Python runtime is present. Voice samples use append-only
   active assignments and profile revisions so calibrated merge/split proposals can be
   applied and reversed without deleting source observations or prior derivations.
+- Publishes the ADR-0016 voice evaluation reducer and schema. Release CI recomputes
+  overlap-aware diarization and identity/fact/export/delete metrics from hash-bound,
+  content-free schema-v2 evidence; synthetic or hand-authored legacy aggregates cannot
+  authorize a quality release.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
