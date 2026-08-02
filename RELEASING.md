@@ -20,9 +20,9 @@ To cut a new release:
    update `version = "X.Y.Z"` in `Cargo.toml` and refresh `Cargo.lock`.
 2. Produce the licensed source manifest, real-corpus aggregate cases, and deterministic report
    described in [`eval/voice/README.md`](eval/voice/README.md). Review and
-   commit `eval/voice/release-manifest-v1.json`,
-   `eval/voice/release-cases-v1.json`, and
-   `eval/voice/release-report-v1.json`; they contain no media or user content.
+   commit `eval/voice/release-manifest.json`,
+   `eval/voice/release-cases.json`, and
+   `eval/voice/release-report.json`; they contain no media or user content.
 3. Merge those changes through a green pull request, then synchronize a clean
    local `main` with `origin/main`.
 4. Run `scripts/release.sh` with the trusted signing-key fingerprint. It checks
