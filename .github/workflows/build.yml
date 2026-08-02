@@ -49,7 +49,7 @@ name: Build & push enclave image
 #   GOOGLE_WEB_CLIENT_ID      Google OAuth web audience
 #   BASE_URL                  Public origin, e.g. https://api.kiokuu.com
 #   WEB_ORIGIN                 Browser application origin, e.g. https://kiokuu.com
-#   REVIEWER_AUTH_API_KEY     Public Firebase/Identity Platform web API key
+#   REVIEWER_AUTH_API_KEY     Firebase/Identity Platform web API key
 #   REVIEWER_AUTH_UID         Exact precreated synthetic reviewer account UID
 #   REVIEWER_AUTH_EMAIL       Exact precreated synthetic reviewer account email
 #   VERTEX_PROJECT            GCP project for episode summarization
@@ -61,6 +61,7 @@ name: Build & push enclave image
 # Privacy-sensitive repository secrets (baked in, but masked in Actions logs):
 #   ALLOWED_EMAILS            Comma-separated production account allow-list
 #   ENCLAVE_ACME_CONTACT      ACME account contact email
+#   EVAL_REVIEWER_AUTH_API_KEY  Evaluation Firebase/Identity Platform API key
 #
 # Evaluation builds require an explicit EVAL_* counterpart for every production
 # build-arg variable and secret above. The selector fails closed if any selected
@@ -252,7 +253,7 @@ jobs:
           EVALUATION_ALLOWED_EMAILS: ${{ secrets.EVAL_ALLOWED_EMAILS }}
           EVALUATION_BASE_URL: ${{ vars.EVAL_BASE_URL }}
           EVALUATION_WEB_ORIGIN: ${{ vars.EVAL_WEB_ORIGIN }}
-          EVALUATION_REVIEWER_AUTH_API_KEY: ${{ vars.EVAL_REVIEWER_AUTH_API_KEY }}
+          EVALUATION_REVIEWER_AUTH_API_KEY: ${{ secrets.EVAL_REVIEWER_AUTH_API_KEY }}
           EVALUATION_REVIEWER_AUTH_UID: ${{ vars.EVAL_REVIEWER_AUTH_UID }}
           EVALUATION_REVIEWER_AUTH_EMAIL: ${{ vars.EVAL_REVIEWER_AUTH_EMAIL }}
           EVALUATION_VERTEX_PROJECT: ${{ vars.EVAL_VERTEX_PROJECT }}
