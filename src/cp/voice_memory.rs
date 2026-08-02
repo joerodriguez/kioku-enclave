@@ -27,11 +27,11 @@ use tract_onnx::prelude::*;
 use crate::error::{EnclaveError, Result};
 
 use super::media::AudioTurn;
+use super::voice_quality::{self, SampleDecision, VoiceDiagnostics};
 
 pub const EMBEDDING_SPACE: &str = "wespeaker-resnet34-lm-v1";
 const DEFAULT_MODEL_PATH: &str = "/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx";
 pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
-const MIN_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize;
 const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
 const MATCH_THRESHOLD: f32 = 0.60;
 const NEW_PROFILE_THRESHOLD: f32 = 0.45;
@@ -39,6 +39,12 @@ const MIN_DECISION_MARGIN: f32 = 0.08;
 
 pub struct VoiceEngine {
     model: Arc<TypedRunnableModel>,
+}
+
+pub struct EmbeddedTurn {
+    pub turn_id: String,
+    pub embedding: Option<Vec<f32>>,
+    pub diagnostics: VoiceDiagnostics,
 }
 
 impl VoiceEngine {
@@ -73,7 +79,7 @@ impl VoiceEngine {
         media: &[u8],
         mime_type: &str,
         turns: &[AudioTurn],
-    ) -> Result<Vec<(String, Vec<f32>, f64)>> {
+    ) -> Result<Vec<EmbeddedTurn>> {
         let samples = decode_mono_16khz(media, mime_type)?;
         let mut output = Vec::new();
         for turn in turns {
@@ -82,16 +88,18 @@ impl VoiceEngine {
             let end = end
                 .min(samples.len())
                 .min(start.saturating_add(MAX_TURN_SAMPLES));
-            if end.saturating_sub(start) < MIN_TURN_SAMPLES {
-                continue;
-            }
             let chunk = &samples[start..end];
-            let energy =
-                chunk.iter().map(|value| value.abs() as f64).sum::<f64>() / chunk.len() as f64;
-            if energy < 0.0005 {
-                continue;
-            }
-            output.push((turn.turn_id.clone(), self.embed_samples(chunk)?, energy));
+            let diagnostics = voice_quality::diagnose(chunk, turn.overlap, &turn.quality_flags);
+            let embedding = if diagnostics.decision == SampleDecision::NoEmbedding {
+                None
+            } else {
+                Some(self.embed_samples(chunk)?)
+            };
+            output.push(EmbeddedTurn {
+                turn_id: turn.turn_id.clone(),
+                embedding,
+                diagnostics,
+            });
         }
         Ok(output)
     }
@@ -143,7 +151,7 @@ impl VoiceEngine {
             .to_plain_array_view::<f32>()
             .map_err(|error| EnclaveError::Embedding(format!("voice output: {error}")))?;
         let mut embedding: Vec<f32> = view.iter().copied().collect();
-        normalize(&mut embedding)?;
+        voice_quality::normalize(&mut embedding)?;
         Ok(embedding)
     }
 }
@@ -270,19 +278,6 @@ fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f
         .collect()
 }
 
-fn normalize(vector: &mut [f32]) -> Result<()> {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if !norm.is_finite() || norm <= f32::EPSILON {
-        return Err(EnclaveError::Embedding(
-            "voice embedding has invalid norm".into(),
-        ));
-    }
-    for value in vector {
-        *value /= norm;
-    }
-    Ok(())
-}
-
 fn embedding_blob(vector: &[f32]) -> Vec<u8> {
     vector
         .iter()
@@ -300,21 +295,68 @@ fn embedding_from_blob(blob: &[u8]) -> Result<Vec<f32>> {
         .collect())
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return -1.0;
-    }
-    a.iter().zip(b).map(|(left, right)| left * right).sum()
-}
-
-pub fn match_and_store(
+/// Resolve only a calibrated, unambiguous existing biometric binding. Names
+/// are intentionally absent from this lookup and cannot merge identities.
+pub fn match_existing_person(
     conn: &Connection,
-    speaker_observation_id: i64,
     embedding: &[f32],
     channel_domain: &str,
+) -> Result<Option<i64>> {
+    let mut statement = conn.prepare(
+        "SELECT person_id,centroid FROM voice_profiles WHERE person_id IS NOT NULL \
+         AND embedding_space=?1 AND channel_domain=?2 AND scorer_version=?3 \
+         AND status<>'quarantined'",
+    )?;
+    let mut scores = statement
+        .query_map(
+            params![
+                EMBEDDING_SPACE,
+                channel_domain,
+                voice_quality::SCORER_VERSION
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?
+        .map(|row| {
+            let (person_id, blob) = row?;
+            Ok((
+                person_id,
+                voice_quality::cosine(embedding, &embedding_from_blob(&blob)?),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    scores.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let Some((person_id, best)) = scores.first().copied() else {
+        return Ok(None);
+    };
+    let second = scores.get(1).map(|candidate| candidate.1).unwrap_or(-1.0);
+    Ok((best >= MATCH_THRESHOLD && best - second >= MIN_DECISION_MARGIN).then_some(person_id))
+}
+
+pub fn match_and_store_candidate(
+    conn: &Connection,
+    speaker_observation_id: i64,
+    candidate: &EmbeddedTurn,
+    channel_domain: &str,
     named_person_id: Option<i64>,
-    quality_score: f64,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    let diagnostics_json = serde_json::to_string(&candidate.diagnostics)?;
+    conn.execute(
+        "UPDATE speaker_observations SET voice_eligibility=?1,voice_diagnostics_json=?2 \
+         WHERE id=?3",
+        params![
+            candidate.diagnostics.decision.as_str(),
+            diagnostics_json,
+            speaker_observation_id
+        ],
+    )?;
+    let Some(embedding) = candidate.embedding.as_deref() else {
+        return Ok(None);
+    };
     if embedding.len() != 256 || !embedding.iter().all(|value| value.is_finite()) {
         return Err(EnclaveError::InvalidRequest(
             "voice embedding is invalid".into(),
@@ -323,17 +365,25 @@ pub fn match_and_store(
     let mut profiles = Vec::new();
     let mut statement = conn.prepare(
         "SELECT id,label,person_id,centroid,sample_count FROM voice_profiles \
-         WHERE embedding_space=?1 AND channel_domain=?2 AND status<>'quarantined'",
+         WHERE embedding_space=?1 AND channel_domain=?2 AND scorer_version=?3 \
+         AND status<>'quarantined'",
     )?;
-    for row in statement.query_map(params![EMBEDDING_SPACE, channel_domain], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
-            row.get::<_, i64>(4)?,
-        ))
-    })? {
+    for row in statement.query_map(
+        params![
+            EMBEDDING_SPACE,
+            channel_domain,
+            voice_quality::SCORER_VERSION
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    )? {
         let (id, label, person_id, blob, sample_count) = row?;
         profiles.push((
             id,
@@ -344,16 +394,16 @@ pub fn match_and_store(
         ));
     }
     profiles.sort_by(|left, right| {
-        cosine(embedding, &right.3)
-            .partial_cmp(&cosine(embedding, &left.3))
+        voice_quality::cosine(embedding, &right.3)
+            .partial_cmp(&voice_quality::cosine(embedding, &left.3))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let best = profiles
         .first()
-        .map(|profile| (profile, cosine(embedding, &profile.3)));
+        .map(|profile| (profile, voice_quality::cosine(embedding, &profile.3)));
     let second = profiles
         .get(1)
-        .map(|profile| cosine(embedding, &profile.3))
+        .map(|profile| voice_quality::cosine(embedding, &profile.3))
         .unwrap_or(-1.0);
     let clear_match = best.as_ref().is_some_and(|(_, score)| {
         let identity_compatible = named_person_id.is_none_or(|named| {
@@ -364,39 +414,69 @@ pub fn match_and_store(
         identity_compatible && *score >= MATCH_THRESHOLD && *score - second >= MIN_DECISION_MARGIN
     });
 
-    let (profile_id, similarity, margin, accepted) = if clear_match {
-        let (profile, score) = best.unwrap();
-        let old_weight = profile.4.max(1) as f32;
-        let mut centroid: Vec<f32> = profile
-            .3
-            .iter()
-            .zip(embedding)
-            .map(|(old, new)| (old * old_weight + new) / (old_weight + 1.0))
-            .collect();
-        normalize(&mut centroid)?;
-        conn.execute(
-            "UPDATE voice_profiles SET centroid=?1,sample_count=sample_count+1, \
-             person_id=COALESCE(person_id,?2),status=CASE WHEN sample_count+1>=5 THEN 'stable' ELSE status END, \
-             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?3",
-            params![embedding_blob(&centroid), named_person_id, profile.0],
-        )?;
-        (Some(profile.0), Some(score), Some(score - second), true)
-    } else if named_person_id.is_some()
-        || best
-            .as_ref()
-            .is_none_or(|(_, score)| *score < NEW_PROFILE_THRESHOLD)
+    let may_enroll = candidate.diagnostics.decision == SampleDecision::Enroll;
+    let may_match = matches!(
+        candidate.diagnostics.decision,
+        SampleDecision::Enroll | SampleDecision::MatchOnly
+    );
+    let mut representative_update = None;
+    let mut outlier = false;
+    let (profile_id, similarity, margin, accepted, new_profile) = if clear_match && may_match {
+        let (profile, score) = best.expect("clear match has best profile");
+        if may_enroll {
+            let mut statement = conn.prepare(
+                "SELECT id,embedding FROM voice_samples WHERE voice_profile_id=?1 \
+                 AND accepted=1 AND eligibility='enroll' AND outlier=0 AND scorer_version=?2 \
+                 ORDER BY id DESC LIMIT 100",
+            )?;
+            let rows = statement
+                .query_map(params![profile.0, voice_quality::SCORER_VERSION], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut sample_ids = Vec::with_capacity(rows.len() + 1);
+            let mut samples = Vec::with_capacity(rows.len() + 1);
+            for (id, blob) in rows.into_iter().rev() {
+                sample_ids.push(Some(id));
+                samples.push(embedding_from_blob(&blob)?);
+            }
+            outlier = voice_quality::is_profile_outlier(&samples, embedding)?;
+            if !outlier {
+                sample_ids.push(None);
+                samples.push(embedding.to_vec());
+                let representative = voice_quality::robust_representative(&samples)?;
+                debug_assert!(!representative
+                    .excluded_indices
+                    .contains(&(samples.len() - 1)));
+                representative_update = Some((profile.0, representative, sample_ids));
+            }
+        }
+        (
+            Some(profile.0),
+            Some(score),
+            Some(score - second),
+            !outlier,
+            false,
+        )
+    } else if may_enroll
+        && (named_person_id.is_some()
+            || best
+                .as_ref()
+                .is_none_or(|(_, score)| *score < NEW_PROFILE_THRESHOLD))
     {
         let temporary_label = format!("pending-{speaker_observation_id}");
         conn.execute(
             "INSERT INTO voice_profiles \
-             (person_id,label,embedding_space,channel_domain,centroid,sample_count,status) \
-             VALUES (?1,?2,?3,?4,?5,1,'tentative')",
+             (person_id,label,embedding_space,channel_domain,centroid,sample_count,scorer_version,\
+              representative_kind,status) \
+             VALUES (?1,?2,?3,?4,?5,1,?6,'medoid_trimmed_centroid','tentative')",
             params![
                 named_person_id,
                 temporary_label,
                 EMBEDDING_SPACE,
                 channel_domain,
-                embedding_blob(embedding)
+                embedding_blob(embedding),
+                voice_quality::SCORER_VERSION,
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -404,41 +484,178 @@ pub fn match_and_store(
             "UPDATE voice_profiles SET label=?1 WHERE id=?2",
             params![format!("Voice {id}"), id],
         )?;
-        (Some(id), None, None, true)
+        (Some(id), None, None, true, true)
     } else {
         (
             None,
             best.map(|(_, score)| score),
             best.map(|(_, score)| score - second),
             false,
+            false,
         )
     };
+    let embedding_norm = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
     conn.execute(
         "INSERT INTO voice_samples \
          (speaker_observation_id,voice_profile_id,embedding_space,channel_domain,embedding, \
-          quality_score,similarity,decision_margin,accepted) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+          quality_score,diagnostics_json,quality_version,scorer_version,eligibility,duration_ms,\
+          speech_ratio,snr_proxy_db,clipping_ratio,silence_ratio,embedding_norm,outlier,\
+          similarity,decision_margin,accepted) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             speaker_observation_id,
             profile_id,
             EMBEDDING_SPACE,
             channel_domain,
             embedding_blob(embedding),
-            quality_score,
+            candidate.diagnostics.speech_ratio * (1.0 - candidate.diagnostics.clipping_ratio),
+            diagnostics_json,
+            candidate.diagnostics.quality_version,
+            voice_quality::SCORER_VERSION,
+            candidate.diagnostics.decision.as_str(),
+            candidate.diagnostics.duration_ms,
+            candidate.diagnostics.speech_ratio,
+            candidate.diagnostics.snr_proxy_db,
+            candidate.diagnostics.clipping_ratio,
+            candidate.diagnostics.silence_ratio,
+            embedding_norm,
+            outlier as i64,
             similarity,
             margin,
             accepted as i64
         ],
     )?;
+    let sample_id = conn.last_insert_rowid();
+    if new_profile {
+        conn.execute(
+            "UPDATE voice_profiles SET medoid_sample_id=?1 WHERE id=?2",
+            params![sample_id, profile_id],
+        )?;
+    }
+    if let Some((profile_id, representative, sample_ids)) = representative_update {
+        let medoid_sample_id = sample_ids[representative.medoid_index].unwrap_or(sample_id);
+        let accepted_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM voice_samples WHERE voice_profile_id=?1 AND accepted=1 \
+             AND eligibility='enroll' AND outlier=0 AND scorer_version=?2",
+            params![profile_id, voice_quality::SCORER_VERSION],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE voice_profiles SET centroid=?1,sample_count=?2,person_id=COALESCE(person_id,?3),\
+             scorer_version=?4,representative_kind='medoid_trimmed_centroid',medoid_sample_id=?5,\
+             status=CASE WHEN ?2>=3 THEN 'stable' ELSE status END,\
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?6",
+            params![
+                embedding_blob(&representative.centroid),
+                accepted_count,
+                named_person_id,
+                voice_quality::SCORER_VERSION,
+                medoid_sample_id,
+                profile_id
+            ],
+        )?;
+    }
     let Some(profile_id) = profile_id else {
-        return Ok("Unknown speaker".into());
+        return Ok(None);
     };
-    Ok(conn.query_row(
+    if !accepted {
+        return Ok(None);
+    }
+    Ok(Some(conn.query_row(
         "SELECT COALESCE(p.display_name,v.label) FROM voice_profiles v \
          LEFT JOIN people p ON p.id=v.person_id WHERE v.id=?1",
         [profile_id],
         |row| row.get(0),
-    )?)
+    )?))
+}
+
+/// Recompute robust representatives from already-encrypted raw embeddings.
+/// This is bounded, idempotent, and makes no Gemini call.
+pub fn reconcile_profiles(conn: &Connection, limit: usize) -> Result<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let mut statement = conn.prepare(
+        "SELECT id FROM voice_profiles WHERE status<>'quarantined' AND \
+         (scorer_version<>?1 OR representative_kind<>'medoid_trimmed_centroid') \
+         ORDER BY id LIMIT ?2",
+    )?;
+    let profile_ids = statement
+        .query_map(
+            params![voice_quality::SCORER_VERSION, limit.min(100) as i64],
+            |row| row.get::<_, i64>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut updated = 0;
+    for profile_id in profile_ids {
+        let mut samples_statement = conn.prepare(
+            "SELECT id,embedding FROM voice_samples WHERE voice_profile_id=?1 \
+             AND accepted=1 AND eligibility='enroll' AND outlier=0 ORDER BY id DESC LIMIT 100",
+        )?;
+        let rows = samples_statement
+            .query_map([profile_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            continue;
+        }
+        let mut sample_ids = Vec::with_capacity(rows.len());
+        let mut samples = Vec::with_capacity(rows.len());
+        for (id, blob) in rows.into_iter().rev() {
+            sample_ids.push(id);
+            samples.push(embedding_from_blob(&blob)?);
+        }
+        let representative = voice_quality::robust_representative(&samples)?;
+        let medoid_sample_id = sample_ids[representative.medoid_index];
+        conn.execute(
+            "UPDATE voice_profiles SET centroid=?1,sample_count=?2,scorer_version=?3,\
+             representative_kind='medoid_trimmed_centroid',medoid_sample_id=?4,\
+             status=CASE WHEN ?2>=3 THEN 'stable' ELSE status END,\
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?5",
+            params![
+                embedding_blob(&representative.centroid),
+                samples.len() as i64 - representative.excluded_indices.len() as i64,
+                voice_quality::SCORER_VERSION,
+                medoid_sample_id,
+                profile_id
+            ],
+        )?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+#[cfg(test)]
+pub fn match_and_store(
+    conn: &Connection,
+    speaker_observation_id: i64,
+    embedding: &[f32],
+    channel_domain: &str,
+    named_person_id: Option<i64>,
+    _quality_score: f64,
+) -> Result<String> {
+    let candidate = EmbeddedTurn {
+        turn_id: format!("test-{speaker_observation_id}"),
+        embedding: Some(embedding.to_vec()),
+        diagnostics: voice_quality::diagnose(
+            &vec![0.2; voice_quality::SAMPLE_RATE as usize * 4],
+            false,
+            &[],
+        ),
+    };
+    Ok(match_and_store_candidate(
+        conn,
+        speaker_observation_id,
+        &candidate,
+        channel_domain,
+        named_person_id,
+    )?
+    .unwrap_or_else(|| "Unknown speaker".into()))
 }
 
 #[cfg(test)]
@@ -472,7 +689,7 @@ mod tests {
              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
             [],
         ).unwrap();
-        for turn in ["t1", "t2", "t3"] {
+        for turn in ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"] {
             conn.execute(
                 "INSERT INTO speaker_observations(event_id,turn_id,speaker_local_id,started_at,ended_at,transcript_text) \
                  VALUES ('e',?1,'speaker-1','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z','x')",
@@ -498,7 +715,7 @@ mod tests {
         let mut ambiguous = vec![0.0; 256];
         ambiguous[0] = 0.72;
         ambiguous[1] = 0.69;
-        normalize(&mut ambiguous).unwrap();
+        voice_quality::normalize(&mut ambiguous).unwrap();
         assert_eq!(
             match_and_store(&conn, 3, &ambiguous, "mic", None, 0.8).unwrap(),
             "Unknown speaker"
@@ -511,6 +728,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(accepted, 0);
+    }
+
+    fn candidate(turn_id: &str, embedding: Vec<f32>, seconds: usize) -> EmbeddedTurn {
+        EmbeddedTurn {
+            turn_id: turn_id.into(),
+            embedding: Some(embedding),
+            diagnostics: voice_quality::diagnose(
+                &vec![0.2; voice_quality::SAMPLE_RATE as usize * seconds],
+                false,
+                &[],
+            ),
+        }
+    }
+
+    #[test]
+    fn match_only_samples_link_but_never_change_the_robust_representative() {
+        let conn = voice_db();
+        let enrolled = candidate("t1", unit(0), 4);
+        assert_eq!(
+            match_and_store_candidate(&conn, 1, &enrolled, "mac-mic", None).unwrap(),
+            Some("Voice 1".into())
+        );
+        let before: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT centroid,sample_count FROM voice_profiles WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let match_only = candidate("t2", unit(0), 2);
+        assert_eq!(
+            match_and_store_candidate(&conn, 2, &match_only, "mac-mic", None).unwrap(),
+            Some("Voice 1".into())
+        );
+        let after: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT centroid,sample_count FROM voice_profiles WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        let eligibility: String = conn
+            .query_row(
+                "SELECT eligibility FROM voice_samples WHERE speaker_observation_id=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(eligibility, "match_only");
+    }
+
+    #[test]
+    fn bounded_reconciliation_replaces_legacy_running_mean_without_gemini() {
+        let conn = voice_db();
+        for observation_id in 1..=3 {
+            match_and_store(&conn, observation_id, &unit(0), "legacy-domain", None, 0.9).unwrap();
+        }
+        conn.execute(
+            "UPDATE voice_profiles SET scorer_version=1,representative_kind='running_mean'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(reconcile_profiles(&conn, 1).unwrap(), 1);
+        let state: (i64, String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT scorer_version,representative_kind,sample_count,medoid_sample_id \
+                 FROM voice_profiles",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, voice_quality::SCORER_VERSION);
+        assert_eq!(state.1, "medoid_trimmed_centroid");
+        assert_eq!(state.2, 3);
+        assert!(state.3.is_some());
+        assert_eq!(reconcile_profiles(&conn, 1).unwrap(), 0);
     }
 
     #[test]

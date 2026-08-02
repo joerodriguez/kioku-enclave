@@ -29,7 +29,7 @@ surfaces.
 - CPU-level microarchitectural side channels. Confidential Space provides VM memory
   encryption, not complete Spectre-class protection.
 - **Vertex Gemini inference confidentiality.** Audio transcription/diarization,
-  screenshot understanding, profile learning, settled-episode transcripts, OCR,
+  screenshot understanding, identity/fact evidence extraction, settled-episode transcripts, OCR,
   app/window/URL metadata, browser-tab metadata, and summarisation send bounded user
   content from this process to Vertex under Google's applicable enterprise terms. The
   privacy claim is “attested enclave + Google Vertex inference,” not enclave-only
@@ -61,6 +61,15 @@ surfaces.
 - Unified episode-analysis requests contain text and metadata only. Code that builds a Vertex
   request must not load an image object, image bytes, a signed image URL, or a local image
   path. Cloud Screenshot Evidence consent controls pixel sync, not text inference.
+- Voice embeddings, sample diagnostics, robust profile representatives, biometric
+  match scores, and the identity graph remain inside the encrypted per-user database.
+  They are never sent to Gemini, returned by a public API, emitted in logs/metrics, or
+  compared across users. Candidate names supplied to Gemini are bounded spelling
+  vocabulary only and are never accepted as identity evidence by themselves.
+- Automatic biometric enrollment is quality-gated and versioned. Short samples are
+  match-only, contaminated samples are quarantined, same-name people remain separate
+  opaque identities, and ambiguous/conflicting evidence must abstain rather than
+  overwrite accepted identity history.
 
 ## Key hierarchy and encrypted objects
 
@@ -215,7 +224,7 @@ compilation, and independent rebuild comparison.
 
 ### Vertex and user-configured webhooks cross the TEE boundary
 
-Audio transcription/diarization, screenshot understanding, profile evidence extraction,
+Audio transcription/diarization, screenshot understanding, identity/fact evidence extraction,
 episode summarisation, and evidence verification send bounded content to Google Vertex
 Gemini from this process. Google's no-data-retention terms apply, but the data is outside
 the Confidential Space boundary while Vertex processes it. Webhook events similarly
