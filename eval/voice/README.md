@@ -37,6 +37,11 @@ Each aggregate case records:
   test. The last three counts come from an export assertion followed by an
   account-delete/storage assertion, not from a model response.
 
+The record totals include profile proposals, append-only profile revisions,
+active/superseded sample assignments, and proposal source/result membership.
+Source profiles and prior assignments count toward export/delete coverage even
+after a merge, split, or reversal.
+
 The corpus root includes `diarization_error_baselines` for `noise`,
 `room_audio`, and `overlap`. The scorer reports weighted diarization error for
 every slice and fails closed if a required baseline is absent/invalid or the

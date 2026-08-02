@@ -302,10 +302,14 @@ pub fn match_existing_person(
     embedding: &[f32],
     channel_domain: &str,
 ) -> Result<Option<i64>> {
+    super::voice_lineage::backfill_profile_lineage(conn)?;
     let mut statement = conn.prepare(
         "SELECT person_id,centroid FROM voice_profiles WHERE person_id IS NOT NULL \
          AND embedding_space=?1 AND channel_domain=?2 AND scorer_version=?3 \
-         AND status<>'quarantined'",
+         AND status<>'quarantined' \
+         AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+             WHERE r.profile_id=voice_profiles.id AND r.active=1 \
+               AND r.status IN ('quarantined','superseded','split'))",
     )?;
     let mut scores = statement
         .query_map(
@@ -344,6 +348,7 @@ pub fn match_and_store_candidate(
     channel_domain: &str,
     named_person_id: Option<i64>,
 ) -> Result<Option<String>> {
+    super::voice_lineage::backfill_profile_lineage(conn)?;
     let diagnostics_json = serde_json::to_string(&candidate.diagnostics)?;
     conn.execute(
         "UPDATE speaker_observations SET voice_eligibility=?1,voice_diagnostics_json=?2 \
@@ -366,7 +371,10 @@ pub fn match_and_store_candidate(
     let mut statement = conn.prepare(
         "SELECT id,label,person_id,centroid,sample_count FROM voice_profiles \
          WHERE embedding_space=?1 AND channel_domain=?2 AND scorer_version=?3 \
-         AND status<>'quarantined'",
+         AND status<>'quarantined' \
+         AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+             WHERE r.profile_id=voice_profiles.id AND r.active=1 \
+               AND r.status IN ('quarantined','superseded','split'))",
     )?;
     for row in statement.query_map(
         params![
@@ -425,9 +433,11 @@ pub fn match_and_store_candidate(
         let (profile, score) = best.expect("clear match has best profile");
         if may_enroll {
             let mut statement = conn.prepare(
-                "SELECT id,embedding FROM voice_samples WHERE voice_profile_id=?1 \
-                 AND accepted=1 AND eligibility='enroll' AND outlier=0 AND scorer_version=?2 \
-                 ORDER BY id DESC LIMIT 100",
+                "SELECT s.id,s.embedding FROM voice_samples s \
+                 JOIN voice_sample_profile_assignments a ON a.sample_id=s.id \
+                 WHERE a.profile_id=?1 AND a.active=1 \
+                 AND s.accepted=1 AND s.eligibility='enroll' AND s.outlier=0 AND s.scorer_version=?2 \
+                 ORDER BY s.id DESC LIMIT 100",
             )?;
             let rows = statement
                 .query_map(params![profile.0, voice_quality::SCORER_VERSION], |row| {
@@ -536,11 +546,16 @@ pub fn match_and_store_candidate(
             params![sample_id, profile_id],
         )?;
     }
+    if let Some(profile_id) = profile_id {
+        super::voice_lineage::record_sample_assignment(conn, profile_id, sample_id)?;
+    }
     if let Some((profile_id, representative, sample_ids)) = representative_update {
         let medoid_sample_id = sample_ids[representative.medoid_index].unwrap_or(sample_id);
         let accepted_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM voice_samples WHERE voice_profile_id=?1 AND accepted=1 \
-             AND eligibility='enroll' AND outlier=0 AND scorer_version=?2",
+            "SELECT COUNT(*) FROM voice_samples s \
+             JOIN voice_sample_profile_assignments a ON a.sample_id=s.id \
+             WHERE a.profile_id=?1 AND a.active=1 AND s.accepted=1 \
+             AND s.eligibility='enroll' AND s.outlier=0 AND s.scorer_version=?2",
             params![profile_id, voice_quality::SCORER_VERSION],
             |row| row.get(0),
         )?;
@@ -558,6 +573,13 @@ pub fn match_and_store_candidate(
                 profile_id
             ],
         )?;
+        super::voice_lineage::refresh_profile_revision(
+            conn,
+            profile_id,
+            "representative_recomputed",
+        )?;
+    } else if let Some(profile_id) = profile_id {
+        super::voice_lineage::refresh_profile_revision(conn, profile_id, "sample_assigned")?;
     }
     let Some(profile_id) = profile_id else {
         return Ok(None);
@@ -579,9 +601,13 @@ pub fn reconcile_profiles(conn: &Connection, limit: usize) -> Result<usize> {
     if limit == 0 {
         return Ok(0);
     }
+    super::voice_lineage::backfill_profile_lineage(conn)?;
     let mut statement = conn.prepare(
         "SELECT id FROM voice_profiles WHERE status<>'quarantined' AND \
          (scorer_version<>?1 OR representative_kind<>'medoid_trimmed_centroid') \
+         AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+             WHERE r.profile_id=voice_profiles.id AND r.active=1 \
+               AND r.status IN ('quarantined','superseded','split')) \
          ORDER BY id LIMIT ?2",
     )?;
     let profile_ids = statement
@@ -593,8 +619,11 @@ pub fn reconcile_profiles(conn: &Connection, limit: usize) -> Result<usize> {
     let mut updated = 0;
     for profile_id in profile_ids {
         let mut samples_statement = conn.prepare(
-            "SELECT id,embedding FROM voice_samples WHERE voice_profile_id=?1 \
-             AND accepted=1 AND eligibility='enroll' AND outlier=0 ORDER BY id DESC LIMIT 100",
+            "SELECT s.id,s.embedding FROM voice_samples s \
+             JOIN voice_sample_profile_assignments a ON a.sample_id=s.id \
+             WHERE a.profile_id=?1 AND a.active=1 \
+             AND s.accepted=1 AND s.eligibility='enroll' AND s.outlier=0 \
+             ORDER BY s.id DESC LIMIT 100",
         )?;
         let rows = samples_statement
             .query_map([profile_id], |row| {
@@ -625,6 +654,7 @@ pub fn reconcile_profiles(conn: &Connection, limit: usize) -> Result<usize> {
                 profile_id
             ],
         )?;
+        super::voice_lineage::refresh_profile_revision(conn, profile_id, "bounded_reconciliation")?;
         updated += 1;
     }
     Ok(updated)

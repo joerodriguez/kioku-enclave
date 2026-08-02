@@ -70,6 +70,12 @@ surfaces.
   match-only, contaminated samples are quarantined, same-name people remain separate
   opaque identities, and ambiguous/conflicting evidence must abstain rather than
   overwrite accepted identity history.
+- Voice-profile merge/split work is an append-only derivation inside the encrypted
+  user database. Proposals are bounded, scorer/version bound, same-space/domain
+  checked, identity-conflict checked, and transactionally stale-checked before apply.
+  Source profiles and assignment history are retained; reversal fails closed if a
+  result acquired later samples. No similarity threshold can auto-apply a proposal
+  until the hash-bound real-audio release corpus has calibrated that scorer version.
 
 ## Key hierarchy and encrypted objects
 
