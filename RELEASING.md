@@ -18,7 +18,8 @@ To cut a new release:
 
 1. Run `./scripts/bump_version.sh <NEW_VERSION>` (for example `0.8.4`), or
    update `version = "X.Y.Z"` in `Cargo.toml` and refresh `Cargo.lock`.
-2. Produce the licensed source manifest, real-corpus aggregate cases, and deterministic report
+2. Fetch and derive the licensed corpus into private directories, retain and review its
+   hash receipt, then produce the source manifest, real-corpus aggregate cases, and deterministic report
    described in [`eval/voice/README.md`](eval/voice/README.md). Review and
    commit `eval/voice/release-manifest.json`,
    `eval/voice/release-cases.json`, and

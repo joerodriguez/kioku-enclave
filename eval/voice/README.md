@@ -104,6 +104,18 @@ Changing a source selection, license, fixture, hash, derivation command, run
 record, or pipeline identity therefore makes the release bundle stale until
 the real run and report are regenerated.
 
+The private derivation recipe conforms to
+`derivation-recipe-schema-v1.json`. It binds the raw manifest hash, exact source
+and artifact IDs, an exact archive member path and member hash when applicable,
+fixed-point source/output ranges and gains, recording selection/slice IDs, and
+opaque reference-speaker timing. It contains no transcript or person-name field.
+Plain and `.tar.gz` inputs must decode as mono 16-kHz little-endian PCM16; operators
+must select or separately normalize other formats before manifest review. Multiple
+tracks can begin at the same output timestamp to create deterministic overlap,
+noise, music, or echo slices. Gain is integer thousandths (`1000` is unity), so
+mixing and clipping produce byte-identical canonical WAV output without a Python,
+FFmpeg, or platform audio dependency.
+
 Suitable authoritative inputs include the
 [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) for licensed
 multi-speaker, overlap, headset, and room-array recordings; the
@@ -167,6 +179,13 @@ cargo run --locked -- \
 ./scripts/fetch_voice_eval_assets.sh \
   eval/voice/release-manifest.json \
   /absolute/private/path/kioku-voice-eval-assets
+
+cargo run --locked -- \
+  --derive-voice-eval-assets \
+  eval/voice/release-manifest.json \
+  /absolute/private/path/derivation-recipe-v1.json \
+  /absolute/private/path/kioku-voice-eval-assets \
+  /absolute/private/path/kioku-voice-eval-derived
 ```
 
 The case builder inserts the manifest and private run raw-byte SHA-256 bindings
@@ -177,6 +196,16 @@ The fetcher refuses an in-repository destination, uses HTTPS only, downloads
 every separately identified artifact, never replaces an existing mismatched
 file, and verifies SHA-256 before making a download visible at its final path.
 The explicit private output directory must already exist.
+
+The derivation command is network-free and re-verifies every recipe-bound source
+artifact, including the labels artifact, against the manifest. It reads exact
+`.tar.gz` members in memory, rejects absolute/traversing/duplicate members,
+requires all inputs to be used, and atomically writes
+`recording-<hash>.wav`, `recording-<hash>.labels.json`, and
+`derivation-receipt.json` to a distinct existing private directory. Existing
+byte-identical files make the command idempotent; a mismatched file is never
+replaced. The receipt provides the exact media/labels hashes to copy into private
+schema-v3 run evidence. Do not commit the recipe, receipt, media, or labels.
 
 The check validates and hash-binds the manifest, semantically recomputes the
 report, and returns nonzero if the bundle is stale or any gate fails.

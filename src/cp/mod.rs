@@ -36,6 +36,7 @@ pub mod sync;
 pub mod tokens;
 pub mod vertex;
 pub mod voice_eval;
+pub mod voice_eval_assets;
 pub mod voice_eval_evidence;
 pub mod voice_lineage;
 pub mod voice_memory;
