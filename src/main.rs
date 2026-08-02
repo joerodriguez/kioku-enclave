@@ -434,6 +434,36 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 #[tokio::main]
 async fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--derive-voice-eval-assets") {
+        let manifest_path = args.get(2).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let recipe_path = args.get(3).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let artifact_directory = args.get(4).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let output_directory = args.get(5).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let manifest =
+            std::fs::read_to_string(manifest_path).expect("read voice evaluation manifest");
+        let recipe = std::fs::read_to_string(recipe_path).expect("read private derivation recipe");
+        match cp::voice_eval_assets::derive_assets(
+            &manifest,
+            &recipe,
+            std::path::Path::new(artifact_directory),
+            std::path::Path::new(output_directory),
+        ) {
+            Ok(receipt) => print!("{receipt}"),
+            Err(error) => {
+                eprintln!("Voice evaluation asset derivation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--build-voice-eval-cases") {
         let manifest_path = args.get(2).expect(
             "--build-voice-eval-cases requires source manifest and private run-evidence paths",

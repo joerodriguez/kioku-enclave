@@ -55,7 +55,9 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   precision, wrong-binding, cross-meeting, after-three-sample, and abstention metrics
   for every corpus slice. Each claimed identity is bound to the predicted speaker chosen
   by the same deterministic global mapping used for diarization error; synthetic or
-  hand-authored legacy aggregates cannot authorize a quality release.
+  hand-authored legacy aggregates cannot authorize a quality release. Its offline
+  derivation command independently verifies licensed media/label artifacts and produces
+  canonical fixed-point WAV slices, opaque timing labels, and receipts outside Git.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini

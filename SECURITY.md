@@ -87,7 +87,12 @@ surfaces.
   must match the hypothesis chosen by the scorer's deterministic global diarization
   mapping. The reducer rejects names, transcripts, URLs, paths, embeddings, raw scores,
   unknown fields, modified derived values, and legacy hand-authored real aggregates.
-  Restricted media and authorization documents remain outside Git.
+  The offline derivation command performs no network access, refuses artifact/output
+  directories inside the public checkout, verifies both media and label artifacts,
+  extracts only an exact traversal-free `.tar.gz` member in memory, accepts only bounded
+  mono 16-kHz PCM16 input, and refuses to replace a different output. Its private recipe,
+  restricted media, opaque labels, receipt, and authorization documents remain outside
+  Git; only the later content-free cases/report may be committed.
 
 ## Key hierarchy and encrypted objects
 
