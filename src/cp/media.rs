@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header::RETRY_AFTER, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -572,15 +572,89 @@ struct PersonSummary {
 struct PersonProfile {
     person: PersonSummary,
     voice_labels: Vec<String>,
+    voice_coverage: String,
+    aliases: Vec<PersonNameView>,
     facts: Vec<PersonFactView>,
+    evidence: Vec<PersonEvidenceView>,
+    recent_statements: Vec<PersonStatementView>,
 }
 
 #[derive(Debug, Serialize)]
 struct PersonFactView {
+    id: i64,
     predicate: String,
     value: String,
+    status: String,
     evidence: Value,
+    source_event_id: Option<String>,
+    speaker_observation_id: Option<i64>,
+    observed_at: Option<String>,
+    literal_evidence: Option<String>,
+    confidence: f64,
+    supersedes_id: Option<i64>,
     created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonNameView {
+    id: i64,
+    name: String,
+    status: String,
+    evidence_kind: String,
+    confidence: f64,
+    observed_at: String,
+    source_event_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonEvidenceView {
+    id: i64,
+    kind: String,
+    claimed_name: Option<String>,
+    score: Option<f64>,
+    status: String,
+    observed_at: Option<String>,
+    source_event_id: Option<String>,
+    speaker_observation_id: Option<i64>,
+    evidence: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonStatementView {
+    speaker_observation_id: i64,
+    started_at: String,
+    ended_at: String,
+    text: String,
+    source_event_id: String,
+    episode_id: Option<i64>,
+    episode_title: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonEvidencePage {
+    evidence: Vec<PersonEvidenceView>,
+    next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonStatementPage {
+    statements: Vec<PersonStatementView>,
+    next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeopleListQuery {
+    after_id: Option<i64>,
+    limit: Option<usize>,
+    q: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescendingPageQuery {
+    before_id: Option<i64>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -611,6 +685,11 @@ pub fn router() -> Router<Arc<CpState>> {
         .route("/api/v2/capture/streams/{stream_id}/ack", get(stream_ack))
         .route("/api/v2/people", get(list_people))
         .route("/api/v2/people/{person_id}", get(person_profile))
+        .route("/api/v2/people/{person_id}/evidence", get(person_evidence))
+        .route(
+            "/api/v2/people/{person_id}/statements",
+            get(person_statements),
+        )
         .layer(DefaultBodyLimit::max(MAX_MULTIPART_BYTES))
 }
 
@@ -887,7 +966,16 @@ fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<Captu
 async fn list_people(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<PeopleListQuery>,
 ) -> Response {
+    let after_id = query.after_id.unwrap_or(0).max(0);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(|query| format!("%{}%", query.to_lowercase()));
     match state
         .store
         .with_user(&user.0, |conn| {
@@ -895,11 +983,14 @@ async fn list_people(
                 "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
                  FROM people p LEFT JOIN voice_profiles v ON v.person_id=p.id \
                  LEFT JOIN person_facts f ON f.person_id=p.id AND f.status='active' \
-                 WHERE p.status='identified' AND p.display_name IS NOT NULL \
-                 GROUP BY p.id ORDER BY lower(p.display_name),p.id LIMIT 500",
+                 WHERE p.status='identified' AND p.display_name IS NOT NULL AND p.id>?1 \
+                 AND (?2 IS NULL OR lower(p.display_name) LIKE ?2 OR EXISTS (\
+                   SELECT 1 FROM person_name_claims n WHERE n.person_id=p.id \
+                   AND n.status IN ('accepted','probationary') AND lower(n.name) LIKE ?2)) \
+                 GROUP BY p.id ORDER BY p.id LIMIT ?3",
             )?;
-            let people = statement
-                .query_map([], |row| {
+            let mut people = statement
+                .query_map(params![after_id, search, limit as i64 + 1], |row| {
                     Ok(PersonSummary {
                         id: row.get(0)?,
                         display_name: row.get(1)?,
@@ -909,11 +1000,15 @@ async fn list_people(
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(people)
+            let next_cursor = (people.len() > limit).then(|| people[limit - 1].id);
+            people.truncate(limit);
+            Ok((people, next_cursor))
         })
         .await
     {
-        Ok(people) => Json(json!({"people": people})).into_response(),
+        Ok((people, next_cursor)) => {
+            Json(json!({"people": people, "next_cursor": next_cursor})).into_response()
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -933,6 +1028,75 @@ async fn person_profile(
     {
         Ok(profile) => Json(profile).into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+async fn person_evidence(
+    State(state): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(person_id): Path<i64>,
+    Query(query): Query<DescendingPageQuery>,
+) -> Response {
+    if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
+        return bad_request("person_id and before_id must be positive");
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    match state
+        .store
+        .with_user(&user.0, |conn| {
+            ensure_identified_person(conn, person_id)?;
+            let (evidence, next_cursor) =
+                load_person_evidence(conn, person_id, query.before_id, limit)?;
+            Ok(PersonEvidencePage {
+                evidence,
+                next_cursor,
+            })
+        })
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn person_statements(
+    State(state): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(person_id): Path<i64>,
+    Query(query): Query<DescendingPageQuery>,
+) -> Response {
+    if person_id <= 0 || query.before_id.is_some_and(|cursor| cursor <= 0) {
+        return bad_request("person_id and before_id must be positive");
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    match state
+        .store
+        .with_user(&user.0, |conn| {
+            ensure_identified_person(conn, person_id)?;
+            let (statements, next_cursor) =
+                load_person_statements(conn, person_id, query.before_id, limit)?;
+            Ok(PersonStatementPage {
+                statements,
+                next_cursor,
+            })
+        })
+        .await
+    {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn ensure_identified_person(conn: &Connection, person_id: i64) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM people WHERE id=?1 AND status='identified')",
+        [person_id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(EnclaveError::NotFound)
     }
 }
 
@@ -962,26 +1126,143 @@ fn load_person_profile(conn: &Connection, person_id: i64) -> Result<PersonProfil
     let voice_labels = voice_statement
         .query_map([person_id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut facts_statement = conn.prepare(
-        "SELECT predicate,value,evidence_json,created_at FROM person_facts \
-         WHERE person_id=?1 AND status='active' ORDER BY created_at,id",
+    let (stable_profiles, accepted_samples): (i64, i64) = conn.query_row(
+        "SELECT \
+           (SELECT COUNT(*) FROM voice_profiles WHERE person_id=?1 AND status='stable'),\
+           (SELECT COUNT(*) FROM voice_samples s JOIN voice_profiles v ON v.id=s.voice_profile_id \
+            WHERE v.person_id=?1 AND s.accepted=1 AND s.eligibility='enroll' AND s.outlier=0)",
+        [person_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let facts = facts_statement
+    let voice_coverage = if stable_profiles > 0 {
+        format!(
+            "Recognized from {accepted_samples} high-quality samples across {stable_profiles} stable acoustic profiles"
+        )
+    } else if accepted_samples > 0 {
+        format!("Learning from {accepted_samples} high-quality voice samples")
+    } else {
+        "No stable voice recognition profile yet".into()
+    };
+    let mut aliases_statement = conn.prepare(
+        "SELECT id,name,status,evidence_kind,confidence,observed_at,source_event_id \
+         FROM person_name_claims WHERE person_id=?1 AND status<>'rejected' \
+         ORDER BY observed_at DESC,id DESC LIMIT 100",
+    )?;
+    let aliases = aliases_statement
         .query_map([person_id], |row| {
-            let evidence_json: String = row.get(2)?;
-            Ok(PersonFactView {
-                predicate: row.get(0)?,
-                value: row.get(1)?,
-                evidence: serde_json::from_str(&evidence_json).unwrap_or(Value::Null),
-                created_at: row.get(3)?,
+            Ok(PersonNameView {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                status: row.get(2)?,
+                evidence_kind: row.get(3)?,
+                confidence: row.get(4)?,
+                observed_at: row.get(5)?,
+                source_event_id: row.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut facts_statement = conn.prepare(
+        "SELECT id,predicate,value,status,evidence_json,source_event_id,speaker_observation_id,\
+                observed_at,literal_evidence,confidence,supersedes_id,created_at \
+         FROM person_facts WHERE person_id=?1 \
+         ORDER BY COALESCE(observed_at,created_at) DESC,id DESC LIMIT 200",
+    )?;
+    let facts = facts_statement
+        .query_map([person_id], |row| {
+            let evidence_json: String = row.get(4)?;
+            Ok(PersonFactView {
+                id: row.get(0)?,
+                predicate: row.get(1)?,
+                value: row.get(2)?,
+                status: row.get(3)?,
+                evidence: serde_json::from_str(&evidence_json).unwrap_or(Value::Null),
+                source_event_id: row.get(5)?,
+                speaker_observation_id: row.get(6)?,
+                observed_at: row.get(7)?,
+                literal_evidence: row.get(8)?,
+                confidence: row.get(9)?,
+                supersedes_id: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let (evidence, _) = load_person_evidence(conn, person_id, None, 100)?;
+    let (recent_statements, _) = load_person_statements(conn, person_id, None, 100)?;
     Ok(PersonProfile {
         person,
         voice_labels,
+        voice_coverage,
+        aliases,
         facts,
+        evidence,
+        recent_statements,
     })
+}
+
+fn load_person_evidence(
+    conn: &Connection,
+    person_id: i64,
+    before_id: Option<i64>,
+    limit: usize,
+) -> Result<(Vec<PersonEvidenceView>, Option<i64>)> {
+    let mut statement = conn.prepare(
+        "SELECT id,kind,claimed_name,score,status,observed_at,source_event_id,\
+                speaker_observation_id,evidence_json FROM identity_evidence \
+         WHERE person_id=?1 AND (?2 IS NULL OR id<?2) ORDER BY id DESC LIMIT ?3",
+    )?;
+    let mut evidence = statement
+        .query_map(params![person_id, before_id, limit as i64 + 1], |row| {
+            let raw: String = row.get(8)?;
+            Ok(PersonEvidenceView {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                claimed_name: row.get(2)?,
+                score: row.get(3)?,
+                status: row.get(4)?,
+                observed_at: row.get(5)?,
+                source_event_id: row.get(6)?,
+                speaker_observation_id: row.get(7)?,
+                evidence: serde_json::from_str(&raw).unwrap_or(Value::Null),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let next_cursor = (evidence.len() > limit).then(|| evidence[limit - 1].id);
+    evidence.truncate(limit);
+    Ok((evidence, next_cursor))
+}
+
+fn load_person_statements(
+    conn: &Connection,
+    person_id: i64,
+    before_id: Option<i64>,
+    limit: usize,
+) -> Result<(Vec<PersonStatementView>, Option<i64>)> {
+    let mut statement = conn.prepare(
+        "SELECT s.id,s.started_at,s.ended_at,s.transcript_text,s.event_id,e.id,e.title \
+         FROM speaker_observations s \
+         LEFT JOIN utterances u ON u.source_key=('cloud-v2:'||s.event_id||':'||s.turn_id) \
+         LEFT JOIN episode_members m ON m.record_type='utterance' AND m.record_id=u.id \
+         LEFT JOIN episodes e ON e.id=m.episode_id \
+         WHERE s.person_id=?1 AND (?2 IS NULL OR s.id<?2) \
+         GROUP BY s.id ORDER BY s.id DESC LIMIT ?3",
+    )?;
+    let mut statements = statement
+        .query_map(params![person_id, before_id, limit as i64 + 1], |row| {
+            Ok(PersonStatementView {
+                speaker_observation_id: row.get(0)?,
+                started_at: row.get(1)?,
+                ended_at: row.get(2)?,
+                text: row.get(3)?,
+                source_event_id: row.get(4)?,
+                episode_id: row.get(5)?,
+                episode_title: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let next_cursor =
+        (statements.len() > limit).then(|| statements[limit - 1].speaker_observation_id);
+    statements.truncate(limit);
+    Ok((statements, next_cursor))
 }
 
 fn bad_request(message: &'static str) -> Response {
@@ -1264,6 +1545,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             transcript_text TEXT NOT NULL,
             language TEXT,
             overlap INTEGER NOT NULL DEFAULT 0,
+            voice_eligibility TEXT,
+            voice_diagnostics_json TEXT,
             UNIQUE(event_id, turn_id)
         );
         CREATE TABLE IF NOT EXISTS speaker_observation_sources (
@@ -1278,8 +1561,41 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS people (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             display_name TEXT,
-            normalized_name TEXT UNIQUE,
+            normalized_name TEXT,
             status TEXT NOT NULL DEFAULT 'unknown' CHECK (status IN ('unknown','identified','quarantined')),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS person_name_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            normalized_email TEXT,
+            source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE,
+            speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE,
+            observed_at TEXT NOT NULL,
+            evidence_kind TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('proposed','probationary','accepted','conflicted','superseded','rejected')),
+            supersedes_id INTEGER REFERENCES person_name_claims(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_person_name_claims_name
+            ON person_name_claims(normalized_name, observed_at);
+        CREATE INDEX IF NOT EXISTS idx_person_name_claims_person
+            ON person_name_claims(person_id, status, observed_at);
+        CREATE TABLE IF NOT EXISTS profile_identity_bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            voice_profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            evidence_count INTEGER NOT NULL DEFAULT 1,
+            confidence REAL NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('probationary','accepted','conflicted','superseded','rejected')),
+            derivation_version INTEGER NOT NULL,
+            evidence_json TEXT NOT NULL,
+            supersedes_id INTEGER REFERENCES profile_identity_bindings(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
@@ -1291,6 +1607,9 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             channel_domain TEXT NOT NULL,
             centroid BLOB NOT NULL,
             sample_count INTEGER NOT NULL DEFAULT 0,
+            scorer_version INTEGER NOT NULL DEFAULT 2,
+            representative_kind TEXT NOT NULL DEFAULT 'medoid_trimmed_centroid',
+            medoid_sample_id INTEGER,
             status TEXT NOT NULL DEFAULT 'tentative' CHECK (status IN ('tentative','stable','quarantined')),
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -1303,6 +1622,17 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             channel_domain TEXT NOT NULL,
             embedding BLOB NOT NULL,
             quality_score REAL NOT NULL,
+            diagnostics_json TEXT NOT NULL DEFAULT '{}',
+            quality_version INTEGER NOT NULL DEFAULT 1,
+            scorer_version INTEGER NOT NULL DEFAULT 2,
+            eligibility TEXT NOT NULL DEFAULT 'enroll',
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            speech_ratio REAL NOT NULL DEFAULT 0,
+            snr_proxy_db REAL NOT NULL DEFAULT 0,
+            clipping_ratio REAL NOT NULL DEFAULT 0,
+            silence_ratio REAL NOT NULL DEFAULT 0,
+            embedding_norm REAL NOT NULL DEFAULT 1,
+            outlier INTEGER NOT NULL DEFAULT 0,
             similarity REAL,
             decision_margin REAL,
             accepted INTEGER NOT NULL DEFAULT 0,
@@ -1331,6 +1661,12 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             derivation_version INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','conflicted')),
             supersedes_id INTEGER REFERENCES person_facts(id) ON DELETE SET NULL,
+            source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE,
+            speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE,
+            observed_at TEXT,
+            literal_evidence TEXT,
+            confidence REAL NOT NULL DEFAULT 0,
+            conflicts_with_id INTEGER REFERENCES person_facts(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         "#,
@@ -1349,6 +1685,90 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         "person_id",
         "ALTER TABLE speaker_observations ADD COLUMN person_id INTEGER REFERENCES people(id) ON DELETE SET NULL",
     )?;
+    for (table, column, alteration) in [
+        (
+            "speaker_observations",
+            "voice_eligibility",
+            "ALTER TABLE speaker_observations ADD COLUMN voice_eligibility TEXT",
+        ),
+        (
+            "speaker_observations",
+            "voice_diagnostics_json",
+            "ALTER TABLE speaker_observations ADD COLUMN voice_diagnostics_json TEXT",
+        ),
+        (
+            "voice_profiles",
+            "scorer_version",
+            "ALTER TABLE voice_profiles ADD COLUMN scorer_version INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "voice_profiles",
+            "representative_kind",
+            "ALTER TABLE voice_profiles ADD COLUMN representative_kind TEXT NOT NULL DEFAULT 'running_mean'",
+        ),
+        (
+            "voice_profiles",
+            "medoid_sample_id",
+            "ALTER TABLE voice_profiles ADD COLUMN medoid_sample_id INTEGER",
+        ),
+        (
+            "voice_samples",
+            "diagnostics_json",
+            "ALTER TABLE voice_samples ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'",
+        ),
+        (
+            "voice_samples",
+            "quality_version",
+            "ALTER TABLE voice_samples ADD COLUMN quality_version INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "voice_samples",
+            "scorer_version",
+            "ALTER TABLE voice_samples ADD COLUMN scorer_version INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "voice_samples",
+            "eligibility",
+            "ALTER TABLE voice_samples ADD COLUMN eligibility TEXT NOT NULL DEFAULT 'enroll'",
+        ),
+        (
+            "voice_samples",
+            "duration_ms",
+            "ALTER TABLE voice_samples ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "voice_samples",
+            "speech_ratio",
+            "ALTER TABLE voice_samples ADD COLUMN speech_ratio REAL NOT NULL DEFAULT 0",
+        ),
+        (
+            "voice_samples",
+            "snr_proxy_db",
+            "ALTER TABLE voice_samples ADD COLUMN snr_proxy_db REAL NOT NULL DEFAULT 0",
+        ),
+        (
+            "voice_samples",
+            "clipping_ratio",
+            "ALTER TABLE voice_samples ADD COLUMN clipping_ratio REAL NOT NULL DEFAULT 0",
+        ),
+        (
+            "voice_samples",
+            "silence_ratio",
+            "ALTER TABLE voice_samples ADD COLUMN silence_ratio REAL NOT NULL DEFAULT 0",
+        ),
+        (
+            "voice_samples",
+            "embedding_norm",
+            "ALTER TABLE voice_samples ADD COLUMN embedding_norm REAL NOT NULL DEFAULT 1",
+        ),
+        (
+            "voice_samples",
+            "outlier",
+            "ALTER TABLE voice_samples ADD COLUMN outlier INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        add_column_if_missing(conn, table, column, alteration)?;
+    }
     add_column_if_missing(
         conn,
         "identity_evidence",
@@ -1408,11 +1828,44 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         add_column_if_missing(conn, "capture_events", column, alteration)?;
     }
     conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_normalized_name \
-         ON people(normalized_name) WHERE normalized_name IS NOT NULL;\
+        "DROP INDEX IF EXISTS idx_people_normalized_name;\
+         INSERT INTO person_name_claims \
+           (person_id,name,normalized_name,observed_at,evidence_kind,evidence_json,confidence,status) \
+         SELECT p.id,p.display_name,p.normalized_name,p.created_at,'legacy_migration','{}',1.0,'accepted' \
+         FROM people p WHERE p.normalized_name IS NOT NULL AND p.display_name IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM person_name_claims c WHERE c.person_id=p.id);\
+         UPDATE people SET normalized_name=NULL WHERE normalized_name IS NOT NULL;\
          CREATE INDEX IF NOT EXISTS idx_capture_events_canonical_reference \
          ON capture_events(canonical_event_id) WHERE canonical_event_id IS NOT NULL;",
     )?;
+    for (column, alteration) in [
+        (
+            "source_event_id",
+            "ALTER TABLE person_facts ADD COLUMN source_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE",
+        ),
+        (
+            "speaker_observation_id",
+            "ALTER TABLE person_facts ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE",
+        ),
+        (
+            "observed_at",
+            "ALTER TABLE person_facts ADD COLUMN observed_at TEXT",
+        ),
+        (
+            "literal_evidence",
+            "ALTER TABLE person_facts ADD COLUMN literal_evidence TEXT",
+        ),
+        (
+            "confidence",
+            "ALTER TABLE person_facts ADD COLUMN confidence REAL NOT NULL DEFAULT 0",
+        ),
+        (
+            "conflicts_with_id",
+            "ALTER TABLE person_facts ADD COLUMN conflicts_with_id INTEGER REFERENCES person_facts(id) ON DELETE SET NULL",
+        ),
+    ] {
+        add_column_if_missing(conn, "person_facts", column, alteration)?;
+    }
     Ok(())
 }
 
@@ -2192,6 +2645,8 @@ mod tests {
             "voice_samples",
             "identity_evidence",
             "people",
+            "person_name_claims",
+            "profile_identity_bindings",
             "person_facts",
         ] {
             let count: i64 = conn
@@ -2203,6 +2658,89 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "missing {table}");
         }
+    }
+
+    #[test]
+    fn legacy_unique_names_migrate_to_non_keyed_claims_without_merging_people() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                display_name TEXT,
+                normalized_name TEXT UNIQUE,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z',
+                updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
+             );
+             INSERT INTO people(display_name,normalized_name,status)
+             VALUES ('John Smith','john smith','identified');",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT normalized_name FROM people WHERE id=1", [], |row| {
+                row.get::<_, Option<String>>(0)
+            },)
+                .unwrap(),
+            None
+        );
+        let migrated: (String, String, String) = conn
+            .query_row(
+                "SELECT name,normalized_name,status FROM person_name_claims WHERE person_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            ("John Smith".into(), "john smith".into(), "accepted".into())
+        );
+
+        conn.execute(
+            "INSERT INTO people(display_name,normalized_name,status) VALUES (?1,NULL,'identified')",
+            ["John Smith"],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM people WHERE display_name='John Smith'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn person_evidence_pagination_is_stable_and_never_exposes_voice_vectors() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO people(display_name,status) VALUES ('John Garcia','identified')",
+            [],
+        )
+        .unwrap();
+        for ordinal in 1..=3 {
+            conn.execute(
+                "INSERT INTO identity_evidence(person_id,kind,claimed_name,evidence_json,score,status) \
+                 VALUES (1,'audio_self_identification','John Garcia',?1,0.99,'accepted')",
+                [format!(r#"{{"ordinal":{ordinal}}}"#)],
+            )
+            .unwrap();
+        }
+
+        let (first, cursor) = load_person_evidence(&conn, 1, None, 2).unwrap();
+        assert_eq!(first.iter().map(|item| item.id).collect::<Vec<_>>(), [3, 2]);
+        assert_eq!(cursor, Some(2));
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains("embedding"));
+        assert!(!encoded.contains("centroid"));
+
+        let (second, cursor) = load_person_evidence(&conn, 1, cursor, 2).unwrap();
+        assert_eq!(second.iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(cursor, None);
     }
 
     #[test]
@@ -2503,6 +3041,8 @@ mod tests {
             ("voice_profiles", "person_id, id"),
             ("voice_samples", "speaker_observation_id, id"),
             ("identity_evidence", "created_at, id"),
+            ("person_name_claims", "observed_at, id"),
+            ("profile_identity_bindings", "updated_at, id"),
             ("person_facts", "person_id, created_at, id"),
         ] {
             assert!(crate::dump_optional_table(&conn, table, order)

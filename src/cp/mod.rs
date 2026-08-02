@@ -35,7 +35,9 @@ pub mod summarizer;
 pub mod sync;
 pub mod tokens;
 pub mod vertex;
+pub mod voice_eval;
 pub mod voice_memory;
+pub mod voice_quality;
 pub mod webhook_worker;
 
 use serde::Deserialize;

@@ -92,6 +92,17 @@ impl MediaJob {
             ),
         })
     }
+
+    fn acoustic_domain(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.stream_kind,
+            self.mime_type,
+            self.codec,
+            self.sample_rate.unwrap_or(0),
+            self.channels.unwrap_or(0)
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -551,27 +562,117 @@ fn validate_person_evidence(evidence: &PersonEvidence) -> Result<()> {
     Ok(())
 }
 
-fn upsert_person(conn: &Connection, name: &str) -> Result<i64> {
+fn create_person(conn: &Connection, name: &str) -> Result<i64> {
     let normalized = normalized_name(name);
     if normalized.is_empty() {
         return Err(EnclaveError::InvalidRequest("person name is empty".into()));
     }
     conn.execute(
-        "INSERT INTO people (display_name,normalized_name,status) VALUES (?1,?2,'identified') \
-         ON CONFLICT(normalized_name) DO UPDATE SET \
-         display_name=CASE WHEN length(excluded.display_name)>length(display_name) \
-                           THEN excluded.display_name ELSE display_name END, \
-         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-        params![name.trim(), normalized],
+        "INSERT INTO people (display_name,normalized_name,status) VALUES (?1,NULL,'identified')",
+        [name.trim()],
     )?;
-    Ok(conn.query_row(
-        "SELECT id FROM people WHERE normalized_name=?1",
-        [normalized],
-        |row| row.get(0),
-    )?)
+    Ok(conn.last_insert_rowid())
 }
 
-fn unique_active_screen_person(
+struct NameClaim<'a> {
+    person_id: Option<i64>,
+    name: &'a str,
+    source_event_id: &'a str,
+    speaker_observation_id: Option<i64>,
+    observed_at: &'a str,
+    evidence_kind: &'a str,
+    evidence_json: String,
+    confidence: f64,
+    status: &'a str,
+}
+
+fn record_name_claim(conn: &Connection, claim: NameClaim<'_>) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO person_name_claims \
+         (person_id,name,normalized_name,source_event_id,speaker_observation_id,observed_at,\
+          evidence_kind,evidence_json,confidence,status) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            claim.person_id,
+            claim.name.trim(),
+            normalized_name(claim.name),
+            claim.source_event_id,
+            claim.speaker_observation_id,
+            claim.observed_at,
+            claim.evidence_kind,
+            claim.evidence_json,
+            claim.confidence,
+            claim.status,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+struct FactEvidence<'a> {
+    person_id: i64,
+    fact: &'a super::media::PersonFact,
+    source_event_id: &'a str,
+    speaker_observation_id: i64,
+    observed_at: &'a str,
+    evidence_json: String,
+}
+
+fn persist_person_fact(conn: &Connection, evidence: FactEvidence<'_>) -> Result<()> {
+    let exact: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM person_facts WHERE person_id=?1 AND predicate=?2 \
+         AND lower(value)=lower(?3) AND status='active'",
+        params![
+            evidence.person_id,
+            evidence.fact.predicate,
+            evidence.fact.value
+        ],
+        |row| row.get(0),
+    )?;
+    if exact > 0 {
+        return Ok(());
+    }
+    let temporal_singleton = matches!(
+        evidence.fact.predicate.as_str(),
+        "role" | "organization" | "location"
+    );
+    let supersedes_id: Option<i64> = if temporal_singleton {
+        conn.query_row(
+            "SELECT id FROM person_facts WHERE person_id=?1 AND predicate=?2 AND status='active' \
+             ORDER BY COALESCE(observed_at,created_at) DESC,id DESC LIMIT 1",
+            params![evidence.person_id, evidence.fact.predicate],
+            |row| row.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    if let Some(previous_id) = supersedes_id {
+        conn.execute(
+            "UPDATE person_facts SET status='superseded' WHERE id=?1 AND status='active'",
+            [previous_id],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO person_facts \
+         (person_id,predicate,value,evidence_json,derivation_version,status,supersedes_id,\
+          source_event_id,speaker_observation_id,observed_at,literal_evidence,confidence) \
+         VALUES (?1,?2,?3,?4,2,'active',?5,?6,?7,?8,?9,1.0)",
+        params![
+            evidence.person_id,
+            evidence.fact.predicate,
+            evidence.fact.value,
+            evidence.evidence_json,
+            supersedes_id,
+            evidence.source_event_id,
+            evidence.speaker_observation_id,
+            evidence.observed_at,
+            evidence.fact.evidence,
+        ],
+    )?;
+    Ok(())
+}
+
+fn corroborated_active_screen_person(
     conn: &Connection,
     started_at: &str,
     ended_at: &str,
@@ -584,11 +685,41 @@ fn unique_active_screen_person(
     let people = statement
         .query_map(params![started_at, ended_at], |row| row.get::<_, i64>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(if people.len() == 1 {
-        Some(people[0])
-    } else {
-        None
-    })
+    if people.len() == 1 {
+        return Ok(Some(people[0]));
+    }
+    let claims: Vec<(String, String)> = {
+        let mut statement = conn.prepare(
+            "SELECT normalized_name,MAX(name) FROM person_name_claims \
+             WHERE evidence_kind='screen_active_speaker' AND status IN ('proposed','probationary') \
+             AND observed_at>=?1 AND observed_at<=?2 GROUP BY normalized_name \
+             HAVING COUNT(DISTINCT source_event_id)>=2 LIMIT 2",
+        )?;
+        let rows = statement
+            .query_map(params![started_at, ended_at], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    if claims.len() != 1 {
+        return Ok(None);
+    }
+    let person_id = create_person(conn, &claims[0].1)?;
+    conn.execute(
+        "UPDATE person_name_claims SET person_id=?1,status='accepted' \
+         WHERE normalized_name=?2 AND evidence_kind='screen_active_speaker' \
+         AND observed_at>=?3 AND observed_at<=?4 AND status IN ('proposed','probationary')",
+        params![person_id, claims[0].0, started_at, ended_at],
+    )?;
+    conn.execute(
+        "UPDATE identity_evidence SET person_id=?1,status='accepted' \
+         WHERE kind='screen_active_speaker' AND claimed_name IS NOT NULL \
+         AND lower(trim(claimed_name))=?2 AND observed_at>=?3 AND observed_at<=?4 \
+         AND status='proposed'",
+        params![person_id, claims[0].0, started_at, ended_at],
+    )?;
+    Ok(Some(person_id))
 }
 
 fn bind_person_to_speaker_observation(
@@ -633,11 +764,11 @@ fn bind_person_to_speaker_observation(
     Ok(true)
 }
 
-fn bind_screen_person_to_existing_speaker(
+fn promote_screen_name_if_corroborated(
     conn: &Connection,
     observed_at: &str,
-    person_id: i64,
-) -> Result<Option<i64>> {
+    name: &str,
+) -> Result<Option<(i64, i64, Option<i64>)>> {
     let mut statement = conn.prepare(
         "SELECT s.id FROM speaker_observations s JOIN capture_events e ON e.event_id=s.event_id \
          WHERE e.stream_kind='system_audio' AND s.overlap=0 \
@@ -649,10 +780,65 @@ fn bind_screen_person_to_existing_speaker(
     if observations.len() != 1 {
         return Ok(None);
     }
-    Ok(
-        bind_person_to_speaker_observation(conn, observations[0], person_id)?
-            .then_some(observations[0]),
-    )
+    let observation_id = observations[0];
+    let (started_at, ended_at, existing_person): (String, String, Option<i64>) = conn.query_row(
+        "SELECT started_at,ended_at,person_id FROM speaker_observations WHERE id=?1",
+        [observation_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let normalized = normalized_name(name);
+    let evidence_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT source_event_id) FROM person_name_claims \
+         WHERE normalized_name=?1 AND evidence_kind='screen_active_speaker' \
+         AND confidence>=0.90 AND observed_at>=?2 AND observed_at<=?3 \
+         AND status IN ('proposed','probationary','accepted')",
+        params![normalized, started_at, ended_at],
+        |row| row.get(0),
+    )?;
+    if evidence_count < 2 {
+        return Ok(None);
+    }
+    let person_id = match existing_person {
+        Some(person_id) => person_id,
+        None => create_person(conn, name)?,
+    };
+    conn.execute(
+        "UPDATE person_name_claims SET person_id=?1,status='accepted' \
+         WHERE normalized_name=?2 AND evidence_kind='screen_active_speaker' \
+         AND observed_at>=?3 AND observed_at<=?4 AND status IN ('proposed','probationary')",
+        params![person_id, normalized, started_at, ended_at],
+    )?;
+    conn.execute(
+        "UPDATE identity_evidence SET person_id=?1,status='accepted',speaker_observation_id=?2 \
+         WHERE kind='screen_active_speaker' AND lower(trim(claimed_name))=?3 \
+         AND observed_at>=?4 AND observed_at<=?5 AND status='proposed'",
+        params![person_id, observation_id, normalized, started_at, ended_at],
+    )?;
+    let _ = bind_person_to_speaker_observation(conn, observation_id, person_id)?;
+    let voice_profile_id: Option<i64> = conn
+        .query_row(
+            "SELECT voice_profile_id FROM voice_samples WHERE speaker_observation_id=?1 \
+             AND accepted=1 ORDER BY id DESC LIMIT 1",
+            [observation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(profile_id) = voice_profile_id {
+        conn.execute(
+            "INSERT INTO profile_identity_bindings \
+             (voice_profile_id,person_id,evidence_count,confidence,state,derivation_version,evidence_json) \
+             SELECT ?1,?2,?3,0.99,'accepted',1,?4 \
+             WHERE NOT EXISTS (SELECT 1 FROM profile_identity_bindings \
+               WHERE voice_profile_id=?1 AND person_id=?2 AND state='accepted')",
+            params![
+                profile_id,
+                person_id,
+                evidence_count,
+                json!({"kind":"repeated_active_speaker_frames","speaker_observation_id":observation_id}).to_string()
+            ],
+        )?;
+    }
+    Ok(Some((person_id, observation_id, voice_profile_id)))
 }
 
 fn persist_audio_window_result(
@@ -661,7 +847,7 @@ fn persist_audio_window_result(
     jobs: &[MediaJob],
     sources: &[SourceInterval],
     turns: &[AudioTurn],
-    voiceprints: &[(String, Vec<f32>, f64)],
+    voiceprints: &[super::voice_memory::EmbeddedTurn],
 ) -> Result<()> {
     let job = jobs
         .first()
@@ -753,30 +939,83 @@ fn persist_audio_window_result(
             }
             _ => None,
         };
-        let explicit_person_id = confident_name
-            .map(|name| upsert_person(&tx, name))
-            .transpose()?;
+        let voice_candidate = voiceprints
+            .iter()
+            .find(|candidate| candidate.turn_id == turn.turn_id);
+        let explicit_person_id = if let Some(name) = confident_name {
+            let matched = voice_candidate
+                .and_then(|candidate| candidate.embedding.as_deref())
+                .map(|embedding| {
+                    super::voice_memory::match_existing_person(
+                        &tx,
+                        embedding,
+                        &job.acoustic_domain(),
+                    )
+                })
+                .transpose()?
+                .flatten()
+                .filter(|person_id| {
+                    tx.query_row(
+                        "SELECT COUNT(*)=0 OR SUM(normalized_name=?1)>0 FROM person_name_claims \
+                         WHERE person_id=?2 AND status='accepted'",
+                        params![normalized_name(name), person_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false)
+                });
+            Some(match matched {
+                Some(person_id) => person_id,
+                None => create_person(&tx, name)?,
+            })
+        } else {
+            None
+        };
         let screen_person_id =
             if explicit_person_id.is_none() && job.stream_kind == "system_audio" && !turn.overlap {
-                unique_active_screen_person(&tx, &turn_started_at, &turn_ended_at)?
+                corroborated_active_screen_person(&tx, &turn_started_at, &turn_ended_at)?
             } else {
                 None
             };
-        let person_id = explicit_person_id.or(screen_person_id);
-        let voice_label = voiceprints
-            .iter()
-            .find(|(turn_id, _, _)| turn_id == &turn.turn_id)
-            .map(|(_, embedding, energy)| {
-                super::voice_memory::match_and_store(
+        let evidence_person_id = explicit_person_id.or(screen_person_id);
+        let voice_label = voice_candidate
+            .map(|candidate| {
+                super::voice_memory::match_and_store_candidate(
                     &tx,
                     speaker_observation_id,
-                    embedding,
-                    &job.stream_kind,
-                    person_id,
-                    energy.clamp(0.0, 1.0),
+                    candidate,
+                    &job.acoustic_domain(),
+                    evidence_person_id,
                 )
             })
-            .transpose()?;
+            .transpose()?
+            .flatten();
+        let voice_binding: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT v.id,v.person_id FROM voice_samples s JOIN voice_profiles v \
+                 ON v.id=s.voice_profile_id WHERE s.speaker_observation_id=?1 AND s.accepted=1 \
+                 ORDER BY s.id DESC LIMIT 1",
+                [speaker_observation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let voice_person_id = voice_binding.and_then(|(_, person_id)| person_id);
+        let person_id = evidence_person_id.or(voice_person_id);
+        if let (Some(explicit_person_id), Some((voice_profile_id, _))) =
+            (explicit_person_id, voice_binding)
+        {
+            tx.execute(
+                "INSERT INTO profile_identity_bindings \
+                 (voice_profile_id,person_id,evidence_count,confidence,state,derivation_version,evidence_json) \
+                 SELECT ?1,?2,1,0.99,'accepted',1,?3 \
+                 WHERE NOT EXISTS (SELECT 1 FROM profile_identity_bindings \
+                   WHERE voice_profile_id=?1 AND person_id=?2 AND state='accepted')",
+                params![
+                    voice_profile_id,
+                    explicit_person_id,
+                    json!({"kind":"direct_audio_self_identification","speaker_observation_id":speaker_observation_id}).to_string()
+                ],
+            )?;
+        }
         let speaker_label = confident_name
             .map(ToOwned::to_owned)
             .or(voice_label)
@@ -804,6 +1043,7 @@ fn persist_audio_window_result(
             turn.speaker_name_confidence,
             turn.speaker_name_evidence.as_deref(),
         ) {
+            let evidence_json = json!({"work_unit_id":work_unit_id,"event_id":anchor_job.event_id,"source_event_ids":projected.iter().map(|source| &source.event_id).collect::<Vec<_>>(),"turn_id":turn.turn_id,"evidence":evidence}).to_string();
             tx.execute(
                 "INSERT INTO identity_evidence \
                  (person_id,source_event_id,observed_at,speaker_observation_id,kind, \
@@ -815,8 +1055,7 @@ fn persist_audio_window_result(
                     turn_started_at,
                     speaker_observation_id,
                     name,
-                    json!({"work_unit_id":work_unit_id,"event_id":anchor_job.event_id,"source_event_ids":projected.iter().map(|source| &source.event_id).collect::<Vec<_>>(),"turn_id":turn.turn_id,"evidence":evidence})
-                        .to_string(),
+                    evidence_json,
                     confidence,
                     if explicit_person_id.is_some() {
                         "accepted"
@@ -826,21 +1065,36 @@ fn persist_audio_window_result(
                 ],
             )?;
             if let Some(person_id) = explicit_person_id {
-                for fact in &turn.person_facts {
-                    tx.execute(
-                        "INSERT INTO person_facts \
-                         (person_id,predicate,value,evidence_json,derivation_version,status) \
-                         SELECT ?1,?2,?3,?4,1,'active' \
-                         WHERE NOT EXISTS (SELECT 1 FROM person_facts \
-                         WHERE person_id=?1 AND predicate=?2 AND lower(value)=lower(?3) AND status='active')",
-                        params![
-                            person_id,
-                            fact.predicate,
-                            fact.value,
-                            json!({"work_unit_id":work_unit_id,"event_id":anchor_job.event_id,"source_event_ids":projected.iter().map(|source| &source.event_id).collect::<Vec<_>>(),"turn_id":turn.turn_id,"evidence":fact.evidence}).to_string()
-                        ],
-                    )?;
-                }
+                record_name_claim(
+                    &tx,
+                    NameClaim {
+                        person_id: Some(person_id),
+                        name,
+                        source_event_id: &anchor_job.event_id,
+                        speaker_observation_id: Some(speaker_observation_id),
+                        observed_at: &turn_started_at,
+                        evidence_kind: "audio_self_identification",
+                        evidence_json: json!({"work_unit_id":work_unit_id,"turn_id":turn.turn_id,"evidence":evidence}).to_string(),
+                        confidence,
+                        status: "accepted",
+                    },
+                )?;
+            }
+        }
+        if let Some(person_id) = person_id {
+            for fact in &turn.person_facts {
+                let evidence_json = json!({"work_unit_id":work_unit_id,"event_id":anchor_job.event_id,"source_event_ids":projected.iter().map(|source| &source.event_id).collect::<Vec<_>>(),"turn_id":turn.turn_id,"evidence":fact.evidence}).to_string();
+                persist_person_fact(
+                    &tx,
+                    FactEvidence {
+                        person_id,
+                        fact,
+                        source_event_id: &anchor_job.event_id,
+                        speaker_observation_id,
+                        observed_at: &turn_started_at,
+                        evidence_json,
+                    },
+                )?;
             }
         }
     }
@@ -860,7 +1114,7 @@ fn persist_audio_result(
     conn: &Connection,
     job: &MediaJob,
     turns: &[AudioTurn],
-    voiceprints: &[(String, Vec<f32>, f64)],
+    voiceprints: &[super::voice_memory::EmbeddedTurn],
 ) -> Result<()> {
     let duration_ms = isotime::parse_epoch_millis(&job.ended_at)
         .zip(isotime::parse_epoch_millis(&job.started_at))
@@ -945,51 +1199,58 @@ fn persist_screen_result_body(
         ],
     )?;
     for evidence in &result.people {
-        let person_id = if evidence.confidence >= 0.90 && is_full_name(&evidence.name) {
-            Some(upsert_person(conn, &evidence.name)?)
+        let strong_complete_name = evidence.confidence >= 0.90 && is_full_name(&evidence.name);
+        let evidence_kind = if evidence.is_active_speaker {
+            "screen_active_speaker"
         } else {
-            None
+            "screen_visible_name"
         };
+        let evidence_json = json!({"event_id":job.event_id,"screenshot_id":screenshot_id,"evidence":evidence.evidence}).to_string();
         conn.execute(
             "INSERT INTO identity_evidence \
              (person_id,source_event_id,observed_at,kind,claimed_name,evidence_json,score,status) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
-                person_id,
+                Option::<i64>::None,
                 job.event_id,
                 job.started_at,
-                if evidence.is_active_speaker {
-                    "screen_active_speaker"
-                } else {
-                    "screen_visible_name"
-                },
+                evidence_kind,
                 evidence.name,
-                json!({"event_id":job.event_id,"screenshot_id":screenshot_id,"evidence":evidence.evidence}).to_string(),
+                evidence_json,
                 evidence.confidence,
-                if person_id.is_some() { "accepted" } else { "proposed" }
+                "proposed"
             ],
         )?;
         let evidence_id = conn.last_insert_rowid();
-        if evidence.is_active_speaker {
-            if let Some(person_id) = person_id {
-                if let Some(observation_id) =
-                    bind_screen_person_to_existing_speaker(conn, &job.started_at, person_id)?
-                {
-                    let voice_profile_id: Option<i64> = conn
-                        .query_row(
-                            "SELECT voice_profile_id FROM voice_samples \
-                             WHERE speaker_observation_id=?1 AND accepted=1 \
-                             ORDER BY id DESC LIMIT 1",
-                            [observation_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    conn.execute(
-                        "UPDATE identity_evidence SET speaker_observation_id=?1,voice_profile_id=?2 \
-                         WHERE id=?3",
-                        params![observation_id, voice_profile_id, evidence_id],
-                    )?;
-                }
+        if strong_complete_name {
+            record_name_claim(
+                conn,
+                NameClaim {
+                    person_id: None,
+                    name: &evidence.name,
+                    source_event_id: &job.event_id,
+                    speaker_observation_id: None,
+                    observed_at: &job.started_at,
+                    evidence_kind,
+                    evidence_json: json!({"event_id":job.event_id,"screenshot_id":screenshot_id,"evidence":evidence.evidence}).to_string(),
+                    confidence: evidence.confidence,
+                    status: if evidence.is_active_speaker {
+                        "probationary"
+                    } else {
+                        "proposed"
+                    },
+                },
+            )?;
+        }
+        if strong_complete_name && evidence.is_active_speaker {
+            if let Some((person_id, observation_id, voice_profile_id)) =
+                promote_screen_name_if_corroborated(conn, &job.started_at, &evidence.name)?
+            {
+                conn.execute(
+                    "UPDATE identity_evidence SET person_id=?1,speaker_observation_id=?2,\
+                     voice_profile_id=?3,status='accepted' WHERE id=?4",
+                    params![person_id, observation_id, voice_profile_id, evidence_id],
+                )?;
             }
         }
     }
@@ -1174,6 +1435,22 @@ async fn load_job_media(state: &CpState, user_id: &str, job: &MediaJob) -> Resul
     Ok(media)
 }
 
+async fn candidate_name_vocabulary(state: &CpState, user_id: &str) -> Result<Vec<String>> {
+    state
+        .store
+        .with_user(user_id, |conn| {
+            let mut statement = conn.prepare(
+                "SELECT name FROM person_name_claims WHERE status IN ('accepted','probationary') \
+                 GROUP BY normalized_name ORDER BY MAX(observed_at) DESC LIMIT 50",
+            )?;
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(names)
+        })
+        .await
+}
+
 async fn persist_actual_media_usage(
     state: &CpState,
     user_id: &str,
@@ -1305,10 +1582,14 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
     if work.class == WorkClass::Audio {
         let (window, sources, duration_ms) = assemble_audio_window(&work.jobs, &media)?;
         reserve_media_output(state, user_id, work).await?;
-        let prompt = "Transcribe this audio exactly. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this asset. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. For a named speaker, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts.";
+        let candidate_names = candidate_name_vocabulary(state, user_id).await?;
+        let prompt = format!(
+            "Transcribe this audio exactly. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this asset. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
+            serde_json::to_string(&candidate_names)?
+        );
         let generation = vertex::generate_media_custom(
             &state.config,
-            prompt,
+            &prompt,
             "audio/wav",
             &window,
             audio_schema(),
@@ -1462,6 +1743,21 @@ async fn process_user(state: &CpState, user_id: &str) {
             if matches!(error_code, "vertex_quota" | "vertex_daily_budget") {
                 return;
             }
+        }
+    }
+    match state
+        .store
+        .with_user(user_id, |conn| {
+            super::voice_memory::reconcile_profiles(conn, 10)
+        })
+        .await
+    {
+        Ok(updated) if updated > 0 => {
+            let _ = state.store.save_user(user_id).await;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(user_id, error = %error, "bounded voice-profile reconciliation failed");
         }
     }
 }
@@ -1645,6 +1941,20 @@ mod tests {
         .unwrap()
     }
 
+    fn numbered_screen_manifest(index: i64) -> CaptureEventManifest {
+        let mut value = screen_manifest();
+        value.event_id = format!("screen-event-{index}");
+        value.sequence = index;
+        value.source_monotonic_ns += index as u64;
+        value.started_at = isotime::add_seconds(&value.started_at, index as f64);
+        value.ended_at = isotime::add_seconds(&value.started_at, 0.001);
+        value.source_wall_at = value.started_at.clone();
+        let media = value.media.as_mut().unwrap();
+        media.asset_id = format!("screen-asset-{index}");
+        media.sha256 = format!("{:064x}", index + 200);
+        value
+    }
+
     fn unnamed_turn() -> AudioTurn {
         AudioTurn {
             turn_id: "turn-1".into(),
@@ -1662,6 +1972,25 @@ mod tests {
         }
     }
 
+    fn enrolled_voiceprint() -> super::super::voice_memory::EmbeddedTurn {
+        enrolled_voiceprint_for("turn-1", vec![0.0625; 256])
+    }
+
+    fn enrolled_voiceprint_for(
+        turn_id: &str,
+        embedding: Vec<f32>,
+    ) -> super::super::voice_memory::EmbeddedTurn {
+        super::super::voice_memory::EmbeddedTurn {
+            turn_id: turn_id.into(),
+            embedding: Some(embedding),
+            diagnostics: super::super::voice_quality::diagnose(
+                &vec![0.2; super::super::voice_quality::SAMPLE_RATE as usize * 4],
+                false,
+                &[],
+            ),
+        }
+    }
+
     fn active_speaker_screen() -> ScreenResult {
         ScreenResult {
             literal_description: "John Garcia is visibly marked as speaking".into(),
@@ -1676,6 +2005,13 @@ mod tests {
                 is_active_speaker: true,
             }],
         }
+    }
+
+    fn roster_only_screen() -> ScreenResult {
+        let mut result = active_speaker_screen();
+        result.people[0].is_active_speaker = false;
+        result.people[0].evidence = "John Garcia is visible only in the attendee roster".into();
+        result
     }
 
     fn storyboard_json(ids: &[&str]) -> String {
@@ -1885,7 +2221,8 @@ mod tests {
         assert_eq!(label, "John Garcia");
         let person_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM people WHERE normalized_name='john garcia'",
+                "SELECT COUNT(DISTINCT person_id) FROM person_name_claims \
+                 WHERE normalized_name='john garcia' AND status='accepted'",
                 [],
                 |row| row.get(0),
             )
@@ -1908,20 +2245,184 @@ mod tests {
     }
 
     #[test]
+    fn two_different_voices_with_the_same_complete_name_remain_distinct_people() {
+        let conn = job_fixture_db();
+        for index in 0..2 {
+            let manifest = numbered_audio_manifest(index);
+            record_source_event(
+                &conn,
+                "account-1",
+                &manifest,
+                &format!("{:064x}", index + 1),
+                &format!("raw/same-name-{index}"),
+            )
+            .unwrap();
+            let job = lease_next_job(&conn, "2026-07-31T18:01:00.000Z")
+                .unwrap()
+                .unwrap();
+            let turn_id = format!("turn-{index}");
+            let turn = AudioTurn {
+                turn_id: turn_id.clone(),
+                start_ms: 0,
+                end_ms: 4_000,
+                speaker_local_id: format!("speaker-{index}"),
+                text: "I'm John Smith".into(),
+                language: Some("en".into()),
+                speaker_name: Some("John Smith".into()),
+                speaker_name_confidence: Some(0.99),
+                speaker_name_evidence: Some("I'm John Smith".into()),
+                person_facts: vec![],
+                overlap: false,
+                quality_flags: vec![],
+            };
+            let mut embedding = vec![0.0; 256];
+            embedding[index as usize] = 1.0;
+            persist_audio_result(
+                &conn,
+                &job,
+                &[turn],
+                &[enrolled_voiceprint_for(&turn_id, embedding)],
+            )
+            .unwrap();
+        }
+        let people: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT person_id) FROM person_name_claims \
+                 WHERE normalized_name='john smith' AND status='accepted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(people, 2);
+        let linked_profiles: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT person_id) FROM voice_profiles WHERE person_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_profiles, 2);
+    }
+
+    #[test]
+    fn roster_names_alone_never_create_or_bind_a_person() {
+        let conn = job_fixture_db();
+        for index in 0..2 {
+            record_source_event(
+                &conn,
+                "account-1",
+                &numbered_screen_manifest(index),
+                &format!("{:064x}", index + 10),
+                &format!("raw/roster-{index}"),
+            )
+            .unwrap();
+            let job = lease_next_job(&conn, "2026-07-31T18:00:04.000Z")
+                .unwrap()
+                .unwrap();
+            persist_screen_result(&conn, &job, &roster_only_screen()).unwrap();
+        }
+        let people: i64 = conn
+            .query_row("SELECT COUNT(*) FROM people", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(people, 0);
+        let proposed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM person_name_claims WHERE status='proposed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proposed, 2);
+    }
+
+    #[test]
+    fn later_voice_attributed_facts_are_provenanced_and_temporally_supersede() {
+        let conn = job_fixture_db();
+        for index in 0..2 {
+            let manifest = numbered_audio_manifest(index);
+            record_source_event(
+                &conn,
+                "account-1",
+                &manifest,
+                &format!("{:064x}", index + 1),
+                &format!("raw/fact-{index}"),
+            )
+            .unwrap();
+            let job = lease_next_job(&conn, "2026-07-31T18:01:00.000Z")
+                .unwrap()
+                .unwrap();
+            let mut turn = unnamed_turn();
+            turn.turn_id = format!("fact-turn-{index}");
+            turn.start_ms = 0;
+            turn.end_ms = 4_000;
+            turn.person_facts = vec![crate::cp::media::PersonFact {
+                predicate: "role".into(),
+                value: if index == 0 { "Engineer" } else { "CTO" }.into(),
+                evidence: if index == 0 {
+                    "I am an engineer"
+                } else {
+                    "I am now the CTO"
+                }
+                .into(),
+            }];
+            if index == 0 {
+                turn.text = "I'm John Garcia, and I am an engineer".into();
+                turn.speaker_name = Some("John Garcia".into());
+                turn.speaker_name_confidence = Some(0.99);
+                turn.speaker_name_evidence = Some("I'm John Garcia".into());
+            } else {
+                turn.text = "I am now the CTO".into();
+            }
+            let voiceprint = enrolled_voiceprint_for(&turn.turn_id, vec![0.0625; 256]);
+            persist_audio_result(&conn, &job, &[turn], &[voiceprint]).unwrap();
+        }
+        let facts = conn
+            .prepare(
+                "SELECT value,status,source_event_id,speaker_observation_id,literal_evidence,\
+                        supersedes_id FROM person_facts ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].0, "Engineer");
+        assert_eq!(facts[0].1, "superseded");
+        assert_eq!(facts[1].0, "CTO");
+        assert_eq!(facts[1].1, "active");
+        assert!(facts[1].2.is_some());
+        assert!(facts[1].3.is_some());
+        assert_eq!(facts[1].4.as_deref(), Some("I am now the CTO"));
+        assert_eq!(facts[1].5, Some(1));
+    }
+
+    #[test]
     fn active_speaker_screen_processed_first_names_the_later_voice_profile() {
         let conn = job_fixture_db();
-        record_source_event(
-            &conn,
-            "account-1",
-            &screen_manifest(),
-            &"d".repeat(64),
-            "raw/screen",
-        )
-        .unwrap();
-        let screen_job = lease_next_job(&conn, "2026-07-31T18:00:02.000Z")
-            .unwrap()
+        for index in 0..2 {
+            record_source_event(
+                &conn,
+                "account-1",
+                &numbered_screen_manifest(index),
+                &format!("{:064x}", index + 10),
+                &format!("raw/screen-{index}"),
+            )
             .unwrap();
-        persist_screen_result(&conn, &screen_job, &active_speaker_screen()).unwrap();
+            let screen_job = lease_next_job(&conn, "2026-07-31T18:00:04.000Z")
+                .unwrap()
+                .unwrap();
+            persist_screen_result(&conn, &screen_job, &active_speaker_screen()).unwrap();
+        }
 
         record_source_event(
             &conn,
@@ -1938,7 +2439,7 @@ mod tests {
             &conn,
             &audio_job,
             &[unnamed_turn()],
-            &[("turn-1".into(), vec![0.0625; 256], 0.8)],
+            &[enrolled_voiceprint()],
         )
         .unwrap();
         assert_john_bound(&conn);
@@ -1962,22 +2463,24 @@ mod tests {
             &conn,
             &audio_job,
             &[unnamed_turn()],
-            &[("turn-1".into(), vec![0.0625; 256], 0.8)],
+            &[enrolled_voiceprint()],
         )
         .unwrap();
 
-        record_source_event(
-            &conn,
-            "account-1",
-            &screen_manifest(),
-            &"d".repeat(64),
-            "raw/screen",
-        )
-        .unwrap();
-        let screen_job = lease_next_job(&conn, "2026-07-31T18:00:02.000Z")
-            .unwrap()
+        for index in 0..2 {
+            record_source_event(
+                &conn,
+                "account-1",
+                &numbered_screen_manifest(index),
+                &format!("{:064x}", index + 10),
+                &format!("raw/screen-{index}"),
+            )
             .unwrap();
-        persist_screen_result(&conn, &screen_job, &active_speaker_screen()).unwrap();
+            let screen_job = lease_next_job(&conn, "2026-07-31T18:00:04.000Z")
+                .unwrap()
+                .unwrap();
+            persist_screen_result(&conn, &screen_job, &active_speaker_screen()).unwrap();
+        }
         assert_john_bound(&conn);
     }
 }

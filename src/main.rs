@@ -195,6 +195,8 @@ pub(crate) async fn dump_user_export(
                 "voice_profiles": dump_optional_table(conn, "voice_profiles", "person_id, id")?,
                 "voice_samples": dump_optional_table(conn, "voice_samples", "speaker_observation_id, id")?,
                 "identity_evidence": dump_optional_table(conn, "identity_evidence", "created_at, id")?,
+                "person_name_claims": dump_optional_table(conn, "person_name_claims", "observed_at, id")?,
+                "profile_identity_bindings": dump_optional_table(conn, "profile_identity_bindings", "updated_at, id")?,
                 "person_facts": dump_optional_table(conn, "person_facts", "person_id, created_at, id")?,
             }))
         })
@@ -426,6 +428,18 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 #[tokio::main]
 async fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--score-voice-eval") {
+        let path = args
+            .get(2)
+            .expect("--score-voice-eval requires one aggregate case JSON path");
+        let raw = std::fs::read_to_string(path).expect("read voice evaluation cases");
+        println!(
+            "{}",
+            cp::voice_eval::score_json(&raw).expect("score voice evaluation cases")
+        );
+        return;
+    }
     // Structured logging; RUST_LOG overrides the default.
     tracing_subscriber::fmt()
         .with_env_filter(

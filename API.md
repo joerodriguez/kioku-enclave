@@ -319,7 +319,10 @@ that does not belong to the authenticated account returns HTTP `404`.
 
 ## People learned automatically
 
-`GET /api/v2/people` returns up to 500 identified profiles:
+`GET /api/v2/people?after_id=0&limit=50&q=john` returns identified people in
+stable opaque-ID order. `limit` is 1–100, `after_id` is the prior page's
+`next_cursor`, and optional `q` matches a display name or supported alias.
+Unnamed/tentative voices are not returned:
 
 ```json
 {
@@ -329,14 +332,30 @@ that does not belong to the authenticated account returns HTTP `404`.
     "voice_profile_count": 1,
     "fact_count": 2,
     "updated_at": "2026-07-31T18:04:12.000Z"
-  }]
+  }],
+  "next_cursor": null
 }
 ```
 
-`GET /api/v2/people/{person_id}` returns the profile, its internal voice labels,
-and evidence-backed durable facts. Evidence contains source `event_id`, turn or
-screenshot identity, and the literal evidence used by the model. Clients should
-present these facts as learned observations, not user-authored contact data.
+`GET /api/v2/people/{person_id}` returns supported aliases, human-readable
+voice coverage, current and superseded temporal facts, identity evidence, and
+up to 100 recent attributed statements with source event/time and episode
+navigation. Each name/fact/evidence item includes its state, confidence,
+observed time, literal evidence, and source event/turn. Raw embeddings and score
+vectors never appear. Clients should present facts as learned observations,
+not user-authored contact data. Existing REST search supports speaker filtering.
+
+Large histories are available without growing the profile response:
+
+- `GET /api/v2/people/{person_id}/evidence?limit=50&before_id=123` returns
+  `{"evidence": [...], "next_cursor": 98}` newest first.
+- `GET /api/v2/people/{person_id}/statements?limit=50&before_id=456` returns
+  `{"statements": [...], "next_cursor": 407}` newest first, including source
+  event and optional episode ID/title for navigation.
+
+`limit` is 1–100. Omit `before_id` for the first page; pass the returned
+positive `next_cursor` as the next `before_id`. A missing, unnamed, or tentative
+person returns `404`. Unknown query fields return `400`.
 
 ## Processing and privacy semantics
 
@@ -346,13 +365,20 @@ present these facts as learned observations, not user-authored contact data.
 - Gemini 3.5 Flash receives a bounded decrypted asset from inside the enclave
   for transcription/diarization or screenshot understanding. This is an
   explicit Vertex processing boundary, not enclave-only inference.
-- Speaker names are accepted only from high-confidence complete-name evidence.
-  Explicit audio self-identification binds its own turn. A screenshot name binds
-  a system-audio turn only when the meeting UI visibly marks that exact label as
-  the active speaker and exactly one non-overlapping turn spans the screenshot
-  timestamp. Reconciliation works whether audio or screenshot processing finishes
-  first. Independent WeSpeaker embeddings then match later turns; Gemini is never
-  treated as a voice biometric identifier.
+- Speaker names are opaque-person claims, never identity keys. Explicit audio
+  self-identification binds its own turn; repeated exact active-speaker frames
+  may bind only when exactly one non-overlapping system-audio turn spans them.
+  Roster/context names and the bounded spelling vocabulary sent to Gemini are
+  never proof of identity. Two people with the same normalized display name
+  remain distinct. One-to-three-second samples are match-only; overlap, music,
+  echo, silence, clipping, and low-purity samples quarantine. At least three
+  seconds of clean speech is required for enrollment, and profiles use a
+  versioned medoid/trimmed centroid with outlier rejection. Independent
+  WeSpeaker embeddings then match later turns; Gemini never receives
+  voiceprints or acts as a biometric identifier.
+- Facts may be learned from every confidently attributed turn, not only an
+  introduction. Facts retain source event/turn, observed time, literal evidence,
+  confidence, derivation version, and temporal supersession history.
 - Raw encrypted media is retained for 30 days to support processing retries and
   voice-profile reconciliation, then deleted automatically. Account deletion
   removes raw objects, derived records, profiles, credentials, and the encrypted
