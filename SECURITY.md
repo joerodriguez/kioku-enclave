@@ -48,6 +48,11 @@ surfaces.
 - The Confidential Space launch policy permits only `PORT` to be changed at launch.
   KMS, GCS, caller identity, OAuth, TLS, attestation, and migration settings are baked
   into the image and therefore covered by its digest.
+- CI selects exactly one complete image configuration before Docker runs. Manual
+  evaluation builds never inherit production values, are marked with an `eval-` tag and
+  metadata profile, cannot become signed releases, and may run only with an isolated
+  service account, KMS key, buckets, hostname, and attestation binding that have no
+  production data access.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL

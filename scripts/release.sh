@@ -323,14 +323,14 @@ RELEASE_METADATA="$(python3 - "$METADATA_FILE" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
-keys = ("schema_version", "source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest", "build_url")
+keys = ("schema_version", "source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest", "build_url", "build_profile")
 print("\t".join(str(data[key]) for key in keys))
 PY
 )"
-IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL <<< "$RELEASE_METADATA"
+IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE <<< "$RELEASE_METADATA"
 
-if [[ "$SCHEMA_VERSION" != "1" || "$SOURCE_REPOSITORY" != "https://github.com/${REPOSITORY}" ]]; then
-  echo "Error: build metadata has an unexpected schema or source repository." >&2
+if [[ "$SCHEMA_VERSION" != "1" || "$SOURCE_REPOSITORY" != "https://github.com/${REPOSITORY}" || "$BUILD_PROFILE" != "production" ]]; then
+  echo "Error: build metadata has an unexpected schema, source repository, or non-production profile." >&2
   exit 1
 fi
 if [[ "$BUILT_REF" != "$RELEASE_TAG" || "$BUILT_COMMIT" != "$REMOTE_TAG_COMMIT" ]]; then
