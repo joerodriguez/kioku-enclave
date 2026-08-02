@@ -18,9 +18,10 @@ To cut a new release:
 
 1. Run `./scripts/bump_version.sh <NEW_VERSION>` (for example `0.8.4`), or
    update `version = "X.Y.Z"` in `Cargo.toml` and refresh `Cargo.lock`.
-2. Produce the licensed real-corpus aggregate cases and deterministic report
+2. Produce the licensed source manifest, real-corpus aggregate cases, and deterministic report
    described in [`eval/voice/README.md`](eval/voice/README.md). Review and
-   commit `eval/voice/release-cases-v1.json` and
+   commit `eval/voice/release-manifest-v1.json`,
+   `eval/voice/release-cases-v1.json`, and
    `eval/voice/release-report-v1.json`; they contain no media or user content.
 3. Merge those changes through a green pull request, then synchronize a clean
    local `main` with `origin/main`.
@@ -42,10 +43,11 @@ To cut a new release:
 - Configure a Git signing key. `scripts/release.sh` creates `git tag -s` tags and rejects
   a tag that cannot be verified against the required `RELEASE_SIGNER_FINGERPRINT`
   trust anchor (an OpenPGP fingerprint or `SHA256:…` SSH key fingerprint).
-- Check in the current content-free ADR-0016 real aggregate cases and matching
-  passing report at the canonical paths documented in `eval/voice/README.md`.
-  Missing, stale, synthetic-only, incomplete, or regressed reports block both
-  the local release command and release-tag CI.
+- Check in the current content-free ADR-0016 licensed-source manifest, real
+  aggregate cases, and matching passing report at the canonical paths
+  documented in `eval/voice/README.md`. Missing, stale, unbound,
+  synthetic-only, incomplete, or regressed bundles block both the local
+  release command and release-tag CI.
 - Publish the trusted signing public key and fingerprint through a separately authenticated
   channel, and require release verifiers to pin that identity. A cryptographically valid
   signature from an unknown key does not authenticate the release operator.

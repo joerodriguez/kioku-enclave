@@ -6,4 +6,4 @@ content-free scored decisions may be committed.
 
 | Path | Role |
 |---|---|
-| [voice/](voice/map.md) | ADR-0016 voice, identity, diarization, collision, and fact-provenance evaluation contract |
+| [voice/](voice/map.md) | ADR-0016 licensed-source manifest/fetch workflow plus voice, identity, diarization, collision, provenance, export, and deletion release scoring |

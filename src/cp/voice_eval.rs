@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{EnclaveError, Result};
 
@@ -11,6 +12,7 @@ use crate::error::{EnclaveError, Result};
 pub struct EvaluationCorpus {
     pub schema_version: u32,
     pub corpus_id: String,
+    pub source_manifest_sha256: String,
     #[serde(default)]
     pub diarization_error_baselines: BTreeMap<String, f64>,
     pub cases: Vec<EvaluationCase>,
@@ -45,6 +47,7 @@ pub struct EvaluationCase {
 pub struct EvaluationReport {
     pub schema_version: u32,
     pub corpus_id: String,
+    pub source_manifest_sha256: String,
     pub case_count: usize,
     pub real_case_count: usize,
     pub quality_case_count: usize,
@@ -77,6 +80,38 @@ pub struct EvaluationReport {
     pub release_gates_pass: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvaluationManifest {
+    schema_version: u32,
+    corpus_id: String,
+    sources: Vec<EvaluationSource>,
+    owner_fixtures: Vec<OwnerFixture>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvaluationSource {
+    id: String,
+    archive_url: String,
+    license_id: String,
+    license_url: String,
+    archive_sha256: String,
+    selected_item_ids: Vec<String>,
+    slices: Vec<String>,
+    derivation_command: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerFixture {
+    id: String,
+    media_sha256: String,
+    labels_sha256: String,
+    authorization_record_sha256: String,
+    slices: Vec<String>,
+}
+
 const REQUIRED_REAL_SLICES: &[&str] = &[
     "clean_remote_call",
     "three_plus_speakers",
@@ -103,6 +138,229 @@ const REQUIRED_REAL_SLICES: &[&str] = &[
 ];
 
 const REGRESSION_SLICES: &[&str] = &["noise", "room_audio", "overlap"];
+
+const REQUIRED_OWNER_SLICES: &[&str] = &[
+    "system_audio",
+    "mac_microphone",
+    "iphone_microphone",
+    "bluetooth",
+    "active_speaker_ui",
+    "same_display_name",
+];
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_opaque_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_hashed_id(value: &str, prefix: &str) -> bool {
+    let Some(digest) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    (16..=64).contains(&digest.len())
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn require_https_url(value: &str, field: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|_| EnclaveError::InvalidRequest(format!("invalid manifest {field}")))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(EnclaveError::InvalidRequest(format!(
+            "manifest {field} must be an HTTPS URL without credentials"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
+    if manifest.schema_version != 1 || !valid_opaque_id(&manifest.corpus_id) {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid voice evaluation manifest schema or corpus ID".into(),
+        ));
+    }
+    if manifest.sources.is_empty() || manifest.sources.len() > 32 {
+        return Err(EnclaveError::InvalidRequest(
+            "voice evaluation manifest must contain 1 to 32 licensed sources".into(),
+        ));
+    }
+    if manifest.owner_fixtures.is_empty() || manifest.owner_fixtures.len() > 64 {
+        return Err(EnclaveError::InvalidRequest(
+            "voice evaluation manifest must contain 1 to 64 owner fixtures".into(),
+        ));
+    }
+    let allowed_slices = REQUIRED_REAL_SLICES.iter().copied().collect::<HashSet<_>>();
+    let mut ids = HashSet::new();
+    let mut covered_slices = HashSet::new();
+    for source in &manifest.sources {
+        if !valid_opaque_id(&source.id) || !ids.insert(source.id.as_str()) {
+            return Err(EnclaveError::InvalidRequest(
+                "manifest source IDs must be unique opaque identifiers".into(),
+            ));
+        }
+        require_https_url(&source.archive_url, "archive_url")?;
+        require_https_url(&source.license_url, "license_url")?;
+        if source.license_id.is_empty()
+            || source.license_id.len() > 128
+            || !valid_sha256(&source.archive_sha256)
+            || source.selected_item_ids.is_empty()
+            || source.selected_item_ids.len() > 10_000
+            || source.derivation_command.is_empty()
+            || source.derivation_command.len() > 2_048
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "manifest source is missing bounded license, hash, selection, or derivation evidence"
+                    .into(),
+            ));
+        }
+        for selected in &source.selected_item_ids {
+            if !valid_opaque_id(selected) {
+                return Err(EnclaveError::InvalidRequest(
+                    "manifest selected item IDs must be opaque identifiers".into(),
+                ));
+            }
+        }
+        for slice in &source.slices {
+            if !allowed_slices.contains(slice.as_str()) {
+                return Err(EnclaveError::InvalidRequest(format!(
+                    "unknown manifest slice: {slice}"
+                )));
+            }
+            covered_slices.insert(slice.as_str());
+        }
+    }
+    let mut owner_slices = HashSet::new();
+    for fixture in &manifest.owner_fixtures {
+        if !valid_opaque_id(&fixture.id) || !ids.insert(fixture.id.as_str()) {
+            return Err(EnclaveError::InvalidRequest(
+                "manifest fixture IDs must be unique opaque identifiers".into(),
+            ));
+        }
+        if !valid_sha256(&fixture.media_sha256)
+            || !valid_sha256(&fixture.labels_sha256)
+            || !valid_sha256(&fixture.authorization_record_sha256)
+            || fixture.slices.is_empty()
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "owner fixture must bind media, labels, authorization, and slices".into(),
+            ));
+        }
+        for slice in &fixture.slices {
+            if !allowed_slices.contains(slice.as_str()) {
+                return Err(EnclaveError::InvalidRequest(format!(
+                    "unknown owner fixture slice: {slice}"
+                )));
+            }
+            covered_slices.insert(slice.as_str());
+            owner_slices.insert(slice.as_str());
+        }
+    }
+    let missing = REQUIRED_REAL_SLICES
+        .iter()
+        .filter(|slice| !covered_slices.contains(**slice))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(EnclaveError::InvalidRequest(format!(
+            "voice evaluation manifest is missing slices: {}",
+            missing.join(", ")
+        )));
+    }
+    let missing_owner = REQUIRED_OWNER_SLICES
+        .iter()
+        .filter(|slice| !owner_slices.contains(**slice))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_owner.is_empty() {
+        return Err(EnclaveError::InvalidRequest(format!(
+            "owner-controlled evaluation fixtures are missing slices: {}",
+            missing_owner.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn validate_corpus(corpus: &EvaluationCorpus) -> Result<()> {
+    if corpus.schema_version != 1
+        || !valid_opaque_id(&corpus.corpus_id)
+        || !valid_sha256(&corpus.source_manifest_sha256)
+        || corpus.cases.is_empty()
+        || corpus.cases.len() > 100_000
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid bounded voice evaluation corpus header".into(),
+        ));
+    }
+    let allowed_slices = REQUIRED_REAL_SLICES.iter().copied().collect::<HashSet<_>>();
+    for (slice, baseline) in &corpus.diarization_error_baselines {
+        if !allowed_slices.contains(slice.as_str()) || !baseline.is_finite() || *baseline < 0.0 {
+            return Err(EnclaveError::InvalidRequest(
+                "invalid diarization slice baseline".into(),
+            ));
+        }
+    }
+    for case in &corpus.cases {
+        if !valid_hashed_id(&case.id, "case-")
+            || !valid_hashed_id(&case.expected_person, "person-")
+            || case
+                .predicted_person
+                .as_deref()
+                .is_some_and(|person| !valid_hashed_id(person, "person-"))
+            || case
+                .display_name_collision_group
+                .as_deref()
+                .is_some_and(|group| !valid_hashed_id(group, "collision-"))
+            || !allowed_slices.contains(case.slice.as_str())
+            || !matches!(
+                case.corpus_kind.as_str(),
+                "real_audio" | "synthetic_contract"
+            )
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "voice evaluation case identifiers and slices must use the content-free contract"
+                    .into(),
+            ));
+        }
+        if (case.accepted_name || case.cross_meeting_link) && case.predicted_person.is_none() {
+            return Err(EnclaveError::InvalidRequest(
+                "accepted names and cross-meeting links require an opaque predicted person".into(),
+            ));
+        }
+        if (case.corpus_kind == "real_audio" && case.speech_ms == 0)
+            || case.speech_ms > 86_400_000
+            || case.diarization_error_ms > 864_000_000
+            || case.fact_count > 1_000_000
+            || case.new_record_count > 1_000_000
+            || case.facts_with_provenance > case.fact_count
+            || case.exported_new_record_count > case.new_record_count
+            || case.deleted_new_record_count > case.new_record_count
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "voice evaluation case timing or coverage counts are invalid".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn ratio(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
@@ -302,6 +560,7 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
     EvaluationReport {
         schema_version: corpus.schema_version,
         corpus_id: corpus.corpus_id.clone(),
+        source_manifest_sha256: corpus.source_manifest_sha256.clone(),
         case_count: corpus.cases.len(),
         real_case_count,
         quality_case_count: quality_cases.len(),
@@ -337,11 +596,13 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
 
 pub fn score_json(raw: &str) -> Result<String> {
     let corpus: EvaluationCorpus = serde_json::from_str(raw)?;
+    validate_corpus(&corpus)?;
     Ok(serde_json::to_string_pretty(&score(&corpus))?)
 }
 
 pub fn validate_release_report(corpus_raw: &str, report_raw: &str) -> Result<()> {
     let corpus: EvaluationCorpus = serde_json::from_str(corpus_raw)?;
+    validate_corpus(&corpus)?;
     let checked_in: EvaluationReport = serde_json::from_str(report_raw)?;
     let computed = score(&corpus);
     if checked_in != computed {
@@ -356,6 +617,35 @@ pub fn validate_release_report(corpus_raw: &str, report_raw: &str) -> Result<()>
         ));
     }
     Ok(())
+}
+
+pub fn validate_manifest_json(manifest_raw: &str) -> Result<String> {
+    let manifest: EvaluationManifest = serde_json::from_str(manifest_raw)?;
+    validate_manifest(&manifest)?;
+    Ok(sha256_hex(manifest_raw.as_bytes()))
+}
+
+pub fn validate_release_bundle(
+    manifest_raw: &str,
+    corpus_raw: &str,
+    report_raw: &str,
+) -> Result<()> {
+    let manifest: EvaluationManifest = serde_json::from_str(manifest_raw)?;
+    validate_manifest(&manifest)?;
+    let corpus: EvaluationCorpus = serde_json::from_str(corpus_raw)?;
+    if corpus.corpus_id != manifest.corpus_id {
+        return Err(EnclaveError::InvalidRequest(
+            "voice evaluation manifest and aggregate cases have different corpus IDs".into(),
+        ));
+    }
+    if !valid_sha256(&corpus.source_manifest_sha256)
+        || corpus.source_manifest_sha256 != sha256_hex(manifest_raw.as_bytes())
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "voice evaluation cases are not bound to the exact checked-in source manifest".into(),
+        ));
+    }
+    validate_release_report(corpus_raw, report_raw)
 }
 
 #[cfg(test)]
@@ -388,11 +678,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, slice)| EvaluationCase {
-                id: format!("real-{index}"),
+                id: format!("case-{index:016x}"),
                 corpus_kind: "real_audio".into(),
                 slice: (*slice).into(),
-                expected_person: format!("person-{index}"),
-                predicted_person: Some(format!("person-{index}")),
+                expected_person: format!("person-{index:016x}"),
+                predicted_person: Some(format!("person-{index:016x}")),
                 accepted_name: true,
                 cross_meeting_link: true,
                 after_three_high_quality_samples: true,
@@ -411,11 +701,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         cases.push(EvaluationCase {
-            id: "second-alex".into(),
+            id: "case-ffffffffffffffff".into(),
             corpus_kind: "real_audio".into(),
             slice: "same_display_name".into(),
-            expected_person: "alex-2".into(),
-            predicted_person: Some("alex-2".into()),
+            expected_person: "person-eeeeeeeeeeeeeeee".into(),
+            predicted_person: Some("person-eeeeeeeeeeeeeeee".into()),
             accepted_name: true,
             cross_meeting_link: true,
             after_three_high_quality_samples: true,
@@ -423,7 +713,7 @@ mod tests {
             diarization_error_ms: 0,
             fact_count: 1,
             facts_with_provenance: 1,
-            display_name_collision_group: Some("alex".into()),
+            display_name_collision_group: Some("collision-aaaaaaaaaaaaaaaa".into()),
             new_record_count: 1,
             exported_new_record_count: 1,
             deleted_new_record_count: 1,
@@ -432,10 +722,11 @@ mod tests {
             .iter_mut()
             .find(|case| case.slice == "same_display_name")
             .unwrap();
-        first_alex.display_name_collision_group = Some("alex".into());
+        first_alex.display_name_collision_group = Some("collision-aaaaaaaaaaaaaaaa".into());
         EvaluationCorpus {
             schema_version: 1,
             corpus_id: "real-release-v1".into(),
+            source_manifest_sha256: "0".repeat(64),
             diarization_error_baselines: [
                 ("noise".into(), 0.20),
                 ("room_audio".into(), 0.20),
@@ -450,11 +741,11 @@ mod tests {
     fn release_metrics_ignore_synthetic_contract_cases_when_real_cases_exist() {
         let mut corpus = passing_real_corpus();
         corpus.cases.push(EvaluationCase {
-            id: "synthetic-poison".into(),
+            id: "case-dddddddddddddddd".into(),
             corpus_kind: "synthetic_contract".into(),
             slice: "clean_remote_call".into(),
-            expected_person: "expected".into(),
-            predicted_person: Some("wrong".into()),
+            expected_person: "person-aaaaaaaaaaaaaaaa".into(),
+            predicted_person: Some("person-bbbbbbbbbbbbbbbb".into()),
             accepted_name: true,
             cross_meeting_link: true,
             after_three_high_quality_samples: true,
@@ -533,5 +824,99 @@ mod tests {
         assert!(validate_release_report(&corpus_json, &stale.to_string()).is_err());
 
         assert!(validate_release_report(SYNTHETIC, &score_json(SYNTHETIC).unwrap()).is_err());
+    }
+
+    fn passing_manifest_json() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "corpus_id": "real-release-v1",
+            "sources": [{
+                "id": "ami-eval-subset",
+                "archive_url": "https://groups.inf.ed.ac.uk/ami/download/",
+                "license_id": "CC-BY-4.0",
+                "license_url": "https://groups.inf.ed.ac.uk/ami/corpus/license.shtml",
+                "archive_sha256": "a".repeat(64),
+                "selected_item_ids": ["meeting-001"],
+                "slices": REQUIRED_REAL_SLICES,
+                "derivation_command": "./eval/voice/derive.sh manifest.json"
+            }],
+            "owner_fixtures": [{
+                "id": "owner-device-matrix-v1",
+                "media_sha256": "b".repeat(64),
+                "labels_sha256": "c".repeat(64),
+                "authorization_record_sha256": "d".repeat(64),
+                "slices": [
+                    "system_audio", "mac_microphone", "iphone_microphone",
+                    "bluetooth", "active_speaker_ui", "same_display_name"
+                ]
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn release_bundle_binds_passing_report_to_a_valid_source_manifest() {
+        let manifest = passing_manifest_json();
+        let mut corpus = passing_real_corpus();
+        corpus.source_manifest_sha256 = sha256_hex(manifest.as_bytes());
+        let corpus_json = serde_json::to_string(&corpus).unwrap();
+        let report_json = score_json(&corpus_json).unwrap();
+
+        validate_release_bundle(&manifest, &corpus_json, &report_json).unwrap();
+
+        let mut changed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        changed["sources"][0]["selected_item_ids"][0] =
+            serde_json::Value::String("meeting-002".into());
+        assert!(validate_release_bundle(&changed.to_string(), &corpus_json, &report_json).is_err());
+    }
+
+    #[test]
+    fn release_bundle_requires_owner_device_ui_and_collision_fixtures() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&passing_manifest_json()).unwrap();
+        manifest["owner_fixtures"][0]["slices"] =
+            serde_json::json!(["system_audio", "mac_microphone"]);
+        let manifest = manifest.to_string();
+        let mut corpus = passing_real_corpus();
+        corpus.source_manifest_sha256 = sha256_hex(manifest.as_bytes());
+        let corpus_json = serde_json::to_string(&corpus).unwrap();
+        let report_json = score_json(&corpus_json).unwrap();
+
+        assert!(validate_release_bundle(&manifest, &corpus_json, &report_json).is_err());
+    }
+
+    #[test]
+    fn manifest_validator_emits_raw_hash_and_rejects_url_credentials() {
+        let manifest = passing_manifest_json();
+        assert_eq!(
+            validate_manifest_json(&manifest).unwrap(),
+            sha256_hex(manifest.as_bytes())
+        );
+
+        let mut credentials: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        credentials["sources"][0]["archive_url"] =
+            serde_json::Value::String("https://user:password@example.com/archive".into());
+        assert!(validate_manifest_json(&credentials.to_string()).is_err());
+    }
+
+    #[test]
+    fn aggregate_cases_reject_names_and_per_case_coverage_overclaims() {
+        let mut named = passing_real_corpus();
+        named.cases[0].expected_person = "John Garcia".into();
+        assert!(score_json(&serde_json::to_string(&named).unwrap()).is_err());
+
+        let mut overclaim = passing_real_corpus();
+        overclaim.cases[0].facts_with_provenance = 2;
+        overclaim.cases[1].facts_with_provenance = 0;
+        overclaim.cases[2].exported_new_record_count = 2;
+        overclaim.cases[3].exported_new_record_count = 0;
+        assert!(score_json(&serde_json::to_string(&overclaim).unwrap()).is_err());
+    }
+
+    #[test]
+    fn accepted_names_and_cross_meeting_links_require_a_prediction() {
+        let mut corpus = passing_real_corpus();
+        corpus.cases[0].predicted_person = None;
+        assert!(score_json(&serde_json::to_string(&corpus).unwrap()).is_err());
     }
 }
