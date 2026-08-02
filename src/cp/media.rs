@@ -74,6 +74,33 @@ pub struct MediaDescriptor {
     pub orientation: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaDisposition {
+    #[default]
+    Canonical,
+    Reference,
+}
+
+impl MediaDisposition {
+    fn is_canonical(&self) -> bool {
+        matches!(self, Self::Canonical)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenReferenceDescriptor {
+    pub canonical_event_id: String,
+    pub canonical_asset_id: String,
+    pub canonical_media_sha256: String,
+    pub perceptual_hash: String,
+    pub hamming_distance: u32,
+    pub pixel_change_ratio: f64,
+    pub context_fingerprint: String,
+    pub dedupe_version: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureContext {
@@ -136,7 +163,12 @@ pub struct CaptureEventManifest {
     pub timezone_id: String,
     pub utc_offset_minutes: i32,
     pub clock_uncertainty_ms: u32,
-    pub media: MediaDescriptor,
+    #[serde(default, skip_serializing_if = "MediaDisposition::is_canonical")]
+    pub media_disposition: MediaDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ScreenReferenceDescriptor>,
     pub context: Option<CaptureContext>,
 }
 
@@ -167,7 +199,6 @@ impl CaptureEventManifest {
             ("install_id", self.install_id.as_str()),
             ("capture_session_id", self.capture_session_id.as_str()),
             ("stream_id", self.stream_id.as_str()),
-            ("asset_id", self.media.asset_id.as_str()),
         ] {
             validate_id(name, value)?;
         }
@@ -197,12 +228,86 @@ impl CaptureEventManifest {
                 "utc_offset_minutes is invalid".into(),
             ));
         }
-        validate_media(self.stream_kind, &self.media)?;
+        match self.media_disposition {
+            MediaDisposition::Canonical => {
+                let media = self.media.as_ref().ok_or_else(|| {
+                    EnclaveError::InvalidRequest("canonical media is required".into())
+                })?;
+                validate_id("asset_id", &media.asset_id)?;
+                validate_media(self.stream_kind, media)?;
+                if self.reference.is_some() {
+                    return Err(EnclaveError::InvalidRequest(
+                        "canonical events cannot contain a reference".into(),
+                    ));
+                }
+            }
+            MediaDisposition::Reference => {
+                if self.media.is_some() {
+                    return Err(EnclaveError::InvalidRequest(
+                        "reference events cannot contain media".into(),
+                    ));
+                }
+                if self.stream_kind != StreamKind::MacScreen {
+                    return Err(EnclaveError::InvalidRequest(
+                        "only mac_screen events may reference canonical media".into(),
+                    ));
+                }
+                validate_screen_reference(self.reference.as_ref().ok_or_else(|| {
+                    EnclaveError::InvalidRequest("reference metadata is required".into())
+                })?)?;
+                if self
+                    .context
+                    .as_ref()
+                    .is_none_or(|context| context.capture_status != "stable")
+                {
+                    return Err(EnclaveError::InvalidRequest(
+                        "reference events require stable capture context".into(),
+                    ));
+                }
+            }
+        }
         if let Some(context) = &self.context {
             validate_context(context)?;
         }
         Ok(())
     }
+}
+
+fn validate_screen_reference(reference: &ScreenReferenceDescriptor) -> Result<()> {
+    validate_id(
+        "reference.canonical_event_id",
+        &reference.canonical_event_id,
+    )?;
+    validate_id(
+        "reference.canonical_asset_id",
+        &reference.canonical_asset_id,
+    )?;
+    if !validate_sha256(&reference.canonical_media_sha256) {
+        return Err(EnclaveError::InvalidRequest(
+            "reference.canonical_media_sha256 must be 64 hexadecimal characters".into(),
+        ));
+    }
+    let valid_perceptual_hash = reference.perceptual_hash.len() == 16
+        && reference
+            .perceptual_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+    if !valid_perceptual_hash {
+        return Err(EnclaveError::InvalidRequest(
+            "reference.perceptual_hash must be 16 hexadecimal characters".into(),
+        ));
+    }
+    if reference.hamming_distance > 3
+        || !reference.pixel_change_ratio.is_finite()
+        || !(0.0..=0.01).contains(&reference.pixel_change_ratio)
+        || !validate_sha256(&reference.context_fingerprint)
+        || reference.dedupe_version != 1
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "reference deduplication evidence is outside version 1 bounds".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_id(name: &str, value: &str) -> Result<()> {
@@ -383,27 +488,32 @@ fn validate_media_bytes(
     multipart_content_type: Option<&str>,
 ) -> Result<()> {
     manifest.validate()?;
-    if bytes.len() as i64 != manifest.media.byte_length {
+    if manifest.media_disposition != MediaDisposition::Canonical {
+        return Err(EnclaveError::InvalidRequest(
+            "reference events cannot contain a media part".into(),
+        ));
+    }
+    let media = manifest
+        .media
+        .as_ref()
+        .ok_or_else(|| EnclaveError::InvalidRequest("canonical media is required".into()))?;
+    if bytes.len() as i64 != media.byte_length {
         return Err(EnclaveError::InvalidRequest(
             "media byte length does not match manifest".into(),
         ));
     }
-    if !manifest
-        .media
-        .sha256
-        .eq_ignore_ascii_case(&sha256_hex(bytes))
-    {
+    if !media.sha256.eq_ignore_ascii_case(&sha256_hex(bytes)) {
         return Err(EnclaveError::InvalidRequest(
             "media sha256 does not match manifest".into(),
         ));
     }
-    if multipart_content_type.is_some_and(|value| value != manifest.media.mime_type) {
+    if multipart_content_type.is_some_and(|value| value != media.mime_type) {
         return Err(EnclaveError::InvalidRequest(
             "multipart content type does not match manifest".into(),
         ));
     }
 
-    let supported = match manifest.media.mime_type.as_str() {
+    let supported = match media.mime_type.as_str() {
         "audio/m4a" | "audio/mp4" if manifest.stream_kind.is_audio() => {
             bytes.len() >= 12 && bytes.get(4..8) == Some(b"ftyp")
         }
@@ -430,6 +540,7 @@ fn validate_media_bytes(
 struct CaptureAccepted {
     event_id: String,
     asset_id: String,
+    media_disposition: MediaDisposition,
     processing_state: &'static str,
     committed_through_sequence: i64,
 }
@@ -476,6 +587,21 @@ struct PersonFactView {
 enum PreflightOutcome {
     New,
     Duplicate { committed_through_sequence: i64 },
+}
+
+fn response_asset_id(manifest: &CaptureEventManifest) -> Result<String> {
+    match manifest.media_disposition {
+        MediaDisposition::Canonical => manifest
+            .media
+            .as_ref()
+            .map(|media| media.asset_id.clone())
+            .ok_or_else(|| EnclaveError::InvalidRequest("canonical media is required".into())),
+        MediaDisposition::Reference => manifest
+            .reference
+            .as_ref()
+            .map(|reference| reference.canonical_asset_id.clone())
+            .ok_or_else(|| EnclaveError::InvalidRequest("reference metadata is required".into())),
+    }
 }
 
 pub fn router() -> Router<Arc<CpState>> {
@@ -547,26 +673,48 @@ async fn upload_capture_event(
             _ => return bad_request("unknown multipart field"),
         }
     }
-    let (Some(manifest_bytes), Some(media_bytes)) = (manifest_bytes, media_bytes) else {
-        return bad_request("manifest and media fields are required");
+    let Some(manifest_bytes) = manifest_bytes else {
+        return bad_request("manifest field is required");
     };
     let manifest: CaptureEventManifest = match serde_json::from_slice(&manifest_bytes) {
         Ok(value) => value,
         Err(_) => return bad_request("manifest is not valid capture schema v2 JSON"),
     };
-    if let Err(error) = validate_media_bytes(&manifest, &media_bytes, media_content_type.as_deref())
-    {
+    if let Err(error) = manifest.validate() {
         return error.into_response();
+    }
+    match manifest.media_disposition {
+        MediaDisposition::Canonical => {
+            let Some(bytes) = media_bytes.as_deref() else {
+                return bad_request("canonical events require a media field");
+            };
+            if let Err(error) =
+                validate_media_bytes(&manifest, bytes, media_content_type.as_deref())
+            {
+                return error.into_response();
+            }
+        }
+        MediaDisposition::Reference if media_bytes.is_some() => {
+            return bad_request("reference events cannot contain a media field")
+        }
+        MediaDisposition::Reference => {}
     }
     let digest = match manifest_digest(&manifest) {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let object_key = format!("raw/{user_id}/{}.enc", manifest.media.asset_id);
+    let asset_id = match response_asset_id(&manifest) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let object_key = manifest
+        .media
+        .as_ref()
+        .map(|media| format!("raw/{user_id}/{}.enc", media.asset_id));
     let preflight = state
         .store
         .with_user(&user_id, |conn| {
-            preflight_source_event(conn, &manifest, &digest, &object_key)
+            preflight_source_event(conn, &manifest, &digest, object_key.as_deref())
         })
         .await;
     match preflight {
@@ -577,8 +725,13 @@ async fn upload_capture_event(
                 StatusCode::OK,
                 Json(CaptureAccepted {
                     event_id: manifest.event_id,
-                    asset_id: manifest.media.asset_id,
-                    processing_state: "queued",
+                    asset_id,
+                    media_disposition: manifest.media_disposition,
+                    processing_state: if manifest.media_disposition.is_canonical() {
+                        "queued"
+                    } else {
+                        "ready"
+                    },
                     committed_through_sequence,
                 }),
             )
@@ -588,39 +741,60 @@ async fn upload_capture_event(
         Err(error) => return error.into_response(),
     }
 
-    let (media_dek, wrapped_dek) = match load_or_create_media_dek(&state, &user_id).await {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(error = %error, "capture media key setup failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
-        }
-    };
-    let media_context = crate::store::media_blob_context(&user_id, &object_key);
-    let encrypted =
-        match crate::crypto::encrypt_bound_blob(&media_dek, &media_bytes, &media_context) {
+    if manifest.media_disposition == MediaDisposition::Canonical {
+        let object_key = object_key
+            .as_deref()
+            .expect("validated canonical object key");
+        let media_bytes = media_bytes.as_deref().expect("validated canonical media");
+        let (media_dek, wrapped_dek) = match load_or_create_media_dek(&state, &user_id).await {
             Ok(value) => value,
             Err(error) => {
-                tracing::error!(error = %error, "capture media encryption failed");
+                tracing::error!(error = %error, "capture media key setup failed");
                 return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
             }
         };
-    if let Err(put_error) = state
-        .store
-        .put_media(&object_key, &encrypted, &wrapped_dek)
-        .await
-    {
-        if let Err(error) =
-            verify_existing_media(&state, &user_id, &object_key, &media_context, &media_bytes).await
+        let media_context = crate::store::media_blob_context(&user_id, object_key);
+        let encrypted =
+            match crate::crypto::encrypt_bound_blob(&media_dek, media_bytes, &media_context) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(error = %error, "capture media encryption failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
+                        .into_response();
+                }
+            };
+        if let Err(put_error) = state
+            .store
+            .put_media(object_key, &encrypted, &wrapped_dek)
+            .await
         {
-            tracing::error!(error = %put_error, verify_error = %error, "capture media storage failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+            if let Err(error) =
+                verify_existing_media(&state, &user_id, object_key, &media_context, media_bytes)
+                    .await
+            {
+                tracing::error!(error = %put_error, verify_error = %error, "capture media storage failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+            }
         }
     }
 
     let outcome = state
         .store
         .with_user(&user_id, |conn| {
-            record_source_event(conn, &user_id, &manifest, &digest, &object_key)?;
+            match manifest.media_disposition {
+                MediaDisposition::Canonical => record_source_event(
+                    conn,
+                    &user_id,
+                    &manifest,
+                    &digest,
+                    object_key
+                        .as_deref()
+                        .expect("validated canonical object key"),
+                )?,
+                MediaDisposition::Reference => {
+                    record_reference_event(conn, &user_id, &manifest, &digest)?
+                }
+            };
             committed_through_sequence(conn, &manifest.stream_id)
         })
         .await;
@@ -636,8 +810,13 @@ async fn upload_capture_event(
         StatusCode::CREATED,
         Json(CaptureAccepted {
             event_id: manifest.event_id,
-            asset_id: manifest.media.asset_id,
-            processing_state: "queued",
+            asset_id,
+            media_disposition: manifest.media_disposition,
+            processing_state: if manifest.media_disposition.is_canonical() {
+                "queued"
+            } else {
+                "ready"
+            },
             committed_through_sequence: committed,
         }),
     )
@@ -687,9 +866,10 @@ async fn capture_status(
 
 fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<CaptureStatus>> {
     conn.query_row(
-        "SELECT e.event_id,m.processing_state,j.error_code,j.attempt_count \
-         FROM capture_events e JOIN media_objects m USING(event_id) \
-         JOIN media_processing_jobs j USING(event_id) WHERE e.event_id=?1",
+        "SELECT e.event_id,COALESCE(m.processing_state,'ready'),j.error_code,\
+                COALESCE(j.attempt_count,0) \
+         FROM capture_events e LEFT JOIN media_objects m USING(event_id) \
+         LEFT JOIN media_processing_jobs j USING(event_id) WHERE e.event_id=?1",
         [event_id],
         |row| {
             Ok(CaptureStatus {
@@ -824,20 +1004,29 @@ fn preflight_source_event(
     conn: &Connection,
     manifest: &CaptureEventManifest,
     manifest_digest: &str,
-    object_key: &str,
+    object_key: Option<&str>,
 ) -> Result<PreflightOutcome> {
-    let existing: Option<(String, String, String)> = conn
+    let existing: Option<(String, Option<String>, String, String)> = conn
         .query_row(
-            "SELECT e.manifest_digest,m.object_key,e.stream_id FROM capture_events e \
-             JOIN media_objects m ON m.event_id=e.event_id WHERE e.event_id=?1",
+            "SELECT e.manifest_digest,m.object_key,e.stream_id,e.media_disposition \
+             FROM capture_events e LEFT JOIN media_objects m ON m.event_id=e.event_id \
+             WHERE e.event_id=?1",
             [&manifest.event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((existing_digest, existing_object, existing_stream)) = existing else {
+    let Some((existing_digest, existing_object, existing_stream, existing_disposition)) = existing
+    else {
         return Ok(PreflightOutcome::New);
     };
-    if existing_digest != manifest_digest || existing_object != object_key {
+    let disposition = match manifest.media_disposition {
+        MediaDisposition::Canonical => "canonical",
+        MediaDisposition::Reference => "reference",
+    };
+    if existing_digest != manifest_digest
+        || existing_object.as_deref() != object_key
+        || existing_disposition != disposition
+    {
         return Err(EnclaveError::Conflict(
             "idempotency conflict for event_id".into(),
         ));
@@ -964,6 +1153,16 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             asset_id TEXT NOT NULL UNIQUE,
             manifest_digest TEXT NOT NULL,
             context_json TEXT,
+            media_disposition TEXT NOT NULL DEFAULT 'canonical'
+                CHECK (media_disposition IN ('canonical','reference')),
+            canonical_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE,
+            canonical_asset_id TEXT,
+            canonical_media_sha256 TEXT,
+            perceptual_hash TEXT,
+            hamming_distance INTEGER,
+            pixel_change_ratio REAL,
+            context_fingerprint TEXT,
+            dedupe_version INTEGER,
             received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             UNIQUE(device_id, stream_id, sequence)
         );
@@ -1134,9 +1333,51 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         "speaker_observation_id",
         "ALTER TABLE identity_evidence ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE CASCADE",
     )?;
+    for (column, alteration) in [
+        (
+            "media_disposition",
+            "ALTER TABLE capture_events ADD COLUMN media_disposition TEXT NOT NULL DEFAULT 'canonical' CHECK (media_disposition IN ('canonical','reference'))",
+        ),
+        (
+            "canonical_event_id",
+            "ALTER TABLE capture_events ADD COLUMN canonical_event_id TEXT REFERENCES capture_events(event_id) ON DELETE CASCADE",
+        ),
+        (
+            "canonical_asset_id",
+            "ALTER TABLE capture_events ADD COLUMN canonical_asset_id TEXT",
+        ),
+        (
+            "canonical_media_sha256",
+            "ALTER TABLE capture_events ADD COLUMN canonical_media_sha256 TEXT",
+        ),
+        (
+            "perceptual_hash",
+            "ALTER TABLE capture_events ADD COLUMN perceptual_hash TEXT",
+        ),
+        (
+            "hamming_distance",
+            "ALTER TABLE capture_events ADD COLUMN hamming_distance INTEGER",
+        ),
+        (
+            "pixel_change_ratio",
+            "ALTER TABLE capture_events ADD COLUMN pixel_change_ratio REAL",
+        ),
+        (
+            "context_fingerprint",
+            "ALTER TABLE capture_events ADD COLUMN context_fingerprint TEXT",
+        ),
+        (
+            "dedupe_version",
+            "ALTER TABLE capture_events ADD COLUMN dedupe_version INTEGER",
+        ),
+    ] {
+        add_column_if_missing(conn, "capture_events", column, alteration)?;
+    }
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_normalized_name \
-         ON people(normalized_name) WHERE normalized_name IS NOT NULL;",
+         ON people(normalized_name) WHERE normalized_name IS NOT NULL;\
+         CREATE INDEX IF NOT EXISTS idx_capture_events_canonical_reference \
+         ON capture_events(canonical_event_id) WHERE canonical_event_id IS NOT NULL;",
     )?;
     Ok(())
 }
@@ -1169,6 +1410,15 @@ pub fn record_source_event(
     object_key: &str,
 ) -> Result<RecordOutcome> {
     manifest.validate()?;
+    if manifest.media_disposition != MediaDisposition::Canonical {
+        return Err(EnclaveError::InvalidRequest(
+            "record_source_event requires canonical media".into(),
+        ));
+    }
+    let media = manifest
+        .media
+        .as_ref()
+        .ok_or_else(|| EnclaveError::InvalidRequest("canonical media is required".into()))?;
     validate_id("account_id", account_id)?;
     if !validate_sha256(manifest_digest) {
         return Err(EnclaveError::InvalidRequest(
@@ -1247,7 +1497,7 @@ pub fn record_source_event(
             manifest.timezone_id,
             manifest.utc_offset_minutes,
             manifest.clock_uncertainty_ms,
-            manifest.media.asset_id,
+            media.asset_id,
             manifest_digest,
             context_json
         ],
@@ -1266,20 +1516,20 @@ pub fn record_source_event(
           frame_count,width,height,scale,orientation,retain_until) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
-            manifest.media.asset_id,
+            media.asset_id,
             manifest.event_id,
             object_key,
-            manifest.media.mime_type,
-            manifest.media.codec,
-            manifest.media.byte_length,
-            manifest.media.sha256.to_ascii_lowercase(),
-            manifest.media.sample_rate,
-            manifest.media.channels,
-            manifest.media.frame_count,
-            manifest.media.width,
-            manifest.media.height,
-            manifest.media.scale,
-            manifest.media.orientation,
+            media.mime_type,
+            media.codec,
+            media.byte_length,
+            media.sha256.to_ascii_lowercase(),
+            media.sample_rate,
+            media.channels,
+            media.frame_count,
+            media.width,
+            media.height,
+            media.scale,
+            media.orientation,
             super::isotime::add_seconds(&manifest.ended_at, 30.0 * 86_400.0)
         ],
     )?;
@@ -1295,6 +1545,217 @@ pub fn record_source_event(
          VALUES (?1,?2,?3,1,'pending')",
         params![manifest.event_id, job_kind, manifest_digest],
     )?;
+    advance_contiguous_ack(&tx, &manifest.stream_id)?;
+    tx.commit()?;
+    Ok(RecordOutcome::Created)
+}
+
+fn semantic_context_value(context: &CaptureContext) -> Value {
+    json!({
+        "active_app": context.active_app,
+        "active_url": context.active_url,
+        "active_url_title": context.active_url_title,
+        "browser_permission_status": context.browser_permission_status,
+        "capture_status": context.capture_status,
+        "display_id": context.display_id,
+        "primary_bundle_id": context.primary_bundle_id,
+        "primary_window_id": context.primary_window_id,
+        "visible_windows": context.visible_windows,
+        "visible_windows_truncated": context.visible_windows_truncated,
+        "window_title": context.window_title,
+    })
+}
+
+fn semantic_context_fingerprint(context: &CaptureContext) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(&semantic_context_value(
+        context,
+    ))?))
+}
+
+struct CanonicalReferenceTarget {
+    device_id: String,
+    install_id: String,
+    capture_session_id: String,
+    stream_id: String,
+    sequence: i64,
+    media_disposition: String,
+    context_json: Option<String>,
+    asset_id: String,
+    media_sha256: String,
+}
+
+fn record_reference_event(
+    conn: &Connection,
+    account_id: &str,
+    manifest: &CaptureEventManifest,
+    manifest_digest: &str,
+) -> Result<RecordOutcome> {
+    manifest.validate()?;
+    if manifest.media_disposition != MediaDisposition::Reference {
+        return Err(EnclaveError::InvalidRequest(
+            "record_reference_event requires reference metadata".into(),
+        ));
+    }
+    validate_id("account_id", account_id)?;
+    if !validate_sha256(manifest_digest) {
+        return Err(EnclaveError::InvalidRequest(
+            "manifest digest is invalid".into(),
+        ));
+    }
+    match preflight_source_event(conn, manifest, manifest_digest, None)? {
+        PreflightOutcome::Duplicate { .. } => return Ok(RecordOutcome::Duplicate),
+        PreflightOutcome::New => {}
+    }
+
+    let reference = manifest
+        .reference
+        .as_ref()
+        .ok_or_else(|| EnclaveError::InvalidRequest("reference metadata is required".into()))?;
+    let current_context = manifest.context.as_ref().ok_or_else(|| {
+        EnclaveError::InvalidRequest("reference events require capture context".into())
+    })?;
+    if !reference
+        .context_fingerprint
+        .eq_ignore_ascii_case(&semantic_context_fingerprint(current_context)?)
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "reference context fingerprint does not match the manifest".into(),
+        ));
+    }
+
+    let canonical: Option<CanonicalReferenceTarget> = conn
+        .query_row(
+            "SELECT e.device_id,e.install_id,e.capture_session_id,e.stream_id,e.sequence,\
+                    e.media_disposition,e.context_json,m.asset_id,m.sha256 \
+             FROM capture_events e JOIN media_objects m ON m.event_id=e.event_id \
+             WHERE e.event_id=?1",
+            [&reference.canonical_event_id],
+            |row| {
+                Ok(CanonicalReferenceTarget {
+                    device_id: row.get(0)?,
+                    install_id: row.get(1)?,
+                    capture_session_id: row.get(2)?,
+                    stream_id: row.get(3)?,
+                    sequence: row.get(4)?,
+                    media_disposition: row.get(5)?,
+                    context_json: row.get(6)?,
+                    asset_id: row.get(7)?,
+                    media_sha256: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(canonical) = canonical else {
+        return Err(EnclaveError::InvalidRequest(
+            "referenced canonical screen is unavailable".into(),
+        ));
+    };
+    if canonical.media_disposition != "canonical"
+        || canonical.device_id != manifest.device_id
+        || canonical.install_id != manifest.install_id
+        || canonical.capture_session_id != manifest.capture_session_id
+        || canonical.stream_id != manifest.stream_id
+        || canonical.sequence >= manifest.sequence
+        || canonical.asset_id != reference.canonical_asset_id
+        || !canonical
+            .media_sha256
+            .eq_ignore_ascii_case(&reference.canonical_media_sha256)
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "referenced screen must be an earlier canonical event in the same capture stream"
+                .into(),
+        ));
+    }
+    let canonical_context: CaptureContext = canonical
+        .context_json
+        .as_deref()
+        .ok_or_else(|| {
+            EnclaveError::InvalidRequest("canonical screen has no capture context".into())
+        })
+        .and_then(|raw| {
+            serde_json::from_str(raw).map_err(|_| {
+                EnclaveError::InvalidRequest("canonical screen context is invalid".into())
+            })
+        })?;
+    if semantic_context_value(&canonical_context) != semantic_context_value(current_context) {
+        return Err(EnclaveError::InvalidRequest(
+            "reference events cannot hide a visible context transition".into(),
+        ));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO capture_sessions \
+         (id,device_id,install_id,started_at,last_event_at,schema_version) \
+         VALUES (?1,?2,?3,?4,?5,2) \
+         ON CONFLICT(id) DO UPDATE SET last_event_at=MAX(last_event_at,excluded.last_event_at)",
+        params![
+            manifest.capture_session_id,
+            manifest.device_id,
+            manifest.install_id,
+            manifest.started_at,
+            manifest.ended_at
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO capture_streams \
+         (id,capture_session_id,device_id,stream_kind) VALUES (?1,?2,?3,?4) \
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            manifest.stream_id,
+            manifest.capture_session_id,
+            manifest.device_id,
+            manifest.stream_kind.as_str()
+        ],
+    )?;
+    let context_json = serde_json::to_string(current_context)?;
+    let internal_asset_id = format!("reference-{}", manifest.event_id);
+    let event_insert = tx.execute(
+        "INSERT INTO capture_events \
+         (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,\
+          source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,\
+          clock_uncertainty_ms,asset_id,manifest_digest,context_json,media_disposition,\
+          canonical_event_id,canonical_asset_id,canonical_media_sha256,perceptual_hash,\
+          hamming_distance,pixel_change_ratio,context_fingerprint,dedupe_version) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,\
+                 'reference',?18,?19,?20,?21,?22,?23,?24,?25)",
+        params![
+            manifest.event_id,
+            manifest.device_id,
+            manifest.install_id,
+            manifest.capture_session_id,
+            manifest.stream_id,
+            manifest.stream_kind.as_str(),
+            manifest.sequence,
+            manifest.source_wall_at,
+            manifest.source_monotonic_ns.to_string(),
+            manifest.started_at,
+            manifest.ended_at,
+            manifest.timezone_id,
+            manifest.utc_offset_minutes,
+            manifest.clock_uncertainty_ms,
+            internal_asset_id,
+            manifest_digest,
+            context_json,
+            reference.canonical_event_id,
+            reference.canonical_asset_id,
+            reference.canonical_media_sha256.to_ascii_lowercase(),
+            reference.perceptual_hash.to_ascii_lowercase(),
+            reference.hamming_distance,
+            reference.pixel_change_ratio,
+            reference.context_fingerprint.to_ascii_lowercase(),
+            reference.dedupe_version,
+        ],
+    );
+    if let Err(error) = event_insert {
+        if error.to_string().contains("UNIQUE constraint failed") {
+            return Err(EnclaveError::Conflict(
+                "idempotency conflict for stream sequence".into(),
+            ));
+        }
+        return Err(error.into());
+    }
+    record_browser_observation(&tx, manifest)?;
     advance_contiguous_ack(&tx, &manifest.stream_id)?;
     tx.commit()?;
     Ok(RecordOutcome::Created)
@@ -1572,6 +2033,81 @@ mod tests {
         .expect("valid fixture")
     }
 
+    fn valid_screen_manifest(
+        sequence: i64,
+        event_id: &str,
+        asset_id: &str,
+    ) -> CaptureEventManifest {
+        let mut manifest: CaptureEventManifest = serde_json::from_value(json!({
+            "schema_version": 2,
+            "event_id": event_id,
+            "device_id": "device-1",
+            "install_id": "install-1",
+            "capture_session_id": "session-1",
+            "stream_id": "screen-1",
+            "stream_kind": "mac_screen",
+            "sequence": sequence,
+            "source_wall_at": "2026-07-31T18:00:00.000Z",
+            "source_monotonic_ns": 9000000000_u64 + sequence as u64,
+            "started_at": "2026-07-31T18:00:00.000Z",
+            "ended_at": "2026-07-31T18:00:02.000Z",
+            "timezone_id": "America/New_York",
+            "utc_offset_minutes": -240,
+            "clock_uncertainty_ms": 24,
+            "media": {
+                "asset_id": asset_id,
+                "mime_type": "image/jpeg",
+                "codec": "jpeg",
+                "byte_length": 12,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "width": 1280,
+                "height": 720
+            },
+            "context": {
+                "capture_status": "stable",
+                "active_app": "Google Chrome",
+                "primary_bundle_id": "com.google.Chrome",
+                "primary_window_id": 9,
+                "window_title": "Weekly planning",
+                "display_id": 42,
+                "active_url": "https://meet.google.com/abc-defg-hij?authuser=0",
+                "active_url_title": "Weekly planning",
+                "browser_permission_status": "granted",
+                "visible_windows": [{"bundle_id":"com.google.Chrome","window_id":9}],
+                "visible_windows_truncated": false
+            }
+        }))
+        .expect("valid screen fixture");
+        manifest.source_monotonic_ns += sequence as u64;
+        manifest
+    }
+
+    fn reference_to(
+        canonical: &CaptureEventManifest,
+        sequence: i64,
+        event_id: &str,
+    ) -> CaptureEventManifest {
+        let mut reference = canonical.clone();
+        let media = canonical.media.as_ref().expect("canonical media");
+        let context = canonical.context.as_ref().expect("canonical context");
+        reference.event_id = event_id.into();
+        reference.sequence = sequence;
+        reference.source_monotonic_ns += sequence as u64 + 1;
+        reference.media_disposition = MediaDisposition::Reference;
+        reference.media = None;
+        reference.reference = Some(ScreenReferenceDescriptor {
+            canonical_event_id: canonical.event_id.clone(),
+            canonical_asset_id: media.asset_id.clone(),
+            canonical_media_sha256: media.sha256.clone(),
+            perceptual_hash: "0123456789abcdef".into(),
+            hamming_distance: 2,
+            pixel_change_ratio: 0.004,
+            context_fingerprint: semantic_context_fingerprint(context).unwrap(),
+            dedupe_version: 1,
+        });
+        reference
+    }
+
     #[test]
     fn manifest_accepts_authoritative_clocks_and_exact_browser_url() {
         let manifest = valid_manifest();
@@ -1588,7 +2124,7 @@ mod tests {
     #[test]
     fn manifest_rejects_invalid_hash_time_and_sequence() {
         let mut manifest = valid_manifest();
-        manifest.media.sha256 = "not-a-hash".into();
+        manifest.media.as_mut().unwrap().sha256 = "not-a-hash".into();
         assert!(manifest.validate().is_err());
 
         let mut manifest = valid_manifest();
@@ -1650,6 +2186,124 @@ mod tests {
         let conflict =
             record_source_event(&conn, "account-1", &manifest, &digest_2, "object-2").unwrap_err();
         assert!(conflict.to_string().contains("idempotency"));
+    }
+
+    #[test]
+    fn screen_reference_retains_observation_without_media_or_model_job() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0").unwrap();
+        let reference = reference_to(&canonical, 1, "screen-event-1");
+        assert_eq!(
+            record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap(),
+            RecordOutcome::Created
+        );
+
+        let (disposition, canonical_id, hamming, ratio): (String, String, i64, f64) = conn
+            .query_row(
+                "SELECT media_disposition,canonical_event_id,hamming_distance,pixel_change_ratio \
+                 FROM capture_events WHERE event_id='screen-event-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(disposition, "reference");
+        assert_eq!(canonical_id, "screen-event-0");
+        assert_eq!(hamming, 2);
+        assert_eq!(ratio, 0.004);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM media_objects WHERE event_id='screen-event-1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM media_processing_jobs WHERE event_id='screen-event-1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(committed_through_sequence(&conn, "screen-1").unwrap(), 1);
+        let status = load_capture_status(&conn, "screen-event-1")
+            .unwrap()
+            .expect("reference status");
+        assert_eq!(status.processing_state, "ready");
+        assert_eq!(status.attempt_count, 0);
+    }
+
+    #[test]
+    fn screen_reference_is_idempotent_but_changed_evidence_conflicts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0").unwrap();
+        let reference = reference_to(&canonical, 1, "screen-event-1");
+        record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap();
+        assert_eq!(
+            record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)).unwrap(),
+            RecordOutcome::Duplicate
+        );
+        assert!(
+            record_reference_event(&conn, "account-1", &reference, &"c".repeat(64))
+                .unwrap_err()
+                .to_string()
+                .contains("idempotency")
+        );
+    }
+
+    #[test]
+    fn screen_reference_rejects_missing_forward_cross_stream_chain_digest_and_context() {
+        let cases = [
+            "missing", "forward", "device", "stream", "chain", "digest", "context",
+        ];
+        for case in cases {
+            let conn = Connection::open_in_memory().unwrap();
+            init_schema(&conn).unwrap();
+            let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+            record_source_event(&conn, "account-1", &canonical, &"a".repeat(64), "object-0")
+                .unwrap();
+            let mut reference = reference_to(&canonical, 1, "screen-event-1");
+            match case {
+                "missing" => {
+                    reference.reference.as_mut().unwrap().canonical_event_id =
+                        "missing-event".into()
+                }
+                "forward" => reference.sequence = 0,
+                "device" => reference.device_id = "device-2".into(),
+                "stream" => reference.stream_id = "screen-2".into(),
+                "digest" => {
+                    reference.reference.as_mut().unwrap().canonical_media_sha256 = "b".repeat(64)
+                }
+                "context" => {
+                    reference.context.as_mut().unwrap().active_url =
+                        Some("https://meet.google.com/different".into());
+                    reference.reference.as_mut().unwrap().context_fingerprint =
+                        semantic_context_fingerprint(reference.context.as_ref().unwrap()).unwrap();
+                }
+                "chain" => {
+                    let first_reference = reference.clone();
+                    record_reference_event(&conn, "account-1", &first_reference, &"b".repeat(64))
+                        .unwrap();
+                    reference = reference_to(&canonical, 2, "screen-event-2");
+                    let descriptor = reference.reference.as_mut().unwrap();
+                    descriptor.canonical_event_id = first_reference.event_id;
+                    descriptor.canonical_asset_id =
+                        format!("reference-{}", descriptor.canonical_event_id);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                record_reference_event(&conn, "account-1", &reference, &"d".repeat(64)).is_err(),
+                "{case} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1763,8 +2417,8 @@ mod tests {
     fn uploaded_media_must_match_the_manifest_bytes_and_container() {
         let mut manifest = valid_manifest();
         let m4a = b"\0\0\0\x18ftypM4A \0\0\0\0";
-        manifest.media.byte_length = m4a.len() as i64;
-        manifest.media.sha256 = sha256_hex(m4a);
+        manifest.media.as_mut().unwrap().byte_length = m4a.len() as i64;
+        manifest.media.as_mut().unwrap().sha256 = sha256_hex(m4a);
         validate_media_bytes(&manifest, m4a, Some("audio/m4a")).unwrap();
 
         let mut corrupted = m4a.to_vec();
@@ -1773,7 +2427,7 @@ mod tests {
         assert!(validate_media_bytes(&manifest, m4a, Some("image/jpeg")).is_err());
 
         let invalid_container = vec![0u8; m4a.len()];
-        manifest.media.sha256 = sha256_hex(&invalid_container);
+        manifest.media.as_mut().unwrap().sha256 = sha256_hex(&invalid_container);
         assert!(validate_media_bytes(&manifest, &invalid_container, Some("audio/m4a")).is_err());
     }
 
