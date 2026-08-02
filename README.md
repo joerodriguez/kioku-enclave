@@ -317,6 +317,15 @@ operation. For `main` and tags the workflow then:
 6. creates GitHub-signed image provenance and a signed SBOM attestation; and
 7. uploads release metadata, provenance, SBOM, and attestation bundles.
 
+A manual dispatch from reviewed `main` can choose the `evaluation` build profile. That
+profile is accepted only when every `EVAL_*` counterpart is present and valid; selection
+is atomic and never falls back to production values. Evaluation images use an `eval-`
+tag prefix, carry `build_profile: evaluation` in their metadata, and are not eligible for
+a GitHub Release or production rollout. They must be deployed only to an isolated
+evaluation VM whose service account, KMS key, GCS buckets, audience, and hostname cannot
+access production data. Ordinary `main` and signed `v*` tag pushes always select the
+production profile.
+
 All third-party Actions are pinned to reviewed commit SHAs. A separate security workflow
 runs CodeQL on pull requests, `main`, and a weekly schedule, plus dependency review on
 pull requests. Dependabot checks Cargo, GitHub Actions, and Docker weekly.
@@ -368,7 +377,8 @@ published trusted fingerprint; a valid signature from an unknown key is not suff
 
 The release contains:
 
-- `enclave-release.json` — source ref/commit, image URI/digest, and build URL;
+- `enclave-release.json` — production build profile, source ref/commit, image URI/digest,
+  and build URL;
 - `enclave-provenance.jsonl` — GitHub-signed image provenance;
 - `enclave-sbom.spdx.json` — SPDX SBOM; and
 - `enclave-sbom-attestation.jsonl` — signed SBOM attestation.

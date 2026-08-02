@@ -12,7 +12,9 @@ name: Build & push enclave image
 # ── What this workflow does ──────────────────────────────────────────────────
 #
 # Runs source checks on pull requests. On main and public release-tag pushes it
-# also builds and pushes the enclave image to the operator's Artifact Registry.
+# builds the production enclave image. A manual dispatch from main may instead
+# build an evaluation image whose complete, isolated configuration is supplied
+# through EVAL_* variables. Evaluation images are never public releases.
 # All security-sensitive config is baked in via --build-arg so it is part of
 # the attested image digest and cannot be overridden at VM launch time.
 #
@@ -32,7 +34,7 @@ name: Build & push enclave image
 #   GCP_PROJECT_ID / GCP_REGION / AR_REPOSITORY / IMAGE_NAME
 #                             Destination image coordinates
 #
-#   Build-arg variables (baked into the attested image digest):
+#   Production build-arg variables (baked into the attested image digest):
 #   ENCLAVE_KMS_PROJECT       GCP project containing the KMS key ring
 #   ENCLAVE_KMS_LOCATION      KMS key location (e.g. global)
 #   ENCLAVE_KMS_KEY_RING      KMS key ring name
@@ -59,6 +61,10 @@ name: Build & push enclave image
 # Privacy-sensitive repository secrets (baked in, but masked in Actions logs):
 #   ALLOWED_EMAILS            Comma-separated production account allow-list
 #   ENCLAVE_ACME_CONTACT      ACME account contact email
+#
+# Evaluation builds require an explicit EVAL_* counterpart for every production
+# build-arg variable and secret above. The selector fails closed if any selected
+# value is absent or malformed; it never falls back between profiles.
 
 on:
   pull_request:
@@ -70,6 +76,15 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      build_profile:
+        description: Configuration profile baked into the enclave image
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - evaluation
 
 
 concurrency:
@@ -110,6 +125,7 @@ jobs:
             echo "::error::Cargo version ${EXPECTED_TAG} does not match pushed tag ${GITHUB_REF_NAME}."
             exit 1
           fi
+
           if [[ "$(git cat-file -t "${GITHUB_REF_NAME}")" != "tag" ]]; then
             echo "::error::Release source must be an annotated tag."
             exit 1
@@ -122,6 +138,9 @@ jobs:
             echo "::error::GitHub could not verify the release tag signature."
             exit 1
           fi
+
+      - name: Build profile contract tests
+        run: python3 scripts/test_select_build_configuration.py
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -185,156 +204,85 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate baked production configuration
+      - name: Select and validate baked image configuration
         env:
-          ENCLAVE_KMS_PROJECT: ${{ vars.ENCLAVE_KMS_PROJECT }}
-          ENCLAVE_KMS_LOCATION: ${{ vars.ENCLAVE_KMS_LOCATION }}
-          ENCLAVE_KMS_KEY_RING: ${{ vars.ENCLAVE_KMS_KEY_RING }}
-          ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
-          ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
-          ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
-          ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
-          ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
-          ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
-          GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
-          GOOGLE_IOS_CLIENT_ID: ${{ vars.GOOGLE_IOS_CLIENT_ID }}
-          GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
-          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
-          BASE_URL: ${{ vars.BASE_URL }}
-          WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
-          REVIEWER_AUTH_API_KEY: ${{ vars.REVIEWER_AUTH_API_KEY }}
-          REVIEWER_AUTH_UID: ${{ vars.REVIEWER_AUTH_UID }}
-          REVIEWER_AUTH_EMAIL: ${{ vars.REVIEWER_AUTH_EMAIL }}
-          VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
-          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
-          VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
-          ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
-          ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
-          ENCLAVE_ACME_CONTACT: ${{ secrets.ENCLAVE_ACME_CONTACT }}
-          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
-          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          SELECTED_BUILD_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.build_profile || 'production' }}
           PROJECT_ID: ${{ env.PROJECT_ID }}
           REGION: ${{ env.REGION }}
           AR_REPOSITORY: ${{ env.AR_REPOSITORY }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          PRODUCTION_ENCLAVE_KMS_PROJECT: ${{ vars.ENCLAVE_KMS_PROJECT }}
+          PRODUCTION_ENCLAVE_KMS_LOCATION: ${{ vars.ENCLAVE_KMS_LOCATION }}
+          PRODUCTION_ENCLAVE_KMS_KEY_RING: ${{ vars.ENCLAVE_KMS_KEY_RING }}
+          PRODUCTION_ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
+          PRODUCTION_ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
+          PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
+          PRODUCTION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
+          PRODUCTION_ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
+          PRODUCTION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
+          PRODUCTION_GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
+          PRODUCTION_GOOGLE_IOS_CLIENT_ID: ${{ vars.GOOGLE_IOS_CLIENT_ID }}
+          PRODUCTION_GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
+          PRODUCTION_ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
+          PRODUCTION_BASE_URL: ${{ vars.BASE_URL }}
+          PRODUCTION_WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
+          PRODUCTION_REVIEWER_AUTH_API_KEY: ${{ vars.REVIEWER_AUTH_API_KEY }}
+          PRODUCTION_REVIEWER_AUTH_UID: ${{ vars.REVIEWER_AUTH_UID }}
+          PRODUCTION_REVIEWER_AUTH_EMAIL: ${{ vars.REVIEWER_AUTH_EMAIL }}
+          PRODUCTION_VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
+          PRODUCTION_VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+          PRODUCTION_VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
+          PRODUCTION_ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
+          PRODUCTION_ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
+          PRODUCTION_ENCLAVE_ACME_CONTACT: ${{ secrets.ENCLAVE_ACME_CONTACT }}
+          EVALUATION_ENCLAVE_KMS_PROJECT: ${{ vars.EVAL_ENCLAVE_KMS_PROJECT }}
+          EVALUATION_ENCLAVE_KMS_LOCATION: ${{ vars.EVAL_ENCLAVE_KMS_LOCATION }}
+          EVALUATION_ENCLAVE_KMS_KEY_RING: ${{ vars.EVAL_ENCLAVE_KMS_KEY_RING }}
+          EVALUATION_ENCLAVE_KMS_KEY: ${{ vars.EVAL_ENCLAVE_KMS_KEY }}
+          EVALUATION_ENCLAVE_GCS_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_BUCKET }}
+          EVALUATION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_MEDIA_BUCKET }}
+          EVALUATION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.EVAL_ENCLAVE_RUN_SA_EMAIL }}
+          EVALUATION_ENCLAVE_AUDIENCE: ${{ vars.EVAL_ENCLAVE_AUDIENCE }}
+          EVALUATION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.EVAL_ENCLAVE_ATTEST_STS_AUDIENCE }}
+          EVALUATION_GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.EVAL_GOOGLE_DESKTOP_CLIENT_ID }}
+          EVALUATION_GOOGLE_IOS_CLIENT_ID: ${{ vars.EVAL_GOOGLE_IOS_CLIENT_ID }}
+          EVALUATION_GOOGLE_WEB_CLIENT_ID: ${{ vars.EVAL_GOOGLE_WEB_CLIENT_ID }}
+          EVALUATION_ALLOWED_EMAILS: ${{ secrets.EVAL_ALLOWED_EMAILS }}
+          EVALUATION_BASE_URL: ${{ vars.EVAL_BASE_URL }}
+          EVALUATION_WEB_ORIGIN: ${{ vars.EVAL_WEB_ORIGIN }}
+          EVALUATION_REVIEWER_AUTH_API_KEY: ${{ vars.EVAL_REVIEWER_AUTH_API_KEY }}
+          EVALUATION_REVIEWER_AUTH_UID: ${{ vars.EVAL_REVIEWER_AUTH_UID }}
+          EVALUATION_REVIEWER_AUTH_EMAIL: ${{ vars.EVAL_REVIEWER_AUTH_EMAIL }}
+          EVALUATION_VERTEX_PROJECT: ${{ vars.EVAL_VERTEX_PROJECT }}
+          EVALUATION_VERTEX_LOCATION: ${{ vars.EVAL_VERTEX_LOCATION }}
+          EVALUATION_VERTEX_MODEL: ${{ vars.EVAL_VERTEX_MODEL }}
+          EVALUATION_ENCLAVE_ACME: ${{ vars.EVAL_ENCLAVE_ACME }}
+          EVALUATION_ENCLAVE_ACME_DIRECTORY: ${{ vars.EVAL_ENCLAVE_ACME_DIRECTORY }}
+          EVALUATION_ENCLAVE_ACME_CONTACT: ${{ secrets.EVAL_ENCLAVE_ACME_CONTACT }}
         run: |
-          REQUIRED=(
-            ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING
-            ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_RUN_SA_EMAIL
-            ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
-            GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID ALLOWED_EMAILS BASE_URL WEB_ORIGIN
-            REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL
-            VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
-            ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY ENCLAVE_ACME_CONTACT
-            GCP_WIF_PROVIDER GCP_SERVICE_ACCOUNT PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME
-          )
-          for name in "${REQUIRED[@]}"; do
-            if [[ -z "${!name}" ]]; then
-              echo "Missing required repository variable: $name" >&2
-              exit 1
-            fi
-          done
-          if [[ "$ENCLAVE_ACME" != "1" ]]; then
-            echo "ENCLAVE_ACME must be 1 for the production image." >&2
+          if [[ "${GITHUB_REF}" == refs/tags/v* && "${SELECTED_BUILD_PROFILE}" != "production" ]]; then
+            echo "::error::Release tags may only build the production profile."
             exit 1
           fi
-          python3 - <<'PY'
-          import os
-          import re
-          from urllib.parse import urlsplit
-
-          def require_pattern(name, pattern):
-              if not re.fullmatch(pattern, os.environ[name]):
-                  raise SystemExit(f"invalid format for repository configuration: {name}")
-
-          for name in os.environ:
-              if name in {
-                  "ALLOWED_EMAILS", "AR_REPOSITORY", "BASE_URL", "ENCLAVE_ACME_CONTACT",
-                  "ENCLAVE_ACME_DIRECTORY", "ENCLAVE_ATTEST_STS_AUDIENCE", "ENCLAVE_AUDIENCE",
-                  "ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET", "ENCLAVE_KMS_KEY", "ENCLAVE_KMS_KEY_RING",
-                  "ENCLAVE_KMS_LOCATION", "ENCLAVE_KMS_PROJECT", "ENCLAVE_RUN_SA_EMAIL",
-                  "GCP_PROJECT_ID", "GCP_REGION", "GCP_SERVICE_ACCOUNT", "GCP_WIF_PROVIDER",
-                  "GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_IOS_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID", "IMAGE_NAME", "PROJECT_ID",
-                  "REGION", "REVIEWER_AUTH_API_KEY", "REVIEWER_AUTH_EMAIL", "REVIEWER_AUTH_UID",
-                  "VERTEX_LOCATION", "VERTEX_MODEL", "VERTEX_PROJECT", "WEB_ORIGIN",
-              } and any(ord(char) < 32 or ord(char) == 127 for char in os.environ[name]):
-                  raise SystemExit(f"control character in repository configuration: {name}")
-
-          require_pattern("PROJECT_ID", r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
-          require_pattern("REGION", r"[a-z]+-[a-z0-9]+[0-9]")
-          require_pattern("AR_REPOSITORY", r"[a-z0-9][a-z0-9._-]{0,126}")
-          require_pattern("IMAGE_NAME", r"[a-z0-9][a-z0-9._-]{0,126}")
-          require_pattern("GCP_SERVICE_ACCOUNT", r"[a-z0-9][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com")
-          require_pattern("ENCLAVE_RUN_SA_EMAIL", r"[a-z0-9][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com")
-          require_pattern("GCP_WIF_PROVIDER", r"projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+")
-          require_pattern("ENCLAVE_ATTEST_STS_AUDIENCE", r"//iam\.googleapis\.com/projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+")
-          for name in ("GOOGLE_DESKTOP_CLIENT_ID", "GOOGLE_IOS_CLIENT_ID", "GOOGLE_WEB_CLIENT_ID"):
-              require_pattern(name, r"[A-Za-z0-9._-]+\.apps\.googleusercontent\.com")
-          require_pattern("REVIEWER_AUTH_API_KEY", r"[A-Za-z0-9_-]{20,256}")
-          require_pattern("REVIEWER_AUTH_UID", r"[A-Za-z0-9_-]{1,128}")
-          require_pattern("REVIEWER_AUTH_EMAIL", r"[^@,\s]+@[^@,\s]+")
-          for name in ("ENCLAVE_KMS_PROJECT", "VERTEX_PROJECT"):
-              require_pattern(name, r"[a-z][a-z0-9-]{4,28}[a-z0-9]")
-          for name in ("ENCLAVE_KMS_LOCATION", "VERTEX_LOCATION"):
-              require_pattern(name, r"[a-z0-9][a-z0-9-]{0,62}")
-          for name in ("ENCLAVE_KMS_KEY_RING", "ENCLAVE_KMS_KEY"):
-              require_pattern(name, r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
-          require_pattern("ENCLAVE_GCS_BUCKET", r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
-          require_pattern("ENCLAVE_GCS_MEDIA_BUCKET", r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
-          require_pattern("VERTEX_MODEL", r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}")
-
-          def require_https(name, origin_only=False):
-              value = os.environ[name]
-              parsed = urlsplit(value)
-              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
-                  raise SystemExit(f"invalid HTTPS URL in repository configuration: {name}")
-              if origin_only and (parsed.query or parsed.path not in ("", "/")):
-                  raise SystemExit(f"expected an HTTPS origin in repository configuration: {name}")
-
-          for name in ("ENCLAVE_AUDIENCE", "BASE_URL", "WEB_ORIGIN"):
-              require_https(name, origin_only=True)
-          require_https("ENCLAVE_ACME_DIRECTORY")
-
-          contact = os.environ["ENCLAVE_ACME_CONTACT"]
-          if not re.fullmatch(r"mailto:[^@,\s]+@[^@,\s]+", contact):
-              raise SystemExit("invalid ACME contact")
-          emails = [email.strip() for email in os.environ["ALLOWED_EMAILS"].split(",")]
-          if not emails or any(not re.fullmatch(r"[^@,\s]+@[^@,\s]+", email) for email in emails):
-              raise SystemExit("invalid ALLOWED_EMAILS")
-          PY
+          python3 scripts/select_build_configuration.py \
+            --profile "${SELECTED_BUILD_PROFILE}" \
+            --github-env "${GITHUB_ENV}"
 
       - name: Build image
         id: build
-        env:
-          ENCLAVE_KMS_PROJECT: ${{ vars.ENCLAVE_KMS_PROJECT }}
-          ENCLAVE_KMS_LOCATION: ${{ vars.ENCLAVE_KMS_LOCATION }}
-          ENCLAVE_KMS_KEY_RING: ${{ vars.ENCLAVE_KMS_KEY_RING }}
-          ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
-          ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
-          ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
-          ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
-          ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
-          ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
-          GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
-          GOOGLE_IOS_CLIENT_ID: ${{ vars.GOOGLE_IOS_CLIENT_ID }}
-          GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
-          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
-          BASE_URL: ${{ vars.BASE_URL }}
-          WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
-          REVIEWER_AUTH_API_KEY: ${{ vars.REVIEWER_AUTH_API_KEY }}
-          REVIEWER_AUTH_UID: ${{ vars.REVIEWER_AUTH_UID }}
-          REVIEWER_AUTH_EMAIL: ${{ vars.REVIEWER_AUTH_EMAIL }}
-          VERTEX_PROJECT: ${{ vars.VERTEX_PROJECT }}
-          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
-          VERTEX_MODEL: ${{ vars.VERTEX_MODEL }}
-          ENCLAVE_ACME: ${{ vars.ENCLAVE_ACME }}
-          ENCLAVE_ACME_DIRECTORY: ${{ vars.ENCLAVE_ACME_DIRECTORY }}
-          ENCLAVE_ACME_CONTACT: ${{ secrets.ENCLAVE_ACME_CONTACT }}
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           TIMESTAMP="$(date +%s)"
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "${GITHUB_SHA}")"
-          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+          PROFILE_PREFIX=""
+          # KIOKU_BUILD_PROFILE == "evaluation" is deliberately visible in
+          # the tag as an additional guard against accidental production use.
+          if [[ "${KIOKU_BUILD_PROFILE}" == "evaluation" ]]; then
+            PROFILE_PREFIX="eval-"
+          fi
+          IMAGE_TAG="${PROFILE_PREFIX}${SHORT_SHA}-${TIMESTAMP}"
           IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
           IMAGE_URI="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 
@@ -374,6 +322,23 @@ jobs:
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "image_repository=${IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      # The selector must use GITHUB_ENV so the trusted Docker build can receive
+      # one dynamically chosen profile. Remove those values before any
+      # third-party action executes, limiting them to the selector/build steps.
+      - name: Clear selected build configuration
+        run: |
+          for name in \
+            ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING \
+            ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET \
+            ENCLAVE_RUN_SA_EMAIL ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE \
+            GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID \
+            ALLOWED_EMAILS BASE_URL WEB_ORIGIN REVIEWER_AUTH_API_KEY \
+            REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION \
+            VERTEX_MODEL ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY \
+            ENCLAVE_ACME_CONTACT; do
+            echo "${name}=" >> "${GITHUB_ENV}"
+          done
 
       - name: Generate image SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -469,16 +434,24 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
+            echo "| Build profile | \`${KIOKU_BUILD_PROFILE}\` |"
             echo "| Image tag | \`${{ steps.build.outputs.image_tag }}\` |"
             echo "| Image URI | \`${IMAGE_TAGGED_URI}\` |"
             echo "| **Image digest** | \`${EXPECTED_DIGEST}\` |"
             echo "| Commit | \`${GITHUB_SHA}\` |"
             echo "| Built at | $(date -u '+%Y-%m-%dT%H:%M:%SZ') |"
             echo ""
-            echo "### Next step: roll the VM"
-            echo ""
-            echo "Pin this digest as \`enclave_image_digest\` in the deployment terraform"
-            echo "and trigger the deployment repo's VM-roll workflow to replace the VM."
+            if [[ "${KIOKU_BUILD_PROFILE}" == "evaluation" ]]; then
+              echo "### Evaluation image only"
+              echo ""
+              echo "This is not a production release or deployment input. Pin it only in"
+              echo "the isolated evaluation environment with evaluation KMS and buckets."
+            else
+              echo "### Next step: roll the VM"
+              echo ""
+              echo "Pin this digest as \`enclave_image_digest\` in the deployment terraform"
+              echo "and trigger the deployment repo's VM-roll workflow to replace the VM."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Attest image provenance
@@ -512,30 +485,36 @@ jobs:
         run: |
           VERSION="$(grep '^version =' Cargo.toml | head -1 | cut -d '"' -f 2)"
           TAG_NAME="v${VERSION}"
+          SOURCE_REF="${GITHUB_REF}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            SOURCE_REF="${GITHUB_REF_NAME}"
+          fi
           IMAGE_URI="${{ steps.build.outputs.image_uri }}"
           DIGEST="${{ steps.digest.outputs.digest }}"
           IMAGE_REPOSITORY="${IMAGE_URI%:*}"
           python3 - \
-            "${TAG_NAME}" \
+            "${SOURCE_REF}" \
             "${GITHUB_SHA}" \
             "${IMAGE_URI}" \
             "${IMAGE_REPOSITORY}@${DIGEST}" \
             "${DIGEST}" \
             "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "${KIOKU_BUILD_PROFILE}" \
             > enclave-release.json <<'PY'
           import json
           import sys
 
-          tag, commit, image_uri, digest_uri, digest, build_url = sys.argv[1:]
+          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile = sys.argv[1:]
           print(json.dumps({
               "schema_version": 1,
               "source_repository": "https://github.com/${{ github.repository }}",
-              "source_ref": tag,
+              "source_ref": source_ref,
               "source_commit": commit,
               "image_uri": image_uri,
               "image_digest_uri": digest_uri,
               "image_digest": digest,
               "build_url": build_url,
+              "build_profile": build_profile,
           }, indent=2))
           PY
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"

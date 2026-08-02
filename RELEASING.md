@@ -10,7 +10,8 @@ attestation condition.
 
 Releasing a new enclave version requires a reviewed version bump, a passing
 ADR-0016 real-corpus report, and an operator-created signed tag. A `main` push
-may build an evaluation image, but CI never creates a release tag from `main`.
+builds production configuration; an explicit manual dispatch from reviewed `main` may
+build the isolated evaluation profile. CI never creates a release tag from `main`.
 This prevents an unsigned automated tag from bypassing the release operator's
 trust anchor.
 
@@ -89,6 +90,23 @@ variables. They are build-time configuration rather than credentials, but maskin
 prevents account and contact addresses from being copied into public Actions logs. The
 resulting values remain baked into the image, so they must not contain authentication
 secrets.
+
+### Isolated evaluation image variables
+
+To build a non-release image for the ADR-0016 real-corpus run, configure an `EVAL_`
+counterpart for every build-arg variable in the table above. Store
+`EVAL_ALLOWED_EMAILS` and `EVAL_ENCLAVE_ACME_CONTACT` as Actions secrets; all other
+counterparts are Actions variables. Then manually dispatch `build.yml` from `main` with
+`build_profile=evaluation`.
+
+The selector validates the entire chosen profile before exporting any value. Missing or
+malformed evaluation values fail the build; production settings are never substitutes.
+The resulting `eval-*` image and its metadata are evaluation inputs only. They must use a
+separate service account, KMS key, index bucket, media bucket, HTTPS hostname/audience,
+and VM with no production bucket or KMS access. Do not tag it `v*`, publish it as a
+release, pass it to `scripts/release.sh`, or deploy it to production. The evaluated
+source commit, image digest, model, scorer, corpus sources, and thresholds are instead
+bound into the content-free ADR-0016 run evidence.
 
 Production requirements are fail-closed:
 
@@ -195,8 +213,9 @@ gh release download vX.Y.Z \
 
 Check that:
 
-- `enclave-release.json` names this repository, tag, signed-tag commit, build URL, and the
-  expected digest-qualified Artifact Registry repository;
+- `enclave-release.json` names the `production` build profile, this repository, tag,
+  signed-tag commit, build URL, and the expected digest-qualified Artifact Registry
+  repository;
 - `gh attestation verify` accepts the image provenance for this repository's
   `.github/workflows/build.yml`, tag, and commit;
 - the SPDX SBOM is present and its signed attestation verifies for the same image digest;
