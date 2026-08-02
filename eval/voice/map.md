@@ -4,8 +4,11 @@
 |---|---|
 | `README.md` | Aggregate case contract, required real-corpus coverage, licensing/hash rules, slice baselines, canonical release artifacts, and fail-closed release policy |
 | `synthetic-contract-v1.json` | Redistributable content-free cases that pin scorer arithmetic and prove synthetic evidence can never pass release gates |
+| `run-evidence-schema-v1.json` | Strict private run-input contract for pipeline/version identity, hash-bound source recordings and labels, opaque diarization intervals, identity decisions, fact provenance, and exact create/export/delete record sets |
 
-Run `kioku-enclave --score-voice-eval <cases.json>` to emit an aggregate report,
+Run `kioku-enclave --build-voice-eval-cases <manifest.json>
+<private-run-evidence.json>` to derive the schema-v2 content-free cases, then
+`kioku-enclave --score-voice-eval <cases.json>` to emit an aggregate report,
 then `kioku-enclave --check-voice-eval <manifest.json> <cases.json>
 <report.json>` to require a hash-bound, exactly matching passing bundle.
 Real audio stays in its licensed source location or an access-controlled evaluator;

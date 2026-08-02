@@ -76,6 +76,12 @@ surfaces.
   Source profiles and assignment history are retained; reversal fails closed if a
   result acquired later samples. No similarity threshold can auto-apply a proposal
   until the hash-bound real-audio release corpus has calibrated that scorer version.
+- Real voice-quality releases require schema-v2 evidence derived by the public
+  reducer. It pins the evaluated image/source/model/scorer plus export and
+  post-delete artifact hashes, derives all release counters from opaque timing and
+  exact record sets, and rejects names, transcripts, URLs, paths, embeddings, raw
+  scores, unknown fields, modified derived values, and legacy hand-authored real
+  aggregates. Restricted media and authorization documents remain outside Git.
 
 ## Key hierarchy and encrypted objects
 

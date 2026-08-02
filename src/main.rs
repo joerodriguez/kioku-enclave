@@ -434,6 +434,26 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 #[tokio::main]
 async fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--build-voice-eval-cases") {
+        let manifest_path = args.get(2).expect(
+            "--build-voice-eval-cases requires source manifest and private run-evidence paths",
+        );
+        let evidence_path = args.get(3).expect(
+            "--build-voice-eval-cases requires source manifest and private run-evidence paths",
+        );
+        let manifest =
+            std::fs::read_to_string(manifest_path).expect("read voice evaluation manifest");
+        let evidence =
+            std::fs::read_to_string(evidence_path).expect("read private voice run evidence");
+        match cp::voice_eval_evidence::build_cases_json(&manifest, &evidence) {
+            Ok(cases) => println!("{cases}"),
+            Err(error) => {
+                eprintln!("Voice evaluation case generation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--score-voice-eval") {
         let path = args
             .get(2)

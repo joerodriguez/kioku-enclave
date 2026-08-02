@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/joerodriguez/kioku-enclave/eval/voice/run-evidence-schema-v1.json",
+  "title": "Kioku ADR-0016 private voice evaluation run evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "corpus_id",
+    "run",
+    "diarization_error_baselines",
+    "recordings",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "corpus_id": {"$ref": "#/$defs/opaqueId"},
+    "run": {"$ref": "#/$defs/run"},
+    "diarization_error_baselines": {
+      "type": "object",
+      "additionalProperties": {"type": "number", "minimum": 0}
+    },
+    "recordings": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": {"$ref": "#/$defs/recording"}
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100000,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "hashedId": {
+      "type": "string",
+      "pattern": "^[a-z]+-[0-9a-f]{16,64}$"
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enclave_image_digest",
+        "evaluated_source_commit",
+        "vertex_model",
+        "voice_model_sha256",
+        "export_artifact_sha256",
+        "post_delete_scan_sha256",
+        "embedding_space",
+        "scorer_version",
+        "quality_version",
+        "match_threshold",
+        "new_profile_threshold",
+        "minimum_decision_margin",
+        "outlier_similarity"
+      ],
+      "properties": {
+        "enclave_image_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "evaluated_source_commit": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "vertex_model": {"type": "string", "minLength": 1, "maxLength": 128},
+        "voice_model_sha256": {"$ref": "#/$defs/sha256"},
+        "export_artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "post_delete_scan_sha256": {"$ref": "#/$defs/sha256"},
+        "embedding_space": {"const": "wespeaker-resnet34-lm-v1"},
+        "scorer_version": {"const": 2},
+        "quality_version": {"const": 1},
+        "match_threshold": {"const": 0.6},
+        "new_profile_threshold": {"const": 0.45},
+        "minimum_decision_margin": {"const": 0.08},
+        "outlier_similarity": {"const": 0.5}
+      }
+    },
+    "turn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_ms", "end_ms", "speaker_id"],
+      "properties": {
+        "start_ms": {"type": "integer", "minimum": 0, "maximum": 86400000},
+        "end_ms": {"type": "integer", "minimum": 1, "maximum": 86400000},
+        "speaker_id": {
+          "type": "string",
+          "pattern": "^speaker-[0-9a-f]{16,64}$"
+        }
+      }
+    },
+    "recording": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_id",
+        "selected_item_id",
+        "slice",
+        "media_sha256",
+        "labels_sha256",
+        "reference_turns",
+        "predicted_turns"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^recording-[0-9a-f]{16,64}$"},
+        "source_id": {"$ref": "#/$defs/opaqueId"},
+        "selected_item_id": {
+          "oneOf": [{"$ref": "#/$defs/opaqueId"}, {"type": "null"}]
+        },
+        "slice": {"$ref": "#/$defs/opaqueId"},
+        "media_sha256": {"$ref": "#/$defs/sha256"},
+        "labels_sha256": {"$ref": "#/$defs/sha256"},
+        "reference_turns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10000,
+          "items": {"$ref": "#/$defs/turn"}
+        },
+        "predicted_turns": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {"$ref": "#/$defs/turn"}
+        }
+      }
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "evidence_id", "source_record_id"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^fact-[0-9a-f]{16,64}$"},
+        "status": {
+          "enum": ["accepted", "rejected", "superseded", "conflicting"]
+        },
+        "evidence_id": {
+          "oneOf": [
+            {"type": "string", "pattern": "^evidence-[0-9a-f]{16,64}$"},
+            {"type": "null"}
+          ]
+        },
+        "source_record_id": {
+          "oneOf": [
+            {"type": "string", "pattern": "^record-[0-9a-f]{16,64}$"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "recordIds": {
+      "type": "array",
+      "maxItems": 10000,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^record-[0-9a-f]{16,64}$"}
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "corpus_kind",
+        "slice",
+        "recording_id",
+        "expected_person",
+        "predicted_person",
+        "name_binding_state",
+        "meeting_id",
+        "first_seen_meeting_id",
+        "prior_high_quality_sample_count",
+        "display_name_collision_group",
+        "facts",
+        "created_record_ids",
+        "exported_record_ids",
+        "deleted_record_ids"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^case-[0-9a-f]{16,64}$"},
+        "corpus_kind": {"enum": ["real_audio", "synthetic_contract"]},
+        "slice": {"$ref": "#/$defs/opaqueId"},
+        "recording_id": {
+          "type": "string",
+          "pattern": "^recording-[0-9a-f]{16,64}$"
+        },
+        "expected_person": {
+          "type": "string",
+          "pattern": "^person-[0-9a-f]{16,64}$"
+        },
+        "predicted_person": {
+          "oneOf": [
+            {"type": "string", "pattern": "^person-[0-9a-f]{16,64}$"},
+            {"type": "null"}
+          ]
+        },
+        "name_binding_state": {
+          "enum": [
+            "none",
+            "proposed",
+            "probationary",
+            "accepted",
+            "conflicting",
+            "rejected",
+            "superseded"
+          ]
+        },
+        "meeting_id": {
+          "type": "string",
+          "pattern": "^meeting-[0-9a-f]{16,64}$"
+        },
+        "first_seen_meeting_id": {
+          "oneOf": [
+            {"type": "string", "pattern": "^meeting-[0-9a-f]{16,64}$"},
+            {"type": "null"}
+          ]
+        },
+        "prior_high_quality_sample_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "display_name_collision_group": {
+          "oneOf": [
+            {"type": "string", "pattern": "^collision-[0-9a-f]{16,64}$"},
+            {"type": "null"}
+          ]
+        },
+        "facts": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {"$ref": "#/$defs/fact"}
+        },
+        "created_record_ids": {"$ref": "#/$defs/recordIds"},
+        "exported_record_ids": {"$ref": "#/$defs/recordIds"},
+        "deleted_record_ids": {"$ref": "#/$defs/recordIds"}
+      }
+    }
+  }
+}

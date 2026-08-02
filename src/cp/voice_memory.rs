@@ -33,9 +33,9 @@ pub const EMBEDDING_SPACE: &str = "wespeaker-resnet34-lm-v1";
 const DEFAULT_MODEL_PATH: &str = "/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx";
 pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
-const MATCH_THRESHOLD: f32 = 0.60;
-const NEW_PROFILE_THRESHOLD: f32 = 0.45;
-const MIN_DECISION_MARGIN: f32 = 0.08;
+pub(crate) const MATCH_THRESHOLD: f32 = 0.60;
+pub(crate) const NEW_PROFILE_THRESHOLD: f32 = 0.45;
+pub(crate) const MIN_DECISION_MARGIN: f32 = 0.08;
 
 pub struct VoiceEngine {
     model: Arc<TypedRunnableModel>,

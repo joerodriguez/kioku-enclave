@@ -13,12 +13,18 @@ pub struct EvaluationCorpus {
     pub schema_version: u32,
     pub corpus_id: String,
     pub source_manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_evidence_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<super::voice_eval_evidence::EvaluationRunMetadata>,
     #[serde(default)]
     pub diarization_error_baselines: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diarization_recordings: Vec<super::voice_eval_evidence::DiarizationRecordingEvidence>,
     pub cases: Vec<EvaluationCase>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationCase {
     pub id: String,
@@ -40,6 +46,8 @@ pub struct EvaluationCase {
     pub exported_new_record_count: u64,
     #[serde(default)]
     pub deleted_new_record_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<super::voice_eval_evidence::CaseRunEvidence>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -48,6 +56,10 @@ pub struct EvaluationReport {
     pub schema_version: u32,
     pub corpus_id: String,
     pub source_manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_evidence_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<super::voice_eval_evidence::EvaluationRunMetadata>,
     pub case_count: usize,
     pub real_case_count: usize,
     pub quality_case_count: usize,
@@ -300,7 +312,7 @@ fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
 }
 
 fn validate_corpus(corpus: &EvaluationCorpus) -> Result<()> {
-    if corpus.schema_version != 1
+    if !matches!(corpus.schema_version, 1 | 2)
         || !valid_opaque_id(&corpus.corpus_id)
         || !valid_sha256(&corpus.source_manifest_sha256)
         || corpus.cases.is_empty()
@@ -345,7 +357,7 @@ fn validate_corpus(corpus: &EvaluationCorpus) -> Result<()> {
                 "accepted names and cross-meeting links require an opaque predicted person".into(),
             ));
         }
-        if (case.corpus_kind == "real_audio" && case.speech_ms == 0)
+        if (corpus.schema_version == 1 && case.corpus_kind == "real_audio" && case.speech_ms == 0)
             || case.speech_ms > 86_400_000
             || case.diarization_error_ms > 864_000_000
             || case.fact_count > 1_000_000
@@ -358,6 +370,19 @@ fn validate_corpus(corpus: &EvaluationCorpus) -> Result<()> {
                 "voice evaluation case timing or coverage counts are invalid".into(),
             ));
         }
+    }
+    if corpus.schema_version == 1 {
+        if corpus.run_evidence_sha256.is_some()
+            || corpus.run.is_some()
+            || !corpus.diarization_recordings.is_empty()
+            || corpus.cases.iter().any(|case| case.evidence.is_some())
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "schema-v1 voice evaluation corpus cannot contain schema-v2 evidence".into(),
+            ));
+        }
+    } else {
+        super::voice_eval_evidence::validate_generated_corpus(corpus)?;
     }
     Ok(())
 }
@@ -417,12 +442,6 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
     let recognized_after_three = after_three
         .filter(|case| case.predicted_person.as_deref() == Some(case.expected_person.as_str()))
         .count() as u64;
-    let clean = quality_cases
-        .iter()
-        .copied()
-        .filter(|case| case.slice == "clean_remote_call");
-    let clean_speech = clean.clone().map(|case| case.speech_ms).sum::<u64>();
-    let clean_error = clean.map(|case| case.diarization_error_ms).sum::<u64>();
     let facts = quality_cases
         .iter()
         .map(|case| case.fact_count)
@@ -466,7 +485,6 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
     let wrong_person_accepted_binding_rate = ratio(wrong_accepted, accepted_count);
     let cross_meeting_link_precision = ratio(correct_cross, cross_count);
     let recognition_recall_after_three = ratio(recognized_after_three, after_three_count);
-    let clean_remote_diarization_error = ratio(clean_error, clean_speech);
     let fact_provenance_coverage = ratio(facts_with_provenance, facts);
     let export_coverage = ratio(exported_new_records, new_records);
     let delete_coverage = ratio(deleted_new_records, new_records);
@@ -481,11 +499,24 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         .map(|slice| (*slice).to_string())
         .collect::<Vec<_>>();
     let mut slice_totals = BTreeMap::<String, (u64, u64)>::new();
-    for case in &quality_cases {
-        let totals = slice_totals.entry(case.slice.clone()).or_default();
-        totals.0 = totals.0.saturating_add(case.diarization_error_ms);
-        totals.1 = totals.1.saturating_add(case.speech_ms);
+    if corpus.schema_version == 2 {
+        for (slice, metrics) in
+            super::voice_eval_evidence::aggregate_diarization(corpus).unwrap_or_default()
+        {
+            slice_totals.insert(slice, (metrics.error_ms, metrics.speech_ms));
+        }
+    } else {
+        for case in &quality_cases {
+            let totals = slice_totals.entry(case.slice.clone()).or_default();
+            totals.0 = totals.0.saturating_add(case.diarization_error_ms);
+            totals.1 = totals.1.saturating_add(case.speech_ms);
+        }
     }
+    let (clean_error, clean_speech) = slice_totals
+        .get("clean_remote_call")
+        .copied()
+        .unwrap_or_default();
+    let clean_remote_diarization_error = ratio(clean_error, clean_speech);
     let diarization_error_by_slice = slice_totals
         .into_iter()
         .map(|(slice, (error, speech))| (slice, ratio(error, speech)))
@@ -539,7 +570,7 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         .count();
     // Synthetic contract fixtures can exercise the scorer but can never make
     // a release quality claim by themselves.
-    let release_gates_pass = corpus.schema_version == 1
+    let release_gates_pass = corpus.schema_version == 2
         && duplicate_case_ids == 0
         && unknown_corpus_kind_count == 0
         && real_case_count > 0
@@ -561,6 +592,8 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         schema_version: corpus.schema_version,
         corpus_id: corpus.corpus_id.clone(),
         source_manifest_sha256: corpus.source_manifest_sha256.clone(),
+        run_evidence_sha256: corpus.run_evidence_sha256.clone(),
+        run: corpus.run.clone(),
         case_count: corpus.cases.len(),
         real_case_count,
         quality_case_count: quality_cases.len(),
@@ -645,6 +678,9 @@ pub fn validate_release_bundle(
             "voice evaluation cases are not bound to the exact checked-in source manifest".into(),
         ));
     }
+    if corpus.schema_version == 2 {
+        super::voice_eval_evidence::validate_manifest_bindings(manifest_raw, &corpus)?;
+    }
     validate_release_report(corpus_raw, report_raw)
 }
 
@@ -698,6 +734,7 @@ mod tests {
                 new_record_count: 1,
                 exported_new_record_count: 1,
                 deleted_new_record_count: 1,
+                evidence: None,
             })
             .collect::<Vec<_>>();
         cases.push(EvaluationCase {
@@ -717,6 +754,7 @@ mod tests {
             new_record_count: 1,
             exported_new_record_count: 1,
             deleted_new_record_count: 1,
+            evidence: None,
         });
         let first_alex = cases
             .iter_mut()
@@ -727,12 +765,15 @@ mod tests {
             schema_version: 1,
             corpus_id: "real-release-v1".into(),
             source_manifest_sha256: "0".repeat(64),
+            run_evidence_sha256: None,
+            run: None,
             diarization_error_baselines: [
                 ("noise".into(), 0.20),
                 ("room_audio".into(), 0.20),
                 ("overlap".into(), 0.20),
             ]
             .into(),
+            diarization_recordings: Vec::new(),
             cases,
         }
     }
@@ -757,6 +798,7 @@ mod tests {
             new_record_count: 1,
             exported_new_record_count: 0,
             deleted_new_record_count: 0,
+            evidence: None,
         });
 
         let report = score(&corpus);
@@ -765,7 +807,7 @@ mod tests {
         assert_eq!(report.fact_provenance_coverage, 1.0);
         assert_eq!(report.export_coverage, 1.0);
         assert_eq!(report.delete_coverage, 1.0);
-        assert!(report.release_gates_pass);
+        assert!(!report.release_gates_pass);
     }
 
     #[test]
@@ -817,7 +859,7 @@ mod tests {
         let corpus = passing_real_corpus();
         let corpus_json = serde_json::to_string(&corpus).unwrap();
         let report_json = score_json(&corpus_json).unwrap();
-        validate_release_report(&corpus_json, &report_json).unwrap();
+        assert!(validate_release_report(&corpus_json, &report_json).is_err());
 
         let mut stale: serde_json::Value = serde_json::from_str(&report_json).unwrap();
         stale["corpus_id"] = serde_json::Value::String("stale".into());
@@ -862,7 +904,7 @@ mod tests {
         let corpus_json = serde_json::to_string(&corpus).unwrap();
         let report_json = score_json(&corpus_json).unwrap();
 
-        validate_release_bundle(&manifest, &corpus_json, &report_json).unwrap();
+        assert!(validate_release_bundle(&manifest, &corpus_json, &report_json).is_err());
 
         let mut changed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
         changed["sources"][0]["selected_item_ids"][0] =
