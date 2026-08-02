@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/joerodriguez/kioku-enclave/eval/voice/run-evidence-schema-v1.json",
-  "title": "Kioku ADR-0016 private voice evaluation run evidence",
+  "$id": "https://github.com/joerodriguez/kioku-enclave/eval/voice/run-evidence-schema-v2.json",
+  "title": "Kioku ADR-0016 private voice evaluation run evidence v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,7 +13,7 @@
     "cases"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "corpus_id": {"$ref": "#/$defs/opaqueId"},
     "run": {"$ref": "#/$defs/run"},
     "diarization_error_baselines": {
@@ -98,6 +98,34 @@
         }
       }
     },
+    "predictedSpeakerIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["speaker_id", "predicted_person", "name_binding_state"],
+      "properties": {
+        "speaker_id": {
+          "type": "string",
+          "pattern": "^speaker-[0-9a-f]{16,64}$"
+        },
+        "predicted_person": {
+          "oneOf": [
+            {"type": "string", "pattern": "^person-[0-9a-f]{16,64}$"},
+            {"type": "null"}
+          ]
+        },
+        "name_binding_state": {
+          "enum": [
+            "none",
+            "proposed",
+            "probationary",
+            "accepted",
+            "conflicting",
+            "rejected",
+            "superseded"
+          ]
+        }
+      }
+    },
     "recording": {
       "type": "object",
       "additionalProperties": false,
@@ -109,7 +137,8 @@
         "media_sha256",
         "labels_sha256",
         "reference_turns",
-        "predicted_turns"
+        "predicted_turns",
+        "predicted_speaker_identities"
       ],
       "properties": {
         "id": {"type": "string", "pattern": "^recording-[0-9a-f]{16,64}$"},
@@ -130,6 +159,11 @@
           "type": "array",
           "maxItems": 10000,
           "items": {"$ref": "#/$defs/turn"}
+        },
+        "predicted_speaker_identities": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {"$ref": "#/$defs/predictedSpeakerIdentity"}
         }
       }
     },
@@ -170,6 +204,7 @@
         "corpus_kind",
         "slice",
         "recording_id",
+        "reference_speaker_id",
         "expected_person",
         "predicted_person",
         "name_binding_state",
@@ -189,6 +224,10 @@
         "recording_id": {
           "type": "string",
           "pattern": "^recording-[0-9a-f]{16,64}$"
+        },
+        "reference_speaker_id": {
+          "type": "string",
+          "pattern": "^speaker-[0-9a-f]{16,64}$"
         },
         "expected_person": {
           "type": "string",
