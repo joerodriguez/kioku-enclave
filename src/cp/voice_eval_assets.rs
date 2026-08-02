@@ -4,7 +4,7 @@
 //! licensed audio, labels, transcripts, names, or biometric material into Git.
 //! This module consumes a strict private recipe and the independently
 //! hash-bound artifacts from the public source manifest. It extracts exact
-//! `.tar.gz` members in memory, accepts only canonical mono 16 kHz PCM16 WAV,
+//! `.tar.gz` or ZIP members in memory, accepts only canonical mono 16 kHz PCM16 WAV,
 //! performs fixed-point trim/concatenate/mix operations, and writes canonical
 //! WAV plus opaque timing labels and a hash receipt outside the checkout.
 
@@ -30,6 +30,7 @@ const MAX_REFERENCE_TURNS: usize = 10_000;
 const MAX_RECORDING_MS: u64 = 30 * 60 * 1_000;
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1_024 * 1_024 * 1_024;
 const MAX_MEMBER_BYTES: usize = 256 * 1_024 * 1_024;
+const MAX_ZIP_ENTRIES: usize = 250_000;
 const MAX_TOTAL_INPUT_SAMPLES: usize = SAMPLE_RATE * 4 * 60 * 60;
 const MAX_TOTAL_OUTPUT_SAMPLES: usize = SAMPLE_RATE * 2 * 60 * 60;
 const MAX_TOTAL_REFERENCE_TURNS: usize = 100_000;
@@ -50,6 +51,7 @@ struct DerivationRecipe {
 enum ArchiveFormat {
     Plain,
     TarGzip,
+    Zip,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,6 +305,40 @@ fn read_exact_tar_gzip_member(artifact_path: &Path, member_path: &str) -> Result
     selected.ok_or_else(|| invalid("selected source tar member was not found"))
 }
 
+fn read_exact_zip_member(artifact_path: &Path, member_path: &str) -> Result<Vec<u8>> {
+    validate_member_path(member_path)?;
+    let file = File::open(artifact_path)
+        .map_err(|error| invalid(format!("cannot open source ZIP bundle: {error}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| invalid(format!("cannot read source ZIP bundle: {error}")))?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(invalid("source ZIP bundle contains too many entries"));
+    }
+    let mut selected = None;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| invalid(format!("cannot read source ZIP entry: {error}")))?;
+        if entry.name() != member_path {
+            continue;
+        }
+        if selected.is_some() || !entry.is_file() {
+            return Err(invalid(
+                "selected source ZIP member must be one unique regular file",
+            ));
+        }
+        if entry.size() > MAX_MEMBER_BYTES as u64 {
+            return Err(invalid("source ZIP member exceeds the bounded size limit"));
+        }
+        selected = Some(read_bounded(
+            &mut entry,
+            MAX_MEMBER_BYTES,
+            "source ZIP member",
+        )?);
+    }
+    selected.ok_or_else(|| invalid("selected source ZIP member was not found"))
+}
+
 fn artifact_for<'a>(
     source: &'a EvaluationSource,
     artifact_id: &str,
@@ -379,6 +415,26 @@ fn load_input(
             if sha256_hex(&bytes) != expected_sha256 {
                 return Err(invalid(
                     "source archive member SHA-256 does not match the private recipe",
+                ));
+            }
+            bytes
+        }
+        ArchiveFormat::Zip => {
+            let member_path = input
+                .member_path
+                .as_deref()
+                .ok_or_else(|| invalid("ZIP derivation input requires an exact member path"))?;
+            let expected_sha256 = input
+                .member_sha256
+                .as_deref()
+                .filter(|hash| valid_sha256(hash))
+                .ok_or_else(|| {
+                    invalid("ZIP derivation input requires a lowercase member SHA-256")
+                })?;
+            let bytes = read_exact_zip_member(&artifact_path, member_path)?;
+            if sha256_hex(&bytes) != expected_sha256 {
+                return Err(invalid(
+                    "source ZIP member SHA-256 does not match the private recipe",
                 ));
             }
             bytes
@@ -963,6 +1019,17 @@ mod tests {
         archive.into_inner().unwrap().finish().unwrap()
     }
 
+    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (member_path, member) in entries {
+            archive.start_file(member_path, options).unwrap();
+            archive.write_all(member).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn derives_a_hash_bound_plain_wav_and_opaque_labels() {
         let artifacts = tempfile::tempdir().unwrap();
@@ -1159,6 +1226,63 @@ mod tests {
         )
         .unwrap();
         assert!(derive_assets(&manifest, &recipe, artifacts.path(), output.path()).is_err());
+    }
+
+    #[test]
+    fn extracts_one_exact_hash_bound_deflated_zip_member() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let member = wav(&vec![1_000; 32_000]);
+        let member_path = "RIRS_NOISES/pointsource_noises/noise.wav";
+        let bundle = zip(&[(member_path, &member)]);
+        let labels = b"reviewed-label-artifact";
+        fs::write(artifacts.path().join("source-0.media-0.asset"), &bundle).unwrap();
+        fs::write(artifacts.path().join("source-0.labels-0.asset"), labels).unwrap();
+        let manifest_raw = manifest(&hash(&bundle), &hash(labels), "bundle");
+        let recipe_value = recipe(&manifest_raw, "zip", Some(member_path), Some(hash(&member)));
+
+        let receipt = derive_assets(
+            &manifest_raw,
+            &recipe_value.to_string(),
+            artifacts.path(),
+            output.path(),
+        )
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["outputs"][0]["duration_ms"], 1000);
+
+        let mut wrong_hash = recipe_value.clone();
+        wrong_hash["inputs"][0]["member_sha256"] = json!("f".repeat(64));
+        let rejected = tempfile::tempdir().unwrap();
+        assert!(derive_assets(
+            &manifest_raw,
+            &wrong_hash.to_string(),
+            artifacts.path(),
+            rejected.path(),
+        )
+        .is_err());
+
+        let mut traversal = recipe_value.clone();
+        traversal["inputs"][0]["member_path"] = json!("../noise.wav");
+        let rejected = tempfile::tempdir().unwrap();
+        assert!(derive_assets(
+            &manifest_raw,
+            &traversal.to_string(),
+            artifacts.path(),
+            rejected.path(),
+        )
+        .is_err());
+
+        let mut missing = recipe_value;
+        missing["inputs"][0]["member_path"] = json!("RIRS_NOISES/missing.wav");
+        let rejected = tempfile::tempdir().unwrap();
+        assert!(derive_assets(
+            &manifest_raw,
+            &missing.to_string(),
+            artifacts.path(),
+            rejected.path(),
+        )
+        .is_err());
     }
 
     #[test]

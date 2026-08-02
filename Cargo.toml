@@ -129,10 +129,11 @@ regex = "1.10"
 
 # Offline ADR-0016 corpus derivation. These are already locked transitive
 # dependencies of the attested binary; direct declarations let the public
-# evaluator read exact members from hash-pinned .tar.gz source bundles without
-# shell extraction or writing licensed content into the source checkout.
+# evaluator read exact members from hash-pinned .tar.gz or ZIP source bundles
+# without shell extraction or writing licensed content into the source checkout.
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 tar = "0.4.46"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 # Decode uploaded visual-evidence JPEGs inside the enclave so multipart MIME,
 # dimensions, and hashes cannot stand in for inspection of the actual bytes.
