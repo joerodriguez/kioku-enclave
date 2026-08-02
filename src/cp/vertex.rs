@@ -12,6 +12,7 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Instant;
 
 use crate::error::{EnclaveError, Result};
 
@@ -22,18 +23,29 @@ const METADATA_TOKEN_URL: &str =
 const GENERATION_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_TEXT_OUTPUT_TOKENS: u32 = 8_192;
 pub(crate) const MAX_MEDIA_OUTPUT_TOKENS: u32 = 4_096;
+pub(crate) const MAX_SCREEN_OUTPUT_TOKENS: u32 = 1_024;
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct VertexUsage {
-    prompt_tokens: u64,
-    cached_input_tokens: u64,
-    output_tokens: u64,
-    thought_tokens: u64,
-    total_tokens: u64,
+pub(crate) struct VertexUsage {
+    pub prompt_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub thought_tokens: u64,
+    pub total_tokens: u64,
+}
+
+pub struct MediaGeneration {
+    pub text: String,
+    pub usage: VertexUsage,
+    pub latency_ms: u64,
 }
 
 fn bounded_output_tokens(requested: u32) -> u32 {
     requested.clamp(1, MAX_TEXT_OUTPUT_TOKENS)
+}
+
+fn bounded_media_output_tokens(requested: u32) -> u32 {
+    requested.clamp(1, MAX_MEDIA_OUTPUT_TOKENS)
 }
 
 fn usage_metadata(data: &Value) -> VertexUsage {
@@ -259,18 +271,58 @@ fn media_request_body(
     })
 }
 
-/// Send one bounded audio or screenshot asset to Gemini using inline data.
-/// `audioTimestamp` is enabled for audio-only inputs as required by Vertex's
-/// audio understanding API. The caller supplies a constrained JSON schema and
-/// validates the returned timestamps again before persistence.
-pub async fn generate_media_custom(
-    config: &CpConfig,
+pub struct MediaInput<'a> {
+    pub id: &'a str,
+    pub mime_type: &'a str,
+    pub media: &'a [u8],
+}
+
+impl<'a> MediaInput<'a> {
+    pub fn new(id: &'a str, mime_type: &'a str, media: &'a [u8]) -> Self {
+        Self {
+            id,
+            mime_type,
+            media,
+        }
+    }
+}
+
+fn media_parts_request_body(
     prompt: &str,
-    mime_type: &str,
-    media: &[u8],
+    inputs: &[MediaInput<'_>],
     schema: Value,
     audio_timestamp: bool,
-) -> Result<String> {
+    max_output_tokens: u32,
+) -> Value {
+    let mut parts = Vec::with_capacity(inputs.len().saturating_mul(2).saturating_add(1));
+    for input in inputs {
+        parts.push(json!({"text": format!("frame_id: {}", input.id)}));
+        parts.push(json!({
+            "inlineData": {
+                "mimeType": input.mime_type,
+                "data": B64.encode(input.media),
+            }
+        }));
+    }
+    parts.push(json!({"text": prompt}));
+    json!({
+        "contents": [{"role":"user", "parts": parts}],
+        "generationConfig": {
+            "maxOutputTokens": bounded_media_output_tokens(max_output_tokens),
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "audioTimestamp": audio_timestamp,
+            "thinkingConfig": {"thinkingBudget": 0}
+        }
+    })
+}
+
+async fn send_media_request(
+    config: &CpConfig,
+    body: Value,
+    operation: &str,
+    max_output_tokens: u32,
+) -> Result<MediaGeneration> {
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }
@@ -282,31 +334,23 @@ pub async fn generate_media_custom(
         "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
         config.vertex_project, config.vertex_model
     );
+    let started = Instant::now();
     let response = http
         .post(&url)
         .bearer_auth(token)
-        .json(&media_request_body(
-            prompt,
-            mime_type,
-            media,
-            schema,
-            audio_timestamp,
-        ))
+        .json(&body)
         .send()
         .await?;
     if response.status().as_u16() == 429 {
         return Err(EnclaveError::Config("quota".into()));
     }
     let data: Value = response.error_for_status()?.json().await?;
+    let usage = usage_metadata(&data);
     log_usage(
         &data,
-        if audio_timestamp {
-            "audio"
-        } else {
-            "screenshot"
-        },
+        operation,
         &config.vertex_model,
-        MAX_MEDIA_OUTPUT_TOKENS,
+        bounded_media_output_tokens(max_output_tokens),
     );
     let text = data
         .get("candidates")
@@ -332,7 +376,64 @@ pub async fn generate_media_custom(
             "unexpected Vertex media response shape (finishReason: {finish})"
         )));
     }
-    Ok(text)
+    Ok(MediaGeneration {
+        text,
+        usage,
+        latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
+/// Send one bounded audio or screenshot asset to Gemini using inline data.
+/// `audioTimestamp` is enabled for audio-only inputs as required by Vertex's
+/// audio understanding API. The caller supplies a constrained JSON schema and
+/// validates the returned timestamps again before persistence.
+pub async fn generate_media_custom(
+    config: &CpConfig,
+    prompt: &str,
+    mime_type: &str,
+    media: &[u8],
+    schema: Value,
+    audio_timestamp: bool,
+) -> Result<MediaGeneration> {
+    send_media_request(
+        config,
+        media_request_body(prompt, mime_type, media, schema, audio_timestamp),
+        if audio_timestamp {
+            "audio"
+        } else {
+            "screenshot"
+        },
+        MAX_MEDIA_OUTPUT_TOKENS,
+    )
+    .await
+}
+
+/// Send a bounded storyboard with opaque frame identifiers. Callers must
+/// validate exact response coverage before projecting any result.
+pub async fn generate_media_parts_custom(
+    config: &CpConfig,
+    prompt: &str,
+    inputs: &[MediaInput<'_>],
+    schema: Value,
+    max_output_tokens: u32,
+) -> Result<MediaGeneration> {
+    if inputs.is_empty() || inputs.len() > super::media_planner::MAX_SCREEN_FRAMES {
+        return Err(EnclaveError::InvalidRequest(
+            "storyboard frame count is outside allowed bounds".into(),
+        ));
+    }
+    if inputs.iter().any(|input| input.id.is_empty()) {
+        return Err(EnclaveError::InvalidRequest(
+            "storyboard frame id is empty".into(),
+        ));
+    }
+    send_media_request(
+        config,
+        media_parts_request_body(prompt, inputs, schema, false, max_output_tokens),
+        "screen_storyboard",
+        max_output_tokens,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -396,6 +497,34 @@ mod tests {
         assert_eq!(bounded_output_tokens(1_024), 1_024);
         assert_eq!(MAX_TEXT_OUTPUT_TOKENS, 8_192);
         assert_eq!(MAX_MEDIA_OUTPUT_TOKENS, 4_096);
+    }
+
+    #[test]
+    fn storyboard_request_has_opaque_frame_ids_and_a_1024_token_ceiling() {
+        let frames = vec![
+            MediaInput::new("frame-a", "image/jpeg", b"a"),
+            MediaInput::new("frame-b", "image/jpeg", b"b"),
+        ];
+        let body = media_parts_request_body(
+            "inspect each frame",
+            &frames,
+            json!({"type":"OBJECT"}),
+            false,
+            MAX_SCREEN_OUTPUT_TOKENS,
+        );
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1_024);
+        assert_eq!(body["generationConfig"]["audioTimestamp"], false);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "frame_id: frame-a");
+        assert_eq!(parts[2]["text"], "frame_id: frame-b");
+        assert_eq!(parts.last().unwrap()["text"], "inspect each frame");
+    }
+
+    #[test]
+    fn media_output_ceiling_is_never_exceeded() {
+        assert_eq!(bounded_media_output_tokens(65_535), 4_096);
+        assert_eq!(bounded_media_output_tokens(0), 1);
+        assert_eq!(bounded_media_output_tokens(1_024), 1_024);
     }
 
     #[test]

@@ -30,7 +30,7 @@ use super::media::AudioTurn;
 
 pub const EMBEDDING_SPACE: &str = "wespeaker-resnet34-lm-v1";
 const DEFAULT_MODEL_PATH: &str = "/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx";
-const TARGET_SAMPLE_RATE: u32 = 16_000;
+pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MIN_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize;
 const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
 const MATCH_THRESHOLD: f32 = 0.60;
@@ -148,7 +148,7 @@ impl VoiceEngine {
     }
 }
 
-fn decode_mono_16khz(media: &[u8], mime_type: &str) -> Result<Vec<f32>> {
+pub(crate) fn decode_mono_16khz(media: &[u8], mime_type: &str) -> Result<Vec<f32>> {
     let source = Box::new(Cursor::new(media.to_vec()));
     let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
@@ -220,6 +220,37 @@ fn decode_mono_16khz(media: &[u8], mime_type: &str) -> Result<Vec<f32>> {
         return Err(EnclaveError::Embedding("decoded audio is empty".into()));
     }
     Ok(resample_linear(&mono, source_rate, TARGET_SAMPLE_RATE))
+}
+
+/// Encode normalized mono samples as a canonical 16 kHz PCM WAV for a bounded
+/// multi-event Gemini audio window. This is deterministic and Python-free.
+pub(crate) fn encode_mono_16khz_wav(samples: &[f32]) -> Result<Vec<u8>> {
+    let data_len = samples
+        .len()
+        .checked_mul(2)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| EnclaveError::InvalidRequest("audio window is too large".into()))?;
+    let riff_len = data_len
+        .checked_add(36)
+        .ok_or_else(|| EnclaveError::InvalidRequest("audio window is too large".into()))?;
+    let mut output = Vec::with_capacity(data_len as usize + 44);
+    output.extend_from_slice(b"RIFF");
+    output.extend_from_slice(&riff_len.to_le_bytes());
+    output.extend_from_slice(b"WAVEfmt ");
+    output.extend_from_slice(&16_u32.to_le_bytes());
+    output.extend_from_slice(&1_u16.to_le_bytes());
+    output.extend_from_slice(&1_u16.to_le_bytes());
+    output.extend_from_slice(&TARGET_SAMPLE_RATE.to_le_bytes());
+    output.extend_from_slice(&(TARGET_SAMPLE_RATE * 2).to_le_bytes());
+    output.extend_from_slice(&2_u16.to_le_bytes());
+    output.extend_from_slice(&16_u16.to_le_bytes());
+    output.extend_from_slice(b"data");
+    output.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+        output.extend_from_slice(&pcm.to_le_bytes());
+    }
+    Ok(output)
 }
 
 fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
@@ -489,5 +520,16 @@ mod tests {
         assert_eq!(output.len(), 8);
         assert_eq!(output[0], 0.0);
         assert!((output[2] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn assembled_audio_wav_round_trips_through_the_rust_decoder() {
+        let samples = (0..TARGET_SAMPLE_RATE)
+            .map(|index| ((index as f32 / 40.0).sin()) * 0.25)
+            .collect::<Vec<_>>();
+        let wav = encode_mono_16khz_wav(&samples).unwrap();
+        let decoded = decode_mono_16khz(&wav, "audio/wav").unwrap();
+        assert_eq!(decoded.len(), samples.len());
+        assert!((decoded[1_000] - samples[1_000]).abs() < 0.001);
     }
 }

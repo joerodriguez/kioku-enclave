@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     mcp_calls            INTEGER NOT NULL DEFAULT 0,
     vertex_requests      INTEGER NOT NULL DEFAULT 0,
     vertex_output_tokens INTEGER NOT NULL DEFAULT 0,
+    vertex_audio_output_tokens INTEGER NOT NULL DEFAULT 0,
+    vertex_screen_output_tokens INTEGER NOT NULL DEFAULT 0,
+    vertex_derived_output_tokens INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, day)
 );
 CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -472,6 +475,9 @@ impl ControlStore {
         for column in [
             "ALTER TABLE usage_daily ADD COLUMN vertex_requests INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE usage_daily ADD COLUMN vertex_output_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_daily ADD COLUMN vertex_audio_output_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_daily ADD COLUMN vertex_screen_output_tokens INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_daily ADD COLUMN vertex_derived_output_tokens INTEGER NOT NULL DEFAULT 0",
         ] {
             match conn.execute(column, []) {
                 Ok(_) => schema_migrations += 1,
