@@ -114,7 +114,13 @@ must select or separately normalize other formats before manifest review. Multip
 tracks can begin at the same output timestamp to create deterministic overlap,
 noise, music, or echo slices. Gain is integer thousandths (`1000` is unity), so
 mixing and clipping produce byte-identical canonical WAV output without a Python,
-FFmpeg, or platform audio dependency.
+FFmpeg, or platform audio dependency. A recording's primary media and labels stay
+under one source, while augmentation tracks may come from independently licensed
+manifest sources only when their artifacts are explicitly typed `augmentation` and
+their source declares the evaluated slice. The derived labels, receipt, private run
+evidence, and content-free release cases retain each augmentation source ID, artifact
+ID, and exact hash; cross-source media/bundle tracks and hash or slice mismatches fail
+closed.
 
 Suitable authoritative inputs include the
 [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) for licensed
