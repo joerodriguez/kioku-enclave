@@ -63,9 +63,19 @@ pub struct DiarizationRecordingEvidence {
     pub slice: String,
     pub media_sha256: String,
     pub labels_sha256: String,
+    #[serde(default)]
+    pub augmentation_artifacts: Vec<AugmentationArtifactEvidence>,
     pub reference_turns: Vec<DiarizationTurnEvidence>,
     pub predicted_turns: Vec<DiarizationTurnEvidence>,
     pub predicted_speaker_identities: Vec<PredictedSpeakerIdentityEvidence>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AugmentationArtifactEvidence {
+    pub source_id: String,
+    pub artifact_id: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
@@ -405,6 +415,12 @@ fn validate_recording_shape(recording: &DiarizationRecordingEvidence) -> Result<
         || !valid_opaque_id(&recording.slice)
         || !valid_sha256(&recording.media_sha256)
         || !valid_sha256(&recording.labels_sha256)
+        || recording.augmentation_artifacts.len() > 64
+        || recording.augmentation_artifacts.iter().any(|artifact| {
+            !valid_opaque_id(&artifact.source_id)
+                || !valid_opaque_id(&artifact.artifact_id)
+                || !valid_sha256(&artifact.sha256)
+        })
     {
         return Err(EnclaveError::InvalidRequest(
             "invalid voice evaluation recording binding".into(),
@@ -569,6 +585,35 @@ fn validate_recording_bindings(
         } else {
             return Err(EnclaveError::InvalidRequest(
                 "voice evaluation recording references an unknown manifest source".into(),
+            ));
+        }
+        let mut augmentation_ids = HashSet::new();
+        for binding in &recording.augmentation_artifacts {
+            let artifact = sources.get(binding.source_id.as_str()).and_then(|source| {
+                if !source.slices.contains(&recording.slice) {
+                    return None;
+                }
+                source
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.id == binding.artifact_id)
+            });
+            if !augmentation_ids.insert((binding.source_id.as_str(), binding.artifact_id.as_str()))
+                || artifact.is_none_or(|artifact| {
+                    artifact.kind != "augmentation" || artifact.sha256 != binding.sha256
+                })
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "voice evaluation augmentation does not match a reviewed source artifact, hash, and slice"
+                        .into(),
+                ));
+            }
+        }
+        if fixtures.contains_key(recording.source_id.as_str())
+            && !recording.augmentation_artifacts.is_empty()
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "owner recording augmentation lineage belongs in the reviewed owner fixture".into(),
             ));
         }
     }
@@ -1091,6 +1136,37 @@ mod tests {
     }
 
     #[test]
+    fn recordings_bind_cross_source_augmentation_artifacts_and_hashes() {
+        let (manifest, evidence) = fixtures::passing_bundle();
+        let mut manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        manifest["sources"].as_array_mut().unwrap().push(json!({
+            "id":"source-augmentation",
+            "license_id":"Apache-2.0",
+            "license_url":"https://example.test/augmentation-license",
+            "artifacts":[{
+                "id":"noise",
+                "kind":"augmentation",
+                "url":"https://example.test/noise.wav",
+                "sha256":"f".repeat(64)
+            }],
+            "selected_item_ids":["noise-0"],
+            "slices":SLICES,
+            "derivation_command":"kioku-enclave --derive-voice-eval-assets"
+        }));
+        let manifest = manifest.to_string();
+        let mut evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        evidence["recordings"][0]["augmentation_artifacts"] = json!([{
+            "source_id":"source-augmentation",
+            "artifact_id":"noise",
+            "sha256":"f".repeat(64)
+        }]);
+        build_cases_json(&manifest, &evidence.to_string()).unwrap();
+
+        evidence["recordings"][0]["augmentation_artifacts"][0]["sha256"] = json!("e".repeat(64));
+        assert!(build_cases_json(&manifest, &evidence.to_string()).is_err());
+    }
+
+    #[test]
     fn unmapped_reference_speech_forces_identity_abstention() {
         let (manifest, evidence) = fixtures::passing_bundle();
         let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
@@ -1276,6 +1352,7 @@ mod tests {
                             "slice":slice,
                             "media_sha256":format!("{:064x}", owner_index + 1000),
                             "labels_sha256":format!("{:064x}", owner_index + 2000),
+                            "augmentation_artifacts":[],
                             "reference_turns":[turn("speaker-aaaaaaaaaaaaaaaa")],
                             "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")],
                             "predicted_speaker_identities":[{
@@ -1294,6 +1371,7 @@ mod tests {
                             "slice":slice,
                             "media_sha256":format!("{:064x}", index + 4000),
                             "labels_sha256":format!("{:064x}", index + 5000),
+                            "augmentation_artifacts":[],
                             "reference_turns":[turn("speaker-aaaaaaaaaaaaaaaa")],
                             "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")],
                             "predicted_speaker_identities":[{
@@ -1314,6 +1392,7 @@ mod tests {
                 "slice":"same_display_name",
                 "media_sha256":format!("{:064x}", 1005),
                 "labels_sha256":format!("{:064x}", 2005),
+                "augmentation_artifacts":[],
                 "reference_turns":[turn("speaker-aaaaaaaaaaaaaaaa")],
                 "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")],
                 "predicted_speaker_identities":[{
@@ -1414,6 +1493,7 @@ mod tests {
                 slice: "overlap".into(),
                 media_sha256: "a".repeat(64),
                 labels_sha256: "b".repeat(64),
+                augmentation_artifacts: Vec::new(),
                 reference_turns: vec![
                     DiarizationTurnEvidence {
                         start_ms: 0,

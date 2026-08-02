@@ -8,7 +8,7 @@
 //! performs fixed-point trim/concatenate/mix operations, and writes canonical
 //! WAV plus opaque timing labels and a hash receipt outside the checkout.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -111,7 +111,16 @@ struct LabelsFile<'a> {
     selected_item_id: &'a str,
     slice: &'a str,
     duration_ms: u64,
+    augmentation_artifacts: &'a [AugmentationArtifactBinding],
     reference_turns: &'a [ReferenceTurn],
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AugmentationArtifactBinding {
+    source_id: String,
+    artifact_id: String,
+    sha256: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -135,6 +144,7 @@ struct DerivedOutput {
     selected_item_id: String,
     slice: String,
     duration_ms: u64,
+    augmentation_artifacts: Vec<AugmentationArtifactBinding>,
     media_file: String,
     media_sha256: String,
     labels_file: String,
@@ -528,7 +538,7 @@ fn render_recording(
     sources: &HashMap<&str, &EvaluationSource>,
     inputs: &HashMap<&str, LoadedInput>,
     referenced_inputs: &mut HashSet<String>,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<AugmentationArtifactBinding>)> {
     if !valid_hashed_id(&recording.id, "recording-")
         || !valid_opaque_id(&recording.source_id)
         || !valid_opaque_id(&recording.media_artifact_id)
@@ -560,13 +570,20 @@ fn render_recording(
     }
     let duration_samples = milliseconds_to_samples(recording.duration_ms)?;
     let mut mixed = vec![0_i64; duration_samples];
+    let mut augmentation_artifacts = BTreeSet::new();
     for track in &recording.tracks {
         let input = inputs
             .get(track.input_id.as_str())
             .ok_or_else(|| invalid("derived track references an unknown input"))?;
-        if input.source_id != recording.source_id
-            || (input.artifact_id != recording.media_artifact_id
-                && artifact_for(source, &input.artifact_id)?.kind != "augmentation")
+        let input_source = sources
+            .get(input.source_id.as_str())
+            .ok_or_else(|| invalid("derived track references an unknown input source"))?;
+        let input_artifact = artifact_for(input_source, &input.artifact_id)?;
+        let is_primary_media = input.source_id == recording.source_id
+            && input.artifact_id == recording.media_artifact_id;
+        let is_augmentation =
+            input_artifact.kind == "augmentation" && input_source.slices.contains(&recording.slice);
+        if (!is_primary_media && !is_augmentation)
             || track.source_start_ms >= track.source_end_ms
             || track.gain_milli == 0
             || track.gain_milli > 4_000
@@ -574,6 +591,13 @@ fn render_recording(
             return Err(invalid(
                 "derived track has an invalid source, artifact, range, or gain",
             ));
+        }
+        if is_augmentation {
+            augmentation_artifacts.insert(AugmentationArtifactBinding {
+                source_id: input.source_id.clone(),
+                artifact_id: input.artifact_id.clone(),
+                sha256: input_artifact.sha256.clone(),
+            });
         }
         let source_start = milliseconds_to_samples(track.source_start_ms)?;
         let source_end = milliseconds_to_samples(track.source_end_ms)?;
@@ -603,6 +627,7 @@ fn render_recording(
         .collect::<Vec<_>>();
     let media = encode_canonical_pcm16_wav(&pcm)?;
     let reference_turns = sorted_reference_turns(recording)?;
+    let augmentation_artifacts = augmentation_artifacts.into_iter().collect::<Vec<_>>();
     let labels = LabelsFile {
         schema_version: 1,
         corpus_id: &recipe.corpus_id,
@@ -611,11 +636,12 @@ fn render_recording(
         selected_item_id: &recording.selected_item_id,
         slice: &recording.slice,
         duration_ms: recording.duration_ms,
+        augmentation_artifacts: &augmentation_artifacts,
         reference_turns: &reference_turns,
     };
     let mut labels = serde_json::to_vec_pretty(&labels)?;
     labels.push(b'\n');
-    Ok((media, labels))
+    Ok((media, labels, augmentation_artifacts))
 }
 
 fn write_exact_file(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
@@ -742,7 +768,7 @@ pub fn derive_assets(
             &recording.source_id,
             artifact_for(source, &recording.labels_artifact_id)?,
         )?;
-        let (media, labels) = render_recording(
+        let (media, labels, augmentation_artifacts) = render_recording(
             &recipe,
             recording,
             &sources,
@@ -759,6 +785,7 @@ pub fn derive_assets(
             selected_item_id: recording.selected_item_id.clone(),
             slice: recording.slice.clone(),
             duration_ms: recording.duration_ms,
+            augmentation_artifacts,
             media_file: media_file.clone(),
             media_sha256: sha256_hex(&media),
             labels_file: labels_file.clone(),
@@ -963,6 +990,112 @@ mod tests {
             .join("recording-0000000000000001.labels.json")
             .is_file());
         assert!(output.path().join("derivation-receipt.json").is_file());
+    }
+
+    #[test]
+    fn cross_source_augmentation_retains_independent_license_lineage() {
+        let artifacts = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let speech = wav(&vec![1_000; 32_000]);
+        let noise = wav(&vec![250; 16_000]);
+        let labels = b"reviewed-label-artifact";
+        fs::write(artifacts.path().join("source-0.media-0.asset"), &speech).unwrap();
+        fs::write(artifacts.path().join("source-0.labels-0.asset"), labels).unwrap();
+        fs::write(
+            artifacts.path().join("source-1.augmentation-0.asset"),
+            &noise,
+        )
+        .unwrap();
+
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&manifest(&hash(&speech), &hash(labels), "media")).unwrap();
+        manifest["sources"].as_array_mut().unwrap().push(json!({
+            "id":"source-1",
+            "license_id":"Apache-2.0",
+            "license_url":"https://example.test/source-1-license",
+            "artifacts":[{
+                "id":"augmentation-0",
+                "kind":"augmentation",
+                "url":"https://example.test/noise.wav",
+                "sha256":hash(&noise)
+            }],
+            "selected_item_ids":["noise-0"],
+            "slices":["noise"],
+            "derivation_command":"kioku-enclave --derive-voice-eval-assets"
+        }));
+        let manifest = manifest.to_string();
+
+        let mut recipe = recipe(&manifest, "plain", None, None);
+        recipe["inputs"].as_array_mut().unwrap().push(json!({
+            "id":"input-augmentation",
+            "source_id":"source-1",
+            "artifact_id":"augmentation-0",
+            "archive_format":"plain",
+            "member_path":null,
+            "member_sha256":null
+        }));
+        recipe["recordings"][0]["slice"] = json!("noise");
+        recipe["recordings"][0]["tracks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "input_id":"input-augmentation",
+                "source_start_ms":0,
+                "source_end_ms":1000,
+                "output_start_ms":0,
+                "gain_milli":500
+            }));
+
+        let receipt = derive_assets(
+            &manifest,
+            &recipe.to_string(),
+            artifacts.path(),
+            output.path(),
+        )
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(
+            receipt["outputs"][0]["augmentation_artifacts"],
+            json!([{
+                "source_id":"source-1",
+                "artifact_id":"augmentation-0",
+                "sha256":hash(&noise)
+            }])
+        );
+        let labels: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.path().join("recording-0000000000000001.labels.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            labels["augmentation_artifacts"],
+            receipt["outputs"][0]["augmentation_artifacts"]
+        );
+
+        let mut invalid_manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        invalid_manifest["sources"][1]["artifacts"][0]["kind"] = json!("media");
+        let invalid_manifest = invalid_manifest.to_string();
+        recipe["source_manifest_sha256"] = json!(hash(invalid_manifest.as_bytes()));
+        let invalid_output = tempfile::tempdir().unwrap();
+        assert!(derive_assets(
+            &invalid_manifest,
+            &recipe.to_string(),
+            artifacts.path(),
+            invalid_output.path(),
+        )
+        .is_err());
+
+        let mut invalid_manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        invalid_manifest["sources"][1]["slices"] = json!(["music"]);
+        let invalid_manifest = invalid_manifest.to_string();
+        recipe["source_manifest_sha256"] = json!(hash(invalid_manifest.as_bytes()));
+        let invalid_output = tempfile::tempdir().unwrap();
+        assert!(derive_assets(
+            &invalid_manifest,
+            &recipe.to_string(),
+            artifacts.path(),
+            invalid_output.path(),
+        )
+        .is_err());
     }
 
     #[test]
