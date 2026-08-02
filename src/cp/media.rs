@@ -1228,6 +1228,31 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_media_jobs_state
             ON media_processing_jobs(state, updated_at, id);
+        CREATE TABLE IF NOT EXISTS media_work_units (
+            id TEXT PRIMARY KEY,
+            work_class TEXT NOT NULL CHECK (work_class IN ('audio','screen')),
+            processor_version INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('planned','processing','retry_wait','succeeded','failed_terminal')),
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            reserved_output_tokens INTEGER NOT NULL,
+            reservation_retained INTEGER NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            error_code TEXT,
+            usage_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS media_work_members (
+            work_unit_id TEXT NOT NULL REFERENCES media_work_units(id) ON DELETE CASCADE,
+            event_id TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
+            job_id INTEGER NOT NULL REFERENCES media_processing_jobs(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            window_start_ms INTEGER NOT NULL,
+            window_end_ms INTEGER NOT NULL,
+            PRIMARY KEY (work_unit_id,event_id),
+            UNIQUE (work_unit_id,ordinal)
+        );
         CREATE TABLE IF NOT EXISTS speaker_observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
@@ -1240,6 +1265,15 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             language TEXT,
             overlap INTEGER NOT NULL DEFAULT 0,
             UNIQUE(event_id, turn_id)
+        );
+        CREATE TABLE IF NOT EXISTS speaker_observation_sources (
+            speaker_observation_id INTEGER NOT NULL REFERENCES speaker_observations(id) ON DELETE CASCADE,
+            event_id TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
+            window_start_ms INTEGER NOT NULL,
+            window_end_ms INTEGER NOT NULL,
+            event_start_ms INTEGER NOT NULL,
+            event_end_ms INTEGER NOT NULL,
+            PRIMARY KEY (speaker_observation_id,event_id,window_start_ms)
         );
         CREATE TABLE IF NOT EXISTS people (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2150,7 +2184,10 @@ mod tests {
             "browser_states_v2",
             "browser_observations_v2",
             "media_processing_jobs",
+            "media_work_units",
+            "media_work_members",
             "speaker_observations",
+            "speaker_observation_sources",
             "voice_profiles",
             "voice_samples",
             "identity_evidence",
@@ -2455,7 +2492,13 @@ mod tests {
             ("browser_states_v2", "created_at, state_key"),
             ("browser_observations_v2", "observed_at, event_id"),
             ("media_processing_jobs", "updated_at, event_id"),
+            ("media_work_units", "updated_at, id"),
+            ("media_work_members", "work_unit_id, ordinal"),
             ("speaker_observations", "started_at, event_id, id"),
+            (
+                "speaker_observation_sources",
+                "speaker_observation_id, window_start_ms",
+            ),
             ("people", "display_name, id"),
             ("voice_profiles", "person_id, id"),
             ("voice_samples", "speaker_observation_id, id"),

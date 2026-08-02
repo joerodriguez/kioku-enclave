@@ -25,6 +25,7 @@ pub mod mcp_projection;
 pub mod mcp_query;
 pub(crate) mod mcp_safety;
 pub mod media;
+pub mod media_planner;
 pub mod media_worker;
 pub mod oauth;
 pub mod query;

@@ -280,6 +280,38 @@ not belong to the authenticated account returns HTTP `404`.
 }
 ```
 
+### Cloud aggregation and immutable provenance
+
+The accepted event and its original clocks are immutable. The enclave plans
+canonical media into deterministic bounded work units before calling Gemini:
+
+- adjacent compatible audio events from one capture session and stream form a
+  window of at most five minutes, 20 MiB, and a one-second inter-event gap;
+- a screen storyboard spans at most 90 seconds, 12 canonical frames, 16 MiB,
+  and 24 million input pixels; and
+- reference observations have no media job, work-unit membership, output-token
+  reservation, or model call.
+
+Every work unit stores its ordered member events and exact window offsets.
+Every diarized turn stores its intersections with the original source-event
+intervals, including a turn that crosses an event boundary. Gemini offsets are
+validated against the assembled window; source timestamps, URLs, and literal
+device context always remain authoritative.
+
+Storyboard inputs use each event ID as an opaque `frame_id`. A response is
+rejected atomically if any expected ID is missing, duplicated, or replaced by
+an unknown ID. Per-frame results are projected only to that exact source frame;
+an active-speaker label is never smeared across the storyboard.
+
+The persistent daily Vertex ceiling is divided into protected output-token
+reservations: 50% audio, 25% screens, and 25% episode/finalization text. Screen
+storyboards reserve at most 1,024 output tokens; audio windows reserve at most
+4,096. Audio is scheduled before screen work for each user sweep, so screen
+volume cannot consume or queue ahead of protected audio capacity. Retries reuse
+the deterministic work-unit reservation. Encrypted per-user telemetry stores
+only work class, opaque unit/version, reserved and actual token counts,
+latency, attempt, and outcome—never captured content.
+
 States are `queued`, `processing`, `retry_wait`, `ready`, `failed`, or
 `pruned`. `pruned` means the bounded raw-media retention window elapsed; the
 derived searchable records and timestamped evidence remain. A well-formed event ID
