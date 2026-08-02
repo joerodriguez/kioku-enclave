@@ -59,7 +59,7 @@
         "id": {"$ref": "#/$defs/opaqueId"},
         "source_id": {"$ref": "#/$defs/opaqueId"},
         "artifact_id": {"$ref": "#/$defs/opaqueId"},
-        "archive_format": {"enum": ["plain", "tar_gzip"]},
+        "archive_format": {"enum": ["plain", "tar_gzip", "zip"]},
         "member_path": {
           "oneOf": [
             {"type": "string", "minLength": 1, "maxLength": 1024},
@@ -85,6 +85,15 @@
         },
         {
           "if": {"properties": {"archive_format": {"const": "tar_gzip"}}},
+          "then": {
+            "properties": {
+              "member_path": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "member_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"archive_format": {"const": "zip"}}},
           "then": {
             "properties": {
               "member_path": {"type": "string", "minLength": 1, "maxLength": 1024},

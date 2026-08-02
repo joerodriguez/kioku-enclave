@@ -109,8 +109,10 @@ The private derivation recipe conforms to
 and artifact IDs, an exact archive member path and member hash when applicable,
 fixed-point source/output ranges and gains, recording selection/slice IDs, and
 opaque reference-speaker timing. It contains no transcript or person-name field.
-Plain and `.tar.gz` inputs must decode as mono 16-kHz little-endian PCM16; operators
-must select or separately normalize other formats before manifest review. Multiple
+Plain, `.tar.gz`, and deflated/stored ZIP inputs must decode as mono 16-kHz
+little-endian PCM16; operators must select or separately normalize other formats
+before manifest review. ZIP bundles are entry-count bounded and selected members
+are size bounded and path/hash checked. Multiple
 tracks can begin at the same output timestamp to create deterministic overlap,
 noise, music, or echo slices. Gain is integer thousandths (`1000` is unity), so
 mixing and clipping produce byte-identical canonical WAV output without a Python,
