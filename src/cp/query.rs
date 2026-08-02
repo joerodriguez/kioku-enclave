@@ -344,7 +344,7 @@ async fn query_episodes_value(
                         "finalization_attempted_at": finalization_attempted_at,
                         "finalization_retryable": matches!(
                             finalization_status.as_str(),
-                            "retry_model" | "regeneration_queued"
+                            "retry_wait" | "budget_wait" | "failed_terminal"
                         ),
                         "final_brief": final_brief,
                     }))
@@ -1397,6 +1397,8 @@ async fn rest_episode_finalize(
                 "UPDATE episodes
                  SET finalization_status = 'queued',
                      finalization_error = NULL,
+                     finalization_attempt_count = 0,
+                     finalization_next_attempt_at = NULL,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id = ?1",
                 [id],
@@ -2944,6 +2946,7 @@ mod tests {
                 quota_utterances_per_day: 1,
                 quota_screenshots_per_day: 1,
                 quota_mcp_calls_per_day: 1,
+                quota_vertex_output_tokens_per_day: 524_288,
                 web_origin: "http://localhost:3000".into(),
                 reviewer_auth: None,
             }),

@@ -21,10 +21,10 @@ use crate::error::{EnclaveError, Result};
 use super::media::{parse_audio_result, AudioTurn};
 use super::{isotime, vertex, CpState};
 
-const WORKER_INTERVAL_SECONDS: u64 = 5;
-const MAX_JOBS_PER_USER_PER_SWEEP: usize = 24;
-const MAX_CONCURRENT_USER_SWEEPS: usize = 8;
-const MAX_ATTEMPTS: i64 = 5;
+const WORKER_INTERVAL_SECONDS: u64 = 30;
+const MAX_JOBS_PER_USER_PER_SWEEP: usize = 2;
+const MAX_CONCURRENT_USER_SWEEPS: usize = 4;
+const MAX_ATTEMPTS: i64 = 3;
 const PROCESSOR_VERSION: i64 = 1;
 const PROMPT_VERSION: i64 = 1;
 
@@ -633,6 +633,41 @@ fn mark_failed(conn: &Connection, job_id: i64, error_code: &str, now: &str) -> R
     Ok(())
 }
 
+fn defer_for_budget(conn: &Connection, job_id: i64, now: &str) -> Result<()> {
+    let retry_at = isotime::add_seconds(now, 6.0 * 60.0 * 60.0);
+    conn.execute(
+        "UPDATE media_processing_jobs
+         SET state='retry_wait',
+             attempt_count=MAX(attempt_count-1, 0),
+             lease_until=NULL,
+             error_code='vertex_daily_budget',
+             updated_at=?1
+         WHERE id=?2",
+        params![retry_at, job_id],
+    )?;
+    conn.execute(
+        "UPDATE media_objects SET processing_state='retry_wait' WHERE event_id=(
+         SELECT event_id FROM media_processing_jobs WHERE id=?1)",
+        [job_id],
+    )?;
+    Ok(())
+}
+
+async fn reserve_media_output(state: &CpState, user_id: &str) -> Result<()> {
+    let reserved = super::limits::reserve_vertex_output_tokens(
+        &state.control,
+        user_id,
+        i64::from(vertex::MAX_MEDIA_OUTPUT_TOKENS),
+        state.config.quota_vertex_output_tokens_per_day,
+    )
+    .await?;
+    if reserved.allowed {
+        Ok(())
+    } else {
+        Err(EnclaveError::Config("vertex_daily_budget".into()))
+    }
+}
+
 async fn process_job(state: &CpState, user_id: &str, job: &MediaJob) -> Result<()> {
     let stored = state.store.get_media(&job.object_key).await?;
     let dek = crate::crypto::load_dek(state.store.kms.as_ref(), &stored.wrapped_dek_b64).await?;
@@ -642,6 +677,7 @@ async fn process_job(state: &CpState, user_id: &str, job: &MediaJob) -> Result<(
     if !actual_hash.eq_ignore_ascii_case(&job.sha256) {
         return Err(EnclaveError::Crypto("raw media hash mismatch".into()));
     }
+    reserve_media_output(state, user_id).await?;
 
     if job.job_kind == "gemini_audio" {
         let duration_ms = isotime::parse_epoch_millis(&job.ended_at)
@@ -715,24 +751,28 @@ async fn process_user(state: &CpState, user_id: &str) {
         if let Err(error) = process_job(state, user_id, &job).await {
             let error_code = match error {
                 EnclaveError::Config(ref message) if message == "quota" => "vertex_quota",
+                EnclaveError::Config(ref message) if message == "vertex_daily_budget" => {
+                    "vertex_daily_budget"
+                }
                 EnclaveError::Json(_) | EnclaveError::InvalidRequest(_) => "invalid_model_output",
                 EnclaveError::Crypto(_) => "media_integrity",
                 _ => "processing_error",
             };
             warn!(user_id, job_id = job.id, error_code, "media job failed");
             let failed_at = now_iso();
-            if let Err(mark_error) = state
-                .store
-                .with_user(user_id, |conn| {
+            let update = state.store.with_user(user_id, |conn| {
+                if error_code == "vertex_daily_budget" {
+                    defer_for_budget(conn, job.id, &failed_at)
+                } else {
                     mark_failed(conn, job.id, error_code, &failed_at)
-                })
-                .await
-            {
+                }
+            });
+            if let Err(mark_error) = update.await {
                 warn!(user_id, job_id = job.id, error = %mark_error, "media job failure persistence failed");
                 return;
             }
             let _ = state.store.save_user(user_id).await;
-            if error_code == "vertex_quota" {
+            if matches!(error_code, "vertex_quota" | "vertex_daily_budget") {
                 return;
             }
         }
@@ -856,6 +896,12 @@ mod tests {
         .unwrap();
         init_schema(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn media_inference_has_bounded_sweep_and_retry_exposure() {
+        assert_eq!(MAX_JOBS_PER_USER_PER_SWEEP, 2);
+        assert_eq!(MAX_ATTEMPTS, 3);
     }
 
     fn manifest() -> CaptureEventManifest {

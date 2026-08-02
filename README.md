@@ -51,6 +51,11 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   deterministic visual statistics, transcript context, and derived text are sent together
   for holistic episode analysis once an episode is settled; raw audio and screenshot
   pixels are never included.
+- Enforces cost safety before every inference: 8,192-token text and 4,096-token media
+  response ceilings, a persistent 524,288 maximum-output-token reservation per user per
+  UTC day, bounded sweep sizes, and terminal retry limits. Timeouts retain their
+  reservation because Vertex may have completed billable work after the client stopped
+  waiting. Automatic workers never regenerate already-completed historical episodes.
 - Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
@@ -267,6 +272,7 @@ binding.
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
 | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
 | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration |
+| `QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY` | Optional per-user UTC-day maximum-output reservation ceiling; defaults to `524288`. Each request reserves its full configured output maximum before Vertex is called and fails closed when exhausted |
 | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |

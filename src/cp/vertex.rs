@@ -19,6 +19,63 @@ use super::CpConfig;
 
 const METADATA_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+const GENERATION_TIMEOUT_SECONDS: u64 = 120;
+pub(crate) const MAX_TEXT_OUTPUT_TOKENS: u32 = 8_192;
+pub(crate) const MAX_MEDIA_OUTPUT_TOKENS: u32 = 4_096;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VertexUsage {
+    prompt_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    thought_tokens: u64,
+    total_tokens: u64,
+}
+
+fn bounded_output_tokens(requested: u32) -> u32 {
+    requested.clamp(1, MAX_TEXT_OUTPUT_TOKENS)
+}
+
+fn usage_metadata(data: &Value) -> VertexUsage {
+    let usage = data.get("usageMetadata").unwrap_or(&Value::Null);
+    VertexUsage {
+        prompt_tokens: usage
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cached_input_tokens: usage
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        thought_tokens: usage
+            .get("thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        total_tokens: usage
+            .get("totalTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+fn log_usage(data: &Value, operation: &str, model: &str, output_limit: u32) {
+    let usage = usage_metadata(data);
+    tracing::info!(
+        operation,
+        model,
+        output_limit,
+        prompt_tokens = usage.prompt_tokens,
+        cached_input_tokens = usage.cached_input_tokens,
+        output_tokens = usage.output_tokens,
+        thought_tokens = usage.thought_tokens,
+        total_tokens = usage.total_tokens,
+        "Vertex inference usage"
+    );
+}
 
 #[derive(Deserialize)]
 struct TokenResp {
@@ -85,7 +142,14 @@ fn response_schema() -> Value {
 /// Call Gemini and return the raw response text (expected to be JSON per the
 /// schema). `Err` with a `quota` marker string on HTTP 429.
 pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Result<String> {
-    generate_custom(config, system, user_message, response_schema(), 65_535).await
+    generate_custom(
+        config,
+        system,
+        user_message,
+        response_schema(),
+        MAX_TEXT_OUTPUT_TOKENS,
+    )
+    .await
 }
 
 /// Call Gemini with a caller-supplied constrained-decoding schema. The episode
@@ -102,11 +166,12 @@ pub async fn generate_custom(
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }
-    // Explicit timeout: reqwest has NONE by default, and a hung generateContent
-    // call would wedge the summarizer (and, since runs are serialized, every
-    // future run) forever. 3 min is generous for a 6-h window.
+    let max_output_tokens = bounded_output_tokens(max_output_tokens);
+    // The output ceiling makes two minutes sufficient. A shorter client
+    // timeout also limits how long a lost response can block the serialized
+    // workers; retries are bounded separately by their durable queues.
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
+        .timeout(std::time::Duration::from_secs(GENERATION_TIMEOUT_SECONDS))
         .build()?;
     let token = access_token(&http).await?;
 
@@ -118,9 +183,7 @@ pub async fn generate_custom(
         "contents": [{ "role": "user", "parts": [{ "text": user_message }] }],
         "systemInstruction": { "parts": [{ "text": system }] },
         "generationConfig": {
-            // Model max (Gemini 2.5 Flash): a JSON response truncated by the
-            // output cap is unparseable and deterministically stalls that
-            // summarizer window, so leave no headroom to waste.
+            // Cost safety boundary: callers may request less, never more.
             "maxOutputTokens": max_output_tokens,
             "responseMimeType": "application/json",
             "responseSchema": schema,
@@ -140,6 +203,7 @@ pub async fn generate_custom(
     }
     let resp = resp.error_for_status()?;
     let data: Value = resp.json().await?;
+    log_usage(&data, "text", model, max_output_tokens);
     let text: String = data
         .get("candidates")
         .and_then(|c| c.get(0))
@@ -186,7 +250,7 @@ fn media_request_body(
             ]
         }],
         "generationConfig": {
-            "maxOutputTokens": 16_384,
+            "maxOutputTokens": MAX_MEDIA_OUTPUT_TOKENS,
             "responseMimeType": "application/json",
             "responseSchema": schema,
             "audioTimestamp": audio_timestamp,
@@ -211,7 +275,7 @@ pub async fn generate_media_custom(
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
+        .timeout(std::time::Duration::from_secs(GENERATION_TIMEOUT_SECONDS))
         .build()?;
     let token = access_token(&http).await?;
     let url = format!(
@@ -234,6 +298,16 @@ pub async fn generate_media_custom(
         return Err(EnclaveError::Config("quota".into()));
     }
     let data: Value = response.error_for_status()?.json().await?;
+    log_usage(
+        &data,
+        if audio_timestamp {
+            "audio"
+        } else {
+            "screenshot"
+        },
+        &config.vertex_model,
+        MAX_MEDIA_OUTPUT_TOKENS,
+    );
     let text = data
         .get("candidates")
         .and_then(|candidates| candidates.get(0))
@@ -303,8 +377,42 @@ mod tests {
             "audio/m4a"
         );
         assert_eq!(body["generationConfig"]["audioTimestamp"], true);
+        assert_eq!(
+            body["generationConfig"]["maxOutputTokens"],
+            MAX_MEDIA_OUTPUT_TOKENS
+        );
         assert!(body["contents"][0]["parts"][0]["inlineData"]["data"]
             .as_str()
             .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn caller_cannot_request_an_unbounded_text_response() {
+        assert_eq!(bounded_output_tokens(65_535), MAX_TEXT_OUTPUT_TOKENS);
+        assert_eq!(
+            bounded_output_tokens(MAX_TEXT_OUTPUT_TOKENS),
+            MAX_TEXT_OUTPUT_TOKENS
+        );
+        assert_eq!(bounded_output_tokens(1_024), 1_024);
+        assert_eq!(MAX_TEXT_OUTPUT_TOKENS, 8_192);
+        assert_eq!(MAX_MEDIA_OUTPUT_TOKENS, 4_096);
+    }
+
+    #[test]
+    fn usage_metadata_is_reduced_to_non_content_telemetry() {
+        let usage = usage_metadata(&json!({
+            "usageMetadata": {
+                "promptTokenCount": 123,
+                "cachedContentTokenCount": 45,
+                "candidatesTokenCount": 67,
+                "thoughtsTokenCount": 8,
+                "totalTokenCount": 198
+            }
+        }));
+        assert_eq!(usage.prompt_tokens, 123);
+        assert_eq!(usage.cached_input_tokens, 45);
+        assert_eq!(usage.output_tokens, 67);
+        assert_eq!(usage.thought_tokens, 8);
+        assert_eq!(usage.total_tokens, 198);
     }
 }
