@@ -167,6 +167,19 @@ class SelectorTests(unittest.TestCase):
         third_party = workflow.index("anchore/sbom-action")
         self.assertLess(clear, third_party)
 
+    def test_evaluation_reviewer_key_is_read_from_an_encrypted_secret(self) -> None:
+        workflow = WORKFLOW.read_text()
+        self.assertIn(
+            "EVALUATION_REVIEWER_AUTH_API_KEY: "
+            "${{ secrets.EVAL_REVIEWER_AUTH_API_KEY }}",
+            workflow,
+        )
+        self.assertNotIn(
+            "EVALUATION_REVIEWER_AUTH_API_KEY: "
+            "${{ vars.EVAL_REVIEWER_AUTH_API_KEY }}",
+            workflow,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
