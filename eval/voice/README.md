@@ -39,7 +39,7 @@ This makes a model or threshold comparison reviewable for every device,
 language, noise, overlap, and adversarial slice without publishing raw voice
 scores or private content.
 
-The private run input conforms to `run-evidence-schema-v1.json`. It binds the
+The private run input conforms to `run-evidence-schema-v2.json`. It binds the
 evaluated enclave image digest, source commit, Vertex model, exact voice-model
 hash, embedding/scorer/quality versions, exact match/new-profile/margin/outlier
 thresholds, account-export artifact hash, and post-delete storage-scan hash. It records opaque reference and predicted
@@ -56,12 +56,17 @@ Each schema-v2 case records:
 - exact created, exported, and deleted record-ID sets. Export/delete IDs must
   be subsets of the created set and record IDs must be globally unique.
 
-Each recording contains opaque reference and predicted speaker intervals. The
-scorer computes overlap-aware diarization error after finding the optimal
-one-to-one mapping between the two opaque speaker namespaces. Reference speech,
-misses, false alarms, confusion, and overlapping speaker-time are therefore
-not operator-supplied counters. Every recording must support a scored case, and
-same-display-name evidence must include at least two distinct expected people.
+Each recording contains opaque reference and predicted speaker intervals plus
+exactly one identity-decision row for every predicted speaker. The scorer
+computes overlap-aware diarization error and a deterministic optimal one-to-one
+mapping between the two opaque speaker namespaces. Each reference speaker has
+exactly one identity case; that case names the reference speaker, and its
+predicted person/binding state must equal the decision attached to the mapped
+prediction. An unmatched reference must abstain. Reference speech, misses,
+false alarms, confusion, overlapping speaker-time, and the speaker-to-identity
+join are therefore not independent operator-supplied claims. Same-display-name
+evidence must use distinct recordings/reference speakers for at least two
+distinct expected people.
 
 The record totals include profile proposals, append-only profile revisions,
 active/superseded sample assignments, and proposal source/result membership.

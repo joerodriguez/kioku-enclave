@@ -79,9 +79,12 @@ surfaces.
 - Real voice-quality releases require schema-v2 evidence derived by the public
   reducer. It pins the evaluated image/source/model/scorer plus export and
   post-delete artifact hashes, derives all release counters from opaque timing and
-  exact record sets, and rejects names, transcripts, URLs, paths, embeddings, raw
-  scores, unknown fields, modified derived values, and legacy hand-authored real
-  aggregates. Restricted media and authorization documents remain outside Git.
+  exact record sets. Every predicted speaker has exactly one identity-decision row;
+  every reference speaker has exactly one case; and a case's predicted person/state
+  must match the hypothesis chosen by the scorer's deterministic global diarization
+  mapping. The reducer rejects names, transcripts, URLs, paths, embeddings, raw scores,
+  unknown fields, modified derived values, and legacy hand-authored real aggregates.
+  Restricted media and authorization documents remain outside Git.
 
 ## Key hierarchy and encrypted objects
 

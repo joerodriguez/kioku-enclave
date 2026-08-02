@@ -2,8 +2,10 @@
 //!
 //! Real release metrics must not be hand-authored counters. The private run
 //! input contains opaque speaker/person/record identifiers, source hashes, and
-//! timing decisions exported by the production pipeline. This module binds
-//! that input to the reviewed source manifest and emits a content-free corpus
+//! timing and per-hypothesis identity decisions exported by the production
+//! pipeline. This module binds each identity case to the deterministic speaker
+//! mapping used for diarization error, binds that input to the reviewed source
+//! manifest, and emits a content-free corpus
 //! whose derived fields can be recomputed by CI without access to media,
 //! transcripts, names, embeddings, or raw similarity scores.
 
@@ -60,6 +62,15 @@ pub struct DiarizationRecordingEvidence {
     pub labels_sha256: String,
     pub reference_turns: Vec<DiarizationTurnEvidence>,
     pub predicted_turns: Vec<DiarizationTurnEvidence>,
+    pub predicted_speaker_identities: Vec<PredictedSpeakerIdentityEvidence>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictedSpeakerIdentityEvidence {
+    pub speaker_id: String,
+    pub predicted_person: Option<String>,
+    pub name_binding_state: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
@@ -78,6 +89,7 @@ pub struct CaseRunEvidence {
     pub corpus_kind: String,
     pub slice: String,
     pub recording_id: String,
+    pub reference_speaker_id: String,
     pub expected_person: String,
     pub predicted_person: Option<String>,
     pub name_binding_state: String,
@@ -247,7 +259,10 @@ fn validate_turns(turns: &[DiarizationTurnEvidence], label: &str) -> Result<Vec<
     Ok(speakers.into_iter().collect())
 }
 
-fn maximum_mapping_overlap(weights: &[Vec<u64>], hypothesis_count: usize) -> u64 {
+fn maximum_mapping_overlap(
+    weights: &[Vec<u64>],
+    hypothesis_count: usize,
+) -> (u64, Vec<Option<usize>>) {
     fn visit(
         row: usize,
         used: u32,
@@ -275,12 +290,54 @@ fn maximum_mapping_overlap(weights: &[Vec<u64>], hypothesis_count: usize) -> u64
         best
     }
 
-    visit(0, 0, weights, hypothesis_count, &mut HashMap::new())
+    let mut memo = HashMap::new();
+    let correct_ms = visit(0, 0, weights, hypothesis_count, &mut memo);
+    let mut mapping = Vec::with_capacity(weights.len());
+    let mut used = 0_u32;
+    for row in 0..weights.len() {
+        let target = visit(row, used, weights, hypothesis_count, &mut memo);
+        let mut selected = None;
+        for column in 0..hypothesis_count {
+            let bit = 1_u32 << column;
+            if used & bit == 0
+                && weights[row][column] > 0
+                && weights[row][column]
+                    + visit(row + 1, used | bit, weights, hypothesis_count, &mut memo)
+                    == target
+            {
+                selected = Some(column);
+                used |= bit;
+                break;
+            }
+        }
+        if selected.is_none() {
+            debug_assert_eq!(
+                visit(row + 1, used, weights, hypothesis_count, &mut memo),
+                target
+            );
+        }
+        mapping.push(selected);
+    }
+    (correct_ms, mapping)
 }
 
-pub(crate) fn derive_diarization_metrics(
+#[derive(Debug)]
+struct DiarizationAnalysis {
+    metrics: DiarizationMetrics,
+    predicted_speakers: BTreeMap<String, Option<String>>,
+}
+
+impl DiarizationAnalysis {
+    fn predicted_speaker_for(&self, reference_speaker: &str) -> Option<&str> {
+        self.predicted_speakers
+            .get(reference_speaker)
+            .and_then(Option::as_deref)
+    }
+}
+
+fn derive_diarization_analysis(
     recording: &DiarizationRecordingEvidence,
-) -> Result<DiarizationMetrics> {
+) -> Result<DiarizationAnalysis> {
     let reference_speakers = validate_turns(&recording.reference_turns, "reference")?;
     let predicted_speakers = validate_turns(&recording.predicted_turns, "predicted")?;
     if reference_speakers.is_empty() {
@@ -338,11 +395,28 @@ pub(crate) fn derive_diarization_metrics(
             }
         }
     }
-    let correct_ms = maximum_mapping_overlap(&weights, predicted_speakers.len());
-    Ok(DiarizationMetrics {
-        speech_ms,
-        error_ms: maximum_active_ms.saturating_sub(correct_ms),
+    let (correct_ms, mapping) = maximum_mapping_overlap(&weights, predicted_speakers.len());
+    let predicted_speakers = reference_speakers
+        .into_iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            let predicted = mapping[index].map(|column| predicted_speakers[column].clone());
+            (reference, predicted)
+        })
+        .collect();
+    Ok(DiarizationAnalysis {
+        metrics: DiarizationMetrics {
+            speech_ms,
+            error_ms: maximum_active_ms.saturating_sub(correct_ms),
+        },
+        predicted_speakers,
     })
+}
+
+pub(crate) fn derive_diarization_metrics(
+    recording: &DiarizationRecordingEvidence,
+) -> Result<DiarizationMetrics> {
+    Ok(derive_diarization_analysis(recording)?.metrics)
 }
 
 fn validate_recording_shape(recording: &DiarizationRecordingEvidence) -> Result<()> {
@@ -361,6 +435,99 @@ fn validate_recording_shape(recording: &DiarizationRecordingEvidence) -> Result<
         ));
     }
     derive_diarization_metrics(recording)?;
+    validate_predicted_speaker_identities(recording)?;
+    Ok(())
+}
+
+fn valid_binding_state(value: &str) -> bool {
+    matches!(
+        value,
+        "none"
+            | "proposed"
+            | "probationary"
+            | "accepted"
+            | "conflicting"
+            | "rejected"
+            | "superseded"
+    )
+}
+
+fn validate_predicted_speaker_identities(
+    recording: &DiarizationRecordingEvidence,
+) -> Result<HashMap<&str, &PredictedSpeakerIdentityEvidence>> {
+    let predicted_speakers = recording
+        .predicted_turns
+        .iter()
+        .map(|turn| turn.speaker_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut identities = HashMap::new();
+    for identity in &recording.predicted_speaker_identities {
+        if !valid_hash_prefixed_id(&identity.speaker_id, "speaker-")
+            || identity
+                .predicted_person
+                .as_deref()
+                .is_some_and(|person| !valid_hash_prefixed_id(person, "person-"))
+            || !valid_binding_state(&identity.name_binding_state)
+            || (identity.name_binding_state == "accepted" && identity.predicted_person.is_none())
+            || identities
+                .insert(identity.speaker_id.as_str(), identity)
+                .is_some()
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "invalid predicted-speaker identity evidence".into(),
+            ));
+        }
+    }
+    if identities.len() != predicted_speakers.len()
+        || predicted_speakers
+            .iter()
+            .any(|speaker| !identities.contains_key(speaker))
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "predicted-speaker identity evidence must exactly cover diarization hypotheses".into(),
+        ));
+    }
+    Ok(identities)
+}
+
+fn validate_case_speaker_binding(
+    recording: &DiarizationRecordingEvidence,
+    evidence: &CaseRunEvidence,
+) -> Result<()> {
+    let analysis = derive_diarization_analysis(recording)?;
+    if !analysis
+        .predicted_speakers
+        .contains_key(&evidence.reference_speaker_id)
+    {
+        return Err(EnclaveError::InvalidRequest(
+            "voice evaluation case references an unknown reference speaker".into(),
+        ));
+    }
+    let identities = validate_predicted_speaker_identities(recording)?;
+    match analysis.predicted_speaker_for(&evidence.reference_speaker_id) {
+        Some(predicted_speaker) => {
+            let identity = identities.get(predicted_speaker).ok_or_else(|| {
+                EnclaveError::InvalidRequest(
+                    "mapped diarization hypothesis has no identity evidence".into(),
+                )
+            })?;
+            if evidence.predicted_person != identity.predicted_person
+                || evidence.name_binding_state != identity.name_binding_state
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "voice evaluation identity decision is not bound to its mapped diarization hypothesis"
+                        .into(),
+                ));
+            }
+        }
+        None => {
+            if evidence.predicted_person.is_some() || evidence.name_binding_state != "none" {
+                return Err(EnclaveError::InvalidRequest(
+                    "unmapped reference speech must produce an identity abstention".into(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -444,6 +611,7 @@ fn derive_case(evidence: CaseRunEvidence) -> Result<EvaluationCase> {
         )
         || !valid_opaque_id(&evidence.slice)
         || !valid_hash_prefixed_id(&evidence.recording_id, "recording-")
+        || !valid_hash_prefixed_id(&evidence.reference_speaker_id, "speaker-")
         || !valid_hash_prefixed_id(&evidence.expected_person, "person-")
         || evidence
             .predicted_person
@@ -459,16 +627,7 @@ fn derive_case(evidence: CaseRunEvidence) -> Result<EvaluationCase> {
             .as_deref()
             .is_some_and(|group| !valid_hash_prefixed_id(group, "collision-"))
         || evidence.prior_high_quality_sample_count > 100_000
-        || !matches!(
-            evidence.name_binding_state.as_str(),
-            "none"
-                | "proposed"
-                | "probationary"
-                | "accepted"
-                | "conflicting"
-                | "rejected"
-                | "superseded"
-        )
+        || !valid_binding_state(&evidence.name_binding_state)
     {
         return Err(EnclaveError::InvalidRequest(
             "invalid voice evaluation case evidence".into(),
@@ -548,7 +707,7 @@ pub fn build_cases_json(manifest_raw: &str, evidence_raw: &str) -> Result<String
     super::voice_eval::validate_manifest_json(manifest_raw)?;
     let manifest: EvidenceManifest = serde_json::from_str(manifest_raw)?;
     let evidence: EvaluationRunEvidence = serde_json::from_str(evidence_raw)?;
-    if evidence.schema_version != 1
+    if evidence.schema_version != 2
         || evidence.corpus_id != manifest.corpus_id
         || evidence.recordings.is_empty()
         || evidence.recordings.len() > MAX_RECORDINGS
@@ -561,20 +720,36 @@ pub fn build_cases_json(manifest_raw: &str, evidence_raw: &str) -> Result<String
     }
     validate_run(&evidence.run)?;
     validate_recording_bindings(&manifest, &evidence.recordings)?;
-    let recording_slices = evidence
+    let recordings_by_id = evidence
         .recordings
         .iter()
-        .map(|recording| (recording.id.as_str(), recording.slice.as_str()))
+        .enumerate()
+        .map(|(index, recording)| (recording.id.as_str(), index))
         .collect::<HashMap<_, _>>();
     let mut cases = Vec::with_capacity(evidence.cases.len());
     let mut global_record_ids = HashSet::new();
+    let mut scored_reference_speakers = HashSet::new();
     for case_evidence in evidence.cases {
-        if recording_slices
+        let recording = recordings_by_id
             .get(case_evidence.recording_id.as_str())
-            .is_none_or(|slice| *slice != case_evidence.slice)
-        {
+            .map(|index| &evidence.recordings[*index])
+            .ok_or_else(|| {
+                EnclaveError::InvalidRequest(
+                    "voice evaluation case references an unknown recording".into(),
+                )
+            })?;
+        if recording.slice != case_evidence.slice {
             return Err(EnclaveError::InvalidRequest(
                 "voice evaluation case does not match its recording slice".into(),
+            ));
+        }
+        validate_case_speaker_binding(recording, &case_evidence)?;
+        if !scored_reference_speakers.insert((
+            case_evidence.recording_id.clone(),
+            case_evidence.reference_speaker_id.clone(),
+        )) {
+            return Err(EnclaveError::InvalidRequest(
+                "a reference speaker may support only one identity case per recording".into(),
             ));
         }
         for record_id in &case_evidence.created_record_ids {
@@ -585,6 +760,16 @@ pub fn build_cases_json(manifest_raw: &str, evidence_raw: &str) -> Result<String
             }
         }
         cases.push(derive_case(case_evidence)?);
+    }
+    for recording in &evidence.recordings {
+        let reference_speakers = validate_turns(&recording.reference_turns, "reference")?;
+        if reference_speakers.iter().any(|speaker| {
+            !scored_reference_speakers.contains(&(recording.id.clone(), speaker.clone()))
+        }) {
+            return Err(EnclaveError::InvalidRequest(
+                "every reference speaker must support exactly one identity case".into(),
+            ));
+        }
     }
     let corpus = EvaluationCorpus {
         schema_version: 2,
@@ -618,11 +803,11 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
             "schema-v2 voice evaluation corpus is missing bounded evidence".into(),
         ));
     }
-    let mut recording_slices = HashMap::new();
+    let mut recordings_by_id = HashMap::new();
     for recording in &corpus.diarization_recordings {
         validate_recording_shape(recording)?;
-        if recording_slices
-            .insert(recording.id.as_str(), recording.slice.as_str())
+        if recordings_by_id
+            .insert(recording.id.as_str(), recording)
             .is_some()
         {
             return Err(EnclaveError::InvalidRequest(
@@ -632,6 +817,7 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
     }
     let mut global_records = HashSet::new();
     let mut referenced_recordings = HashSet::new();
+    let mut scored_reference_speakers = HashSet::new();
     let mut collision_people = HashMap::<String, HashSet<String>>::new();
     for case in &corpus.cases {
         let evidence = case.evidence.clone().ok_or_else(|| {
@@ -639,12 +825,24 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
                 "schema-v2 voice evaluation case is missing derivation evidence".into(),
             )
         })?;
-        if recording_slices
+        let recording = recordings_by_id
             .get(evidence.recording_id.as_str())
-            .is_none_or(|slice| *slice != case.slice)
-        {
+            .copied()
+            .ok_or_else(|| {
+                EnclaveError::InvalidRequest("schema-v2 case recording binding is invalid".into())
+            })?;
+        if recording.slice != case.slice {
             return Err(EnclaveError::InvalidRequest(
                 "schema-v2 case recording binding is invalid".into(),
+            ));
+        }
+        validate_case_speaker_binding(recording, &evidence)?;
+        if !scored_reference_speakers.insert((
+            evidence.recording_id.clone(),
+            evidence.reference_speaker_id.clone(),
+        )) {
+            return Err(EnclaveError::InvalidRequest(
+                "schema-v2 reference speakers must have exactly one identity case".into(),
             ));
         }
         referenced_recordings.insert(evidence.recording_id.clone());
@@ -677,6 +875,16 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
         return Err(EnclaveError::InvalidRequest(
             "every schema-v2 diarization recording must support at least one scored case".into(),
         ));
+    }
+    for recording in &corpus.diarization_recordings {
+        let reference_speakers = validate_turns(&recording.reference_turns, "reference")?;
+        if reference_speakers.iter().any(|speaker| {
+            !scored_reference_speakers.contains(&(recording.id.clone(), speaker.clone()))
+        }) {
+            return Err(EnclaveError::InvalidRequest(
+                "every schema-v2 reference speaker must have exactly one identity case".into(),
+            ));
+        }
     }
     if !collision_people
         .values()
@@ -783,6 +991,21 @@ mod tests {
     }
 
     #[test]
+    fn optimal_mapping_exposes_the_hypothesis_bound_to_each_reference_speaker() {
+        let recording = fixtures::permuted_overlap_recording();
+        let analysis = derive_diarization_analysis(&recording).unwrap();
+
+        assert_eq!(
+            analysis.predicted_speaker_for("speaker-aaaaaaaaaaaaaaaa"),
+            Some("speaker-dddddddddddddddd")
+        );
+        assert_eq!(
+            analysis.predicted_speaker_for("speaker-bbbbbbbbbbbbbbbb"),
+            Some("speaker-cccccccccccccccc")
+        );
+    }
+
+    #[test]
     fn diarization_counts_miss_false_alarm_and_confusion() {
         let mut recording = fixtures::permuted_overlap_recording();
         recording.predicted_turns = vec![DiarizationTurnEvidence {
@@ -820,6 +1043,73 @@ mod tests {
     }
 
     #[test]
+    fn case_identity_must_match_the_globally_mapped_diarization_hypothesis() {
+        let (manifest, evidence) = fixtures::passing_bundle();
+        let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        value["cases"][0]["predicted_person"] = json!("person-ffffffffffffffff");
+
+        assert!(build_cases_json(&manifest, &value.to_string()).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        value["cases"][0]["name_binding_state"] = json!("probationary");
+
+        assert!(build_cases_json(&manifest, &value.to_string()).is_err());
+    }
+
+    #[test]
+    fn predicted_identity_rows_exactly_cover_diarization_hypotheses() {
+        let (manifest, evidence) = fixtures::passing_bundle();
+        let mut missing: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        missing["recordings"][0]["predicted_speaker_identities"] = json!([]);
+        assert!(build_cases_json(&manifest, &missing.to_string()).is_err());
+
+        let mut extra: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        extra["recordings"][0]["predicted_speaker_identities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "speaker_id":"speaker-cccccccccccccccc",
+                "predicted_person":null,
+                "name_binding_state":"none"
+            }));
+        assert!(build_cases_json(&manifest, &extra.to_string()).is_err());
+    }
+
+    #[test]
+    fn unmapped_reference_speech_forces_identity_abstention() {
+        let (manifest, evidence) = fixtures::passing_bundle();
+        let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        value["recordings"][0]["predicted_turns"] = json!([]);
+        value["recordings"][0]["predicted_speaker_identities"] = json!([]);
+        value["cases"][0]["predicted_person"] = serde_json::Value::Null;
+        value["cases"][0]["name_binding_state"] = json!("none");
+
+        let cases = build_cases_json(&manifest, &value.to_string()).unwrap();
+        let corpus: EvaluationCorpus = serde_json::from_str(&cases).unwrap();
+        assert_eq!(corpus.cases[0].predicted_person, None);
+        assert!(!corpus.cases[0].accepted_name);
+
+        value["cases"][0]["predicted_person"] = json!("person-0000000000000000");
+        value["cases"][0]["name_binding_state"] = json!("accepted");
+        assert!(build_cases_json(&manifest, &value.to_string()).is_err());
+    }
+
+    #[test]
+    fn each_reference_speaker_supports_exactly_one_identity_case() {
+        let (manifest, evidence) = fixtures::passing_bundle();
+        let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        let mut duplicate = value["cases"][0].clone();
+        duplicate["id"] = json!("case-abababababababab");
+        duplicate["created_record_ids"] = json!([]);
+        duplicate["exported_record_ids"] = json!([]);
+        duplicate["deleted_record_ids"] = json!([]);
+        duplicate["facts"] = json!([]);
+        value["cases"].as_array_mut().unwrap().push(duplicate);
+
+        assert!(build_cases_json(&manifest, &value.to_string()).is_err());
+    }
+
+    #[test]
     fn media_and_label_hashes_must_match_the_reviewed_manifest() {
         let (manifest, evidence) = fixtures::passing_bundle();
         let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
@@ -833,6 +1123,15 @@ mod tests {
         let (manifest, evidence) = fixtures::passing_bundle();
         let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
         value["run"]["match_threshold"] = json!(0.01);
+
+        assert!(build_cases_json(&manifest, &value.to_string()).is_err());
+    }
+
+    #[test]
+    fn legacy_private_run_schema_cannot_authorize_a_release() {
+        let (manifest, evidence) = fixtures::passing_bundle();
+        let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        value["schema_version"] = json!(1);
 
         assert!(build_cases_json(&manifest, &value.to_string()).is_err());
     }
@@ -923,7 +1222,7 @@ mod tests {
                 "owner_fixtures":owner_fixtures
             })
             .to_string();
-            let recordings = SLICES
+            let mut recordings = SLICES
                 .iter()
                 .enumerate()
                 .map(|(index, slice)| {
@@ -937,7 +1236,12 @@ mod tests {
                             "media_sha256":format!("{:064x}", owner_index + 1000),
                             "labels_sha256":format!("{:064x}", owner_index + 2000),
                             "reference_turns":[turn("speaker-aaaaaaaaaaaaaaaa")],
-                            "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")]
+                            "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")],
+                            "predicted_speaker_identities":[{
+                                "speaker_id":"speaker-bbbbbbbbbbbbbbbb",
+                                "predicted_person":format!("person-{index:016x}"),
+                                "name_binding_state":"accepted"
+                            }]
                         })
                     } else {
                         json!({
@@ -948,11 +1252,31 @@ mod tests {
                             "media_sha256":format!("{:064x}", index + 4000),
                             "labels_sha256":format!("{:064x}", index + 5000),
                             "reference_turns":[turn("speaker-aaaaaaaaaaaaaaaa")],
-                            "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")]
+                            "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")],
+                            "predicted_speaker_identities":[{
+                                "speaker_id":"speaker-bbbbbbbbbbbbbbbb",
+                                "predicted_person":format!("person-{index:016x}"),
+                                "name_binding_state":"accepted"
+                            }]
                         })
                     }
                 })
                 .collect::<Vec<_>>();
+            recordings.push(json!({
+                "id":"recording-ffffffffffffffff",
+                "source_id":"owner-5",
+                "selected_item_id":null,
+                "slice":"same_display_name",
+                "media_sha256":format!("{:064x}", 1005),
+                "labels_sha256":format!("{:064x}", 2005),
+                "reference_turns":[turn("speaker-aaaaaaaaaaaaaaaa")],
+                "predicted_turns":[turn("speaker-bbbbbbbbbbbbbbbb")],
+                "predicted_speaker_identities":[{
+                    "speaker_id":"speaker-bbbbbbbbbbbbbbbb",
+                    "predicted_person":"person-eeeeeeeeeeeeeeee",
+                    "name_binding_state":"accepted"
+                }]
+            }));
             let mut cases = SLICES
                 .iter()
                 .enumerate()
@@ -966,6 +1290,7 @@ mod tests {
                         "corpus_kind":"real_audio",
                         "slice":slice,
                         "recording_id":format!("recording-{index:016x}"),
+                        "reference_speaker_id":"speaker-aaaaaaaaaaaaaaaa",
                         "expected_person":format!("person-{index:016x}"),
                         "predicted_person":format!("person-{index:016x}"),
                         "name_binding_state":"accepted",
@@ -989,7 +1314,8 @@ mod tests {
                 "id":"case-ffffffffffffffff",
                 "corpus_kind":"real_audio",
                 "slice":"same_display_name",
-                "recording_id":"recording-0000000000000005",
+                "recording_id":"recording-ffffffffffffffff",
+                "reference_speaker_id":"speaker-aaaaaaaaaaaaaaaa",
                 "expected_person":"person-eeeeeeeeeeeeeeee",
                 "predicted_person":"person-eeeeeeeeeeeeeeee",
                 "name_binding_state":"accepted",
@@ -1008,7 +1334,7 @@ mod tests {
                 "deleted_record_ids":["record-eeeeeeeeeeeeeee0","record-eeeeeeeeeeeeeee1"]
             }));
             let evidence = json!({
-                "schema_version":1,
+                "schema_version":2,
                 "corpus_id":"real-evidence-v1",
                 "run":{
                     "enclave_image_digest":format!("sha256:{}", "a".repeat(64)),
@@ -1063,6 +1389,18 @@ mod tests {
                         start_ms: 4_000,
                         end_ms: 10_000,
                         speaker_id: "speaker-cccccccccccccccc".into(),
+                    },
+                ],
+                predicted_speaker_identities: vec![
+                    PredictedSpeakerIdentityEvidence {
+                        speaker_id: "speaker-cccccccccccccccc".into(),
+                        predicted_person: Some("person-cccccccccccccccc".into()),
+                        name_binding_state: "accepted".into(),
+                    },
+                    PredictedSpeakerIdentityEvidence {
+                        speaker_id: "speaker-dddddddddddddddd".into(),
+                        predicted_person: Some("person-dddddddddddddddd".into()),
+                        name_binding_state: "accepted".into(),
                     },
                 ],
             }
