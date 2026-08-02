@@ -27,11 +27,13 @@ indicators and the product's cloud-processing disclosure.
 
 `POST /api/v2/capture/events`
 
-Content type: `multipart/form-data` with exactly two parts:
+Content type: `multipart/form-data` with one or two parts:
 
 1. `manifest`: UTF-8 JSON matching `CaptureEventManifest` below, maximum 128 KiB.
-2. `media`: the exact bytes described by `manifest.media`; set the part's
-   content type to the same value as `manifest.media.mime_type`.
+2. `media`: required for a canonical event and forbidden for a reference
+   observation. For canonical events it contains the exact bytes described by
+   `manifest.media`; set the part's content type to the same value as
+   `manifest.media.mime_type`.
 
 Supported media:
 
@@ -64,6 +66,7 @@ screenshot.
   "timezone_id": "America/New_York",
   "utc_offset_minutes": -240,
   "clock_uncertainty_ms": 24,
+  "media_disposition": "canonical",
   "media": {
     "asset_id": "019fbab2-8413-7053-9117-eb249b72b161",
     "mime_type": "audio/m4a",
@@ -116,6 +119,88 @@ screenshot.
 }
 ```
 
+`media_disposition` is `canonical` or `reference`; omission means `canonical`
+for compatibility. Canonical events require `media`, forbid `reference`, and
+create one encrypted media object plus one bounded processing job.
+
+### Metadata-only screen references
+
+A stable `mac_screen` capture attempt whose pixels meet deduplication version 1
+may send a reference observation. It omits `media` and the multipart `media`
+part while retaining all normal clocks, sequence fields, and complete current
+context:
+
+```json
+{
+  "schema_version": 2,
+  "event_id": "019fbab2-8413-7053-9117-eb249b72b170",
+  "device_id": "019fbab2-8413-7053-9117-eb249b72b15d",
+  "install_id": "019fbab2-8413-7053-9117-eb249b72b15e",
+  "capture_session_id": "019fbab2-8413-7053-9117-eb249b72b15f",
+  "stream_id": "019fbab2-8413-7053-9117-eb249b72b169",
+  "stream_kind": "mac_screen",
+  "sequence": 43,
+  "source_wall_at": "2026-07-31T18:00:02.000Z",
+  "source_monotonic_ns": 11000000000,
+  "started_at": "2026-07-31T18:00:02.000Z",
+  "ended_at": "2026-07-31T18:00:04.000Z",
+  "timezone_id": "America/New_York",
+  "utc_offset_minutes": -240,
+  "clock_uncertainty_ms": 24,
+  "media_disposition": "reference",
+  "reference": {
+    "canonical_event_id": "019fbab2-8413-7053-9117-eb249b72b168",
+    "canonical_asset_id": "019fbab2-8413-7053-9117-eb249b72b167",
+    "canonical_media_sha256": "64 hexadecimal characters",
+    "perceptual_hash": "0123456789abcdef",
+    "hamming_distance": 2,
+    "pixel_change_ratio": 0.004,
+    "context_fingerprint": "64 hexadecimal characters",
+    "dedupe_version": 1
+  },
+  "context": {
+    "capture_status": "stable",
+    "active_app": "Google Chrome",
+    "primary_bundle_id": "com.google.Chrome",
+    "primary_window_id": 876,
+    "window_title": "Weekly planning",
+    "display_id": 42,
+    "active_url": "https://meet.google.com/abc-defg-hij?authuser=0",
+    "active_url_title": "Weekly planning",
+    "browser_permission_status": "granted",
+    "visible_windows": [],
+    "visible_windows_truncated": false
+  }
+}
+```
+
+Version 1 permits a reference only when the client compared against the last
+canonical screen in that display stream, the before/after context was stable,
+the context fingerprint was unchanged, the 8×8 grayscale average-hash Hamming
+distance is at most 3, and the bounded downscaled pixel-change ratio is at most
+0.01. Ambiguous or missing state must produce another canonical upload.
+
+The context fingerprint is SHA-256 over compact UTF-8 JSON with recursively
+lexicographically sorted keys for exactly these nullable fields:
+`active_app`, `active_url`, `active_url_title`,
+`browser_permission_status`, `capture_status`, `display_id`,
+`primary_bundle_id`, `primary_window_id`, `visible_windows`,
+`visible_windows_truncated`, and `window_title`. Ambient browser-tab inventory
+is retained on the observation but excluded from this fingerprint so an
+unchanged visible screen need not be re-uploaded merely because a background
+tab changed.
+
+The enclave recomputes the fingerprint, compares the literal visible context,
+and requires the target to be an earlier canonical event for the same
+authenticated account, device, install, session, stream, and display. It also
+verifies the canonical asset and SHA-256. Missing/forward references, chains,
+digest mismatches, and context transitions fail with HTTP 400. A valid
+reference creates no media object and no Gemini job, but it advances contiguous
+acknowledgement and remains in export and deletion coverage.
+
+iOS imported screenshots remain intentional canonical assets; clients must not
+apply perceptual suppression to them.
+
 `stream_kind` is one of `mic`, `system_audio`, `mac_screen`, `ios_mic`,
 `ios_imported_screenshot`, or `ios_shared_page`.
 
@@ -143,6 +228,7 @@ A new event returns HTTP `201`:
 {
   "event_id": "019fbab2-8413-7053-9117-eb249b72b15b",
   "asset_id": "019fbab2-8413-7053-9117-eb249b72b161",
+  "media_disposition": "canonical",
   "processing_state": "queued",
   "committed_through_sequence": 42
 }
@@ -153,8 +239,14 @@ An identical retry returns HTTP `200` with the same shape. Reusing an
 content returns HTTP `409`; the client must treat that as a local data-integrity
 error and mint new IDs only for a genuinely new event.
 
-Clients durably spool the manifest and media before upload. Delete a local
-spool item only when its sequence is at or below
+A newly accepted reference returns `201` with
+`media_disposition: "reference"`, the canonical `asset_id`, and
+`processing_state: "ready"`; an identical retry returns `200`.
+
+Clients durably spool a canonical manifest and media before upload, and spool a
+reference manifest only after its canonical dependency is durable. Replay in
+ascending stream sequence and never upload a reference until its canonical has
+been acknowledged. Delete a local spool item only when its sequence is at or below
 `committed_through_sequence`. Retry network failures and HTTP 5xx with bounded
 exponential backoff plus jitter. Respect HTTP `429` and its `retry_after`
 seconds. Do not retry malformed requests (HTTP 400) without correcting them.

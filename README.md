@@ -39,8 +39,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   ACME without exporting the private key.
 - Verifies Google identity, runs OAuth 2.1-style authorization with PKCE, and issues Kioku
   access and refresh tokens.
-- Receives raw bounded audio/screenshots plus timestamped application, window, display,
-  and browser metadata from pure-Swift Kioku clients.
+- Receives raw bounded audio/canonical screenshots plus timestamped application, window,
+  display, and browser metadata from pure-Swift Kioku clients. Deterministically validated
+  metadata-only screen references retain repeated observations without another encrypted
+  image object or inference job.
 - Runs Gemini 3.5 Flash transcription, timestamped speaker-turn extraction, screenshot
   understanding, evidence-backed person learning, and independent WeSpeaker voiceprint
   matching in the cloud; no Python runtime is present.
