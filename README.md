@@ -45,7 +45,9 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   image object or inference job.
 - Runs Gemini 3.5 Flash transcription, timestamped speaker-turn extraction, screenshot
   understanding, evidence-backed person learning, and independent WeSpeaker voiceprint
-  matching in the cloud; no Python runtime is present.
+  matching in the cloud; no Python runtime is present. Voice samples use append-only
+  active assignments and profile revisions so calibrated merge/split proposals can be
+  applied and reversed without deleting source observations or prior derivations.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini

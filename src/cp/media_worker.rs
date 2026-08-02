@@ -729,8 +729,9 @@ fn bind_person_to_speaker_observation(
 ) -> Result<bool> {
     let profile: Option<(i64, Option<i64>)> = conn
         .query_row(
-            "SELECT v.id,v.person_id FROM voice_samples s JOIN voice_profiles v \
-             ON v.id=s.voice_profile_id WHERE s.speaker_observation_id=?1 \
+            "SELECT v.id,v.person_id FROM voice_samples s \
+             JOIN voice_sample_profile_assignments a ON a.sample_id=s.id AND a.active=1 \
+             JOIN voice_profiles v ON v.id=a.profile_id WHERE s.speaker_observation_id=?1 \
              AND s.accepted=1 ORDER BY s.id DESC LIMIT 1",
             [speaker_observation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -744,6 +745,11 @@ fn bind_person_to_speaker_observation(
             "UPDATE voice_profiles SET person_id=?1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
              WHERE id=?2 AND (person_id IS NULL OR person_id=?1)",
             params![person_id, profile_id],
+        )?;
+        super::voice_lineage::refresh_profile_revision(
+            conn,
+            profile_id,
+            "identity_binding_updated",
         )?;
     }
     conn.execute(
@@ -817,8 +823,9 @@ fn promote_screen_name_if_corroborated(
     let _ = bind_person_to_speaker_observation(conn, observation_id, person_id)?;
     let voice_profile_id: Option<i64> = conn
         .query_row(
-            "SELECT voice_profile_id FROM voice_samples WHERE speaker_observation_id=?1 \
-             AND accepted=1 ORDER BY id DESC LIMIT 1",
+            "SELECT a.profile_id FROM voice_samples s \
+             JOIN voice_sample_profile_assignments a ON a.sample_id=s.id AND a.active=1 \
+             WHERE s.speaker_observation_id=?1 AND s.accepted=1 ORDER BY s.id DESC LIMIT 1",
             [observation_id],
             |row| row.get(0),
         )
@@ -991,8 +998,10 @@ fn persist_audio_window_result(
             .flatten();
         let voice_binding: Option<(i64, Option<i64>)> = tx
             .query_row(
-                "SELECT v.id,v.person_id FROM voice_samples s JOIN voice_profiles v \
-                 ON v.id=s.voice_profile_id WHERE s.speaker_observation_id=?1 AND s.accepted=1 \
+                "SELECT v.id,v.person_id FROM voice_samples s \
+                 JOIN voice_sample_profile_assignments a ON a.sample_id=s.id AND a.active=1 \
+                 JOIN voice_profiles v ON v.id=a.profile_id \
+                 WHERE s.speaker_observation_id=?1 AND s.accepted=1 \
                  ORDER BY s.id DESC LIMIT 1",
                 [speaker_observation_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1758,6 +1767,21 @@ async fn process_user(state: &CpState, user_id: &str) {
         Ok(_) => {}
         Err(error) => {
             warn!(user_id, error = %error, "bounded voice-profile reconciliation failed");
+        }
+    }
+    match state
+        .store
+        .with_user(user_id, |conn| {
+            super::voice_lineage::process_lineage_actions(conn, 10)
+        })
+        .await
+    {
+        Ok(processed) if processed > 0 => {
+            let _ = state.store.save_user(user_id).await;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(user_id, error = %error, "bounded voice-profile lineage action failed");
         }
     }
 }

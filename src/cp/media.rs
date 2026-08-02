@@ -982,6 +982,9 @@ async fn list_people(
             let mut statement = conn.prepare(
                 "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
                  FROM people p LEFT JOIN voice_profiles v ON v.person_id=p.id \
+                   AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                     WHERE r.profile_id=v.id AND r.active=1 \
+                       AND r.status IN ('quarantined','superseded','split')) \
                  LEFT JOIN person_facts f ON f.person_id=p.id AND f.status='active' \
                  WHERE p.status='identified' AND p.display_name IS NOT NULL AND p.id>?1 \
                  AND (?2 IS NULL OR lower(p.display_name) LIKE ?2 OR EXISTS (\
@@ -1105,6 +1108,9 @@ fn load_person_profile(conn: &Connection, person_id: i64) -> Result<PersonProfil
         .query_row(
             "SELECT p.id,p.display_name,COUNT(DISTINCT v.id),COUNT(DISTINCT f.id),p.updated_at \
              FROM people p LEFT JOIN voice_profiles v ON v.person_id=p.id \
+               AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                 WHERE r.profile_id=v.id AND r.active=1 \
+                   AND r.status IN ('quarantined','superseded','split')) \
              LEFT JOIN person_facts f ON f.person_id=p.id AND f.status='active' \
              WHERE p.id=?1 AND p.status='identified' GROUP BY p.id",
             [person_id],
@@ -1121,16 +1127,27 @@ fn load_person_profile(conn: &Connection, person_id: i64) -> Result<PersonProfil
         .optional()?
         .ok_or(EnclaveError::NotFound)?;
     let mut voice_statement = conn.prepare(
-        "SELECT label FROM voice_profiles WHERE person_id=?1 AND status<>'quarantined' ORDER BY id",
+        "SELECT label FROM voice_profiles v WHERE person_id=?1 AND status<>'quarantined' \
+         AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+           WHERE r.profile_id=v.id AND r.active=1 \
+             AND r.status IN ('quarantined','superseded','split')) ORDER BY id",
     )?;
     let voice_labels = voice_statement
         .query_map([person_id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let (stable_profiles, accepted_samples): (i64, i64) = conn.query_row(
         "SELECT \
-           (SELECT COUNT(*) FROM voice_profiles WHERE person_id=?1 AND status='stable'),\
-           (SELECT COUNT(*) FROM voice_samples s JOIN voice_profiles v ON v.id=s.voice_profile_id \
-            WHERE v.person_id=?1 AND s.accepted=1 AND s.eligibility='enroll' AND s.outlier=0)",
+           (SELECT COUNT(*) FROM voice_profiles v WHERE person_id=?1 AND status='stable' \
+             AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+               WHERE r.profile_id=v.id AND r.active=1 \
+                 AND r.status IN ('quarantined','superseded','split'))),\
+           (SELECT COUNT(*) FROM voice_samples s \
+            JOIN voice_sample_profile_assignments a ON a.sample_id=s.id AND a.active=1 \
+            JOIN voice_profiles v ON v.id=a.profile_id \
+            WHERE v.person_id=?1 AND s.accepted=1 AND s.eligibility='enroll' AND s.outlier=0 \
+              AND NOT EXISTS (SELECT 1 FROM voice_profile_revisions r \
+                WHERE r.profile_id=v.id AND r.active=1 \
+                  AND r.status IN ('quarantined','superseded','split')))",
         [person_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1638,6 +1655,63 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             accepted INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
+        CREATE TABLE IF NOT EXISTS voice_profile_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK (kind IN ('merge','split')),
+            state TEXT NOT NULL DEFAULT 'proposed' CHECK (state IN ('proposed','approved','applied','revert_requested','rejected','reverted')),
+            scorer_version INTEGER NOT NULL,
+            derivation_version INTEGER NOT NULL,
+            reason_code TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS voice_profile_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('tentative','stable','quarantined','superseded','split')),
+            derivation_version INTEGER NOT NULL,
+            scorer_version INTEGER NOT NULL,
+            representative_kind TEXT NOT NULL,
+            centroid BLOB NOT NULL,
+            sample_count INTEGER NOT NULL,
+            medoid_sample_id INTEGER REFERENCES voice_samples(id) ON DELETE SET NULL,
+            person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+            proposal_id INTEGER REFERENCES voice_profile_proposals(id) ON DELETE SET NULL,
+            predecessor_revision_id INTEGER REFERENCES voice_profile_revisions(id) ON DELETE SET NULL,
+            reason_code TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_profile_revisions_active
+            ON voice_profile_revisions(profile_id) WHERE active=1;
+        CREATE TABLE IF NOT EXISTS voice_sample_profile_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_id INTEGER NOT NULL REFERENCES voice_samples(id) ON DELETE CASCADE,
+            profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+            proposal_id INTEGER REFERENCES voice_profile_proposals(id) ON DELETE SET NULL,
+            predecessor_assignment_id INTEGER REFERENCES voice_sample_profile_assignments(id) ON DELETE SET NULL,
+            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sample_assignment_active
+            ON voice_sample_profile_assignments(sample_id) WHERE active=1;
+        CREATE INDEX IF NOT EXISTS idx_voice_sample_assignment_profile
+            ON voice_sample_profile_assignments(profile_id,active,sample_id);
+        CREATE TABLE IF NOT EXISTS voice_profile_proposal_profiles (
+            proposal_id INTEGER NOT NULL REFERENCES voice_profile_proposals(id) ON DELETE CASCADE,
+            profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK (role IN ('source','result')),
+            partition_ordinal INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (proposal_id,profile_id,role)
+        );
+        CREATE TABLE IF NOT EXISTS voice_profile_proposal_samples (
+            proposal_id INTEGER NOT NULL REFERENCES voice_profile_proposals(id) ON DELETE CASCADE,
+            sample_id INTEGER NOT NULL REFERENCES voice_samples(id) ON DELETE CASCADE,
+            source_profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+            partition_ordinal INTEGER NOT NULL,
+            PRIMARY KEY (proposal_id,sample_id)
+        );
         CREATE TABLE IF NOT EXISTS identity_evidence (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person_id INTEGER REFERENCES people(id) ON DELETE CASCADE,
@@ -1866,6 +1940,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     ] {
         add_column_if_missing(conn, "person_facts", column, alteration)?;
     }
+    super::voice_lineage::backfill_profile_lineage(conn)?;
     Ok(())
 }
 
@@ -2643,6 +2718,11 @@ mod tests {
             "speaker_observation_sources",
             "voice_profiles",
             "voice_samples",
+            "voice_profile_proposals",
+            "voice_profile_revisions",
+            "voice_sample_profile_assignments",
+            "voice_profile_proposal_profiles",
+            "voice_profile_proposal_samples",
             "identity_evidence",
             "people",
             "person_name_claims",
@@ -3040,6 +3120,17 @@ mod tests {
             ("people", "display_name, id"),
             ("voice_profiles", "person_id, id"),
             ("voice_samples", "speaker_observation_id, id"),
+            ("voice_profile_proposals", "created_at, id"),
+            ("voice_profile_revisions", "profile_id, id"),
+            ("voice_sample_profile_assignments", "sample_id, id"),
+            (
+                "voice_profile_proposal_profiles",
+                "proposal_id, role, partition_ordinal, profile_id",
+            ),
+            (
+                "voice_profile_proposal_samples",
+                "proposal_id, partition_ordinal, sample_id",
+            ),
             ("identity_evidence", "created_at, id"),
             ("person_name_claims", "observed_at, id"),
             ("profile_identity_bindings", "updated_at, id"),

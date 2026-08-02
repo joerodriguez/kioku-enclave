@@ -376,12 +376,21 @@ person returns `404`. Unknown query fields return `400`.
   versioned medoid/trimmed centroid with outlier rejection. Independent
   WeSpeaker embeddings then match later turns; Gemini never receives
   voiceprints or acts as a biometric identifier.
+- Profile reconciliation retains append-only revisions and sample-assignment
+  history. A merge proposal is accepted only across the same embedding space,
+  scorer, acoustic domain, and nonconflicting identity; a split is anonymous
+  unless identity-aware correction has resolved it. Applied proposals replace
+  the current derived labels without mutating source turns and are reversible
+  only while doing so cannot orphan later samples. Superseded/split profiles
+  are excluded from matching and People coverage. Similarity-driven proposal
+  generation remains disabled until its versioned real-corpus gates pass.
 - Facts may be learned from every confidently attributed turn, not only an
   introduction. Facts retain source event/turn, observed time, literal evidence,
   confidence, derivation version, and temporal supersession history.
 - Raw encrypted media is retained for 30 days to support processing retries and
-  voice-profile reconciliation, then deleted automatically. Account deletion
-  removes raw objects, derived records, profiles, credentials, and the encrypted
-  user database.
+  voice-profile reconciliation, then deleted automatically. Account export
+  includes profile proposals, revisions, and sample-assignment lineage. Account
+  deletion removes raw objects, derived records, profiles, lineage, credentials,
+  and the encrypted user database.
 - Server logs may contain operational IDs, counts, states, and error classes,
   but never media, transcripts, URLs, names, facts, tokens, or key material.
