@@ -820,7 +820,9 @@ CREATE TABLE IF NOT EXISTS episodes (
     finalization_version INTEGER,
     finalization_status TEXT NOT NULL DEFAULT 'pending_horizon',
     finalization_error TEXT,
-    finalization_attempted_at TEXT
+    finalization_attempted_at TEXT,
+    finalization_attempt_count INTEGER NOT NULL DEFAULT 0,
+    finalization_next_attempt_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_started_at ON episodes(started_at);
 
@@ -1442,6 +1444,8 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         "ALTER TABLE episodes ADD COLUMN finalization_status TEXT NOT NULL DEFAULT 'pending_horizon';",
         "ALTER TABLE episodes ADD COLUMN finalization_error TEXT;",
         "ALTER TABLE episodes ADD COLUMN finalization_attempted_at TEXT;",
+        "ALTER TABLE episodes ADD COLUMN finalization_attempt_count INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE episodes ADD COLUMN finalization_next_attempt_at TEXT;",
     ] {
         if let Err(e) = conn.execute_batch(col_def) {
             let msg = e.to_string();
@@ -1450,26 +1454,29 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             }
         }
     }
-    // Version 3 introduces OCR salience and deictic entity retention. Existing
-    // briefs remain readable while their status makes the queued regeneration
-    // visible. Unfinalized rows retain the horizon default.
-    conn.execute(
-        "UPDATE episodes
-         SET finalization_status = 'regeneration_queued',
-             finalization_error = NULL
-         WHERE finalized_at IS NOT NULL
-           AND COALESCE(finalization_version, 1) < ?1
-           AND finalization_status IN ('complete', 'pending_horizon')",
-        [EPISODE_FINALIZATION_VERSION],
-    )?;
+    // Historical briefs remain readable but are never automatically sent back
+    // to a paid model merely because the analysis schema changed. A scoped
+    // user/operator action can still request regeneration explicitly.
     conn.execute(
         "UPDATE episodes
          SET finalization_status = 'complete',
-             finalization_error = NULL
-         WHERE finalized_at IS NOT NULL
-           AND COALESCE(finalization_version, 1) >= ?1
-           AND finalization_status != 'complete'",
-        [EPISODE_FINALIZATION_VERSION],
+             finalization_error = NULL,
+             finalization_attempt_count = 0,
+             finalization_next_attempt_at = NULL
+         WHERE finalized_at IS NOT NULL",
+        [],
+    )?;
+    // Quarantine the pre-guard retry loop. Its attempt count was not persisted,
+    // so treating it as fresh would immediately repeat the production incident.
+    conn.execute(
+        "UPDATE episodes
+         SET finalization_status = 'failed_terminal',
+             finalization_error = 'legacy unbounded retry quarantined; retry explicitly',
+             finalization_attempt_count = 3,
+             finalization_next_attempt_at = NULL
+         WHERE finalized_at IS NULL
+           AND finalization_status IN ('retry_model', 'processing')",
+        [],
     )?;
 
     // ADR-0011/0012: canonical briefs, generic webhook outbox, and watermarks.
@@ -2032,7 +2039,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn finalization_v5_migration_queues_stale_briefs_and_keeps_current_complete() {
+    fn finalization_migration_never_auto_queues_historical_briefs() {
         init_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -2065,8 +2072,18 @@ pub(crate) mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(stale, ("regeneration_queued".into(), None));
+        assert_eq!(stale, ("complete".into(), None));
         assert_eq!(current, ("complete".into(), None));
+
+        let retry_columns: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT finalization_attempt_count, finalization_next_attempt_at \
+                 FROM episodes WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retry_columns, (0, None));
     }
 
     #[test]

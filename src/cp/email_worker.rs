@@ -459,6 +459,7 @@ mod tests {
             quota_utterances_per_day: 1,
             quota_screenshots_per_day: 1,
             quota_mcp_calls_per_day: 1,
+            quota_vertex_output_tokens_per_day: 524_288,
             web_origin: "http://localhost:3000".into(),
             reviewer_auth: None,
         })

@@ -41,11 +41,13 @@ CREATE TABLE IF NOT EXISTS users (
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
-    user_id     TEXT NOT NULL,
-    day         TEXT NOT NULL,
-    utterances  INTEGER NOT NULL DEFAULT 0,
-    screenshots INTEGER NOT NULL DEFAULT 0,
-    mcp_calls   INTEGER NOT NULL DEFAULT 0,
+    user_id              TEXT NOT NULL,
+    day                  TEXT NOT NULL,
+    utterances           INTEGER NOT NULL DEFAULT 0,
+    screenshots          INTEGER NOT NULL DEFAULT 0,
+    mcp_calls            INTEGER NOT NULL DEFAULT 0,
+    vertex_requests      INTEGER NOT NULL DEFAULT 0,
+    vertex_output_tokens INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, day)
 );
 CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -466,6 +468,17 @@ impl ControlStore {
         drop(temp_file);
         let conn = Connection::open(&temp_path)?;
         conn.execute_batch(SCHEMA)?;
+        let mut schema_migrations = 0;
+        for column in [
+            "ALTER TABLE usage_daily ADD COLUMN vertex_requests INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_daily ADD COLUMN vertex_output_tokens INTEGER NOT NULL DEFAULT 0",
+        ] {
+            match conn.execute(column, []) {
+                Ok(_) => schema_migrations += 1,
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         // Historical builds retained raw search text in the central accounting
         // DB. Remove it during load so the migration is automatic and durable.
         let redacted_queries = conn.execute(
@@ -477,11 +490,11 @@ impl ControlStore {
             meta,
             temp_path,
         };
-        if redacted_queries > 0 {
+        if redacted_queries > 0 || schema_migrations > 0 {
             self.flush(&mut handle).await?;
             info!(
                 rows = redacted_queries,
-                "redacted legacy control-plane query text"
+                schema_migrations, "control DB migrated"
             );
         }
         pending_temp.disarm();

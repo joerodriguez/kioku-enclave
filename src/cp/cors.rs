@@ -88,6 +88,7 @@ mod tests {
             quota_utterances_per_day: 0,
             quota_screenshots_per_day: 0,
             quota_mcp_calls_per_day: 0,
+            quota_vertex_output_tokens_per_day: 524_288,
             web_origin: web_origin.to_string(),
             reviewer_auth: None,
         });
