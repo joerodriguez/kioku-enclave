@@ -121,6 +121,7 @@ where
 }
 
 fn validate_resend_api_key(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim();
     if !api_key.starts_with("re_")
         || !(8..=256).contains(&api_key.len())
         || !api_key
@@ -129,7 +130,7 @@ fn validate_resend_api_key(api_key: String) -> Result<String, String> {
     {
         return Err("Resend API key has an invalid format".into());
     }
-    Ok(api_key)
+    Ok(api_key.to_string())
 }
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -833,6 +834,17 @@ mod email_startup_tests {
     async fn production_ignores_environment_key_and_fetches_secret_manager() {
         let key = resolve_resend_api_key(false, Some("re_environment_key".into()), || async {
             Ok("re_secret_manager_key".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(key.as_deref(), Some("re_secret_manager_key"));
+    }
+
+    #[tokio::test]
+    async fn production_normalizes_surrounding_whitespace_from_secret_manager() {
+        let key = resolve_resend_api_key(false, None, || async {
+            Ok("\n\tre_secret_manager_key\r\n".to_string())
         })
         .await
         .unwrap();
