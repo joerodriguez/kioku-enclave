@@ -123,7 +123,8 @@ invalidates that binding.
 
 The fetcher refuses an in-repository destination, uses HTTPS only, never
 replaces an existing mismatched archive, and verifies SHA-256 before making a
-download visible at its final path.
+download visible at its final path. The explicit private output directory must
+already exist.
 
 The check validates and hash-binds the manifest, semantically recomputes the
 report, and returns nonzero if the bundle is stale or any gate fails.

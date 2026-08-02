@@ -39,7 +39,10 @@ if [[ ! -s "$MANIFEST_PATH" ]]; then
 fi
 MANIFEST_PATH="$(cd "$(dirname "$MANIFEST_PATH")" && pwd -P)/$(basename "$MANIFEST_PATH")"
 
-mkdir -p "$OUTPUT_DIRECTORY"
+if [[ ! -d "$OUTPUT_DIRECTORY" ]]; then
+  echo "Error: create the private output directory before running this command." >&2
+  exit 1
+fi
 OUTPUT_DIRECTORY="$(cd "$OUTPUT_DIRECTORY" && pwd -P)"
 case "$OUTPUT_DIRECTORY" in
   /|"${REPO_ROOT}"|"${REPO_ROOT}/"*)
