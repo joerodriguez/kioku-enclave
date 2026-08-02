@@ -440,6 +440,43 @@ async fn main() {
         );
         return;
     }
+    if args.get(1).map(String::as_str) == Some("--validate-voice-eval-manifest") {
+        let path = args
+            .get(2)
+            .expect("--validate-voice-eval-manifest requires one manifest JSON path");
+        let raw = std::fs::read_to_string(path).expect("read voice evaluation manifest");
+        match cp::voice_eval::validate_manifest_json(&raw) {
+            Ok(sha256) => {
+                println!("Voice evaluation manifest is valid; raw-byte SHA-256: {sha256}")
+            }
+            Err(error) => {
+                eprintln!("Voice evaluation manifest validation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--check-voice-eval") {
+        let manifest_path = args
+            .get(2)
+            .expect("--check-voice-eval requires manifest, aggregate cases, and report paths");
+        let cases_path = args
+            .get(3)
+            .expect("--check-voice-eval requires manifest, aggregate cases, and report paths");
+        let report_path = args
+            .get(4)
+            .expect("--check-voice-eval requires manifest, aggregate cases, and report paths");
+        let manifest =
+            std::fs::read_to_string(manifest_path).expect("read voice evaluation manifest");
+        let cases = std::fs::read_to_string(cases_path).expect("read voice evaluation cases");
+        let report = std::fs::read_to_string(report_path).expect("read voice evaluation report");
+        if let Err(error) = cp::voice_eval::validate_release_bundle(&manifest, &cases, &report) {
+            eprintln!("Voice evaluation release gate failed: {error}");
+            std::process::exit(1);
+        }
+        println!("Voice evaluation release gates passed.");
+        return;
+    }
     // Structured logging; RUST_LOG overrides the default.
     tracing_subscriber::fmt()
         .with_env_filter(

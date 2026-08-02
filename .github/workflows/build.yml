@@ -100,6 +100,29 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy && rustup default 1.96.0
 
+      - name: Verify release tag identity and signature
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXPECTED_TAG="v$(grep '^version =' Cargo.toml | head -1 | cut -d '"' -f 2)"
+          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
+            echo "::error::Cargo version ${EXPECTED_TAG} does not match pushed tag ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "${GITHUB_REF_NAME}")" != "tag" ]]; then
+            echo "::error::Release source must be an annotated tag."
+            exit 1
+          fi
+          TAG_OBJECT_SHA="$(git rev-parse "${GITHUB_REF_NAME}^{tag}")"
+          if [[ "$(gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}" \
+            --jq .verification.verified)" != "true" ]]; then
+            echo "::error::GitHub could not verify the release tag signature."
+            exit 1
+          fi
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
@@ -108,6 +131,22 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      # A signed release tag is allowed to build only when its reviewed,
+      # content-free real-corpus report is present, current, and passing.
+      # Pull requests and main builds exercise the scorer tests without making
+      # a product-quality claim.
+      - name: ADR-0016 real voice quality release gate
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          test -s eval/voice/release-manifest-v1.json
+          test -s eval/voice/release-cases-v1.json
+          test -s eval/voice/release-report-v1.json
+          cargo run --locked --quiet -- \
+            --check-voice-eval \
+            eval/voice/release-manifest-v1.json \
+            eval/voice/release-cases-v1.json \
+            eval/voice/release-report-v1.json
 
       # RUSTSEC-2023-0071 affects RSA private-key operations. This service only
       # verifies third-party RS256 signatures and holds no RSA private key.
@@ -513,23 +552,26 @@ jobs:
           retention-days: 90
 
       - name: Automatically publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ steps.metadata.outputs.tag_name }}
         run: |
+          if [[ "${GITHUB_REF_NAME}" != "${TAG_NAME}" ]]; then
+            echo "::error::Cargo version ${TAG_NAME} does not match pushed tag ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "${TAG_NAME}")" != "tag" ]]; then
+            echo "::error::Release source must be an annotated tag created and verified by scripts/release.sh."
+            exit 1
+          fi
+
           if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             echo "Release ${TAG_NAME} already exists. Skipping release publication."
             exit 0
           fi
 
-          echo "Publishing automated GitHub Release for ${TAG_NAME}..."
-          if ! git rev-parse "${TAG_NAME}" >/dev/null 2>&1; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag -a "${TAG_NAME}" -m "Kioku enclave ${TAG_NAME}" "${GITHUB_SHA}"
-            git push origin "${TAG_NAME}" || true
-          fi
-
+          echo "Publishing GitHub Release for the verified signed tag ${TAG_NAME}..."
           gh release create "${TAG_NAME}" \
             enclave-release.json \
             enclave-provenance.jsonl \
