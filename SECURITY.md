@@ -76,9 +76,12 @@ surfaces.
   Source profiles and assignment history are retained; reversal fails closed if a
   result acquired later samples. No similarity threshold can auto-apply a proposal
   until the hash-bound real-audio release corpus has calibrated that scorer version.
-- Real voice-quality releases require schema-v2 evidence derived by the public
-  reducer. It pins the evaluated image/source/model/scorer plus export and
-  post-delete artifact hashes, derives all release counters from opaque timing and
+- Real voice-quality releases require schema-v3 evidence derived by the public
+  reducer plus a schema-v2 source manifest. Separately hashed media/label/bundle/
+  augmentation artifacts, licensed-playback lineage, physical-capture assertions,
+  authorization hashes, and exact device/UI routes fail closed before scoring. The
+  reducer pins the evaluated image/source/model/scorer plus export and post-delete
+  artifact hashes, derives all release counters from opaque timing and
   exact record sets. Every predicted speaker has exactly one identity-decision row;
   every reference speaker has exactly one case; and a case's predicted person/state
   must match the hypothesis chosen by the scorer's deterministic global diarization

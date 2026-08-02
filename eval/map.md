@@ -6,4 +6,4 @@ content-free scored decisions may be committed.
 
 | Path | Role |
 |---|---|
-| [voice/](voice/map.md) | ADR-0016 licensed-source manifest/fetch workflow plus voice, identity, diarization, collision, provenance, export, and deletion release scoring |
+| [voice/](voice/map.md) | ADR-0016 multi-artifact licensed-source/physical-capture manifest and fetch workflow plus voice, identity, diarization, collision, provenance, export, and deletion release scoring |

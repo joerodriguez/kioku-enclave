@@ -139,14 +139,14 @@ jobs:
       - name: ADR-0016 real voice quality release gate
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          test -s eval/voice/release-manifest-v1.json
-          test -s eval/voice/release-cases-v1.json
-          test -s eval/voice/release-report-v1.json
+          test -s eval/voice/release-manifest.json
+          test -s eval/voice/release-cases.json
+          test -s eval/voice/release-report.json
           cargo run --locked --quiet -- \
             --check-voice-eval \
-            eval/voice/release-manifest-v1.json \
-            eval/voice/release-cases-v1.json \
-            eval/voice/release-report-v1.json
+            eval/voice/release-manifest.json \
+            eval/voice/release-cases.json \
+            eval/voice/release-report.json
 
       # RUSTSEC-2023-0071 affects RSA private-key operations. This service only
       # verifies third-party RS256 signatures and holds no RSA private key.

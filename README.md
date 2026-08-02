@@ -50,7 +50,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   applied and reversed without deleting source observations or prior derivations.
 - Publishes the ADR-0016 voice evaluation reducer and schema. Release CI recomputes
   overlap-aware diarization and identity/fact/export/delete metrics from hash-bound,
-  content-free schema-v2 evidence. Identity decisions include denominator-visible
+  content-free schema-v3 evidence bound to a schema-v2 multi-artifact source and
+  authorized physical-route manifest. Identity decisions include denominator-visible
   precision, wrong-binding, cross-meeting, after-three-sample, and abstention metrics
   for every corpus slice. Each claimed identity is bound to the predicted speaker chosen
   by the same deterministic global mapping used for diarization error; synthetic or

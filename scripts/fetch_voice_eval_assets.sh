@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch the exact licensed archives named by an ADR-0016 release manifest.
+# Fetch the exact licensed artifacts named by an ADR-0016 release manifest.
 # Media is required to live outside the public source checkout.
 
 set -euo pipefail
@@ -63,19 +63,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-while IFS=$'\t' read -r source_id archive_url expected_sha256; do
-  archive_path="${OUTPUT_DIRECTORY}/${source_id}.archive"
-  if [[ -e "$archive_path" ]]; then
-    actual_sha256="$("${SHA256_COMMAND[@]}" "$archive_path" | awk '{print $1}')"
+while IFS=$'\t' read -r source_id artifact_id artifact_url expected_sha256; do
+  artifact_path="${OUTPUT_DIRECTORY}/${source_id}.${artifact_id}.asset"
+  if [[ -e "$artifact_path" ]]; then
+    actual_sha256="$("${SHA256_COMMAND[@]}" "$artifact_path" | awk '{print $1}')"
     if [[ "$actual_sha256" != "$expected_sha256" ]]; then
-      echo "Error: existing archive has the wrong SHA-256: $archive_path" >&2
+      echo "Error: existing artifact has the wrong SHA-256: $artifact_path" >&2
       exit 1
     fi
-    echo "Verified existing licensed archive: $source_id"
+    echo "Verified existing licensed artifact: ${source_id}/${artifact_id}"
     continue
   fi
 
-  temporary_path="$(mktemp "${OUTPUT_DIRECTORY}/.${source_id}.download.XXXXXX")"
+  temporary_path="$(mktemp "${OUTPUT_DIRECTORY}/.${source_id}.${artifact_id}.download.XXXXXX")"
   curl \
     --fail \
     --location \
@@ -86,19 +86,19 @@ while IFS=$'\t' read -r source_id archive_url expected_sha256; do
     --silent \
     --tlsv1.2 \
     --output "$temporary_path" \
-    "$archive_url"
+    "$artifact_url"
   actual_sha256="$("${SHA256_COMMAND[@]}" "$temporary_path" | awk '{print $1}')"
   if [[ "$actual_sha256" != "$expected_sha256" ]]; then
-    echo "Error: downloaded archive SHA-256 mismatch for $source_id" >&2
+    echo "Error: downloaded artifact SHA-256 mismatch for ${source_id}/${artifact_id}" >&2
     exit 1
   fi
-  mv -n "$temporary_path" "$archive_path"
+  mv -n "$temporary_path" "$artifact_path"
   if [[ -e "$temporary_path" ]]; then
-    echo "Error: archive appeared concurrently; refusing to replace it: $archive_path" >&2
+    echo "Error: artifact appeared concurrently; refusing to replace it: $artifact_path" >&2
     exit 1
   fi
   temporary_path=""
-  echo "Fetched and verified licensed archive: $source_id"
-done < <(jq -er '.sources[] | [.id, .archive_url, .archive_sha256] | @tsv' "$MANIFEST_PATH")
+  echo "Fetched and verified licensed artifact: ${source_id}/${artifact_id}"
+done < <(jq -er '.sources[] as $source | $source.artifacts[] | [$source.id, .id, .url, .sha256] | @tsv' "$MANIFEST_PATH")
 
-echo "All licensed evaluation archives are present and hash-verified in $OUTPUT_DIRECTORY"
+echo "All licensed evaluation artifacts are present and hash-verified in $OUTPUT_DIRECTORY"

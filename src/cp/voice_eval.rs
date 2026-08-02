@@ -115,34 +115,46 @@ pub struct SliceIdentityMetrics {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EvaluationManifest {
-    schema_version: u32,
-    corpus_id: String,
-    sources: Vec<EvaluationSource>,
-    owner_fixtures: Vec<OwnerFixture>,
+pub(crate) struct EvaluationManifest {
+    pub(crate) schema_version: u32,
+    pub(crate) corpus_id: String,
+    pub(crate) sources: Vec<EvaluationSource>,
+    pub(crate) owner_fixtures: Vec<OwnerFixture>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EvaluationSource {
-    id: String,
-    archive_url: String,
-    license_id: String,
-    license_url: String,
-    archive_sha256: String,
-    selected_item_ids: Vec<String>,
-    slices: Vec<String>,
-    derivation_command: String,
+pub(crate) struct EvaluationSource {
+    pub(crate) id: String,
+    pub(crate) license_id: String,
+    pub(crate) license_url: String,
+    pub(crate) artifacts: Vec<EvaluationArtifact>,
+    pub(crate) selected_item_ids: Vec<String>,
+    pub(crate) slices: Vec<String>,
+    pub(crate) derivation_command: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OwnerFixture {
-    id: String,
-    media_sha256: String,
-    labels_sha256: String,
-    authorization_record_sha256: String,
-    slices: Vec<String>,
+pub(crate) struct EvaluationArtifact {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) url: String,
+    pub(crate) sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OwnerFixture {
+    pub(crate) id: String,
+    pub(crate) media_sha256: String,
+    pub(crate) labels_sha256: String,
+    pub(crate) authorization_record_sha256: String,
+    pub(crate) physical_capture: bool,
+    pub(crate) capture_origin: String,
+    pub(crate) derived_from_source_ids: Vec<String>,
+    pub(crate) capture_routes: Vec<String>,
+    pub(crate) slices: Vec<String>,
 }
 
 const REQUIRED_REAL_SLICES: &[&str] = &[
@@ -226,7 +238,7 @@ fn require_https_url(value: &str, field: &str) -> Result<()> {
 }
 
 fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
-    if manifest.schema_version != 1 || !valid_opaque_id(&manifest.corpus_id) {
+    if manifest.schema_version != 2 || !valid_opaque_id(&manifest.corpus_id) {
         return Err(EnclaveError::InvalidRequest(
             "invalid voice evaluation manifest schema or corpus ID".into(),
         ));
@@ -243,6 +255,7 @@ fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
     }
     let allowed_slices = REQUIRED_REAL_SLICES.iter().copied().collect::<HashSet<_>>();
     let mut ids = HashSet::new();
+    let mut source_ids = HashSet::new();
     let mut covered_slices = HashSet::new();
     for source in &manifest.sources {
         if !valid_opaque_id(&source.id) || !ids.insert(source.id.as_str()) {
@@ -250,13 +263,15 @@ fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
                 "manifest source IDs must be unique opaque identifiers".into(),
             ));
         }
-        require_https_url(&source.archive_url, "archive_url")?;
+        source_ids.insert(source.id.as_str());
         require_https_url(&source.license_url, "license_url")?;
         if source.license_id.is_empty()
             || source.license_id.len() > 128
-            || !valid_sha256(&source.archive_sha256)
+            || source.artifacts.is_empty()
+            || source.artifacts.len() > 64
             || source.selected_item_ids.is_empty()
             || source.selected_item_ids.len() > 10_000
+            || source.slices.is_empty()
             || source.derivation_command.is_empty()
             || source.derivation_command.len() > 2_048
         {
@@ -265,17 +280,44 @@ fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
                     .into(),
             ));
         }
-        for selected in &source.selected_item_ids {
-            if !valid_opaque_id(selected) {
+        let mut artifact_ids = HashSet::new();
+        let mut has_signal_artifact = false;
+        for artifact in &source.artifacts {
+            require_https_url(&artifact.url, "artifact url")?;
+            if !valid_opaque_id(&artifact.id)
+                || !artifact_ids.insert(artifact.id.as_str())
+                || !matches!(
+                    artifact.kind.as_str(),
+                    "media" | "labels" | "bundle" | "augmentation"
+                )
+                || !valid_sha256(&artifact.sha256)
+            {
                 return Err(EnclaveError::InvalidRequest(
-                    "manifest selected item IDs must be opaque identifiers".into(),
+                    "manifest source artifacts must have unique opaque IDs, supported kinds, HTTPS URLs, and SHA-256 bindings"
+                        .into(),
+                ));
+            }
+            has_signal_artifact |=
+                matches!(artifact.kind.as_str(), "media" | "bundle" | "augmentation");
+        }
+        if !has_signal_artifact {
+            return Err(EnclaveError::InvalidRequest(
+                "manifest source must contain a media, bundle, or augmentation artifact".into(),
+            ));
+        }
+        let mut selected_items = HashSet::new();
+        for selected in &source.selected_item_ids {
+            if !valid_opaque_id(selected) || !selected_items.insert(selected.as_str()) {
+                return Err(EnclaveError::InvalidRequest(
+                    "manifest selected item IDs must be unique opaque identifiers".into(),
                 ));
             }
         }
+        let mut source_slices = HashSet::new();
         for slice in &source.slices {
-            if !allowed_slices.contains(slice.as_str()) {
+            if !allowed_slices.contains(slice.as_str()) || !source_slices.insert(slice.as_str()) {
                 return Err(EnclaveError::InvalidRequest(format!(
-                    "unknown manifest slice: {slice}"
+                    "unknown or duplicate manifest slice: {slice}"
                 )));
             }
             covered_slices.insert(slice.as_str());
@@ -291,20 +333,81 @@ fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
         if !valid_sha256(&fixture.media_sha256)
             || !valid_sha256(&fixture.labels_sha256)
             || !valid_sha256(&fixture.authorization_record_sha256)
+            || !fixture.physical_capture
+            || !matches!(
+                fixture.capture_origin.as_str(),
+                "owner_speech" | "licensed_playback" | "mixed"
+            )
+            || fixture.derived_from_source_ids.len() > 32
+            || fixture.capture_routes.is_empty()
+            || fixture.capture_routes.len() > 8
             || fixture.slices.is_empty()
         {
             return Err(EnclaveError::InvalidRequest(
-                "owner fixture must bind media, labels, authorization, and slices".into(),
+                "owner fixture must bind physical media, labels, authorization, origin, routes, and slices"
+                    .into(),
             ));
         }
+        let mut derived_sources = HashSet::new();
+        for source_id in &fixture.derived_from_source_ids {
+            if !source_ids.contains(source_id.as_str())
+                || !derived_sources.insert(source_id.as_str())
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "owner fixture derivation must reference unique licensed manifest sources"
+                        .into(),
+                ));
+            }
+        }
+        let derived_source_required = matches!(
+            fixture.capture_origin.as_str(),
+            "licensed_playback" | "mixed"
+        );
+        if derived_source_required == fixture.derived_from_source_ids.is_empty() {
+            return Err(EnclaveError::InvalidRequest(
+                "owner fixture capture origin does not match its licensed-source lineage".into(),
+            ));
+        }
+        let allowed_routes = [
+            "mac_system_audio",
+            "mac_microphone",
+            "iphone_microphone",
+            "bluetooth",
+            "screen_capture",
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let mut routes = HashSet::new();
+        for route in &fixture.capture_routes {
+            if !allowed_routes.contains(route.as_str()) || !routes.insert(route.as_str()) {
+                return Err(EnclaveError::InvalidRequest(
+                    "owner fixture capture routes must be unique supported physical routes".into(),
+                ));
+            }
+        }
+        let mut fixture_slices = HashSet::new();
         for slice in &fixture.slices {
-            if !allowed_slices.contains(slice.as_str()) {
+            if !allowed_slices.contains(slice.as_str()) || !fixture_slices.insert(slice.as_str()) {
                 return Err(EnclaveError::InvalidRequest(format!(
-                    "unknown owner fixture slice: {slice}"
+                    "unknown or duplicate owner fixture slice: {slice}"
                 )));
             }
             covered_slices.insert(slice.as_str());
             owner_slices.insert(slice.as_str());
+        }
+        for (slice, required_route) in [
+            ("system_audio", "mac_system_audio"),
+            ("mac_microphone", "mac_microphone"),
+            ("iphone_microphone", "iphone_microphone"),
+            ("bluetooth", "bluetooth"),
+            ("active_speaker_ui", "screen_capture"),
+            ("same_display_name", "screen_capture"),
+        ] {
+            if fixture_slices.contains(slice) && !routes.contains(required_route) {
+                return Err(EnclaveError::InvalidRequest(format!(
+                    "owner fixture slice {slice} requires physical capture route {required_route}"
+                )));
+            }
         }
     }
     let missing = REQUIRED_REAL_SLICES
@@ -333,7 +436,7 @@ fn validate_manifest(manifest: &EvaluationManifest) -> Result<()> {
 }
 
 fn validate_corpus(corpus: &EvaluationCorpus) -> Result<()> {
-    if !matches!(corpus.schema_version, 1 | 2)
+    if !matches!(corpus.schema_version, 1 | 3)
         || !valid_opaque_id(&corpus.corpus_id)
         || !valid_sha256(&corpus.source_manifest_sha256)
         || corpus.cases.is_empty()
@@ -399,7 +502,7 @@ fn validate_corpus(corpus: &EvaluationCorpus) -> Result<()> {
             || corpus.cases.iter().any(|case| case.evidence.is_some())
         {
             return Err(EnclaveError::InvalidRequest(
-                "schema-v1 voice evaluation corpus cannot contain schema-v2 evidence".into(),
+                "schema-v1 voice evaluation corpus cannot contain evidence-derived fields".into(),
             ));
         }
     } else {
@@ -566,7 +669,7 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         .map(|slice| (*slice).to_string())
         .collect::<Vec<_>>();
     let mut slice_totals = BTreeMap::<String, (u64, u64)>::new();
-    if corpus.schema_version == 2 {
+    if corpus.schema_version == 3 {
         for (slice, metrics) in
             super::voice_eval_evidence::aggregate_diarization(corpus).unwrap_or_default()
         {
@@ -637,7 +740,7 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         .count();
     // Synthetic contract fixtures can exercise the scorer but can never make
     // a release quality claim by themselves.
-    let release_gates_pass = corpus.schema_version == 2
+    let release_gates_pass = corpus.schema_version == 3
         && duplicate_case_ids == 0
         && unknown_corpus_kind_count == 0
         && real_case_count > 0
@@ -746,7 +849,7 @@ pub fn validate_release_bundle(
             "voice evaluation cases are not bound to the exact checked-in source manifest".into(),
         ));
     }
-    if corpus.schema_version == 2 {
+    if corpus.schema_version == 3 {
         super::voice_eval_evidence::validate_manifest_bindings(manifest_raw, &corpus)?;
     }
     validate_release_report(corpus_raw, report_raw)
@@ -754,6 +857,8 @@ pub fn validate_release_bundle(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     const SYNTHETIC: &str = include_str!("../../eval/voice/synthetic-contract-v1.json");
@@ -996,14 +1101,18 @@ mod tests {
 
     fn passing_manifest_json() -> String {
         serde_json::json!({
-            "schema_version": 1,
-            "corpus_id": "real-release-v1",
+            "schema_version": 2,
+            "corpus_id": "real-release-v2",
             "sources": [{
                 "id": "ami-eval-subset",
-                "archive_url": "https://groups.inf.ed.ac.uk/ami/download/",
                 "license_id": "CC-BY-4.0",
                 "license_url": "https://groups.inf.ed.ac.uk/ami/corpus/license.shtml",
-                "archive_sha256": "a".repeat(64),
+                "artifacts": [{
+                    "id": "source-bundle",
+                    "kind": "bundle",
+                    "url": "https://groups.inf.ed.ac.uk/ami/download/source.tar",
+                    "sha256": "a".repeat(64)
+                }],
                 "selected_item_ids": ["meeting-001"],
                 "slices": REQUIRED_REAL_SLICES,
                 "derivation_command": "./eval/voice/derive.sh manifest.json"
@@ -1013,6 +1122,13 @@ mod tests {
                 "media_sha256": "b".repeat(64),
                 "labels_sha256": "c".repeat(64),
                 "authorization_record_sha256": "d".repeat(64),
+                "physical_capture": true,
+                "capture_origin": "licensed_playback",
+                "derived_from_source_ids": ["ami-eval-subset"],
+                "capture_routes": [
+                    "mac_system_audio", "mac_microphone", "iphone_microphone",
+                    "bluetooth", "screen_capture"
+                ],
                 "slices": [
                     "system_audio", "mac_microphone", "iphone_microphone",
                     "bluetooth", "active_speaker_ui", "same_display_name"
@@ -1020,6 +1136,93 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    #[test]
+    fn manifest_v2_binds_separate_artifacts_and_physical_capture_lineage() {
+        let manifest = serde_json::json!({
+            "schema_version": 2,
+            "corpus_id": "real-release-v2",
+            "sources": [{
+                "id": "ami-eval-subset",
+                "license_id": "CC-BY-4.0",
+                "license_url": "https://groups.inf.ed.ac.uk/ami/corpus/license.shtml",
+                "artifacts": [
+                    {
+                        "id": "meeting-audio",
+                        "kind": "media",
+                        "url": "https://groups.inf.ed.ac.uk/ami/audio.wav",
+                        "sha256": "a".repeat(64)
+                    },
+                    {
+                        "id": "manual-annotations",
+                        "kind": "labels",
+                        "url": "https://groups.inf.ed.ac.uk/ami/annotations.zip",
+                        "sha256": "b".repeat(64)
+                    }
+                ],
+                "selected_item_ids": ["meeting-001"],
+                "slices": REQUIRED_REAL_SLICES,
+                "derivation_command": "./eval/voice/derive.sh manifest.json"
+            }],
+            "owner_fixtures": [{
+                "id": "owner-device-matrix-v2",
+                "media_sha256": "c".repeat(64),
+                "labels_sha256": "d".repeat(64),
+                "authorization_record_sha256": "e".repeat(64),
+                "physical_capture": true,
+                "capture_origin": "licensed_playback",
+                "derived_from_source_ids": ["ami-eval-subset"],
+                "capture_routes": [
+                    "mac_system_audio", "mac_microphone", "iphone_microphone",
+                    "bluetooth", "screen_capture"
+                ],
+                "slices": [
+                    "system_audio", "mac_microphone", "iphone_microphone",
+                    "bluetooth", "active_speaker_ui", "same_display_name"
+                ]
+            }]
+        })
+        .to_string();
+
+        assert_eq!(
+            validate_manifest_json(&manifest).unwrap(),
+            sha256_hex(manifest.as_bytes())
+        );
+    }
+
+    #[test]
+    fn manifest_v2_rejects_weak_artifact_and_physical_route_claims() {
+        let original: serde_json::Value = serde_json::from_str(&passing_manifest_json()).unwrap();
+
+        let mut duplicate_artifact = original.clone();
+        let artifact = duplicate_artifact["sources"][0]["artifacts"][0].clone();
+        duplicate_artifact["sources"][0]["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .push(artifact);
+        assert!(validate_manifest_json(&duplicate_artifact.to_string()).is_err());
+
+        let mut not_physical = original.clone();
+        not_physical["owner_fixtures"][0]["physical_capture"] = json!(false);
+        assert!(validate_manifest_json(&not_physical.to_string()).is_err());
+
+        let mut unknown_lineage = original.clone();
+        unknown_lineage["owner_fixtures"][0]["derived_from_source_ids"] = json!(["unknown-source"]);
+        assert!(validate_manifest_json(&unknown_lineage.to_string()).is_err());
+
+        let mut origin_mismatch = original.clone();
+        origin_mismatch["owner_fixtures"][0]["capture_origin"] = json!("owner_speech");
+        assert!(validate_manifest_json(&origin_mismatch.to_string()).is_err());
+
+        let mut missing_iphone_route = original;
+        missing_iphone_route["owner_fixtures"][0]["capture_routes"] = json!([
+            "mac_system_audio",
+            "mac_microphone",
+            "bluetooth",
+            "screen_capture"
+        ]);
+        assert!(validate_manifest_json(&missing_iphone_route.to_string()).is_err());
     }
 
     #[test]
@@ -1062,7 +1265,7 @@ mod tests {
         );
 
         let mut credentials: serde_json::Value = serde_json::from_str(&manifest).unwrap();
-        credentials["sources"][0]["archive_url"] =
+        credentials["sources"][0]["artifacts"][0]["url"] =
             serde_json::Value::String("https://user:password@example.com/archive".into());
         assert!(validate_manifest_json(&credentials.to_string()).is_err());
     }

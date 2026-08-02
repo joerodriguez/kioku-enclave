@@ -1,7 +1,8 @@
 //! Evidence-derived ADR-0016 release cases.
 //!
 //! Real release metrics must not be hand-authored counters. The private run
-//! input contains opaque speaker/person/record identifiers, source hashes, and
+//! schema-v3 input contains opaque speaker/person/record identifiers, exact
+//! reviewed source-artifact hashes, and
 //! timing and per-hypothesis identity decisions exported by the production
 //! pipeline. This module binds each identity case to the deterministic speaker
 //! mapping used for diarization error, binds that input to the reviewed source
@@ -16,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{EnclaveError, Result};
 
-use super::voice_eval::{EvaluationCase, EvaluationCorpus};
+use super::voice_eval::{EvaluationCase, EvaluationCorpus, EvaluationManifest};
 
 const MAX_RECORDINGS: usize = 10_000;
 const MAX_CASES: usize = 100_000;
@@ -56,6 +57,8 @@ pub struct DiarizationTurnEvidence {
 pub struct DiarizationRecordingEvidence {
     pub id: String,
     pub source_id: String,
+    pub media_artifact_id: Option<String>,
+    pub labels_artifact_id: Option<String>,
     pub selected_item_id: Option<String>,
     pub slice: String,
     pub media_sha256: String,
@@ -116,41 +119,6 @@ struct EvaluationRunEvidence {
     diarization_error_baselines: BTreeMap<String, f64>,
     recordings: Vec<DiarizationRecordingEvidence>,
     cases: Vec<CaseRunEvidence>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EvidenceManifest {
-    schema_version: u32,
-    corpus_id: String,
-    sources: Vec<EvidenceSource>,
-    owner_fixtures: Vec<EvidenceOwnerFixture>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EvidenceSource {
-    id: String,
-    archive_url: String,
-    license_id: String,
-    license_url: String,
-    archive_sha256: String,
-    selected_item_ids: Vec<String>,
-    slices: Vec<String>,
-    derivation_command: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EvidenceOwnerFixture {
-    id: String,
-    media_sha256: String,
-    labels_sha256: String,
-    authorization_record_sha256: String,
-    slices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,6 +391,14 @@ fn validate_recording_shape(recording: &DiarizationRecordingEvidence) -> Result<
     if !valid_hash_prefixed_id(&recording.id, "recording-")
         || !valid_opaque_id(&recording.source_id)
         || recording
+            .media_artifact_id
+            .as_deref()
+            .is_some_and(|id| !valid_opaque_id(id))
+        || recording
+            .labels_artifact_id
+            .as_deref()
+            .is_some_and(|id| !valid_opaque_id(id))
+        || recording
             .selected_item_id
             .as_deref()
             .is_some_and(|id| !valid_opaque_id(id))
@@ -532,7 +508,7 @@ fn validate_case_speaker_binding(
 }
 
 fn validate_recording_bindings(
-    manifest: &EvidenceManifest,
+    manifest: &EvaluationManifest,
     recordings: &[DiarizationRecordingEvidence],
 ) -> Result<()> {
     let sources = manifest
@@ -554,7 +530,9 @@ fn validate_recording_bindings(
             ));
         }
         if let Some(fixture) = fixtures.get(recording.source_id.as_str()) {
-            if recording.selected_item_id.is_some()
+            if recording.media_artifact_id.is_some()
+                || recording.labels_artifact_id.is_some()
+                || recording.selected_item_id.is_some()
                 || recording.media_sha256 != fixture.media_sha256
                 || recording.labels_sha256 != fixture.labels_sha256
                 || !fixture.slices.contains(&recording.slice)
@@ -565,14 +543,27 @@ fn validate_recording_bindings(
                 ));
             }
         } else if let Some(source) = sources.get(recording.source_id.as_str()) {
+            let media_artifact = recording
+                .media_artifact_id
+                .as_deref()
+                .and_then(|id| source.artifacts.iter().find(|artifact| artifact.id == id));
+            let labels_artifact = recording
+                .labels_artifact_id
+                .as_deref()
+                .and_then(|id| source.artifacts.iter().find(|artifact| artifact.id == id));
             if recording
                 .selected_item_id
                 .as_ref()
                 .is_none_or(|item| !source.selected_item_ids.contains(item))
+                || media_artifact
+                    .is_none_or(|artifact| !matches!(artifact.kind.as_str(), "media" | "bundle"))
+                || labels_artifact
+                    .is_none_or(|artifact| !matches!(artifact.kind.as_str(), "labels" | "bundle"))
                 || !source.slices.contains(&recording.slice)
             {
                 return Err(EnclaveError::InvalidRequest(
-                    "licensed recording does not match a reviewed selected item and slice".into(),
+                    "licensed recording does not match reviewed media/label artifacts, selected item, and slice"
+                        .into(),
                 ));
             }
         } else {
@@ -705,9 +696,9 @@ fn derive_case(evidence: CaseRunEvidence) -> Result<EvaluationCase> {
 
 pub fn build_cases_json(manifest_raw: &str, evidence_raw: &str) -> Result<String> {
     super::voice_eval::validate_manifest_json(manifest_raw)?;
-    let manifest: EvidenceManifest = serde_json::from_str(manifest_raw)?;
+    let manifest: EvaluationManifest = serde_json::from_str(manifest_raw)?;
     let evidence: EvaluationRunEvidence = serde_json::from_str(evidence_raw)?;
-    if evidence.schema_version != 2
+    if evidence.schema_version != 3
         || evidence.corpus_id != manifest.corpus_id
         || evidence.recordings.is_empty()
         || evidence.recordings.len() > MAX_RECORDINGS
@@ -772,7 +763,7 @@ pub fn build_cases_json(manifest_raw: &str, evidence_raw: &str) -> Result<String
         }
     }
     let corpus = EvaluationCorpus {
-        schema_version: 2,
+        schema_version: 3,
         corpus_id: evidence.corpus_id,
         source_manifest_sha256: sha256_hex(manifest_raw.as_bytes()),
         run_evidence_sha256: Some(sha256_hex(evidence_raw.as_bytes())),
@@ -788,7 +779,7 @@ pub fn build_cases_json(manifest_raw: &str, evidence_raw: &str) -> Result<String
 pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()> {
     let Some(run) = corpus.run.as_ref() else {
         return Err(EnclaveError::InvalidRequest(
-            "schema-v2 voice evaluation corpus is missing run metadata".into(),
+            "schema-v3 voice evaluation corpus is missing run metadata".into(),
         ));
     };
     validate_run(run)?;
@@ -800,7 +791,7 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
         || corpus.diarization_recordings.len() > MAX_RECORDINGS
     {
         return Err(EnclaveError::InvalidRequest(
-            "schema-v2 voice evaluation corpus is missing bounded evidence".into(),
+            "schema-v3 voice evaluation corpus is missing bounded evidence".into(),
         ));
     }
     let mut recordings_by_id = HashMap::new();
@@ -811,7 +802,7 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
             .is_some()
         {
             return Err(EnclaveError::InvalidRequest(
-                "schema-v2 diarization recording IDs must be unique".into(),
+                "schema-v3 diarization recording IDs must be unique".into(),
             ));
         }
     }
@@ -822,18 +813,18 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
     for case in &corpus.cases {
         let evidence = case.evidence.clone().ok_or_else(|| {
             EnclaveError::InvalidRequest(
-                "schema-v2 voice evaluation case is missing derivation evidence".into(),
+                "schema-v3 voice evaluation case is missing derivation evidence".into(),
             )
         })?;
         let recording = recordings_by_id
             .get(evidence.recording_id.as_str())
             .copied()
             .ok_or_else(|| {
-                EnclaveError::InvalidRequest("schema-v2 case recording binding is invalid".into())
+                EnclaveError::InvalidRequest("schema-v3 case recording binding is invalid".into())
             })?;
         if recording.slice != case.slice {
             return Err(EnclaveError::InvalidRequest(
-                "schema-v2 case recording binding is invalid".into(),
+                "schema-v3 case recording binding is invalid".into(),
             ));
         }
         validate_case_speaker_binding(recording, &evidence)?;
@@ -842,7 +833,7 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
             evidence.reference_speaker_id.clone(),
         )) {
             return Err(EnclaveError::InvalidRequest(
-                "schema-v2 reference speakers must have exactly one identity case".into(),
+                "schema-v3 reference speakers must have exactly one identity case".into(),
             ));
         }
         referenced_recordings.insert(evidence.recording_id.clone());
@@ -855,14 +846,14 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
         for record_id in &evidence.created_record_ids {
             if !global_records.insert(record_id.clone()) {
                 return Err(EnclaveError::InvalidRequest(
-                    "schema-v2 created record IDs are not globally unique".into(),
+                    "schema-v3 created record IDs are not globally unique".into(),
                 ));
             }
         }
         let derived = derive_case(evidence)?;
         if case != &derived {
             return Err(EnclaveError::InvalidRequest(
-                "schema-v2 voice evaluation derived fields were modified".into(),
+                "schema-v3 voice evaluation derived fields were modified".into(),
             ));
         }
     }
@@ -873,7 +864,7 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
             .any(|recording| !referenced_recordings.contains(&recording.id))
     {
         return Err(EnclaveError::InvalidRequest(
-            "every schema-v2 diarization recording must support at least one scored case".into(),
+            "every schema-v3 diarization recording must support at least one scored case".into(),
         ));
     }
     for recording in &corpus.diarization_recordings {
@@ -882,7 +873,7 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
             !scored_reference_speakers.contains(&(recording.id.clone(), speaker.clone()))
         }) {
             return Err(EnclaveError::InvalidRequest(
-                "every schema-v2 reference speaker must have exactly one identity case".into(),
+                "every schema-v3 reference speaker must have exactly one identity case".into(),
             ));
         }
     }
@@ -891,7 +882,7 @@ pub(crate) fn validate_generated_corpus(corpus: &EvaluationCorpus) -> Result<()>
         .any(|expected_people| expected_people.len() >= 2)
     {
         return Err(EnclaveError::InvalidRequest(
-            "schema-v2 release evidence must test two distinct people with the same display name"
+            "schema-v3 release evidence must test two distinct people with the same display name"
                 .into(),
         ));
     }
@@ -902,7 +893,7 @@ pub(crate) fn validate_manifest_bindings(
     manifest_raw: &str,
     corpus: &EvaluationCorpus,
 ) -> Result<()> {
-    let manifest: EvidenceManifest = serde_json::from_str(manifest_raw)?;
+    let manifest: EvaluationManifest = serde_json::from_str(manifest_raw)?;
     validate_recording_bindings(&manifest, &corpus.diarization_recordings)
 }
 
@@ -961,7 +952,7 @@ mod tests {
         let generated = build_cases_json(&manifest, &evidence).unwrap();
         let corpus: EvaluationCorpus = serde_json::from_str(&generated).unwrap();
 
-        assert_eq!(corpus.schema_version, 2);
+        assert_eq!(corpus.schema_version, 3);
         assert!(corpus.run_evidence_sha256.is_some());
         assert!(corpus.cases[0].accepted_name);
         assert_eq!(corpus.cases[0].fact_count, 1);
@@ -1076,6 +1067,30 @@ mod tests {
     }
 
     #[test]
+    fn recordings_must_bind_the_exact_reviewed_media_and_label_artifacts() {
+        let (manifest, evidence) = fixtures::passing_bundle();
+        let mut unknown_media: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        unknown_media["recordings"][0]["media_artifact_id"] = json!("unknown");
+        assert!(build_cases_json(&manifest, &unknown_media.to_string()).is_err());
+
+        let mut wrong_label_kind: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        wrong_label_kind["recordings"][0]["labels_artifact_id"] = json!("media");
+        assert!(build_cases_json(&manifest, &wrong_label_kind.to_string()).is_err());
+
+        let owner_recording = SLICES
+            .iter()
+            .position(|slice| *slice == "system_audio")
+            .unwrap();
+        let mut owner_claims_archive: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        owner_claims_archive["recordings"][owner_recording]["media_artifact_id"] = json!("media");
+        assert!(build_cases_json(&manifest, &owner_claims_archive.to_string()).is_err());
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        legacy["schema_version"] = json!(2);
+        assert!(build_cases_json(&manifest, &legacy.to_string()).is_err());
+    }
+
+    #[test]
     fn unmapped_reference_speech_forces_identity_abstention() {
         let (manifest, evidence) = fixtures::passing_bundle();
         let mut value: serde_json::Value = serde_json::from_str(&evidence).unwrap();
@@ -1184,10 +1199,22 @@ mod tests {
                 .map(|(index, slice)| {
                     json!({
                         "id": format!("source-{index}"),
-                        "archive_url": format!("https://example.com/source-{index}.tar"),
                         "license_id":"CC0-1.0",
                         "license_url":"https://example.com/license",
-                        "archive_sha256": format!("{index:064x}"),
+                        "artifacts":[
+                            {
+                                "id":"media",
+                                "kind":"media",
+                                "url":format!("https://example.com/source-{index}.wav"),
+                                "sha256":format!("{index:064x}")
+                            },
+                            {
+                                "id":"labels",
+                                "kind":"labels",
+                                "url":format!("https://example.com/source-{index}.labels"),
+                                "sha256":format!("{:064x}", index + 100)
+                            }
+                        ],
                         "selected_item_ids":[format!("item-{index}")],
                         "slices":[slice],
                         "derivation_command":"./derive --bounded"
@@ -1206,18 +1233,30 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, slice)| {
+                    let capture_route = match *slice {
+                        "system_audio" => "mac_system_audio",
+                        "mac_microphone" => "mac_microphone",
+                        "iphone_microphone" => "iphone_microphone",
+                        "bluetooth" => "bluetooth",
+                        "active_speaker_ui" | "same_display_name" => "screen_capture",
+                        _ => unreachable!(),
+                    };
                     json!({
                         "id":format!("owner-{index}"),
                         "media_sha256":format!("{:064x}", index + 1000),
                         "labels_sha256":format!("{:064x}", index + 2000),
                         "authorization_record_sha256":format!("{:064x}", index + 3000),
+                        "physical_capture":true,
+                        "capture_origin":"licensed_playback",
+                        "derived_from_source_ids":["source-0"],
+                        "capture_routes":[capture_route],
                         "slices":[slice]
                     })
                 })
                 .collect::<Vec<_>>();
             let manifest = json!({
-                "schema_version":1,
-                "corpus_id":"real-evidence-v1",
+                "schema_version":2,
+                "corpus_id":"real-evidence-v2",
                 "sources":sources,
                 "owner_fixtures":owner_fixtures
             })
@@ -1231,6 +1270,8 @@ mod tests {
                         json!({
                             "id":format!("recording-{index:016x}"),
                             "source_id":format!("owner-{owner_index}"),
+                            "media_artifact_id":null,
+                            "labels_artifact_id":null,
                             "selected_item_id":null,
                             "slice":slice,
                             "media_sha256":format!("{:064x}", owner_index + 1000),
@@ -1247,6 +1288,8 @@ mod tests {
                         json!({
                             "id":format!("recording-{index:016x}"),
                             "source_id":format!("source-{index}"),
+                            "media_artifact_id":"media",
+                            "labels_artifact_id":"labels",
                             "selected_item_id":format!("item-{index}"),
                             "slice":slice,
                             "media_sha256":format!("{:064x}", index + 4000),
@@ -1265,6 +1308,8 @@ mod tests {
             recordings.push(json!({
                 "id":"recording-ffffffffffffffff",
                 "source_id":"owner-5",
+                "media_artifact_id":null,
+                "labels_artifact_id":null,
                 "selected_item_id":null,
                 "slice":"same_display_name",
                 "media_sha256":format!("{:064x}", 1005),
@@ -1334,8 +1379,8 @@ mod tests {
                 "deleted_record_ids":["record-eeeeeeeeeeeeeee0","record-eeeeeeeeeeeeeee1"]
             }));
             let evidence = json!({
-                "schema_version":2,
-                "corpus_id":"real-evidence-v1",
+                "schema_version":3,
+                "corpus_id":"real-evidence-v2",
                 "run":{
                     "enclave_image_digest":format!("sha256:{}", "a".repeat(64)),
                     "evaluated_source_commit":"b".repeat(40),
@@ -1363,6 +1408,8 @@ mod tests {
             DiarizationRecordingEvidence {
                 id: "recording-aaaaaaaaaaaaaaaa".into(),
                 source_id: "source-1".into(),
+                media_artifact_id: Some("media".into()),
+                labels_artifact_id: Some("labels".into()),
                 selected_item_id: Some("item-1".into()),
                 slice: "overlap".into(),
                 media_sha256: "a".repeat(64),
