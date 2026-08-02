@@ -195,6 +195,15 @@ if [[ "$ROLLBACK_EXISTING" == "false" && "$RESUME_EXISTING" == "false" ]]; then
   cargo fmt --all -- --check
   cargo test --locked
   cargo clippy --locked --all-targets -- -D warnings
+  VOICE_EVAL_CASES="eval/voice/release-cases-v1.json"
+  VOICE_EVAL_REPORT="eval/voice/release-report-v1.json"
+  if [[ ! -s "$VOICE_EVAL_CASES" || ! -s "$VOICE_EVAL_REPORT" ]]; then
+    echo "Error: ADR-0016 requires checked-in real voice evaluation cases and a matching passing report." >&2
+    echo "       Expected $VOICE_EVAL_CASES and $VOICE_EVAL_REPORT; see eval/voice/README.md." >&2
+    exit 1
+  fi
+  cargo run --locked --quiet -- \
+    --check-voice-eval "$VOICE_EVAL_CASES" "$VOICE_EVAL_REPORT"
 fi
 
 verify_tag_signer() {

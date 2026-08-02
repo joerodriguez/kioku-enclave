@@ -1,20 +1,22 @@
 //! Public, content-free scoring harness for ADR-0016 voice/identity releases.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{EnclaveError, Result};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationCorpus {
     pub schema_version: u32,
     pub corpus_id: String,
+    #[serde(default)]
+    pub diarization_error_baselines: BTreeMap<String, f64>,
     pub cases: Vec<EvaluationCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationCase {
     pub id: String,
@@ -30,23 +32,48 @@ pub struct EvaluationCase {
     pub fact_count: u64,
     pub facts_with_provenance: u64,
     pub display_name_collision_group: Option<String>,
+    #[serde(default)]
+    pub new_record_count: u64,
+    #[serde(default)]
+    pub exported_new_record_count: u64,
+    #[serde(default)]
+    pub deleted_new_record_count: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationReport {
     pub schema_version: u32,
     pub corpus_id: String,
     pub case_count: usize,
     pub real_case_count: usize,
+    pub quality_case_count: usize,
     pub duplicate_case_ids: usize,
+    pub unknown_corpus_kind_count: usize,
+    pub accepted_name_decision_count: u64,
     pub accepted_name_precision: f64,
     pub wrong_person_accepted_binding_rate: f64,
+    pub cross_meeting_link_count: u64,
     pub cross_meeting_link_precision: f64,
+    pub after_three_sample_count: u64,
     pub recognition_recall_after_three: f64,
+    pub clean_remote_speech_ms: u64,
     pub clean_remote_diarization_error: f64,
+    pub diarization_error_by_slice: BTreeMap<String, f64>,
+    pub missing_diarization_baselines: Vec<String>,
+    pub invalid_diarization_baselines: Vec<String>,
+    pub diarization_regressions: Vec<String>,
     pub same_display_name_merges: usize,
+    pub fact_count: u64,
+    pub facts_with_provenance: u64,
     pub fact_provenance_coverage: f64,
-    pub missing_required_slices: Vec<&'static str>,
+    pub new_record_count: u64,
+    pub exported_new_record_count: u64,
+    pub deleted_new_record_count: u64,
+    pub export_coverage: f64,
+    pub delete_coverage: f64,
+    pub missing_metric_evidence: Vec<String>,
+    pub missing_required_slices: Vec<String>,
     pub release_gates_pass: bool,
 }
 
@@ -75,9 +102,11 @@ const REQUIRED_REAL_SLICES: &[&str] = &[
     "conflicting_evidence",
 ];
 
+const REGRESSION_SLICES: &[&str] = &["noise", "room_audio", "overlap"];
+
 fn ratio(numerator: u64, denominator: u64) -> f64 {
     if denominator == 0 {
-        1.0
+        0.0
     } else {
         numerator as f64 / denominator as f64
     }
@@ -91,43 +120,73 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
         .collect::<HashSet<_>>()
         .len();
     let duplicate_case_ids = corpus.cases.len() - unique_case_ids;
-    let accepted = corpus.cases.iter().filter(|case| case.accepted_name);
+    let real_cases = corpus
+        .cases
+        .iter()
+        .filter(|case| case.corpus_kind == "real_audio")
+        .collect::<Vec<_>>();
+    // The synthetic contract remains useful before a licensed corpus exists,
+    // but once real cases are present it cannot dilute or inflate release
+    // metrics. A release still requires real coverage below.
+    let quality_cases = if real_cases.is_empty() {
+        corpus.cases.iter().collect::<Vec<_>>()
+    } else {
+        real_cases.clone()
+    };
+    let accepted = quality_cases
+        .iter()
+        .copied()
+        .filter(|case| case.accepted_name);
     let accepted_count = accepted.clone().count() as u64;
     let correct_accepted = accepted
         .clone()
         .filter(|case| case.predicted_person.as_deref() == Some(case.expected_person.as_str()))
         .count() as u64;
     let wrong_accepted = accepted_count - correct_accepted;
-    let cross = corpus
-        .cases
+    let cross = quality_cases
         .iter()
+        .copied()
         .filter(|case| case.cross_meeting_link && case.predicted_person.is_some());
     let cross_count = cross.clone().count() as u64;
     let correct_cross = cross
         .filter(|case| case.predicted_person.as_deref() == Some(case.expected_person.as_str()))
         .count() as u64;
-    let after_three = corpus
-        .cases
+    let after_three = quality_cases
         .iter()
+        .copied()
         .filter(|case| case.after_three_high_quality_samples);
     let after_three_count = after_three.clone().count() as u64;
     let recognized_after_three = after_three
         .filter(|case| case.predicted_person.as_deref() == Some(case.expected_person.as_str()))
         .count() as u64;
-    let clean = corpus
-        .cases
+    let clean = quality_cases
         .iter()
+        .copied()
         .filter(|case| case.slice == "clean_remote_call");
     let clean_speech = clean.clone().map(|case| case.speech_ms).sum::<u64>();
     let clean_error = clean.map(|case| case.diarization_error_ms).sum::<u64>();
-    let facts = corpus.cases.iter().map(|case| case.fact_count).sum::<u64>();
-    let facts_with_provenance = corpus
-        .cases
+    let facts = quality_cases
+        .iter()
+        .map(|case| case.fact_count)
+        .sum::<u64>();
+    let facts_with_provenance = quality_cases
         .iter()
         .map(|case| case.facts_with_provenance)
         .sum::<u64>();
+    let new_records = quality_cases
+        .iter()
+        .map(|case| case.new_record_count)
+        .sum::<u64>();
+    let exported_new_records = quality_cases
+        .iter()
+        .map(|case| case.exported_new_record_count)
+        .sum::<u64>();
+    let deleted_new_records = quality_cases
+        .iter()
+        .map(|case| case.deleted_new_record_count)
+        .sum::<u64>();
     let mut collision_predictions: HashMap<&str, HashMap<&str, HashSet<&str>>> = HashMap::new();
-    for case in &corpus.cases {
+    for case in &quality_cases {
         if let (Some(group), Some(predicted)) = (
             case.display_name_collision_group.as_deref(),
             case.predicted_person.as_deref(),
@@ -151,48 +210,126 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
     let recognition_recall_after_three = ratio(recognized_after_three, after_three_count);
     let clean_remote_diarization_error = ratio(clean_error, clean_speech);
     let fact_provenance_coverage = ratio(facts_with_provenance, facts);
-    let real_case_count = corpus
-        .cases
+    let export_coverage = ratio(exported_new_records, new_records);
+    let delete_coverage = ratio(deleted_new_records, new_records);
+    let real_case_count = real_cases.len();
+    let real_slices = real_cases
         .iter()
-        .filter(|case| case.corpus_kind == "real_audio")
-        .count();
-    let real_slices = corpus
-        .cases
-        .iter()
-        .filter(|case| case.corpus_kind == "real_audio")
         .map(|case| case.slice.as_str())
         .collect::<HashSet<_>>();
     let missing_required_slices = REQUIRED_REAL_SLICES
         .iter()
         .filter(|slice| !real_slices.contains(**slice))
-        .copied()
+        .map(|slice| (*slice).to_string())
         .collect::<Vec<_>>();
+    let mut slice_totals = BTreeMap::<String, (u64, u64)>::new();
+    for case in &quality_cases {
+        let totals = slice_totals.entry(case.slice.clone()).or_default();
+        totals.0 = totals.0.saturating_add(case.diarization_error_ms);
+        totals.1 = totals.1.saturating_add(case.speech_ms);
+    }
+    let diarization_error_by_slice = slice_totals
+        .into_iter()
+        .map(|(slice, (error, speech))| (slice, ratio(error, speech)))
+        .collect::<BTreeMap<_, _>>();
+    let missing_diarization_baselines = REGRESSION_SLICES
+        .iter()
+        .filter(|slice| !corpus.diarization_error_baselines.contains_key(**slice))
+        .map(|slice| (*slice).to_string())
+        .collect::<Vec<_>>();
+    let invalid_diarization_baselines = corpus
+        .diarization_error_baselines
+        .iter()
+        .filter(|(_, baseline)| !baseline.is_finite() || **baseline < 0.0)
+        .map(|(slice, _)| slice.clone())
+        .collect::<Vec<_>>();
+    let diarization_regressions = REGRESSION_SLICES
+        .iter()
+        .filter(|slice| {
+            match (
+                diarization_error_by_slice.get(**slice),
+                corpus.diarization_error_baselines.get(**slice),
+            ) {
+                (Some(current), Some(baseline)) => current > baseline,
+                _ => false,
+            }
+        })
+        .map(|slice| (*slice).to_string())
+        .collect::<Vec<_>>();
+    let mut missing_metric_evidence = Vec::new();
+    for (missing, present) in [
+        ("accepted_name_decisions", accepted_count > 0),
+        ("cross_meeting_links", cross_count > 0),
+        ("after_three_samples", after_three_count > 0),
+        ("clean_remote_speech", clean_speech > 0),
+        ("accepted_facts", facts > 0),
+        ("new_records", new_records > 0),
+    ] {
+        if !present {
+            missing_metric_evidence.push(missing.to_string());
+        }
+    }
+    let unknown_corpus_kind_count = corpus
+        .cases
+        .iter()
+        .filter(|case| {
+            !matches!(
+                case.corpus_kind.as_str(),
+                "real_audio" | "synthetic_contract"
+            )
+        })
+        .count();
     // Synthetic contract fixtures can exercise the scorer but can never make
     // a release quality claim by themselves.
     let release_gates_pass = corpus.schema_version == 1
         && duplicate_case_ids == 0
+        && unknown_corpus_kind_count == 0
         && real_case_count > 0
         && missing_required_slices.is_empty()
+        && missing_metric_evidence.is_empty()
+        && missing_diarization_baselines.is_empty()
+        && invalid_diarization_baselines.is_empty()
+        && diarization_regressions.is_empty()
         && accepted_name_precision >= 0.995
         && wrong_person_accepted_binding_rate < 0.001
         && cross_meeting_link_precision >= 0.99
         && recognition_recall_after_three >= 0.85
         && clean_remote_diarization_error <= 0.15
         && same_display_name_merges == 0
-        && fact_provenance_coverage == 1.0;
+        && facts_with_provenance == facts
+        && exported_new_records == new_records
+        && deleted_new_records == new_records;
     EvaluationReport {
         schema_version: corpus.schema_version,
         corpus_id: corpus.corpus_id.clone(),
         case_count: corpus.cases.len(),
         real_case_count,
+        quality_case_count: quality_cases.len(),
         duplicate_case_ids,
+        unknown_corpus_kind_count,
+        accepted_name_decision_count: accepted_count,
         accepted_name_precision,
         wrong_person_accepted_binding_rate,
+        cross_meeting_link_count: cross_count,
         cross_meeting_link_precision,
+        after_three_sample_count: after_three_count,
         recognition_recall_after_three,
+        clean_remote_speech_ms: clean_speech,
         clean_remote_diarization_error,
+        diarization_error_by_slice,
+        missing_diarization_baselines,
+        invalid_diarization_baselines,
+        diarization_regressions,
         same_display_name_merges,
+        fact_count: facts,
+        facts_with_provenance,
         fact_provenance_coverage,
+        new_record_count: new_records,
+        exported_new_record_count: exported_new_records,
+        deleted_new_record_count: deleted_new_records,
+        export_coverage,
+        delete_coverage,
+        missing_metric_evidence,
         missing_required_slices,
         release_gates_pass,
     }
@@ -201,6 +338,24 @@ pub fn score(corpus: &EvaluationCorpus) -> EvaluationReport {
 pub fn score_json(raw: &str) -> Result<String> {
     let corpus: EvaluationCorpus = serde_json::from_str(raw)?;
     Ok(serde_json::to_string_pretty(&score(&corpus))?)
+}
+
+pub fn validate_release_report(corpus_raw: &str, report_raw: &str) -> Result<()> {
+    let corpus: EvaluationCorpus = serde_json::from_str(corpus_raw)?;
+    let checked_in: EvaluationReport = serde_json::from_str(report_raw)?;
+    let computed = score(&corpus);
+    if checked_in != computed {
+        return Err(EnclaveError::InvalidRequest(
+            "checked-in voice evaluation report is stale or does not match its aggregate cases"
+                .into(),
+        ));
+    }
+    if !computed.release_gates_pass {
+        return Err(EnclaveError::InvalidRequest(
+            "voice evaluation release gates did not pass".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -226,5 +381,157 @@ mod tests {
         assert!(score_json(SYNTHETIC)
             .unwrap()
             .contains("release_gates_pass"));
+    }
+
+    fn passing_real_corpus() -> EvaluationCorpus {
+        let mut cases = REQUIRED_REAL_SLICES
+            .iter()
+            .enumerate()
+            .map(|(index, slice)| EvaluationCase {
+                id: format!("real-{index}"),
+                corpus_kind: "real_audio".into(),
+                slice: (*slice).into(),
+                expected_person: format!("person-{index}"),
+                predicted_person: Some(format!("person-{index}")),
+                accepted_name: true,
+                cross_meeting_link: true,
+                after_three_high_quality_samples: true,
+                speech_ms: 10_000,
+                diarization_error_ms: if *slice == "clean_remote_call" {
+                    1_000
+                } else {
+                    0
+                },
+                fact_count: 1,
+                facts_with_provenance: 1,
+                display_name_collision_group: None,
+                new_record_count: 1,
+                exported_new_record_count: 1,
+                deleted_new_record_count: 1,
+            })
+            .collect::<Vec<_>>();
+        cases.push(EvaluationCase {
+            id: "second-alex".into(),
+            corpus_kind: "real_audio".into(),
+            slice: "same_display_name".into(),
+            expected_person: "alex-2".into(),
+            predicted_person: Some("alex-2".into()),
+            accepted_name: true,
+            cross_meeting_link: true,
+            after_three_high_quality_samples: true,
+            speech_ms: 10_000,
+            diarization_error_ms: 0,
+            fact_count: 1,
+            facts_with_provenance: 1,
+            display_name_collision_group: Some("alex".into()),
+            new_record_count: 1,
+            exported_new_record_count: 1,
+            deleted_new_record_count: 1,
+        });
+        let first_alex = cases
+            .iter_mut()
+            .find(|case| case.slice == "same_display_name")
+            .unwrap();
+        first_alex.display_name_collision_group = Some("alex".into());
+        EvaluationCorpus {
+            schema_version: 1,
+            corpus_id: "real-release-v1".into(),
+            diarization_error_baselines: [
+                ("noise".into(), 0.20),
+                ("room_audio".into(), 0.20),
+                ("overlap".into(), 0.20),
+            ]
+            .into(),
+            cases,
+        }
+    }
+
+    #[test]
+    fn release_metrics_ignore_synthetic_contract_cases_when_real_cases_exist() {
+        let mut corpus = passing_real_corpus();
+        corpus.cases.push(EvaluationCase {
+            id: "synthetic-poison".into(),
+            corpus_kind: "synthetic_contract".into(),
+            slice: "clean_remote_call".into(),
+            expected_person: "expected".into(),
+            predicted_person: Some("wrong".into()),
+            accepted_name: true,
+            cross_meeting_link: true,
+            after_three_high_quality_samples: true,
+            speech_ms: 1,
+            diarization_error_ms: 1,
+            fact_count: 1,
+            facts_with_provenance: 0,
+            display_name_collision_group: None,
+            new_record_count: 1,
+            exported_new_record_count: 0,
+            deleted_new_record_count: 0,
+        });
+
+        let report = score(&corpus);
+        assert_eq!(report.quality_case_count, REQUIRED_REAL_SLICES.len() + 1);
+        assert_eq!(report.accepted_name_precision, 1.0);
+        assert_eq!(report.fact_provenance_coverage, 1.0);
+        assert_eq!(report.export_coverage, 1.0);
+        assert_eq!(report.delete_coverage, 1.0);
+        assert!(report.release_gates_pass);
+    }
+
+    #[test]
+    fn noisy_room_and_overlap_regressions_fail_closed() {
+        let mut corpus = passing_real_corpus();
+        let overlap = corpus
+            .cases
+            .iter_mut()
+            .find(|case| case.slice == "overlap")
+            .unwrap();
+        overlap.diarization_error_ms = 2_001;
+        corpus
+            .diarization_error_baselines
+            .insert("overlap".into(), 0.20);
+
+        let report = score(&corpus);
+        assert_eq!(report.diarization_regressions, vec!["overlap"]);
+        assert!(!report.release_gates_pass);
+    }
+
+    #[test]
+    fn missing_or_invalid_slice_baselines_fail_closed() {
+        let mut corpus = passing_real_corpus();
+        corpus.diarization_error_baselines.remove("noise");
+        corpus
+            .diarization_error_baselines
+            .insert("room_audio".into(), -0.01);
+
+        let report = score(&corpus);
+        assert_eq!(report.missing_diarization_baselines, vec!["noise"]);
+        assert_eq!(report.invalid_diarization_baselines, vec!["room_audio"]);
+        assert!(!report.release_gates_pass);
+    }
+
+    #[test]
+    fn export_and_delete_must_cover_every_new_record() {
+        let mut corpus = passing_real_corpus();
+        corpus.cases[0].exported_new_record_count = 0;
+        corpus.cases[1].deleted_new_record_count = 0;
+
+        let report = score(&corpus);
+        assert!(report.export_coverage < 1.0);
+        assert!(report.delete_coverage < 1.0);
+        assert!(!report.release_gates_pass);
+    }
+
+    #[test]
+    fn release_check_requires_a_matching_checked_in_passing_report() {
+        let corpus = passing_real_corpus();
+        let corpus_json = serde_json::to_string(&corpus).unwrap();
+        let report_json = score_json(&corpus_json).unwrap();
+        validate_release_report(&corpus_json, &report_json).unwrap();
+
+        let mut stale: serde_json::Value = serde_json::from_str(&report_json).unwrap();
+        stale["corpus_id"] = serde_json::Value::String("stale".into());
+        assert!(validate_release_report(&corpus_json, &stale.to_string()).is_err());
+
+        assert!(validate_release_report(SYNTHETIC, &score_json(SYNTHETIC).unwrap()).is_err());
     }
 }

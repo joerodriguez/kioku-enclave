@@ -6,19 +6,30 @@ validated image metadata, GitHub-signed build provenance, an SPDX SBOM, and a si
 attestation. The image digest is the value authorized by the deployment's KMS
 attestation condition.
 
-## Automated Release Workflow (Primary Method)
+## Signed release workflow
 
-Releasing a new enclave version requires **bumping `version` in `Cargo.toml`**.
+Releasing a new enclave version requires a reviewed version bump, a passing
+ADR-0016 real-corpus report, and an operator-created signed tag. A `main` push
+may build an evaluation image, but CI never creates a release tag from `main`.
+This prevents an unsigned automated tag from bypassing the release operator's
+trust anchor.
 
-### For AI/LLM Agents & Developers:
 To cut a new release:
-1. Run `./scripts/bump_version.sh <NEW_VERSION>` (e.g. `./scripts/bump_version.sh 0.6.15`), or update `version = "X.Y.Z"` in `Cargo.toml` and run `cargo check`.
-2. Commit `Cargo.toml` & `Cargo.lock` and push to `main` (or merge your PR to `main`).
-3. GitHub Actions (`.github/workflows/build.yml`) will automatically:
-   - Create git tag `vX.Y.Z` on `main`.
-   - Build the container image and bake configuration into the attested image digest.
-   - Generate Sigstore build provenance and SPDX SBOM attestations.
-   - Publish the public GitHub Release for `vX.Y.Z` with all attestation assets attached.
+
+1. Run `./scripts/bump_version.sh <NEW_VERSION>` (for example `0.8.4`), or
+   update `version = "X.Y.Z"` in `Cargo.toml` and refresh `Cargo.lock`.
+2. Produce the licensed real-corpus aggregate cases and deterministic report
+   described in [`eval/voice/README.md`](eval/voice/README.md). Review and
+   commit `eval/voice/release-cases-v1.json` and
+   `eval/voice/release-report-v1.json`; they contain no media or user content.
+3. Merge those changes through a green pull request, then synchronize a clean
+   local `main` with `origin/main`.
+4. Run `scripts/release.sh` with the trusted signing-key fingerprint. It checks
+   the report, creates and verifies the signed tag, and pushes it.
+5. The tag workflow independently checks the report, builds the image,
+   generates provenance/SBOM attestations, and publishes the immutable release.
+   The local script then verifies that evidence and may request a separately
+   approved production roll.
 
 ## Prerequisites
 
@@ -31,6 +42,10 @@ To cut a new release:
 - Configure a Git signing key. `scripts/release.sh` creates `git tag -s` tags and rejects
   a tag that cannot be verified against the required `RELEASE_SIGNER_FINGERPRINT`
   trust anchor (an OpenPGP fingerprint or `SHA256:…` SSH key fingerprint).
+- Check in the current content-free ADR-0016 real aggregate cases and matching
+  passing report at the canonical paths documented in `eval/voice/README.md`.
+  Missing, stale, synthetic-only, incomplete, or regressed reports block both
+  the local release command and release-tag CI.
 - Publish the trusted signing public key and fingerprint through a separately authenticated
   channel, and require release verifiers to pin that identity. A cryptographically valid
   signature from an unknown key does not authenticate the release operator.
@@ -134,9 +149,10 @@ The script and workflow then:
 
 1. verify clean, synchronized public `main` and all required repository variables;
 2. require the tag version to match the Cargo package version;
-3. run `cargo fmt --all -- --check`, locked tests, and clippy with warnings denied;
+3. run formatting, locked tests, warnings-denied Clippy, and the deterministic
+   ADR-0016 real-corpus report check;
 4. create, verify against `RELEASE_SIGNER_FINGERPRINT`, and push a signed source tag;
-5. run CI and build with full-SHA-pinned Actions, a digest-pinned Rust builder, and a
+5. run tag CI, repeat the voice report check, and build with full-SHA-pinned Actions, a digest-pinned Rust builder, and a
    revision- and hash-pinned embedding model;
 6. push the image to the configured
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>` destination;
