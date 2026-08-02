@@ -100,6 +100,29 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy && rustup default 1.96.0
 
+      - name: Verify release tag identity and signature
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXPECTED_TAG="v$(grep '^version =' Cargo.toml | head -1 | cut -d '"' -f 2)"
+          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
+            echo "::error::Cargo version ${EXPECTED_TAG} does not match pushed tag ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "${GITHUB_REF_NAME}")" != "tag" ]]; then
+            echo "::error::Release source must be an annotated tag."
+            exit 1
+          fi
+          TAG_OBJECT_SHA="$(git rev-parse "${GITHUB_REF_NAME}^{tag}")"
+          if [[ "$(gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}" \
+            --jq .verification.verified)" != "true" ]]; then
+            echo "::error::GitHub could not verify the release tag signature."
+            exit 1
+          fi
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
@@ -546,7 +569,7 @@ jobs:
             exit 0
           fi
 
-          echo "Publishing GitHub Release for operator-verified signed tag ${TAG_NAME}..."
+          echo "Publishing GitHub Release for the verified signed tag ${TAG_NAME}..."
           gh release create "${TAG_NAME}" \
             enclave-release.json \
             enclave-provenance.jsonl \

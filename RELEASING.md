@@ -26,10 +26,10 @@ To cut a new release:
    local `main` with `origin/main`.
 4. Run `scripts/release.sh` with the trusted signing-key fingerprint. It checks
    the report, creates and verifies the signed tag, and pushes it.
-5. The tag workflow independently checks the report, builds the image,
-   generates provenance/SBOM attestations, and publishes the immutable release.
-   The local script then verifies that evidence and may request a separately
-   approved production roll.
+5. The tag workflow independently requires GitHub to verify the tag signature,
+   checks the report, builds the image, generates provenance/SBOM attestations,
+   and publishes the immutable release. The local script then verifies that
+   evidence and may request a separately approved production roll.
 
 ## Prerequisites
 
@@ -152,8 +152,9 @@ The script and workflow then:
 3. run formatting, locked tests, warnings-denied Clippy, and the deterministic
    ADR-0016 real-corpus report check;
 4. create, verify against `RELEASE_SIGNER_FINGERPRINT`, and push a signed source tag;
-5. run tag CI, repeat the voice report check, and build with full-SHA-pinned Actions, a digest-pinned Rust builder, and a
-   revision- and hash-pinned embedding model;
+5. run tag CI, independently verify the tag signature, repeat the voice report
+   check, and build with full-SHA-pinned Actions, a digest-pinned Rust builder,
+   and a revision- and hash-pinned embedding model;
 6. push the image to the configured
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>` destination;
 7. generate an SPDX SBOM, fail on fixed high-severity image findings, and create
