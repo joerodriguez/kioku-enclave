@@ -48,7 +48,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   matching in the cloud; no Python runtime is present. Voice samples use append-only
   active assignments and profile revisions so calibrated merge/split proposals can be
   applied and reversed without deleting source observations or prior derivations.
-- Publishes the ADR-0016 voice evaluation reducer and schema. Release CI recomputes
+- Publishes the ADR-0016 voice evaluation reducer, objective production-model
+  similarity measurement, and schemas. Release CI recomputes
   overlap-aware diarization and identity/fact/export/delete metrics from hash-bound,
   content-free schema-v3 evidence bound to a schema-v2 multi-artifact source and
   authorized physical-route manifest. Identity decisions include denominator-visible
@@ -57,7 +58,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   by the same deterministic global mapping used for diarization error; synthetic or
   hand-authored legacy aggregates cannot authorize a quality release. Its offline
   derivation command independently verifies licensed media/label artifacts and produces
-  canonical fixed-point WAV slices, opaque timing labels, and receipts outside Git.
+  canonical fixed-point WAV slices, opaque timing labels, and receipts outside Git. Its
+  private similarity command verifies the exact production WeSpeaker model and media
+  hashes, then emits only opaque integer pair scores to select the hardest different-
+  speaker slice without exposing vectors or content.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini

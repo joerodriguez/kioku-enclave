@@ -9,7 +9,7 @@ configured webhook events use the separate webhook boundary.
 
 | File | Role |
 |---|---|
-| `main.rs` | Entry point; wires public OAuth, auth-gated control-plane routes (including Cloud Capture v2), legacy `/v1/*`, and public health/attestation; starts media and summarization workers; production serves only through `serve_tls`, while plaintext application HTTP requires a debug build plus `ENCLAVE_TEST_MODE=1`; spawns the isolated ACME :80 listener and renewal loop |
+| `main.rs` | Entry point; wires public OAuth, auth-gated control-plane routes (including Cloud Capture v2), legacy `/v1/*`, public health/attestation, and offline ADR-0016 derivation/similarity/evidence/scoring commands; starts media and summarization workers; production serves only through `serve_tls`, while plaintext application HTTP requires a debug build plus `ENCLAVE_TEST_MODE=1`; spawns the isolated ACME :80 listener and renewal loop |
 | `tls.rs` | In-enclave rustls termination with a swappable certificate resolver and SHA-256 leaf fingerprint. Production uses ACME; static/generated certificate paths are custom/debug fallback mechanisms, not production launch overrides |
 | `acme.rs` | Required production ACME lifecycle: answers HTTP-01 on :80, generates the TLS key in the TEE, persists account/cert/key as context-bound KMS-wrapped state (`acme/tls.json.enc`), blocks boot until a usable cert exists, and hot-swaps renewals |
 | [`cp/`](cp/map.md) | **Control plane:** OAuth/DCR, sync, account, MCP + REST, quotas, summarizer, and identity control store |

@@ -124,6 +124,18 @@ evidence, and content-free release cases retain each augmentation source ID, art
 ID, and exact hash; cross-source media/bundle tracks and hash or slice mismatches fail
 closed.
 
+The optional private similarity specification conforms to
+`similarity-spec-schema-v1.json`. It binds at least two opaque speakers, at
+least two independently hashed enrollment-quality recordings per speaker, the
+exact derivation receipt, and the pinned production WeSpeaker model. The
+measurement tool runs the same Rust decoder, 16-kHz preprocessing, quality
+gate, filterbank, model, normalization, and cosine path used in production. It
+sorts recordings before scoring and emits only opaque recording/speaker IDs,
+integer-millionth pair scores, hashes, and the hardest genuine/impostor pairs.
+It never emits vectors, audio, names, transcripts, email addresses, or URLs.
+The specification and pair report stay outside Git: release cases deliberately
+contain decisions and aggregate metrics, not raw similarity scores.
+
 Suitable authoritative inputs include the
 [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) for licensed
 multi-speaker, overlap, headset, and room-array recordings; the
@@ -194,6 +206,13 @@ cargo run --locked -- \
   /absolute/private/path/derivation-recipe-v1.json \
   /absolute/private/path/kioku-voice-eval-assets \
   /absolute/private/path/kioku-voice-eval-derived
+
+cargo run --locked -- \
+  --measure-voice-eval-similarity \
+  /absolute/private/path/similarity-spec-v1.json \
+  /absolute/private/path/kioku-voice-eval-derived \
+  /absolute/private/path/wespeaker_en_voxceleb_resnet34_LM.onnx \
+  > /absolute/private/path/similarity-report-v1.json
 ```
 
 The case builder inserts the manifest and private run raw-byte SHA-256 bindings
@@ -214,6 +233,13 @@ requires all inputs to be used, and atomically writes
 byte-identical files make the command idempotent; a mismatched file is never
 replaced. The receipt provides the exact media/labels hashes to copy into private
 schema-v3 run evidence. Do not commit the recipe, receipt, media, or labels.
+
+Similarity measurement additionally refuses a model whose bytes differ from
+the SHA-256 pinned in the production Docker image, refuses media inside the
+source checkout, requires every declared WAV to pass the production enrollment
+quality gate, and fails if a speaker has fewer than two distinct recordings.
+Use the highest different-speaker score to select the objectively hardest
+`similar_voices` pair; do not relabel a subjectively chosen pair as similar.
 
 The check validates and hash-binds the manifest, semantically recomputes the
 report, and returns nonzero if the bundle is stale or any gate fails.

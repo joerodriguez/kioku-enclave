@@ -434,6 +434,31 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 #[tokio::main]
 async fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--measure-voice-eval-similarity") {
+        let spec_path = args.get(2).expect(
+            "--measure-voice-eval-similarity requires private specification, media directory, and voice model paths",
+        );
+        let media_directory = args.get(3).expect(
+            "--measure-voice-eval-similarity requires private specification, media directory, and voice model paths",
+        );
+        let model_path = args.get(4).expect(
+            "--measure-voice-eval-similarity requires private specification, media directory, and voice model paths",
+        );
+        let spec = std::fs::read_to_string(spec_path)
+            .expect("read private voice similarity specification");
+        match cp::voice_eval_similarity::measure_similarity(
+            &spec,
+            std::path::Path::new(media_directory),
+            std::path::Path::new(model_path),
+        ) {
+            Ok(report) => print!("{report}"),
+            Err(error) => {
+                eprintln!("Voice similarity measurement failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--derive-voice-eval-assets") {
         let manifest_path = args.get(2).expect(
             "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
