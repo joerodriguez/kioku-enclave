@@ -79,7 +79,7 @@ reqwest = { version = "0.12.15", default-features = false, features = ["rustls-t
 async-trait = "0.1.88"
 
 # Base64 encoding/decoding for KMS payloads and DEK storage
-base64 = "0.22.1"
+base64 = "0.23.0"
 
 # URL-encoding for GCS object names
 urlencoding = "2.1.3"
