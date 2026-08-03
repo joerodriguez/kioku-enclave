@@ -30,6 +30,7 @@ use super::media::AudioTurn;
 use super::voice_quality::{self, SampleDecision, VoiceDiagnostics};
 
 pub const EMBEDDING_SPACE: &str = "wespeaker-resnet34-lm-v1";
+pub const MODEL_SHA256: &str = "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012";
 const DEFAULT_MODEL_PATH: &str = "/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx";
 pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MAX_TURN_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * 30;
