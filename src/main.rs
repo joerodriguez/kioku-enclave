@@ -82,6 +82,7 @@ mod error;
 mod ingest;
 mod ocr;
 mod search;
+mod storage_observability;
 mod store;
 mod timeline;
 mod tls;
@@ -622,6 +623,7 @@ async fn main() {
         Arc::clone(&gcs),
         media_gcs,
     ));
+    Store::spawn_metrics_reporter(Arc::clone(&store));
 
     // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
     // control store consumes the originals.

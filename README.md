@@ -234,6 +234,49 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+## Archive capacity fixtures and observability
+
+ADR-0022 Phase-0a instruments the existing whole-encrypted-SQLite snapshot path with
+process-local, unlabeled counters and fixed-bucket histograms. Once per active minute the
+service emits one cumulative `archive_snapshot_v1` structured event through its existing
+logging pipeline; it does not expose a metrics endpoint or add another network service.
+The event contains logical database byte observations, the pre-checkpoint WAL-file byte
+length as a changed-page proxy, successful and attempted encrypted upload bytes, encrypted
+download bytes, save attempts/completed/failed/skipped, end-to-end save latency, and
+encrypted-durable/WAL-proxy ratio in parts per million. It never contains user/archive
+IDs, object names or paths, query/content fields, keys, URLs, or per-user labels.
+
+The ratio is exactly
+`successful encrypted snapshot bytes / pre-checkpoint SQLite -wal file bytes` for each
+completed save. A zero-byte or absent WAL denominator records `u64::MAX` in the `+Inf`
+bucket, exposing a full-database rewrite with no observed changed frames. WAL length is
+only a proxy: it includes WAL framing and can diverge from changed-page bytes after
+SQLite auto-checkpointing or WAL reuse, so this is not a claim of exact dirty-byte
+amplification. Logical database size remains a separate histogram. The current legacy
+path cannot prove and
+skip a clean save, so `save_skipped_total` remains zero rather than relabeling the
+observed no-op rewrite. Failed uploads contribute to attempted-upload bytes and
+failed/latency counters, but only durable successes contribute to upload and ratio
+histograms. Upload/download byte values measure the encrypted object payload, excluding
+HTTP metadata and multipart framing. All counters reset on process restart.
+
+The deterministic, content-free capacity contract is
+[`eval/capacity/archive-fixtures-v1.json`](eval/capacity/archive-fixtures-v1.json). Inspect
+and validate its exact three-year 480/960/1,200-hour distributions without generating
+records:
+
+```sh
+python3 scripts/generate_capacity_fixture.py check
+```
+
+The optional generator streams numeric synthetic records to ignored `target/` output (or
+outside the checkout), so it does not allocate every record in memory. Its bounded smoke
+mode is exercised in unit tests. The explicit `power-user-c-1200-32gib` plus
+`--create-sparse-shape` path creates a 32-GiB logical sparse file, not 32 GiB of written
+blocks; that file is not SQLite and is not query-performance evidence. See
+[`eval/capacity/README.md`](eval/capacity/README.md) for commands and release-evidence
+limitations.
+
 The production Docker build has no permissive configuration defaults. Supply every
 deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` or
 `WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the

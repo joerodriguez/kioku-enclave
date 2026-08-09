@@ -45,7 +45,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Once, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags, OptionalExtension};
@@ -60,6 +60,10 @@ use crate::{
         decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient,
     },
     error::{EnclaveError, Result},
+    storage_observability::{
+        StorageMetrics, StorageMetricsSnapshot, AMPLIFICATION_PPM_BUCKET_UPPER_BOUNDS,
+        BYTE_BUCKET_UPPER_BOUNDS, LATENCY_US_BUCKET_UPPER_BOUNDS,
+    },
 };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -167,6 +171,7 @@ pub struct Store {
     pub media_gcs: Arc<dyn GcsClient>,
     max_open: usize,
     checkpoint_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    storage_metrics: StorageMetrics,
 }
 
 struct UserActor {
@@ -355,7 +360,32 @@ impl Store {
             media_gcs,
             max_open: max_open.max(1),
             checkpoint_clock: Arc::new(SystemTime::now),
+            storage_metrics: StorageMetrics::default(),
         }
+    }
+
+    /// Periodically emit one process-wide, unlabeled snapshot through the
+    /// existing structured tracing pipeline. No network metrics service is
+    /// introduced, and idle intervals are suppressed.
+    pub fn spawn_metrics_reporter(store: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            let mut last_snapshot = store.storage_metrics_snapshot();
+            loop {
+                interval.tick().await;
+                let snapshot = store.storage_metrics_snapshot();
+                if snapshot == last_snapshot {
+                    continue;
+                }
+                log_storage_metrics(&snapshot);
+                last_snapshot = snapshot;
+            }
+        });
+    }
+
+    pub(crate) fn storage_metrics_snapshot(&self) -> StorageMetricsSnapshot {
+        self.storage_metrics.snapshot()
     }
 
     pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<i64> {
@@ -1185,6 +1215,8 @@ impl Store {
         let fetch_result = self.gcs.get_object(&object_name).await;
         let (plaintext_db, blob_meta, envelope_rewrite_dirty) = match fetch_result {
             Ok(resp) => {
+                self.storage_metrics
+                    .record_encrypted_download(resp.ciphertext.len() as u64);
                 // Unwrap the DEK from KMS
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
                 let context = user_blob_context(user_id);
@@ -1218,6 +1250,8 @@ impl Store {
             }
             Err(e) => return Err(e),
         };
+        self.storage_metrics
+            .record_logical_db_bytes(plaintext_db.len() as u64);
 
         // Write plaintext to a temp file and open it with rusqlite
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
@@ -1256,6 +1290,40 @@ impl Store {
         // closure can observe an idempotency duplicate and return success.
         handle.blob_meta.retry_save_before_access = true;
 
+        let started = Instant::now();
+        self.storage_metrics.record_save_attempt();
+        let result = self.flush_handle_inner(handle).await;
+        let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        match &result {
+            Ok((logical_db_bytes, changed_wal_bytes_proxy, encrypted_bytes)) => {
+                self.storage_metrics.record_save_completed(
+                    Some((
+                        *logical_db_bytes,
+                        *changed_wal_bytes_proxy,
+                        *encrypted_bytes,
+                    )),
+                    latency_us,
+                )
+            }
+            Err(_) => self.storage_metrics.record_save_failed(latency_us),
+        }
+        result.map(|_| ())
+    }
+
+    async fn flush_handle_inner(&self, handle: &mut UserHandle) -> Result<(u64, u64, u64)> {
+        // The WAL length before checkpoint is the best available Phase-0 proxy
+        // for bytes changed since the previous flush. It is not exact dirty
+        // page bytes: it includes WAL headers/frame metadata and SQLite may
+        // auto-checkpoint frames before this observation.
+        let wal_path = sqlite_sidecar_path(&handle.temp_path, "-wal");
+        let changed_wal_bytes_proxy = match tokio::fs::metadata(&wal_path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        self.storage_metrics
+            .record_changed_wal_bytes_proxy(changed_wal_bytes_proxy);
+
         // WAL checkpoint: make sure all WAL pages are in the main DB file
         handle
             .conn
@@ -1289,6 +1357,10 @@ impl Store {
             handle.blob_meta.verified_legacy_recovery_day = Some(checkpoint_day);
         }
 
+        let logical_db_bytes = db_bytes.len() as u64;
+        let encrypted_bytes = ciphertext.len() as u64;
+        self.storage_metrics
+            .record_encrypted_upload_attempt(encrypted_bytes);
         let new_generation = self
             .gcs
             .put_object(
@@ -1306,7 +1378,7 @@ impl Store {
         handle.dirty = false;
 
         debug!("flushed user index to GCS");
-        Ok(())
+        Ok((logical_db_bytes, changed_wal_bytes_proxy, encrypted_bytes))
     }
 
     async fn ensure_legacy_recovery_checkpoint(
@@ -1345,6 +1417,46 @@ impl UserHandle {
         self.mutation_generation = self.mutation_generation.saturating_add(1);
         self.dirty = true;
     }
+}
+
+fn log_storage_metrics(snapshot: &StorageMetricsSnapshot) {
+    info!(
+        target: "kioku::storage_metrics",
+        metric_schema = "archive_snapshot_v1",
+        logical_db_bytes_count = snapshot.logical_db_bytes.count,
+        logical_db_bytes_sum = snapshot.logical_db_bytes.sum,
+        logical_db_bytes_max = snapshot.logical_db_bytes.max,
+        byte_bucket_upper_bounds = ?BYTE_BUCKET_UPPER_BOUNDS,
+        logical_db_bytes_cumulative_buckets = ?snapshot.logical_db_bytes.cumulative_buckets,
+        changed_wal_bytes_proxy_count = snapshot.changed_wal_bytes_proxy.count,
+        changed_wal_bytes_proxy_sum = snapshot.changed_wal_bytes_proxy.sum,
+        changed_wal_bytes_proxy_max = snapshot.changed_wal_bytes_proxy.max,
+        changed_wal_bytes_proxy_cumulative_buckets = ?snapshot.changed_wal_bytes_proxy.cumulative_buckets,
+        encrypted_upload_bytes_count = snapshot.encrypted_upload_bytes.count,
+        encrypted_upload_bytes_total = snapshot.encrypted_upload_bytes.sum,
+        encrypted_upload_bytes_max = snapshot.encrypted_upload_bytes.max,
+        encrypted_upload_bytes_cumulative_buckets = ?snapshot.encrypted_upload_bytes.cumulative_buckets,
+        encrypted_upload_attempted_bytes_total = snapshot.encrypted_upload_attempted_bytes_total,
+        encrypted_download_bytes_count = snapshot.encrypted_download_bytes.count,
+        encrypted_download_bytes_total = snapshot.encrypted_download_bytes.sum,
+        encrypted_download_bytes_max = snapshot.encrypted_download_bytes.max,
+        encrypted_download_bytes_cumulative_buckets = ?snapshot.encrypted_download_bytes.cumulative_buckets,
+        save_attempts_total = snapshot.save_attempts_total,
+        save_completed_total = snapshot.save_completed_total,
+        save_failed_total = snapshot.save_failed_total,
+        save_skipped_total = snapshot.save_skipped_total,
+        save_latency_us_count = snapshot.save_latency_us.count,
+        save_latency_us_sum = snapshot.save_latency_us.sum,
+        save_latency_us_max = snapshot.save_latency_us.max,
+        save_latency_us_bucket_upper_bounds = ?LATENCY_US_BUCKET_UPPER_BOUNDS,
+        save_latency_us_cumulative_buckets = ?snapshot.save_latency_us.cumulative_buckets,
+        write_amplification_ppm_count = snapshot.write_amplification_ppm.count,
+        write_amplification_ppm_sum = snapshot.write_amplification_ppm.sum,
+        write_amplification_ppm_max = snapshot.write_amplification_ppm.max,
+        write_amplification_ppm_bucket_upper_bounds = ?AMPLIFICATION_PPM_BUCKET_UPPER_BOUNDS,
+        write_amplification_ppm_cumulative_buckets = ?snapshot.write_amplification_ppm.cumulative_buckets,
+        "aggregate archive storage metrics"
+    );
 }
 
 // ── sqlite-vec auto-extension registration ─────────────────────────────────────
@@ -3298,10 +3410,14 @@ async fn write_private_temp_db(user_id: &str, plaintext: &[u8]) -> Result<PathBu
 fn remove_temp_db_files(path: &Path) {
     let _ = std::fs::remove_file(path);
     for suffix in ["-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
     }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -5759,6 +5875,102 @@ pub(crate) mod tests {
             .await
             .expect("reload");
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn snapshot_metrics_use_pre_checkpoint_wal_as_changed_byte_proxy() {
+        let store = make_store();
+
+        // Establish a checkpointed baseline so schema creation/migration WAL
+        // frames do not become part of the changed-write assertion.
+        store
+            .with_user("metric-user", |_| Ok(()))
+            .await
+            .expect("load");
+        store.save_user("metric-user").await.expect("baseline save");
+
+        store
+            .with_user("metric-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-01-01T00:00:00Z', 'synthetic')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("write");
+
+        let wal_bytes_before_save = {
+            let actor = store.actor_for_access("metric-user").await.unwrap();
+            let state = actor.state.lock().await;
+            let handle = state.handle.as_ref().expect("open handle");
+            std::fs::metadata(sqlite_sidecar_path(&handle.temp_path, "-wal"))
+                .expect("WAL metadata")
+                .len()
+        };
+        assert!(wal_bytes_before_save > 0, "mutation must create WAL frames");
+
+        let before_changed = store.storage_metrics_snapshot();
+        store.save_user("metric-user").await.expect("changed save");
+        let after_changed = store.storage_metrics_snapshot();
+        assert_eq!(
+            after_changed.changed_wal_bytes_proxy.count,
+            before_changed.changed_wal_bytes_proxy.count + 1
+        );
+        assert_eq!(
+            after_changed
+                .changed_wal_bytes_proxy
+                .sum
+                .saturating_sub(before_changed.changed_wal_bytes_proxy.sum),
+            wal_bytes_before_save
+        );
+        assert_eq!(
+            after_changed.write_amplification_ppm.count,
+            before_changed.write_amplification_ppm.count + 1
+        );
+
+        // A second save with forced dirty marking (e.g. with_user_mut without
+        // SQL changes) still rewrites the complete encrypted database. Its
+        // observed WAL denominator is zero, so the amplification sample must
+        // be +Inf (the final bucket only).
+        store
+            .with_user_mut("metric-user", |_| Ok(()))
+            .await
+            .expect("mut access without sql");
+
+        let wal_bytes_before_noop = {
+            let actor = store.actor_for_access("metric-user").await.unwrap();
+            let state = actor.state.lock().await;
+            let handle = state.handle.as_ref().expect("open handle");
+            std::fs::metadata(sqlite_sidecar_path(&handle.temp_path, "-wal"))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(wal_bytes_before_noop, 0);
+
+        let before_noop = store.storage_metrics_snapshot();
+        store.save_user("metric-user").await.expect("no-op save");
+        let after_noop = store.storage_metrics_snapshot();
+        assert_eq!(
+            after_noop.changed_wal_bytes_proxy.count,
+            before_noop.changed_wal_bytes_proxy.count + 1
+        );
+        assert_eq!(
+            after_noop.changed_wal_bytes_proxy.sum,
+            before_noop.changed_wal_bytes_proxy.sum
+        );
+        assert_eq!(after_noop.write_amplification_ppm.max, u64::MAX);
+        for index in 0..AMPLIFICATION_PPM_BUCKET_UPPER_BOUNDS.len() - 1 {
+            assert_eq!(
+                after_noop.write_amplification_ppm.cumulative_buckets[index],
+                before_noop.write_amplification_ppm.cumulative_buckets[index]
+            );
+        }
+        assert_eq!(
+            after_noop.write_amplification_ppm.cumulative_buckets[9],
+            before_noop.write_amplification_ppm.cumulative_buckets[9] + 1
+        );
     }
 
     #[tokio::test]
