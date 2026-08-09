@@ -6,10 +6,13 @@
 //!    an empty one on first use), decrypt it to a temporary file, open rusqlite,
 //!    run schema migrations, cache the handle.
 //!
-//! 2. Callers write rows via the open [`rusqlite::Connection`].
+//! 2. Callers query or write through a tracked [`rusqlite::Connection`]
+//!    closure. SQLite row changes (including triggers), schema changes, and
+//!    persistent header versions advance a process-local mutation generation.
 //!
-//! 3. **save(user_id)** — WAL checkpoint → read temp file → AES-GCM encrypt →
-//!    PUT back to GCS with `ifGenerationMatch` for optimistic concurrency.
+//! 3. **save(user_id)** — if dirty: WAL checkpoint → read temp file → AES-GCM
+//!    encrypt → PUT back to GCS with `ifGenerationMatch`. A proven-clean save
+//!    returns without KMS, encryption, file read, or GCS work.
 //!
 //! # Optimistic concurrency / conflict story
 //!
@@ -146,6 +149,12 @@ struct UserHandle {
     user_id: UserId,
     conn: Connection,
     blob_meta: BlobMeta,
+    /// Monotonic process-local generation advanced whenever SQLite reports a
+    /// possible persistent logical mutation. `dirty` remains the fail-closed
+    /// authority if this diagnostic counter ever saturates.
+    mutation_generation: u64,
+    persisted_mutation_generation: u64,
+    dirty: bool,
     temp_path: PathBuf,
     last_used: Instant,
 }
@@ -273,6 +282,68 @@ impl Store {
         if handle.blob_meta.retry_save_before_access {
             self.flush_handle(handle).await?;
         }
+        let before = database_mutation_fingerprint(&handle.conn)?;
+        let result = f(&handle.conn);
+        match database_mutation_fingerprint(&handle.conn) {
+            Ok(after) if after != before => handle.mark_dirty(),
+            Ok(_) => {}
+            Err(error) => {
+                // The closure may already have committed. If we cannot prove
+                // the post-state, retain the handle as dirty and fail closed.
+                handle.mark_dirty();
+                return Err(error);
+            }
+        }
+        result
+    }
+
+    /// Run a closure under SQLite's connection-level query-only guard.
+    ///
+    /// This is the explicit API for operations claimed to be read-only. Any
+    /// attempted SQL mutation fails in SQLite, and the guard is restored even
+    /// when the caller returns an error.
+    pub async fn with_user_read<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        self.with_user(user_id, move |conn| {
+            conn.pragma_update(None, "query_only", true)?;
+            let result = f(conn);
+            let restore = conn.pragma_update(None, "query_only", false);
+            if let Err(error) = restore {
+                return Err(error.into());
+            }
+            result
+        })
+        .await
+    }
+
+    /// Conservatively declare an operation mutating before invoking it.
+    ///
+    /// Use this for extension or FFI work whose effects cannot be represented
+    /// by SQLite's row/schema/header mutation fingerprint. Ordinary SQL can use
+    /// [`Store::with_user`], which detects direct, trigger, and schema changes.
+    pub async fn with_user_mut<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let mut inner = self.inner.lock().await;
+        if inner.blocked_users.contains(user_id) {
+            return Err(EnclaveError::Auth("user account is deleted".into()));
+        }
+        if !inner.handles.contains_key(user_id) && inner.handles.len() >= self.max_open {
+            self.evict_lru_locked(&mut inner).await?;
+        }
+        if !inner.handles.contains_key(user_id) {
+            let handle = self.load_user(user_id).await?;
+            inner.handles.insert(user_id.to_string(), handle);
+        }
+        let handle = inner.handles.get_mut(user_id).unwrap();
+        handle.last_used = Instant::now();
+        if handle.blob_meta.retry_save_before_access {
+            self.flush_handle(handle).await?;
+        }
+        handle.mark_dirty();
         f(&handle.conn)
     }
 
@@ -691,7 +762,7 @@ impl Store {
 
         // Try to fetch existing blob from GCS
         let fetch_result = self.gcs.get_object(&object_name).await;
-        let (plaintext_db, blob_meta) = match fetch_result {
+        let (plaintext_db, blob_meta, envelope_rewrite_dirty) = match fetch_result {
             Ok(resp) => {
                 // Unwrap the DEK from KMS
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
@@ -705,6 +776,7 @@ impl Store {
                         verified_legacy_recovery_day: None,
                         retry_save_before_access: false,
                     },
+                    opened.requires_rewrite,
                 )
             }
             Err(EnclaveError::NotFound) => {
@@ -720,6 +792,7 @@ impl Store {
                         verified_legacy_recovery_day: None,
                         retry_save_before_access: false,
                     },
+                    false,
                 )
             }
             Err(e) => return Err(e),
@@ -727,8 +800,8 @@ impl Store {
 
         // Write plaintext to a temp file and open it with rusqlite
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
-        let conn = match open_db(&temp_path) {
-            Ok(conn) => conn,
+        let (conn, migration_dirty) = match open_db(&temp_path) {
+            Ok(opened) => opened,
             Err(e) => {
                 remove_temp_db_files(&temp_path);
                 return Err(e);
@@ -739,12 +812,24 @@ impl Store {
             user_id: user_id.to_string(),
             conn,
             blob_meta,
+            mutation_generation: u64::from(migration_dirty || envelope_rewrite_dirty),
+            persisted_mutation_generation: 0,
+            dirty: migration_dirty || envelope_rewrite_dirty,
             temp_path,
             last_used: Instant::now(),
         })
     }
 
     async fn flush_handle(&self, handle: &mut UserHandle) -> Result<()> {
+        if !handle.dirty {
+            debug!(
+                mutation_generation = handle.mutation_generation,
+                persisted_mutation_generation = handle.persisted_mutation_generation,
+                "skipped clean user index save"
+            );
+            return Ok(());
+        }
+
         // From this point until the generation-checked PUT succeeds, the local
         // handle may contain state a request intends to acknowledge. Any
         // failure must make the next access retry persistence before its
@@ -803,6 +888,8 @@ impl Store {
         // `ifGenerationMatch` conflicts against our own previous write.
         handle.blob_meta.generation = new_generation;
         handle.blob_meta.retry_save_before_access = false;
+        handle.persisted_mutation_generation = handle.mutation_generation;
+        handle.dirty = false;
 
         debug!("flushed user index to GCS");
         Ok(())
@@ -857,6 +944,13 @@ impl Store {
             }
         }
         Ok(())
+    }
+}
+
+impl UserHandle {
+    fn mark_dirty(&mut self) {
+        self.mutation_generation = self.mutation_generation.saturating_add(1);
+        self.dirty = true;
     }
 }
 
@@ -1726,7 +1820,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
              finalization_error = NULL,
              finalization_attempt_count = 0,
              finalization_next_attempt_at = NULL
-         WHERE finalized_at IS NOT NULL",
+         WHERE finalized_at IS NOT NULL
+           AND (finalization_status IS NOT 'complete'
+                OR finalization_error IS NOT NULL
+                OR finalization_attempt_count <> 0
+                OR finalization_next_attempt_at IS NOT NULL)",
         [],
     )?;
     // Quarantine the pre-guard retry loop. Its attempt count was not persisted,
@@ -1853,14 +1951,34 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn open_db(path: &PathBuf) -> Result<Connection> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DatabaseMutationFingerprint {
+    total_changes: u64,
+    schema_version: i64,
+    user_version: i64,
+    application_id: i64,
+}
+
+fn database_mutation_fingerprint(conn: &Connection) -> Result<DatabaseMutationFingerprint> {
+    Ok(DatabaseMutationFingerprint {
+        // SQLite total_changes includes row changes performed by triggers.
+        total_changes: conn.total_changes(),
+        schema_version: conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?,
+        user_version: conn.query_row("PRAGMA user_version", [], |row| row.get(0))?,
+        application_id: conn.query_row("PRAGMA application_id", [], |row| row.get(0))?,
+    })
+}
+
+fn open_db(path: &PathBuf) -> Result<(Connection, bool)> {
     // Register the sqlite-vec extension globally before any connection opens.
     // This is idempotent (Once guard) and thread-safe.
     init_vec_extension();
     let conn = Connection::open(path)?;
+    let before = database_mutation_fingerprint(&conn)?;
     conn.execute_batch(SCHEMA_SQL)?;
     run_migrations(&conn)?;
-    Ok(conn)
+    let migrated = database_mutation_fingerprint(&conn)? != before;
+    Ok((conn, migrated))
 }
 
 /// Build a fresh empty SQLite database in memory, serialize it, encrypt it,
@@ -3299,6 +3417,19 @@ pub(crate) mod tests {
         fn fail_next_generation_delete(&self, object_name: &str, generation: i64) {
             *self.fail_generation_delete.lock().unwrap() = Some((object_name.into(), generation));
         }
+
+        fn generation(&self, object_name: &str) -> Option<i64> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(object_name)
+                .and_then(|versions| versions.iter().rev().find(|v| v.live))
+                .map(|v| v.generation)
+        }
+
+        fn put_attempts(&self) -> usize {
+            self.put_calls.lock().unwrap().len()
+        }
     }
 
     #[async_trait::async_trait]
@@ -3981,6 +4112,307 @@ pub(crate) mod tests {
         );
     }
 
+    fn seed_user_object_with_missing_schema(gcs: &FakeGcs, user_id: &str) {
+        let dek = Dek([7_u8; 32]);
+        let current = create_empty_db(&dek).unwrap();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), current).unwrap();
+        let conn = Connection::open(temp.path()).unwrap();
+        conn.execute_batch(
+            "DROP TABLE email_deliveries;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        drop(conn);
+        let old_bytes = std::fs::read(temp.path()).unwrap();
+        let ciphertext = encrypt_bound_blob(&dek, &old_bytes, &user_blob_context(user_id)).unwrap();
+        gcs.objects.lock().unwrap().insert(
+            gcs_object_name(user_id),
+            vec![FakeObject {
+                ciphertext,
+                wrapped_dek_b64: B64.encode(dek.0),
+                generation: 1,
+                live: true,
+                soft_deleted: false,
+                crc32c: "fake-crc32c".into(),
+                md5_hash: None,
+                legacy_recovery: None,
+            }],
+        );
+    }
+
+    fn seed_user_object_with_legacy_envelope(gcs: &FakeGcs, user_id: &str) {
+        let dek = Dek([9_u8; 32]);
+        let plaintext = create_empty_db(&dek).unwrap();
+        let legacy =
+            crate::crypto::encrypt_blob_with_aad(&dek, &plaintext, &user_blob_context(user_id))
+                .unwrap();
+        gcs.objects.lock().unwrap().insert(
+            gcs_object_name(user_id),
+            vec![FakeObject {
+                ciphertext: legacy,
+                wrapped_dek_b64: B64.encode(dek.0),
+                generation: 1,
+                live: true,
+                soft_deleted: false,
+                crc32c: "fake-crc32c".into(),
+                md5_hash: None,
+                legacy_recovery: None,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_access_and_save_do_not_create_or_rewrite_an_object() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = Store::new(kms.clone(), gcs.clone());
+
+        let count: i64 = store
+            .with_user_read("read-only-new", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        store.save_user("read-only-new").await.unwrap();
+        assert_eq!(gcs.put_attempts(), 0);
+        assert_eq!(gcs.generation(&gcs_object_name("read-only-new")), None);
+
+        store
+            .with_user("read-only-existing", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-01-01T00:00:00Z', 'durable')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("read-only-existing").await.unwrap();
+        let attempts_after_write = gcs.put_attempts();
+        let generation_after_write = gcs
+            .generation(&gcs_object_name("read-only-existing"))
+            .unwrap();
+
+        store
+            .with_user_read("read-only-existing", |conn| {
+                let _: i64 =
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("read-only-existing").await.unwrap();
+        assert_eq!(gcs.put_attempts(), attempts_after_write);
+        assert_eq!(
+            gcs.generation(&gcs_object_name("read-only-existing")),
+            Some(generation_after_write)
+        );
+
+        // Process restart must not make idempotent schema setup look dirty.
+        let reopened = Store::new(kms, gcs.clone());
+        reopened
+            .with_user_read("read-only-existing", |conn| {
+                Ok(
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        reopened.save_user("read-only-existing").await.unwrap();
+        assert_eq!(gcs.put_attempts(), attempts_after_write);
+        assert_eq!(
+            gcs.generation(&gcs_object_name("read-only-existing")),
+            Some(generation_after_write)
+        );
+    }
+
+    #[tokio::test]
+    async fn query_only_api_rejects_sql_mutation_and_restores_guard_after_error() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let result = store
+            .with_user_read("guarded-reader", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(result, Err(EnclaveError::Db(_))));
+        store
+            .with_user("guarded-reader", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("query_only must be restored after the read closure error");
+        store.save_user("guarded-reader").await.unwrap();
+        assert_eq!(gcs.put_attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_schema_and_trigger_mutations_advance_dirty_generation_and_persist() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = Store::new(kms.clone(), gcs.clone());
+
+        store
+            .with_user("tracked-mutations", |conn| {
+                conn.execute_batch(
+                    "CREATE TABLE dirty_save_probe(value TEXT NOT NULL);
+                     CREATE TRIGGER dirty_save_probe_mirror AFTER INSERT ON dirty_save_probe BEGIN
+                         INSERT INTO dirty_save_probe(value) VALUES ('triggered');
+                     END;",
+                )?;
+                conn.execute("INSERT INTO dirty_save_probe(value) VALUES ('direct')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("tracked-mutations").await.unwrap();
+        assert_eq!(
+            gcs.generation(&gcs_object_name("tracked-mutations")),
+            Some(1)
+        );
+
+        let restarted = Store::new(kms, gcs);
+        let values: Vec<String> = restarted
+            .with_user_read("tracked-mutations", |conn| {
+                let mut statement =
+                    conn.prepare("SELECT value FROM dirty_save_probe ORDER BY rowid")?;
+                let values = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(values)
+            })
+            .await
+            .unwrap();
+        assert_eq!(values, vec!["direct", "triggered"]);
+    }
+
+    #[tokio::test]
+    async fn clean_eviction_skips_put_but_dirty_eviction_and_migration_flush() {
+        let gcs = Arc::new(FakeGcs::new());
+        let mut store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.max_open = 1;
+
+        store
+            .with_user("clean-eviction", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("clean-eviction").await.unwrap();
+        let after_initial_save = gcs.put_attempts();
+        store
+            .with_user_read("other-reader", |conn| {
+                Ok(
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(gcs.put_attempts(), after_initial_save);
+
+        store
+            .with_user("dirty-eviction", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-02T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before_dirty_evict = gcs.put_attempts();
+        store
+            .with_user_read("dirty-eviction-next", |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(gcs.put_attempts(), before_dirty_evict + 1);
+        assert_eq!(gcs.generation(&gcs_object_name("dirty-eviction")), Some(1));
+
+        seed_user_object_with_missing_schema(&gcs, "migration-eviction");
+        store
+            .with_user_read("migration-eviction", |conn| {
+                let present: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='email_deliveries'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(present, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before_migration_evict = gcs.put_attempts();
+        store
+            .with_user_read("post-migration-reader", |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(gcs.put_attempts(), before_migration_evict + 1);
+        assert_eq!(
+            gcs.generation(&gcs_object_name("migration-eviction")),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_put_retains_dirty_generation_for_retry() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .with_user("dirty-retry", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        *gcs.fail_put.lock().unwrap() = Some(EnclaveError::Gcs("injected PUT failure".into()));
+        assert!(matches!(
+            store.save_user("dirty-retry").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.generation(&gcs_object_name("dirty-retry")), None);
+        store.save_user("dirty-retry").await.unwrap();
+        assert_eq!(gcs.generation(&gcs_object_name("dirty-retry")), Some(1));
+    }
+
+    #[tokio::test]
+    async fn legacy_envelope_read_remains_dirty_until_v2_rewrite_succeeds() {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_user_object_with_legacy_envelope(&gcs, "legacy-envelope");
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .with_user_read("legacy-envelope", |conn| {
+                Ok(
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        store.save_user("legacy-envelope").await.unwrap();
+        assert_eq!(gcs.generation(&gcs_object_name("legacy-envelope")), Some(2));
+    }
     #[tokio::test]
     async fn new_user_creates_index() {
         let store = make_store();
@@ -4172,8 +4604,7 @@ pub(crate) mod tests {
     async fn account_deletion_paginates_and_removes_all_user_generations_only() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
-        store.with_user("alice", |_| Ok(())).await.unwrap();
-        store.save_user("alice").await.unwrap();
+        write_and_save(&store, "alice", "init").await.unwrap();
         let index = gcs_object_name("alice");
         let live = gcs.get_object(&index).await.unwrap();
         gcs.put_object(
@@ -4223,8 +4654,7 @@ pub(crate) mod tests {
     async fn account_deletion_retries_after_exact_generation_failure_and_not_found() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
-        store.with_user("alice", |_| Ok(())).await.unwrap();
-        store.save_user("alice").await.unwrap();
+        write_and_save(&store, "alice", "init").await.unwrap();
         let media = "raw/alice/retry.enc";
         let first = gcs.put_object(media, b"one", "wrapped", 0).await.unwrap();
         let second = gcs
@@ -4243,11 +4673,10 @@ pub(crate) mod tests {
     async fn preexisting_soft_residue_does_not_block_live_version_cleanup() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
-        store.with_user("alice", |_| Ok(())).await.unwrap();
-        store.save_user("alice").await.unwrap();
+        write_and_save(&store, "alice", "v1").await.unwrap();
         let index = gcs_object_name("alice");
         let old_generation = gcs.get_object(&index).await.unwrap().generation;
-        store.save_user("alice").await.unwrap();
+        write_and_save(&store, "alice", "v2").await.unwrap();
         gcs.soft_delete_generation(&index, old_generation);
         gcs.set_soft_delete_enabled(true);
 
@@ -4263,8 +4692,7 @@ pub(crate) mod tests {
     async fn post_delete_soft_inventory_prevents_success_when_policy_is_enabled() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
-        store.with_user("alice", |_| Ok(())).await.unwrap();
-        store.save_user("alice").await.unwrap();
+        write_and_save(&store, "alice", "init").await.unwrap();
         gcs.put_object("raw/alice/capture.enc", b"media", "wrapped", 0)
             .await
             .unwrap();
@@ -4332,8 +4760,7 @@ pub(crate) mod tests {
     async fn unreadable_recovery_generation_keeps_deletion_incomplete() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
-        store.with_user("alice", |_| Ok(())).await.unwrap();
-        store.save_user("alice").await.unwrap();
+        write_and_save(&store, "alice", "init").await.unwrap();
         let recovery = "legacy-recovery/alice/unreadable.db.enc";
         gcs.put_object(
             recovery,
@@ -4359,8 +4786,7 @@ pub(crate) mod tests {
     async fn oversized_legacy_generation_fails_before_snapshot_download() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
-        store.with_user("alice", |_| Ok(())).await.unwrap();
-        store.save_user("alice").await.unwrap();
+        write_and_save(&store, "alice", "init").await.unwrap();
         let index = gcs_object_name("alice");
         gcs.set_listed_size(&index, MAX_LEGACY_DELETION_SNAPSHOT_BYTES + 1);
 
@@ -4667,6 +5093,16 @@ pub(crate) mod tests {
         store.save_user(user_id).await.expect("save");
         // The initial create has no previous generation to protect. Its first
         // overwrite establishes the daily recovery copy.
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-01-01T00:00:01Z', 'y')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("second write");
         store.save_user(user_id).await.expect("second save");
 
         let objects = gcs.objects.lock().unwrap();
