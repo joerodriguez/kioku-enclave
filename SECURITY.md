@@ -136,6 +136,34 @@ Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-wa
 [`RELEASING.md`](RELEASING.md#one-time-legacy-blob-migration) before upgrading a
 deployment that contains pre-v2 objects.
 
+### ADR-0022 archive-v3 foundation is inactive
+
+`src/archive_v3.rs` defines only audited, unit-tested format primitives for the future
+immutable archive: opaque archive/database/key/object IDs; canonical context-bound
+HKDF-SHA-256 subkeys with AES-256-GCM envelopes; bounded root/Merkle decoding; and an
+immutable-object backend contract. Key-registry entries are explicitly outside the
+archive-DEK AEAD: a canonical plaintext binds domain, archive, archive/media key kind,
+and key epoch to the DEK before KMS wrapping, and unwrap must verify those fields before
+exposing the key. New DEK holders, KMS plaintext buffers, and derived object-key buffers
+zeroize on drop and do not implement revealing debug formatting. The root-key registry
+epoch/object/hash must come from the independent witness so cold recovery can unwrap the
+key before decrypting the root. This foundation makes no KMS calls and has no live Store,
+SQLite VFS, GCS, witness, route, migration,
+export, or deletion wiring. The legacy context-bound v2 database blob remains the sole
+production authority. No image may acknowledge a write from archive-v3 until ADR-0022
+Phase 1 shadow recovery, VFS crash/conformance, witness, fault, lifecycle, and capacity
+gates have passed and an explicit authority change is reviewed.
+
+Root objects are explicitly named as candidates. Crashes and CAS races may leave more
+than one immutable candidate for a sequence; none has authority unless the independent
+witness names its exact object ID and ciphertext hash, and recovery never selects one by
+listing a storage prefix.
+
+The foundation also refuses a monolithic checkpoint object: its generic envelope is
+bounded near 1 MiB, so the checkpoint role/tag remains reserved until a reviewed bounded
+streaming/chunk-manifest format exists. A WAL-bearing root must still name a checkpoint
+base reference, preventing publication of an unrecoverable WAL chain.
+
 ## Attestation and TLS
 
 The KMS credential path and public verification path deliberately use different
