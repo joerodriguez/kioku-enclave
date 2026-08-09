@@ -61,7 +61,12 @@ serde_json = "1.0.140"
 
 # Crypto: AES-256-GCM
 aes-gcm = { version = "0.10.3", features = ["std"] }
+# Direct declaration of the already-locked HKDF implementation used by the
+# inactive ADR-0022 archive-v3 format foundation.  Keeping this explicit makes
+# the archive KDF auditable rather than relying on a transitive dependency.
+hkdf = "0.12.4"
 rand = "0.8.5"
+zeroize = { version = "1.8.2", features = ["derive"] }
 
 # Typed errors
 thiserror = "2.0.12"

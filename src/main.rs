@@ -69,6 +69,9 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod acme;
+// ADR-0022 format/crypto/backend primitives only.  This is intentionally not
+// connected to the live Store, SQLite VFS, witness, routes, or write authority.
+mod archive_v3;
 mod attestation;
 mod auth;
 mod cp;

@@ -1788,6 +1788,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "flate2",
+ "hkdf",
  "hmac",
  "http-body",
  "hyper",
@@ -1818,6 +1819,7 @@ dependencies = [
  "tracing-subscriber",
  "tract-onnx",
  "urlencoding",
+ "zeroize",
  "zip",
 ]
 

@@ -35,6 +35,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | Path | What it is |
 |---|---|
 | [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, attestation, storage, search, episodes |
+| `src/archive_v3.rs` | Inactive ADR-0022 immutable archive format foundation; it is compiled/tested only and has no live persistence authority until shadow gates pass |
 | `.github/workflows/` | CI, CodeQL/dependency checks, image build/scan, provenance, and SBOM attestations |
 | `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image; remaining rebuild limits are documented in `SECURITY.md` |
 | `Cargo.toml` / `Cargo.lock` | Crate manifest |
