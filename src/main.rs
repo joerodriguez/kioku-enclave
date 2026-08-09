@@ -331,9 +331,10 @@ fn sqlite_value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
 
 // ── Delete handler ────────────────────────────────────────────────────────────
 
-// This legacy route intentionally deletes only the per-user content blob. It
-// is reachable only through the service-account-authenticated router; end-user
-// identity cleanup and tombstoning use DELETE /api/account instead.
+// This service-account-authenticated compatibility route invokes the same
+// generation-aware content deletion as account deletion. It does not remove
+// the control-store identity or install the durable account tombstone; those
+// steps remain exclusive to DELETE /api/account.
 #[derive(Deserialize)]
 struct DeleteBody {
     user_id: String,
@@ -345,7 +346,7 @@ async fn handle_delete_user(
 ) -> error::Result<Json<serde_json::Value>> {
     let user_id = body.user_id;
     store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, "delete user request");
+    info!("delete user request");
 
     state.store.delete_user(&user_id).await?;
 

@@ -45,7 +45,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{ffi::sqlite3_auto_extension, Connection, OptionalExtension};
+use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
 use tokio::io::AsyncWriteExt;
@@ -210,7 +210,7 @@ impl Store {
         }
     }
 
-    pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<()> {
+    pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<i64> {
         self.put_media_at_generation(name, data, wrapped_dek_b64, 0)
             .await
     }
@@ -221,11 +221,10 @@ impl Store {
         data: &[u8],
         wrapped_dek_b64: &str,
         generation: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.media_gcs
             .put_object(name, data, wrapped_dek_b64, generation)
-            .await?;
-        Ok(())
+            .await
     }
 
     pub async fn get_media(&self, name: &str) -> Result<crate::store::GcsGetResponse> {
@@ -234,6 +233,12 @@ impl Store {
 
     pub async fn delete_media(&self, name: &str) -> Result<()> {
         self.media_gcs.delete_object(name).await
+    }
+
+    pub async fn delete_media_generation(&self, name: &str, generation: i64) -> Result<()> {
+        self.media_gcs
+            .delete_object_generation(name, generation)
+            .await
     }
 
     /// Run an operation with a user's open SQLite connection.
@@ -279,50 +284,208 @@ impl Store {
     pub async fn delete_user(&self, user_id: &str) -> Result<()> {
         validate_user_id(user_id)?;
 
-        // 1. Query for GCS media keys to clean up
+        // Query for DB-referenced media keys before deleting the encrypted
+        // index. A failed attempt leaves the handle cached and blocked; retries
+        // must still read that handle so unscoped `media/...` keys are not lost.
         let keys_to_delete = {
             let mut inner = self.inner.lock().await;
-            let keys = if !inner.handles.contains_key(user_id) {
-                if inner.blocked_users.contains(user_id) {
-                    Vec::new()
-                } else {
-                    let handle = self.load_user(user_id).await?;
-                    inner.handles.insert(user_id.to_string(), handle);
-                    media_keys(&inner.handles.get(user_id).unwrap().conn)?
-                }
+            let keys = if let Some(handle) = inner.handles.get(user_id) {
+                media_keys(&handle.conn)?
+            } else if inner.blocked_users.contains(user_id) {
+                Vec::new()
             } else {
-                media_keys(&inner.handles.get(user_id).unwrap().conn)?
+                let handle = self.load_user(user_id).await?;
+                let keys = media_keys(&handle.conn)?;
+                inner.handles.insert(user_id.to_string(), handle);
+                keys
             };
             inner.blocked_users.insert(user_id.to_string());
             keys
         };
 
-        // Delete media first and propagate failures. Keeping the database until
-        // every referenced object is gone makes the operation safely retryable.
+        // `versions=true` excludes soft-deleted objects. Record pre-existing
+        // residue, but continue removing anything still live/noncurrent. Final
+        // verification below remains fail-closed.
+        let _preexisting_soft_deleted = self
+            .has_soft_deleted_account_objects(user_id, &keys_to_delete)
+            .await?;
+
+        // Delete every historical raw-media generation, including objects no
+        // longer represented by the current SQLite blob.  The prefix includes
+        // its trailing slash, so another user's similarly named prefix cannot
+        // be selected.
+        self.delete_all_versions_under(&self.media_gcs, &media_prefix(user_id))
+            .await?;
         for key in &keys_to_delete {
-            info!(user_id, "deleting associated GCS media object");
-            self.delete_media(key).await?;
+            self.delete_all_versions_for_name(&self.media_gcs, key)
+                .await?;
         }
 
-        // 2. Evict the cached handle (and temp file) without flushing —
-        //    we are deleting the data, not saving it.
+        // Every retained legacy DB/checkpoint generation can name unscoped
+        // evidence that the live DB no longer references. Inventory one exact
+        // generation at a time, delete its media, and only then erase that DB
+        // generation. Any unreadable generation leaves deletion incomplete.
+        self.inventory_and_delete_legacy_databases(user_id, &gcs_object_name(user_id), true)
+            .await?;
+        self.inventory_and_delete_legacy_databases(
+            user_id,
+            &legacy_recovery_prefix(user_id),
+            false,
+        )
+        .await?;
+
+        if self
+            .has_soft_deleted_account_objects(user_id, &keys_to_delete)
+            .await?
+        {
+            return Err(soft_deleted_account_objects_error());
+        }
+
+        // Only discard the local inventory after live/noncurrent and
+        // soft-deleted verification succeeds. Do not flush deleted content.
         {
             let mut inner = self.inner.lock().await;
             if let Some(handle) = inner.handles.remove(user_id) {
-                info!(user_id, "evicting user handle for deletion");
+                info!("evicting blocked user handle after verified deletion");
                 let temp_path = handle.temp_path.clone();
                 drop(handle);
                 remove_temp_db_files(&temp_path);
             }
         }
 
-        // 3. Delete the GCS database object. 404 is treated as success by the GCS
-        //    implementations, so this call is idempotent.
-        let object_name = gcs_object_name(user_id);
-        info!(user_id, object = %object_name, "deleting GCS object");
-        self.gcs.delete_object(&object_name).await?;
-
         Ok(())
+    }
+
+    async fn has_soft_deleted_account_objects(
+        &self,
+        user_id: &str,
+        referenced_media_keys: &[String],
+    ) -> Result<bool> {
+        let namespaces = [
+            (&self.gcs, gcs_object_name(user_id), true),
+            (&self.gcs, legacy_recovery_prefix(user_id), false),
+            (&self.media_gcs, media_prefix(user_id), false),
+        ];
+        for (gcs, selector, exact_name) in namespaces {
+            if has_matching_soft_deleted_object(gcs.as_ref(), &selector, exact_name).await? {
+                return Ok(true);
+            }
+        }
+        for name in referenced_media_keys {
+            if has_matching_soft_deleted_object(self.media_gcs.as_ref(), name, true).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn delete_all_versions_for_name(
+        &self,
+        gcs: &Arc<dyn GcsClient>,
+        name: &str,
+    ) -> Result<()> {
+        delete_matching_object_versions(gcs.as_ref(), name, true).await
+    }
+
+    async fn delete_all_versions_under(
+        &self,
+        gcs: &Arc<dyn GcsClient>,
+        prefix: &str,
+    ) -> Result<()> {
+        delete_matching_object_versions(gcs.as_ref(), prefix, false).await
+    }
+
+    async fn inventory_and_delete_legacy_databases(
+        &self,
+        user_id: &str,
+        selector: &str,
+        exact_name: bool,
+    ) -> Result<()> {
+        let mut page_token = None;
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = self
+                .gcs
+                .list_object_versions(selector, page_token.as_deref())
+                .await?;
+            let matching = page
+                .versions
+                .into_iter()
+                .filter(|version| {
+                    if exact_name {
+                        version.name == selector
+                    } else {
+                        version.name.starts_with(selector)
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !matching.is_empty() {
+                for version in matching {
+                    let keys = match self
+                        .media_keys_from_legacy_generation(user_id, &version)
+                        .await
+                    {
+                        Ok(keys) => keys,
+                        // A concurrent/idempotent retry may have already
+                        // removed the exact generation after it was listed.
+                        Err(EnclaveError::NotFound) => Vec::new(),
+                        Err(_) => return Err(legacy_inventory_incomplete_error()),
+                    };
+                    for key in keys {
+                        self.delete_all_versions_for_name(&self.media_gcs, &key)
+                            .await?;
+                        if has_matching_soft_deleted_object(self.media_gcs.as_ref(), &key, true)
+                            .await?
+                        {
+                            return Err(soft_deleted_account_objects_error());
+                        }
+                    }
+                    self.gcs
+                        .delete_object_generation(&version.name, version.generation)
+                        .await?;
+                }
+                page_token = None;
+                continue;
+            }
+            match page.next_page_token {
+                Some(next) if page_token.as_deref() != Some(next.as_str()) => {
+                    page_token = Some(next)
+                }
+                Some(_) => {
+                    return Err(EnclaveError::Gcs(
+                        "GCS legacy database listing repeated a page cursor".into(),
+                    ))
+                }
+                None => return Ok(()),
+            }
+        }
+        Err(EnclaveError::Gcs(
+            "GCS legacy database listing exceeded the bounded page limit".into(),
+        ))
+    }
+
+    async fn media_keys_from_legacy_generation(
+        &self,
+        user_id: &str,
+        version: &GcsObjectVersion,
+    ) -> Result<Vec<String>> {
+        if version.size > MAX_LEGACY_DELETION_SNAPSHOT_BYTES {
+            return Err(legacy_inventory_incomplete_error());
+        }
+        let response = self
+            .gcs
+            .get_object_generation(&version.name, version.generation)
+            .await?;
+        let dek = load_dek(self.kms.as_ref(), &response.wrapped_dek_b64).await?;
+        let opened = decrypt_bound_blob(&dek, &response.ciphertext, &user_blob_context(user_id))?;
+        let temp_path = write_private_temp_db(user_id, &opened.plaintext).await?;
+        let result = (|| {
+            init_vec_extension();
+            let conn = Connection::open_with_flags(&temp_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            conn.execute_batch("PRAGMA query_only=ON;")?;
+            media_keys(&conn)
+        })();
+        remove_temp_db_files(&temp_path);
+        result
     }
 
     // ── Email Outbox ───────────────────────────────────────────────────────────
@@ -1652,17 +1815,38 @@ fn create_empty_db(dek: &Dek) -> Result<Vec<u8>> {
 
 // ── GCS trait (seam for testing) ──────────────────────────────────────────────
 
-#[derive(Debug)]
 pub struct GcsGetResponse {
     pub ciphertext: Vec<u8>,
     pub wrapped_dek_b64: String,
     pub generation: i64,
 }
 
+/// One concrete GCS object generation.  Names and generations are routing
+/// metadata only; callers must never log them because names can carry user data.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsObjectVersion {
+    pub name: String,
+    pub generation: i64,
+    pub size: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct GcsListVersionsResponse {
+    pub versions: Vec<GcsObjectVersion>,
+    pub next_page_token: Option<String>,
+}
+
 /// Abstraction over GCS so unit tests can inject an in-memory fake.
 #[async_trait::async_trait]
 pub trait GcsClient: Send + Sync {
     async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse>;
+    /// Fetches one exact live/noncurrent generation, including its historical
+    /// wrapped-DEK metadata.
+    async fn get_object_generation(
+        &self,
+        object_name: &str,
+        generation: i64,
+    ) -> Result<GcsGetResponse>;
     /// Returns the object's NEW generation on success. Callers must record it
     /// for the next `if_generation_match` — forgetting to do so makes every
     /// save after the first 409 against the caller's own previous write.
@@ -1674,6 +1858,127 @@ pub trait GcsClient: Send + Sync {
         if_generation_match: i64,
     ) -> Result<i64>;
     async fn delete_object(&self, object_name: &str) -> Result<()>;
+    /// Lists live and noncurrent generations under an exact caller-owned
+    /// prefix/name. `page_token` is an opaque GCS cursor.
+    async fn list_object_versions(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse>;
+    /// Deletes exactly one generation. Not-found is success so deletion
+    /// inventories can be retried after partial completion.
+    async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()>;
+    /// Lists soft-deleted objects separately from live/noncurrent versions.
+    /// Callers must not try to delete these: GCS retains them until its
+    /// immutable `hardDeleteTime`.
+    async fn list_soft_deleted_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse>;
+}
+
+const GCS_LIST_PAGE_SIZE: usize = 1_000;
+const MAX_GCS_LIST_PAGES: usize = 1_000_000;
+/// Historical Phase-0 inventory still decrypts one whole legacy SQLite
+/// snapshot. Reject larger generations before download until the streaming
+/// archive converter replaces this compatibility path.
+const MAX_LEGACY_DELETION_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+
+fn soft_deleted_account_objects_error() -> EnclaveError {
+    EnclaveError::Conflict(
+        "GCS soft-deleted account objects remain until their provider hard-delete deadline".into(),
+    )
+}
+
+fn legacy_inventory_incomplete_error() -> EnclaveError {
+    EnclaveError::Conflict(
+        "a retained legacy database generation could not be inventoried; deletion is incomplete"
+            .into(),
+    )
+}
+
+/// Deletes at most one provider page at a time, then restarts at the first
+/// page. Restarting avoids skipped generations when deleting changes the
+/// meaning of a continuation token, while keeping memory bounded by one page.
+async fn delete_matching_object_versions(
+    gcs: &dyn GcsClient,
+    selector: &str,
+    exact_name: bool,
+) -> Result<()> {
+    let mut page_token = None;
+    for _ in 0..MAX_GCS_LIST_PAGES {
+        let page = gcs
+            .list_object_versions(selector, page_token.as_deref())
+            .await?;
+        let matching = page
+            .versions
+            .into_iter()
+            .filter(|version| {
+                if exact_name {
+                    version.name == selector
+                } else {
+                    version.name.starts_with(selector)
+                }
+            })
+            .collect::<Vec<_>>();
+        if !matching.is_empty() {
+            for version in matching {
+                gcs.delete_object_generation(&version.name, version.generation)
+                    .await?;
+            }
+            page_token = None;
+            continue;
+        }
+        match page.next_page_token {
+            Some(next) if page_token.as_deref() != Some(next.as_str()) => page_token = Some(next),
+            Some(_) => {
+                return Err(EnclaveError::Gcs(
+                    "GCS version listing repeated a page cursor".into(),
+                ))
+            }
+            None => return Ok(()),
+        }
+    }
+    Err(EnclaveError::Gcs(
+        "GCS version listing exceeded the bounded page limit".into(),
+    ))
+}
+
+/// Streams soft-deleted inventory and returns as soon as one account-owned
+/// object is found. No content inventory is accumulated in enclave memory.
+async fn has_matching_soft_deleted_object(
+    gcs: &dyn GcsClient,
+    selector: &str,
+    exact_name: bool,
+) -> Result<bool> {
+    let mut page_token = None;
+    for _ in 0..MAX_GCS_LIST_PAGES {
+        let page = gcs
+            .list_soft_deleted_objects(selector, page_token.as_deref())
+            .await?;
+        if page.versions.into_iter().any(|version| {
+            if exact_name {
+                version.name == selector
+            } else {
+                version.name.starts_with(selector)
+            }
+        }) {
+            return Ok(true);
+        }
+        match page.next_page_token {
+            Some(next) if page_token.as_deref() != Some(next.as_str()) => page_token = Some(next),
+            Some(_) => {
+                return Err(EnclaveError::Gcs(
+                    "GCS soft-delete listing repeated a page cursor".into(),
+                ))
+            }
+            None => return Ok(false),
+        }
+    }
+    Err(EnclaveError::Gcs(
+        "GCS soft-delete listing exceeded the bounded page limit".into(),
+    ))
 }
 
 // ── Production GCS client ──────────────────────────────────────────────────────
@@ -1682,6 +1987,97 @@ pub trait GcsClient: Send + Sync {
 struct GcsObjectMetadata {
     generation: String,
     metadata: Option<GcsCustomMetadata>,
+}
+
+#[derive(Deserialize)]
+struct GcsListVersionsPage {
+    #[serde(default)]
+    items: Vec<GcsVersionMetadata>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GcsErrorEnvelope {
+    error: GcsErrorBody,
+}
+
+#[derive(Deserialize)]
+struct GcsErrorBody {
+    code: u16,
+    #[serde(default)]
+    errors: Vec<GcsErrorDetail>,
+}
+
+#[derive(Deserialize)]
+struct GcsErrorDetail {
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct GcsVersionMetadata {
+    name: String,
+    generation: String,
+    size: String,
+}
+
+fn decode_gcs_versions_page(
+    body: &[u8],
+    generation_label: &str,
+) -> Result<GcsListVersionsResponse> {
+    let page: GcsListVersionsPage = serde_json::from_slice(body)?;
+    let versions = page
+        .items
+        .into_iter()
+        .map(|item| {
+            Ok(GcsObjectVersion {
+                name: item.name,
+                generation: item.generation.parse().map_err(|_| {
+                    EnclaveError::Gcs(format!("invalid {generation_label} generation"))
+                })?,
+                size: item
+                    .size
+                    .parse()
+                    .map_err(|_| EnclaveError::Gcs("invalid listed object size".into()))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GcsListVersionsResponse {
+        versions,
+        next_page_token: page.next_page_token,
+    })
+}
+
+fn decode_soft_deleted_list_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    first_page: bool,
+) -> Result<GcsListVersionsResponse> {
+    if status.is_success() {
+        return decode_gcs_versions_page(body, "soft-deleted");
+    }
+    // With this fixed request shape, the JSON API documents first-page
+    // invalidArgument as the response when the bucket has no soft-delete
+    // policy. Never apply the exception to continuation requests or any other
+    // status/reason, since those may indicate a bad cursor or request bug.
+    let policy_disabled = status == reqwest::StatusCode::BAD_REQUEST
+        && first_page
+        && serde_json::from_slice::<GcsErrorEnvelope>(body).is_ok_and(|envelope| {
+            envelope.error.code == 400
+                && !envelope.error.errors.is_empty()
+                && envelope
+                    .error
+                    .errors
+                    .iter()
+                    .all(|detail| detail.reason == "invalidArgument")
+        });
+    if policy_disabled {
+        return Ok(GcsListVersionsResponse::default());
+    }
+    Err(EnclaveError::Gcs(format!(
+        "GCS soft-delete listing failed with HTTP {}",
+        status.as_u16()
+    )))
 }
 
 #[derive(Deserialize)]
@@ -1729,29 +2125,23 @@ impl GcpGcsClient {
             .await?;
         Ok(tok.access_token)
     }
-}
 
-fn gcs_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(300))
-        .build()
-        .expect("static GCS HTTP client configuration is valid")
-}
-
-#[async_trait::async_trait]
-impl GcsClient for GcpGcsClient {
-    async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse> {
+    async fn get_object_at_generation(
+        &self,
+        object_name: &str,
+        requested_generation: Option<i64>,
+    ) -> Result<GcsGetResponse> {
         let token = self.access_token().await?;
         let encoded = urlencoding::encode(object_name);
-
-        // Fetch metadata to get generation and wrapped DEK
-        let meta_url = format!(
+        let mut meta_url = format!(
             "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
             self.bucket, encoded
         );
+        if let Some(generation) = requested_generation {
+            meta_url.push_str("?generation=");
+            meta_url.push_str(&generation.to_string());
+        }
         let meta_resp = self.http.get(&meta_url).bearer_auth(&token).send().await?;
-
         if meta_resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(EnclaveError::NotFound);
         }
@@ -1760,12 +2150,15 @@ impl GcsClient for GcpGcsClient {
             .generation
             .parse()
             .map_err(|_| EnclaveError::Gcs("invalid generation".into()))?;
+        if requested_generation.is_some_and(|requested| requested != generation) {
+            return Err(EnclaveError::Gcs(
+                "GCS returned a different object generation than requested".into(),
+            ));
+        }
         let wrapped_dek_b64 = meta
             .metadata
-            .and_then(|m| m.wrapped_dek)
+            .and_then(|metadata| metadata.wrapped_dek)
             .ok_or_else(|| EnclaveError::Gcs("missing wrapped DEK in object metadata".into()))?;
-
-        // Fetch body (media download)
         let data_url = format!(
             "https://storage.googleapis.com/download/storage/v1/b/{}/o/{}?alt=media&generation={}",
             self.bucket, encoded, generation
@@ -1779,12 +2172,35 @@ impl GcsClient for GcpGcsClient {
             .error_for_status()?
             .bytes()
             .await?;
-
         Ok(GcsGetResponse {
             ciphertext: bytes.to_vec(),
             wrapped_dek_b64,
             generation,
         })
+    }
+}
+
+fn gcs_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("static GCS HTTP client configuration is valid")
+}
+
+#[async_trait::async_trait]
+impl GcsClient for GcpGcsClient {
+    async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse> {
+        self.get_object_at_generation(object_name, None).await
+    }
+
+    async fn get_object_generation(
+        &self,
+        object_name: &str,
+        generation: i64,
+    ) -> Result<GcsGetResponse> {
+        self.get_object_at_generation(object_name, Some(generation))
+            .await
     }
 
     async fn put_object(
@@ -1881,12 +2297,79 @@ impl GcsClient for GcpGcsClient {
         resp.error_for_status()?;
         Ok(())
     }
+
+    async fn list_object_versions(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        let token = self.access_token().await?;
+        let mut url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o?versions=true&maxResults={}&prefix={}",
+            self.bucket,
+            GCS_LIST_PAGE_SIZE,
+            urlencoding::encode(prefix)
+        );
+        if let Some(page_token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencoding::encode(page_token));
+        }
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
+        let response = response.error_for_status()?;
+        decode_gcs_versions_page(&response.bytes().await?, "listed")
+    }
+
+    async fn list_soft_deleted_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        let token = self.access_token().await?;
+        let mut url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o?softDeleted=true&maxResults={}&prefix={}",
+            self.bucket,
+            GCS_LIST_PAGE_SIZE,
+            urlencoding::encode(prefix)
+        );
+        if let Some(page_token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencoding::encode(page_token));
+        }
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        decode_soft_deleted_list_response(status, &body, page_token.is_none())
+    }
+
+    async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}?generation={}",
+            self.bucket,
+            urlencoding::encode(object_name),
+            generation
+        );
+        let response = self.http.delete(&url).bearer_auth(&token).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        response.error_for_status()?;
+        Ok(())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn gcs_object_name(user_id: &str) -> String {
     format!("indexes/{user_id}.db.enc")
+}
+
+fn media_prefix(user_id: &str) -> String {
+    format!("raw/{user_id}/")
+}
+
+fn legacy_recovery_prefix(user_id: &str) -> String {
+    format!("legacy-recovery/{user_id}/")
 }
 
 fn media_keys(conn: &Connection) -> Result<Vec<String>> {
@@ -2333,18 +2816,99 @@ pub(crate) mod tests {
 
     // ── Fake GCS ──────────────────────────────────────────────────────────────
 
-    /// (ciphertext, wrapped_dek, generation)
-    type FakeObject = (Vec<u8>, String, i64);
+    #[derive(Clone)]
+    struct FakeObject {
+        ciphertext: Vec<u8>,
+        wrapped_dek: String,
+        generation: i64,
+        live: bool,
+        soft_deleted: bool,
+    }
 
     pub struct FakeGcs {
-        objects: StdMutex<HashMap<String, FakeObject>>,
+        objects: StdMutex<HashMap<String, Vec<FakeObject>>>,
+        fail_generation_delete: StdMutex<Option<(String, i64)>>,
+        soft_delete_enabled: StdMutex<bool>,
+        repeat_version_cursor: StdMutex<bool>,
+        listed_size_overrides: StdMutex<HashMap<String, u64>>,
+        exact_generation_gets: StdMutex<usize>,
     }
 
     impl FakeGcs {
         pub fn new() -> Self {
             Self {
                 objects: StdMutex::new(HashMap::new()),
+                fail_generation_delete: StdMutex::new(None),
+                soft_delete_enabled: StdMutex::new(false),
+                repeat_version_cursor: StdMutex::new(false),
+                listed_size_overrides: StdMutex::new(HashMap::new()),
+                exact_generation_gets: StdMutex::new(0),
             }
+        }
+
+        fn set_soft_delete_enabled(&self, enabled: bool) {
+            *self.soft_delete_enabled.lock().unwrap() = enabled;
+        }
+
+        fn set_repeat_version_cursor(&self, enabled: bool) {
+            *self.repeat_version_cursor.lock().unwrap() = enabled;
+        }
+
+        fn set_listed_size(&self, object_name: &str, size: u64) {
+            self.listed_size_overrides
+                .lock()
+                .unwrap()
+                .insert(object_name.into(), size);
+        }
+
+        fn exact_generation_get_count(&self) -> usize {
+            *self.exact_generation_gets.lock().unwrap()
+        }
+
+        fn version_count(&self, prefix: &str) -> usize {
+            self.objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .map(|(_, versions)| {
+                    versions
+                        .iter()
+                        .filter(|version| !version.soft_deleted)
+                        .count()
+                })
+                .sum()
+        }
+
+        fn soft_deleted_count(&self, prefix: &str) -> usize {
+            self.objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .map(|(_, versions)| {
+                    versions
+                        .iter()
+                        .filter(|version| version.soft_deleted)
+                        .count()
+                })
+                .sum()
+        }
+
+        fn soft_delete_generation(&self, object_name: &str, generation: i64) {
+            if let Some(versions) = self.objects.lock().unwrap().get_mut(object_name) {
+                if let Some(version) = versions
+                    .iter_mut()
+                    .find(|version| version.generation == generation)
+                {
+                    version.live = false;
+                    version.soft_deleted = true;
+                }
+            }
+        }
+
+        fn fail_next_generation_delete(&self, object_name: &str, generation: i64) {
+            *self.fail_generation_delete.lock().unwrap() = Some((object_name.into(), generation));
         }
     }
 
@@ -2354,10 +2918,33 @@ pub(crate) mod tests {
             let store = self.objects.lock().unwrap();
             store
                 .get(object_name)
-                .map(|(ct, dek, gen)| GcsGetResponse {
-                    ciphertext: ct.clone(),
-                    wrapped_dek_b64: dek.clone(),
-                    generation: *gen,
+                .and_then(|versions| versions.iter().rev().find(|version| version.live))
+                .map(|version| GcsGetResponse {
+                    ciphertext: version.ciphertext.clone(),
+                    wrapped_dek_b64: version.wrapped_dek.clone(),
+                    generation: version.generation,
+                })
+                .ok_or(crate::error::EnclaveError::NotFound)
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            *self.exact_generation_gets.lock().unwrap() += 1;
+            let store = self.objects.lock().unwrap();
+            store
+                .get(object_name)
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .find(|version| version.generation == generation && !version.soft_deleted)
+                })
+                .map(|version| GcsGetResponse {
+                    ciphertext: version.ciphertext.clone(),
+                    wrapped_dek_b64: version.wrapped_dek.clone(),
+                    generation: version.generation,
                 })
                 .ok_or(crate::error::EnclaveError::NotFound)
         }
@@ -2370,23 +2957,183 @@ pub(crate) mod tests {
             if_generation_match: i64,
         ) -> crate::error::Result<i64> {
             let mut store = self.objects.lock().unwrap();
-            let current_gen = store.get(object_name).map(|(_, _, g)| *g).unwrap_or(0);
+            let current_gen = store
+                .get(object_name)
+                .and_then(|versions| versions.iter().rev().find(|version| version.live))
+                .map(|version| version.generation)
+                .unwrap_or(0);
             if current_gen != if_generation_match {
                 return Err(crate::error::EnclaveError::Conflict(
                     "generation mismatch".into(),
                 ));
             }
             let new_gen = current_gen + 1;
-            store.insert(
-                object_name.to_string(),
-                (ciphertext.to_vec(), wrapped_dek_b64.to_string(), new_gen),
-            );
+            if let Some(versions) = store.get_mut(object_name) {
+                for version in versions.iter_mut() {
+                    version.live = false;
+                }
+                versions.push(FakeObject {
+                    ciphertext: ciphertext.to_vec(),
+                    wrapped_dek: wrapped_dek_b64.to_string(),
+                    generation: new_gen,
+                    live: true,
+                    soft_deleted: false,
+                });
+            } else {
+                store.insert(
+                    object_name.to_string(),
+                    vec![FakeObject {
+                        ciphertext: ciphertext.to_vec(),
+                        wrapped_dek: wrapped_dek_b64.to_string(),
+                        generation: new_gen,
+                        live: true,
+                        soft_deleted: false,
+                    }],
+                );
+            }
             Ok(new_gen)
         }
 
         async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
-            self.objects.lock().unwrap().remove(object_name);
+            if let Some(versions) = self.objects.lock().unwrap().get_mut(object_name) {
+                for version in versions.iter_mut() {
+                    version.live = false;
+                }
+            }
             Ok(())
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            const PAGE_SIZE: usize = 2;
+            let start = page_token
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| EnclaveError::Gcs("invalid fake GCS page cursor".into()))?
+                .unwrap_or(0);
+            let store = self.objects.lock().unwrap();
+            let size_overrides = self.listed_size_overrides.lock().unwrap().clone();
+            let mut versions = store
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .flat_map(|(name, objects)| {
+                    let size_override = size_overrides.get(name).copied();
+                    objects
+                        .iter()
+                        .filter(|object| !object.soft_deleted)
+                        .map(move |object| GcsObjectVersion {
+                            name: name.clone(),
+                            generation: object.generation,
+                            size: size_override.unwrap_or(object.ciphertext.len() as u64),
+                        })
+                })
+                .collect::<Vec<_>>();
+            versions.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.generation.cmp(&right.generation))
+            });
+            let end = (start + PAGE_SIZE).min(versions.len());
+            let next_page_token =
+                if *self.repeat_version_cursor.lock().unwrap() && page_token.is_some() {
+                    page_token.map(str::to_string)
+                } else {
+                    (end < versions.len()).then(|| end.to_string())
+                };
+            Ok(GcsListVersionsResponse {
+                versions: versions[start..end].to_vec(),
+                next_page_token,
+            })
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            if self
+                .fail_generation_delete
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|failure| failure.0 == object_name && failure.1 == generation)
+            {
+                *self.fail_generation_delete.lock().unwrap() = None;
+                return Err(EnclaveError::Gcs(
+                    "injected generation-delete failure".into(),
+                ));
+            }
+            let soft_delete_enabled = *self.soft_delete_enabled.lock().unwrap();
+            let mut store = self.objects.lock().unwrap();
+            if let Some(versions) = store.get_mut(object_name) {
+                if soft_delete_enabled {
+                    if let Some(version) = versions
+                        .iter_mut()
+                        .find(|version| version.generation == generation)
+                    {
+                        version.live = false;
+                        version.soft_deleted = true;
+                    }
+                } else {
+                    versions.retain(|version| version.generation != generation);
+                }
+                if versions.is_empty() {
+                    store.remove(object_name);
+                }
+            }
+            Ok(())
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            const PAGE_SIZE: usize = 2;
+            if !*self.soft_delete_enabled.lock().unwrap() {
+                return Ok(GcsListVersionsResponse::default());
+            }
+            let start = page_token
+                .map(str::parse::<usize>)
+                .transpose()
+                .map_err(|_| EnclaveError::Gcs("invalid fake GCS page cursor".into()))?
+                .unwrap_or(0);
+            let store = self.objects.lock().unwrap();
+            let size_overrides = self.listed_size_overrides.lock().unwrap().clone();
+            let mut versions = store
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .flat_map(|(name, objects)| {
+                    let size_override = size_overrides.get(name).copied();
+                    objects
+                        .iter()
+                        .filter(|object| object.soft_deleted)
+                        .map(move |object| GcsObjectVersion {
+                            name: name.clone(),
+                            generation: object.generation,
+                            size: size_override.unwrap_or(object.ciphertext.len() as u64),
+                        })
+                })
+                .collect::<Vec<_>>();
+            versions.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.generation.cmp(&right.generation))
+            });
+            let end = (start + PAGE_SIZE).min(versions.len());
+            let next_page_token =
+                if *self.repeat_version_cursor.lock().unwrap() && page_token.is_some() {
+                    page_token.map(str::to_string)
+                } else {
+                    (end < versions.len()).then(|| end.to_string())
+                };
+            Ok(GcsListVersionsResponse {
+                versions: versions[start..end].to_vec(),
+                next_page_token,
+            })
         }
     }
 
@@ -2394,6 +3141,25 @@ pub(crate) mod tests {
 
     fn make_store() -> Store {
         Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()))
+    }
+
+    fn insert_screenshot_evidence(conn: &Connection, object_key: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO screenshots(id,captured_at) VALUES (1,'2026-01-01T00:00:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO episodes(id,started_at,ended_at) \
+             VALUES (1,'2026-01-01T00:00:00Z','2026-01-01T00:01:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO screenshot_images \
+             (id,screenshot_id,episode_id,source_key,captured_at,object_key,mime_type,width,height,byte_length,sha256) \
+             VALUES ('image-1',1,1,'source-1','2026-01-01T00:00:00Z',?1,'image/jpeg',1,1,1,?2)",
+            rusqlite::params![object_key, "a".repeat(64)],
+        )?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2581,6 +3347,277 @@ pub(crate) mod tests {
             result.is_ok(),
             "delete_user on never-seen user should be Ok, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn account_deletion_paginates_and_removes_all_user_generations_only() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        let index = gcs_object_name("alice");
+        let live = gcs.get_object(&index).await.unwrap();
+        gcs.put_object(
+            &index,
+            &live.ciphertext,
+            &live.wrapped_dek_b64,
+            live.generation,
+        )
+        .await
+        .unwrap();
+        for name in ["raw/alice/a.enc", "raw/alice/b.enc"] {
+            let first = gcs
+                .put_object(name, b"ciphertext", "wrapped", 0)
+                .await
+                .unwrap();
+            gcs.put_object(name, b"ciphertext-2", "wrapped", first)
+                .await
+                .unwrap();
+        }
+        let checkpoint_source = gcs.get_object(&index).await.unwrap();
+        let checkpoint = "legacy-recovery/alice/day-1.db.enc";
+        gcs.put_object(
+            checkpoint,
+            &checkpoint_source.ciphertext,
+            &checkpoint_source.wrapped_dek_b64,
+            0,
+        )
+        .await
+        .unwrap();
+        gcs.put_object("raw/alice-other/keep.enc", b"other", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.put_object("raw/bob/keep.enc", b"other", "wrapped", 0)
+            .await
+            .unwrap();
+
+        store.delete_user("alice").await.unwrap();
+
+        assert_eq!(gcs.version_count(&index), 0);
+        assert_eq!(gcs.version_count("raw/alice/"), 0);
+        assert_eq!(gcs.version_count("legacy-recovery/alice/"), 0);
+        assert_eq!(gcs.version_count("raw/bob/"), 1);
+        assert_eq!(gcs.version_count("raw/alice-other/"), 1);
+    }
+
+    #[tokio::test]
+    async fn account_deletion_retries_after_exact_generation_failure_and_not_found() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        let media = "raw/alice/retry.enc";
+        let first = gcs.put_object(media, b"one", "wrapped", 0).await.unwrap();
+        let second = gcs
+            .put_object(media, b"two", "wrapped", first)
+            .await
+            .unwrap();
+        gcs.fail_next_generation_delete(media, second);
+
+        assert!(store.delete_user("alice").await.is_err());
+        // The first generation may already be gone; retry must tolerate it.
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(gcs.version_count(media), 0);
+    }
+
+    #[tokio::test]
+    async fn preexisting_soft_residue_does_not_block_live_version_cleanup() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        let index = gcs_object_name("alice");
+        let old_generation = gcs.get_object(&index).await.unwrap().generation;
+        store.save_user("alice").await.unwrap();
+        gcs.soft_delete_generation(&index, old_generation);
+        gcs.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(gcs.version_count(&index), 0);
+        assert_eq!(gcs.soft_deleted_count(&index), 2);
+    }
+
+    #[tokio::test]
+    async fn post_delete_soft_inventory_prevents_success_when_policy_is_enabled() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        gcs.put_object("raw/alice/capture.enc", b"media", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert!(gcs.soft_deleted_count(&gcs_object_name("alice")) > 0);
+        assert_eq!(gcs.soft_deleted_count("raw/alice/"), 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_retry_keeps_live_db_inventory_for_unscoped_media() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let media = "media/opaque-evidence-key";
+        store
+            .with_user("alice", |conn| insert_screenshot_evidence(conn, media))
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        let first = gcs.put_object(media, b"one", "wrapped", 0).await.unwrap();
+        let second = gcs
+            .put_object(media, b"two", "wrapped", first)
+            .await
+            .unwrap();
+        gcs.fail_next_generation_delete(media, second);
+
+        assert!(store.delete_user("alice").await.is_err());
+        assert_eq!(gcs.version_count(media), 1);
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(gcs.version_count(media), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_database_generation_inventories_removed_unscoped_evidence() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let media = "media/historical-only-evidence";
+        store
+            .with_user("alice", |conn| insert_screenshot_evidence(conn, media))
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        store
+            .with_user("alice", |conn| {
+                conn.execute("DELETE FROM screenshot_images", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        gcs.put_object(media, b"historical", "wrapped", 0)
+            .await
+            .unwrap();
+
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(gcs.version_count(media), 0);
+        assert_eq!(gcs.version_count(&gcs_object_name("alice")), 0);
+    }
+
+    #[tokio::test]
+    async fn unreadable_recovery_generation_keeps_deletion_incomplete() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        let recovery = "legacy-recovery/alice/unreadable.db.enc";
+        gcs.put_object(
+            recovery,
+            b"not-an-encrypted-database",
+            "not-a-wrapped-key",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let deletion = store.delete_user("alice").await;
+        assert!(
+            matches!(
+                deletion,
+                Err(EnclaveError::Conflict(ref message)) if message.contains("inventor")
+            ),
+            "unexpected deletion result: {deletion:?}"
+        );
+        assert_eq!(gcs.version_count(recovery), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_legacy_generation_fails_before_snapshot_download() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        let index = gcs_object_name("alice");
+        gcs.set_listed_size(&index, MAX_LEGACY_DELETION_SNAPSHOT_BYTES + 1);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(gcs.exact_generation_get_count(), 0);
+        assert_eq!(gcs.version_count(&index), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_version_cursor_fails_closed() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        for suffix in ["-a", "-b", "-c"] {
+            gcs.put_object(
+                &format!("indexes/alice.db.enc{suffix}"),
+                b"other",
+                "wrapped",
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        gcs.set_repeat_version_cursor(true);
+        assert!(matches!(
+            store
+                .delete_all_versions_for_name(&store.gcs, "indexes/alice.db.enc")
+                .await,
+            Err(EnclaveError::Gcs(message)) if message.contains("repeated")
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_soft_delete_cursor_fails_closed() {
+        let gcs = Arc::new(FakeGcs::new());
+        for suffix in ["-a", "-b", "-c"] {
+            let name = format!("indexes/alice.db.enc{suffix}");
+            let generation = gcs.put_object(&name, b"other", "wrapped", 0).await.unwrap();
+            gcs.soft_delete_generation(&name, generation);
+        }
+        gcs.set_soft_delete_enabled(true);
+        gcs.set_repeat_version_cursor(true);
+        assert!(matches!(
+            has_matching_soft_deleted_object(gcs.as_ref(), "indexes/alice.db.enc", true).await,
+            Err(EnclaveError::Gcs(message)) if message.contains("repeated")
+        ));
+    }
+
+    #[test]
+    fn soft_delete_policy_disabled_400_is_empty_only_on_first_page() {
+        let body = br#"{"error":{"code":400,"errors":[{"reason":"invalidArgument"}]}}"#;
+        let first = decode_soft_deleted_list_response(reqwest::StatusCode::BAD_REQUEST, body, true)
+            .unwrap();
+        assert!(first.versions.is_empty());
+        assert!(
+            decode_soft_deleted_list_response(reqwest::StatusCode::BAD_REQUEST, body, false,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn soft_delete_listing_does_not_mask_other_bad_requests() {
+        for body in [
+            br#"{"error":{"code":400,"errors":[{"reason":"badRequest"}]}}"#.as_slice(),
+            br#"{"error":{"code":400,"errors":[]}}"#.as_slice(),
+            br#"not-json"#.as_slice(),
+        ] {
+            assert!(decode_soft_deleted_list_response(
+                reqwest::StatusCode::BAD_REQUEST,
+                body,
+                true,
+            )
+            .is_err());
+        }
     }
 
     #[tokio::test]

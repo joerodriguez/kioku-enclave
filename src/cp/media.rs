@@ -820,6 +820,7 @@ async fn upload_capture_event(
         Err(error) => return error.into_response(),
     }
 
+    let mut media_generation = None;
     if manifest.media_disposition == MediaDisposition::Canonical {
         let object_key = object_key
             .as_deref()
@@ -842,17 +843,29 @@ async fn upload_capture_event(
                         .into_response();
                 }
             };
-        if let Err(put_error) = state
+        match state
             .store
             .put_media(object_key, &encrypted, &wrapped_dek)
             .await
         {
-            if let Err(error) =
-                verify_existing_media(&state, &user_id, object_key, &media_context, media_bytes)
-                    .await
-            {
-                tracing::error!(error = %put_error, verify_error = %error, "capture media storage failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+            Ok(generation) => media_generation = Some(generation),
+            Err(put_error) => {
+                if let Err(error) =
+                    verify_existing_media(&state, &user_id, object_key, &media_context, media_bytes)
+                        .await
+                {
+                    tracing::error!(error = %put_error, verify_error = %error, "capture media storage failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
+                        .into_response();
+                }
+                media_generation = match state.store.get_media(object_key).await {
+                    Ok(existing) => Some(existing.generation),
+                    Err(error) => {
+                        tracing::error!(error = %error, "capture media generation lookup failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
+                            .into_response();
+                    }
+                };
             }
         }
     }
@@ -861,7 +874,7 @@ async fn upload_capture_event(
         .store
         .with_user(&user_id, |conn| {
             match manifest.media_disposition {
-                MediaDisposition::Canonical => record_source_event(
+                MediaDisposition::Canonical => record_source_event_with_generation(
                     conn,
                     &user_id,
                     &manifest,
@@ -869,6 +882,7 @@ async fn upload_capture_event(
                     object_key
                         .as_deref()
                         .expect("validated canonical object key"),
+                    media_generation,
                 )?,
                 MediaDisposition::Reference => {
                     record_reference_event(conn, &user_id, &manifest, &digest)?
@@ -1470,6 +1484,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             asset_id TEXT PRIMARY KEY,
             event_id TEXT NOT NULL UNIQUE REFERENCES capture_events(event_id) ON DELETE CASCADE,
             object_key TEXT NOT NULL UNIQUE,
+            object_generation INTEGER,
             mime_type TEXT NOT NULL,
             codec TEXT NOT NULL,
             byte_length INTEGER NOT NULL,
@@ -1745,6 +1760,12 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    add_column_if_missing(
+        conn,
+        "media_objects",
+        "object_generation",
+        "ALTER TABLE media_objects ADD COLUMN object_generation INTEGER",
+    )?;
     let has_normalized_name: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('people') WHERE name='normalized_name'",
         [],
@@ -1964,12 +1985,33 @@ pub enum RecordOutcome {
     Duplicate,
 }
 
+#[cfg(test)]
 pub fn record_source_event(
     conn: &Connection,
     account_id: &str,
     manifest: &CaptureEventManifest,
     manifest_digest: &str,
     object_key: &str,
+) -> Result<RecordOutcome> {
+    record_source_event_with_generation(
+        conn,
+        account_id,
+        manifest,
+        manifest_digest,
+        object_key,
+        None,
+    )
+}
+
+/// Records the generation returned by GCS for canonical media when available.
+/// Old rows may not have it; deletion still reconciles the exact user prefix.
+pub fn record_source_event_with_generation(
+    conn: &Connection,
+    account_id: &str,
+    manifest: &CaptureEventManifest,
+    manifest_digest: &str,
+    object_key: &str,
+    object_generation: Option<i64>,
 ) -> Result<RecordOutcome> {
     manifest.validate()?;
     if manifest.media_disposition != MediaDisposition::Canonical {
@@ -2074,13 +2116,14 @@ pub fn record_source_event(
     }
     tx.execute(
         "INSERT INTO media_objects \
-         (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256,sample_rate,channels, \
+         (asset_id,event_id,object_key,object_generation,mime_type,codec,byte_length,sha256,sample_rate,channels, \
           frame_count,width,height,scale,orientation,retain_until) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             media.asset_id,
             manifest.event_id,
             object_key,
+            object_generation,
             media.mime_type,
             media.codec,
             media.byte_length,
@@ -2830,9 +2873,25 @@ mod tests {
         let manifest = valid_manifest();
         let digest_1 = "a".repeat(64);
         let digest_2 = "b".repeat(64);
-        let first =
-            record_source_event(&conn, "account-1", &manifest, &digest_1, "object-1").unwrap();
+        let first = record_source_event_with_generation(
+            &conn,
+            "account-1",
+            &manifest,
+            &digest_1,
+            "object-1",
+            Some(42),
+        )
+        .unwrap();
         assert_eq!(first, RecordOutcome::Created);
+        assert_eq!(
+            conn.query_row(
+                "SELECT object_generation FROM media_objects WHERE object_key='object-1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            42
+        );
 
         let duplicate =
             record_source_event(&conn, "account-1", &manifest, &digest_1, "object-1").unwrap();
