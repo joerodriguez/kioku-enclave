@@ -112,7 +112,7 @@ Version 2 blobs are prefixed with `KIOKU-BLOB\x02` and encrypted with AES-256-GC
 authenticated data binds each ciphertext to its logical purpose and location:
 
 - user databases bind to `indexes/{user_id}.db.enc`;
-- raw capture and screenshot evidence bind to both the authenticated user and opaque media object key;
+- raw capture and screenshot evidence bind to both the authenticated user and opaque media object key; new selected screenshot evidence is under the validated owner prefix `raw/{user_id}/evidence/{opaque_key}.enc` (legacy keys remain compatible);
 - the control database and ACME state use separate fixed contexts.
 
 Copying ciphertext and its wrapped DEK to another user or object therefore fails

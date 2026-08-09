@@ -2411,7 +2411,13 @@ async fn rest_screenshot_image_upload(
     let mut random_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random_bytes);
     let opaque_key: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    let object_key = format!("media/{}", opaque_key);
+    let object_key = match crate::store::selected_evidence_media_object_key(&user_id, &opaque_key) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(error = %e, "selected evidence media key construction failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
     let media_context = crate::store::media_blob_context(&user_id, &object_key);
     let encrypted_data =
         match crate::crypto::encrypt_bound_blob(&media_dek, &image_bytes, &media_context) {
@@ -2461,13 +2467,13 @@ async fn rest_screenshot_image_upload(
         Ok(ScreenshotRecordOutcome::Created(stored)) => stored,
         Ok(ScreenshotRecordOutcome::Existing(existing)) => {
             if let Err(e) = s.store.delete_media(&object_key).await {
-                tracing::error!(error = %e, object_key, "failed to clean up redundant media object");
+                tracing::error!(error = %e, "failed to clean up redundant selected evidence media");
             }
             return (StatusCode::OK, Json(existing.response_json())).into_response();
         }
         Err(e) => {
             if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
-                tracing::error!(error = %cleanup_error, object_key, "failed to clean up rejected media object");
+                tracing::error!(error = %cleanup_error, "failed to clean up rejected selected evidence media");
             }
             tracing::warn!(error = %e, "media upload database insert failed");
             return match e {
@@ -2499,7 +2505,7 @@ async fn rest_screenshot_image_upload(
             }
         }
         if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
-            tracing::error!(error = %cleanup_error, object_key, "failed to clean up media object after database save failure");
+            tracing::error!(error = %cleanup_error, "failed to clean up selected evidence media after database save failure");
         }
         return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
     }
