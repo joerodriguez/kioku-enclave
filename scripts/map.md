@@ -8,7 +8,9 @@ None of these scripts runs in the enclave or in a Kioku client.
 |---|---|
 | `bump_version.sh` | Updates the Cargo version and stages the complete release change. |
 | `fetch_voice_eval_assets.sh` | Downloads licensed evaluation inputs and records hashes outside Git. |
-| `release.sh` | Verifies the real-corpus gate, creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
+| `check_voice_release_gate.py` | Classifies a release as exact owner-only/no-claim or invokes the Rust checker for a complete real-corpus trio. |
+| `test_check_voice_release_gate.py` | Fail-closed contract tests for owner-only and validated-real-corpus classifications. |
+| `release.sh` | Verifies the selected voice-quality classification, creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
 | `select_build_configuration.py` | Atomically selects and validates one complete production or evaluation image profile without cross-profile fallback. |
 | `test_select_build_configuration.py` | Contract tests for profile isolation and the public build workflow. |
 

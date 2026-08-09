@@ -9,6 +9,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOYMENT_REPO="${DEPLOYMENT_REPO:-}"
 RELEASE_SIGNER_FINGERPRINT="${RELEASE_SIGNER_FINGERPRINT:-}"
 ROLL=false
+EXPECTED_VOICE_QUALITY_GATE=""
 
 usage() {
   echo "Usage: $0 <vMAJOR.MINOR.PATCH> [--roll]"
@@ -195,18 +196,8 @@ if [[ "$ROLLBACK_EXISTING" == "false" && "$RESUME_EXISTING" == "false" ]]; then
   cargo fmt --all -- --check
   cargo test --locked
   cargo clippy --locked --all-targets -- -D warnings
-  VOICE_EVAL_MANIFEST="eval/voice/release-manifest.json"
-  VOICE_EVAL_CASES="eval/voice/release-cases.json"
-  VOICE_EVAL_REPORT="eval/voice/release-report.json"
-  if [[ ! -s "$VOICE_EVAL_MANIFEST" || ! -s "$VOICE_EVAL_CASES" || ! -s "$VOICE_EVAL_REPORT" ]]; then
-    echo "Error: ADR-0016 requires a checked-in source manifest, real cases, and matching passing report." >&2
-    echo "       Expected $VOICE_EVAL_MANIFEST, $VOICE_EVAL_CASES, and $VOICE_EVAL_REPORT." >&2
-    echo "       See eval/voice/README.md." >&2
-    exit 1
-  fi
-  cargo run --locked --quiet -- \
-    --check-voice-eval \
-    "$VOICE_EVAL_MANIFEST" "$VOICE_EVAL_CASES" "$VOICE_EVAL_REPORT"
+  VOICE_QUALITY_GATE="$(python3 scripts/check_voice_release_gate.py)"
+  EXPECTED_VOICE_QUALITY_GATE="$VOICE_QUALITY_GATE"
 fi
 
 verify_tag_signer() {
@@ -324,13 +315,28 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 keys = ("schema_version", "source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest", "build_url", "build_profile")
+data["voice_quality_gate"] = data.get("voice_quality_gate", "legacy_unclassified")
+keys += ("voice_quality_gate",)
 print("\t".join(str(data[key]) for key in keys))
 PY
 )"
-IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE <<< "$RELEASE_METADATA"
+IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE <<< "$RELEASE_METADATA"
 
-if [[ "$SCHEMA_VERSION" != "1" || "$SOURCE_REPOSITORY" != "https://github.com/${REPOSITORY}" || "$BUILD_PROFILE" != "production" ]]; then
+if [[ "$SOURCE_REPOSITORY" != "https://github.com/${REPOSITORY}" || "$BUILD_PROFILE" != "production" ]]; then
   echo "Error: build metadata has an unexpected schema, source repository, or non-production profile." >&2
+  exit 1
+fi
+if [[ "$SCHEMA_VERSION" == "2" ]]; then
+  if [[ "$VOICE_QUALITY_GATE" != "owner_only_unvalidated" && "$VOICE_QUALITY_GATE" != "validated_real_corpus" ]]; then
+    echo "Error: schema-v2 build metadata has an invalid voice-quality gate classification." >&2
+    exit 1
+  fi
+elif [[ "$SCHEMA_VERSION" != "1" || "$VOICE_QUALITY_GATE" != "legacy_unclassified" || "$ROLLBACK_EXISTING" != "true" ]]; then
+  echo "Error: legacy unclassified metadata is accepted only for an immutable rollback." >&2
+  exit 1
+fi
+if [[ -n "$EXPECTED_VOICE_QUALITY_GATE" && "$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE" ]]; then
+  echo "Error: build metadata voice-quality classification does not match the checked source." >&2
   exit 1
 fi
 if [[ "$BUILT_REF" != "$RELEASE_TAG" || "$BUILT_COMMIT" != "$REMOTE_TAG_COMMIT" ]]; then
@@ -440,6 +446,7 @@ printf '%s\n' \
   "| Image | \`${DIGEST_URI}\` |" \
   "| Image digest | \`${DIGEST}\` |" \
   "| Build | [GitHub Actions run](${BUILD_URL}) |" \
+  "| Voice quality gate | \`${VOICE_QUALITY_GATE}\` |" \
   "" \
   "The digest is the attestation anchor used by the deployment's KMS policy." \
   "See README.md for the trust boundary and current reproducibility caveats." \

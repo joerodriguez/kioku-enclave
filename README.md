@@ -62,6 +62,9 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   private similarity command verifies the exact production WeSpeaker model and media
   hashes, then emits only opaque integer pair scores to select the hardest different-
   speaker slice without exposing vectors or content.
+- Classifies every signed image as either `owner_only_unvalidated` or
+  `validated_real_corpus`. The former permits owner-only production evaluation but
+  explicitly authorizes no speaker-quality claim and no external users.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
@@ -321,14 +324,14 @@ operation. For `main` and tags the workflow then:
 6. creates GitHub-signed image provenance and a signed SBOM attestation; and
 7. uploads release metadata, provenance, SBOM, and attestation bundles.
 
-A manual dispatch from reviewed `main` can choose the `evaluation` build profile. That
-profile is accepted only when every `EVAL_*` counterpart is present and valid; selection
-is atomic and never falls back to production values. Evaluation images use an `eval-`
-tag prefix, carry `build_profile: evaluation` in their metadata, and are not eligible for
-a GitHub Release or production rollout. They must be deployed only to an isolated
-evaluation VM whose service account, KMS key, GCS buckets, audience, and hostname cannot
-access production data. Ordinary `main` and signed `v*` tag pushes always select the
-production profile.
+Production is the sole active owner evaluation environment. Signed releases either carry
+the exact `eval/voice/owner-only-production.json` declaration and record
+`voice_quality_gate: owner_only_unvalidated`, or carry a complete passing real-corpus trio
+and record `validated_real_corpus`. The owner-only declaration permits neither external
+users nor a voice-quality claim. The former manual `evaluation` build profile remains
+available only to reproduce and audit historical isolated images; its runtime is retired,
+it cannot become a GitHub Release or production rollout, and it must not be deployed.
+Ordinary `main` and signed `v*` tag pushes always select the production profile.
 
 All third-party Actions are pinned to reviewed commit SHAs. A separate security workflow
 runs CodeQL on pull requests, `main`, and a weekly schedule, plus dependency review on
@@ -382,7 +385,7 @@ published trusted fingerprint; a valid signature from an unknown key is not suff
 The release contains:
 
 - `enclave-release.json` — production build profile, source ref/commit, image URI/digest,
-  and build URL;
+  build URL, and explicit voice-quality gate classification;
 - `enclave-provenance.jsonl` — GitHub-signed image provenance;
 - `enclave-sbom.spdx.json` — SPDX SBOM; and
 - `enclave-sbom-attestation.jsonl` — signed SBOM attestation.
