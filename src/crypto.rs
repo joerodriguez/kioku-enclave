@@ -49,6 +49,9 @@ const BOUND_BLOB_V2_DOMAIN: &[u8] = b"kioku-enclave:bound-blob:v2\0";
 /// Result of opening a context-bound blob.
 pub struct OpenedBoundBlob {
     pub plaintext: Vec<u8>,
+    /// True when the accepted input used a migration-only legacy envelope and
+    /// must be persisted again in the current context-bound v2 format.
+    pub requires_rewrite: bool,
 }
 
 // ── DEK type ──────────────────────────────────────────────────────────────────
@@ -162,15 +165,22 @@ pub fn decrypt_bound_blob(dek: &Dek, blob: &[u8], context: &[u8]) -> Result<Open
         let aad = bound_blob_aad(context);
         return Ok(OpenedBoundBlob {
             plaintext: decrypt_blob_with_aad(dek, encrypted, &aad)?,
+            requires_rewrite: false,
         });
     }
 
     // Legacy blob fallback (pre-v2 format without KIOKU-BLOB header)
     if let Ok(plaintext) = decrypt_blob_with_aad(dek, blob, context) {
-        return Ok(OpenedBoundBlob { plaintext });
+        return Ok(OpenedBoundBlob {
+            plaintext,
+            requires_rewrite: true,
+        });
     }
     if let Ok(plaintext) = decrypt_blob(dek, blob) {
-        return Ok(OpenedBoundBlob { plaintext });
+        return Ok(OpenedBoundBlob {
+            plaintext,
+            requires_rewrite: true,
+        });
     }
 
     Err(EnclaveError::Crypto(
@@ -444,8 +454,19 @@ mod tests {
         let opened =
             decrypt_bound_blob(&dek, &blob, alice_context).expect("open with correct context");
         assert_eq!(opened.plaintext, b"alice data");
+        assert!(!opened.requires_rewrite);
 
         assert!(decrypt_bound_blob(&dek, &blob, b"user-db\0indexes/bob.db.enc").is_err());
+    }
+
+    #[test]
+    fn legacy_bound_blob_reports_required_rewrite() {
+        let dek = Dek::generate();
+        let context = b"user-db\0indexes/migration.db.enc";
+        let legacy = encrypt_blob_with_aad(&dek, b"legacy data", context).unwrap();
+        let opened = decrypt_bound_blob(&dek, &legacy, context).unwrap();
+        assert_eq!(opened.plaintext, b"legacy data");
+        assert!(opened.requires_rewrite);
     }
 
     #[test]

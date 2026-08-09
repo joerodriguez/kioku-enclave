@@ -136,8 +136,6 @@ User databases, the control database, ACME state, and media evidence are rewritt
 to v2 immediately when successfully opened by an explicitly enabled migration image.
 Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-way; see
 [`RELEASING.md`](RELEASING.md#one-time-legacy-blob-migration) before upgrading a
-deployment that contains pre-v2 objects.
-
 ### ADR-0022 archive-v3 foundation is inactive
 
 `src/archive_v3.rs` defines only audited, unit-tested format primitives for the future
@@ -181,6 +179,17 @@ and their content-free metadata are included in later export/deletion inventorie
 flush begins, any failure before the authoritative generation-checked PUT succeeds fences
 the local handle: its next access must retry persistence before request code can observe an
 idempotency duplicate and acknowledge it.
+
+Legacy whole-database persistence tracks a process-local dirty generation around every
+SQLite operation. Cumulative row changes include SQL-trigger effects; schema version,
+user version, and application ID cover persistent schema/header mutations. A failed
+post-operation state check is treated as dirty. The explicit read API also enables
+SQLite `query_only`, while extension or FFI mutations can use an unconditional dirty
+guard. Successfully persisted generations become clean; failed uploads and detected
+open-time migrations remain dirty through retry or eviction. A clean save or eviction
+does no checkpoint, plaintext file read, KMS unwrap, encryption, or GCS upload. This is a
+write-amplification optimization only: it does not change ciphertext format, authority,
+or acknowledgement requirements.
 
 ## Attestation and TLS
 
