@@ -1792,13 +1792,17 @@ async fn prune_user_media(state: &CpState, user_id: &str) {
         .store
         .with_user(user_id, |conn| {
             let mut statement = conn.prepare(
-                "SELECT event_id,object_key FROM media_objects \
+                "SELECT event_id,object_key,object_generation FROM media_objects \
                  WHERE deleted_at IS NULL AND retain_until<=?1 \
                  AND processing_state IN ('ready','failed') ORDER BY retain_until LIMIT 100",
             )?;
             let rows = statement
                 .query_map([&now], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -1812,9 +1816,21 @@ async fn prune_user_media(state: &CpState, user_id: &str) {
         }
     };
     let mut changed = false;
-    for (event_id, object_key) in due {
-        if let Err(error) = state.store.delete_media(&object_key).await {
-            warn!(user_id, error = %error, "raw media retention delete failed");
+    for (event_id, object_key, object_generation) in due {
+        let delete_result = match object_generation {
+            Some(generation) => {
+                state
+                    .store
+                    .delete_media_generation(&object_key, generation)
+                    .await
+            }
+            // Rows accepted before generation capture retain the legacy
+            // name-delete fallback; account deletion still reconciles every
+            // generation under the exact user prefix.
+            None => state.store.delete_media(&object_key).await,
+        };
+        if let Err(error) = delete_result {
+            warn!(error = %error, "raw media retention delete failed");
             continue;
         }
         let deleted_at = now_iso();
@@ -1830,7 +1846,7 @@ async fn prune_user_media(state: &CpState, user_id: &str) {
             })
             .await
         {
-            warn!(user_id, error = %error, "raw media retention ledger update failed");
+            warn!(error = %error, "raw media retention ledger update failed");
             continue;
         }
         changed = true;
