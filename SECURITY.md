@@ -62,6 +62,14 @@ surfaces.
   leave the enclave.
 - Decrypted databases exist only in the `/tmp` Confidential Space tmpfs and in process
   memory. User content and key material must never be logged.
+- Archive storage telemetry is process-aggregate and content-free. Its in-process state
+  and structured events have no user/archive IDs, object names or paths, URLs, queries,
+  content, keys, per-user labels, or timestamps sourced from user records. Only fixed
+  byte/latency/ratio buckets and aggregate save outcome counters are permitted.
+- Capacity fixtures contain deterministic numeric shapes only. Generated records and
+  sparse files stay under ignored `target/` output or outside the checkout; no captured
+  content, realistic text/media, user identifier, object path, biometric vector, or key
+  may be introduced as capacity input.
 - Legacy encrypted blobs are rejected unless a reviewed migration image explicitly
   bakes in `ENCLAVE_ALLOW_LEGACY_BLOBS=1`.
 - Unified episode-analysis requests contain text and metadata only. Code that builds a Vertex
@@ -360,6 +368,15 @@ signatures, or response bodies.
 User IDs are deterministically derived from the Google subject identifier. Anyone who
 already knows that subject can derive the corresponding `indexes/{user_id}.db.enc` name.
 This is an accepted availability trade-off, not an encryption bypass.
+
+### Aggregate storage telemetry reveals process-wide activity
+
+The existing structured log sink receives at most one cumulative archive-storage metric
+event per active minute. It reveals process-wide operation timing, byte-volume buckets and
+save outcomes, but deliberately cannot attribute an observation to a user, archive,
+object, request or content value. Counters are process-local and reset on restart. Access
+to operational logs remains privileged; do not join these events to request-level user
+logs or add high-cardinality labels.
 
 ## Reporting vulnerabilities
 
