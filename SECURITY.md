@@ -166,6 +166,22 @@ bounded near 1 MiB, so the checkpoint role/tag remains reserved until a reviewed
 streaming/chunk-manifest format exists. A WAL-bearing root must still name a checkpoint
 base reference, preventing publication of an unrecoverable WAL chain.
 
+During the ADR-0022 legacy lifecycle transition, before the first whole-blob overwrite
+for each user and UTC day, the service creates or verifies one immutable server-side
+recovery copy under `legacy-recovery/{user_id}/YYYY-MM-DD.db.enc`. A generation-zero
+initial create has no prior remote state to protect; its first overwrite establishes the
+checkpoint. The copy is pinned to the exact currently authoritative source generation,
+preserves the wrapped-DEK metadata, and atomically records a protocol marker binding the
+source name, generation, size, and CRC32C. Created and pre-existing destinations must
+verify against that marker and provider generation/integrity metadata without downloading
+or decrypting the database. A checkpoint copy retains the original ciphertext's logical
+binding; it is recovery/inventory material, not an independently relocatable blob. The
+overwrite is withheld when the required checkpoint cannot be verified. Checkpoint names
+and their content-free metadata are included in later export/deletion inventories. Once a
+flush begins, any failure before the authoritative generation-checked PUT succeeds fences
+the local handle: its next access must retry persistence before request code can observe an
+idempotency duplicate and acknowledge it.
+
 ## Attestation and TLS
 
 The KMS credential path and public verification path deliberately use different

@@ -131,6 +131,13 @@ struct BlobMeta {
     generation: i64,
     /// Base64-encoded wrapped DEK stored alongside the blob (in GCS metadata).
     wrapped_dek_b64: String,
+    /// UTC epoch day whose named checkpoint this process has fully verified.
+    /// This is deliberately process-local; restart re-verifies once.
+    verified_legacy_recovery_day: Option<i64>,
+    /// A flush failed after local mutation but before authoritative remote
+    /// persistence. The next access must retry that pending save before a
+    /// caller can observe a duplicate and acknowledge without persisting it.
+    retry_save_before_access: bool,
 }
 
 struct UserHandle {
@@ -150,6 +157,7 @@ pub struct Store {
     pub gcs: Arc<dyn GcsClient>,
     pub media_gcs: Arc<dyn GcsClient>,
     max_open: usize,
+    checkpoint_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 struct StoreInner {
@@ -207,6 +215,7 @@ impl Store {
             gcs,
             media_gcs,
             max_open,
+            checkpoint_clock: Arc::new(SystemTime::now),
         }
     }
 
@@ -261,6 +270,9 @@ impl Store {
         }
         let handle = inner.handles.get_mut(user_id).unwrap();
         handle.last_used = Instant::now();
+        if handle.blob_meta.retry_save_before_access {
+            self.flush_handle(handle).await?;
+        }
         f(&handle.conn)
     }
 
@@ -690,6 +702,8 @@ impl Store {
                     BlobMeta {
                         generation: resp.generation,
                         wrapped_dek_b64: resp.wrapped_dek_b64,
+                        verified_legacy_recovery_day: None,
+                        retry_save_before_access: false,
                     },
                 )
             }
@@ -703,6 +717,8 @@ impl Store {
                     BlobMeta {
                         generation: 0,
                         wrapped_dek_b64: wrapped,
+                        verified_legacy_recovery_day: None,
+                        retry_save_before_access: false,
                     },
                 )
             }
@@ -729,6 +745,12 @@ impl Store {
     }
 
     async fn flush_handle(&self, handle: &mut UserHandle) -> Result<()> {
+        // From this point until the generation-checked PUT succeeds, the local
+        // handle may contain state a request intends to acknowledge. Any
+        // failure must make the next access retry persistence before its
+        // closure can observe an idempotency duplicate and return success.
+        handle.blob_meta.retry_save_before_access = true;
+
         // WAL checkpoint: make sure all WAL pages are in the main DB file
         handle
             .conn
@@ -748,6 +770,26 @@ impl Store {
         let object_name = gcs_object_name(&handle.user_id);
         let context = user_blob_context(&handle.user_id);
         let ciphertext = encrypt_bound_blob(&dek, &db_bytes, &context)?;
+
+        // Before the first overwrite of each UTC day, preserve the exact
+        // currently authoritative generation. A generation-zero object has no
+        // prior remote state at risk, so its initial create needs no copy; its
+        // next overwrite will establish the checkpoint. Cache only a fully
+        // verified day, and re-verify once after process restart.
+        let checkpoint_now = (self.checkpoint_clock)();
+        let checkpoint_day = utc_epoch_day(checkpoint_now);
+        if handle.blob_meta.generation > 0
+            && handle.blob_meta.verified_legacy_recovery_day != Some(checkpoint_day)
+        {
+            self.ensure_legacy_recovery_checkpoint(
+                &handle.user_id,
+                handle.blob_meta.generation,
+                checkpoint_now,
+            )
+            .await?;
+            handle.blob_meta.verified_legacy_recovery_day = Some(checkpoint_day);
+        }
+
         let new_generation = self
             .gcs
             .put_object(
@@ -760,9 +802,36 @@ impl Store {
         // Invariant: record the post-write generation, or the NEXT save's
         // `ifGenerationMatch` conflicts against our own previous write.
         handle.blob_meta.generation = new_generation;
+        handle.blob_meta.retry_save_before_access = false;
 
         debug!("flushed user index to GCS");
         Ok(())
+    }
+
+    async fn ensure_legacy_recovery_checkpoint(
+        &self,
+        user_id: &str,
+        source_generation: i64,
+        now: SystemTime,
+    ) -> Result<()> {
+        let destination = legacy_recovery_checkpoint_name(user_id, now);
+        let source = gcs_object_name(user_id);
+        let copied = self
+            .gcs
+            .copy_generation_if_absent(&source, source_generation, &destination)
+            .await?;
+        if copied.source.generation != source_generation {
+            return Err(EnclaveError::Gcs(
+                "legacy recovery source generation did not match requested generation".into(),
+            ));
+        }
+        verify_legacy_recovery_copy(
+            &source,
+            source_generation,
+            &copied.source,
+            &copied.destination,
+            copied.created,
+        )
     }
 
     async fn evict_lru_locked(&self, inner: &mut StoreInner) -> Result<()> {
@@ -1815,6 +1884,30 @@ fn create_empty_db(dek: &Dek) -> Result<Vec<u8>> {
 
 // ── GCS trait (seam for testing) ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcsObjectMetadata {
+    pub generation: i64,
+    pub size: u64,
+    /// Provider-calculated CRC32C in GCS's base64 representation.
+    pub crc32c: String,
+    pub md5_hash: Option<String>,
+    pub wrapped_dek_b64: String,
+    pub legacy_recovery: Option<LegacyRecoveryBinding>,
+}
+
+/// Provider-stored protocol marker written atomically with a daily recovery
+/// rewrite. Its source identity and integrity fields describe the immutable
+/// generation from which the destination bytes were copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRecoveryBinding {
+    pub format_version: u8,
+    pub source_object: String,
+    pub source_generation: i64,
+    pub source_size: u64,
+    pub source_crc32c: String,
+}
+
+#[derive(Debug)]
 pub struct GcsGetResponse {
     pub ciphertext: Vec<u8>,
     pub wrapped_dek_b64: String,
@@ -1834,6 +1927,17 @@ pub struct GcsObjectVersion {
 pub struct GcsListVersionsResponse {
     pub versions: Vec<GcsObjectVersion>,
     pub next_page_token: Option<String>,
+}
+
+/// Result of a generation-pinned, create-only recovery copy.  The metadata is
+/// intentionally content-free and is sufficient for export/deletion inventory
+/// code to identify an exact checkpoint generation without reading ciphertext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcsGenerationCopy {
+    pub source: GcsObjectMetadata,
+    pub destination: GcsObjectMetadata,
+    /// False means this UTC day's immutable destination already existed.
+    pub created: bool,
 }
 
 /// Abstraction over GCS so unit tests can inject an in-memory fake.
@@ -1857,6 +1961,15 @@ pub trait GcsClient: Send + Sync {
         wrapped_dek_b64: &str,
         if_generation_match: i64,
     ) -> Result<i64>;
+    /// Copy exactly `source_generation` to a destination that must not already
+    /// exist. If a prior attempt may have succeeded, implementations must read
+    /// and return that destination instead of copying a newer source version.
+    async fn copy_generation_if_absent(
+        &self,
+        source_name: &str,
+        source_generation: i64,
+        destination_name: &str,
+    ) -> Result<GcsGenerationCopy>;
     async fn delete_object(&self, object_name: &str) -> Result<()>;
     /// Lists live and noncurrent generations under an exact caller-owned
     /// prefix/name. `page_token` is an opaque GCS cursor.
@@ -1983,9 +2096,14 @@ async fn has_matching_soft_deleted_object(
 
 // ── Production GCS client ──────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct GcsObjectMetadata {
+#[derive(Debug, Deserialize)]
+struct GcsApiObjectMetadata {
     generation: String,
+    size: String,
+    #[serde(rename = "crc32c")]
+    crc32c: Option<String>,
+    #[serde(rename = "md5Hash")]
+    md5_hash: Option<String>,
     metadata: Option<GcsCustomMetadata>,
 }
 
@@ -2080,10 +2198,93 @@ fn decode_soft_deleted_list_response(
     )))
 }
 
-#[derive(Deserialize)]
+impl GcsApiObjectMetadata {
+    fn into_public(self) -> Result<GcsObjectMetadata> {
+        let custom = self
+            .metadata
+            .ok_or_else(|| EnclaveError::Gcs("missing GCS custom metadata".into()))?;
+        let wrapped_dek_b64 = custom
+            .wrapped_dek
+            .clone()
+            .ok_or_else(|| EnclaveError::Gcs("missing wrapped DEK in object metadata".into()))?;
+        let legacy_recovery = custom.legacy_recovery_binding()?;
+        Ok(GcsObjectMetadata {
+            generation: self
+                .generation
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid generation".into()))?,
+            size: self
+                .size
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid GCS object size".into()))?,
+            crc32c: self
+                .crc32c
+                .ok_or_else(|| EnclaveError::Gcs("missing GCS CRC32C".into()))?,
+            md5_hash: self.md5_hash,
+            wrapped_dek_b64,
+            legacy_recovery,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct GcsCustomMetadata {
     #[serde(rename = "x-kioku-wrapped-dek")]
     wrapped_dek: Option<String>,
+    #[serde(rename = "x-kioku-legacy-recovery-format")]
+    legacy_recovery_format: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-object")]
+    legacy_source_object: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-generation")]
+    legacy_source_generation: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-size")]
+    legacy_source_size: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-crc32c")]
+    legacy_source_crc32c: Option<String>,
+}
+
+impl GcsCustomMetadata {
+    fn legacy_recovery_binding(&self) -> Result<Option<LegacyRecoveryBinding>> {
+        let fields_present = [
+            self.legacy_recovery_format.is_some(),
+            self.legacy_source_object.is_some(),
+            self.legacy_source_generation.is_some(),
+            self.legacy_source_size.is_some(),
+            self.legacy_source_crc32c.is_some(),
+        ];
+        if fields_present.iter().all(|present| !present) {
+            return Ok(None);
+        }
+        if !fields_present.iter().all(|present| *present) {
+            return Err(EnclaveError::Gcs(
+                "incomplete legacy recovery checkpoint metadata".into(),
+            ));
+        }
+        Ok(Some(LegacyRecoveryBinding {
+            format_version: self
+                .legacy_recovery_format
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid legacy recovery format".into()))?,
+            source_object: self.legacy_source_object.clone().unwrap_or_default(),
+            source_generation: self
+                .legacy_source_generation
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|_| {
+                    EnclaveError::Gcs("invalid legacy recovery source generation".into())
+                })?,
+            source_size: self
+                .legacy_source_size
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid legacy recovery source size".into()))?,
+            source_crc32c: self.legacy_source_crc32c.clone().unwrap_or_default(),
+        }))
+    }
 }
 
 pub struct GcpGcsClient {
@@ -2125,40 +2326,43 @@ impl GcpGcsClient {
             .await?;
         Ok(tok.access_token)
     }
+    async fn object_metadata(
+        &self,
+        object_name: &str,
+        generation: Option<i64>,
+    ) -> Result<GcsObjectMetadata> {
+        let token = self.access_token().await?;
+        let encoded = urlencoding::encode(object_name);
+        let generation_query = generation
+            .map(|g| format!("?generation={g}"))
+            .unwrap_or_default();
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}{}",
+            self.bucket, encoded, generation_query
+        );
+        let response = self.http.get(url).bearer_auth(token).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(EnclaveError::NotFound);
+        }
+        response
+            .error_for_status()?
+            .json::<GcsApiObjectMetadata>()
+            .await?
+            .into_public()
+    }
 
     async fn get_object_at_generation(
         &self,
         object_name: &str,
         requested_generation: Option<i64>,
     ) -> Result<GcsGetResponse> {
+        let metadata = self
+            .object_metadata(object_name, requested_generation)
+            .await?;
+        let generation = metadata.generation;
         let token = self.access_token().await?;
         let encoded = urlencoding::encode(object_name);
-        let mut meta_url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
-            self.bucket, encoded
-        );
-        if let Some(generation) = requested_generation {
-            meta_url.push_str("?generation=");
-            meta_url.push_str(&generation.to_string());
-        }
-        let meta_resp = self.http.get(&meta_url).bearer_auth(&token).send().await?;
-        if meta_resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(EnclaveError::NotFound);
-        }
-        let meta: GcsObjectMetadata = meta_resp.error_for_status()?.json().await?;
-        let generation: i64 = meta
-            .generation
-            .parse()
-            .map_err(|_| EnclaveError::Gcs("invalid generation".into()))?;
-        if requested_generation.is_some_and(|requested| requested != generation) {
-            return Err(EnclaveError::Gcs(
-                "GCS returned a different object generation than requested".into(),
-            ));
-        }
-        let wrapped_dek_b64 = meta
-            .metadata
-            .and_then(|metadata| metadata.wrapped_dek)
-            .ok_or_else(|| EnclaveError::Gcs("missing wrapped DEK in object metadata".into()))?;
+
         let data_url = format!(
             "https://storage.googleapis.com/download/storage/v1/b/{}/o/{}?alt=media&generation={}",
             self.bucket, encoded, generation
@@ -2174,7 +2378,7 @@ impl GcpGcsClient {
             .await?;
         Ok(GcsGetResponse {
             ciphertext: bytes.to_vec(),
-            wrapped_dek_b64,
+            wrapped_dek_b64: metadata.wrapped_dek_b64,
             generation,
         })
     }
@@ -2274,12 +2478,102 @@ impl GcsClient for GcpGcsClient {
         let resp = resp.error_for_status()?;
         // The upload response carries the object's new generation (as a JSON
         // string) — return it so the caller can match against it next save.
-        let meta: GcsObjectMetadata = resp.json().await?;
+        let meta: GcsApiObjectMetadata = resp.json().await?;
         let new_gen = meta
             .generation
             .parse::<i64>()
             .map_err(|e| EnclaveError::Gcs(format!("bad generation in PUT response: {e}")))?;
         Ok(new_gen)
+    }
+
+    async fn copy_generation_if_absent(
+        &self,
+        source_name: &str,
+        source_generation: i64,
+        destination_name: &str,
+    ) -> Result<GcsGenerationCopy> {
+        let source = self
+            .object_metadata(source_name, Some(source_generation))
+            .await?;
+        if source.generation != source_generation {
+            return Err(EnclaveError::Gcs(
+                "GCS returned an unexpected source generation".into(),
+            ));
+        }
+        let token = self.access_token().await?;
+        let source_encoded = urlencoding::encode(source_name);
+        let destination_encoded = urlencoding::encode(destination_name);
+        // Supplying the complete custom metadata in the Rewrite request makes
+        // the protocol marker and wrapped DEK part of the same create-only
+        // destination operation as the copied bytes.
+        let destination_resource = serde_json::json!({
+            "metadata": {
+                "x-kioku-wrapped-dek": source.wrapped_dek_b64.clone(),
+                "x-kioku-legacy-recovery-format": "1",
+                "x-kioku-legacy-source-object": source_name,
+                "x-kioku-legacy-source-generation": source_generation.to_string(),
+                "x-kioku-legacy-source-size": source.size.to_string(),
+                "x-kioku-legacy-source-crc32c": source.crc32c.clone(),
+            }
+        });
+        let mut url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0",
+            self.bucket,
+            source_encoded,
+            self.bucket,
+            destination_encoded,
+            source_generation,
+            source_generation
+        );
+        loop {
+            let response = self
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&destination_resource)
+                .send()
+                .await?;
+            if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+                // A lost success or another writer can only converge by checking
+                // the named destination; never retry against a latest source.
+                let destination = self.object_metadata(destination_name, None).await?;
+                return Ok(GcsGenerationCopy {
+                    source,
+                    destination,
+                    created: false,
+                });
+            }
+            #[derive(Deserialize)]
+            struct RewriteResponse {
+                done: Option<bool>,
+                #[serde(rename = "rewriteToken")]
+                rewrite_token: Option<String>,
+                resource: Option<GcsApiObjectMetadata>,
+            }
+            let rewritten: RewriteResponse = response.error_for_status()?.json().await?;
+            if rewritten.done == Some(true) {
+                let destination = rewritten
+                    .resource
+                    .ok_or_else(|| {
+                        EnclaveError::Gcs("GCS rewrite completed without metadata".into())
+                    })?
+                    .into_public()?;
+                return Ok(GcsGenerationCopy {
+                    source,
+                    destination,
+                    created: true,
+                });
+            }
+            let token = rewritten
+                .rewrite_token
+                .ok_or_else(|| EnclaveError::Gcs("GCS rewrite incomplete without token".into()))?;
+            url = format!(
+                "https://storage.googleapis.com/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0&rewriteToken={}",
+                self.bucket, source_encoded, self.bucket, destination_encoded,
+                source_generation, source_generation,
+                urlencoding::encode(&token)
+            );
+        }
     }
 
     async fn delete_object(&self, object_name: &str) -> Result<()> {
@@ -2372,6 +2666,74 @@ fn legacy_recovery_prefix(user_id: &str) -> String {
     format!("legacy-recovery/{user_id}/")
 }
 
+/// Stable named checkpoint for the UTC day containing `now`. This name is an
+/// inventory boundary: export/delete can list `legacy-recovery/{user_id}/`
+/// without interpreting ciphertext or user content.
+pub fn legacy_recovery_checkpoint_name(user_id: &str, now: SystemTime) -> String {
+    let (year, month, day) = civil_from_unix_days(utc_epoch_day(now));
+    format!("legacy-recovery/{user_id}/{year:04}-{month:02}-{day:02}.db.enc")
+}
+
+fn utc_epoch_day(now: SystemTime) -> i64 {
+    now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 / 86_400
+}
+
+// Gregorian civil date from Unix epoch day, adapted from the public-domain
+// Hinnant calendar algorithm. It avoids a runtime timezone dependency; UTC is
+// the sole permitted checkpoint boundary.
+fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    (
+        year + if month <= 2 { 1 } else { 0 },
+        month as u32,
+        day as u32,
+    )
+}
+
+fn verify_legacy_recovery_copy(
+    expected_source_object: &str,
+    requested_source_generation: i64,
+    source: &GcsObjectMetadata,
+    destination: &GcsObjectMetadata,
+    created: bool,
+) -> Result<()> {
+    let binding = destination.legacy_recovery.as_ref().ok_or_else(|| {
+        EnclaveError::Gcs("missing legacy recovery checkpoint protocol metadata".into())
+    })?;
+    let common_valid = source.generation == requested_source_generation
+        && requested_source_generation > 0
+        && destination.generation > 0
+        && !destination.wrapped_dek_b64.is_empty()
+        && !destination.crc32c.is_empty()
+        && source.wrapped_dek_b64 == destination.wrapped_dek_b64
+        && binding.format_version == 1
+        && binding.source_object == expected_source_object
+        && binding.source_generation > 0
+        && binding.source_generation <= requested_source_generation
+        && binding.source_size == destination.size
+        && !binding.source_crc32c.is_empty()
+        && binding.source_crc32c == destination.crc32c;
+    let created_valid = !created
+        || (binding.source_generation == requested_source_generation
+            && source.size == destination.size
+            && source.crc32c == destination.crc32c
+            && source.md5_hash == destination.md5_hash);
+    if !common_valid || !created_valid {
+        return Err(EnclaveError::Gcs(
+            "legacy recovery checkpoint metadata verification failed".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn media_keys(conn: &Connection) -> Result<Vec<String>> {
     let mut keys = Vec::new();
     for table in ["screenshot_images", "media_objects"] {
@@ -2437,7 +2799,10 @@ fn remove_temp_db_files(path: &Path) {
 pub(crate) mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex as StdMutex,
+    };
 
     // ── v1 → v2 episodes migration ────────────────────────────────────────────
 
@@ -2819,30 +3184,54 @@ pub(crate) mod tests {
     #[derive(Clone)]
     struct FakeObject {
         ciphertext: Vec<u8>,
-        wrapped_dek: String,
+        wrapped_dek_b64: String,
         generation: i64,
         live: bool,
         soft_deleted: bool,
+        crc32c: String,
+        md5_hash: Option<String>,
+        legacy_recovery: Option<LegacyRecoveryBinding>,
     }
 
     pub struct FakeGcs {
         objects: StdMutex<HashMap<String, Vec<FakeObject>>>,
+        fail_copy: StdMutex<Option<EnclaveError>>,
+        fail_copy_after_create: StdMutex<Option<EnclaveError>>,
+        fail_put: StdMutex<Option<EnclaveError>>,
         fail_generation_delete: StdMutex<Option<(String, i64)>>,
         soft_delete_enabled: StdMutex<bool>,
         repeat_version_cursor: StdMutex<bool>,
         listed_size_overrides: StdMutex<HashMap<String, u64>>,
         exact_generation_gets: StdMutex<usize>,
+        copy_calls: StdMutex<Vec<(String, i64, String)>>,
+        put_calls: StdMutex<Vec<(String, i64)>>,
     }
 
     impl FakeGcs {
         pub fn new() -> Self {
             Self {
                 objects: StdMutex::new(HashMap::new()),
+                fail_copy: StdMutex::new(None),
+                fail_copy_after_create: StdMutex::new(None),
+                fail_put: StdMutex::new(None),
                 fail_generation_delete: StdMutex::new(None),
                 soft_delete_enabled: StdMutex::new(false),
                 repeat_version_cursor: StdMutex::new(false),
                 listed_size_overrides: StdMutex::new(HashMap::new()),
                 exact_generation_gets: StdMutex::new(0),
+                copy_calls: StdMutex::new(Vec::new()),
+                put_calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn metadata(object: &FakeObject) -> GcsObjectMetadata {
+            GcsObjectMetadata {
+                generation: object.generation,
+                size: object.ciphertext.len() as u64,
+                crc32c: object.crc32c.clone(),
+                md5_hash: object.md5_hash.clone(),
+                wrapped_dek_b64: object.wrapped_dek_b64.clone(),
+                legacy_recovery: object.legacy_recovery.clone(),
             }
         }
 
@@ -2921,7 +3310,7 @@ pub(crate) mod tests {
                 .and_then(|versions| versions.iter().rev().find(|version| version.live))
                 .map(|version| GcsGetResponse {
                     ciphertext: version.ciphertext.clone(),
-                    wrapped_dek_b64: version.wrapped_dek.clone(),
+                    wrapped_dek_b64: version.wrapped_dek_b64.clone(),
                     generation: version.generation,
                 })
                 .ok_or(crate::error::EnclaveError::NotFound)
@@ -2943,7 +3332,7 @@ pub(crate) mod tests {
                 })
                 .map(|version| GcsGetResponse {
                     ciphertext: version.ciphertext.clone(),
-                    wrapped_dek_b64: version.wrapped_dek.clone(),
+                    wrapped_dek_b64: version.wrapped_dek_b64.clone(),
                     generation: version.generation,
                 })
                 .ok_or(crate::error::EnclaveError::NotFound)
@@ -2956,6 +3345,13 @@ pub(crate) mod tests {
             wrapped_dek_b64: &str,
             if_generation_match: i64,
         ) -> crate::error::Result<i64> {
+            self.put_calls
+                .lock()
+                .unwrap()
+                .push((object_name.to_string(), if_generation_match));
+            if let Some(error) = self.fail_put.lock().unwrap().take() {
+                return Err(error);
+            }
             let mut store = self.objects.lock().unwrap();
             let current_gen = store
                 .get(object_name)
@@ -2968,30 +3364,88 @@ pub(crate) mod tests {
                 ));
             }
             let new_gen = current_gen + 1;
+            let new_obj = FakeObject {
+                ciphertext: ciphertext.to_vec(),
+                wrapped_dek_b64: wrapped_dek_b64.to_string(),
+                generation: new_gen,
+                live: true,
+                soft_deleted: false,
+                crc32c: format!("fake-crc32c-{}", ciphertext.len()),
+                md5_hash: Some(format!("fake-md5-{}", ciphertext.len())),
+                legacy_recovery: None,
+            };
             if let Some(versions) = store.get_mut(object_name) {
                 for version in versions.iter_mut() {
                     version.live = false;
                 }
-                versions.push(FakeObject {
-                    ciphertext: ciphertext.to_vec(),
-                    wrapped_dek: wrapped_dek_b64.to_string(),
-                    generation: new_gen,
-                    live: true,
-                    soft_deleted: false,
-                });
+                versions.push(new_obj);
             } else {
-                store.insert(
-                    object_name.to_string(),
-                    vec![FakeObject {
-                        ciphertext: ciphertext.to_vec(),
-                        wrapped_dek: wrapped_dek_b64.to_string(),
-                        generation: new_gen,
-                        live: true,
-                        soft_deleted: false,
-                    }],
-                );
+                store.insert(object_name.to_string(), vec![new_obj]);
             }
             Ok(new_gen)
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_name: &str,
+            source_generation: i64,
+            destination_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.copy_calls.lock().unwrap().push((
+                source_name.to_string(),
+                source_generation,
+                destination_name.to_string(),
+            ));
+            if let Some(error) = self.fail_copy.lock().unwrap().take() {
+                return Err(error);
+            }
+            let mut store = self.objects.lock().unwrap();
+            let source = store
+                .get(source_name)
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .find(|v| v.generation == source_generation && !v.soft_deleted)
+                })
+                .cloned()
+                .ok_or(EnclaveError::NotFound)?;
+            if let Some(destination) = store
+                .get(destination_name)
+                .and_then(|versions| versions.iter().rev().find(|v| v.live))
+            {
+                return Ok(GcsGenerationCopy {
+                    source: Self::metadata(&source),
+                    destination: Self::metadata(destination),
+                    created: false,
+                });
+            }
+            let mut destination = source.clone();
+            destination.generation = 1;
+            destination.live = true;
+            destination.soft_deleted = false;
+            destination.legacy_recovery = Some(LegacyRecoveryBinding {
+                format_version: 1,
+                source_object: source_name.to_string(),
+                source_generation,
+                source_size: source.ciphertext.len() as u64,
+                source_crc32c: source.crc32c.clone(),
+            });
+            if let Some(versions) = store.get_mut(destination_name) {
+                for version in versions.iter_mut() {
+                    version.live = false;
+                }
+                versions.push(destination.clone());
+            } else {
+                store.insert(destination_name.to_string(), vec![destination.clone()]);
+            }
+            if let Some(error) = self.fail_copy_after_create.lock().unwrap().take() {
+                return Err(error);
+            }
+            Ok(GcsGenerationCopy {
+                source: Self::metadata(&source),
+                destination: Self::metadata(&destination),
+                created: true,
+            })
         }
 
         async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
@@ -3160,6 +3614,371 @@ pub(crate) mod tests {
             rusqlite::params![object_key, "a".repeat(64)],
         )?;
         Ok(())
+    }
+
+    fn store_with_checkpoint_time(gcs: Arc<FakeGcs>, unix_seconds: u64) -> Store {
+        let mut store = Store::new(Arc::new(FakeKms), gcs);
+        store.checkpoint_clock = Arc::new(move || UNIX_EPOCH + Duration::from_secs(unix_seconds));
+        store
+    }
+
+    fn store_with_mutable_checkpoint_time(
+        gcs: Arc<FakeGcs>,
+        unix_seconds: u64,
+    ) -> (Store, Arc<AtomicU64>) {
+        let clock = Arc::new(AtomicU64::new(unix_seconds));
+        let clock_for_store = Arc::clone(&clock);
+        let mut store = Store::new(Arc::new(FakeKms), gcs);
+        store.checkpoint_clock = Arc::new(move || {
+            UNIX_EPOCH + Duration::from_secs(clock_for_store.load(Ordering::SeqCst))
+        });
+        (store, clock)
+    }
+
+    async fn write_and_save(store: &Store, user_id: &str, marker: &str) -> Result<()> {
+        let marker = marker.to_string();
+        store
+            .with_user(user_id, move |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-01-01T00:00:00Z', ?1)",
+                    [&marker],
+                )?;
+                Ok(())
+            })
+            .await?;
+        store.save_user(user_id).await
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_is_once_per_utc_day_and_pins_first_save() {
+        let gcs = Arc::new(FakeGcs::new());
+        // 2026-01-01T12:00:00Z
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "checkpoint-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&store, "checkpoint-user", "second")
+            .await
+            .unwrap();
+        write_and_save(&store, "checkpoint-user", "third")
+            .await
+            .unwrap();
+
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "checkpoint-user",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        let objects = gcs.objects.lock().unwrap();
+        assert_eq!(
+            objects
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/checkpoint-user/"))
+                .count(),
+            1
+        );
+        let checkpoint = objects.get(&checkpoint).unwrap().last().unwrap();
+        assert_eq!(checkpoint.generation, 1);
+        assert_eq!(
+            checkpoint
+                .legacy_recovery
+                .as_ref()
+                .unwrap()
+                .source_generation,
+            1,
+            "checkpoint must bind the pre-overwrite authoritative generation"
+        );
+        drop(objects);
+        let calls = gcs.copy_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "same-day saves must hit the process cache");
+        assert_eq!(calls[0].1, 1);
+    }
+
+    #[test]
+    fn legacy_recovery_checkpoint_uses_utc_not_local_day() {
+        assert_eq!(
+            legacy_recovery_checkpoint_name(
+                "alice",
+                UNIX_EPOCH + Duration::from_secs(1_767_225_599)
+            ),
+            "legacy-recovery/alice/2025-12-31.db.enc"
+        );
+        assert_eq!(
+            legacy_recovery_checkpoint_name(
+                "alice",
+                UNIX_EPOCH + Duration::from_secs(1_767_225_600)
+            ),
+            "legacy-recovery/alice/2026-01-01.db.enc"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_survives_process_restart() {
+        let gcs = Arc::new(FakeGcs::new());
+        let time = 1_767_268_800;
+        let first = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&first, "restart-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&first, "restart-user", "second")
+            .await
+            .unwrap();
+        let second = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&second, "restart-user", "third")
+            .await
+            .unwrap();
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/restart-user/"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            gcs.copy_calls.lock().unwrap().len(),
+            2,
+            "restart re-verifies the existing destination exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_lost_success_converges_on_retry() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "retry-user", "first").await.unwrap();
+        *gcs.fail_copy_after_create.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost response".into()));
+        assert!(write_and_save(&store, "retry-user", "second")
+            .await
+            .is_err());
+        assert_eq!(
+            gcs.put_calls.lock().unwrap().len(),
+            1,
+            "lost checkpoint response must happen before the overwrite"
+        );
+        // A handler-style retry re-enters through with_user. The store must
+        // persist the pending local mutation before the closure can observe it
+        // as a duplicate and return success without another save_user call.
+        let count: i64 = store
+            .with_user("retry-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/retry-user/"))
+                .count(),
+            1
+        );
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_put_is_persisted_before_handler_style_retry_observes_duplicate() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "put-retry-user", "first")
+            .await
+            .unwrap();
+        *gcs.fail_put.lock().unwrap() = Some(EnclaveError::Gcs("transient PUT failure".into()));
+
+        assert!(matches!(
+            write_and_save(&store, "put-retry-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .get(&gcs_object_name("put-retry-user"))
+                .unwrap()
+                .last()
+                .unwrap()
+                .generation,
+            1,
+            "failed PUT must leave remote authority unchanged"
+        );
+
+        // This models an idempotency retry: before the handler closure can see
+        // the locally inserted row and call it a duplicate, with_user retries
+        // the pending authoritative PUT.
+        let local_count: i64 = store
+            .with_user("put-retry-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(local_count, 2);
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 3);
+
+        let restarted = Store::new(Arc::new(FakeKms), gcs);
+        let durable_count: i64 = restarted
+            .with_user("put-retry-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(durable_count, 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_failure_withholds_save_success() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "failure-user", "first")
+            .await
+            .unwrap();
+        *gcs.fail_copy.lock().unwrap() = Some(EnclaveError::Gcs("copy unavailable".into()));
+        assert!(matches!(
+            write_and_save(&store, "failure-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(
+            gcs.put_calls.lock().unwrap().len(),
+            1,
+            "checkpoint failure must prevent the authoritative overwrite"
+        );
+        store.save_user("failure-user").await.unwrap();
+        assert_eq!(
+            gcs.copy_calls.lock().unwrap().len(),
+            2,
+            "failure must not poison the verified-day cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_rejects_existing_integrity_mismatch() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "mismatch-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&store, "mismatch-user", "second")
+            .await
+            .unwrap();
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "mismatch-user",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        gcs.objects
+            .lock()
+            .unwrap()
+            .get_mut(&checkpoint)
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .crc32c
+            .clear();
+        let restarted = store_with_checkpoint_time(gcs, 1_767_268_800);
+        assert!(matches!(
+            write_and_save(&restarted, "mismatch-user", "third").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_rejects_unmarked_preexisting_destination() {
+        let gcs = Arc::new(FakeGcs::new());
+        let time = 1_767_268_800;
+        let store = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&store, "unmarked-user", "first")
+            .await
+            .unwrap();
+        let source_name = gcs_object_name("unmarked-user");
+        let destination_name = legacy_recovery_checkpoint_name(
+            "unmarked-user",
+            UNIX_EPOCH + Duration::from_secs(time),
+        );
+        {
+            let mut objects = gcs.objects.lock().unwrap();
+            let mut malicious = objects.get(&source_name).unwrap().last().unwrap().clone();
+            malicious.generation = 7;
+            malicious.legacy_recovery = None;
+            objects.insert(destination_name, vec![malicious]);
+        }
+
+        assert!(matches!(
+            write_and_save(&store, "unmarked-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_rejects_mismatched_protocol_marker() {
+        let gcs = Arc::new(FakeGcs::new());
+        let time = 1_767_268_800;
+        let store = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&store, "marker-user", "first")
+            .await
+            .unwrap();
+        let source_name = gcs_object_name("marker-user");
+        let destination_name =
+            legacy_recovery_checkpoint_name("marker-user", UNIX_EPOCH + Duration::from_secs(time));
+        {
+            let mut objects = gcs.objects.lock().unwrap();
+            let mut malicious = objects.get(&source_name).unwrap().last().unwrap().clone();
+            malicious.generation = 9;
+            malicious.legacy_recovery = Some(LegacyRecoveryBinding {
+                format_version: 1,
+                source_object: "indexes/a-different-user.db.enc".into(),
+                source_generation: 1,
+                source_size: malicious.ciphertext.len() as u64,
+                source_crc32c: malicious.crc32c.clone(),
+            });
+            objects.insert(destination_name, vec![malicious]);
+        }
+
+        assert!(matches!(
+            write_and_save(&store, "marker-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn utc_rollover_requires_a_new_checkpoint_and_failure_does_not_cache() {
+        let gcs = Arc::new(FakeGcs::new());
+        let day_one = 1_767_268_800;
+        let (store, clock) = store_with_mutable_checkpoint_time(gcs.clone(), day_one);
+        write_and_save(&store, "rollover-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&store, "rollover-user", "second")
+            .await
+            .unwrap();
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+
+        clock.store(day_one + 86_400, Ordering::SeqCst);
+        *gcs.fail_copy.lock().unwrap() = Some(EnclaveError::Gcs("rollover failure".into()));
+        assert!(write_and_save(&store, "rollover-user", "third")
+            .await
+            .is_err());
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 2);
+
+        store.save_user("rollover-user").await.unwrap();
+        write_and_save(&store, "rollover-user", "fourth")
+            .await
+            .unwrap();
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 3);
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/rollover-user/"))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -3846,6 +4665,9 @@ pub(crate) mod tests {
             .await
             .expect("write");
         store.save_user(user_id).await.expect("save");
+        // The initial create has no previous generation to protect. Its first
+        // overwrite establishes the daily recovery copy.
+        store.save_user(user_id).await.expect("second save");
 
         let objects = gcs.objects.lock().unwrap();
         let expected = format!("indexes/{user_id}.db.enc");
@@ -3854,7 +4676,17 @@ pub(crate) mod tests {
             "expected GCS object {expected:?}, found keys: {:?}",
             objects.keys().collect::<Vec<_>>()
         );
-        assert_eq!(objects.len(), 1, "no stray objects should be written");
+        assert_eq!(
+            objects.len(),
+            2,
+            "only the index and its named daily recovery checkpoint should be written"
+        );
+        assert!(
+            objects
+                .keys()
+                .any(|name| name.starts_with(&format!("legacy-recovery/{user_id}/"))),
+            "expected named daily recovery checkpoint"
+        );
     }
 
     #[tokio::test]
