@@ -1831,7 +1831,9 @@ async fn finalize_user_episodes_scoped(
         );
 
         let model_resp = match vertex::generate_custom(
-            &state.config,
+            state,
+            user_id,
+            vertex::VertexOperation::FinalEpisodeAnalysis,
             FINALIZER_SYSTEM_PROMPT,
             &model_input,
             brief_response_schema(),
@@ -1839,7 +1841,7 @@ async fn finalize_user_episodes_scoped(
         )
         .await
         {
-            Ok(r) => r,
+            Ok(r) => r.text,
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "Gemini unified episode analysis failed");
                 let _ = record_finalization_failure(state, user_id, ep.id, &e.to_string()).await;

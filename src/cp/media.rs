@@ -790,6 +790,10 @@ async fn upload_capture_event(
         .media
         .as_ref()
         .map(|media| format!("raw/{user_id}/{}.enc", media.asset_id));
+    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
+        Ok(guard) => guard,
+        Err(error) => return error.into_response(),
+    };
     // Keep admission alive through the GCS object and durable SQLite record.
     // DELETE /api/account closes this barrier before it inventories media, so
     // an already-authorized capture cannot recreate an object afterward.
@@ -825,6 +829,14 @@ async fn upload_capture_event(
         }
         Ok(PreflightOutcome::New) => {}
         Err(error) => return error.into_response(),
+    }
+
+    // Wall-clock allowance is consumed by short idempotent recording leases,
+    // not by VAD-triggered media duration, which can overlap across streams.
+    if capture_requires_recording_lease(manifest.stream_kind) {
+        if let Err(response) = super::billing::check_recording_entitlement(&state, &user_id).await {
+            return response;
+        }
     }
 
     let mut media_generation = None;
@@ -934,6 +946,10 @@ async fn upload_capture_event(
         }),
     )
         .into_response()
+}
+
+fn capture_requires_recording_lease(_stream_kind: StreamKind) -> bool {
+    true
 }
 
 async fn stream_ack(
@@ -3215,7 +3231,7 @@ mod tests {
             ("profile_identity_bindings", "updated_at, id"),
             ("person_facts", "person_id, created_at, id"),
         ] {
-            assert!(crate::dump_optional_table(&conn, table, order)
+            assert!(super::super::sync::dump_optional_table(&conn, table, order)
                 .unwrap()
                 .is_empty());
         }
@@ -3226,5 +3242,19 @@ mod tests {
         let response = rate_limited_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "5");
+    }
+
+    #[test]
+    fn every_new_capture_kind_requires_a_recording_lease() {
+        for stream in [
+            StreamKind::Mic,
+            StreamKind::SystemAudio,
+            StreamKind::MacScreen,
+            StreamKind::IosMic,
+            StreamKind::IosImportedScreenshot,
+            StreamKind::IosSharedPage,
+        ] {
+            assert!(capture_requires_recording_lease(stream));
+        }
     }
 }

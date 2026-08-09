@@ -51,7 +51,10 @@
 #                        Optional Sign in with Apple identifiers; set all five
 #                        or none. The private key is fetched from Secret Manager.
 #   ALLOWED_EMAILS       Comma-separated account allow-list
+#   ADMIN_USER_IDS       Comma-separated stable owner IDs (separate from email access)
 #   BASE_URL / WEB_ORIGIN  Public API issuer and browser application origin
+#   BILLING_SERVICE_URL / BILLING_SERVICE_AUDIENCE  Exact billing HTTPS origin/audience
+#   BILLING_ENFORCEMENT_MODE  shadow or enforce
 #   REVIEWER_AUTH_API_KEY / REVIEWER_AUTH_UID / REVIEWER_AUTH_EMAIL
 #                        Optional exact Google Identity Platform review account;
 #                        set all three or none. The password is never built in.
@@ -80,8 +83,12 @@
 #     --build-arg APPLE_MACOS_CLIENT_ID=com.kiokuu.app \
 #     --build-arg APPLE_WEB_CLIENT_ID=com.kiokuu.web \
 #     --build-arg ALLOWED_EMAILS=owner@example.com \
+#     --build-arg ADMIN_USER_IDS=12345678-1234-1234-1234-123456789abc \
 #     --build-arg BASE_URL=https://api.example.com \
 #     --build-arg WEB_ORIGIN=https://app.example.com \
+#     --build-arg BILLING_SERVICE_URL=https://billing.example.com \
+#     --build-arg BILLING_SERVICE_AUDIENCE=https://billing.example.com \
+#     --build-arg BILLING_ENFORCEMENT_MODE=enforce \
 #     --build-arg VERTEX_PROJECT=my-project \
 #     --build-arg VERTEX_LOCATION=us-central1 \
 #     --build-arg VERTEX_MODEL=gemini-3.5-flash \
@@ -116,8 +123,12 @@ ARG APPLE_IOS_CLIENT_ID
 ARG APPLE_MACOS_CLIENT_ID
 ARG APPLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
+ARG ADMIN_USER_IDS
 ARG BASE_URL
 ARG WEB_ORIGIN
+ARG BILLING_SERVICE_URL
+ARG BILLING_SERVICE_AUDIENCE
+ARG BILLING_ENFORCEMENT_MODE
 ARG REVIEWER_AUTH_API_KEY
 ARG REVIEWER_AUTH_UID
 ARG REVIEWER_AUTH_EMAIL
@@ -134,16 +145,21 @@ RUN set -eu \
         "${KMS_PROJECT}" "${KMS_LOCATION}" "${KMS_KEY_RING}" "${KMS_KEY}" \
         "${GCS_BUCKET}" "${GCS_MEDIA_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
         "${ATTEST_STS_AUDIENCE}" "${GOOGLE_DESKTOP_CLIENT_ID}" "${GOOGLE_IOS_CLIENT_ID}" \
-        "${GOOGLE_WEB_CLIENT_ID}" "${ALLOWED_EMAILS}" "${BASE_URL}" "${WEB_ORIGIN}" \
+        "${GOOGLE_WEB_CLIENT_ID}" "${ALLOWED_EMAILS}" "${ADMIN_USER_IDS}" "${BASE_URL}" "${WEB_ORIGIN}" \
+        "${BILLING_SERVICE_URL}" "${BILLING_SERVICE_AUDIENCE}" "${BILLING_ENFORCEMENT_MODE}" \
         "${VERTEX_PROJECT}" "${VERTEX_LOCATION}" "${VERTEX_MODEL}" \
         "${ENCLAVE_ACME_DIRECTORY}" "${ENCLAVE_ACME_CONTACT}"; \
        do [ -n "${value}" ]; done \
     && [ "${ENCLAVE_ACME}" = "1" ] \
     && [ "${ALLOWED_EMAILS}" != "*" ] \
-
+    && case "${ADMIN_USER_IDS}" in *[!0-9A-Fa-f,-]*) false;; *) true;; esac \
     && case "${ENCLAVE_AUDIENCE}" in https://*) true;; *) false;; esac \
     && case "${BASE_URL}" in https://*) true;; *) false;; esac \
     && case "${WEB_ORIGIN}" in https://*) true;; *) false;; esac \
+    && case "${BILLING_SERVICE_URL}" in https://*) true;; *) false;; esac \
+    && [ "${BILLING_SERVICE_AUDIENCE%/}" = "${BILLING_SERVICE_URL%/}" ] \
+    && case "${BILLING_ENFORCEMENT_MODE}" in shadow|enforce) true;; *) false;; esac \
+    && printf '%s\n' "${VERTEX_MODEL}" | grep -Eq '^[A-Za-z0-9._:-]{1,128}$' \
     && case "${ATTEST_STS_AUDIENCE}" in //iam.googleapis.com/*/workloadIdentityPools/*/providers/*) true;; *) false;; esac
 RUN set -eu \
     && if [ -n "${REVIEWER_AUTH_API_KEY}${REVIEWER_AUTH_UID}${REVIEWER_AUTH_EMAIL}" ]; then \
@@ -325,8 +341,12 @@ ARG APPLE_IOS_CLIENT_ID
 ARG APPLE_MACOS_CLIENT_ID
 ARG APPLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
+ARG ADMIN_USER_IDS
 ARG BASE_URL
 ARG WEB_ORIGIN
+ARG BILLING_SERVICE_URL
+ARG BILLING_SERVICE_AUDIENCE
+ARG BILLING_ENFORCEMENT_MODE
 ARG REVIEWER_AUTH_API_KEY
 ARG REVIEWER_AUTH_UID
 ARG REVIEWER_AUTH_EMAIL
@@ -345,8 +365,12 @@ ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     APPLE_MACOS_CLIENT_ID=${APPLE_MACOS_CLIENT_ID} \
     APPLE_WEB_CLIENT_ID=${APPLE_WEB_CLIENT_ID} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
+    ADMIN_USER_IDS=${ADMIN_USER_IDS} \
     BASE_URL=${BASE_URL} \
     WEB_ORIGIN=${WEB_ORIGIN} \
+    BILLING_SERVICE_URL=${BILLING_SERVICE_URL} \
+    BILLING_SERVICE_AUDIENCE=${BILLING_SERVICE_AUDIENCE} \
+    BILLING_ENFORCEMENT_MODE=${BILLING_ENFORCEMENT_MODE} \
     REVIEWER_AUTH_API_KEY=${REVIEWER_AUTH_API_KEY} \
     REVIEWER_AUTH_UID=${REVIEWER_AUTH_UID} \
     REVIEWER_AUTH_EMAIL=${REVIEWER_AUTH_EMAIL} \

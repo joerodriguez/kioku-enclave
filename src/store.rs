@@ -55,7 +55,7 @@ use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags, OptionalExten
 use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -169,6 +169,7 @@ struct UserHandle {
 pub struct Store {
     registry: Mutex<StoreRegistry>,
     registry_changed: Arc<Notify>,
+    lifecycle_gates: Mutex<HashMap<UserId, Arc<Mutex<()>>>>,
     /// Admission barrier for operations which can create a raw object outside
     /// the SQLite actor.  It is deliberately separate from the async actor
     /// mutex so a GCS PUT can remain in an owned task without holding a SQLite
@@ -527,6 +528,7 @@ impl Store {
                 access_clock: 0,
             }),
             registry_changed: Arc::new(Notify::new()),
+            lifecycle_gates: Mutex::new(HashMap::new()),
             content_write_barrier: Arc::new(ContentWriteBarrier::default()),
             kms,
             gcs,
@@ -832,6 +834,21 @@ impl Store {
             .await
     }
 
+    /// Serialize one account's cloud-write lifecycle with deletion. The gate
+    /// is process-local and contains no customer data.
+    pub async fn lock_user_lifecycle(&self, user_id: &str) -> Result<OwnedMutexGuard<()>> {
+        validate_user_id(user_id)?;
+        let gate = {
+            let mut gates = self.lifecycle_gates.lock().await;
+            Arc::clone(
+                gates
+                    .entry(user_id.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        Ok(gate.lock_owned().await)
+    }
+
     /// Run an operation with a user's open SQLite connection.
     /// Loads the user on first access; evicts LRU handle if over cap.
     pub async fn with_user<F, T>(&self, user_id: &str, f: F) -> Result<T>
@@ -920,6 +937,25 @@ impl Store {
         f(&handle.conn)
     }
 
+    /// Run a proven read-only operation without making a clean cache entry
+    /// eligible for a write on eviction.
+    pub async fn read_user<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        self.with_user_read(user_id, f).await
+    }
+
+    /// Run an operation whose closure reports whether it actually changed the
+    /// database. This keeps periodic no-op reconciliation scans read-only.
+    pub async fn with_user_if_changed<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<(T, bool)>,
+    {
+        self.with_user(user_id, move |conn| f(conn).map(|(value, _changed)| value))
+            .await
+    }
+
     /// Persist a user's index back to GCS.
     pub async fn save_user(&self, user_id: &str) -> Result<()> {
         let actor = match self.actor_for_existing(user_id).await? {
@@ -947,6 +983,7 @@ impl Store {
     /// this returns `Ok(())`.
     pub async fn delete_user(&self, user_id: &str) -> Result<()> {
         validate_user_id(user_id)?;
+        let _lifecycle_guard = self.lock_user_lifecycle(user_id).await?;
 
         // Raw media PUTs do not hold the SQLite actor while they await GCS.
         // Close that independent admission path first, then wait for every
@@ -995,6 +1032,8 @@ impl Store {
         // be selected.
         self.delete_all_versions_under(&self.media_gcs, &media_prefix(user_id))
             .await?;
+        self.delete_all_versions_under(&self.media_gcs, &legacy_media_prefix(user_id))
+            .await?;
         for key in keys_to_delete.iter() {
             self.delete_all_versions_for_name(&self.media_gcs, key)
                 .await?;
@@ -1040,6 +1079,7 @@ impl Store {
             (&self.gcs, gcs_object_name(user_id), true),
             (&self.gcs, legacy_recovery_prefix(user_id), false),
             (&self.media_gcs, media_prefix(user_id), false),
+            (&self.media_gcs, legacy_media_prefix(user_id), false),
         ];
         for (gcs, selector, exact_name) in namespaces {
             inventory
@@ -2247,6 +2287,48 @@ CREATE TABLE IF NOT EXISTS app_metadata (
     updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Privacy-minimized Vertex cost attribution. One row is created before an
+-- outbound invocation and completed in place. It contains no prompt, output,
+-- response id, episode id, Google identity, or provider account identifier.
+CREATE TABLE IF NOT EXISTS vertex_usage_events (
+    event_id                TEXT PRIMARY KEY,
+    operation               TEXT NOT NULL CHECK (operation IN (
+        'audio_understanding','screen_understanding','episode_summarization',
+        'episode_finalization')),
+    requested_model         TEXT NOT NULL,
+    returned_model          TEXT,
+    location                TEXT NOT NULL,
+    traffic_type            TEXT NOT NULL DEFAULT 'on_demand' CHECK (traffic_type IN (
+        'on_demand','batch','provisioned_throughput')),
+    http_status             INTEGER,
+    prompt_tokens           INTEGER,
+    input_text_tokens       INTEGER,
+    input_audio_tokens      INTEGER,
+    input_image_tokens      INTEGER,
+    cached_input_tokens     INTEGER,
+    cached_input_text_tokens INTEGER,
+    cached_input_audio_tokens INTEGER,
+    cached_input_image_tokens INTEGER,
+    output_text_tokens      INTEGER,
+    thought_tokens          INTEGER,
+    total_tokens            INTEGER,
+    outcome                 TEXT NOT NULL CHECK (outcome IN ('started','metered','usage_missing','ambiguous','not_billed')),
+    delivery_state          TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+    delivery_attempt_count  INTEGER NOT NULL DEFAULT 0,
+    observed_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS vertex_usage_events_outbox_idx
+    ON vertex_usage_events(delivery_state, observed_at);
+CREATE TABLE IF NOT EXISTS vertex_usage_coverage (
+    period          TEXT PRIMARY KEY,
+    sequence        INTEGER NOT NULL CHECK (sequence > 0),
+    pending_events  INTEGER NOT NULL CHECK (pending_events >= 0),
+    lost_events     INTEGER NOT NULL DEFAULT 0 CHECK (lost_events >= 0),
+    delivery_state  TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 -- Explicit episode membership (FK join). record_type ∈ {utterance, screenshot};
 -- record_id references utterances(id) / screenshots(id). Enables both
 -- "records of an episode" and the reverse "episode of a record" lookup, and
@@ -2652,6 +2734,46 @@ fn run_migrations(conn: &Connection) -> Result<()> {
              key         TEXT PRIMARY KEY,
              value       TEXT NOT NULL,
              updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vertex_usage_events (
+             event_id TEXT PRIMARY KEY,
+             operation TEXT NOT NULL CHECK (operation IN (
+                'audio_understanding','screen_understanding','episode_summarization',
+                'episode_finalization')),
+             requested_model TEXT NOT NULL,
+             returned_model TEXT,
+             location TEXT NOT NULL,
+             traffic_type TEXT NOT NULL DEFAULT 'on_demand' CHECK (traffic_type IN (
+                'on_demand','batch','provisioned_throughput')),
+             http_status INTEGER,
+             prompt_tokens INTEGER,
+             input_text_tokens INTEGER,
+             input_audio_tokens INTEGER,
+             input_image_tokens INTEGER,
+             cached_input_tokens INTEGER,
+             cached_input_text_tokens INTEGER,
+             cached_input_audio_tokens INTEGER,
+             cached_input_image_tokens INTEGER,
+             output_text_tokens INTEGER,
+             thought_tokens INTEGER,
+             total_tokens INTEGER,
+             outcome TEXT NOT NULL CHECK (outcome IN ('started','metered','usage_missing','ambiguous','not_billed')),
+             delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+             delivery_attempt_count INTEGER NOT NULL DEFAULT 0,
+             observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );
+         CREATE INDEX IF NOT EXISTS vertex_usage_events_outbox_idx
+             ON vertex_usage_events(delivery_state, observed_at);
+         CREATE TABLE IF NOT EXISTS vertex_usage_coverage (
+             period TEXT PRIMARY KEY,
+             sequence INTEGER NOT NULL CHECK (sequence > 0),
+             pending_events INTEGER NOT NULL CHECK (pending_events >= 0),
+             lost_events INTEGER NOT NULL DEFAULT 0 CHECK (lost_events >= 0),
+             delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          );",
     )?;
 
@@ -3174,6 +3296,89 @@ pub trait GcsClient: Send + Sync {
         prefix: &str,
         page_token: Option<&str>,
     ) -> Result<GcsListVersionsResponse>;
+}
+
+async fn list_all_object_versions(
+    gcs: &dyn GcsClient,
+    prefix: &str,
+) -> Result<Vec<GcsObjectVersion>> {
+    let mut versions = Vec::new();
+    let mut page_token: Option<String> = None;
+    for _ in 0..MAX_GCS_LIST_PAGES {
+        let page = gcs
+            .list_object_versions(prefix, page_token.as_deref())
+            .await?;
+        versions.extend(page.versions);
+        match page.next_page_token {
+            None => return Ok(versions),
+            Some(next) if page_token.as_deref() != Some(next.as_str()) => page_token = Some(next),
+            Some(_) => {
+                return Err(EnclaveError::Gcs(
+                    "GCS version listing repeated a page cursor".into(),
+                ))
+            }
+        }
+    }
+    Err(EnclaveError::Gcs(
+        "GCS version listing exceeded its page bound".into(),
+    ))
+}
+
+pub(crate) async fn delete_all_object_generations(
+    gcs: &dyn GcsClient,
+    object_name: &str,
+) -> Result<()> {
+    for version in list_all_object_versions(gcs, object_name)
+        .await?
+        .into_iter()
+        .filter(|version| version.name == object_name)
+    {
+        gcs.delete_object_generation(&version.name, version.generation)
+            .await?;
+    }
+    if list_all_object_versions(gcs, object_name)
+        .await?
+        .iter()
+        .any(|version| version.name == object_name)
+    {
+        return Err(EnclaveError::Gcs(
+            "GCS object generations remain after deletion".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_object_generations_except(
+    gcs: &dyn GcsClient,
+    object_name: &str,
+    keep_generation: i64,
+) -> Result<()> {
+    let versions = list_all_object_versions(gcs, object_name).await?;
+    if !versions
+        .iter()
+        .any(|version| version.name == object_name && version.generation == keep_generation)
+    {
+        return Err(EnclaveError::Gcs(
+            "required current GCS generation is missing during privacy purge".into(),
+        ));
+    }
+    for version in versions
+        .into_iter()
+        .filter(|version| version.name == object_name && version.generation != keep_generation)
+    {
+        gcs.delete_object_generation(&version.name, version.generation)
+            .await?;
+    }
+    if list_all_object_versions(gcs, object_name)
+        .await?
+        .iter()
+        .any(|version| version.name == object_name && version.generation != keep_generation)
+    {
+        return Err(EnclaveError::Gcs(
+            "superseded GCS generations remain after privacy purge".into(),
+        ));
+    }
+    Ok(())
 }
 
 const GCS_LIST_PAGE_SIZE: usize = 1_000;
@@ -3967,6 +4172,10 @@ fn media_prefix(user_id: &str) -> String {
     format!("raw/{user_id}/")
 }
 
+fn legacy_media_prefix(user_id: &str) -> String {
+    format!("media/{user_id}/")
+}
+
 fn legacy_recovery_prefix(user_id: &str) -> String {
     format!("legacy-recovery/{user_id}/")
 }
@@ -4054,7 +4263,13 @@ fn verify_legacy_recovery_copy(
 
 fn media_keys(conn: &Connection) -> Result<Vec<String>> {
     let mut keys = Vec::new();
-    for table in ["screenshot_images", "media_objects"] {
+    for (table, state_filter) in [
+        ("screenshot_images", ""),
+        (
+            "media_objects",
+            " WHERE deleted_at IS NULL AND processing_state != 'pruned'",
+        ),
+    ] {
         let table_exists: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
             [table],
@@ -4063,7 +4278,7 @@ fn media_keys(conn: &Connection) -> Result<Vec<String>> {
         if table_exists == 0 {
             continue;
         }
-        let mut stmt = conn.prepare(&format!("SELECT object_key FROM {table}"))?;
+        let mut stmt = conn.prepare(&format!("SELECT object_key FROM {table}{state_filter}"))?;
         keys.extend(
             stmt.query_map([], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?,
@@ -4072,6 +4287,16 @@ fn media_keys(conn: &Connection) -> Result<Vec<String>> {
     keys.sort();
     keys.dedup();
     Ok(keys)
+}
+
+#[cfg(test)]
+fn historical_media_keys(conn: &Connection, user_id: &str) -> Result<Vec<String>> {
+    let raw_prefix = format!("raw/{user_id}/");
+    let media_prefix = format!("media/{user_id}/");
+    Ok(media_keys(conn)?
+        .into_iter()
+        .filter(|key| !key.starts_with(&raw_prefix) && !key.starts_with(&media_prefix))
+        .collect())
 }
 
 pub(crate) fn user_blob_context(user_id: &str) -> Vec<u8> {
@@ -4533,6 +4758,8 @@ pub(crate) mod tests {
         live_gets: StdMutex<Vec<String>>,
         copy_calls: StdMutex<Vec<(String, i64, String)>>,
         put_calls: StdMutex<Vec<(String, i64)>>,
+        list_calls: AtomicUsize,
+        delete_generation_calls: AtomicUsize,
     }
 
     impl FakeGcs {
@@ -4555,7 +4782,29 @@ pub(crate) mod tests {
                 live_gets: StdMutex::new(Vec::new()),
                 copy_calls: StdMutex::new(Vec::new()),
                 put_calls: StdMutex::new(Vec::new()),
+                list_calls: AtomicUsize::new(0),
+                delete_generation_calls: AtomicUsize::new(0),
             }
+        }
+
+        pub fn exact_generation_count(&self, object_name: &str) -> usize {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(object_name)
+                .map_or(0, Vec::len)
+        }
+
+        pub fn reset_operation_counts(&self) {
+            self.list_calls.store(0, Ordering::SeqCst);
+            self.delete_generation_calls.store(0, Ordering::SeqCst);
+        }
+
+        pub fn operation_counts(&self) -> (usize, usize) {
+            (
+                self.list_calls.load(Ordering::SeqCst),
+                self.delete_generation_calls.load(Ordering::SeqCst),
+            )
         }
 
         fn metadata(object: &FakeObject) -> GcsObjectMetadata {
@@ -4864,6 +5113,7 @@ pub(crate) mod tests {
             prefix: &str,
             page_token: Option<&str>,
         ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
             const PAGE_SIZE: usize = 2;
             let start = page_token
                 .map(|value| value.parse::<usize>())
@@ -4953,6 +5203,7 @@ pub(crate) mod tests {
             object_name: &str,
             generation: i64,
         ) -> crate::error::Result<()> {
+            self.delete_generation_calls.fetch_add(1, Ordering::SeqCst);
             if self
                 .fail_generation_delete
                 .lock()
@@ -7573,6 +7824,241 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn delete_user_removes_every_exact_index_generation() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        store
+            .with_user("alice", |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata (key,value) VALUES ('second','generation')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+
+        let exact = gcs_object_name("alice");
+        // Current save policy prunes older versions. Retain one explicit
+        // noncurrent generation so this test covers exact-version deletion.
+        let live = gcs.get_object(&exact).await.unwrap();
+        gcs.put_object(
+            &exact,
+            &live.ciphertext,
+            &live.wrapped_dek_b64,
+            live.generation,
+        )
+        .await
+        .unwrap();
+        let similarly_prefixed = format!("{exact}-other");
+        gcs.put_object(&similarly_prefixed, b"keep", "wrapped", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_all_object_versions(gcs.as_ref(), &exact)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|version| version.name == exact)
+                .count(),
+            2
+        );
+
+        store.delete_user("alice").await.unwrap();
+
+        assert!(list_all_object_versions(gcs.as_ref(), &exact)
+            .await
+            .unwrap()
+            .iter()
+            .all(|version| version.name != exact));
+        assert!(gcs.get_object(&similarly_prefixed).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_only_lru_churn_never_writes_clean_user_indexes() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let mut writer = Store::new(kms.clone(), gcs.clone());
+        writer.max_open = 2;
+        let users = (0..20)
+            .map(|index| format!("idle-{index}"))
+            .collect::<Vec<_>>();
+
+        for user_id in &users {
+            writer
+                .with_user(user_id, |conn| {
+                    conn.execute(
+                        "INSERT INTO app_metadata (key,value) VALUES ('created','yes')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            writer.save_user(user_id).await.unwrap();
+        }
+        for user_id in &users {
+            assert_eq!(gcs.exact_generation_count(&gcs_object_name(user_id)), 1);
+        }
+
+        let mut scanner = Store::new(kms, gcs.clone());
+        scanner.max_open = 2;
+        for _ in 0..3 {
+            for user_id in &users {
+                let value: String = scanner
+                    .read_user(user_id, |conn| {
+                        Ok(conn.query_row(
+                            "SELECT value FROM app_metadata WHERE key='created'",
+                            [],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(value, "yes");
+            }
+        }
+        for user_id in &users {
+            assert_eq!(gcs.exact_generation_count(&gcs_object_name(user_id)), 1);
+        }
+
+        scanner
+            .with_user(&users[0], |conn| {
+                conn.execute(
+                    "UPDATE app_metadata SET value='changed' WHERE key='created'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        scanner.save_user(&users[0]).await.unwrap();
+        assert_eq!(gcs.exact_generation_count(&gcs_object_name(&users[0])), 2);
+        for user_id in &users[1..] {
+            assert_eq!(gcs.exact_generation_count(&gcs_object_name(user_id)), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_waits_for_inflight_upload_and_sweeps_unreferenced_media_prefix() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
+        let user_id = "capture-delete-race-user";
+        store.with_user(user_id, |_| Ok(())).await.unwrap();
+        store.save_user(user_id).await.unwrap();
+
+        // Model an upload that passed preflight and placed the encrypted object
+        // but has not yet recorded its database row. Deletion must wait at the
+        // same lifecycle fence, then remove the whole namespaced prefix even
+        // though this object is absent from the DB snapshot.
+        let upload_guard = store.lock_user_lifecycle(user_id).await.unwrap();
+        let object_key = format!("raw/{user_id}/asset.enc");
+        store
+            .put_media(&object_key, b"encrypted-media", "wrapped")
+            .await
+            .unwrap();
+        let deleting_store = Arc::clone(&store);
+        let deletion = tokio::spawn(async move { deleting_store.delete_user(user_id).await });
+        tokio::task::yield_now().await;
+        assert!(!deletion.is_finished());
+
+        drop(upload_guard);
+        deletion.await.unwrap().unwrap();
+
+        assert!(
+            list_all_object_versions(gcs.as_ref(), &format!("raw/{user_id}/"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_cost_tracks_live_generations_not_pruned_media_ledger_rows() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let user_id = "large-pruned-ledger-user";
+        store
+            .with_user(user_id, |conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+                let tx = conn.unchecked_transaction()?;
+                for index in 0..2_000 {
+                    tx.execute(
+                        "INSERT INTO media_objects
+                         (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256,
+                          processing_state,deleted_at)
+                         VALUES (?1,?2,?3,'audio/m4a','aac',1,?4,'pruned',
+                                 '2026-08-09T12:00:00.000Z')",
+                        rusqlite::params![
+                            format!("pruned-asset-{index}"),
+                            format!("pruned-event-{index}"),
+                            format!("raw/{user_id}/pruned-{index}.enc"),
+                            format!("{index:064x}"),
+                        ],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO media_objects
+                     (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256,
+                      processing_state)
+                     VALUES ('legacy-asset','legacy-event','legacy/object.enc',
+                             'audio/m4a','aac',1,?1,'ready')",
+                    ["f".repeat(64)],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(user_id).await.unwrap();
+
+        for (name, generations) in [
+            (format!("raw/{user_id}/live.enc"), 2),
+            (format!("media/{user_id}/screen.enc"), 1),
+            ("legacy/object.enc".to_string(), 2),
+        ] {
+            for generation in 0..generations {
+                store
+                    .put_media_at_generation(&name, b"ciphertext", "wrapped", generation)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        gcs.reset_operation_counts();
+        store.delete_user(user_id).await.unwrap();
+        let (list_calls, delete_calls) = gcs.operation_counts();
+        assert!(
+            list_calls <= 10,
+            "pruned ledger rows caused {list_calls} GCS listings"
+        );
+        assert_eq!(delete_calls, 6);
+        for prefix in [
+            format!("raw/{user_id}/"),
+            format!("media/{user_id}/"),
+            "legacy/object.enc".to_string(),
+            gcs_object_name(user_id),
+        ] {
+            assert!(
+                list_all_object_versions(gcs.as_ref(), &prefix)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "deletion left generations under {prefix}"
+            );
+        }
+
+        gcs.reset_operation_counts();
+        store.delete_user(user_id).await.unwrap();
+        let (retry_lists, retry_deletes) = gcs.operation_counts();
+        assert!(retry_lists <= 6);
+        assert_eq!(retry_deletes, 0);
+    }
+
     /// Deleting a user that was never seen must succeed without error (idempotent).
     #[tokio::test]
     async fn delete_user_never_seen_is_ok() {
@@ -8225,7 +8711,10 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        assert_eq!(media_keys(&conn).unwrap(), vec!["raw/cloud".to_string()]);
+        assert_eq!(
+            historical_media_keys(&conn, "owner").unwrap(),
+            vec!["raw/cloud".to_string()]
+        );
     }
 
     /// A traversal-style user_id must be rejected by the store itself before

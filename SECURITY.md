@@ -25,7 +25,9 @@ surfaces.
 ### Out of scope or accepted external trust
 
 - The macOS client, which is a separate binary with its own threat model.
-- Payment processing; no billing provider is implemented here.
+- Paddle payment processing, tax, invoices, subscription webhooks, and catalog pricing
+  occur in the external monorepo billing service. The enclave's pseudonymous metering,
+  entitlement enforcement, checkout/portal facade, and owner authorization are in scope.
 - CPU-level microarchitectural side channels. Confidential Space provides VM memory
   encryption, not complete Spectre-class protection.
 - **Vertex Gemini inference confidentiality.** Audio transcription/diarization,
@@ -54,6 +56,10 @@ surfaces.
   service account, KMS key, buckets, hostname, and attestation binding that have no
   production data access. The operator has retired that isolated runtime; production is
   now the only active owner evaluation environment.
+- Production selection fails closed unless billing enforcement remains `shadow`. The
+  selected mode is preserved in schema-v3 release metadata and rechecked by the release
+  script, so a later configuration clear cannot hide an enforcement change before
+  native clients are ready.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL
@@ -446,6 +452,8 @@ below.
 **Mitigation:** GCS contains ciphertext and KMS-wrapped DEKs. KMS access is separately
 attestation-gated. AES-GCM authenticates contents, GCS generation preconditions reject
 lost-update races, and v2 AAD binds each blob to its intended logical object and user.
+Account deletion enumerates every exact live and noncurrent object generation, deletes
+each generation explicitly, and verifies no matching generation remains.
 
 ### T5 — Hypervisor or memory inspection
 
@@ -505,6 +513,21 @@ default and carry final-brief content only when that destination's explicit opti
 enabled. The sender revalidates public DNS addresses on every attempt, pins the validated
 address, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
 signatures, or response bodies.
+
+### Pseudonymous billing events cross the TEE boundary
+
+The monorepo billing service receives a random account pseudonym and content-free usage
+events over HTTPS authenticated with an exact-audience Google OIDC token. It does not
+receive email, Google subject, stable enclave user UUID, capture/episode identifiers, or
+model content. The random mapping, lease receipts, and deletion-detach outbox remain
+encrypted inside the enclave. This boundary reveals subscription usage and inference-cost
+shape; compromise of both databases could link those records.
+
+New capture depends on the billing service in enforce mode: a denial or inactive lease is
+HTTP 402, idempotency/early-renewal conflict is HTTP 409, and unavailable durable state is
+HTTP 503 before persistence. Screenshots and references require an active lease but do not
+consume again. Reads, search, export, and deletion remain ungated. Shadow mode is
+temporary and must not log upstream denial detail.
 
 ### Stable user identifiers are linkable
 

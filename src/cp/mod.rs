@@ -13,6 +13,7 @@
 
 pub mod apple;
 pub mod auth;
+pub mod billing;
 pub mod control_store;
 pub mod cors;
 pub mod delivery;
@@ -28,9 +29,13 @@ pub(crate) mod mcp_safety;
 pub mod media;
 pub mod media_planner;
 pub mod media_worker;
+pub mod model_usage;
 pub mod oauth;
 pub mod query;
 pub mod reviewer;
+// Retained for legacy-index migrations and focused regression tests after
+// local screenshot ingestion was retired.
+#[allow(dead_code)]
 pub mod screen_understanding;
 pub mod summarizer;
 pub mod sync;
@@ -79,6 +84,9 @@ pub struct CpConfig {
     pub apple_sign_in: Option<apple::AppleSignInConfig>,
     /// Lowercased allow-list. `None` is permitted only in debug test mode.
     pub allowed_emails: Option<Vec<String>>,
+    /// Stable UUIDs authorized for owner-only operational reporting. This is
+    /// intentionally independent from the broader sign-in email allow-list.
+    pub admin_user_ids: Vec<String>,
     pub scheduler_sa_email: Option<String>,
     pub vertex_project: String,
     pub vertex_location: String,
@@ -91,6 +99,19 @@ pub struct CpConfig {
     /// Optional exact-match Google Identity Platform account used only by the
     /// public plugin-review login page. The password never enters this config.
     pub reviewer_auth: Option<ReviewerAuthConfig>,
+    pub billing_enforcement_mode: BillingEnforcementMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BillingEnforcementMode {
+    Shadow,
+    Enforce,
+}
+
+impl BillingEnforcementMode {
+    pub fn enforces(self) -> bool {
+        self == Self::Enforce
+    }
 }
 
 #[derive(Clone)]
@@ -159,6 +180,23 @@ impl CpConfig {
         {
             return Err(crate::error::EnclaveError::Config(
                 "ALLOWED_EMAILS does not permit a wildcard".into(),
+            ));
+        }
+        let admin_user_ids = std::env::var("ADMIN_USER_IDS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if (!crate::test_mode_enabled() && admin_user_ids.is_empty())
+            || admin_user_ids.iter().any(|value| !is_stable_uuid(value))
+        {
+            return Err(crate::error::EnclaveError::Config(
+                "ADMIN_USER_IDS must contain explicit stable UUIDs".into(),
             ));
         }
 
@@ -304,6 +342,29 @@ impl CpConfig {
         };
 
         let vertex_model = config_value("VERTEX_MODEL", "gemini-3.5-flash")?;
+        if !vertex_model_name_is_billing_safe(&vertex_model) {
+            return Err(crate::error::EnclaveError::Config(
+                "VERTEX_MODEL must be 1-128 ASCII letters, digits, '.', '_', ':', or '-'".into(),
+            ));
+        }
+        let billing_enforcement_mode = match std::env::var("BILLING_ENFORCEMENT_MODE")
+            .unwrap_or_else(|_| {
+                if crate::test_mode_enabled() {
+                    "enforce".into()
+                } else {
+                    String::new()
+                }
+            })
+            .as_str()
+        {
+            "shadow" => BillingEnforcementMode::Shadow,
+            "enforce" => BillingEnforcementMode::Enforce,
+            _ => {
+                return Err(crate::error::EnclaveError::Config(
+                    "BILLING_ENFORCEMENT_MODE must be shadow or enforce".into(),
+                ))
+            }
+        };
 
         Ok(Self {
             base_url,
@@ -323,6 +384,7 @@ impl CpConfig {
             google_web_client_secret,
             apple_sign_in,
             allowed_emails,
+            admin_user_ids,
             scheduler_sa_email: std::env::var("SCHEDULER_SA_EMAIL")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -338,6 +400,7 @@ impl CpConfig {
             )?,
             web_origin,
             reviewer_auth,
+            billing_enforcement_mode,
         })
     }
 
@@ -360,6 +423,25 @@ impl CpConfig {
             Some(list) => list.contains(&email.to_lowercase()),
         }
     }
+
+    pub fn is_admin(&self, user_id: &str) -> bool {
+        self.admin_user_ids.iter().any(|value| value == user_id)
+    }
+}
+
+fn is_stable_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+pub(crate) fn vertex_model_name_is_billing_safe(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 /// Shared state for the control-plane HTTP surface. Holds the same `Arc<Store>`
@@ -369,6 +451,8 @@ impl CpConfig {
 pub struct CpState {
     pub store: Arc<Store>,
     pub control: Arc<control_store::ControlStore>,
+    pub billing: Arc<dyn billing::BillingGateway>,
+    pub recording_lease_gate: Arc<billing::RecordingLeaseGates>,
     pub config: Arc<CpConfig>,
     pub user_verifier: Arc<auth::UserIdTokenVerifier>,
     pub reviewer_verifier: Option<Arc<auth::ReviewerIdentityVerifier>>,
@@ -490,4 +574,20 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
         .map_err(|e| format!("Secret {} payload is not valid UTF-8: {}", secret_id, e))?;
 
     Ok(decoded_str)
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::vertex_model_name_is_billing_safe;
+
+    #[test]
+    fn vertex_model_grammar_matches_the_billing_contract() {
+        assert!(vertex_model_name_is_billing_safe("gemini-3.5-flash"));
+        assert!(vertex_model_name_is_billing_safe("publisher:model_001"));
+        assert!(!vertex_model_name_is_billing_safe(
+            "publishers/google/model"
+        ));
+        assert!(!vertex_model_name_is_billing_safe(&"m".repeat(129)));
+        assert!(!vertex_model_name_is_billing_safe(""));
+    }
 }

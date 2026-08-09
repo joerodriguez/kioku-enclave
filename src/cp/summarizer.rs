@@ -571,14 +571,16 @@ async fn run_substance_backfill(state: &CpState, user_id: &str) -> Result<()> {
         );
         reserve_vertex_output(state, user_id, CLASSIFIER_MAX_OUTPUT_TOKENS).await?;
         let response = super::vertex::generate_custom(
-            &state.config,
+            state,
+            user_id,
+            super::vertex::VertexOperation::SubstanceBackfill,
             SUBSTANCE_BACKFILL_PROMPT,
             &message,
             substance_backfill_schema(),
             CLASSIFIER_MAX_OUTPUT_TOKENS,
         )
         .await?;
-        let parsed = extract_json(&response).ok_or_else(|| {
+        let parsed = extract_json(&response.text).ok_or_else(|| {
             EnclaveError::Config("substance backfill response was not valid JSON".into())
         })?;
         let classifications = parsed
@@ -773,14 +775,16 @@ async fn run_visual_evidence_backfill(state: &CpState, user_id: &str) -> Result<
         );
         reserve_vertex_output(state, user_id, CLASSIFIER_MAX_OUTPUT_TOKENS).await?;
         let response = super::vertex::generate_custom(
-            &state.config,
+            state,
+            user_id,
+            super::vertex::VertexOperation::VisualEvidenceBackfill,
             VISUAL_EVIDENCE_BACKFILL_PROMPT,
             &message,
             visual_evidence_backfill_schema(),
             CLASSIFIER_MAX_OUTPUT_TOKENS,
         )
         .await?;
-        let parsed = extract_json(&response).ok_or_else(|| {
+        let parsed = extract_json(&response.text).ok_or_else(|| {
             EnclaveError::Config("visual evidence backfill response was not valid JSON".into())
         })?;
         let classifications = parsed
@@ -985,9 +989,16 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     // deterministically (see summarize_all) instead of stalling forever.
     let system_prompt = format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}");
     reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await?;
-    let response = match super::vertex::generate(&state.config, &system_prompt, &user_message).await
+    let response = match super::vertex::generate(
+        state,
+        user_id,
+        super::vertex::VertexOperation::EpisodeSummary,
+        &system_prompt,
+        &user_message,
+    )
+    .await
     {
-        Ok(t) => t,
+        Ok(t) => t.text,
         Err(e) if e.to_string().contains("quota") => {
             return Ok(serde_json::json!({ "skipped": true, "reason": "quota" }));
         }
@@ -1023,9 +1034,17 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
                 .join(", ")
         );
         reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await?;
-        match super::vertex::generate(&state.config, &system_prompt, &repair_message).await {
+        match super::vertex::generate(
+            state,
+            user_id,
+            super::vertex::VertexOperation::EpisodeSummaryRepair,
+            &system_prompt,
+            &repair_message,
+        )
+        .await
+        {
             Ok(repaired_text) => {
-                if let Some(repaired) = extract_json(&repaired_text) {
+                if let Some(repaired) = extract_json(&repaired_text.text) {
                     if missing_grounded_entities(&repaired, &grounding).is_empty() {
                         parsed = repaired;
                     } else {

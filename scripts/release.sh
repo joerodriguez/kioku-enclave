@@ -316,22 +316,27 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 keys = ("schema_version", "source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest", "build_url", "build_profile")
 data["voice_quality_gate"] = data.get("voice_quality_gate", "legacy_unclassified")
-keys += ("voice_quality_gate",)
+data["billing_enforcement_mode"] = data.get("billing_enforcement_mode", "legacy_unclassified")
+keys += ("voice_quality_gate", "billing_enforcement_mode")
 print("\t".join(str(data[key]) for key in keys))
 PY
 )"
-IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE <<< "$RELEASE_METADATA"
+IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE <<< "$RELEASE_METADATA"
 
 if [[ "$SOURCE_REPOSITORY" != "https://github.com/${REPOSITORY}" || "$BUILD_PROFILE" != "production" ]]; then
   echo "Error: build metadata has an unexpected schema, source repository, or non-production profile." >&2
   exit 1
 fi
-if [[ "$SCHEMA_VERSION" == "2" ]]; then
+if [[ "$SCHEMA_VERSION" == "3" ]]; then
   if [[ "$VOICE_QUALITY_GATE" != "owner_only_unvalidated" && "$VOICE_QUALITY_GATE" != "validated_real_corpus" ]]; then
-    echo "Error: schema-v2 build metadata has an invalid voice-quality gate classification." >&2
+    echo "Error: schema-v3 build metadata has an invalid voice-quality gate classification." >&2
     exit 1
   fi
-elif [[ "$SCHEMA_VERSION" != "1" || "$VOICE_QUALITY_GATE" != "legacy_unclassified" || "$ROLLBACK_EXISTING" != "true" ]]; then
+  if [[ "$BILLING_ENFORCEMENT_MODE" != "shadow" ]]; then
+    echo "Error: production release metadata must attest shadow billing enforcement." >&2
+    exit 1
+  fi
+elif [[ "$SCHEMA_VERSION" != "1" && "$SCHEMA_VERSION" != "2" ]] || [[ "$BILLING_ENFORCEMENT_MODE" != "legacy_unclassified" || "$ROLLBACK_EXISTING" != "true" ]]; then
   echo "Error: legacy unclassified metadata is accepted only for an immutable rollback." >&2
   exit 1
 fi

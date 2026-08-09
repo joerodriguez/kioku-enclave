@@ -7,7 +7,7 @@ None of these scripts runs in the enclave or in a Kioku client.
 
 | Path | Responsibility |
 |---|---|
-| `bump_version.sh` | Updates the Cargo version and stages the complete release change. |
+| `bump_version.sh` | Refuses main/detached HEAD, updates the Cargo version, and stages the complete release change without committing or pushing. |
 | `fetch_voice_eval_assets.sh` | Downloads licensed evaluation inputs and records hashes outside Git. |
 | `check_voice_release_gate.py` | Classifies a release as exact owner-only/no-claim or invokes the Rust checker for a complete real-corpus trio. |
 | `test_check_voice_release_gate.py` | Fail-closed contract tests for owner-only and validated-real-corpus classifications. |

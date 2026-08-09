@@ -1,8 +1,8 @@
 # map.md — src/ (enclave service)
 
 The entire attested Kioku backend: it terminates TLS and serves OAuth, sync, MCP/REST,
-account, quotas, and the summarizer—see [`cp/`](cp/map.md)—alongside the legacy `/v1/*`
-query/storage API. Plaintext databases exist only here and in SEV tmpfs, never on
+account, quotas, and the summarizer—see [`cp/`](cp/map.md)—alongside authenticated
+`410 Gone` tombstones for the retired `/v1/*` query/storage API. Plaintext databases exist only here and in SEV tmpfs, never on
 persistent disk; bounded audio, screenshot pixels, transcript/screen text, and metadata
 leave the TEE through the documented Vertex inference boundary, while explicitly
 configured webhook events use the separate webhook boundary.
@@ -14,7 +14,7 @@ configured webhook events use the separate webhook boundary.
 | `acme.rs` | Required production ACME lifecycle: answers HTTP-01 on :80, generates the TLS key in the TEE, persists account/cert/key as context-bound KMS-wrapped state (`acme/tls.json.enc`), blocks boot until a usable cert exists, and hot-swaps renewals |
 | [`cp/`](cp/map.md) | **Control plane:** OAuth/DCR, sync, account, MCP + REST, quotas, summarizer, and identity control store |
 | `attestation.rs` | Two separated Confidential Space token paths: internal WIF-audience STS exchange for KMS credentials, and public HTTPS-verifier-audience OIDC tokens that can never use the WIF audience |
-| `auth.rs` | Legacy caller auth — verifies the control-plane SA ID token for the `/v1/*` routes |
+| `auth.rs` | Legacy caller auth — verifies the control-plane SA ID token before retired `/v1/*` data routes return `410 Gone` |
 | `crypto.rs` | KMS/DEK handling plus versioned, context-bound AES-256-GCM v2 blobs. Legacy formats fail closed unless a migration image bakes `ENCLAVE_ALLOW_LEGACY_BLOBS=1` |
 | `archive_v3.rs` | **Inactive ADR-0022 foundation:** non-loggable opaque identities; a bounded, caller-buffered archive-key provider resolver that fetches/hashes the exact nominated registry object, passes those same bytes to KMS unwrap, verifies archive/key/monotonic-rotation context in the zeroizing plaintext, and retains object/hash binding; canonical HKDF/AES-GCM archive envelopes with encoded random nonces safe across process restarts; bounded leaf/internal extent Merkle and root codecs; and a cursor-bounded immutable-backend contract with an in-memory test backend. Raw archive DEK/cipher construction is test-only; production-capable root adapters require the resolved cipher. It has no live KMS/GCS client, Store/VFS/witness/route wiring, or write authority until the ADR shadow gates pass. |
 | `archive_v3_gcs.rs` | **Inactive ADR-0022 GCS semantic boundary:** async provider-neutral transport and bounded registry-KMS traits plus fakes; strict bounded canonical names/prefixes, permanent archive-wide ID claims committed to the exact key/ciphertext, conditional create with exact read-after-create and explicitly ambiguous lost-success reconciliation, 412 identical/conflict handling, bounded key pagination, and a transport contract requiring verified all-generation deletion. The fake proves delegation/multi-generation semantics, not live GCS deletion evidence. It deliberately has no concrete GCP HTTP client, credentials/runtime wiring, Store/VFS/witness/route/Firestore/authority/deploy connection, or production authority. |

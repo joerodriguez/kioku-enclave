@@ -7,8 +7,9 @@
 //!
 //! ## Authentication
 //!
-//! The compatibility `/v1/*` data routes require a Google-signed service-account
-//! ID token (RS256, `https://accounts.google.com`) with:
+//! Retired `/v1/*` data routes require the former Google-signed service-account
+//! ID token before returning an explicit `410 Gone`; they cannot read or write
+//! user data. The public `/v1/attestation` verifier route remains active.
 //!
 //! - `aud` == `ENCLAVE_AUDIENCE` env var (baked into the image)
 //! - `email` == `RUN_SA_EMAIL` env var (the trusted control-plane service
@@ -36,34 +37,23 @@
 //! live cert hot-swapped on renewal. See `acme.rs`. Static `ENCLAVE_TLS_*`
 //! inputs remain only for debug/custom bootstrap images.
 //!
-//! ## Compatibility routes
+//! ## Public and retired compatibility routes
 //!
 //! | Method | Path                       | Description                                  |
 //! |--------|----------------------------|----------------------------------------------|
 //! | GET    | /health                    | Liveness probe; returns `{"ok":true}`        |
-//! | POST   | /v1/ingest                 | Append utterances / screenshots to user index|
-//! | POST   | /v1/search                 | FTS5 search (optional kinds filter)          |
-//! | POST   | /v1/context                | Rows nearest a center timestamp              |
-//! | POST   | /v1/range                  | Raw rows in [from, to) for summariser        |
-//! | POST   | /v1/episodes/upsert        | Write / replace summarised episodes          |
-//! | POST   | /v1/episodes/list          | List episodes newest-first                   |
-//! | POST   | /v1/episodes/delete_range  | Delete episodes in [from, to)                |
-//! | POST   | /v1/stats                  | Per-user row counts + latest timestamps      |
-//! | GET    | /v1/export                 | Full JSON export of user's index             |
-//! | DELETE | /v1/user                   | Legacy content-only delete (trusted SA)      |
+//! | ANY    | /v1/* data routes          | Authenticated `410 Gone`; permanently retired|
 
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{Query, Request, State},
+    extract::{Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post},
+    routing::{any, get},
     Router,
 };
-use base64::Engine as _; // trait in scope for .encode()
-use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -91,11 +81,17 @@ mod crypto;
 mod embedding;
 mod episodes;
 mod error;
+// The retired local-sync route no longer calls this legacy ingestion surface,
+// but its core remains as migration/regression-test coverage for old indexes.
+#[allow(dead_code)]
 mod ingest;
 mod ocr;
 mod search;
 mod storage_observability;
 mod store;
+// Retained for historical index regression tests after the `/v1` query routes
+// were tombstoned.
+#[allow(dead_code)]
 mod timeline;
 mod tls;
 
@@ -106,16 +102,7 @@ pub(crate) fn test_mode_enabled() -> bool {
     cfg!(debug_assertions) && std::env::var("ENCLAVE_TEST_MODE").as_deref() == Ok("1")
 }
 
-use crate::{
-    episodes::{
-        handle_episodes_delete_range, handle_episodes_list, handle_episodes_members,
-        handle_episodes_upsert,
-    },
-    ingest::handle_ingest,
-    search::handle_search,
-    store::{GcpGcsClient, Store},
-    timeline::{handle_context, handle_range, handle_stats},
-};
+use crate::store::{GcpGcsClient, Store};
 
 async fn resolve_resend_api_key<F, Fut>(
     test_mode: bool,
@@ -157,71 +144,6 @@ pub struct AppState {
     id_token_verifier: Arc<auth::IdTokenVerifier>,
     pub attestation_cache: Option<Arc<attestation::AttestationCache>>,
     pub tls_keystone: Option<Arc<tls::TlsKeystone>>,
-}
-
-/// In-process full export of a user's searchable index, capture provenance,
-/// learned people, and voice-memory records. Encrypted raw object bytes remain
-/// represented by their media-object inventory; the export never exposes KMS
-/// wrapping keys or reusable authentication material.
-pub(crate) async fn dump_user_export(
-    store: &Store,
-    user_id: &str,
-) -> error::Result<serde_json::Value> {
-    store::validate_user_id(user_id)?;
-    store
-        .with_user(user_id, |conn| {
-            let utterances = dump_table(conn, "SELECT * FROM utterances ORDER BY id")?;
-            let screenshots = dump_table(conn, "SELECT * FROM screenshots ORDER BY id")?;
-            let screenshot_images = {
-                let table_exists: i64 = conn.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if table_exists > 0 {
-                    dump_table(conn, "SELECT * FROM screenshot_images ORDER BY id")?
-                } else {
-                    Vec::new()
-                }
-            };
-            let episodes = dump_table(conn, "SELECT * FROM episodes ORDER BY id")?;
-            let final_briefs = dump_table(conn, "SELECT * FROM episode_final_briefs ORDER BY episode_id")?;
-            let webhook_deliveries =
-                dump_table(conn, "SELECT * FROM webhook_deliveries ORDER BY episode_id, subscription_id")?;
-            Ok(json!({
-                "utterances": utterances,
-                "screenshots": screenshots,
-                "screenshot_images": screenshot_images,
-                "episodes": episodes,
-                "episode_final_briefs": final_briefs,
-                "webhook_deliveries": webhook_deliveries,
-                "email_deliveries": dump_optional_table(conn, "email_deliveries", "episode_id, delivery_version")?,
-                "capture_sessions": dump_optional_table(conn, "capture_sessions", "created_at")?,
-                "capture_streams": dump_optional_table(conn, "capture_streams", "created_at")?,
-                "capture_events": dump_optional_table(conn, "capture_events", "started_at, event_id")?,
-                "media_objects": dump_optional_table(conn, "media_objects", "created_at, event_id")?,
-                "browser_states": dump_optional_table(conn, "browser_states_v2", "created_at, state_key")?,
-                "browser_observations": dump_optional_table(conn, "browser_observations_v2", "observed_at, event_id")?,
-                "media_processing_jobs": dump_optional_table(conn, "media_processing_jobs", "updated_at, event_id")?,
-                "media_work_units": dump_optional_table(conn, "media_work_units", "updated_at, id")?,
-                "media_work_members": dump_optional_table(conn, "media_work_members", "work_unit_id, ordinal")?,
-                "speaker_observations": dump_optional_table(conn, "speaker_observations", "started_at, event_id, id")?,
-                "speaker_observation_sources": dump_optional_table(conn, "speaker_observation_sources", "speaker_observation_id, window_start_ms")?,
-                "people": dump_optional_table(conn, "people", "display_name, id")?,
-                "voice_profiles": dump_optional_table(conn, "voice_profiles", "person_id, id")?,
-                "voice_samples": dump_optional_table(conn, "voice_samples", "speaker_observation_id, id")?,
-                "voice_profile_proposals": dump_optional_table(conn, "voice_profile_proposals", "created_at, id")?,
-                "voice_profile_revisions": dump_optional_table(conn, "voice_profile_revisions", "profile_id, id")?,
-                "voice_sample_profile_assignments": dump_optional_table(conn, "voice_sample_profile_assignments", "sample_id, id")?,
-                "voice_profile_proposal_profiles": dump_optional_table(conn, "voice_profile_proposal_profiles", "proposal_id, role, partition_ordinal, profile_id")?,
-                "voice_profile_proposal_samples": dump_optional_table(conn, "voice_profile_proposal_samples", "proposal_id, partition_ordinal, sample_id")?,
-                "identity_evidence": dump_optional_table(conn, "identity_evidence", "created_at, id")?,
-                "person_name_claims": dump_optional_table(conn, "person_name_claims", "observed_at, id")?,
-                "profile_identity_bindings": dump_optional_table(conn, "profile_identity_bindings", "updated_at, id")?,
-                "person_facts": dump_optional_table(conn, "person_facts", "person_id, created_at, id")?,
-            }))
-        })
-        .await
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -273,100 +195,35 @@ async fn require_auth(
     }
 }
 
-// ── Export handler ────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct ExportQuery {
-    user_id: String,
+async fn legacy_data_plane_retired() -> Response {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "legacy_data_plane_retired",
+            "message": "Use Kioku Cloud Capture v2."
+        })),
+    )
+        .into_response()
 }
 
-async fn handle_export(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<ExportQuery>,
-) -> error::Result<Json<serde_json::Value>> {
-    info!(user_id = %q.user_id, "export request");
-    let data = dump_user_export(&state.store, &q.user_id).await?;
-    Ok(Json(data))
-}
-
-fn dump_table(
-    conn: &rusqlite::Connection,
-    sql: &str,
-) -> crate::error::Result<Vec<serde_json::Value>> {
-    let mut stmt = conn.prepare(sql)?;
-    let col_count = stmt.column_count();
-    let col_names: Vec<String> = (0..col_count)
-        .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
-        .collect();
-
-    let rows = stmt.query_map([], |row| {
-        let mut map = serde_json::Map::new();
-        for (i, name) in col_names.iter().enumerate() {
-            let val: rusqlite::types::Value = row.get(i)?;
-            map.insert(name.clone(), sqlite_value_to_json(val));
-        }
-        Ok(serde_json::Value::Object(map))
-    })?;
-
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn dump_optional_table(
-    conn: &rusqlite::Connection,
-    name: &str,
-    order: &str,
-) -> crate::error::Result<Vec<serde_json::Value>> {
-    let exists: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |row| row.get(0),
-    )?;
-    if exists == 0 {
-        return Ok(Vec::new());
-    }
-    dump_table(conn, &format!("SELECT * FROM {name} ORDER BY {order}"))
-}
-
-fn sqlite_value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
-    match v {
-        rusqlite::types::Value::Null => serde_json::Value::Null,
-        rusqlite::types::Value::Integer(i) => serde_json::Value::Number(i.into()),
-        rusqlite::types::Value::Real(f) => serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-        rusqlite::types::Value::Blob(b) => {
-            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b))
-        }
-    }
-}
-
-// ── Delete handler ────────────────────────────────────────────────────────────
-
-// This service-account-authenticated compatibility route invokes the same
-// generation-aware content deletion as account deletion. It does not remove
-// the control-store identity or install the durable account tombstone; those
-// steps remain exclusive to DELETE /api/account.
-#[derive(Deserialize)]
-struct DeleteBody {
-    user_id: String,
-}
-
-async fn handle_delete_user(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<DeleteBody>,
-) -> error::Result<Json<serde_json::Value>> {
-    let user_id = body.user_id;
-    store::validate_user_id(&user_id)?;
-    info!("delete user request");
-
-    state.store.delete_user(&user_id).await?;
-
-    Ok(Json(json!({
-        "deleted": true,
-        "user_id": user_id,
-    })))
+fn legacy_data_plane_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/ingest", any(legacy_data_plane_retired))
+        .route("/v1/search", any(legacy_data_plane_retired))
+        .route("/v1/context", any(legacy_data_plane_retired))
+        .route("/v1/range", any(legacy_data_plane_retired))
+        .route("/v1/episodes/upsert", any(legacy_data_plane_retired))
+        .route("/v1/episodes/list", any(legacy_data_plane_retired))
+        .route("/v1/episodes/members", any(legacy_data_plane_retired))
+        .route("/v1/episodes/delete_range", any(legacy_data_plane_retired))
+        .route("/v1/stats", any(legacy_data_plane_retired))
+        .route("/v1/export", any(legacy_data_plane_retired))
+        .route("/v1/user", any(legacy_data_plane_retired))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_auth,
+        ))
+        .with_state::<Arc<AppState>>(state)
 }
 
 // ── Health handler ────────────────────────────────────────────────────────────
@@ -817,9 +674,16 @@ async fn main() {
             )) as Arc<dyn cp::email_worker::EmailTransport>
         });
 
+    let billing_gateway: Arc<dyn cp::billing::BillingGateway> = Arc::new(
+        cp::billing::HttpBillingGateway::from_env()
+            .unwrap_or_else(|error| panic!("Invalid billing service configuration: {error}")),
+    );
+
     let cp_state = Arc::new(cp::CpState {
         store: Arc::clone(&store),
         control: control_store,
+        billing: billing_gateway,
+        recording_lease_gate: Arc::new(cp::billing::RecordingLeaseGates::default()),
         user_verifier: Arc::new(cp::auth::UserIdTokenVerifier::new(
             cp_config.user_audiences(),
         )),
@@ -841,34 +705,18 @@ async fn main() {
     // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
     cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
     cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
+    cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
+    cp::billing::spawn_detach_worker(Arc::clone(&cp_state));
     cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
 
-    // ── Legacy data-plane routes ──────────────────────────────────────────────
-    let authenticated = Router::new()
-        .route("/v1/ingest", post(handle_ingest))
-        .route("/v1/search", post(handle_search))
-        .route("/v1/context", post(handle_context))
-        .route("/v1/range", post(handle_range))
-        .route("/v1/episodes/upsert", post(handle_episodes_upsert))
-        .route("/v1/episodes/list", post(handle_episodes_list))
-        .route("/v1/episodes/members", post(handle_episodes_members))
-        .route(
-            "/v1/episodes/delete_range",
-            post(handle_episodes_delete_range),
-        )
-        .route("/v1/stats", post(handle_stats))
-        .route("/v1/export", get(handle_export))
-        .route("/v1/user", delete(handle_delete_user))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_auth,
-        ))
-        .with_state(Arc::clone(&state));
+    // ── Retired legacy data-plane tombstones ─────────────────────────────────
+    let authenticated = legacy_data_plane_router(Arc::clone(&state));
 
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
     let cp_authed = cp::sync::router()
         .merge(cp::media::router())
         .merge(cp::query::router())
+        .merge(cp::billing::router())
         .merge(cp::apple::authenticated_router())
         .layer(middleware::from_fn_with_state(
             Arc::clone(&cp_state),
@@ -1087,5 +935,85 @@ mod email_startup_tests {
             .unwrap()
             .keys()
             .all(|key| !key.contains("user")));
+    }
+}
+
+#[cfg(test)]
+mod retired_route_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn every_retired_v1_route_authenticates_before_gone_and_never_mutates() {
+        let gcs = Arc::new(crate::store::tests::FakeGcs::new());
+        let store = Arc::new(Store::new(
+            Arc::new(crate::store::tests::FakeKms),
+            gcs.clone(),
+        ));
+        let user_id = "legacy-route-test";
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at,ocr_text)
+                     VALUES ('2026-08-09T12:00:00.000Z','must survive')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(user_id).await.unwrap();
+        let object_name = format!("indexes/{user_id}.db.enc");
+        let generations_before = gcs.exact_generation_count(&object_name);
+
+        let state = Arc::new(AppState {
+            store: Arc::clone(&store),
+            id_token_verifier: Arc::new(auth::IdTokenVerifier::new(
+                "test-audience".into(),
+                "caller@example.com".into(),
+            )),
+            attestation_cache: None,
+            tls_keystone: None,
+        });
+        let router = legacy_data_plane_router(Arc::clone(&state)).with_state(state);
+        for path in [
+            "/v1/ingest",
+            "/v1/search",
+            "/v1/context",
+            "/v1/range",
+            "/v1/episodes/upsert",
+            "/v1/episodes/list",
+            "/v1/episodes/members",
+            "/v1/episodes/delete_range",
+            "/v1/stats",
+            "/v1/export",
+            "/v1/user",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::from(r#"{"user_id":"legacy-route-test"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        // This is the post-authentication destination for all paths above.
+        let gone = legacy_data_plane_retired().await;
+        assert_eq!(gone.status(), StatusCode::GONE);
+        assert_eq!(gcs.exact_generation_count(&object_name), generations_before);
+        let surviving: i64 = store
+            .with_user(user_id, |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(surviving, 1);
     }
 }

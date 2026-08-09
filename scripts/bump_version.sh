@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Helper script to bump version in Cargo.toml, sync Cargo.lock, commit, and push to main.
+# Helper script to bump version in Cargo.toml, sync Cargo.lock, and stage the
+# complete release candidate on a review branch. It never commits or pushes.
 
 set -euo pipefail
 
@@ -22,6 +23,16 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "$REPO_ROOT"
 
+CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+if [[ -z "$CURRENT_BRANCH" ]]; then
+  echo "Error: version bumps require a named review branch, not detached HEAD." >&2
+  exit 3
+fi
+if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
+  echo "Error: refusing to prepare a release directly on $CURRENT_BRANCH; use a PR branch." >&2
+  exit 4
+fi
+
 echo "Bumping package version to $NEW_VERSION in Cargo.toml..."
 python3 - "$NEW_VERSION" <<'PY'
 import sys
@@ -40,9 +51,5 @@ echo "Syncing Cargo.lock..."
 cargo check >/dev/null
 
 git add -A
-git commit -m "chore: prepare enclave v${NEW_VERSION} release"
-
-echo "Pushing main to origin..."
-git push origin main
-
-echo "Version bump pushed cleanly! GitHub Actions will build the enclave image and publish release v${NEW_VERSION} automatically."
+echo "Release candidate v${NEW_VERSION} is staged on ${CURRENT_BRANCH}."
+echo "Inspect the staged diff, run all required checks, then commit and push this branch through a PR."
