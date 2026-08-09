@@ -125,7 +125,9 @@ Cloud KMS KEK
 Version 2 uses AES-GCM Additional Authenticated Data containing a domain separator and
 the object's logical identity. User databases are bound to their exact
 `indexes/{user_id}.db.enc` name, raw capture and screenshot evidence objects are bound to
-both the authenticated user and exact media object key, and control/ACME state uses fixed,
+both the authenticated user and exact media object key. New selected screenshot evidence is
+restricted to `raw/{user_id}/evidence/{opaque_key}.enc`; legacy `media/{opaque_key}` rows
+remain readable and deletable until normal retention or account deletion. Control/ACME state uses fixed,
 distinct contexts.
 Moving ciphertext and its wrapped DEK to another object or user therefore fails
 authentication.
