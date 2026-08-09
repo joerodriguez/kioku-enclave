@@ -54,6 +54,9 @@ name: Build & push enclave image
 #   APPLE_WEB_CLIENT_ID       Optional Services ID (com.kiokuu.web)
 #   BASE_URL                  Public origin, e.g. https://api.kiokuu.com
 #   WEB_ORIGIN                 Browser application origin, e.g. https://kiokuu.com
+#   BILLING_SERVICE_URL / BILLING_SERVICE_AUDIENCE
+#                             Exact billing-plane HTTPS origin and OIDC audience
+#   BILLING_ENFORCEMENT_MODE  shadow or enforce
 #   REVIEWER_AUTH_API_KEY     Firebase/Identity Platform web API key
 #   REVIEWER_AUTH_UID         Exact precreated synthetic reviewer account UID
 #   REVIEWER_AUTH_EMAIL       Exact precreated synthetic reviewer account email
@@ -236,8 +239,12 @@ jobs:
           PRODUCTION_APPLE_MACOS_CLIENT_ID: ${{ vars.APPLE_MACOS_CLIENT_ID }}
           PRODUCTION_APPLE_WEB_CLIENT_ID: ${{ vars.APPLE_WEB_CLIENT_ID }}
           PRODUCTION_ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
+          PRODUCTION_ADMIN_USER_IDS: ${{ vars.ADMIN_USER_IDS }}
           PRODUCTION_BASE_URL: ${{ vars.BASE_URL }}
           PRODUCTION_WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
+          PRODUCTION_BILLING_SERVICE_URL: ${{ vars.BILLING_SERVICE_URL }}
+          PRODUCTION_BILLING_SERVICE_AUDIENCE: ${{ vars.BILLING_SERVICE_AUDIENCE }}
+          PRODUCTION_BILLING_ENFORCEMENT_MODE: ${{ vars.BILLING_ENFORCEMENT_MODE }}
           PRODUCTION_REVIEWER_AUTH_API_KEY: ${{ vars.REVIEWER_AUTH_API_KEY }}
           PRODUCTION_REVIEWER_AUTH_UID: ${{ vars.REVIEWER_AUTH_UID }}
           PRODUCTION_REVIEWER_AUTH_EMAIL: ${{ vars.REVIEWER_AUTH_EMAIL }}
@@ -265,8 +272,12 @@ jobs:
           EVALUATION_APPLE_MACOS_CLIENT_ID: ${{ vars.EVAL_APPLE_MACOS_CLIENT_ID }}
           EVALUATION_APPLE_WEB_CLIENT_ID: ${{ vars.EVAL_APPLE_WEB_CLIENT_ID }}
           EVALUATION_ALLOWED_EMAILS: ${{ secrets.EVAL_ALLOWED_EMAILS }}
+          EVALUATION_ADMIN_USER_IDS: ${{ vars.EVAL_ADMIN_USER_IDS }}
           EVALUATION_BASE_URL: ${{ vars.EVAL_BASE_URL }}
           EVALUATION_WEB_ORIGIN: ${{ vars.EVAL_WEB_ORIGIN }}
+          EVALUATION_BILLING_SERVICE_URL: ${{ vars.EVAL_BILLING_SERVICE_URL }}
+          EVALUATION_BILLING_SERVICE_AUDIENCE: ${{ vars.EVAL_BILLING_SERVICE_AUDIENCE }}
+          EVALUATION_BILLING_ENFORCEMENT_MODE: ${{ vars.EVAL_BILLING_ENFORCEMENT_MODE }}
           EVALUATION_REVIEWER_AUTH_API_KEY: ${{ secrets.EVAL_REVIEWER_AUTH_API_KEY }}
           EVALUATION_REVIEWER_AUTH_UID: ${{ vars.EVAL_REVIEWER_AUTH_UID }}
           EVALUATION_REVIEWER_AUTH_EMAIL: ${{ vars.EVAL_REVIEWER_AUTH_EMAIL }}
@@ -326,8 +337,12 @@ jobs:
             --build-arg APPLE_MACOS_CLIENT_ID="${APPLE_MACOS_CLIENT_ID}" \
             --build-arg APPLE_WEB_CLIENT_ID="${APPLE_WEB_CLIENT_ID}" \
             --build-arg ALLOWED_EMAILS="${ALLOWED_EMAILS}" \
+            --build-arg ADMIN_USER_IDS="${ADMIN_USER_IDS}" \
             --build-arg BASE_URL="${BASE_URL}" \
             --build-arg WEB_ORIGIN="${WEB_ORIGIN}" \
+            --build-arg BILLING_SERVICE_URL="${BILLING_SERVICE_URL}" \
+            --build-arg BILLING_SERVICE_AUDIENCE="${BILLING_SERVICE_AUDIENCE}" \
+            --build-arg BILLING_ENFORCEMENT_MODE="${BILLING_ENFORCEMENT_MODE}" \
             --build-arg REVIEWER_AUTH_API_KEY="${REVIEWER_AUTH_API_KEY}" \
             --build-arg REVIEWER_AUTH_UID="${REVIEWER_AUTH_UID}" \
             --build-arg REVIEWER_AUTH_EMAIL="${REVIEWER_AUTH_EMAIL}" \
@@ -342,6 +357,7 @@ jobs:
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "image_repository=${IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "billing_enforcement_mode=${BILLING_ENFORCEMENT_MODE}" >> "$GITHUB_OUTPUT"
 
       # The selector must use GITHUB_ENV so the trusted Docker build can receive
       # one dynamically chosen profile. Remove those values before any
@@ -523,13 +539,14 @@ jobs:
             "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             "${KIOKU_BUILD_PROFILE}" \
             "${VOICE_QUALITY_GATE}" \
+            "${{ steps.build.outputs.billing_enforcement_mode }}" \
             > enclave-release.json <<'PY'
           import json
           import sys
 
-          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate = sys.argv[1:]
+          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode = sys.argv[1:]
           print(json.dumps({
-              "schema_version": 2,
+              "schema_version": 3,
               "source_repository": "https://github.com/${{ github.repository }}",
               "source_ref": source_ref,
               "source_commit": commit,
@@ -539,6 +556,7 @@ jobs:
               "build_url": build_url,
               "build_profile": build_profile,
               "voice_quality_gate": voice_quality_gate,
+              "billing_enforcement_mode": billing_enforcement_mode,
           }, indent=2))
           PY
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"

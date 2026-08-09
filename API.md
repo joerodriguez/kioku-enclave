@@ -436,6 +436,7 @@ the bounded server-side reconciler.
   voice-profile reconciliation, then deleted automatically. Account export
   includes profile proposals, revisions, and sample-assignment lineage. Account
   deletion removes raw objects, derived records, profiles, lineage, credentials,
-  and the encrypted user database.
+  and the encrypted user database. For every exact GCS object name, deletion lists,
+  deletes, and verifies the absence of all live and noncurrent generations.
 - Server logs may contain operational IDs, counts, states, and error classes,
   but never media, transcripts, URLs, names, facts, tokens, or key material.

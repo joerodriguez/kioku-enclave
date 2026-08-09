@@ -29,8 +29,12 @@ CONFIGURATION = {
     "GOOGLE_IOS_CLIENT_ID": "ios.apps.googleusercontent.com",
     "GOOGLE_WEB_CLIENT_ID": "web.apps.googleusercontent.com",
     "ALLOWED_EMAILS": "owner@example.com",
+    "ADMIN_USER_IDS": "12345678-1234-1234-1234-123456789abc",
     "BASE_URL": "https://eval-api.kiokuu.com",
     "WEB_ORIGIN": "https://kiokuu.com",
+    "BILLING_SERVICE_URL": "https://billing.kiokuu.com",
+    "BILLING_SERVICE_AUDIENCE": "https://billing.kiokuu.com",
+    "BILLING_ENFORCEMENT_MODE": "shadow",
     "REVIEWER_AUTH_API_KEY": "abcdefghijklmnopqrstuvwxyz123456",
     "REVIEWER_AUTH_UID": "reviewer-uid",
     "REVIEWER_AUTH_EMAIL": "reviewer@example.com",
@@ -109,6 +113,14 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("ENCLAVE_GCS_BUCKET=kioku-production-indexes\n", content)
         self.assertNotIn("ENCLAVE_KMS_KEY_RING=kioku-eval\n", content)
 
+    def test_production_rejects_billing_enforcement_before_native_clients_are_ready(self) -> None:
+        env = environment()
+        env["PRODUCTION_BILLING_ENFORCEMENT_MODE"] = "enforce"
+        completed, content = self.run_selector("production", env)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("must remain shadow", completed.stderr)
+
     def test_missing_evaluation_value_never_falls_back_to_production(self) -> None:
         env = environment()
         del env["EVALUATION_ENCLAVE_GCS_BUCKET"]
@@ -167,6 +179,11 @@ class SelectorTests(unittest.TestCase):
         for key, value in (
             ("EVALUATION_ALLOWED_EMAILS", "*"),
             ("EVALUATION_BASE_URL", "http://eval-api.kiokuu.com"),
+            ("EVALUATION_ADMIN_USER_IDS", "not-an-id"),
+            ("EVALUATION_BILLING_SERVICE_URL", "http://billing.kiokuu.com"),
+            ("EVALUATION_BILLING_ENFORCEMENT_MODE", "disabled"),
+            ("EVALUATION_VERTEX_MODEL", "publishers/google/gemini"),
+            ("EVALUATION_VERTEX_MODEL", "m" * 129),
             ("EVALUATION_ENCLAVE_KMS_KEY", "bad\nINJECTED=value"),
         ):
             with self.subTest(key=key):
@@ -175,6 +192,14 @@ class SelectorTests(unittest.TestCase):
                 completed, content = self.run_selector("evaluation", env)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertEqual(content, "")
+
+    def test_billing_audience_must_exactly_match_service_origin(self) -> None:
+        env = environment()
+        env["EVALUATION_BILLING_SERVICE_AUDIENCE"] = "https://other.kiokuu.com"
+        completed, content = self.run_selector("evaluation", env)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("must exactly match", completed.stderr)
 
     def test_unknown_profile_is_rejected_without_output(self) -> None:
         completed, content = self.run_selector("staging", environment())
@@ -218,8 +243,9 @@ class SelectorTests(unittest.TestCase):
             workflow.count("python3 scripts/check_voice_release_gate.py"), 2
         )
         self.assertNotIn("test -s eval/voice/release-manifest.json", workflow)
-        self.assertIn('"schema_version": 2', workflow)
+        self.assertIn('"schema_version": 3', workflow)
         self.assertIn('"voice_quality_gate": voice_quality_gate', workflow)
+        self.assertIn('"billing_enforcement_mode": billing_enforcement_mode', workflow)
 
     def test_operator_release_uses_shared_voice_gate_and_verifies_metadata(self) -> None:
         release_script = RELEASE_SCRIPT.read_text()
@@ -228,7 +254,8 @@ class SelectorTests(unittest.TestCase):
             release_script,
         )
         self.assertIn('"voice_quality_gate"', release_script)
-        self.assertIn('"2"', release_script)
+        self.assertIn('"3"', release_script)
+        self.assertIn('"billing_enforcement_mode"', release_script)
         self.assertIn("owner_only_unvalidated", release_script)
         self.assertIn("validated_real_corpus", release_script)
         self.assertIn(

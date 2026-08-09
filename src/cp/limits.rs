@@ -54,6 +54,7 @@ pub async fn account_active(control: &ControlStore, user_id: &str) -> Result<boo
 
 pub struct QuotaResult {
     pub allowed: bool,
+    #[allow(dead_code)] // legacy ingest quota name; Vertex callers need only allowed
     pub quota: Option<String>,
 }
 
@@ -206,6 +207,7 @@ pub async fn reserve_vertex_output_tokens_for_class(
 
 /// Check-then-increment daily usage. Mildly racy under concurrency (acceptable —
 /// a few items past the cap don't matter and the next call re-checks).
+#[allow(dead_code)] // retained for old-index tooling after `/api/sync/batch` retirement
 pub async fn daily_quota(
     control: &ControlStore,
     user_id: &str,
@@ -398,5 +400,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(persisted, (16_384, 8_192, 4_096, 4_096));
+    }
+
+    #[tokio::test]
+    async fn every_billable_media_retry_consumes_a_distinct_output_ceiling() {
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = control
+            .upsert_user("media-retry-budget-user", "retries@example.com")
+            .await
+            .unwrap();
+
+        // Audio owns half of the 600-token daily ceiling. Three ambiguous or
+        // invalid-output attempts may each have been billed and therefore
+        // consume all 300 protected tokens; a fourth attempt must fail closed.
+        for _ in 0..3 {
+            assert!(
+                reserve_vertex_output_tokens_for_class(
+                    &control,
+                    &user.id,
+                    VertexWorkClass::Audio,
+                    100,
+                    600,
+                )
+                .await
+                .unwrap()
+                .allowed
+            );
+        }
+        let fourth = reserve_vertex_output_tokens_for_class(
+            &control,
+            &user.id,
+            VertexWorkClass::Audio,
+            100,
+            600,
+        )
+        .await
+        .unwrap();
+        assert!(!fourth.allowed);
+        assert_eq!(
+            fourth.quota.as_deref(),
+            Some("vertex_audio_output_tokens_per_day")
+        );
+
+        let user_id = user.id.clone();
+        let persisted: (i64, i64, i64) = control
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT vertex_requests,vertex_output_tokens,vertex_audio_output_tokens \
+                     FROM usage_daily WHERE user_id=?1",
+                    [&user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(persisted, (3, 300, 300));
     }
 }

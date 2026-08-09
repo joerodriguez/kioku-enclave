@@ -54,6 +54,7 @@ use crate::{error::Result, AppState};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchRequest {
+    #[allow(dead_code)] // accepted only by the retired `/v1/search` DTO
     pub user_id: String,
     pub query: String,
     /// Optional speaker filter (ADR-0006 Phase 3): restricts utterance hits to
@@ -138,6 +139,7 @@ pub enum SearchHit {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)] // response wrapper for the retired `/v1/search` handler
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
     pub total: usize,
@@ -145,6 +147,7 @@ pub struct SearchResponse {
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)] // authenticated route is an explicit 410 tombstone
 pub async fn handle_search(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchRequest>,

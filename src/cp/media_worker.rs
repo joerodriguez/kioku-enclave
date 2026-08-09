@@ -110,7 +110,6 @@ struct MediaWorkUnit {
     id: String,
     class: WorkClass,
     jobs: Vec<MediaJob>,
-    reservation_retained: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,7 +529,6 @@ fn lease_work_unit(
         id,
         class,
         jobs: selected,
-        reservation_retained,
     }))
 }
 
@@ -1369,9 +1367,10 @@ fn defer_for_budget(conn: &Connection, job_id: i64, now: &str) -> Result<()> {
 }
 
 async fn reserve_media_output(state: &CpState, user_id: &str, work: &MediaWorkUnit) -> Result<()> {
-    if work.reservation_retained {
-        return Ok(());
-    }
+    // Reserve for every outbound attempt, including retries. A prior attempt
+    // may have completed billable work even when Kioku timed out or rejected
+    // its response, so reusing that attempt's reservation would let retry
+    // spend exceed the configured hard ceiling.
     let (class, requested) = match work.class {
         WorkClass::Audio => (
             super::limits::VertexWorkClass::Audio,
@@ -1482,11 +1481,16 @@ async fn persist_actual_media_usage(
         "member_count": ids.len(),
         "reservation_state": "reserved",
         "reserved_output_tokens": reserved,
-        "actual_prompt_tokens": generation.usage.prompt_tokens,
-        "actual_cached_input_tokens": generation.usage.cached_input_tokens,
-        "actual_output_tokens": generation.usage.output_tokens,
-        "actual_thought_tokens": generation.usage.thought_tokens,
-        "actual_total_tokens": generation.usage.total_tokens,
+        "actual_prompt_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.prompt_tokens),
+        "actual_input_text_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.input_text_tokens),
+        "actual_input_audio_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.input_audio_tokens),
+        "actual_input_image_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.input_image_tokens),
+        "actual_cached_input_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+        "actual_output_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.output_tokens),
+        "actual_thought_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.thought_tokens),
+        "actual_total_tokens": generation.metadata.usage.as_ref().and_then(|usage| usage.total_tokens),
+        "returned_model": generation.metadata.model_version.as_deref(),
+        "traffic_type": generation.metadata.traffic_type.as_deref(),
         "latency_ms": generation.latency_ms,
         "processor_version": PROCESSOR_VERSION,
         "outcome": "model_returned",
@@ -1597,7 +1601,9 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
             serde_json::to_string(&candidate_names)?
         );
         let generation = vertex::generate_media_custom(
-            &state.config,
+            state,
+            user_id,
+            vertex::VertexOperation::AudioWindow,
             &prompt,
             "audio/wav",
             &window,
@@ -1640,7 +1646,9 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
             .map(|(job, bytes)| vertex::MediaInput::new(&job.event_id, &job.mime_type, bytes))
             .collect::<Vec<_>>();
         let generation = vertex::generate_media_parts_custom(
-            &state.config,
+            state,
+            user_id,
+            vertex::VertexOperation::ScreenStoryboard,
             prompt,
             &inputs,
             storyboard_schema(),

@@ -28,6 +28,7 @@ path = "src/main.rs"
 axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio", "multipart"] }
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net"] }
 tower = { version = "0.5.2", default-features = false }
+futures-util = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }
 
 # Production TLS termination inside the enclave (ADR-0001). The attested binary
 # is the first server-side application code to see request plaintext. rustls only

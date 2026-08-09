@@ -1,7 +1,7 @@
 //! Device-to-enclave sync and account endpoints. All routes are auth-gated by the
 //! [`super::auth::require_auth`] middleware applied in `main`.
 //!
-//! `POST /api/sync/batch`  — idempotent ingest (utterances joined to segments).
+//! `POST /api/sync/batch`  — permanently retired local-sync endpoint.
 //! `GET  /api/sync/status` — counts + latest timestamps.
 //! `GET  /api/export`      — full JSON export.
 //! `DELETE /api/account`   — begin/retry physical deletion.
@@ -16,19 +16,18 @@ use axum::{
     routing::{delete, get, post},
     Extension, Router,
 };
-use serde::Deserialize;
+use base64::Engine as _;
 use serde_json::json;
 use tracing::warn;
 
 use crate::{
     error::{EnclaveError, Result as EnclaveResult},
-    ingest::{IngestRequest, ScreenshotInput, UtteranceInput},
     store::Store,
 };
 
 use super::auth::AuthUser;
 use super::control_store::{AccountDeletionOperation, ControlStore};
-use super::{isotime, limits, CpState};
+use super::CpState;
 
 const DELETION_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const DELETION_RECONCILE_BATCH_SIZE: usize = 64;
@@ -38,350 +37,25 @@ const LEGACY_GENERATION_UNAVAILABLE: &str = "legacy_generation_unavailable";
 
 pub fn router() -> Router<Arc<CpState>> {
     Router::new()
-        .route("/api/sync/batch", post(sync_batch))
+        .route("/api/sync/batch", post(sync_batch_retired))
         .route("/api/sync/status", get(sync_status))
         .route("/api/export", get(export))
         .route("/api/account", delete(delete_account))
         .route("/api/account/deletion", get(account_deletion_status))
 }
 
-// ── Batch shape (the wire format the Mac sends) ─────────────────────────────────
-
-#[derive(Deserialize)]
-struct Segment {
-    local_id: i64,
-    source_type: String,
-    started_at: String,
-    duration_seconds: Option<f64>,
-    #[allow(dead_code)]
-    detected_language: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Utterance {
-    local_id: i64,
-    segment_local_id: i64,
-    start_offset_seconds: f64,
-    end_offset_seconds: f64,
-    text: String,
-    language: Option<String>,
-    confidence: Option<f64>,
-    speaker_label: Option<String>,
-    embedding_b64: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Screenshot {
-    local_id: i64,
-    captured_at: String,
-    active_app: Option<String>,
-    window_title: Option<String>,
-    ocr_text: Option<String>,
-    salient_ocr_text: Option<String>,
-    url: Option<String>,
-    image_hash: Option<String>,
-    is_duplicate: Option<i64>,
-    display_id: Option<i64>,
-    capture_context_version: Option<i64>,
-    capture_status: Option<String>,
-    primary_bundle_id: Option<String>,
-    primary_window_id: Option<i64>,
-    capture_group_id: Option<String>,
-    visible_windows: Option<serde_json::Value>,
-    visible_windows_truncated: Option<bool>,
-    visual_signals: Option<serde_json::Value>,
-    semantic_context_hash: Option<String>,
-    browser_snapshot_source_key: Option<String>,
-    browser_snapshot: Option<crate::ingest::BrowserSnapshotInput>,
-    duplicate_of_local_id: Option<i64>,
-    visible_until: Option<String>,
-    dedupe_version: Option<i64>,
-    /// Optional 384-dim OCR-text embedding (see `crate::embedding::MODEL_ID`).
-    embedding_b64: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SettledWatermarks {
-    audio: Option<String>,
-    screen: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Batch {
-    device_id: String,
-    /// Embedding-space id for every embedding_b64 in this batch. Old clients
-    /// omit it (and send no embeddings); the ingest model gate handles both.
-    #[serde(default)]
-    embedding_model: Option<String>,
-    #[serde(default)]
-    segments: Vec<Segment>,
-    #[serde(default)]
-    utterances: Vec<Utterance>,
-    #[serde(default)]
-    screenshots: Vec<Screenshot>,
-    #[serde(default)]
-    settled_watermarks: Option<SettledWatermarks>,
-}
-
-async fn sync_batch(
-    State(s): State<Arc<CpState>>,
-    Extension(user): Extension<AuthUser>,
-    Json(batch): Json<Batch>,
-) -> Response {
-    let user_id = user.0;
-
-    // 1. Account active
-    match limits::account_active(&s.control, &user_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "account_suspended"})),
-            )
-                .into_response()
-        }
-        Err(_) => return err503(),
-    }
-
-    // 2. Rate limit
-    if !s.sync_limiter.consume(&user_id).await {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": "rate_limited", "retry_after": 5})),
-        )
-            .into_response();
-    }
-
-    // 3. Daily quota
-    let limits = (
-        s.config.quota_utterances_per_day,
-        s.config.quota_screenshots_per_day,
-        s.config.quota_mcp_calls_per_day,
-    );
-    match limits::daily_quota(
-        &s.control,
-        &user_id,
-        batch.utterances.len() as i64,
-        batch.screenshots.len() as i64,
-        0,
-        limits,
+// Cloud capture has replaced device-side transcription and screenshot sync.
+// Keep the authenticated route as an explicit tombstone so old clients cannot
+// silently bypass recording leases and usage metering.
+async fn sync_batch_retired() -> Response {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "local_sync_retired",
+            "message": "Update Kioku to record with cloud capture."
+        })),
     )
-    .await
-    {
-        Ok(q) if !q.allowed => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({"error": "quota_exceeded", "quota": q.quota})),
-            )
-                .into_response();
-        }
-        Ok(_) => {}
-        Err(_) => return err503(),
-    }
-
-    // 4. Join utterances → segments, build the in-process ingest request.
-    let browser_prefix = format!("{}:browser-v1:", batch.device_id);
-    if batch.screenshots.iter().any(|screenshot| {
-        screenshot
-            .browser_snapshot_source_key
-            .as_deref()
-            .is_some_and(|key| !key.starts_with(&browser_prefix))
-            || screenshot
-                .browser_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| {
-                    !snapshot.source_key.starts_with(&browser_prefix)
-                        || screenshot.browser_snapshot_source_key.as_deref()
-                            != Some(snapshot.source_key.as_str())
-                })
-    }) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid_browser_snapshot_namespace"})),
-        )
-            .into_response();
-    }
-    let req = build_ingest(&user_id, &batch);
-
-    let ingest_resp = match crate::ingest::ingest_batch(&s.store, &req).await {
-        Ok(r) => r,
-        Err(crate::error::EnclaveError::InvalidRequest(message)) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
-        }
-        Err(e) => {
-            warn!(error = %e, "enclave ingest failed");
-            return err503();
-        }
-    };
-
-    // 5. If watermarks are provided, upsert them and save the DB
-    let mut trigger_finalization = false;
-    if let Some(w) = &batch.settled_watermarks {
-        let user_id_cloned = user_id.clone();
-        let device_id = batch.device_id.clone();
-        let audio = w.audio.clone();
-        let screen = w.screen.clone();
-        let db_res = s.store.with_user(&user_id_cloned, move |conn| {
-            if let Some(a) = audio {
-                conn.execute(
-                    "INSERT INTO device_watermarks (device_id, modality, watermark_at)
-                     VALUES (?1, 'audio', ?2)
-                     ON CONFLICT(device_id, modality) DO UPDATE SET
-                        watermark_at = CASE WHEN excluded.watermark_at > watermark_at THEN excluded.watermark_at ELSE watermark_at END,
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                    [&device_id, &a],
-                )?;
-            }
-            if let Some(sc) = screen {
-                conn.execute(
-                    "INSERT INTO device_watermarks (device_id, modality, watermark_at)
-                     VALUES (?1, 'screen', ?2)
-                     ON CONFLICT(device_id, modality) DO UPDATE SET
-                        watermark_at = CASE WHEN excluded.watermark_at > watermark_at THEN excluded.watermark_at ELSE watermark_at END,
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                    [&device_id, &sc],
-                )?;
-            }
-            Ok(())
-        }).await;
-        if let Err(e) = db_res {
-            warn!(error = %e, "failed to save settled watermarks");
-        } else if let Err(e) = s.store.save_user(&user_id).await {
-            warn!(error = %e, "failed to save user DB after watermark update");
-        } else {
-            trigger_finalization = w.audio.is_some() || w.screen.is_some();
-        }
-    }
-
-    // A newly persisted settled watermark can make a pending episode eligible
-    // immediately. Keep this detached from the sync response: the periodic
-    // scheduler remains the retry path if finalization itself fails.
-    if trigger_finalization {
-        let state = Arc::clone(&s);
-        let finalizer_user = user_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = super::finalizer::finalize_user_episodes(&state, &finalizer_user).await
-            {
-                warn!(
-                    user_id = %finalizer_user,
-                    error = %e,
-                    "post-sync episode finalization failed"
-                );
-            }
-            if let Err(e) =
-                super::webhook_worker::deliver_user_webhooks(&state, &finalizer_user).await
-            {
-                warn!(
-                    user_id = %finalizer_user,
-                    error = %e,
-                    "post-sync webhook delivery failed"
-                );
-            }
-            if let Some(ref transport) = state.email_transport {
-                if let Err(e) = super::email_worker::deliver_user_emails(
-                    &state,
-                    transport.as_ref(),
-                    &finalizer_user,
-                )
-                .await
-                {
-                    warn!(
-                        user_id = %finalizer_user,
-                        error = %e,
-                        "post-sync email delivery failed"
-                    );
-                }
-            }
-        });
-    }
-
-    Json(json!({
-        "ok": true,
-        "upserted": {
-            "utterances": ingest_resp.utterances_inserted,
-            "screenshots": ingest_resp.screenshots_inserted,
-        }
-    }))
-    .into_response()
-}
-
-/// Join utterances to their segments (computing absolute timestamps +
-/// source_key); utterances whose segment is absent from the batch are skipped.
-fn build_ingest(user_id: &str, batch: &Batch) -> IngestRequest {
-    let find_seg = |id: i64| batch.segments.iter().find(|s| s.local_id == id);
-    let utterances = batch
-        .utterances
-        .iter()
-        .filter_map(|u| {
-            let seg = find_seg(u.segment_local_id)?;
-            let seg_started = seg.started_at.clone();
-            let seg_ended = match seg.duration_seconds {
-                Some(d) => isotime::add_seconds(&seg_started, d),
-                None => seg_started.clone(),
-            };
-            Some(UtteranceInput {
-                segment_started_at: seg_started,
-                segment_ended_at: seg_ended,
-                duration_seconds: seg.duration_seconds,
-                source_type: seg.source_type.clone(),
-                start_offset_seconds: u.start_offset_seconds,
-                end_offset_seconds: u.end_offset_seconds,
-                text: u.text.clone(),
-                speaker_label: u
-                    .speaker_label
-                    .clone()
-                    .unwrap_or_else(|| "speaker_0".to_string()),
-                language: u.language.clone(),
-                confidence: u.confidence,
-                source_key: Some(format!(
-                    "{}:{}:{}",
-                    batch.device_id, u.segment_local_id, u.local_id
-                )),
-                embedding_b64: u.embedding_b64.clone(),
-            })
-        })
-        .collect();
-
-    let screenshots = batch
-        .screenshots
-        .iter()
-        .map(|sc| ScreenshotInput {
-            captured_at: sc.captured_at.clone(),
-            active_app: sc.active_app.clone(),
-            window_title: sc.window_title.clone(),
-            ocr_text: sc.ocr_text.clone(),
-            salient_ocr_text: sc.salient_ocr_text.clone(),
-            url: sc.url.clone(),
-            image_hash: sc.image_hash.clone(),
-            is_duplicate: sc.is_duplicate,
-            display_id: sc.display_id,
-            capture_context_version: sc.capture_context_version,
-            capture_status: sc.capture_status.clone(),
-            primary_bundle_id: sc.primary_bundle_id.clone(),
-            primary_window_id: sc.primary_window_id,
-            capture_group_id: sc.capture_group_id.clone(),
-            visible_windows: sc.visible_windows.clone(),
-            visible_windows_truncated: sc.visible_windows_truncated,
-            visual_signals: sc.visual_signals.clone(),
-            semantic_context_hash: sc.semantic_context_hash.clone(),
-            browser_snapshot_source_key: sc.browser_snapshot_source_key.clone(),
-            browser_snapshot: sc.browser_snapshot.clone(),
-            duplicate_of_source_key: sc
-                .duplicate_of_local_id
-                .map(|local_id| format!("{}:{}", batch.device_id, local_id)),
-            visible_until: sc.visible_until.clone(),
-            dedupe_version: sc.dedupe_version,
-            source_key: Some(format!("{}:{}", batch.device_id, sc.local_id)),
-            embedding_b64: sc.embedding_b64.clone(),
-        })
-        .collect();
-
-    IngestRequest {
-        user_id: user_id.to_string(),
-        embedding_model: batch.embedding_model.clone(),
-        utterances,
-        screenshots,
-    }
+        .into_response()
 }
 
 // ── Status ──────────────────────────────────────────────────────────────────────
@@ -427,7 +101,7 @@ async fn sync_status(
 // ── Export ──────────────────────────────────────────────────────────────────────
 
 async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUser>) -> Response {
-    match crate::dump_user_export(&s.store, &user.0).await {
+    match dump_user_export(&s.store, &user.0).await {
         Ok(data) => (
             [
                 (
@@ -453,6 +127,71 @@ async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUs
     }
 }
 
+async fn dump_user_export(store: &Store, user_id: &str) -> EnclaveResult<serde_json::Value> {
+    crate::store::validate_user_id(user_id)?;
+    store
+        .read_user(user_id, |conn| {
+            Ok(json!({
+                "utterances": dump_optional_table(conn, "utterances", "id")?,
+                "screenshots": dump_optional_table(conn, "screenshots", "id")?,
+                "screenshot_images": dump_optional_table(conn, "screenshot_images", "id")?,
+                "episodes": dump_optional_table(conn, "episodes", "id")?,
+                "episode_final_briefs": dump_optional_table(conn, "episode_final_briefs", "episode_id")?,
+                "capture_sessions": dump_optional_table(conn, "capture_sessions", "created_at")?,
+                "capture_streams": dump_optional_table(conn, "capture_streams", "created_at")?,
+                "capture_events": dump_optional_table(conn, "capture_events", "started_at, event_id")?,
+                "media_objects": dump_optional_table(conn, "media_objects", "created_at, event_id")?,
+                "speaker_observations": dump_optional_table(conn, "speaker_observations", "started_at, event_id, id")?,
+                "people": dump_optional_table(conn, "people", "display_name, id")?,
+                "voice_profiles": dump_optional_table(conn, "voice_profiles", "person_id, id")?,
+                "voice_samples": dump_optional_table(conn, "voice_samples", "speaker_observation_id, id")?,
+            }))
+        })
+        .await
+}
+
+pub(crate) fn dump_optional_table(
+    conn: &rusqlite::Connection,
+    name: &str,
+    order: &str,
+) -> EnclaveResult<Vec<serde_json::Value>> {
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT * FROM {name} ORDER BY {order}"))?;
+    let column_names: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let rows = stmt.query_map([], |row| {
+        let mut value = serde_json::Map::new();
+        for (index, column) in column_names.iter().enumerate() {
+            let cell: rusqlite::types::Value = row.get(index)?;
+            let cell = match cell {
+                rusqlite::types::Value::Null => serde_json::Value::Null,
+                rusqlite::types::Value::Integer(number) => number.into(),
+                rusqlite::types::Value::Real(number) => serde_json::Number::from_f64(number)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                rusqlite::types::Value::Text(text) => text.into(),
+                rusqlite::types::Value::Blob(bytes) => base64::engine::general_purpose::STANDARD
+                    .encode(bytes)
+                    .into(),
+            };
+            value.insert(column.clone(), cell);
+        }
+        Ok(serde_json::Value::Object(value))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 // ── Account deletion ────────────────────────────────────────────────────────────
 
 async fn delete_account(
@@ -460,6 +199,66 @@ async fn delete_account(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
     let user_id = user.0;
+    let account_status = match s.control.user_status(&user_id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "account_unavailable"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to load account deletion status");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "deletion_init_failed"})),
+            )
+                .into_response();
+        }
+    };
+    // Serialize with every centralized Vertex call. Once acquired, all prior
+    // calls have durably recorded terminal telemetry and no new call can begin.
+    let lifecycle_guard = match s.store.lock_user_lifecycle(&user_id).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            warn!(error = %e, "failed to lock account lifecycle for deletion");
+            return err503();
+        }
+    };
+    // A transition to `deleting` happens only after settlement succeeds. On a
+    // retry, content may already be gone, so reopening an empty index to settle
+    // again would violate deletion. Finalized tombstone retries likewise skip.
+    if account_status == "active" {
+        let account_id = match s.control.billing_account_id_for_deletion(&user_id).await {
+            Ok(account_id) => account_id,
+            Err(e) => {
+                warn!(error = %e, "failed to load deletion accounting identity");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "deletion_accounting_unavailable"})),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) =
+            super::model_usage::settle_for_account_deletion(&s, &user_id, &account_id).await
+        {
+            warn!(error = %e, "failed to settle Vertex usage before deletion");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "deletion_accounting_unsettled"})),
+            )
+                .into_response();
+        }
+    } else if !matches!(account_status.as_str(), "deleting" | "deleted") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "account_unavailable"})),
+        )
+            .into_response();
+    }
+
     // 1. Fail closed before touching content: stop every other authenticated
     // route and revoke pending/renewable OAuth credentials. A retry of this
     // deletion route remains allowed while status is `deleting`.
@@ -489,6 +288,10 @@ async fn delete_account(
     if deletion_operation_requires_remediation(&operation) {
         return deletion_delete_response(operation);
     }
+    // Store::delete_user takes the same fence. Release only after the account
+    // is inactive; queued Vertex calls then acquire it, fail their post-lock
+    // active check, and cannot egress or recreate the index.
+    drop(lifecycle_guard);
 
     // Persist an in-progress marker before remote deletion. It remains pending
     // and is safe for the startup worker to retry after cancellation/restart;

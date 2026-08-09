@@ -36,8 +36,12 @@ PROFILE_KEYS = (
     "GOOGLE_IOS_CLIENT_ID",
     "GOOGLE_WEB_CLIENT_ID",
     "ALLOWED_EMAILS",
+    "ADMIN_USER_IDS",
     "BASE_URL",
     "WEB_ORIGIN",
+    "BILLING_SERVICE_URL",
+    "BILLING_SERVICE_AUDIENCE",
+    "BILLING_ENFORCEMENT_MODE",
     "REVIEWER_AUTH_API_KEY",
     "REVIEWER_AUTH_UID",
     "REVIEWER_AUTH_EMAIL",
@@ -126,7 +130,7 @@ def require_https_url(configuration: dict[str, str], name: str) -> None:
         raise SystemExit(f"invalid HTTPS URL in repository configuration: {name}")
 
 
-def validate(configuration: dict[str, str]) -> None:
+def validate(configuration: dict[str, str], profile: str) -> None:
     reject_control_characters(configuration)
 
     require_pattern(configuration, "PROJECT_ID", PROJECT_PATTERN)
@@ -163,11 +167,15 @@ def validate(configuration: dict[str, str]) -> None:
         require_pattern(configuration, name, r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
     for name in ("ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET"):
         require_pattern(configuration, name, r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
-    require_pattern(
-        configuration, "VERTEX_MODEL", r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}"
-    )
+    require_pattern(configuration, "VERTEX_MODEL", r"[A-Za-z0-9._:-]{1,128}")
 
-    for name in ("ENCLAVE_AUDIENCE", "BASE_URL", "WEB_ORIGIN"):
+    for name in (
+        "ENCLAVE_AUDIENCE",
+        "BASE_URL",
+        "WEB_ORIGIN",
+        "BILLING_SERVICE_URL",
+        "BILLING_SERVICE_AUDIENCE",
+    ):
         require_https_origin(configuration, name)
     require_https_url(configuration, "ENCLAVE_ACME_DIRECTORY")
 
@@ -183,6 +191,27 @@ def validate(configuration: dict[str, str]) -> None:
         or any(not re.fullmatch(EMAIL_PATTERN, email) for email in emails)
     ):
         raise SystemExit("invalid format for repository configuration: ALLOWED_EMAILS")
+
+    admin_ids = [value.strip() for value in configuration["ADMIN_USER_IDS"].split(",")]
+    if not admin_ids or any(
+        not re.fullmatch(r"[0-9A-Fa-f-]{36}", value) for value in admin_ids
+    ):
+        raise SystemExit("invalid format for repository configuration: ADMIN_USER_IDS")
+
+    if configuration["BILLING_SERVICE_AUDIENCE"].rstrip("/") != configuration[
+        "BILLING_SERVICE_URL"
+    ].rstrip("/"):
+        raise SystemExit(
+            "BILLING_SERVICE_AUDIENCE must exactly match BILLING_SERVICE_URL"
+        )
+    if configuration["BILLING_ENFORCEMENT_MODE"] not in ("shadow", "enforce"):
+        raise SystemExit(
+            "BILLING_ENFORCEMENT_MODE must be either shadow or enforce"
+        )
+    if profile == "production" and configuration["BILLING_ENFORCEMENT_MODE"] != "shadow":
+        raise SystemExit(
+            "production BILLING_ENFORCEMENT_MODE must remain shadow until native clients are ready"
+        )
 
 
 def selected_configuration(profile: str, environment: dict[str, str]) -> dict[str, str]:
@@ -205,7 +234,7 @@ def selected_configuration(profile: str, environment: dict[str, str]) -> dict[st
                 "incomplete optional repository configuration group; missing: " + missing
             )
         configuration.update(values)
-    validate(configuration)
+    validate(configuration, profile)
     return configuration
 
 

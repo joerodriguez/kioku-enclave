@@ -3,20 +3,19 @@
 //! constrained `responseSchema`. Credentials come from the VM metadata server
 //! (cloud-platform scope), same pattern as the GCS/KMS clients.
 //!
-//! NOTE: only the Gemini path is ported. Anthropic-on-Vertex (`rawPredict`) is a
-//! future toggle — `VERTEX_MODEL` defaults to `gemini-2.5-flash` regardless.
-//!
-//! These calls send assembled capture text and metadata to Vertex, OUTSIDE the
-//! TEE boundary. Raw audio and screenshot pixels are never part of a request.
+//! Only the Gemini path is implemented; `VERTEX_MODEL` defaults to the current
+//! Gemini 3.5 Flash deployment. These calls send bounded assembled text,
+//! decrypted audio windows, and screen storyboards to Vertex outside the TEE.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Instant;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::error::{EnclaveError, Result};
 
-use super::CpConfig;
+use super::{model_usage, CpState};
 
 const METADATA_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
@@ -25,18 +24,98 @@ pub(crate) const MAX_TEXT_OUTPUT_TOKENS: u32 = 8_192;
 pub(crate) const MAX_MEDIA_OUTPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_SCREEN_OUTPUT_TOKENS: u32 = 1_024;
 
-#[derive(Debug, Default, PartialEq, Eq)]
+/// Serialize the complete user-specific Vertex lifecycle with account
+/// deletion. The active-account check deliberately happens after acquiring
+/// the fence, so a request queued behind deletion cannot recreate its index or
+/// send plaintext after the account has become inactive.
+async fn lock_active_user_lifecycle(
+    store: &crate::store::Store,
+    control: &super::control_store::ControlStore,
+    user_id: &str,
+) -> Result<OwnedMutexGuard<()>> {
+    let guard = store.lock_user_lifecycle(user_id).await?;
+    if !super::limits::account_active(control, user_id).await? {
+        return Err(EnclaveError::Auth("account inactive".into()));
+    }
+    Ok(guard)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VertexOperation {
+    EpisodeSummary,
+    EpisodeSummaryRepair,
+    SubstanceBackfill,
+    VisualEvidenceBackfill,
+    FinalEpisodeAnalysis,
+    AudioWindow,
+    ScreenStoryboard,
+}
+
+impl VertexOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EpisodeSummary
+            | Self::EpisodeSummaryRepair
+            | Self::SubstanceBackfill
+            | Self::VisualEvidenceBackfill => "episode_summarization",
+            Self::FinalEpisodeAnalysis => "episode_finalization",
+            Self::AudioWindow => "audio_understanding",
+            Self::ScreenStoryboard => "screen_understanding",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VertexUsage {
-    pub prompt_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
-    pub thought_tokens: u64,
-    pub total_tokens: u64,
+    pub prompt_details_present: bool,
+    pub cache_details_present: bool,
+    pub prompt_tokens: Option<u64>,
+    pub input_text_tokens: Option<u64>,
+    pub input_audio_tokens: Option<u64>,
+    pub input_image_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cached_input_text_tokens: Option<u64>,
+    pub cached_input_audio_tokens: Option<u64>,
+    pub cached_input_image_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub tool_use_prompt_tokens: Option<u64>,
+    pub thought_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+fn detail_token_count(
+    usage: &serde_json::Map<String, Value>,
+    details_key: &str,
+    modality: &str,
+) -> Option<u64> {
+    usage
+        .get(details_key)
+        .and_then(Value::as_array)
+        .and_then(|details| {
+            details.iter().find_map(|detail| {
+                (detail.get("modality").and_then(Value::as_str) == Some(modality))
+                    .then(|| detail.get("tokenCount").and_then(Value::as_u64))
+                    .flatten()
+            })
+        })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VertexMetadata {
+    pub usage: Option<VertexUsage>,
+    pub model_version: Option<String>,
+    pub traffic_type: Option<String>,
+}
+
+pub struct TextGeneration {
+    pub text: String,
+    #[allow(dead_code)] // retained for callers that need provider metadata
+    pub metadata: VertexMetadata,
 }
 
 pub struct MediaGeneration {
     pub text: String,
-    pub usage: VertexUsage,
+    pub metadata: VertexMetadata,
     pub latency_ms: u64,
 }
 
@@ -48,43 +127,66 @@ fn bounded_media_output_tokens(requested: u32) -> u32 {
     requested.clamp(1, MAX_MEDIA_OUTPUT_TOKENS)
 }
 
-fn usage_metadata(data: &Value) -> VertexUsage {
-    let usage = data.get("usageMetadata").unwrap_or(&Value::Null);
-    VertexUsage {
-        prompt_tokens: usage
-            .get("promptTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        cached_input_tokens: usage
-            .get("cachedContentTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: usage
-            .get("candidatesTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        thought_tokens: usage
-            .get("thoughtsTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        total_tokens: usage
-            .get("totalTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+fn response_metadata(data: &Value) -> VertexMetadata {
+    let usage = data
+        .get("usageMetadata")
+        .and_then(Value::as_object)
+        .map(|usage| VertexUsage {
+            prompt_details_present: usage
+                .get("promptTokensDetails")
+                .is_some_and(Value::is_array),
+            cache_details_present: usage.get("cacheTokensDetails").is_some_and(Value::is_array),
+            prompt_tokens: usage.get("promptTokenCount").and_then(Value::as_u64),
+            input_text_tokens: detail_token_count(usage, "promptTokensDetails", "TEXT"),
+            input_audio_tokens: detail_token_count(usage, "promptTokensDetails", "AUDIO"),
+            input_image_tokens: detail_token_count(usage, "promptTokensDetails", "IMAGE"),
+            cached_input_tokens: usage.get("cachedContentTokenCount").and_then(Value::as_u64),
+            cached_input_text_tokens: detail_token_count(usage, "cacheTokensDetails", "TEXT"),
+            cached_input_audio_tokens: detail_token_count(usage, "cacheTokensDetails", "AUDIO"),
+            cached_input_image_tokens: detail_token_count(usage, "cacheTokensDetails", "IMAGE"),
+            output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_u64),
+            tool_use_prompt_tokens: usage.get("toolUsePromptTokenCount").and_then(Value::as_u64),
+            thought_tokens: usage.get("thoughtsTokenCount").and_then(Value::as_u64),
+            total_tokens: usage.get("totalTokenCount").and_then(Value::as_u64),
+        });
+    VertexMetadata {
+        traffic_type: data
+            .get("usageMetadata")
+            .and_then(|value| value.get("trafficType"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        usage,
+        model_version: data
+            .get("modelVersion")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
-fn log_usage(data: &Value, operation: &str, model: &str, output_limit: u32) {
-    let usage = usage_metadata(data);
+fn log_usage(
+    metadata: &VertexMetadata,
+    operation: VertexOperation,
+    model: &str,
+    output_limit: u32,
+) {
+    let usage = metadata.usage.as_ref();
     tracing::info!(
-        operation,
+        operation = operation.as_str(),
         model,
         output_limit,
-        prompt_tokens = usage.prompt_tokens,
-        cached_input_tokens = usage.cached_input_tokens,
-        output_tokens = usage.output_tokens,
-        thought_tokens = usage.thought_tokens,
-        total_tokens = usage.total_tokens,
+        usage_present = usage.is_some(),
+        prompt_tokens = usage.and_then(|value| value.prompt_tokens),
+        input_text_tokens = usage.and_then(|value| value.input_text_tokens),
+        input_audio_tokens = usage.and_then(|value| value.input_audio_tokens),
+        input_image_tokens = usage.and_then(|value| value.input_image_tokens),
+        cached_input_tokens = usage.and_then(|value| value.cached_input_tokens),
+        cached_input_text_tokens = usage.and_then(|value| value.cached_input_text_tokens),
+        cached_input_audio_tokens = usage.and_then(|value| value.cached_input_audio_tokens),
+        cached_input_image_tokens = usage.and_then(|value| value.cached_input_image_tokens),
+        output_tokens = usage.and_then(|value| value.output_tokens),
+        tool_use_prompt_tokens = usage.and_then(|value| value.tool_use_prompt_tokens),
+        thought_tokens = usage.and_then(|value| value.thought_tokens),
+        total_tokens = usage.and_then(|value| value.total_tokens),
         "Vertex inference usage"
     );
 }
@@ -153,9 +255,17 @@ fn response_schema() -> Value {
 
 /// Call Gemini and return the raw response text (expected to be JSON per the
 /// schema). `Err` with a `quota` marker string on HTTP 429.
-pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Result<String> {
+pub async fn generate(
+    state: &CpState,
+    user_id: &str,
+    operation: VertexOperation,
+    system: &str,
+    user_message: &str,
+) -> Result<TextGeneration> {
     generate_custom(
-        config,
+        state,
+        user_id,
+        operation,
         system,
         user_message,
         response_schema(),
@@ -168,12 +278,19 @@ pub async fn generate(config: &CpConfig, system: &str, user_message: &str) -> Re
 /// summarizer uses [`generate`]; ADR-0009's one-time historical classifier uses
 /// this entry point with a compact `{id, substance}` schema.
 pub async fn generate_custom(
-    config: &CpConfig,
+    state: &CpState,
+    user_id: &str,
+    operation: VertexOperation,
     system: &str,
     user_message: &str,
     schema: Value,
     max_output_tokens: u32,
-) -> Result<String> {
+) -> Result<TextGeneration> {
+    // Hold through the durable terminal usage write on every response/error
+    // path. Account deletion waits here before it destroys the usage ledger.
+    let _lifecycle_guard =
+        lock_active_user_lifecycle(&state.store, &state.control, user_id).await?;
+    let config = &state.config;
     let model = &config.vertex_model;
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
@@ -188,8 +305,8 @@ pub async fn generate_custom(
     let token = access_token(&http).await?;
 
     let url = format!(
-        "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
-        config.vertex_project, model
+        "https://aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+        config.vertex_project, config.vertex_location, model
     );
     let body = json!({
         "contents": [{ "role": "user", "parts": [{ "text": user_message }] }],
@@ -203,19 +320,39 @@ pub async fn generate_custom(
         }
     });
 
-    let resp = http
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .await?;
+    let invocation = model_usage::begin_invocation(state, user_id, operation, model).await?;
+    let response = http.post(&url).bearer_auth(&token).json(&body).send().await;
+
+    let resp = match response {
+        Ok(response) => response,
+        Err(error) => {
+            model_usage::record_ambiguous(state, user_id, &invocation, None).await;
+            return Err(error.into());
+        }
+    };
 
     if resp.status().as_u16() == 429 {
+        model_usage::record_not_billed(state, user_id, &invocation, 429).await;
         return Err(EnclaveError::Config("quota".into()));
     }
-    let resp = resp.error_for_status()?;
-    let data: Value = resp.json().await?;
-    log_usage(&data, "text", model, max_output_tokens);
+    let error_status = resp.status().as_u16();
+    let resp = match resp.error_for_status() {
+        Ok(response) => response,
+        Err(error) => {
+            model_usage::record_not_billed(state, user_id, &invocation, error_status).await;
+            return Err(error.into());
+        }
+    };
+    let data: Value = match resp.json().await {
+        Ok(data) => data,
+        Err(error) => {
+            model_usage::record_ambiguous(state, user_id, &invocation, Some(200)).await;
+            return Err(error.into());
+        }
+    };
+    let metadata = response_metadata(&data);
+    log_usage(&metadata, operation, model, max_output_tokens);
+    model_usage::record_response(state, user_id, &invocation, &metadata).await;
     let text: String = data
         .get("candidates")
         .and_then(|c| c.get(0))
@@ -243,7 +380,7 @@ pub async fn generate_custom(
             "unexpected Vertex response shape (finishReason: {finish})"
         )));
     }
-    Ok(text)
+    Ok(TextGeneration { text, metadata })
 }
 
 fn media_request_body(
@@ -318,11 +455,17 @@ fn media_parts_request_body(
 }
 
 async fn send_media_request(
-    config: &CpConfig,
+    state: &CpState,
+    user_id: &str,
     body: Value,
-    operation: &str,
+    operation: VertexOperation,
     max_output_tokens: u32,
 ) -> Result<MediaGeneration> {
+    // Both audio and storyboard calls share the same deletion fence as the
+    // text path; no user-specific Vertex egress bypasses this function.
+    let _lifecycle_guard =
+        lock_active_user_lifecycle(&state.store, &state.control, user_id).await?;
+    let config = &state.config;
     if config.vertex_project.is_empty() {
         return Err(EnclaveError::Config("VERTEX_PROJECT not set".into()));
     }
@@ -331,27 +474,47 @@ async fn send_media_request(
         .build()?;
     let token = access_token(&http).await?;
     let url = format!(
-        "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
-        config.vertex_project, config.vertex_model
+        "https://aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+        config.vertex_project, config.vertex_location, config.vertex_model
     );
+    let invocation =
+        model_usage::begin_invocation(state, user_id, operation, &config.vertex_model).await?;
     let started = Instant::now();
-    let response = http
-        .post(&url)
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await?;
+    let response = http.post(&url).bearer_auth(token).json(&body).send().await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            model_usage::record_ambiguous(state, user_id, &invocation, None).await;
+            return Err(error.into());
+        }
+    };
     if response.status().as_u16() == 429 {
+        model_usage::record_not_billed(state, user_id, &invocation, 429).await;
         return Err(EnclaveError::Config("quota".into()));
     }
-    let data: Value = response.error_for_status()?.json().await?;
-    let usage = usage_metadata(&data);
+    let error_status = response.status().as_u16();
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(error) => {
+            model_usage::record_not_billed(state, user_id, &invocation, error_status).await;
+            return Err(error.into());
+        }
+    };
+    let data: Value = match response.json().await {
+        Ok(data) => data,
+        Err(error) => {
+            model_usage::record_ambiguous(state, user_id, &invocation, Some(200)).await;
+            return Err(error.into());
+        }
+    };
+    let metadata = response_metadata(&data);
     log_usage(
-        &data,
+        &metadata,
         operation,
         &config.vertex_model,
         bounded_media_output_tokens(max_output_tokens),
     );
+    model_usage::record_response(state, user_id, &invocation, &metadata).await;
     let text = data
         .get("candidates")
         .and_then(|candidates| candidates.get(0))
@@ -378,7 +541,7 @@ async fn send_media_request(
     }
     Ok(MediaGeneration {
         text,
-        usage,
+        metadata,
         latency_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     })
 }
@@ -387,8 +550,11 @@ async fn send_media_request(
 /// `audioTimestamp` is enabled for audio-only inputs as required by Vertex's
 /// audio understanding API. The caller supplies a constrained JSON schema and
 /// validates the returned timestamps again before persistence.
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_media_custom(
-    config: &CpConfig,
+    state: &CpState,
+    user_id: &str,
+    operation: VertexOperation,
     prompt: &str,
     mime_type: &str,
     media: &[u8],
@@ -396,13 +562,10 @@ pub async fn generate_media_custom(
     audio_timestamp: bool,
 ) -> Result<MediaGeneration> {
     send_media_request(
-        config,
+        state,
+        user_id,
         media_request_body(prompt, mime_type, media, schema, audio_timestamp),
-        if audio_timestamp {
-            "audio"
-        } else {
-            "screenshot"
-        },
+        operation,
         MAX_MEDIA_OUTPUT_TOKENS,
     )
     .await
@@ -411,7 +574,9 @@ pub async fn generate_media_custom(
 /// Send a bounded storyboard with opaque frame identifiers. Callers must
 /// validate exact response coverage before projecting any result.
 pub async fn generate_media_parts_custom(
-    config: &CpConfig,
+    state: &CpState,
+    user_id: &str,
+    operation: VertexOperation,
     prompt: &str,
     inputs: &[MediaInput<'_>],
     schema: Value,
@@ -428,9 +593,10 @@ pub async fn generate_media_parts_custom(
         ));
     }
     send_media_request(
-        config,
+        state,
+        user_id,
         media_parts_request_body(prompt, inputs, schema, false, max_output_tokens),
-        "screen_storyboard",
+        operation,
         max_output_tokens,
     )
     .await
@@ -439,6 +605,78 @@ pub async fn generate_media_parts_custom(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deletion_waits_for_paused_vertex_call_and_queued_call_never_egresses() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::sync::Notify;
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(crate::store::Store::new(kms.clone(), gcs.clone()));
+        let control = Arc::new(super::super::control_store::ControlStore::new(kms, gcs));
+        let user = control
+            .upsert_user("vertex-delete-fence", "vertex@example.com")
+            .await
+            .unwrap();
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let terminal_usage_persisted = Arc::new(AtomicBool::new(false));
+        let egresses = Arc::new(AtomicUsize::new(0));
+        let call_store = Arc::clone(&store);
+        let call_control = Arc::clone(&control);
+        let call_user = user.id.clone();
+        let call_started = Arc::clone(&started);
+        let call_release = Arc::clone(&release);
+        let call_terminal = Arc::clone(&terminal_usage_persisted);
+        let call_egresses = Arc::clone(&egresses);
+        let in_flight = tokio::spawn(async move {
+            let _guard = lock_active_user_lifecycle(&call_store, &call_control, &call_user).await?;
+            call_egresses.fetch_add(1, Ordering::SeqCst);
+            call_started.notify_one();
+            call_release.notified().await;
+            // Models record_response/record_ambiguous completing before the
+            // central sender releases the lifecycle guard.
+            call_terminal.store(true, Ordering::SeqCst);
+            Ok::<_, EnclaveError>(())
+        });
+        started.notified().await;
+
+        control.begin_user_deletion(&user.id).await.unwrap();
+        let deleting_store = Arc::clone(&store);
+        let deleting_user = user.id.clone();
+        let deletion =
+            tokio::spawn(async move { deleting_store.delete_user(&deleting_user).await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!deletion.is_finished());
+
+        let queued_store = Arc::clone(&store);
+        let queued_control = Arc::clone(&control);
+        let queued_user = user.id.clone();
+        let queued_egresses = Arc::clone(&egresses);
+        let queued = tokio::spawn(async move {
+            let result =
+                lock_active_user_lifecycle(&queued_store, &queued_control, &queued_user).await;
+            if result.is_ok() {
+                queued_egresses.fetch_add(1, Ordering::SeqCst);
+            }
+            result.map(drop)
+        });
+
+        release.notify_one();
+        in_flight.await.unwrap().unwrap();
+        deletion.await.unwrap().unwrap();
+        assert!(matches!(queued.await.unwrap(), Err(EnclaveError::Auth(_))));
+        assert!(terminal_usage_persisted.load(Ordering::SeqCst));
+        assert_eq!(egresses.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn episode_schema_requires_recall_fields_and_visual_evidence() {
@@ -528,20 +766,40 @@ mod tests {
     }
 
     #[test]
-    fn usage_metadata_is_reduced_to_non_content_telemetry() {
-        let usage = usage_metadata(&json!({
+    fn usage_metadata_is_nullable_and_preserves_model_and_modality() {
+        let metadata = response_metadata(&json!({
+            "modelVersion": "gemini-test-001",
             "usageMetadata": {
                 "promptTokenCount": 123,
+                "promptTokensDetails": [
+                    {"modality":"TEXT","tokenCount":23},
+                    {"modality":"AUDIO","tokenCount":100}
+                ],
                 "cachedContentTokenCount": 45,
                 "candidatesTokenCount": 67,
+                "toolUsePromptTokenCount": 2,
                 "thoughtsTokenCount": 8,
-                "totalTokenCount": 198
+                "totalTokenCount": 200,
+                "trafficType": "ON_DEMAND"
             }
         }));
-        assert_eq!(usage.prompt_tokens, 123);
-        assert_eq!(usage.cached_input_tokens, 45);
-        assert_eq!(usage.output_tokens, 67);
-        assert_eq!(usage.thought_tokens, 8);
-        assert_eq!(usage.total_tokens, 198);
+        let usage = metadata.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(123));
+        assert_eq!(usage.input_text_tokens, Some(23));
+        assert_eq!(usage.input_audio_tokens, Some(100));
+        assert_eq!(usage.input_image_tokens, None);
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(67));
+        assert_eq!(usage.tool_use_prompt_tokens, Some(2));
+        assert_eq!(usage.thought_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(200));
+        assert_eq!(metadata.model_version.as_deref(), Some("gemini-test-001"));
+        assert_eq!(metadata.traffic_type.as_deref(), Some("ON_DEMAND"));
+    }
+
+    #[test]
+    fn missing_usage_metadata_is_not_zero() {
+        let metadata = response_metadata(&json!({"candidates": []}));
+        assert_eq!(metadata.usage, None);
     }
 }

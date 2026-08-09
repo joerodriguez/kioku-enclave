@@ -1790,6 +1790,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "flate2",
+ "futures-util",
  "hkdf",
  "hmac",
  "http-body",

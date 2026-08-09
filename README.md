@@ -66,6 +66,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   `validated_real_corpus`. The former permits owner-only production evaluation but
   explicitly authorizes no speaker-quality claim and no external users.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
+- Enforces monthly wall-clock recording allowances through server-timed, idempotent
+  60-second leases and exposes plan, remaining usage, reset, hosted checkout, and plan
+  management. The launch catalog is Free (30 min), Plus ($15/3 h), Pro ($39/8 h), and
+  hidden Max ($199/40 h), monthly only.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
   from inside the service. Synced OCR, app/window/URL and browser-tab metadata,
@@ -81,7 +85,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
 the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Audio,
-screenshots, and selected text leave the TEE through the documented Vertex boundary;
+screenshots, and selected text leave the TEE through the documented Vertex boundary.
+Content-free pseudonymous usage/accounting events leave through the billing boundary;
 explicitly configured webhook paths are a separate egress boundary.
 
 ## Security and trust model
@@ -150,9 +155,11 @@ image-baked UID/email pair, creates only a namespaced synthetic account, and see
 account with non-sensitive fixture data. Reviewer passwords are verified by Google and
 never reach this service, its source tree, or its image.
 
-Legacy `/v1/*` compatibility routes retain Google-signed service-identity-token
-authentication. The expected service-account email and token audience are baked into the
-image. There is no shared-secret bypass or flag that disables authentication.
+Legacy `/v1/*` data routes retain Google-signed service-identity-token authentication,
+then return `410 Gone` without reading or mutating user data. The expected
+service-account email and token audience are baked into the image. There is no
+shared-secret bypass or flag that disables authentication. `/v1/attestation` remains a
+separate public, active endpoint.
 
 ### Production TLS is fail-closed
 
@@ -223,23 +230,18 @@ The same binary serves all of these surfaces:
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
 | Screenshot evidence | `/api/screenshot-images*` | Kioku access token or accepted Google ID token |
 | Webhook automation | `/api/webhooks*` | Kioku access token or accepted Google ID token |
-| Legacy data plane | `/v1/*` below | Google service identity token |
+| Retired local sync | `/api/sync/batch` | Kioku access token or accepted Google ID token, then `410 Gone` |
+| Retired legacy data plane | `/v1/*` below | Google service identity token, then `410 Gone` |
 
-Legacy compatibility routes are:
+Retired compatibility tombstones are:
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/ingest` | Ingest utterances and screenshot metadata |
-| `POST` | `/v1/search` | FTS5 and optional vector/hybrid search |
-| `POST` | `/v1/context` | Rows around a center timestamp |
-| `POST` | `/v1/range` | Raw rows in a half-open time range |
-| `POST` | `/v1/episodes/upsert` | Upsert episodes |
-| `POST` | `/v1/episodes/list` | List episodes in a time range |
-| `POST` | `/v1/episodes/members` | Read episode members |
-| `POST` | `/v1/episodes/delete_range` | Delete episodes in a time range |
-| `POST` | `/v1/stats` | Per-user row counts and latest timestamps |
-| `GET` | `/v1/export?user_id=…` | Full authenticated user export |
-| `DELETE` | `/v1/user` | Idempotent hard deletion |
+| `POST` | `/api/sync/batch` | Authenticated `410 Gone`; no batch mutation |
+| `ANY` | `/v1/ingest` | Authenticated `410 Gone`; no ingest mutation |
+| `ANY` | `/v1/search`, `/v1/context`, `/v1/range`, `/v1/stats` | Authenticated `410 Gone`; no data read |
+| `ANY` | `/v1/episodes/*` | Authenticated `410 Gone`; no episode mutation or read |
+| `ANY` | `/v1/export`, `/v1/user` | Authenticated `410 Gone`; no export or deletion |
 
 The authenticated control-plane `DELETE /api/account` returns `200` when physical
 deletion and identity cleanup are complete, or `202` with a stable opaque
@@ -385,10 +387,13 @@ binding.
 | `APPLE_TEAM_ID`, `APPLE_KEY_ID` | Optional Apple developer team/key identifiers; atomic with every Apple client ID |
 | `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` | Exact Apple audiences `com.kioku.ios`, `com.kiokuu.app`, and `com.kiokuu.web`; all five Apple values are set together or Apple auth stays off |
 | `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
+| `ADMIN_USER_IDS` | Nonempty comma-separated stable owner UUIDs for margin reporting; separate from the email allow-list |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
+| `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE` | Exact matching HTTPS billing-service origin and Google OIDC audience |
+| `BILLING_ENFORCEMENT_MODE` | Image-baked recording rollout mode; signed production builds are gated to `shadow` until native clients are ready |
 | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
-| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration |
+| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration; the model is a 1–128 byte billing-safe name using only ASCII letters, digits, `.`, `_`, `:`, or `-` |
 | `QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY` | Optional per-user UTC-day maximum-output reservation ceiling; defaults to `524288`. Each request reserves its full configured output maximum before Vertex is called and fails closed when exhausted |
 | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
@@ -420,7 +425,8 @@ operation. For `main` and tags the workflow then:
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>`;
 5. generates an SPDX JSON SBOM and scans it for fixed high-severity vulnerabilities;
 6. creates GitHub-signed image provenance and a signed SBOM attestation; and
-7. uploads release metadata, provenance, SBOM, and attestation bundles.
+7. uploads schema-v3 release metadata (including the attested billing enforcement mode),
+   provenance, SBOM, and attestation bundles.
 
 Production is the sole active owner evaluation environment. Signed releases either carry
 the exact `eval/voice/owner-only-production.json` declaration and record

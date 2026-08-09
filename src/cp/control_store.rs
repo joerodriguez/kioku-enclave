@@ -30,6 +30,9 @@ use crate::{
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
 const CONTROL_CONTEXT: &[u8] = b"control-db\0control/control.db.enc";
+const MAX_PENDING_RECORDING_LEASE_REQUESTS_PER_USER: i64 = 1;
+const MAX_RECORDING_LEASE_DENIALS_PER_USER: i64 = 100;
+const RECORDING_LEASE_DURATION_MS: i64 = 60_000;
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -78,6 +81,60 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     vertex_screen_output_tokens INTEGER NOT NULL DEFAULT 0,
     vertex_derived_output_tokens INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, day)
+);
+-- The external billing plane sees only this random pseudonym. Its mapping to
+-- Google-derived identity remains inside the encrypted control database.
+CREATE TABLE IF NOT EXISTS billing_accounts (
+    user_id    TEXT PRIMARY KEY,
+    account_id TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS billing_detach_outbox (
+    account_id      TEXT PRIMARY KEY,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+-- Independent monotonic authority for the per-user Vertex producer-coverage
+-- sequence. It lives outside the user index so a missing or restored old index
+-- cannot silently reset coverage to a fresh, complete sequence 1.
+CREATE TABLE IF NOT EXISTS vertex_coverage_anchors (
+    user_id         TEXT NOT NULL,
+    period          TEXT NOT NULL,
+    sequence        INTEGER NOT NULL CHECK (sequence > 0),
+    pending_events  INTEGER NOT NULL CHECK (pending_events >= 0),
+    lost_events     INTEGER NOT NULL CHECK (lost_events >= 0),
+    observed_at     TEXT NOT NULL,
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (user_id, period)
+);
+CREATE TABLE IF NOT EXISTS recording_leases (
+    user_id    TEXT PRIMARY KEY,
+    lease_id   TEXT UNIQUE NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS recording_lease_requests (
+    user_id      TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
+    requested_lease_id TEXT,
+    issued_lease_id TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    state         TEXT NOT NULL CHECK (state IN ('pending','granted','conflict')),
+    summary_json  TEXT,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (user_id, request_id)
+);
+CREATE TABLE IF NOT EXISTS recording_lease_denials (
+    user_id      TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
+    requested_lease_id TEXT,
+    issued_lease_id TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    denial_code  TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (user_id, request_id)
 );
 CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id     TEXT PRIMARY KEY,
@@ -316,6 +373,38 @@ pub struct EpisodeEmailPreference {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingLeaseRequestRow {
+    pub requested_lease_id: Option<String>,
+    pub issued_lease_id: String,
+    pub expires_at: String,
+    pub state: String,
+    pub summary: Option<serde_json::Value>,
+    pub denial_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexCoverageAnchor {
+    pub period: String,
+    pub sequence: u64,
+    pub pending_events: u64,
+    pub lost_events: u64,
+    pub observed_at: String,
+}
+
+fn valid_utc_month(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 7
+        || bytes[4] != b'-'
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    let month = (bytes[5] - b'0') * 10 + (bytes[6] - b'0');
+    (1..=12).contains(&month)
+}
+
 fn is_active_user_conn(conn: &Connection, user_id: &str) -> Result<bool> {
     let active: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
@@ -470,6 +559,25 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<Account
     tx.execute("DELETE FROM oauth_consents WHERE user_id = ?1", [user_id])?;
     tx.execute("DELETE FROM refresh_tokens WHERE user_id = ?1", [user_id])?;
     tx.execute("DELETE FROM usage_daily WHERE user_id = ?1", [user_id])?;
+    tx.execute(
+        "INSERT OR IGNORE INTO billing_detach_outbox (account_id)
+         SELECT account_id FROM billing_accounts WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute("DELETE FROM billing_accounts WHERE user_id = ?1", [user_id])?;
+    tx.execute(
+        "DELETE FROM vertex_coverage_anchors WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute("DELETE FROM recording_leases WHERE user_id = ?1", [user_id])?;
+    tx.execute(
+        "DELETE FROM recording_lease_requests WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM recording_lease_denials WHERE user_id = ?1",
+        [user_id],
+    )?;
     tx.execute("DELETE FROM query_log WHERE user_id = ?1", [user_id])?;
     tx.execute(
         "DELETE FROM webhook_subscriptions WHERE user_id = ?1",
@@ -828,7 +936,11 @@ impl ControlStore {
             Err(e) => return Err(e),
         }
 
-        self.gcs.delete_object(&old_object).await?;
+        // The content buckets are versioned. An unqualified delete only hides
+        // the live generation and leaves every prior encrypted index version
+        // recoverable. Migration is a privacy boundary, so purge and verify
+        // every exact generation of the pre-stable-id object.
+        crate::store::delete_all_object_generations(self.gcs.as_ref(), &old_object).await?;
         Ok(())
     }
 
@@ -1018,6 +1130,18 @@ impl ControlStore {
                             rusqlite::params![stable_id, old_id],
                         )?;
                         conn.execute(
+                            "UPDATE billing_accounts SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE recording_leases SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE recording_lease_requests SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
                             "UPDATE refresh_tokens SET user_id = ?1 WHERE user_id = ?2",
                             rusqlite::params![stable_id, old_id],
                         )?;
@@ -1031,6 +1155,14 @@ impl ControlStore {
                         )?;
                         conn.execute(
                             "UPDATE query_log SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE vertex_coverage_anchors SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE recording_lease_denials SET user_id = ?1 WHERE user_id = ?2",
                             rusqlite::params![stable_id, old_id],
                         )?;
                         conn.execute(
@@ -1289,6 +1421,627 @@ impl ControlStore {
         .await
     }
 
+    /// Resolve only the pseudonymous accounts present on one validated admin
+    /// billing page. Missing, duplicate, or inactive mappings fail closed.
+    pub async fn active_identities_for_billing_accounts(
+        &self,
+        account_ids: Vec<String>,
+    ) -> Result<Vec<(String, String, String)>> {
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT u.id,u.email
+                 FROM billing_accounts b JOIN users u ON u.id=b.user_id
+                 WHERE b.account_id=?1 AND u.status='active'",
+            )?;
+            let mut identities = Vec::with_capacity(account_ids.len());
+            for account_id in account_ids {
+                let identity = statement
+                    .query_row([&account_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .optional()?
+                    .ok_or_else(|| {
+                        EnclaveError::Config(
+                            "billing margin row has no active enclave identity".into(),
+                        )
+                    })?;
+                identities.push((identity.0, identity.1, account_id));
+            }
+            Ok(identities)
+        })
+        .await
+    }
+
+    /// Global coverage completeness comes from the control-plane high-water
+    /// anchors, so an admin page never has to open every active user index.
+    pub async fn active_vertex_coverage_complete(&self, period: &str) -> Result<bool> {
+        let period = period.to_string();
+        self.read(move |conn| {
+            let incomplete: i64 = conn.query_row(
+                "SELECT count(*)
+                 FROM users u
+                 LEFT JOIN vertex_coverage_anchors a
+                   ON a.user_id=u.id AND a.period=?1
+                 WHERE u.status='active'
+                   AND (a.user_id IS NULL OR a.pending_events!=0 OR a.lost_events!=0)",
+                [&period],
+                |row| row.get(0),
+            )?;
+            Ok(incomplete == 0)
+        })
+        .await
+    }
+
+    pub async fn billing_account_id(&self, user_id: &str) -> Result<String> {
+        let user_id = user_id.to_string();
+        let new_account_id = format!("acct_{}", super::tokens::random_token_hex());
+        self.write_if_changed(move |conn| {
+            if user_status_conn(conn, &user_id)?.as_deref() != Some("active") {
+                return Err(EnclaveError::Auth("account inactive".into()));
+            }
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO billing_accounts (user_id,account_id) VALUES (?1,?2)",
+                rusqlite::params![&user_id, &new_account_id],
+            )?;
+            let account_id = conn.query_row(
+                "SELECT account_id FROM billing_accounts WHERE user_id=?1",
+                [&user_id],
+                |row| row.get(0),
+            )?;
+            Ok((account_id, inserted != 0))
+        })
+        .await
+    }
+
+    /// Return the durable billing pseudonym needed to settle usage before
+    /// account content is destroyed. Active accounts may create the mapping;
+    /// deletion retries may reuse an existing mapping while `deleting` but can
+    /// never recreate one after deletion has started.
+    pub async fn billing_account_id_for_deletion(&self, user_id: &str) -> Result<String> {
+        let user_id = user_id.to_string();
+        let new_account_id = format!("acct_{}", super::tokens::random_token_hex());
+        self.write_if_changed(move |conn| {
+            let status = user_status_conn(conn, &user_id)?;
+            if status.as_deref() == Some("active") {
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO billing_accounts (user_id,account_id) VALUES (?1,?2)",
+                    rusqlite::params![&user_id, &new_account_id],
+                )?;
+                let account_id = conn.query_row(
+                    "SELECT account_id FROM billing_accounts WHERE user_id=?1",
+                    [&user_id],
+                    |row| row.get(0),
+                )?;
+                return Ok((account_id, inserted != 0));
+            }
+            if status.as_deref() == Some("deleting") {
+                let account_id = conn
+                    .query_row(
+                        "SELECT account_id FROM billing_accounts WHERE user_id=?1",
+                        [&user_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        EnclaveError::Conflict(
+                            "deleting account has no durable billing mapping".into(),
+                        )
+                    })?;
+                return Ok((account_id, false));
+            }
+            Err(EnclaveError::Auth("account inactive".into()))
+        })
+        .await
+    }
+
+    /// Reconcile a user-index coverage snapshot against the independent
+    /// control-plane high-water mark. A rolled-back or replaced index can only
+    /// move forward by emitting a new, explicitly incomplete snapshot.
+    pub async fn reconcile_vertex_coverage(
+        &self,
+        user_id: &str,
+        period: &str,
+        sequence: u64,
+        pending_events: u64,
+        lost_events: u64,
+        observed_at: &str,
+    ) -> Result<VertexCoverageAnchor> {
+        if !valid_utc_month(period) {
+            return Err(EnclaveError::InvalidRequest(
+                "Vertex coverage period must be YYYY-MM".into(),
+            ));
+        }
+        let user_id = user_id.to_string();
+        let period = period.to_string();
+        let observed_at = observed_at.to_string();
+        let sequence = i64::try_from(sequence)
+            .map_err(|_| EnclaveError::Config("coverage sequence overflow".into()))?;
+        let pending_events = i64::try_from(pending_events)
+            .map_err(|_| EnclaveError::Config("coverage pending count overflow".into()))?;
+        let lost_events = i64::try_from(lost_events)
+            .map_err(|_| EnclaveError::Config("coverage lost count overflow".into()))?;
+        self.write_if_changed(move |conn| {
+            if !matches!(
+                user_status_conn(conn, &user_id)?.as_deref(),
+                Some("active" | "deleting")
+            ) {
+                return Err(EnclaveError::Auth("account inactive".into()));
+            }
+            let existing: Option<(i64, i64, i64, String)> = conn
+                .query_row(
+                    "SELECT sequence,pending_events,lost_events,observed_at
+                     FROM vertex_coverage_anchors WHERE user_id=?1 AND period=?2",
+                    rusqlite::params![user_id, period],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+
+            let (chosen_sequence, chosen_pending, chosen_lost, chosen_observed, changed) =
+                match existing {
+                    None => (
+                        sequence,
+                        pending_events,
+                        lost_events,
+                        observed_at.clone(),
+                        true,
+                    ),
+                    Some((current_sequence, _, current_lost, _)) if sequence > current_sequence => {
+                        (
+                            sequence,
+                            pending_events,
+                            current_lost.max(lost_events),
+                            observed_at.clone(),
+                            true,
+                        )
+                    }
+                    Some((current_sequence, current_pending, current_lost, current_observed))
+                        if sequence == current_sequence
+                            && pending_events == current_pending
+                            && lost_events == current_lost
+                            && observed_at == current_observed =>
+                    {
+                        (
+                            sequence,
+                            pending_events,
+                            lost_events,
+                            observed_at.clone(),
+                            false,
+                        )
+                    }
+                    Some((current_sequence, _, current_lost, _)) => {
+                        let next = current_sequence.checked_add(1).ok_or_else(|| {
+                            EnclaveError::Config("coverage sequence overflow".into())
+                        })?;
+                        let now: String = conn.query_row(
+                            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        (
+                            next,
+                            pending_events,
+                            current_lost.max(lost_events).max(1),
+                            now,
+                            true,
+                        )
+                    }
+                };
+
+            if changed {
+                conn.execute(
+                    "INSERT INTO vertex_coverage_anchors
+                     (user_id,period,sequence,pending_events,lost_events,observed_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)
+                     ON CONFLICT(user_id,period) DO UPDATE SET
+                       sequence=excluded.sequence,
+                       pending_events=excluded.pending_events,
+                       lost_events=excluded.lost_events,
+                       observed_at=excluded.observed_at,
+                       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    rusqlite::params![
+                        user_id,
+                        period,
+                        chosen_sequence,
+                        chosen_pending,
+                        chosen_lost,
+                        chosen_observed
+                    ],
+                )?;
+            }
+            Ok((
+                VertexCoverageAnchor {
+                    period,
+                    sequence: u64::try_from(chosen_sequence)
+                        .map_err(|_| EnclaveError::Config("coverage sequence overflow".into()))?,
+                    pending_events: u64::try_from(chosen_pending).map_err(|_| {
+                        EnclaveError::Config("coverage pending count overflow".into())
+                    })?,
+                    lost_events: u64::try_from(chosen_lost)
+                        .map_err(|_| EnclaveError::Config("coverage lost count overflow".into()))?,
+                    observed_at: chosen_observed,
+                },
+                changed,
+            ))
+        })
+        .await
+    }
+
+    pub async fn vertex_coverage_anchor(
+        &self,
+        user_id: &str,
+        period: &str,
+    ) -> Result<Option<VertexCoverageAnchor>> {
+        if !valid_utc_month(period) {
+            return Err(EnclaveError::InvalidRequest(
+                "Vertex coverage period must be YYYY-MM".into(),
+            ));
+        }
+        let user_id = user_id.to_string();
+        let period = period.to_string();
+        self.read(move |conn| {
+            let row: Option<(i64, i64, i64, String)> = conn
+                .query_row(
+                    "SELECT sequence,pending_events,lost_events,observed_at
+                     FROM vertex_coverage_anchors WHERE user_id=?1 AND period=?2",
+                    rusqlite::params![user_id, period],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            row.map(|(sequence, pending_events, lost_events, observed_at)| {
+                Ok(VertexCoverageAnchor {
+                    period,
+                    sequence: u64::try_from(sequence)
+                        .map_err(|_| EnclaveError::Config("coverage sequence overflow".into()))?,
+                    pending_events: u64::try_from(pending_events).map_err(|_| {
+                        EnclaveError::Config("coverage pending count overflow".into())
+                    })?,
+                    lost_events: u64::try_from(lost_events)
+                        .map_err(|_| EnclaveError::Config("coverage lost count overflow".into()))?,
+                    observed_at,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn pending_billing_detach_ids(&self, limit: i64) -> Result<Vec<String>> {
+        let limit = limit.clamp(1, 100);
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT account_id FROM billing_detach_outbox ORDER BY created_at LIMIT ?1",
+            )?;
+            let rows = statement.query_map([limit], |row| row.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    pub async fn complete_billing_detach(&self, account_id: &str) -> Result<()> {
+        let account_id = account_id.to_string();
+        self.write_if_changed(move |conn| {
+            let changed = conn.execute(
+                "DELETE FROM billing_detach_outbox WHERE account_id=?1",
+                [&account_id],
+            )?;
+            Ok(((), changed != 0))
+        })
+        .await
+    }
+
+    pub async fn record_billing_detach_failure(&self, account_id: &str) -> Result<()> {
+        let account_id = account_id.to_string();
+        self.write_if_changed(move |conn| {
+            let changed = conn.execute(
+                "UPDATE billing_detach_outbox SET attempts=attempts+1,
+                 last_attempt_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE account_id=?1",
+                [&account_id],
+            )?;
+            Ok(((), changed != 0))
+        })
+        .await
+    }
+
+    pub async fn recording_lease_receipt(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<Option<RecordingLeaseRequestRow>> {
+        let user_id = user_id.to_string();
+        let request_id = request_id.to_string();
+        self.read(move |conn| {
+            type StoredLeaseReceipt = (
+                Option<String>,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            );
+            let mut row: Option<StoredLeaseReceipt> = conn
+                .query_row(
+                    "SELECT requested_lease_id,issued_lease_id,expires_at,state,summary_json
+                     FROM recording_lease_requests WHERE user_id=?1 AND request_id=?2",
+                    rusqlite::params![user_id, request_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            None,
+                        ))
+                    },
+                )
+                .optional()?;
+            if row.is_none() {
+                row = conn
+                    .query_row(
+                        "SELECT requested_lease_id,issued_lease_id,expires_at,
+                                'denied',summary_json,denial_code
+                         FROM recording_lease_denials WHERE user_id=?1 AND request_id=?2",
+                        rusqlite::params![user_id, request_id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+            }
+            row.map(
+                |(requested_lease_id, issued_lease_id, expires_at, state, summary, denial_code)| {
+                    let summary = summary
+                        .map(|summary| {
+                            serde_json::from_str(&summary).map_err(|error| {
+                                EnclaveError::Config(format!(
+                                    "invalid stored billing summary: {error}"
+                                ))
+                            })
+                        })
+                        .transpose()?;
+                    Ok(RecordingLeaseRequestRow {
+                        requested_lease_id,
+                        issued_lease_id,
+                        expires_at,
+                        state,
+                        summary,
+                        denial_code,
+                    })
+                },
+            )
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn active_recording_lease(&self, user_id: &str) -> Result<Option<(String, String)>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT lease_id,expires_at FROM recording_leases WHERE user_id=?1",
+                    [user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    pub async fn begin_recording_lease_request(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        requested_lease_id: Option<&str>,
+        issued_lease_id: &str,
+        expires_at: &str,
+    ) -> Result<()> {
+        let user_id = user_id.to_string();
+        let request_id = request_id.to_string();
+        let requested_lease_id = requested_lease_id.map(str::to_string);
+        let issued_lease_id = issued_lease_id.to_string();
+        let expires_at = expires_at.to_string();
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            // An unavailable upstream can leave an uncertain intent. Never
+            // expire it locally: only retrying the same deterministic request
+            // ID can prove whether billing charged it. A different request is
+            // fail-closed until that reconciliation completes.
+            let pending: i64 = tx.query_row(
+                "SELECT count(*) FROM recording_lease_requests
+                 WHERE user_id=?1 AND state='pending'",
+                [&user_id],
+                |row| row.get(0),
+            )?;
+            if pending >= MAX_PENDING_RECORDING_LEASE_REQUESTS_PER_USER {
+                tx.rollback()?;
+                return Err(EnclaveError::Conflict(
+                    "too many pending recording lease requests".into(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO recording_lease_requests
+                 (user_id,request_id,requested_lease_id,issued_lease_id,expires_at,state)
+                 VALUES (?1,?2,?3,?4,?5,'pending')",
+                rusqlite::params![
+                    user_id,
+                    request_id,
+                    requested_lease_id,
+                    issued_lease_id,
+                    expires_at
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn deny_recording_lease_request(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        denial_code: &str,
+        summary: &serde_json::Value,
+    ) -> Result<()> {
+        let user_id = user_id.to_string();
+        let request_id = request_id.to_string();
+        let denial_code = denial_code.to_string();
+        let summary = serde_json::to_string(summary)?;
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let pending: (Option<String>, String, String) = tx.query_row(
+                "SELECT requested_lease_id,issued_lease_id,expires_at
+                 FROM recording_lease_requests
+                 WHERE user_id=?1 AND request_id=?2 AND state='pending'",
+                rusqlite::params![user_id, request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            tx.execute(
+                "DELETE FROM recording_lease_requests
+                 WHERE user_id=?1 AND request_id=?2 AND state='pending'",
+                rusqlite::params![user_id, request_id],
+            )?;
+            tx.execute(
+                "INSERT INTO recording_lease_denials
+                 (user_id,request_id,requested_lease_id,issued_lease_id,expires_at,
+                  denial_code,summary_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    user_id,
+                    request_id,
+                    pending.0,
+                    pending.1,
+                    pending.2,
+                    denial_code,
+                    summary
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM recording_lease_denials
+                 WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-7 days')",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM recording_lease_denials
+                 WHERE user_id=?1 AND request_id IN (
+                   SELECT request_id FROM recording_lease_denials
+                   WHERE user_id=?1 ORDER BY created_at DESC,rowid DESC
+                   LIMIT -1 OFFSET ?2
+                 )",
+                rusqlite::params![user_id, MAX_RECORDING_LEASE_DENIALS_PER_USER],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn complete_recording_lease(
+        &self,
+        user_id: &str,
+        request_id: &str,
+        retry_now_ms: Option<i64>,
+        summary: &serde_json::Value,
+    ) -> Result<(String, String)> {
+        let user_id = user_id.to_string();
+        let request_id = request_id.to_string();
+        let summary = serde_json::to_string(summary)?;
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let (lease_id, pending_expires_at): (String, String) = tx.query_row(
+                "SELECT issued_lease_id,expires_at FROM recording_lease_requests
+                 WHERE user_id=?1 AND request_id=?2 AND state='pending'",
+                rusqlite::params![user_id, request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let pending_expires_ms = super::isotime::parse_epoch_millis(&pending_expires_at)
+                .ok_or_else(|| {
+                    EnclaveError::Config("invalid pending recording lease expiry".into())
+                })?;
+            let active: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT lease_id,expires_at FROM recording_leases WHERE user_id=?1",
+                    [&user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let active_expires_ms = match active {
+                Some((active_lease_id, _)) if active_lease_id != lease_id => {
+                    return Err(EnclaveError::Conflict(
+                        "a different recording lease became active".into(),
+                    ));
+                }
+                Some((_, active_expires_at)) => Some(
+                    super::isotime::parse_epoch_millis(&active_expires_at).ok_or_else(|| {
+                        EnclaveError::Config("invalid active recording lease expiry".into())
+                    })?,
+                ),
+                None => None,
+            };
+            let expires_ms = match retry_now_ms {
+                Some(retry_now_ms) => retry_now_ms
+                    .max(active_expires_ms.unwrap_or(i64::MIN))
+                    .saturating_add(RECORDING_LEASE_DURATION_MS)
+                    .max(pending_expires_ms),
+                None => pending_expires_ms.max(active_expires_ms.unwrap_or(i64::MIN)),
+            };
+            let expires_at = super::isotime::format_epoch_millis(expires_ms);
+            tx.execute(
+                "UPDATE recording_lease_requests SET expires_at=?3
+                 WHERE user_id=?1 AND request_id=?2 AND state='pending'",
+                rusqlite::params![user_id, request_id, expires_at],
+            )?;
+            tx.execute(
+                "INSERT INTO recording_leases (user_id,lease_id,expires_at)
+                 VALUES (?1,?2,?3)
+                 ON CONFLICT(user_id) DO UPDATE SET lease_id=excluded.lease_id,
+                    expires_at=excluded.expires_at,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                rusqlite::params![user_id, lease_id, expires_at],
+            )?;
+            tx.execute(
+                "UPDATE recording_lease_requests SET state='granted',summary_json=?3
+                 WHERE user_id=?1 AND request_id=?2 AND state='pending'",
+                rusqlite::params![user_id, request_id, summary],
+            )?;
+            tx.execute(
+                "DELETE FROM recording_lease_requests
+                 WHERE state!='pending'
+                   AND created_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-7 days')",
+                [],
+            )?;
+            tx.commit()?;
+            Ok((lease_id, expires_at))
+        })
+        .await
+    }
+
+    pub async fn conflict_recording_lease_request(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        let user_id = user_id.to_string();
+        let request_id = request_id.to_string();
+        self.write_if_changed(move |conn| {
+            let changed = conn.execute(
+                "UPDATE recording_lease_requests SET state='conflict'
+                 WHERE user_id=?1 AND request_id=?2 AND state='pending'",
+                rusqlite::params![user_id, request_id],
+            )?;
+            Ok(((), changed != 0))
+        })
+        .await
+    }
+
     pub async fn user_status(&self, user_id: &str) -> Result<Option<String>> {
         let user_id = user_id.to_string();
         self.read(move |conn| user_status_conn(conn, &user_id))
@@ -1409,9 +2162,36 @@ impl ControlStore {
 
     /// Finalize identity deletion only after the content store has completed.
     pub async fn finalize_user_deletion(&self, user_id: &str) -> Result<AccountDeletionOperation> {
-        let user_id = user_id.to_string();
-        self.write(move |conn| delete_user_identity_conn(conn, &user_id))
-            .await
+        let mut guard = self.inner.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.load().await?);
+        }
+        let operation = match delete_user_identity_conn(&guard.as_ref().unwrap().conn, user_id) {
+            Ok(operation) => operation,
+            Err(error) => {
+                *guard = None;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.flush(guard.as_mut().unwrap()).await {
+            *guard = None;
+            return Err(error);
+        }
+
+        // The shared object is versioned. Keep the control-store mutex until
+        // every older generation containing identity or billing mappings has
+        // been deleted and the sanitized generation has been re-observed.
+        let current_generation = guard
+            .as_ref()
+            .map(|handle| handle.meta.generation)
+            .ok_or(EnclaveError::NotFound)?;
+        crate::store::delete_object_generations_except(
+            self.gcs.as_ref(),
+            CONTROL_OBJECT,
+            current_generation,
+        )
+        .await?;
+        Ok(operation)
     }
 
     pub async fn list_webhook_subscriptions(
@@ -1677,11 +2457,123 @@ impl ControlStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{GcsGetResponse, GcsListVersionsResponse};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
 
     const USER_ID: &str = "11111111-1111-4111-8111-111111111111";
     const GOOGLE_SUB: &str = "google-subject-123";
     const OPERATION_ID: &str =
         "del_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct PausingGcs {
+        inner: Arc<crate::store::tests::FakeGcs>,
+        pause_next_control_list: AtomicBool,
+        list_started: Notify,
+        resume_list: Notify,
+    }
+
+    impl PausingGcs {
+        fn new(inner: Arc<crate::store::tests::FakeGcs>) -> Self {
+            Self {
+                inner,
+                pause_next_control_list: AtomicBool::new(false),
+                list_started: Notify::new(),
+                resume_list: Notify::new(),
+            }
+        }
+
+        fn pause_next_control_list(&self) {
+            self.pause_next_control_list.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for PausingGcs {
+        async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> Result<i64> {
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_name: &str,
+            source_generation: i64,
+            destination_name: &str,
+        ) -> Result<crate::store::GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(source_name, source_generation, destination_name)
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> Result<GcsListVersionsResponse> {
+            if prefix == CONTROL_OBJECT
+                && self.pause_next_control_list.swap(false, Ordering::SeqCst)
+            {
+                self.list_started.notify_one();
+                self.resume_list.notified().await;
+            }
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
 
     fn account_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1824,6 +2716,24 @@ mod tests {
     #[test]
     fn deletion_is_fail_closed_then_finalized_with_tombstone() {
         let conn = account_conn();
+        conn.execute(
+            "INSERT INTO billing_accounts (user_id, account_id) VALUES (?1, 'acct_random')",
+            [USER_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recording_leases (user_id,lease_id,expires_at)
+             VALUES (?1,'lease_random','2099-01-01T00:00:00.000Z')",
+            [USER_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recording_lease_requests
+             (user_id,request_id,requested_lease_id,issued_lease_id,expires_at,state,summary_json)
+             VALUES (?1,'request',NULL,'lease_random','2099-01-01T00:00:00.000Z','granted','{}')",
+            [USER_ID],
+        )
+        .unwrap();
         let first = begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID)
             .unwrap()
             .unwrap();
@@ -1877,8 +2787,34 @@ mod tests {
             .unwrap(),
             0
         );
+        for table in ["recording_leases", "recording_lease_requests"] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE user_id=?1"),
+                    [USER_ID],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} survived deletion");
+        }
         let stable_id = super::super::tokens::derive_stable_uuid(GOOGLE_SUB);
         assert!(is_deleted_user_conn(&conn, &stable_id).unwrap());
+        assert_eq!(
+            conn.query_row("SELECT account_id FROM billing_detach_outbox", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "acct_random"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM billing_accounts WHERE user_id=?1",
+                [USER_ID],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1996,6 +2932,483 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(first_generation, second_generation);
+    }
+
+    #[tokio::test]
+    async fn stable_id_rebind_purges_every_legacy_index_generation() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let content = crate::store::Store::new(kms.clone(), gcs.clone());
+        let legacy_user_id = "legacy-user-id";
+        let stable_user_id = "11111111-1111-4111-8111-111111111111";
+
+        content.with_user(legacy_user_id, |_| Ok(())).await.unwrap();
+        content.save_user(legacy_user_id).await.unwrap();
+        content
+            .with_user(legacy_user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata (key,value) VALUES ('legacy','second')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        content.save_user(legacy_user_id).await.unwrap();
+        let legacy_object = format!("indexes/{legacy_user_id}.db.enc");
+        // Modern saves prune superseded generations. Inject one retained
+        // historical generation to exercise the migration privacy boundary.
+        let live = gcs.get_object(&legacy_object).await.unwrap();
+        gcs.put_object(
+            &legacy_object,
+            &live.ciphertext,
+            &live.wrapped_dek_b64,
+            live.generation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gcs.exact_generation_count(&legacy_object), 2);
+
+        let control = ControlStore::new(kms, gcs.clone());
+        control
+            .rebind_user_blob(legacy_user_id, stable_user_id)
+            .await
+            .unwrap();
+
+        assert_eq!(gcs.exact_generation_count(&legacy_object), 0);
+        assert_eq!(
+            gcs.exact_generation_count(&format!("indexes/{stable_user_id}.db.enc")),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn account_finalization_purges_identity_from_older_control_generations() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let user = control
+            .upsert_user("privacy-purge-subject", "private@example.com")
+            .await
+            .unwrap();
+        control.billing_account_id(&user.id).await.unwrap();
+        control.begin_user_deletion(&user.id).await.unwrap();
+        assert!(gcs.exact_generation_count(CONTROL_OBJECT) >= 3);
+
+        assert_eq!(
+            control
+                .finalize_user_deletion(&user.id)
+                .await
+                .unwrap()
+                .status,
+            "physical_complete"
+        );
+        assert_eq!(gcs.exact_generation_count(CONTROL_OBJECT), 1);
+
+        // A clean restart sees only the sanitized current generation.
+        drop(control);
+        let reloaded = ControlStore::new(kms, gcs);
+        assert_eq!(
+            reloaded.user_status(&user.id).await.unwrap().as_deref(),
+            Some("deleted")
+        );
+    }
+
+    #[tokio::test]
+    async fn account_finalization_bounded_parallel_purge_handles_long_control_history() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let user = control
+            .upsert_user("long-control-history", "history@example.com")
+            .await
+            .unwrap();
+        for index in 0..128 {
+            control
+                .set_summarized_until(
+                    &user.id,
+                    &format!("2026-08-09T12:{:02}:00.000Z", index % 60),
+                )
+                .await
+                .unwrap();
+        }
+        control.begin_user_deletion(&user.id).await.unwrap();
+        assert!(gcs.exact_generation_count(CONTROL_OBJECT) > 100);
+
+        assert_eq!(
+            control
+                .finalize_user_deletion(&user.id)
+                .await
+                .unwrap()
+                .status,
+            "physical_complete"
+        );
+        assert_eq!(gcs.exact_generation_count(CONTROL_OBJECT), 1);
+        assert_eq!(
+            ControlStore::new(kms, gcs)
+                .user_status(&user.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("deleted")
+        );
+    }
+
+    #[tokio::test]
+    async fn account_finalization_holds_control_writes_until_privacy_purge_finishes() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let backing = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(backing.clone()));
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let user = control
+            .upsert_user("privacy-race-subject", "private@example.com")
+            .await
+            .unwrap();
+        control.billing_account_id(&user.id).await.unwrap();
+        control.begin_user_deletion(&user.id).await.unwrap();
+
+        gcs.pause_next_control_list();
+        let deleting_control = Arc::clone(&control);
+        let deleting_user = user.id.clone();
+        let deletion = tokio::spawn(async move {
+            deleting_control
+                .finalize_user_deletion(&deleting_user)
+                .await
+        });
+        gcs.list_started.notified().await;
+
+        let writing_control = Arc::clone(&control);
+        let concurrent_write = tokio::spawn(async move {
+            writing_control
+                .upsert_user("concurrent-subject", "other@example.com")
+                .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !concurrent_write.is_finished(),
+            "a control write escaped while the privacy purge was paused"
+        );
+
+        gcs.resume_list.notify_one();
+        assert_eq!(deletion.await.unwrap().unwrap().status, "physical_complete");
+        let other = concurrent_write.await.unwrap().unwrap();
+
+        // The purge leaves its sanitized generation, then the previously
+        // blocked write adds one more. If the writer had escaped between the
+        // flush and purge, its successful generation would have been deleted.
+        assert_eq!(backing.exact_generation_count(CONTROL_OBJECT), 2);
+        drop(control);
+        let reloaded = ControlStore::new(kms, gcs);
+        assert_eq!(
+            reloaded.user_email(&other.id).await.unwrap().as_deref(),
+            Some("other@example.com")
+        );
+        assert_eq!(
+            reloaded.user_status(&user.id).await.unwrap().as_deref(),
+            Some("deleted")
+        );
+    }
+
+    #[tokio::test]
+    async fn coverage_high_water_marks_a_rolled_back_user_index_incomplete() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = control
+            .upsert_user("coverage-rollback-subject", "coverage@example.com")
+            .await
+            .unwrap();
+        let established = control
+            .reconcile_vertex_coverage(&user.id, "2026-08", 7, 0, 0, "2026-08-09T12:00:00.000Z")
+            .await
+            .unwrap();
+        assert_eq!(established.sequence, 7);
+        assert_eq!(established.lost_events, 0);
+
+        let repaired = control
+            .reconcile_vertex_coverage(&user.id, "2026-08", 1, 0, 0, "2026-08-09T11:00:00.000Z")
+            .await
+            .unwrap();
+        assert_eq!(repaired.sequence, 8);
+        assert_eq!(repaired.lost_events, 1);
+        assert_eq!(
+            control
+                .vertex_coverage_anchor(&user.id, "2026-08")
+                .await
+                .unwrap(),
+            Some(repaired)
+        );
+
+        let later = control
+            .reconcile_vertex_coverage(&user.id, "2026-08", 9, 0, 0, "2026-08-09T13:00:00.000Z")
+            .await
+            .unwrap();
+        assert_eq!(later.sequence, 9);
+        assert_eq!(later.lost_events, 1);
+    }
+
+    #[tokio::test]
+    async fn lease_intents_and_denial_receipts_are_bounded_per_user() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let first = control
+            .upsert_user("lease-bound-first", "first@example.com")
+            .await
+            .unwrap();
+        let second = control
+            .upsert_user("lease-bound-second", "second@example.com")
+            .await
+            .unwrap();
+
+        for index in 0..MAX_PENDING_RECORDING_LEASE_REQUESTS_PER_USER {
+            control
+                .begin_recording_lease_request(
+                    &first.id,
+                    &format!("pending-{index}"),
+                    None,
+                    &format!("lease_pending_{index}"),
+                    "2099-01-01T00:01:00.000Z",
+                )
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            control
+                .begin_recording_lease_request(
+                    &first.id,
+                    "pending-over-cap",
+                    None,
+                    "lease_pending_over_cap",
+                    "2099-01-01T00:01:00.000Z",
+                )
+                .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        // One account at its cap cannot block an unrelated account.
+        control
+            .begin_recording_lease_request(
+                &second.id,
+                "other-user-pending",
+                None,
+                "lease_other_user",
+                "2099-01-01T00:01:00.000Z",
+            )
+            .await
+            .unwrap();
+        control
+            .deny_recording_lease_request(
+                &second.id,
+                "other-user-pending",
+                "monthly_allowance_exhausted",
+                &serde_json::json!({"recording":{"allowed":false}}),
+            )
+            .await
+            .unwrap();
+
+        for index in 0..(MAX_RECORDING_LEASE_DENIALS_PER_USER + 5) {
+            let request_id = format!("denied-{index}");
+            control
+                .begin_recording_lease_request(
+                    &second.id,
+                    &request_id,
+                    None,
+                    &format!("lease_denied_{index}"),
+                    "2099-01-01T00:01:00.000Z",
+                )
+                .await
+                .unwrap();
+            control
+                .deny_recording_lease_request(
+                    &second.id,
+                    &request_id,
+                    "monthly_allowance_exhausted",
+                    &serde_json::json!({"recording":{"allowed":false}}),
+                )
+                .await
+                .unwrap();
+        }
+        let second_id = second.id.clone();
+        let denial_count: i64 = control
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT count(*) FROM recording_lease_denials WHERE user_id=?1",
+                    [&second_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(denial_count, MAX_RECORDING_LEASE_DENIALS_PER_USER);
+    }
+
+    #[tokio::test]
+    async fn pending_recording_lease_can_be_rebased_atomically_before_grant() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = control
+            .upsert_user("lease-rebase-subject", "lease-rebase@example.com")
+            .await
+            .unwrap();
+        let retry_now_ms =
+            super::super::isotime::parse_epoch_millis("2026-08-09T00:00:00.000Z").unwrap();
+        let user_id = user.id.clone();
+        control
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO recording_leases (user_id,lease_id,expires_at)
+                     VALUES (?1,'lease_rebase','2026-08-09T00:00:10.000Z')",
+                    [&user_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        control
+            .begin_recording_lease_request(
+                &user.id,
+                "request-rebase",
+                Some("lease_rebase"),
+                "lease_rebase",
+                "2026-08-09T00:01:00.000Z",
+            )
+            .await
+            .unwrap();
+
+        let granted = control
+            .complete_recording_lease(
+                &user.id,
+                "request-rebase",
+                Some(retry_now_ms),
+                &serde_json::json!({"recording":{"allowed":true}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            granted,
+            ("lease_rebase".into(), "2026-08-09T00:01:10.000Z".into())
+        );
+        assert_eq!(
+            control.active_recording_lease(&user.id).await.unwrap(),
+            Some(granted)
+        );
+        let receipt = control
+            .recording_lease_receipt(&user.id, "request-rebase")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.state, "granted");
+        assert_eq!(receipt.expires_at, "2026-08-09T00:01:10.000Z");
+
+        // Even a later duplicate receipt carrying an older proposed expiry
+        // cannot move the active lease backwards.
+        control
+            .begin_recording_lease_request(
+                &user.id,
+                "request-monotonic",
+                Some("lease_rebase"),
+                "lease_rebase",
+                "2026-08-09T00:00:20.000Z",
+            )
+            .await
+            .unwrap();
+        let monotonic = control
+            .complete_recording_lease(
+                &user.id,
+                "request-monotonic",
+                None,
+                &serde_json::json!({"recording":{"allowed":true}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(monotonic.1, "2026-08-09T00:01:10.000Z");
+    }
+
+    #[tokio::test]
+    async fn competing_pending_lease_ids_cannot_reach_or_overwrite_a_grant() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = control
+            .upsert_user("lease-competing-subject", "lease-competing@example.com")
+            .await
+            .unwrap();
+        control
+            .begin_recording_lease_request(
+                &user.id,
+                "request-first",
+                None,
+                "lease_first",
+                "2026-08-09T00:01:00.000Z",
+            )
+            .await
+            .unwrap();
+        let stale_user_id = user.id.clone();
+        control
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE recording_lease_requests
+                     SET created_at='2000-01-01T00:00:00.000Z'
+                     WHERE user_id=?1 AND request_id='request-first'",
+                    [&stale_user_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            control
+                .begin_recording_lease_request(
+                    &user.id,
+                    "request-second",
+                    None,
+                    "lease_second",
+                    "2026-08-09T00:01:01.000Z",
+                )
+                .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // Defense in depth for pre-fix state: if another lease somehow became
+        // active, completing the old pending intent must not overwrite it.
+        let user_id = user.id.clone();
+        control
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO recording_leases (user_id,lease_id,expires_at)
+                     VALUES (?1,'lease_other','2026-08-09T00:02:00.000Z')",
+                    [&user_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            control
+                .complete_recording_lease(
+                    &user.id,
+                    "request-first",
+                    None,
+                    &serde_json::json!({"recording":{"allowed":true}}),
+                )
+                .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(
+            control.active_recording_lease(&user.id).await.unwrap(),
+            Some(("lease_other".into(), "2026-08-09T00:02:00.000Z".into()))
+        );
     }
 
     #[test]
