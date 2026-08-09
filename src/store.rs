@@ -25,11 +25,11 @@
 //!
 //! # LRU cache
 //!
-//! A simple `HashMap<UserId, UserHandle>` with last-used timestamps and a
-//! configurable cap (`STORE_MAX_OPEN`, default 16).  On eviction the handle is
-//! saved and closed.  All access is behind a `tokio::sync::Mutex` (coarse but
-//! correct for the current single-node topology — revisit with per-user locks
-//! if contention shows up).
+//! A brief registry lock tracks actor identity, deletion fences, LRU order, and
+//! the configurable open-handle cap (`STORE_MAX_OPEN`, default 16). Each user
+//! actor owns its SQLite connection behind a separate async mutex. On eviction
+//! the victim is saved and closed under only that user's lock; another user's
+//! GCS, KMS, SQLite, or filesystem work never holds the registry lock.
 //!
 //! # user_id validation
 //!
@@ -44,15 +44,15 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Once},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Once, Weak},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use sqlite_vec::sqlite3_vec_init;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -156,12 +156,12 @@ struct UserHandle {
     persisted_mutation_generation: u64,
     dirty: bool,
     temp_path: PathBuf,
-    last_used: Instant,
 }
 
 /// The shared store, wrapped in Arc so handlers can clone it cheaply.
 pub struct Store {
-    inner: Mutex<StoreInner>,
+    registry: Mutex<StoreRegistry>,
+    registry_changed: Notify,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     pub media_gcs: Arc<dyn GcsClient>,
@@ -169,11 +169,126 @@ pub struct Store {
     checkpoint_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
-struct StoreInner {
-    handles: HashMap<UserId, UserHandle>,
+struct UserActor {
+    state: Mutex<UserActorState>,
+}
+
+#[derive(Default)]
+struct UserActorState {
+    handle: Option<UserHandle>,
+    /// An eviction that raced a queued `save_user` already persisted the exact
+    /// handle that save intended to flush. The actor is weakly retained only
+    /// while such queued requests still exist.
+    cleanly_evicted: bool,
+}
+
+struct StoreRegistry {
+    /// Weak entries preserve one actor identity across concurrent cache misses
+    /// without retaining an unbounded number of idle actors forever.
+    actors: HashMap<UserId, Weak<UserActor>>,
+    /// Strong references for handles that are loading, open, or being evicted.
+    /// Its length is the strictly enforced `STORE_MAX_OPEN` reservation count.
+    open_users: HashMap<UserId, OpenUser>,
     /// Process-local deletion fence. Once set, in-flight requests that passed
     /// authentication cannot recreate or save this user's content.
     blocked_users: HashSet<UserId>,
+    /// Exact media inventory captured before deletion I/O. Keeping it outside
+    /// the open-handle cache lets a failed deletion release scarce SQLite
+    /// capacity without forgetting locally committed-but-unsaved media keys.
+    pending_deletion_media: HashMap<UserId, Arc<[String]>>,
+    /// Bounded completion markers make `with_user(...); save_user(...)`
+    /// idempotent when an unrelated cache miss evicts and flushes that handle
+    /// in between the two calls.
+    recent_clean_evictions: HashMap<UserId, u64>,
+    access_clock: u64,
+}
+
+struct OpenUser {
+    actor: Arc<UserActor>,
+    last_used: u64,
+    status: OpenStatus,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenStatus {
+    Loading,
+    Open,
+    Evicting,
+}
+
+struct EvictionCandidate {
+    user_id: UserId,
+    actor: Arc<UserActor>,
+}
+
+enum CapacityAction {
+    Reserved,
+    Evict(EvictionCandidate),
+    Wait,
+}
+
+enum SaveTarget {
+    Actor(Arc<UserActor>),
+    AlreadyFlushed,
+}
+
+impl StoreRegistry {
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn actor_for(&mut self, user_id: &str, max_open: usize) -> Arc<UserActor> {
+        if let Some(actor) = self.actors.get(user_id).and_then(Weak::upgrade) {
+            return actor;
+        }
+
+        // Failed loads leave only expired weak entries. Bound that bookkeeping
+        // without scanning the registry on every ordinary request.
+        let cleanup_threshold = max_open.saturating_mul(4).max(64);
+        if self.actors.len() >= cleanup_threshold {
+            self.actors.retain(|_, actor| actor.strong_count() != 0);
+        }
+
+        let actor = Arc::new(UserActor {
+            state: Mutex::new(UserActorState::default()),
+        });
+        self.actors
+            .insert(user_id.to_string(), Arc::downgrade(&actor));
+        actor
+    }
+
+    fn touch(&mut self, user_id: &str) {
+        let access = self.next_access();
+        if let Some(open) = self.open_users.get_mut(user_id) {
+            // Once eviction is selected, that ordering decision wins. A racing
+            // access keeps this same actor Arc, waits for eviction, then reloads;
+            // a racing save observes `cleanly_evicted` and succeeds because the
+            // eviction itself performed the requested flush.
+            if open.status != OpenStatus::Evicting {
+                open.last_used = access;
+            }
+        }
+    }
+
+    fn record_clean_eviction(&mut self, user_id: &str, max_open: usize) {
+        let access = self.next_access();
+        let limit = max_open.saturating_mul(4).max(64);
+        if self.recent_clean_evictions.len() >= limit
+            && !self.recent_clean_evictions.contains_key(user_id)
+        {
+            if let Some(oldest) = self
+                .recent_clean_evictions
+                .iter()
+                .min_by_key(|(_, access)| **access)
+                .map(|(user_id, _)| user_id.clone())
+            {
+                self.recent_clean_evictions.remove(&oldest);
+            }
+        }
+        self.recent_clean_evictions
+            .insert(user_id.to_string(), access);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -214,16 +329,31 @@ impl Store {
         let max_open = std::env::var("STORE_MAX_OPEN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16usize);
+            .unwrap_or(16usize)
+            .max(1);
+        Self::new_internal_with_max_open(kms, gcs, media_gcs, max_open)
+    }
+
+    fn new_internal_with_max_open(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        max_open: usize,
+    ) -> Self {
         Store {
-            inner: Mutex::new(StoreInner {
-                handles: HashMap::new(),
+            registry: Mutex::new(StoreRegistry {
+                actors: HashMap::new(),
+                open_users: HashMap::new(),
                 blocked_users: HashSet::new(),
+                pending_deletion_media: HashMap::new(),
+                recent_clean_evictions: HashMap::new(),
+                access_clock: 0,
             }),
+            registry_changed: Notify::new(),
             kms,
             gcs,
             media_gcs,
-            max_open,
+            max_open: max_open.max(1),
             checkpoint_clock: Arc::new(SystemTime::now),
         }
     }
@@ -265,20 +395,21 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        let mut inner = self.inner.lock().await;
-        if inner.blocked_users.contains(user_id) {
-            return Err(EnclaveError::Auth("user account is deleted".into()));
+        let actor = self.actor_for_access(user_id).await?;
+        let mut state = actor.state.lock().await;
+
+        // Deletion may have installed its fence after this request found the
+        // actor but before it won the per-user lock.
+        self.reject_if_blocked(user_id).await?;
+        if state.handle.is_none() {
+            self.ensure_loaded(user_id, &actor, &mut state).await?;
+            // A load can block on GCS/KMS. Never expose a freshly loaded
+            // connection if deletion fenced the user during that await.
+            self.reject_if_blocked(user_id).await?;
         }
-        // Evict LRU if needed before potentially adding a new entry
-        if !inner.handles.contains_key(user_id) && inner.handles.len() >= self.max_open {
-            self.evict_lru_locked(&mut inner).await?;
-        }
-        if !inner.handles.contains_key(user_id) {
-            let handle = self.load_user(user_id).await?;
-            inner.handles.insert(user_id.to_string(), handle);
-        }
-        let handle = inner.handles.get_mut(user_id).unwrap();
-        handle.last_used = Instant::now();
+        let handle = state.handle.as_mut().ok_or_else(|| {
+            EnclaveError::Store("open-user registry lost its SQLite handle".into())
+        })?;
         if handle.blob_meta.retry_save_before_access {
             self.flush_handle(handle).await?;
         }
@@ -327,19 +458,18 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        let mut inner = self.inner.lock().await;
-        if inner.blocked_users.contains(user_id) {
-            return Err(EnclaveError::Auth("user account is deleted".into()));
+        let actor = self.actor_for_access(user_id).await?;
+        let mut state = actor.state.lock().await;
+
+        self.reject_if_blocked(user_id).await?;
+        if state.handle.is_none() {
+            self.ensure_loaded(user_id, &actor, &mut state).await?;
+            self.reject_if_blocked(user_id).await?;
         }
-        if !inner.handles.contains_key(user_id) && inner.handles.len() >= self.max_open {
-            self.evict_lru_locked(&mut inner).await?;
-        }
-        if !inner.handles.contains_key(user_id) {
-            let handle = self.load_user(user_id).await?;
-            inner.handles.insert(user_id.to_string(), handle);
-        }
-        let handle = inner.handles.get_mut(user_id).unwrap();
-        handle.last_used = Instant::now();
+
+        let handle = state.handle.as_mut().ok_or_else(|| {
+            EnclaveError::Store("open-user registry lost its SQLite handle".into())
+        })?;
         if handle.blob_meta.retry_save_before_access {
             self.flush_handle(handle).await?;
         }
@@ -349,15 +479,23 @@ impl Store {
 
     /// Persist a user's index back to GCS.
     pub async fn save_user(&self, user_id: &str) -> Result<()> {
-        let mut inner = self.inner.lock().await;
-        if inner.blocked_users.contains(user_id) {
-            return Err(EnclaveError::Auth("user account is deleted".into()));
+        let actor = match self.actor_for_existing(user_id).await? {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => return Ok(()),
+        };
+        let mut state = actor.state.lock().await;
+        self.reject_if_blocked(user_id).await?;
+        if let Some(handle) = state.handle.as_mut() {
+            self.flush_handle(handle).await
+        } else if state.cleanly_evicted {
+            // Eviction serialized ahead of this save and flushed the same
+            // connection successfully. Treat it as an idempotent save success.
+            Ok(())
+        } else if self.was_recently_cleanly_evicted(user_id).await {
+            Ok(())
+        } else {
+            Err(EnclaveError::NotFound)
         }
-        let handle = inner
-            .handles
-            .get_mut(user_id)
-            .ok_or(EnclaveError::NotFound)?;
-        self.flush_handle(handle).await
     }
 
     /// Hard-delete all user data: evict from cache and delete the GCS object.
@@ -367,24 +505,50 @@ impl Store {
     pub async fn delete_user(&self, user_id: &str) -> Result<()> {
         validate_user_id(user_id)?;
 
-        // Query for DB-referenced media keys before deleting the encrypted
-        // index. A failed attempt leaves the handle cached and blocked; retries
-        // must still read that handle so unscoped `media/...` keys are not lost.
-        let keys_to_delete = {
-            let mut inner = self.inner.lock().await;
-            let keys = if let Some(handle) = inner.handles.get(user_id) {
-                media_keys(&handle.conn)?
-            } else if inner.blocked_users.contains(user_id) {
-                Vec::new()
-            } else {
-                let handle = self.load_user(user_id).await?;
-                let keys = media_keys(&handle.conn)?;
-                inner.handles.insert(user_id.to_string(), handle);
-                keys
-            };
-            inner.blocked_users.insert(user_id.to_string());
+        // Install the fence before waiting for any in-flight same-user work.
+        // Existing work may finish; later work re-checks after winning the
+        // actor lock and fails without recreating or saving the account.
+        let actor = self.actor_for_deletion(user_id).await;
+        let mut state = actor.state.lock().await;
+
+        // 1. Query for GCS media keys to clean up. Persist the exact inventory
+        // in the process-local deletion state before issuing any delete. A
+        // retry after partial failure can therefore release the SQLite handle
+        // (and its max-open slot) without losing locally-only media references.
+        let saved_inventory = self
+            .registry
+            .lock()
+            .await
+            .pending_deletion_media
+            .get(user_id)
+            .cloned();
+        let keys_to_delete = if let Some(keys) = saved_inventory {
+            keys
+        } else {
+            if state.handle.is_none() {
+                self.ensure_loaded(user_id, &actor, &mut state).await?;
+            }
+            let keys: Arc<[String]> = media_keys(
+                &state
+                    .handle
+                    .as_ref()
+                    .ok_or_else(|| EnclaveError::Store("delete load lost its handle".into()))?
+                    .conn,
+            )?
+            .into();
+            self.registry
+                .lock()
+                .await
+                .pending_deletion_media
+                .insert(user_id.to_string(), Arc::clone(&keys));
             keys
         };
+
+        // The exact inventory is now independent of the live Connection, so
+        // release its max-open slot before any slow remote deletion. The GCS
+        // database remains authoritative until every referenced object is gone.
+        self.discard_handle_for_deletion(user_id, &actor, &mut state)
+            .await;
 
         // `versions=true` excludes soft-deleted objects. Record pre-existing
         // residue, but continue removing anything still live/noncurrent. Final
@@ -394,12 +558,12 @@ impl Store {
             .await?;
 
         // Delete every historical raw-media generation, including objects no
-        // longer represented by the current SQLite blob.  The prefix includes
+        // longer represented by the current SQLite blob. The prefix includes
         // its trailing slash, so another user's similarly named prefix cannot
         // be selected.
         self.delete_all_versions_under(&self.media_gcs, &media_prefix(user_id))
             .await?;
-        for key in &keys_to_delete {
+        for key in keys_to_delete.iter() {
             self.delete_all_versions_for_name(&self.media_gcs, key)
                 .await?;
         }
@@ -424,18 +588,11 @@ impl Store {
             return Err(soft_deleted_account_objects_error());
         }
 
-        // Only discard the local inventory after live/noncurrent and
-        // soft-deleted verification succeeds. Do not flush deleted content.
-        {
-            let mut inner = self.inner.lock().await;
-            if let Some(handle) = inner.handles.remove(user_id) {
-                info!("evicting blocked user handle after verified deletion");
-                let temp_path = handle.temp_path.clone();
-                drop(handle);
-                remove_temp_db_files(&temp_path);
-            }
-        }
-
+        self.registry
+            .lock()
+            .await
+            .pending_deletion_media
+            .remove(user_id);
         Ok(())
     }
 
@@ -754,6 +911,270 @@ impl Store {
 
     // ── Private helpers ────────────────────────────────────────────────────────
 
+    async fn actor_for_access(&self, user_id: &str) -> Result<Arc<UserActor>> {
+        validate_user_id(user_id)?;
+        let mut registry = self.registry.lock().await;
+        if registry.blocked_users.contains(user_id) {
+            return Err(deleted_user_error());
+        }
+        let actor = registry.actor_for(user_id, self.max_open);
+        registry.touch(user_id);
+        Ok(actor)
+    }
+
+    async fn actor_for_existing(&self, user_id: &str) -> Result<SaveTarget> {
+        validate_user_id(user_id)?;
+        let mut registry = self.registry.lock().await;
+        if registry.blocked_users.contains(user_id) {
+            return Err(deleted_user_error());
+        }
+        if let Some(actor) = registry.actors.get(user_id).and_then(Weak::upgrade) {
+            registry.touch(user_id);
+            Ok(SaveTarget::Actor(actor))
+        } else if registry.recent_clean_evictions.contains_key(user_id) {
+            Ok(SaveTarget::AlreadyFlushed)
+        } else {
+            Err(EnclaveError::NotFound)
+        }
+    }
+
+    async fn actor_for_deletion(&self, user_id: &str) -> Arc<UserActor> {
+        let mut registry = self.registry.lock().await;
+        registry.blocked_users.insert(user_id.to_string());
+        registry.recent_clean_evictions.remove(user_id);
+        let actor = registry.actor_for(user_id, self.max_open);
+        registry.touch(user_id);
+        actor
+    }
+
+    async fn reject_if_blocked(&self, user_id: &str) -> Result<()> {
+        if self.registry.lock().await.blocked_users.contains(user_id) {
+            Err(deleted_user_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn was_recently_cleanly_evicted(&self, user_id: &str) -> bool {
+        self.registry
+            .lock()
+            .await
+            .recent_clean_evictions
+            .contains_key(user_id)
+    }
+
+    /// Reserve one of the bounded open-handle slots. Full-cache eviction is
+    /// performed without the registry lock; loading/evicting reservations keep
+    /// concurrent cache misses from exceeding `max_open`.
+    async fn reserve_open_slot(&self, user_id: &str, actor: &Arc<UserActor>) -> Result<()> {
+        loop {
+            // `notify_one` retains a permit if a state transition lands between
+            // the registry check and this await, avoiding a lost wakeup.
+            let changed = self.registry_changed.notified();
+            let action = {
+                let mut registry = self.registry.lock().await;
+                if registry.open_users.contains_key(user_id) {
+                    return Err(EnclaveError::Store(
+                        "duplicate open-handle reservation for one user".into(),
+                    ));
+                }
+
+                if registry.open_users.len() < self.max_open {
+                    let access = registry.next_access();
+                    registry.open_users.insert(
+                        user_id.to_string(),
+                        OpenUser {
+                            actor: Arc::clone(actor),
+                            last_used: access,
+                            status: OpenStatus::Loading,
+                        },
+                    );
+                    CapacityAction::Reserved
+                } else {
+                    let candidate_id = registry
+                        .open_users
+                        .iter()
+                        .filter(|(candidate_id, open)| {
+                            candidate_id.as_str() != user_id
+                                && open.status == OpenStatus::Open
+                                && !registry.blocked_users.contains(candidate_id.as_str())
+                        })
+                        .min_by_key(|(_, open)| open.last_used)
+                        .map(|(candidate_id, _)| candidate_id.clone());
+
+                    if let Some(candidate_id) = candidate_id {
+                        let Some(open) = registry.open_users.get_mut(&candidate_id) else {
+                            return Err(EnclaveError::Store(
+                                "LRU candidate disappeared under registry lock".into(),
+                            ));
+                        };
+                        open.status = OpenStatus::Evicting;
+                        CapacityAction::Evict(EvictionCandidate {
+                            user_id: candidate_id,
+                            actor: Arc::clone(&open.actor),
+                        })
+                    } else {
+                        CapacityAction::Wait
+                    }
+                }
+            };
+
+            match action {
+                CapacityAction::Reserved => return Ok(()),
+                CapacityAction::Evict(candidate) => self.evict_candidate(candidate).await?,
+                CapacityAction::Wait => changed.await,
+            }
+        }
+    }
+
+    async fn finish_load_registration(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        loaded: bool,
+    ) -> Result<()> {
+        let mut registry = self.registry.lock().await;
+        let valid = registry.open_users.get(user_id).is_some_and(|open| {
+            open.status == OpenStatus::Loading && Arc::ptr_eq(&open.actor, actor)
+        });
+        if !valid {
+            return Err(EnclaveError::Store(
+                "open-handle reservation changed during load".into(),
+            ));
+        }
+
+        if loaded {
+            let access = registry.next_access();
+            let open = registry.open_users.get_mut(user_id).ok_or_else(|| {
+                EnclaveError::Store("validated load reservation disappeared".into())
+            })?;
+            open.status = OpenStatus::Open;
+            open.last_used = access;
+            registry.recent_clean_evictions.remove(user_id);
+        } else {
+            registry.open_users.remove(user_id);
+        }
+        drop(registry);
+        self.registry_changed.notify_one();
+        Ok(())
+    }
+
+    async fn ensure_loaded(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        state: &mut UserActorState,
+    ) -> Result<()> {
+        if state.handle.is_some() {
+            return Ok(());
+        }
+
+        self.reserve_open_slot(user_id, actor).await?;
+        match self.load_user(user_id).await {
+            Ok(handle) => {
+                state.handle = Some(handle);
+                state.cleanly_evicted = false;
+                if let Err(error) = self.finish_load_registration(user_id, actor, true).await {
+                    if let Some(handle) = state.handle.take() {
+                        let temp_path = handle.temp_path.clone();
+                        drop(handle);
+                        remove_temp_db_files(&temp_path);
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            }
+            Err(load_error) => {
+                self.finish_load_registration(user_id, actor, false).await?;
+                Err(load_error)
+            }
+        }
+    }
+
+    async fn release_open_registration(&self, user_id: &str, actor: &Arc<UserActor>) {
+        let mut registry = self.registry.lock().await;
+        let matches = registry
+            .open_users
+            .get(user_id)
+            .is_some_and(|open| Arc::ptr_eq(&open.actor, actor));
+        if matches {
+            registry.open_users.remove(user_id);
+        }
+        drop(registry);
+        self.registry_changed.notify_one();
+    }
+
+    async fn complete_clean_eviction_registration(&self, user_id: &str, actor: &Arc<UserActor>) {
+        let mut registry = self.registry.lock().await;
+        let matches = registry
+            .open_users
+            .get(user_id)
+            .is_some_and(|open| Arc::ptr_eq(&open.actor, actor));
+        if matches {
+            registry.open_users.remove(user_id);
+        }
+        if !registry.blocked_users.contains(user_id) {
+            registry.record_clean_eviction(user_id, self.max_open);
+        }
+        drop(registry);
+        self.registry_changed.notify_one();
+    }
+
+    async fn discard_handle_for_deletion(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        state: &mut UserActorState,
+    ) {
+        if let Some(handle) = state.handle.take() {
+            info!("evicting deleted user handle");
+            let temp_path = handle.temp_path.clone();
+            drop(handle);
+            remove_temp_db_files(&temp_path);
+        }
+        state.cleanly_evicted = false;
+        self.release_open_registration(user_id, actor).await;
+    }
+
+    async fn evict_candidate(&self, candidate: EvictionCandidate) -> Result<()> {
+        let mut state = candidate.actor.state.lock().await;
+        warn!("LRU user-handle eviction");
+        let had_handle = state.handle.is_some();
+
+        if let Some(handle) = state.handle.as_mut() {
+            // A failed flush leaves the connection, generation, and plaintext
+            // temp files attached to the same actor. The waiting cache miss
+            // fails rather than discarding unpersisted mutations.
+            if let Err(error) = self.flush_handle(handle).await {
+                tracing::error!("user-handle eviction flush failed");
+                let mut registry = self.registry.lock().await;
+                if let Some(open) = registry.open_users.get_mut(&candidate.user_id) {
+                    if Arc::ptr_eq(&open.actor, &candidate.actor) {
+                        open.status = OpenStatus::Open;
+                    }
+                }
+                drop(registry);
+                self.registry_changed.notify_one();
+                return Err(error);
+            }
+        }
+
+        if let Some(handle) = state.handle.take() {
+            let temp_path = handle.temp_path.clone();
+            drop(handle);
+            remove_temp_db_files(&temp_path);
+        }
+        state.cleanly_evicted = had_handle;
+        if had_handle {
+            self.complete_clean_eviction_registration(&candidate.user_id, &candidate.actor)
+                .await;
+        } else {
+            self.release_open_registration(&candidate.user_id, &candidate.actor)
+                .await;
+        }
+        Ok(())
+    }
+
     async fn load_user(&self, user_id: &str) -> Result<UserHandle> {
         // Defense in depth: handlers validate at the API boundary, but no
         // path or object name may ever be derived from an unvalidated id.
@@ -781,7 +1202,7 @@ impl Store {
             }
             Err(EnclaveError::NotFound) => {
                 // New user — generate a fresh DEK and an empty database
-                info!(user_id, "creating new user index");
+                info!("creating new user index");
                 let (dek, wrapped) = generate_and_wrap_dek(self.kms.as_ref()).await?;
                 let empty_db = create_empty_db(&dek)?;
                 (
@@ -816,7 +1237,6 @@ impl Store {
             persisted_mutation_generation: 0,
             dirty: migration_dirty || envelope_rewrite_dirty,
             temp_path,
-            last_used: Instant::now(),
         })
     }
 
@@ -845,13 +1265,7 @@ impl Store {
         let db_bytes = tokio::fs::read(&handle.temp_path).await?;
 
         // Unwrap DEK from KMS then re-encrypt the DB file
-        let dek = load_dek(
-            // We call KMS here, but the lock is held — acceptable for now.
-            // TODO: drop lock before KMS call in a future pass.
-            self.kms.as_ref(),
-            &handle.blob_meta.wrapped_dek_b64,
-        )
-        .await?;
+        let dek = load_dek(self.kms.as_ref(), &handle.blob_meta.wrapped_dek_b64).await?;
         let object_name = gcs_object_name(&handle.user_id);
         let context = user_blob_context(&handle.user_id);
         let ciphertext = encrypt_bound_blob(&dek, &db_bytes, &context)?;
@@ -920,31 +1334,10 @@ impl Store {
             copied.created,
         )
     }
+}
 
-    async fn evict_lru_locked(&self, inner: &mut StoreInner) -> Result<()> {
-        let oldest_id = inner
-            .handles
-            .iter()
-            .min_by_key(|(_, h)| h.last_used)
-            .map(|(id, _)| id.clone());
-
-        if let Some(id) = oldest_id {
-            if let Some(mut handle) = inner.handles.remove(&id) {
-                warn!(evicted_user = %id, "LRU eviction");
-                // A failed flush must keep the live handle and plaintext temp
-                // file available; dropping either here would lose writes.
-                if let Err(e) = self.flush_handle(&mut handle).await {
-                    tracing::error!(user_id = %id, error = %e, "eviction flush failed");
-                    inner.handles.insert(id, handle);
-                    return Err(e);
-                }
-                let temp_path = handle.temp_path.clone();
-                drop(handle);
-                remove_temp_db_files(&temp_path);
-            }
-        }
-        Ok(())
-    }
+fn deleted_user_error() -> EnclaveError {
+    EnclaveError::Auth("user account is deleted".into())
 }
 
 impl UserHandle {
@@ -2918,9 +3311,10 @@ pub(crate) mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use std::sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Mutex as StdMutex,
     };
+    use tokio::sync::Semaphore;
 
     // ── v1 → v2 episodes migration ────────────────────────────────────────────
 
@@ -3722,6 +4116,430 @@ pub(crate) mod tests {
         }
     }
 
+    struct BlockingPutGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        block_once: AtomicBool,
+        started: Notify,
+        release: Semaphore,
+    }
+
+    impl BlockingPutGcs {
+        fn new(inner: Arc<FakeGcs>, target: String) -> Self {
+            Self {
+                inner,
+                target,
+                block_once: AtomicBool::new(true),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+            }
+        }
+
+        async fn wait_until_blocked(&self) {
+            self.started.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for BlockingPutGcs {
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            if object_name == self.target && self.block_once.swap(false, Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| EnclaveError::Store("test GCS gate closed".into()))?
+                    .forget();
+            }
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
+    struct BlockingGetGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        block_once: AtomicBool,
+        started: Notify,
+        release: Semaphore,
+    }
+
+    impl BlockingGetGcs {
+        fn new(inner: Arc<FakeGcs>, target: String) -> Self {
+            Self {
+                inner,
+                target,
+                block_once: AtomicBool::new(true),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+            }
+        }
+
+        async fn wait_until_blocked(&self) {
+            self.started.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for BlockingGetGcs {
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            if object_name == self.target && self.block_once.swap(false, Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| EnclaveError::Store("test GCS gate closed".into()))?
+                    .forget();
+            }
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
+    struct FailPutOnceGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        fail_once: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for FailPutOnceGcs {
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            if object_name == self.target && self.fail_once.swap(false, Ordering::SeqCst) {
+                return Err(EnclaveError::Gcs("injected PUT failure".into()));
+            }
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
+    struct FailDeleteOnceGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        fail_once: AtomicBool,
+        delete_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for FailDeleteOnceGcs {
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            if object_name == self.target {
+                self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_once.swap(false, Ordering::SeqCst) {
+                    return Err(EnclaveError::Gcs("injected DELETE failure".into()));
+                }
+            }
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            if object_name == self.target {
+                self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_once.swap(false, Ordering::SeqCst) {
+                    return Err(EnclaveError::Gcs("injected DELETE failure".into()));
+                }
+            }
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     fn make_store() -> Store {
@@ -4413,6 +5231,483 @@ pub(crate) mod tests {
         store.save_user("legacy-envelope").await.unwrap();
         assert_eq!(gcs.generation(&gcs_object_name("legacy-envelope")), Some(2));
     }
+
+    fn make_store_with_limit(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        max_open: usize,
+    ) -> Store {
+        Store::new_internal_with_max_open(kms, gcs, media_gcs, max_open)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_user_gcs_save_does_not_block_another_users_read_write_or_save() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("slow-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            2,
+        ));
+
+        for user_id in ["slow-user", "fast-user"] {
+            store
+                .with_user(user_id, |_| Ok(()))
+                .await
+                .expect("preload user");
+        }
+        store
+            .with_user("slow-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'slow')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate slow user");
+
+        let slow_store = Arc::clone(&store);
+        let slow_save = tokio::spawn(async move { slow_store.save_user("slow-user").await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            blocked.wait_until_blocked(),
+        )
+        .await
+        .expect("slow user's GCS PUT never reached the gate");
+
+        let fast_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let counts = store
+                .with_user("fast-user", |conn| {
+                    let before: i64 =
+                        conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?;
+                    conn.execute(
+                        "INSERT INTO screenshots (captured_at, ocr_text) \
+                         VALUES ('2026-08-01T00:00:01Z', 'fast')",
+                        [],
+                    )?;
+                    let after: i64 =
+                        conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?;
+                    Ok((before, after))
+                })
+                .await?;
+            store.save_user("fast-user").await?;
+            Result::<_>::Ok(counts)
+        })
+        .await
+        .expect("unrelated user was blocked by slow user's GCS PUT")
+        .expect("unrelated user operation failed");
+        assert_eq!(fast_result, (0, 1));
+
+        blocked.release();
+        slow_save
+            .await
+            .expect("slow save task panicked")
+            .expect("slow save failed after release");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_user_connection_operations_remain_strictly_serialized() {
+        let store = Arc::new(make_store());
+        store
+            .with_user("ordered-user", |_| Ok(()))
+            .await
+            .expect("preload user");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_store = Arc::clone(&store);
+        let first = tokio::spawn(async move {
+            first_store
+                .with_user("ordered-user", move |conn| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().map_err(|_| {
+                        EnclaveError::Store("same-user test release dropped".into())
+                    })?;
+                    conn.execute(
+                        "INSERT INTO screenshots (captured_at, ocr_text) \
+                         VALUES ('2026-08-01T00:00:00Z', 'first')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("first operation did not enter");
+
+        let second_entered = Arc::new(Notify::new());
+        let second_signal = Arc::clone(&second_entered);
+        let second_store = Arc::clone(&store);
+        let second = tokio::spawn(async move {
+            second_store
+                .with_user("ordered-user", move |conn| {
+                    second_signal.notify_one();
+                    Ok(
+                        conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?,
+                    )
+                })
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                second_entered.notified(),
+            )
+            .await
+            .is_err(),
+            "second same-user operation entered while the first still held the actor"
+        );
+
+        release_tx.send(()).expect("release first operation");
+        first
+            .await
+            .expect("first operation task panicked")
+            .expect("first operation failed");
+        let observed = second
+            .await
+            .expect("second operation task panicked")
+            .expect("second operation failed");
+        assert_eq!(observed, 1, "second operation must observe the first");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_fence_wins_against_an_inflight_first_load() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingGetGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("load-race-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+
+        let load_store = Arc::clone(&store);
+        let load =
+            tokio::spawn(async move { load_store.with_user("load-race-user", |_| Ok(())).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            blocked.wait_until_blocked(),
+        )
+        .await
+        .expect("first load never reached GCS");
+
+        let delete_store = Arc::clone(&store);
+        let deletion =
+            tokio::spawn(async move { delete_store.delete_user("load-race-user").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store
+                    .registry
+                    .lock()
+                    .await
+                    .blocked_users
+                    .contains("load-race-user")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deletion fence was not installed");
+
+        blocked.release();
+        assert!(matches!(
+            load.await.expect("load task panicked"),
+            Err(EnclaveError::Auth(_))
+        ));
+        deletion
+            .await
+            .expect("deletion task panicked")
+            .expect("deletion failed");
+        let registry = store.registry.lock().await;
+        assert!(registry.blocked_users.contains("load-race-user"));
+        assert!(registry.open_users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_eviction_preserves_the_live_handle_and_unsaved_changes() {
+        let inner = Arc::new(FakeGcs::new());
+        let failing = Arc::new(FailPutOnceGcs {
+            inner: Arc::clone(&inner),
+            target: gcs_object_name("eviction-user"),
+            fail_once: AtomicBool::new(true),
+        });
+        let kms = Arc::new(FakeKms);
+        let store = make_store_with_limit(kms.clone(), failing.clone(), failing, 1);
+
+        store
+            .with_user("eviction-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'must survive')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate eviction victim");
+
+        assert!(matches!(
+            store.with_user("new-user", |_| Ok(())).await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        let count: i64 = store
+            .with_user("eviction-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("victim handle was discarded after failed eviction");
+        assert_eq!(count, 1);
+
+        store
+            .save_user("eviction-user")
+            .await
+            .expect("retry save should succeed");
+        let fresh = Store::new(kms, inner);
+        let persisted: i64 = fresh
+            .with_user("eviction-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("reload saved eviction victim");
+        assert_eq!(persisted, 1);
+    }
+
+    #[tokio::test]
+    async fn save_after_completed_intervening_eviction_is_idempotent_success() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = make_store_with_limit(kms.clone(), gcs.clone(), gcs.clone(), 1);
+
+        store
+            .with_user("evicted-before-save", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'already flushed')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate first user");
+
+        // With one slot, this cannot complete without flushing and dropping
+        // the first user's last strong actor reference.
+        store
+            .with_user("evicting-user", |_| Ok(()))
+            .await
+            .expect("evict first user");
+        assert!(store
+            .registry
+            .lock()
+            .await
+            .actors
+            .get("evicted-before-save")
+            .is_some_and(|actor| actor.upgrade().is_none()));
+
+        store
+            .save_user("evicted-before-save")
+            .await
+            .expect("intervening eviction already performed this save");
+        assert!(matches!(
+            store.save_user("never-opened-user").await,
+            Err(EnclaveError::NotFound)
+        ));
+
+        let fresh = Store::new(kms, gcs);
+        let persisted: i64 = fresh
+            .with_user("evicted-before-save", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("reload eviction-flushed data");
+        assert_eq!(persisted, 1);
+    }
+
+    #[tokio::test]
+    async fn save_queued_behind_an_inflight_eviction_observes_its_flush() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("queued-save-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+        store
+            .with_user("queued-save-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'queued save')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate eviction victim");
+
+        let newcomer_store = Arc::clone(&store);
+        let newcomer = tokio::spawn(async move {
+            newcomer_store
+                .with_user("queued-new-user", |_| Ok(()))
+                .await
+        });
+        blocked.wait_until_blocked().await;
+
+        let save_store = Arc::clone(&store);
+        let queued_save =
+            tokio::spawn(async move { save_store.save_user("queued-save-user").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let save_has_actor = store
+                    .registry
+                    .lock()
+                    .await
+                    .actors
+                    .get("queued-save-user")
+                    .is_some_and(|actor| actor.strong_count() >= 3);
+                if save_has_actor {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("save never queued behind the evicting actor");
+
+        blocked.release();
+        newcomer
+            .await
+            .expect("newcomer task panicked")
+            .expect("newcomer load failed");
+        queued_save
+            .await
+            .expect("queued save task panicked")
+            .expect("eviction flush should satisfy queued save");
+    }
+
+    #[test]
+    fn clean_eviction_completion_registry_is_bounded() {
+        let mut registry = StoreRegistry {
+            actors: HashMap::new(),
+            open_users: HashMap::new(),
+            blocked_users: HashSet::new(),
+            pending_deletion_media: HashMap::new(),
+            recent_clean_evictions: HashMap::new(),
+            access_clock: 0,
+        };
+        for index in 0..100 {
+            registry.record_clean_eviction(&format!("user-{index}"), 1);
+        }
+        assert_eq!(registry.recent_clean_evictions.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn failed_deletion_releases_capacity_without_losing_retry_inventory() {
+        let database_gcs = Arc::new(FakeGcs::new());
+        let media_inner = Arc::new(FakeGcs::new());
+        let media_key = "media/local-only";
+        let failing_media = Arc::new(FailDeleteOnceGcs {
+            inner: Arc::clone(&media_inner),
+            target: media_key.to_string(),
+            fail_once: AtomicBool::new(true),
+            delete_calls: AtomicUsize::new(0),
+        });
+        failing_media
+            .put_object(media_key, b"ciphertext", "wrapped", 0)
+            .await
+            .expect("seed media object");
+
+        let store = make_store_with_limit(
+            Arc::new(FakeKms),
+            database_gcs.clone(),
+            failing_media.clone(),
+            1,
+        );
+        store
+            .with_user("delete-user", |conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+                conn.execute(
+                    "INSERT INTO media_objects \
+                     (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256) \
+                     VALUES ('local-asset','local-event','media/local-only', \
+                             'image/jpeg','jpeg',1,'local-sha')",
+                    [],
+                )?;
+                conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+                Ok(())
+            })
+            .await
+            .expect("record locally-only media key");
+
+        assert!(matches!(
+            store.delete_user("delete-user").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        {
+            let registry = store.registry.lock().await;
+            assert!(
+                registry.open_users.is_empty(),
+                "failed delete pinned capacity"
+            );
+            assert_eq!(
+                registry
+                    .pending_deletion_media
+                    .get("delete-user")
+                    .map(AsRef::as_ref),
+                Some([media_key.to_string()].as_slice())
+            );
+        }
+
+        // Phase 0d deliberately has no durable deletion ledger: a restarted
+        // Store does not inherit this locally-only inventory. The remote DB is
+        // retained on failure, but unsaved media keys require the later
+        // encrypted ADR-0022 deletion ledger for crash-safe recovery.
+        let restarted =
+            make_store_with_limit(Arc::new(FakeKms), database_gcs, failing_media.clone(), 1);
+        assert!(restarted
+            .registry
+            .lock()
+            .await
+            .pending_deletion_media
+            .is_empty());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            store.with_user("unrelated-user", |_| Ok(())).await?;
+            store.save_user("unrelated-user").await
+        })
+        .await
+        .expect("blocked failed deletion starved the only open slot")
+        .expect("unrelated user failed after deletion error");
+
+        store
+            .delete_user("delete-user")
+            .await
+            .expect("deletion retry should use retained media inventory");
+        assert_eq!(failing_media.delete_calls.load(Ordering::SeqCst), 2);
+        assert!(!media_inner.objects.lock().unwrap().contains_key(media_key));
+        let registry = store.registry.lock().await;
+        assert!(!registry.pending_deletion_media.contains_key("delete-user"));
+        assert_eq!(registry.open_users.len(), 1);
+        assert!(registry.open_users.contains_key("unrelated-user"));
+    }
+
     #[tokio::test]
     async fn new_user_creates_index() {
         let store = make_store();

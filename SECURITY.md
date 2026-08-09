@@ -191,6 +191,38 @@ does no checkpoint, plaintext file read, KMS unwrap, encryption, or GCS upload. 
 write-amplification optimization only: it does not change ciphertext format, authority,
 or acknowledgement requirements.
 
+### Legacy Store concurrency (ADR-0022 Phase 0d)
+
+The legacy whole-database blob remains the sole persistence format and authority, but it
+no longer places every user's SQLite, filesystem, KMS, and GCS work behind one global
+mutex. A brief registry lock now finds or creates a per-user actor and tracks deletion
+fences, bounded open-handle reservations, LRU order, and bounded recent-eviction
+completion markers. Each actor serializes that user's connection operations, loads,
+saves, and deletion. The registry lock is released before SQLite work or any filesystem,
+KMS, or GCS await, so a slow user cannot serialize already-admitted work for unrelated
+users. Open-handle loading reservations count against `STORE_MAX_OPEN`; successful
+eviction flushes before dropping the handle, while a failed flush retains the exact live
+connection and temp files and fails the requesting cache miss.
+
+Deletion installs the process-local user fence before waiting for in-flight same-user
+work. It snapshots a sorted, deduplicated media-key inventory, releases the SQLite slot,
+and then performs remote deletes; failure retains the inventory for an idempotent retry
+without starving `STORE_MAX_OPEN`. The inventory is held through a shared immutable
+buffer to avoid retry copies, but it is intentionally not truncated because truncation
+would make deletion incomplete. Its memory remains proportional to the number of legacy
+media references.
+
+This is containment, not the later ADR-0022 deletion ledger. The fence, pending inventory,
+and recent-eviction completion markers are process-local. The remote database is retained
+until deletion succeeds, so saved references can be rediscovered after restart; media
+keys present only in an unsaved local database are not crash-safe across a failed deletion
+until a durable encrypted deletion ledger exists. If all configured handle slots are
+actively loading/evicting, a new cold user waits for a slot; and a corrupt database that
+cannot enumerate deletion media must remain fenced and retained rather than discard an
+unknown inventory. These cases do not reintroduce a registry lock across remote I/O, but
+they remain capacity/repair limits. Store diagnostics in this path are content-free and
+do not emit user IDs or object names.
+
 ## Attestation and TLS
 
 The KMS credential path and public verification path deliberately use different
