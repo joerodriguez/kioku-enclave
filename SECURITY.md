@@ -52,7 +52,8 @@ surfaces.
   evaluation builds never inherit production values, are marked with an `eval-` tag and
   metadata profile, cannot become signed releases, and may run only with an isolated
   service account, KMS key, buckets, hostname, and attestation binding that have no
-  production data access.
+  production data access. The operator has retired that isolated runtime; production is
+  now the only active owner evaluation environment.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL
@@ -81,7 +82,12 @@ surfaces.
   Source profiles and assignment history are retained; reversal fails closed if a
   result acquired later samples. No similarity threshold can auto-apply a proposal
   until the hash-bound real-audio release corpus has calibrated that scorer version.
-- Real voice-quality releases require schema-v3 evidence derived by the public
+- A signed release may carry the exact `owner-only-production.json` marker only while
+  `external_users` is zero and `voice_quality_claims_allowed` is false. Release metadata
+  then records `owner_only_unvalidated`. The marker must be removed—and the complete
+  real-corpus trio must pass—before any external user is allowed or any voice-quality
+  claim is made. The marker and real evidence may never coexist.
+- Validated voice-quality releases require schema-v3 evidence derived by the public
   reducer plus a schema-v2 source manifest. Separately hashed media/label/bundle/
   augmentation artifacts, licensed-playback lineage, physical-capture assertions,
   authorization hashes, and exact device/UI routes fail closed before scoring. The

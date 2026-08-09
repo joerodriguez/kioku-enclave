@@ -8,6 +8,13 @@ pin arithmetic, same-name collision handling, abstention, and
 fact/export/delete coverage, but can never substantiate a quality claim. A
 hand-authored schema-v1 `real_audio` aggregate can no longer pass release gates.
 
+While Kioku has zero external users, owner evaluation runs in production under the exact
+checked-in `owner-only-production.json` declaration. That declaration authorizes a signed
+production image but no speaker-quality claim; release metadata records
+`owner_only_unvalidated`. It must be removed before adding an external user or claiming
+quality. At that boundary, all three canonical real-corpus files below must exist and
+pass. The marker and any member of the real-corpus trio may never coexist.
+
 A real-corpus run emits one content-free case per scored source interval. It
 must cover clean two-person calls, 3+ speakers, overlap, introductions,
 repeated meetings, same-name people, similar voices, system and room audio,
@@ -243,10 +250,11 @@ Use the highest different-speaker score to select the objectively hardest
 
 The check validates and hash-binds the manifest, semantically recomputes the
 report, and returns nonzero if the bundle is stale or any gate fails.
-`scripts/release.sh` runs it before creating a signed tag,
-and tag CI runs it again before building or publishing a release. Until all
-three files exist and pass, the missing release is deliberate: an ordinary `main`
-image may be built for evaluation, but it cannot become a release artifact.
+`scripts/check_voice_release_gate.py` selects exactly one classification;
+`scripts/release.sh` and tag CI run it before creating or publishing a signed release.
+For `validated_real_corpus`, the helper invokes the Rust check above. For
+`owner_only_unvalidated`, it accepts only the exact zero-external-user/no-claim marker.
+Missing, partial, malformed, or coexisting classifications fail closed.
 
 A release corpus must contain `real_audio` cases for every scorer slice:
 `clean_remote_call`, `three_plus_speakers`, `overlap`, `introduction`,

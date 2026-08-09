@@ -8,10 +8,9 @@ attestation condition.
 
 ## Signed release workflow
 
-Releasing a new enclave version requires a reviewed version bump, a passing
-ADR-0016 real-corpus report, and an operator-created signed tag. A `main` push
-builds production configuration; an explicit manual dispatch from reviewed `main` may
-build the isolated evaluation profile. CI never creates a release tag from `main`.
+Releasing a new enclave version requires a reviewed version bump, a fail-closed ADR-0016
+release classification, and an operator-created signed tag. A `main` push builds
+production configuration. CI never creates a release tag from `main`.
 This prevents an unsigned automated tag from bypassing the release operator's
 trust anchor.
 
@@ -19,18 +18,18 @@ To cut a new release:
 
 1. Run `./scripts/bump_version.sh <NEW_VERSION>` (for example `0.8.4`), or
    update `version = "X.Y.Z"` in `Cargo.toml` and refresh `Cargo.lock`.
-2. Fetch and derive the licensed corpus into private directories, retain and review its
-   hash receipt, then produce the source manifest, real-corpus aggregate cases, and deterministic report
-   described in [`eval/voice/README.md`](eval/voice/README.md). Review and
-   commit `eval/voice/release-manifest.json`,
-   `eval/voice/release-cases.json`, and
-   `eval/voice/release-report.json`; they contain no media or user content.
+2. Choose exactly one release classification described in
+   [`eval/voice/README.md`](eval/voice/README.md): retain the exact
+   `eval/voice/owner-only-production.json` marker while there are zero external users and
+   no quality claim, or remove it and commit the complete passing real-corpus manifest,
+   cases, and report. Never commit both classifications.
 3. Merge those changes through a green pull request, then synchronize a clean
    local `main` with `origin/main`.
-4. Run `scripts/release.sh` with the trusted signing-key fingerprint. It checks
-   the report, creates and verifies the signed tag, and pushes it.
+4. Run `scripts/release.sh` with the trusted signing-key fingerprint. It validates the
+   selected classification (including the Rust scorer for real evidence), creates and
+   verifies the signed tag, and pushes it.
 5. The tag workflow independently requires GitHub to verify the tag signature,
-   checks the report, builds the image, generates provenance/SBOM attestations,
+   checks the selected classification, builds the image, generates provenance/SBOM attestations,
    and publishes the immutable release. The local script then verifies that
    evidence and may request a separately approved production roll.
 
@@ -45,11 +44,11 @@ To cut a new release:
 - Configure a Git signing key. `scripts/release.sh` creates `git tag -s` tags and rejects
   a tag that cannot be verified against the required `RELEASE_SIGNER_FINGERPRINT`
   trust anchor (an OpenPGP fingerprint or `SHA256:…` SSH key fingerprint).
-- Check in the current content-free ADR-0016 licensed-source manifest, real
-  aggregate cases, and matching passing report at the canonical paths
-  documented in `eval/voice/README.md`. Missing, stale, unbound,
-  synthetic-only, incomplete, or regressed bundles block both the local
-  release command and release-tag CI.
+- Check in exactly one ADR-0016 classification documented in `eval/voice/README.md`.
+  Missing, ambiguous, partial, malformed, stale, unbound, synthetic-only, incomplete, or
+  regressed evidence blocks both the local release command and release-tag CI. The
+  owner-only marker is invalid as soon as any external user exists or a quality claim is
+  intended.
 - Publish the trusted signing public key and fingerprint through a separately authenticated
   channel, and require release verifiers to pin that identity. A cryptographically valid
   signature from an unknown key does not authenticate the release operator.
@@ -91,9 +90,12 @@ prevents account and contact addresses from being copied into public Actions log
 resulting values remain baked into the image, so they must not contain authentication
 secrets.
 
-### Isolated evaluation image variables
+### Retired isolated evaluation profile
 
-To build a non-release image for the ADR-0016 real-corpus run, configure an `EVAL_`
+The isolated evaluation runtime is retired; owner-controlled corpus runs now use the
+production API and a dedicated owner-controlled corpus account. The historical manual
+build profile remains source-visible for reproducibility only. To reconstruct a
+non-release image, configure an `EVAL_`
 counterpart for every build-arg variable in the table above. Store
 `EVAL_ALLOWED_EMAILS` and `EVAL_ENCLAVE_ACME_CONTACT` as Actions secrets; all other
 counterparts are Actions variables. Then manually dispatch `build.yml` from `main` with
@@ -101,10 +103,11 @@ counterparts are Actions variables. Then manually dispatch `build.yml` from `mai
 
 The selector validates the entire chosen profile before exporting any value. Missing or
 malformed evaluation values fail the build; production settings are never substitutes.
-The resulting `eval-*` image and its metadata are evaluation inputs only. They must use a
-separate service account, KMS key, index bucket, media bucket, HTTPS hostname/audience,
+The resulting `eval-*` image and its metadata are historical evaluation inputs only. They
+must use a separate service account, KMS key, index bucket, media bucket, HTTPS hostname/audience,
 and VM with no production bucket or KMS access. Do not tag it `v*`, publish it as a
-release, pass it to `scripts/release.sh`, or deploy it to production. The evaluated
+release, pass it to `scripts/release.sh`, deploy it to production, or recreate the retired
+service. The evaluated
 source commit, image digest, model, scorer, corpus sources, and thresholds are instead
 bound into the content-free ADR-0016 run evidence.
 

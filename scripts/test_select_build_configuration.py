@@ -13,6 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
+RELEASE_SCRIPT = ROOT / "scripts" / "release.sh"
 
 CONFIGURATION = {
     "ENCLAVE_KMS_PROJECT": "kioku-joerodriguez",
@@ -178,6 +179,30 @@ class SelectorTests(unittest.TestCase):
             "EVALUATION_REVIEWER_AUTH_API_KEY: "
             "${{ vars.EVAL_REVIEWER_AUTH_API_KEY }}",
             workflow,
+        )
+
+    def test_release_ci_uses_shared_voice_gate_and_attests_its_result(self) -> None:
+        workflow = WORKFLOW.read_text()
+        self.assertGreaterEqual(
+            workflow.count("python3 scripts/check_voice_release_gate.py"), 2
+        )
+        self.assertNotIn("test -s eval/voice/release-manifest.json", workflow)
+        self.assertIn('"schema_version": 2', workflow)
+        self.assertIn('"voice_quality_gate": voice_quality_gate', workflow)
+
+    def test_operator_release_uses_shared_voice_gate_and_verifies_metadata(self) -> None:
+        release_script = RELEASE_SCRIPT.read_text()
+        self.assertIn(
+            'VOICE_QUALITY_GATE="$(python3 scripts/check_voice_release_gate.py)"',
+            release_script,
+        )
+        self.assertIn('"voice_quality_gate"', release_script)
+        self.assertIn('"2"', release_script)
+        self.assertIn("owner_only_unvalidated", release_script)
+        self.assertIn("validated_real_corpus", release_script)
+        self.assertIn(
+            '"$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE"',
+            release_script,
         )
 
 
