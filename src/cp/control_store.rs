@@ -413,8 +413,7 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<Account
         [user_id],
     )?;
     tx.execute(
-        "INSERT OR IGNORE INTO deleted_identities (provider, subject) \\
-         SELECT provider, subject FROM auth_identities WHERE user_id = ?1",
+        "INSERT OR IGNORE INTO deleted_identities (provider, subject) SELECT provider, subject FROM auth_identities WHERE user_id = ?1",
         [user_id],
     )?;
     tx.execute(
@@ -1016,10 +1015,7 @@ impl ControlStore {
                     )?;
                 }
                 conn.execute(
-                    "INSERT INTO auth_identities (provider, subject, user_id, email) \\
-                     VALUES ('google', ?1, ?2, ?3) \\
-                     ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, \\
-                     last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    "INSERT INTO auth_identities (provider, subject, user_id, email) VALUES ('google', ?1, ?2, ?3) ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
                     rusqlite::params![google_sub, stable_id, email],
                 )?;
                 Ok(())
@@ -1048,9 +1044,7 @@ impl ControlStore {
         self.read(move |conn| {
             Ok(conn
                 .query_row(
-                    "SELECT u.id, u.email FROM auth_identities i \\
-                     JOIN users u ON u.id = i.user_id \\
-                     WHERE i.provider = ?1 AND i.subject = ?2 AND u.status = 'active'",
+                    "SELECT u.id, u.email FROM auth_identities i JOIN users u ON u.id = i.user_id WHERE i.provider = ?1 AND i.subject = ?2 AND u.status = 'active'",
                     rusqlite::params![provider, subject],
                     |row| {
                         Ok(User {
@@ -1085,16 +1079,14 @@ impl ControlStore {
                 return Err(EnclaveError::Auth("account deleted".into()));
             }
             let existing: Option<(String, String, String)> = tx.query_row(
-                "SELECT u.id, u.email, u.status FROM auth_identities i \\
-                 JOIN users u ON u.id = i.user_id WHERE i.provider = ?1 AND i.subject = ?2",
+                "SELECT u.id, u.email, u.status FROM auth_identities i JOIN users u ON u.id = i.user_id WHERE i.provider = ?1 AND i.subject = ?2",
                 rusqlite::params![provider, subject],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).optional()?;
             let (user_id, primary_email) = match existing {
                 Some((user_id, primary_email, status)) if status == "active" => {
                     tx.execute(
-                        "UPDATE auth_identities SET email = ?1, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \\
-                         WHERE provider = ?2 AND subject = ?3",
+                        "UPDATE auth_identities SET email = ?1, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE provider = ?2 AND subject = ?3",
                         rusqlite::params![email, provider, subject],
                     )?;
                     let anchor: String = tx.query_row("SELECT google_sub FROM users WHERE id = ?1", [&user_id], |row| row.get(0))?;
@@ -1131,9 +1123,7 @@ impl ControlStore {
                 }
             };
             tx.execute(
-                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) \\
-                 ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, \\
-                 last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
+                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
                 rusqlite::params![user_id, refresh_token],
             )?;
             tx.commit()?;
@@ -1179,15 +1169,11 @@ impl ControlStore {
                 return Err(EnclaveError::Conflict("account already has a different Apple identity".into()));
             }
             tx.execute(
-                "INSERT INTO auth_identities (provider, subject, user_id, email) VALUES ('apple', ?1, ?2, ?3) \\
-                 ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, \\
-                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                "INSERT INTO auth_identities (provider, subject, user_id, email) VALUES ('apple', ?1, ?2, ?3) ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
                 rusqlite::params![subject, user_id, email],
             )?;
             tx.execute(
-                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) \\
-                 ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, \\
-                 last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
+                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
                 rusqlite::params![user_id, refresh_token],
             )?;
             tx.commit()?;
@@ -1222,8 +1208,7 @@ impl ControlStore {
         let user_id = user_id.to_string();
         self.write_if_changed(move |conn| {
             let changed = conn.execute(
-                "UPDATE apple_credentials SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \\
-                 WHERE user_id = ?1 AND revoked_at IS NULL",
+                "UPDATE apple_credentials SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1 AND revoked_at IS NULL",
                 [user_id],
             )? > 0;
             Ok(((), changed))

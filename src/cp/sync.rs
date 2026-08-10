@@ -506,29 +506,14 @@ async fn delete_account(
         }
     };
 
-    // Revoke Apple's retained refresh authorization before deleting the local
-    // credential. A failed revocation leaves the durable deleting operation in
-    // place so this authenticated DELETE can safely retry it.
-    let apple_refresh = match s.control.apple_refresh_token(&user_id).await {
-        Ok(token) => token,
-        Err(_) => {
-            warn!("Apple credential lookup failed during account deletion");
-            return deletion_delete_response(operation);
-        }
-    };
-    if let Some(refresh_token) = apple_refresh {
-        let Some(provider) = s.apple_provider.as_ref() else {
-            warn!("Apple revocation provider unavailable during account deletion");
-            return deletion_delete_response(operation);
-        };
-        if let Err(error) = provider.revoke_refresh_token(&refresh_token).await {
-            warn!(error = %error, "Apple credential revocation failed");
-            return deletion_delete_response(operation);
-        }
-        if let Err(error) = s.control.mark_apple_credential_revoked(&user_id).await {
-            warn!(error = %error, "Apple credential revocation state failed to persist");
-            return deletion_delete_response(operation);
-        }
+    if revoke_apple_before_content_delete(s.control.as_ref(), s.apple_provider.as_ref(), &user_id)
+        .await
+        .is_err()
+    {
+        // The operation is durably fenced already. Do not delete content or
+        // finalize identity state until revocation is durably recorded.
+        warn!("Apple credential revocation prerequisite unavailable during account deletion");
+        return deletion_delete_response(operation);
     }
 
     // 2. Delete content. Any incomplete outcome remains a durable 202
@@ -619,6 +604,29 @@ async fn persist_deletion_status(
     }
 }
 
+/// Apple authorization is a deletion barrier: when a retained credential is
+/// present, its provider revocation and local durable revoked marker must both
+/// succeed before either content deletion or identity finalization can run.
+/// This intentionally returns only a generic error so callers never log a
+/// refresh token, provider response, account id, or object name.
+async fn revoke_apple_before_content_delete(
+    control: &ControlStore,
+    apple_provider: Option<&Arc<super::apple::AppleIdentityProvider>>,
+    user_id: &str,
+) -> EnclaveResult<()> {
+    let Some(refresh_token) = control.apple_refresh_token(user_id).await? else {
+        return Ok(());
+    };
+    let provider = apple_provider.ok_or_else(|| {
+        EnclaveError::Store("Apple credential revocation provider is unavailable".into())
+    })?;
+    provider
+        .revoke_refresh_token(&refresh_token)
+        .await
+        .map_err(|_| EnclaveError::Store("Apple credential revocation failed".into()))?;
+    control.mark_apple_credential_revoked(user_id).await
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DeletionReconcileSummary {
     attempted: usize,
@@ -638,6 +646,7 @@ fn deletion_operation_requires_remediation(operation: &AccountDeletionOperation)
 async fn reconcile_pending_account_deletions(
     control: &ControlStore,
     store: &Store,
+    apple_provider: Option<&Arc<super::apple::AppleIdentityProvider>>,
 ) -> EnclaveResult<DeletionReconcileSummary> {
     let user_ids = control
         .deleting_user_ids(DELETION_RECONCILE_BATCH_SIZE)
@@ -658,6 +667,15 @@ async fn reconcile_pending_account_deletions(
         }
         if deletion_operation_requires_remediation(&operation) {
             summary.failed_retryable += 1;
+            continue;
+        }
+        if revoke_apple_before_content_delete(control, apple_provider, &user_id)
+            .await
+            .is_err()
+        {
+            // Keep the operation pending: an unavailable revocation provider
+            // must never permit content deletion or finalization on restart.
+            summary.pending += 1;
             continue;
         }
         if operation.reason == "identity_cleanup_in_progress" {
@@ -732,7 +750,13 @@ pub fn spawn_account_deletion_reconciler(state: Arc<CpState>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match reconcile_pending_account_deletions(&state.control, &state.store).await {
+            match reconcile_pending_account_deletions(
+                &state.control,
+                &state.store,
+                state.apple_provider.as_ref(),
+            )
+            .await
+            {
                 Ok(summary) if summary.attempted > 0 => {
                     tracing::info!(
                         attempted = summary.attempted,
@@ -932,9 +956,10 @@ mod tests {
         let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
         let restarted_store = Store::new(kms, gcs);
 
-        let summary = reconcile_pending_account_deletions(&restarted_control, &restarted_store)
-            .await
-            .unwrap();
+        let summary =
+            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
+                .await
+                .unwrap();
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.completed, 1);
         assert_eq!(summary.pending, 0);
@@ -1000,9 +1025,10 @@ mod tests {
         let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
         let restarted_store = Store::new(kms, gcs);
 
-        let summary = reconcile_pending_account_deletions(&restarted_control, &restarted_store)
-            .await
-            .unwrap();
+        let summary =
+            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
+                .await
+                .unwrap();
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.completed, 1);
         assert_eq!(summary.pending, 0);
@@ -1016,6 +1042,68 @@ mod tests {
         assert_eq!(completed.operation_id, operation.operation_id);
         assert_eq!(completed.status, "physical_complete");
         assert!(completed.hard_delete_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_apple_deletion_stays_pending_without_revocation_provider() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let user = control
+            .upsert_apple_user(
+                "cancelled-apple-deletion-subject",
+                "owner@privaterelay.appleid.com",
+                "retained-refresh-token",
+            )
+            .await
+            .unwrap();
+        control
+            .begin_user_deletion(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        control
+            .update_user_deletion_status(&user.id, DELETION_ATTEMPT_UNCONFIRMED, None, None)
+            .await
+            .unwrap();
+
+        // Cancellation after the durable fence but before revocation must not
+        // let the restart worker delete content or finalize the account.
+        drop(store);
+        drop(control);
+        let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
+        let restarted_store = Store::new(kms, gcs);
+        let summary =
+            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
+                .await
+                .unwrap();
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.completed, 0);
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.failures, 0);
+        assert_eq!(
+            restarted_control
+                .user_status(&user.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("deleting")
+        );
+        let operation = restarted_control
+            .account_deletion_operation(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.status, "pending");
+        assert_eq!(
+            restarted_control
+                .apple_refresh_token(&user.id)
+                .await
+                .unwrap(),
+            Some("retained-refresh-token".into())
+        );
     }
 
     #[tokio::test]
@@ -1091,9 +1179,10 @@ mod tests {
         let restarted_control = ControlStore::new(kms.clone(), gcs.clone());
         let restarted_store = Store::new(kms, gcs.clone());
 
-        let summary = reconcile_pending_account_deletions(&restarted_control, &restarted_store)
-            .await
-            .unwrap();
+        let summary =
+            reconcile_pending_account_deletions(&restarted_control, &restarted_store, None)
+                .await
+                .unwrap();
         assert_eq!(summary.attempted, 0);
         assert_eq!(summary.completed, 0);
         assert_eq!(summary.pending, 0);
