@@ -148,12 +148,16 @@ Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-wa
 
 `src/archive_v3.rs` defines only audited, unit-tested format primitives for the future
 immutable archive: opaque archive/database/key/object IDs; canonical context-bound
-HKDF-SHA-256 subkeys with AES-256-GCM envelopes; bounded root/Merkle decoding; and an
+HKDF-SHA-256 subkeys with randomly nonced AES-256-GCM envelopes; bounded root/Merkle decoding; and an
 immutable-object backend contract. Key-registry entries are explicitly outside the
 archive-DEK AEAD: a canonical plaintext binds domain, archive, archive/media key kind,
 and key epoch to the DEK before KMS wrapping, and unwrap must verify those fields before
 exposing the key. New DEK holders, KMS plaintext buffers, and derived object-key buffers
-zeroize on drop and do not implement revealing debug formatting. The root-key registry
+zeroize on drop and do not implement revealing debug formatting. Random nonces are encoded
+into and covered by each envelope hash, so cross-process reuse of an object context cannot
+reuse an AES-GCM key/nonce pair before immutable storage rejects the duplicate. The
+process-local duplicate-seal guard is defense in depth, not the nonce uniqueness boundary.
+The root-key registry
 epoch/object/hash must come from the independent witness so cold recovery can unwrap the
 key before decrypting the root. This foundation makes no KMS calls and has no live Store,
 SQLite VFS, GCS, witness, route, migration,
