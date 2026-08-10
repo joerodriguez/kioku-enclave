@@ -74,6 +74,7 @@ mod acme;
 // or write authority.
 mod archive_v3;
 mod archive_v3_journal;
+mod archive_v3_operation;
 mod attestation;
 mod auth;
 mod cp;

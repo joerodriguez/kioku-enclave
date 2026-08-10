@@ -180,6 +180,17 @@ scraping into a valid capture mechanism: Phase 1 still requires a SQLite VFS shi
 observes the exact `xSync` boundary, plus independent shadow recovery and crash
 conformance.
 
+The inactive mutation ledger records a stable opaque operation ID, a domain-separated
+canonical request fingerprint, the proposed committed root sequence, an internally
+derived exact result digest, and either a bounded inline result or an opaque
+entity/version reference. Its owning batch API derives the 64-operation/1-MiB bounds from
+the exact canonical mutation bytes and commits domain SQL plus every validated ledger row
+in one SQLite transaction; any late failure rolls back both. A matching retry can
+reconstruct the prior result, while reuse with another request or result fails closed.
+This codec/table is not yet route-wired, witnessed, or eligible as idempotency evidence;
+retention and GC remain disabled until source-entity and retry-window semantics are
+implemented.
+
 Root objects are explicitly named as candidates. Crashes and CAS races may leave more
 than one immutable candidate for a sequence; none has authority unless the independent
 witness names its exact object ID and ciphertext hash, and recovery never selects one by
