@@ -47,6 +47,8 @@ const ENVELOPE_HEADER_BYTES: usize =
 
 /// The format's fixed maximum encrypted payload, excluding envelope framing.
 pub const MAX_CIPHERTEXT_BYTES: usize = 1_048_576 + GCM_TAG_BYTES;
+/// Maximum encoded envelope accepted from an immutable object transport.
+pub const MAX_ENCODED_ENVELOPE_BYTES: usize = ENVELOPE_HEADER_BYTES + MAX_CIPHERTEXT_BYTES;
 /// Node decoding is deliberately bounded independently of archive size.
 pub const MAX_NODE_BYTES: usize = 64 * 1024;
 /// Root descriptor decoding has a separately named bound, so it can never grow
@@ -73,6 +75,8 @@ pub enum ArchiveV3Error {
     Authentication,
     #[error("immutable object already exists with different ciphertext")]
     Conflict,
+    #[error("archive-v3 provider is unavailable")]
+    Unavailable,
 }
 
 pub type Result<T> = std::result::Result<T, ArchiveV3Error>;
@@ -493,6 +497,17 @@ impl ObjectKey {
     pub const fn object_id(&self) -> ObjectId {
         self.object_id
     }
+
+    /// Reconstruct an opaque key only after a provider-supplied name has
+    /// passed the strict archive-v3 canonical-name checks at the adapter
+    /// boundary.  It is crate-private so callers cannot turn arbitrary paths
+    /// into storage keys.
+    pub(crate) fn from_validated_canonical(canonical: String, object_id: ObjectId) -> Self {
+        Self {
+            canonical,
+            object_id,
+        }
+    }
 }
 
 /// Exact, archive-scoped enumeration selector.  This prevents a backend from
@@ -569,6 +584,21 @@ impl KeyRegistryContext {
             ),
             object_id,
         }
+    }
+
+    /// Canonical authenticated data for the registry KMS operation.  This is
+    /// deliberately separate from archive-object AAD: it binds the KMS
+    /// ciphertext to precisely one archive/key namespace and rotation, while
+    /// never carrying a raw DEK in any provider-visible metadata.
+    pub fn canonical_kms_aad(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(KEY_REGISTRY_DOMAIN.len() + 1 + 16 + 1 + 16 + 8);
+        out.extend_from_slice(KEY_REGISTRY_DOMAIN);
+        out.push(ARCHIVE_FORMAT_VERSION);
+        out.extend_from_slice(self.archive_id.as_bytes());
+        out.push(self.key_kind as u8);
+        out.extend_from_slice(self.key_epoch.as_bytes());
+        out.extend_from_slice(&self.rotation_generation.to_be_bytes());
+        out
     }
 }
 
@@ -734,15 +764,16 @@ impl VerifiedRegistryDek {
 /// fetches one exact immutable registry object and passes those same verified
 /// bytes to KMS; callers can never combine an independently unwrapped DEK with
 /// a different witness-nominated object.
+#[async_trait::async_trait]
 pub(crate) trait ExactKeyRegistryProvider: Send + Sync {
-    fn read_exact_wrapped(
+    async fn read_exact_wrapped(
         &self,
         context: &KeyRegistryContext,
         object_id: ObjectId,
         destination: &mut [u8],
     ) -> Result<usize>;
 
-    fn kms_unwrap_exact(
+    async fn kms_unwrap_exact(
         &self,
         context: &KeyRegistryContext,
         wrapped_registry_ciphertext: &[u8],
@@ -750,7 +781,7 @@ pub(crate) trait ExactKeyRegistryProvider: Send + Sync {
     ) -> Result<usize>;
 }
 
-pub(crate) fn resolve_archive_cipher(
+pub(crate) async fn resolve_archive_cipher(
     context: &KeyRegistryContext,
     registry_object_id: ObjectId,
     expected_ciphertext_hash: [u8; 32],
@@ -763,8 +794,9 @@ pub(crate) fn resolve_archive_cipher(
         return Err(ArchiveV3Error::InvalidContext);
     }
     let mut wrapped = Zeroizing::new([0u8; MAX_WRAPPED_KEY_REGISTRY_BYTES]);
-    let wrapped_len =
-        provider.read_exact_wrapped(context, registry_object_id, wrapped.as_mut_slice())?;
+    let wrapped_len = provider
+        .read_exact_wrapped(context, registry_object_id, wrapped.as_mut_slice())
+        .await?;
     if wrapped_len == 0 || wrapped_len > wrapped.len() {
         return Err(ArchiveV3Error::TooLarge("wrapped key registry"));
     }
@@ -773,7 +805,9 @@ pub(crate) fn resolve_archive_cipher(
         return Err(ArchiveV3Error::InvalidContext);
     }
     let mut plaintext = Zeroizing::new([0u8; KEY_REGISTRY_PLAINTEXT_BYTES]);
-    let plaintext_len = provider.kms_unwrap_exact(context, wrapped, plaintext.as_mut_slice())?;
+    let plaintext_len = provider
+        .kms_unwrap_exact(context, wrapped, plaintext.as_mut_slice())
+        .await?;
     if plaintext_len > plaintext.len() {
         return Err(ArchiveV3Error::TooLarge("key registry plaintext"));
     }
@@ -1434,8 +1468,8 @@ impl EnumerationLimit {
 /// Stable provider-neutral continuation point bound to one exact prefix.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EnumerationCursor {
-    prefix: ArchivePrefix,
-    after: ObjectKey,
+    pub(crate) prefix: ArchivePrefix,
+    pub(crate) after: ObjectKey,
 }
 
 impl fmt::Debug for EnumerationCursor {
@@ -1452,17 +1486,21 @@ pub struct EnumerationPage {
 
 /// Immutable backend contract.  Production GCS/Bigtable implementations must
 /// retain these exact semantics, including stable complete prefix enumeration.
+#[async_trait::async_trait]
 pub trait ImmutableObjectBackend: Send + Sync {
-    fn create_if_absent(&self, key: ObjectKey, value: CiphertextEnvelope)
-        -> Result<CreateIfAbsent>;
-    fn get(&self, key: &ObjectKey) -> Result<Option<CiphertextEnvelope>>;
-    fn enumerate(
+    async fn create_if_absent(
+        &self,
+        key: ObjectKey,
+        value: CiphertextEnvelope,
+    ) -> Result<CreateIfAbsent>;
+    async fn get(&self, key: &ObjectKey) -> Result<Option<CiphertextEnvelope>>;
+    async fn enumerate(
         &self,
         prefix: &ArchivePrefix,
         cursor: Option<&EnumerationCursor>,
         limit: EnumerationLimit,
     ) -> Result<EnumerationPage>;
-    fn delete_exact(&self, key: &ObjectKey) -> Result<bool>;
+    async fn delete_exact(&self, key: &ObjectKey) -> Result<bool>;
 }
 
 /// Test-only-in-spirit backend implementation with the production contract's
@@ -1479,8 +1517,9 @@ impl InMemoryImmutableBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl ImmutableObjectBackend for InMemoryImmutableBackend {
-    fn create_if_absent(
+    async fn create_if_absent(
         &self,
         key: ObjectKey,
         value: CiphertextEnvelope,
@@ -1501,7 +1540,7 @@ impl ImmutableObjectBackend for InMemoryImmutableBackend {
         }
     }
 
-    fn get(&self, key: &ObjectKey) -> Result<Option<CiphertextEnvelope>> {
+    async fn get(&self, key: &ObjectKey) -> Result<Option<CiphertextEnvelope>> {
         Ok(self
             .objects
             .lock()
@@ -1510,7 +1549,7 @@ impl ImmutableObjectBackend for InMemoryImmutableBackend {
             .cloned())
     }
 
-    fn enumerate(
+    async fn enumerate(
         &self,
         prefix: &ArchivePrefix,
         cursor: Option<&EnumerationCursor>,
@@ -1545,7 +1584,7 @@ impl ImmutableObjectBackend for InMemoryImmutableBackend {
         })
     }
 
-    fn delete_exact(&self, key: &ObjectKey) -> Result<bool> {
+    async fn delete_exact(&self, key: &ObjectKey) -> Result<bool> {
         let mut objects = self.objects.lock().expect("backend mutex poisoned");
         let removed = objects.remove(key).is_some();
         // Intentionally retain the issued object ID after deletion: object IDs
@@ -1667,8 +1706,9 @@ mod tests {
         wrapped: Vec<u8>,
         plaintext: Vec<u8>,
     }
+    #[async_trait::async_trait]
     impl ExactKeyRegistryProvider for TestRegistryProvider {
-        fn read_exact_wrapped(
+        async fn read_exact_wrapped(
             &self,
             _context: &KeyRegistryContext,
             object_id: ObjectId,
@@ -1684,7 +1724,7 @@ mod tests {
             Ok(self.wrapped.len())
         }
 
-        fn kms_unwrap_exact(
+        async fn kms_unwrap_exact(
             &self,
             _context: &KeyRegistryContext,
             wrapped_registry_ciphertext: &[u8],
@@ -1911,8 +1951,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repeated_context_across_processes_uses_independent_nonces() {
+    #[tokio::test]
+    async fn repeated_context_across_processes_uses_independent_nonces() {
         let context = extent_context(4);
         let first_process = cipher();
         let second_process = cipher();
@@ -1934,16 +1974,17 @@ mod tests {
         let backend = InMemoryImmutableBackend::new();
         backend
             .create_if_absent(context.object_key(), first)
+            .await
             .unwrap();
         assert_eq!(
-            backend.create_if_absent(context.object_key(), second),
+            backend.create_if_absent(context.object_key(), second).await,
             Err(ArchiveV3Error::Conflict),
             "immutable rejection remains a logical conflict, not the nonce-safety boundary"
         );
     }
 
-    #[test]
-    fn key_registry_is_kms_framed_context_verified_and_never_archive_encrypted() {
+    #[tokio::test]
+    async fn key_registry_is_kms_framed_context_verified_and_never_archive_encrypted() {
         let (archive, database, key_epoch) = ids();
         let registry = KeyRegistryContext::new(archive, KeyKind::Archive, key_epoch);
         let wrapped_registry = b"kms-wrapped-registry-ciphertext";
@@ -1960,7 +2001,9 @@ mod tests {
             .to_vec(),
         };
         let verified_archive_cipher =
-            resolve_archive_cipher(&registry, registry_object_id, wrapped_hash, &provider).unwrap();
+            resolve_archive_cipher(&registry, registry_object_id, wrapped_hash, &provider)
+                .await
+                .unwrap();
         assert_eq!(verified_archive_cipher.archive_id(), archive);
         assert_eq!(verified_archive_cipher.key_epoch(), key_epoch);
         assert_eq!(verified_archive_cipher.registry_rotation_generation(), 0);
@@ -2006,7 +2049,7 @@ mod tests {
         }
 
         assert!(matches!(
-            resolve_archive_cipher(&registry, registry_object_id, [0x99; 32], &provider),
+            resolve_archive_cipher(&registry, registry_object_id, [0x99; 32], &provider).await,
             Err(ArchiveV3Error::InvalidContext)
         ));
         let wrong_plaintext_provider = TestRegistryProvider {
@@ -2029,7 +2072,8 @@ mod tests {
                 registry_object_id,
                 wrapped_hash,
                 &wrong_plaintext_provider,
-            ),
+            )
+            .await,
             Err(ArchiveV3Error::InvalidContext)
         ));
         let oversized_wrapped = vec![0x55; MAX_WRAPPED_KEY_REGISTRY_BYTES + 1];
@@ -2045,7 +2089,8 @@ mod tests {
                 registry_object_id,
                 oversized_wrapped_hash,
                 &oversized_wrapped_provider,
-            ),
+            )
+            .await,
             Err(ArchiveV3Error::TooLarge("wrapped key registry"))
         ));
         let oversized_plaintext_provider = TestRegistryProvider {
@@ -2059,7 +2104,8 @@ mod tests {
                 registry_object_id,
                 wrapped_hash,
                 &oversized_plaintext_provider,
-            ),
+            )
+            .await,
             Err(ArchiveV3Error::TooLarge("key registry plaintext"))
         ));
 
@@ -2285,8 +2331,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn backend_is_linearizable_for_retries_prefix_isolated_and_delete_idempotent() {
+    #[tokio::test]
+    async fn backend_is_linearizable_for_retries_prefix_isolated_and_delete_idempotent() {
         let backend = InMemoryImmutableBackend::new();
         let first = extent_context(4);
         let (archive, database, key) = ids();
@@ -2310,21 +2356,27 @@ mod tests {
         assert_eq!(
             backend
                 .create_if_absent(first_key.clone(), first_value.clone())
+                .await
                 .unwrap(),
             CreateIfAbsent::Created
         );
         assert_eq!(
             backend
                 .create_if_absent(first_key.clone(), first_value)
+                .await
                 .unwrap(),
             CreateIfAbsent::AlreadyPresentIdentical
         );
         assert_eq!(
-            backend.create_if_absent(first_key.clone(), second_value.clone()),
+            backend
+                .create_if_absent(first_key.clone(), second_value.clone())
+                .await,
             Err(ArchiveV3Error::Conflict)
         );
         assert_eq!(
-            backend.create_if_absent(second.object_key(), second_value.clone()),
+            backend
+                .create_if_absent(second.object_key(), second_value.clone())
+                .await,
             Err(ArchiveV3Error::Conflict),
             "a duplicate object ID must conflict even at a different canonical path"
         );
@@ -2344,6 +2396,7 @@ mod tests {
         let unique_second_value = c.seal(&unique_second, &extent_payload(3)).unwrap();
         backend
             .create_if_absent(unique_second.object_key(), unique_second_value)
+            .await
             .unwrap();
 
         let same_archive_second = extent_context_for(1, 9, 5);
@@ -2353,17 +2406,20 @@ mod tests {
                 same_archive_second.object_key(),
                 c.seal(&same_archive_second, &extent_payload(4)).unwrap(),
             )
+            .await
             .unwrap();
         backend
             .create_if_absent(
                 same_archive_third.object_key(),
                 c.seal(&same_archive_third, &extent_payload(5)).unwrap(),
             )
+            .await
             .unwrap();
 
         let prefix = ArchivePrefix::for_archive(archive);
         let first_page = backend
             .enumerate(&prefix, None, EnumerationLimit::new(2).unwrap())
+            .await
             .unwrap();
         assert_eq!(first_page.objects.len(), 2);
         let cursor = first_page.next_cursor.clone().unwrap();
@@ -2373,9 +2429,11 @@ mod tests {
                 first_page.next_cursor.as_ref(),
                 EnumerationLimit::new(2).unwrap(),
             )
+            .await
             .unwrap();
         let second_page = backend
             .enumerate(&prefix, Some(&cursor), EnumerationLimit::new(2).unwrap())
+            .await
             .unwrap();
         assert_eq!(second_page, repeated, "cursor pages must be stable");
         assert_eq!(second_page.objects.len(), 1);
@@ -2387,11 +2445,13 @@ mod tests {
 
         let other_prefix = ArchivePrefix::for_archive(ArchiveId::from_bytes([6; 16]));
         assert_eq!(
-            backend.enumerate(
-                &other_prefix,
-                Some(&cursor),
-                EnumerationLimit::new(1).unwrap()
-            ),
+            backend
+                .enumerate(
+                    &other_prefix,
+                    Some(&cursor),
+                    EnumerationLimit::new(1).unwrap()
+                )
+                .await,
             Err(ArchiveV3Error::InvalidContext),
             "a cursor is bound to its exact archive prefix"
         );
@@ -2401,15 +2461,16 @@ mod tests {
                 None,
                 EnumerationLimit::new(MAX_ENUMERATION_PAGE).unwrap(),
             )
+            .await
             .unwrap();
         assert_eq!(isolated.objects.len(), 1);
         assert_eq!(
             EnumerationLimit::new(MAX_ENUMERATION_PAGE + 1),
             Err(ArchiveV3Error::TooLarge("enumeration page"))
         );
-        assert!(backend.delete_exact(&first_key).unwrap());
-        assert!(!backend.delete_exact(&first_key).unwrap());
-        assert_eq!(backend.get(&first_key).unwrap(), None);
+        assert!(backend.delete_exact(&first_key).await.unwrap());
+        assert!(!backend.delete_exact(&first_key).await.unwrap());
+        assert_eq!(backend.get(&first_key).await.unwrap(), None);
     }
 
     #[test]

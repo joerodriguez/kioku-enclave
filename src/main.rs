@@ -73,6 +73,9 @@ mod acme;
 // intentionally not connected to the live Store, SQLite VFS, witness, routes,
 // or write authority.
 mod archive_v3;
+// Inactive ADR-0022 GCS semantic adapters. A concrete GCP HTTP transport and
+// all runtime/authority wiring remain intentionally absent.
+mod archive_v3_gcs;
 mod archive_v3_journal;
 mod archive_v3_operation;
 // ADR-0022's inactive, in-memory witness contract.  It intentionally has no
