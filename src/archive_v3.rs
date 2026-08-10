@@ -37,6 +37,9 @@ const NODE_MAGIC: &[u8; 8] = b"KARNv3\0\0";
 const ROOT_MAGIC: &[u8; 8] = b"KARRv3\0\0";
 const KEY_REGISTRY_MAGIC: &[u8; 16] = b"KIOKU-KEYREG-v3\0";
 const KEY_REGISTRY_DOMAIN: &[u8] = b"kioku:archive:v3:kms-wrap\0";
+const KEY_REGISTRY_PLAINTEXT_BYTES: usize =
+    KEY_REGISTRY_MAGIC.len() + 1 + 2 + KEY_REGISTRY_DOMAIN.len() + 16 + 1 + 16 + 8 + 32;
+pub const MAX_WRAPPED_KEY_REGISTRY_BYTES: usize = 16 * 1024;
 const GCM_TAG_BYTES: usize = 16;
 const GCM_NONCE_BYTES: usize = 12;
 const ENVELOPE_HEADER_BYTES: usize =
@@ -524,6 +527,7 @@ pub struct KeyRegistryContext {
     archive_id: ArchiveId,
     key_kind: KeyKind,
     key_epoch: KeyEpoch,
+    rotation_generation: u64,
 }
 
 impl KeyRegistryContext {
@@ -532,7 +536,26 @@ impl KeyRegistryContext {
             archive_id,
             key_kind,
             key_epoch,
+            rotation_generation: 0,
         }
+    }
+
+    pub const fn with_rotation_generation(
+        archive_id: ArchiveId,
+        key_kind: KeyKind,
+        key_epoch: KeyEpoch,
+        rotation_generation: u64,
+    ) -> Self {
+        Self {
+            archive_id,
+            key_kind,
+            key_epoch,
+            rotation_generation,
+        }
+    }
+
+    pub const fn rotation_generation(&self) -> u64 {
+        self.rotation_generation
     }
 
     pub fn object_key(&self, object_id: ObjectId) -> ObjectKey {
@@ -555,6 +578,7 @@ impl fmt::Debug for KeyRegistryContext {
             .field("archive_id", &"<opaque>")
             .field("key_kind", &self.key_kind)
             .field("key_epoch", &"<opaque>")
+            .field("rotation_generation", &self.rotation_generation)
             .finish()
     }
 }
@@ -595,9 +619,7 @@ impl KeyRegistryPlaintext {
     }
 
     fn encode(context: &KeyRegistryContext, dek: &[u8; 32]) -> Zeroizing<Vec<u8>> {
-        let mut out = Zeroizing::new(Vec::with_capacity(
-            KEY_REGISTRY_MAGIC.len() + 1 + 2 + KEY_REGISTRY_DOMAIN.len() + 16 + 1 + 16 + 32,
-        ));
+        let mut out = Zeroizing::new(Vec::with_capacity(KEY_REGISTRY_PLAINTEXT_BYTES));
         out.extend_from_slice(KEY_REGISTRY_MAGIC);
         out.push(ARCHIVE_FORMAT_VERSION);
         push_u16(&mut out, KEY_REGISTRY_DOMAIN.len() as u16);
@@ -605,6 +627,7 @@ impl KeyRegistryPlaintext {
         out.extend_from_slice(context.archive_id.as_bytes());
         out.push(context.key_kind as u8);
         out.extend_from_slice(context.key_epoch.as_bytes());
+        out.extend_from_slice(&context.rotation_generation.to_be_bytes());
         out.extend_from_slice(dek);
         out
     }
@@ -616,8 +639,7 @@ impl KeyRegistryPlaintext {
         expected: &KeyRegistryContext,
     ) -> Result<VerifiedRegistryDek> {
         let input = input.as_slice();
-        let minimum = KEY_REGISTRY_MAGIC.len() + 1 + 2 + 16 + 1 + 16 + 32;
-        if input.len() < minimum {
+        if input.len() != KEY_REGISTRY_PLAINTEXT_BYTES {
             return Err(ArchiveV3Error::Malformed("key registry truncated"));
         }
         if &input[..KEY_REGISTRY_MAGIC.len()] != KEY_REGISTRY_MAGIC {
@@ -640,6 +662,7 @@ impl KeyRegistryPlaintext {
             _ => return Err(ArchiveV3Error::Malformed("key registry kind")),
         };
         let key_epoch = KeyEpoch::from_bytes(take_array(take(input, &mut offset, 16)?)?);
+        let rotation_generation = read_u64(take(input, &mut offset, 8)?)?;
         let dek = take_array(take(input, &mut offset, 32)?)?;
         if offset != input.len() {
             return Err(ArchiveV3Error::Malformed("key registry trailing bytes"));
@@ -647,10 +670,17 @@ impl KeyRegistryPlaintext {
         if archive_id != expected.archive_id
             || key_kind != expected.key_kind
             || key_epoch != expected.key_epoch
+            || rotation_generation != expected.rotation_generation
         {
             return Err(ArchiveV3Error::InvalidContext);
         }
-        Ok(VerifiedRegistryDek { key_kind, dek })
+        Ok(VerifiedRegistryDek {
+            archive_id,
+            key_kind,
+            key_epoch,
+            rotation_generation,
+            dek,
+        })
     }
 }
 
@@ -658,17 +688,37 @@ impl KeyRegistryPlaintext {
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct VerifiedRegistryDek {
     #[zeroize(skip)]
+    archive_id: ArchiveId,
+    #[zeroize(skip)]
     key_kind: KeyKind,
+    #[zeroize(skip)]
+    key_epoch: KeyEpoch,
+    #[zeroize(skip)]
+    rotation_generation: u64,
     dek: [u8; 32],
 }
 
 impl VerifiedRegistryDek {
-    pub fn into_archive_dek(self) -> Result<ArchiveDek> {
+    fn into_archive_cipher(
+        self,
+        registry_object_id: ObjectId,
+        registry_ciphertext_hash: [u8; 32],
+    ) -> Result<VerifiedArchiveCipher> {
         if self.key_kind != KeyKind::Archive {
             return Err(ArchiveV3Error::InvalidContext);
         }
         let mut verified = self;
-        Ok(ArchiveDek::from_bytes(std::mem::take(&mut verified.dek)))
+        let cipher = ArchiveCipher::from_verified_dek(ArchiveDek::from_verified_bytes(
+            std::mem::take(&mut verified.dek),
+        ));
+        Ok(VerifiedArchiveCipher {
+            archive_id: verified.archive_id,
+            key_epoch: verified.key_epoch,
+            registry_rotation_generation: verified.rotation_generation,
+            registry_object_id,
+            registry_ciphertext_hash,
+            cipher,
+        })
     }
 
     pub fn into_media_dek(self) -> Result<MediaDek> {
@@ -677,6 +727,116 @@ impl VerifiedRegistryDek {
         }
         let mut verified = self;
         Ok(MediaDek::from_bytes(std::mem::take(&mut verified.dek)))
+    }
+}
+
+/// Provider boundary for the only archive-key resolution path. The resolver
+/// fetches one exact immutable registry object and passes those same verified
+/// bytes to KMS; callers can never combine an independently unwrapped DEK with
+/// a different witness-nominated object.
+pub(crate) trait ExactKeyRegistryProvider: Send + Sync {
+    fn read_exact_wrapped(
+        &self,
+        context: &KeyRegistryContext,
+        object_id: ObjectId,
+        destination: &mut [u8],
+    ) -> Result<usize>;
+
+    fn kms_unwrap_exact(
+        &self,
+        context: &KeyRegistryContext,
+        wrapped_registry_ciphertext: &[u8],
+        destination: &mut [u8],
+    ) -> Result<usize>;
+}
+
+pub(crate) fn resolve_archive_cipher(
+    context: &KeyRegistryContext,
+    registry_object_id: ObjectId,
+    expected_ciphertext_hash: [u8; 32],
+    provider: &dyn ExactKeyRegistryProvider,
+) -> Result<VerifiedArchiveCipher> {
+    if context.key_kind != KeyKind::Archive
+        || registry_object_id.as_bytes().iter().all(|byte| *byte == 0)
+        || expected_ciphertext_hash.iter().all(|byte| *byte == 0)
+    {
+        return Err(ArchiveV3Error::InvalidContext);
+    }
+    let mut wrapped = Zeroizing::new([0u8; MAX_WRAPPED_KEY_REGISTRY_BYTES]);
+    let wrapped_len =
+        provider.read_exact_wrapped(context, registry_object_id, wrapped.as_mut_slice())?;
+    if wrapped_len == 0 || wrapped_len > wrapped.len() {
+        return Err(ArchiveV3Error::TooLarge("wrapped key registry"));
+    }
+    let wrapped = &wrapped[..wrapped_len];
+    if <[u8; 32]>::from(Sha256::digest(wrapped)) != expected_ciphertext_hash {
+        return Err(ArchiveV3Error::InvalidContext);
+    }
+    let mut plaintext = Zeroizing::new([0u8; KEY_REGISTRY_PLAINTEXT_BYTES]);
+    let plaintext_len = provider.kms_unwrap_exact(context, wrapped, plaintext.as_mut_slice())?;
+    if plaintext_len > plaintext.len() {
+        return Err(ArchiveV3Error::TooLarge("key registry plaintext"));
+    }
+    if plaintext_len != plaintext.len() {
+        return Err(ArchiveV3Error::InvalidContext);
+    }
+    KeyRegistryPlaintext::decode_verified(Zeroizing::new(plaintext.to_vec()), context)?
+        .into_archive_cipher(registry_object_id, expected_ciphertext_hash)
+}
+
+/// Archive cipher whose DEK, logical key context, and exact wrapped registry
+/// object/hash were verified together before use.
+pub struct VerifiedArchiveCipher {
+    archive_id: ArchiveId,
+    key_epoch: KeyEpoch,
+    registry_rotation_generation: u64,
+    registry_object_id: ObjectId,
+    registry_ciphertext_hash: [u8; 32],
+    cipher: ArchiveCipher,
+}
+
+impl VerifiedArchiveCipher {
+    pub const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub const fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+
+    pub const fn registry_rotation_generation(&self) -> u64 {
+        self.registry_rotation_generation
+    }
+
+    pub const fn registry_object_id(&self) -> ObjectId {
+        self.registry_object_id
+    }
+
+    pub const fn registry_ciphertext_hash(&self) -> [u8; 32] {
+        self.registry_ciphertext_hash
+    }
+
+    pub fn seal(&self, context: &ObjectContext, plaintext: &[u8]) -> Result<CiphertextEnvelope> {
+        self.validate_context(context)?;
+        self.cipher.seal(context, plaintext)
+    }
+
+    pub fn open(&self, context: &ObjectContext, envelope: &CiphertextEnvelope) -> Result<Vec<u8>> {
+        self.validate_context(context)?;
+        self.cipher.open(context, envelope)
+    }
+
+    fn validate_context(&self, context: &ObjectContext) -> Result<()> {
+        if context.archive_id() != self.archive_id || context.key_epoch() != self.key_epoch {
+            return Err(ArchiveV3Error::InvalidContext);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for VerifiedArchiveCipher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedArchiveCipher(<redacted>)")
     }
 }
 
@@ -744,13 +904,19 @@ impl CiphertextEnvelope {
 pub struct ArchiveDek([u8; 32]);
 
 impl ArchiveDek {
+    #[cfg(test)]
     pub fn generate() -> Self {
         let mut value = [0u8; 32];
         OsRng.fill_bytes(&mut value);
         Self(value)
     }
 
+    #[cfg(test)]
     pub const fn from_bytes(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
+    const fn from_verified_bytes(value: [u8; 32]) -> Self {
         Self(value)
     }
 }
@@ -764,7 +930,12 @@ pub struct ArchiveCipher {
 }
 
 impl ArchiveCipher {
+    #[cfg(test)]
     pub fn new(dek: ArchiveDek) -> Self {
+        Self::from_verified_dek(dek)
+    }
+
+    fn from_verified_dek(dek: ArchiveDek) -> Self {
         Self {
             dek,
             sealed_contexts: Mutex::new(HashSet::new()),
@@ -1491,6 +1662,45 @@ fn decode_optional_reference(
 mod tests {
     use super::*;
 
+    struct TestRegistryProvider {
+        object_id: ObjectId,
+        wrapped: Vec<u8>,
+        plaintext: Vec<u8>,
+    }
+    impl ExactKeyRegistryProvider for TestRegistryProvider {
+        fn read_exact_wrapped(
+            &self,
+            _context: &KeyRegistryContext,
+            object_id: ObjectId,
+            destination: &mut [u8],
+        ) -> Result<usize> {
+            if object_id != self.object_id {
+                return Err(ArchiveV3Error::InvalidContext);
+            }
+            if self.wrapped.len() > destination.len() {
+                return Ok(self.wrapped.len());
+            }
+            destination[..self.wrapped.len()].copy_from_slice(&self.wrapped);
+            Ok(self.wrapped.len())
+        }
+
+        fn kms_unwrap_exact(
+            &self,
+            _context: &KeyRegistryContext,
+            wrapped_registry_ciphertext: &[u8],
+            destination: &mut [u8],
+        ) -> Result<usize> {
+            if wrapped_registry_ciphertext != self.wrapped {
+                return Err(ArchiveV3Error::InvalidContext);
+            }
+            if self.plaintext.len() > destination.len() {
+                return Ok(self.plaintext.len());
+            }
+            destination[..self.plaintext.len()].copy_from_slice(&self.plaintext);
+            Ok(self.plaintext.len())
+        }
+    }
+
     fn ids() -> (ArchiveId, DatabaseEpoch, KeyEpoch) {
         (
             ArchiveId::from_bytes([1; 16]),
@@ -1736,14 +1946,42 @@ mod tests {
     fn key_registry_is_kms_framed_context_verified_and_never_archive_encrypted() {
         let (archive, database, key_epoch) = ids();
         let registry = KeyRegistryContext::new(archive, KeyKind::Archive, key_epoch);
-        let encoded =
-            KeyRegistryPlaintext::encode_archive(&registry, &ArchiveDek::from_bytes([9; 32]))
-                .unwrap();
-        let verified = KeyRegistryPlaintext::decode_verified(encoded, &registry).unwrap();
-        assert_eq!(verified.into_archive_dek().unwrap().0, [9; 32]);
+        let wrapped_registry = b"kms-wrapped-registry-ciphertext";
+        let wrapped_hash: [u8; 32] = Sha256::digest(wrapped_registry).into();
+        let registry_object_id = ObjectId::from_bytes([4; 16]);
+        let provider = TestRegistryProvider {
+            object_id: registry_object_id,
+            wrapped: wrapped_registry.to_vec(),
+            plaintext: KeyRegistryPlaintext::encode_archive(
+                &registry,
+                &ArchiveDek::from_bytes([9; 32]),
+            )
+            .unwrap()
+            .to_vec(),
+        };
+        let verified_archive_cipher =
+            resolve_archive_cipher(&registry, registry_object_id, wrapped_hash, &provider).unwrap();
+        assert_eq!(verified_archive_cipher.archive_id(), archive);
+        assert_eq!(verified_archive_cipher.key_epoch(), key_epoch);
+        assert_eq!(verified_archive_cipher.registry_rotation_generation(), 0);
+        assert_eq!(
+            verified_archive_cipher.registry_object_id(),
+            registry_object_id
+        );
+        assert_eq!(
+            verified_archive_cipher.registry_ciphertext_hash(),
+            wrapped_hash
+        );
+        let context = extent_context(4);
+        let payload = extent_payload(9);
+        let envelope = verified_archive_cipher.seal(&context, &payload).unwrap();
+        assert_eq!(
+            verified_archive_cipher.open(&context, &envelope).unwrap(),
+            payload
+        );
         assert_eq!(
             registry
-                .object_key(ObjectId::from_bytes([4; 16]))
+                .object_key(registry_object_id)
                 .as_str(),
             "archive/v3/01010101010101010101010101010101/keys/archive/03030303030303030303030303030303/04040404040404040404040404040404.keyx"
         );
@@ -1752,6 +1990,7 @@ mod tests {
             KeyRegistryContext::new(ArchiveId::from_bytes([8; 16]), KeyKind::Archive, key_epoch),
             KeyRegistryContext::new(archive, KeyKind::Media, key_epoch),
             KeyRegistryContext::new(archive, KeyKind::Archive, KeyEpoch::from_bytes([8; 16])),
+            KeyRegistryContext::with_rotation_generation(archive, KeyKind::Archive, key_epoch, 1),
         ] {
             assert!(matches!(
                 KeyRegistryPlaintext::decode_verified(
@@ -1765,6 +2004,64 @@ mod tests {
                 Err(ArchiveV3Error::InvalidContext)
             ));
         }
+
+        assert!(matches!(
+            resolve_archive_cipher(&registry, registry_object_id, [0x99; 32], &provider),
+            Err(ArchiveV3Error::InvalidContext)
+        ));
+        let wrong_plaintext_provider = TestRegistryProvider {
+            object_id: registry_object_id,
+            wrapped: wrapped_registry.to_vec(),
+            plaintext: KeyRegistryPlaintext::encode_archive(
+                &KeyRegistryContext::new(
+                    ArchiveId::from_bytes([8; 16]),
+                    KeyKind::Archive,
+                    key_epoch,
+                ),
+                &ArchiveDek::from_bytes([9; 32]),
+            )
+            .unwrap()
+            .to_vec(),
+        };
+        assert!(matches!(
+            resolve_archive_cipher(
+                &registry,
+                registry_object_id,
+                wrapped_hash,
+                &wrong_plaintext_provider,
+            ),
+            Err(ArchiveV3Error::InvalidContext)
+        ));
+        let oversized_wrapped = vec![0x55; MAX_WRAPPED_KEY_REGISTRY_BYTES + 1];
+        let oversized_wrapped_hash: [u8; 32] = Sha256::digest(&oversized_wrapped).into();
+        let oversized_wrapped_provider = TestRegistryProvider {
+            object_id: registry_object_id,
+            wrapped: oversized_wrapped,
+            plaintext: provider.plaintext.clone(),
+        };
+        assert!(matches!(
+            resolve_archive_cipher(
+                &registry,
+                registry_object_id,
+                oversized_wrapped_hash,
+                &oversized_wrapped_provider,
+            ),
+            Err(ArchiveV3Error::TooLarge("wrapped key registry"))
+        ));
+        let oversized_plaintext_provider = TestRegistryProvider {
+            object_id: registry_object_id,
+            wrapped: wrapped_registry.to_vec(),
+            plaintext: vec![0x66; KEY_REGISTRY_PLAINTEXT_BYTES + 1],
+        };
+        assert!(matches!(
+            resolve_archive_cipher(
+                &registry,
+                registry_object_id,
+                wrapped_hash,
+                &oversized_plaintext_provider,
+            ),
+            Err(ArchiveV3Error::TooLarge("key registry plaintext"))
+        ));
 
         let archive_object_context = ObjectContext::new(
             archive,

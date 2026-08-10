@@ -172,14 +172,30 @@ key before decrypting the root. This foundation makes no KMS calls and has no li
 SQLite VFS, GCS, witness, route, migration,
 export, or deletion wiring. The legacy context-bound v2 database blob remains the sole
 production authority. `src/archive_v3_witness.rs` additionally defines a compiled,
-in-memory-only content-free witness contract: fixed-size records nominate one exact root
-and archive-key-registry object/hash, including the root parent/database/key/fence
-commitment and the durable owner, current/next fencing epoch, server-derived lease expiry,
-and deletion-evidence commitment needed after restart. Its trusted-clock API never accepts
-caller-selected time; tombstoning invalidates normal ownership and later deletion states
-require opaque key-erasure, inventory, and retention commitments. Fenced compare-and-
-advance, direct large-archive extent shadowing, database-epoch predecessor retention,
-migration/deletion, and key-rotation transitions are linearizable only in the test model.
+in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
+read the exact immutable root object back through a provider boundary, authenticate and
+decrypt that stored envelope, validate its `ArchiveRoot` against the
+full `ObjectContext`, and require one provider resolver to fetch/hash the exact
+witness-nominated wrapped key-registry object, pass those same bytes to KMS unwrap, verify
+the unwrapped plaintext context, and retain that binding before deriving the
+object/hash/parent/database/key/fence commitment.
+Fixed-size records durably retain the owner, current/next fencing epoch, server-derived
+lease expiry, full predecessor root and key-registry reference, and an append-only
+four-stage deletion-evidence chain. Its trusted-clock API never accepts caller-selected
+time; tombstoning invalidates ordinary recovery/ownership, while a deletion-only restart
+path requires provider authentication on every step, matches the exact durable
+worker/operation identity derived from that opaque credential (never from persisted IDs),
+and accepts only provider-verified stage proofs whose canonical commitments bind the
+archive, operation identity, deletion fence, target state, root, registry, prior evidence,
+and provider proof commitment. Database-epoch cutover requires extent authority, derives a
+never-reused next epoch from the durable generation/current root, consumes that gate into a
+post-cutover state, retains the predecessor, and only then permits legacy retirement. A
+durable decoder rejects any lifecycle field combination that could reopen the consumed
+gate; this inactive v3 contract deliberately permits only that one bounded cutover. A
+registry generation authenticated inside the KMS plaintext prevents key rollback.
+Fenced compare-and-advance, direct
+large-archive extent shadowing, migration/deletion, database-epoch rollback, and
+key-rotation transitions are linearizable only in the test model.
 It has no GCS/Firestore
 client, Store/VFS/route connection, or production authority. Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
