@@ -2296,6 +2296,14 @@ async fn rest_screenshot_image_upload(
         }
     };
 
+    // Retain one admission lease from preflight through the durable record.
+    // Its owned PUT child prevents cancellation from letting deletion finish
+    // before an admitted evidence object has a definite provider outcome.
+    let _content_write = match s.store.acquire_content_write(&user_id).await {
+        Ok(lease) => lease,
+        Err(error) => return error.into_response(),
+    };
+
     // Reject ineligible bytes before KMS, encryption, or object storage. The
     // same predicate runs again under BEGIN IMMEDIATE when recording the row.
     let user_id_cloned = user_id.clone();
@@ -2429,13 +2437,26 @@ async fn rest_screenshot_image_upload(
         };
 
     // 3. Upload to GCS
-    if let Err(e) = s
-        .store
-        .put_media(&object_key, &encrypted_data, &wrapped_b64)
-        .await
-    {
-        tracing::error!(error = %e, "media upload GCS write failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+    let put_lease = _content_write.child();
+    let put_store = Arc::clone(&s.store);
+    let put_object_key = object_key.clone();
+    let put_wrapped_b64 = wrapped_b64.clone();
+    let put = tokio::spawn(async move {
+        let _put_lease = put_lease;
+        put_store
+            .put_media(&put_object_key, &encrypted_data, &put_wrapped_b64)
+            .await
+    });
+    match put.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "media upload GCS write failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "media upload GCS task failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
     }
 
     // 4. Revalidate eligibility and episode budgets transactionally, then

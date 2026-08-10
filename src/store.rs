@@ -44,7 +44,8 @@
 //! path is derived (defense in depth).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Once, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -168,6 +169,12 @@ struct UserHandle {
 pub struct Store {
     registry: Mutex<StoreRegistry>,
     registry_changed: Arc<Notify>,
+    /// Admission barrier for operations which can create a raw object outside
+    /// the SQLite actor.  It is deliberately separate from the async actor
+    /// mutex so a GCS PUT can remain in an owned task without holding a SQLite
+    /// connection, while deletion can still atomically close admission and
+    /// wait for every admitted writer to settle.
+    content_write_barrier: Arc<ContentWriteBarrier>,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     pub media_gcs: Arc<dyn GcsClient>,
@@ -213,15 +220,74 @@ struct StoreRegistry {
     /// Process-local deletion fence. Once set, in-flight requests that passed
     /// authentication cannot recreate or save this user's content.
     blocked_users: HashSet<UserId>,
-    /// Exact media inventory captured before deletion I/O. Keeping it outside
-    /// the open-handle cache lets a failed deletion release scarce SQLite
-    /// capacity without forgetting locally committed-but-unsaved media keys.
-    pending_deletion_media: HashMap<UserId, Arc<[String]>>,
     /// Bounded completion markers make `with_user(...); save_user(...)`
     /// idempotent when an unrelated cache miss evicts and flushes that handle
     /// in between the two calls.
     recent_clean_evictions: HashMap<UserId, u64>,
     access_clock: u64,
+}
+
+#[derive(Default)]
+struct ContentWriteBarrierState {
+    blocked_users: HashSet<UserId>,
+    active_writes: HashMap<UserId, usize>,
+}
+
+struct ContentWriteBarrier {
+    state: std::sync::Mutex<ContentWriteBarrierState>,
+    changed: Notify,
+}
+
+impl Default for ContentWriteBarrier {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ContentWriteBarrierState::default()),
+            changed: Notify::new(),
+        }
+    }
+}
+
+/// Keeps an admitted raw-content operation visible to account deletion.  It
+/// can be moved into an owned GCS task, so request cancellation never lets
+/// deletion outrun a PUT whose provider outcome is still unknown.
+pub struct ContentWriteLease {
+    barrier: Arc<ContentWriteBarrier>,
+    user_id: UserId,
+}
+
+impl ContentWriteLease {
+    /// A child lease is intentionally allowed after the user is fenced: its
+    /// parent was admitted before the fence and deletion must wait for both.
+    pub fn child(&self) -> Self {
+        let mut state = self.barrier.state.lock().expect("content barrier poisoned");
+        let count = state.active_writes.entry(self.user_id.clone()).or_default();
+        *count = count.saturating_add(1);
+        Self {
+            barrier: Arc::clone(&self.barrier),
+            user_id: self.user_id.clone(),
+        }
+    }
+}
+
+impl Drop for ContentWriteLease {
+    fn drop(&mut self) {
+        let mut state = self.barrier.state.lock().expect("content barrier poisoned");
+        let remove = match state.active_writes.get_mut(&self.user_id) {
+            Some(count) => {
+                debug_assert!(*count > 0, "content-write lease underflow");
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if remove {
+            state.active_writes.remove(&self.user_id);
+            // Retain a permit if the deletion waiter has created its future
+            // but has not yet polled it. This closes the check-then-wait gap
+            // without making the barrier dependent on executor timing.
+            self.barrier.changed.notify_one();
+        }
+    }
 }
 
 struct OpenUser {
@@ -457,11 +523,11 @@ impl Store {
                 actors: HashMap::new(),
                 open_users: HashMap::new(),
                 blocked_users: HashSet::new(),
-                pending_deletion_media: HashMap::new(),
                 recent_clean_evictions: HashMap::new(),
                 access_clock: 0,
             }),
             registry_changed: Arc::new(Notify::new()),
+            content_write_barrier: Arc::new(ContentWriteBarrier::default()),
             kms,
             gcs,
             media_gcs,
@@ -558,7 +624,11 @@ impl Store {
         let mut progress = LegacyCheckpointReconciliation::default();
         let now = (self.checkpoint_clock)();
         let mut page_token = None;
-        let mut seen_page_tokens = HashSet::new();
+        // Keep fixed-size fingerprints rather than retaining every opaque
+        // provider cursor. A repeated cursor always maps to the same bit and
+        // fails closed; a collision can only stop a pass early, never let an
+        // incomplete listing assert readiness.
+        let mut seen_cursor_fingerprints = [0_u64; GCS_CURSOR_FINGERPRINT_WORDS];
         for _ in 0..MAX_GCS_LIST_PAGES {
             let page = match self
                 .gcs
@@ -578,6 +648,18 @@ impl Store {
                     return self
                         .finish_legacy_checkpoint_reconciliation(progress, false)
                         .await;
+                };
+                // This uses the same admission barrier as raw media writes.
+                // A concurrent account deletion either waits for this exact
+                // copy/verification or prevents it from starting before its
+                // recovery-prefix inventory becomes authoritative.
+                let _lease = match self.acquire_content_write(&user_id).await {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await
+                    }
                 };
                 let live = match self.gcs.get_object(&listed.name).await {
                     Ok(live) => live,
@@ -610,11 +692,19 @@ impl Store {
                 progress.checkpoints_verified = progress.checkpoints_verified.saturating_add(1);
             }
             match page.next_page_token {
-                Some(next) if seen_page_tokens.insert(next.clone()) => page_token = Some(next),
-                Some(_) => {
-                    return self
-                        .finish_legacy_checkpoint_reconciliation(progress, false)
-                        .await
+                Some(next) => {
+                    let mut hasher = DefaultHasher::new();
+                    next.hash(&mut hasher);
+                    let fingerprint = (hasher.finish() as usize) % GCS_CURSOR_FINGERPRINT_BITS;
+                    let word = fingerprint / u64::BITS as usize;
+                    let mask = 1_u64 << (fingerprint % u64::BITS as usize);
+                    if seen_cursor_fingerprints[word] & mask != 0 {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await;
+                    }
+                    seen_cursor_fingerprints[word] |= mask;
+                    page_token = Some(next);
                 }
                 None => {
                     progress.completed_scans = 1;
@@ -660,6 +750,51 @@ impl Store {
         self.media_gcs
             .put_object(name, data, wrapped_dek_b64, generation)
             .await
+    }
+
+    /// Admit a raw-content write before it performs its first preflight, KMS,
+    /// or GCS operation. The returned lease must remain alive through the
+    /// durable database save; move a child into an owned provider task when a
+    /// request cancellation must not abandon an in-flight PUT.
+    pub async fn acquire_content_write(&self, user_id: &str) -> Result<ContentWriteLease> {
+        validate_user_id(user_id)?;
+        let mut state = self
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        if state.blocked_users.contains(user_id) {
+            return Err(deleted_user_error());
+        }
+        let count = state.active_writes.entry(user_id.to_string()).or_default();
+        *count = count.saturating_add(1);
+        Ok(ContentWriteLease {
+            barrier: Arc::clone(&self.content_write_barrier),
+            user_id: user_id.to_string(),
+        })
+    }
+
+    /// Atomically prohibit future content writes and wait for every writer
+    /// admitted before the fence to settle. This is intentionally invoked
+    /// before the actor deletion fence so a request cannot pass a preflight,
+    /// start a raw PUT, and then recreate content after deletion inventory.
+    async fn block_content_writes_for_deletion(&self, user_id: &str) {
+        loop {
+            let notified = self.content_write_barrier.changed.notified();
+            let pending = {
+                let mut state = self
+                    .content_write_barrier
+                    .state
+                    .lock()
+                    .expect("content barrier poisoned");
+                state.blocked_users.insert(user_id.to_string());
+                state.active_writes.get(user_id).copied().unwrap_or(0)
+            };
+            if pending == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub async fn get_media(&self, name: &str) -> Result<crate::store::GcsGetResponse> {
@@ -792,44 +927,33 @@ impl Store {
     pub async fn delete_user(&self, user_id: &str) -> Result<()> {
         validate_user_id(user_id)?;
 
+        // Raw media PUTs do not hold the SQLite actor while they await GCS.
+        // Close that independent admission path first, then wait for every
+        // already-admitted request (including an owned, cancellation-safe PUT)
+        // to settle before inventory can become authoritative.
+        self.block_content_writes_for_deletion(user_id).await;
+
         // Install the fence before waiting for any in-flight same-user work.
         // Existing work may finish; later work re-checks after winning the
         // actor lock and fails without recreating or saving the account.
         let actor = self.actor_for_deletion(user_id).await;
         let mut state = actor.state.lock().await;
 
-        // 1. Query for GCS media keys to clean up. Persist the exact inventory
-        // in the process-local deletion state before issuing any delete. A
-        // retry after partial failure can therefore release the SQLite handle
-        // (and its max-open slot) without losing locally-only media references.
-        let saved_inventory = self
-            .registry
-            .lock()
-            .await
-            .pending_deletion_media
-            .get(user_id)
-            .cloned();
-        let keys_to_delete = if let Some(keys) = saved_inventory {
-            keys
-        } else {
-            if state.handle.is_none() {
-                self.ensure_loaded(user_id, &actor, &mut state).await?;
-            }
-            let keys: Arc<[String]> = media_keys(
-                &state
-                    .handle
-                    .as_ref()
-                    .ok_or_else(|| EnclaveError::Store("delete load lost its handle".into()))?
-                    .conn,
-            )?
-            .into();
-            self.registry
-                .lock()
-                .await
-                .pending_deletion_media
-                .insert(user_id.to_string(), Arc::clone(&keys));
-            keys
-        };
+        // 1. Make the exact deletion inventory durable before any remote
+        // delete. A failed delete can then evict this handle without losing a
+        // locally committed media reference across restart: the still-present
+        // authoritative user DB is sufficient to rebuild the inventory.
+        if state.handle.is_none() {
+            self.ensure_loaded(user_id, &actor, &mut state).await?;
+        }
+        let handle = state
+            .handle
+            .as_mut()
+            .ok_or_else(|| EnclaveError::Store("delete load lost its handle".into()))?;
+        if handle.dirty || handle.blob_meta.retry_save_before_access {
+            self.flush_handle(handle).await?;
+        }
+        let keys_to_delete: Arc<[String]> = media_keys(&handle.conn)?.into();
 
         // The exact inventory is now independent of the live Connection, so
         // release its max-open slot before any slow remote deletion. The GCS
@@ -882,11 +1006,6 @@ impl Store {
             return Err(soft_deleted_account_objects_error(soft_deleted));
         }
 
-        self.registry
-            .lock()
-            .await
-            .pending_deletion_media
-            .remove(user_id);
         Ok(())
     }
 
@@ -2989,6 +3108,8 @@ pub trait GcsClient: Send + Sync {
 
 const GCS_LIST_PAGE_SIZE: usize = 1_000;
 const MAX_GCS_LIST_PAGES: usize = 1_000_000;
+const GCS_CURSOR_FINGERPRINT_BITS: usize = 1 << 18;
+const GCS_CURSOR_FINGERPRINT_WORDS: usize = GCS_CURSOR_FINGERPRINT_BITS / u64::BITS as usize;
 /// Historical Phase-0 inventory still decrypts one whole legacy SQLite
 /// snapshot. Reject larger generations before download until the streaming
 /// archive converter replaces this compatibility path.
@@ -4729,21 +4850,19 @@ pub(crate) mod tests {
             let store = self.objects.lock().unwrap();
             let mut versions = store
                 .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
                 .filter_map(|(name, objects)| {
-                    name.starts_with(prefix).then(|| {
-                        objects
-                            .iter()
-                            .rev()
-                            .find(|object| object.live)
-                            .map(|object| GcsObjectVersion {
-                                name: name.clone(),
-                                generation: object.generation,
-                                size: object.ciphertext.len() as u64,
-                                hard_delete_time: None,
-                            })
-                    })
+                    objects
+                        .iter()
+                        .rev()
+                        .find(|object| object.live)
+                        .map(|object| GcsObjectVersion {
+                            name: name.clone(),
+                            generation: object.generation,
+                            size: object.ciphertext.len() as u64,
+                            hard_delete_time: None,
+                        })
                 })
-                .flatten()
                 .collect::<Vec<_>>();
             versions.sort_by(|left, right| left.name.cmp(&right.name));
             let end = (start + PAGE_SIZE).min(versions.len());
@@ -4853,9 +4972,16 @@ pub(crate) mod tests {
     struct BlockingPutGcs {
         inner: Arc<FakeGcs>,
         target: String,
+        operation: BlockingGcsOperation,
         block_once: AtomicBool,
         started: Notify,
         release: Semaphore,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BlockingGcsOperation {
+        Put,
+        Copy,
     }
 
     impl BlockingPutGcs {
@@ -4863,6 +4989,18 @@ pub(crate) mod tests {
             Self {
                 inner,
                 target,
+                operation: BlockingGcsOperation::Put,
+                block_once: AtomicBool::new(true),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+            }
+        }
+
+        fn copy_to(inner: Arc<FakeGcs>, target: String) -> Self {
+            Self {
+                inner,
+                target,
+                operation: BlockingGcsOperation::Copy,
                 block_once: AtomicBool::new(true),
                 started: Notify::new(),
                 release: Semaphore::new(0),
@@ -4891,7 +5029,10 @@ pub(crate) mod tests {
             wrapped_dek_b64: &str,
             if_generation_match: i64,
         ) -> crate::error::Result<i64> {
-            if object_name == self.target && self.block_once.swap(false, Ordering::SeqCst) {
+            if self.operation == BlockingGcsOperation::Put
+                && object_name == self.target
+                && self.block_once.swap(false, Ordering::SeqCst)
+            {
                 self.started.notify_one();
                 self.release
                     .acquire()
@@ -4929,6 +5070,17 @@ pub(crate) mod tests {
             source_generation: i64,
             destination_object_name: &str,
         ) -> crate::error::Result<GcsGenerationCopy> {
+            if self.operation == BlockingGcsOperation::Copy
+                && destination_object_name == self.target
+                && self.block_once.swap(false, Ordering::SeqCst)
+            {
+                self.started.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| EnclaveError::Store("test GCS gate closed".into()))?
+                    .forget();
+            }
             self.inner
                 .copy_generation_if_absent(
                     source_object_name,
@@ -5457,6 +5609,68 @@ pub(crate) mod tests {
             1,
             "retry must not overwrite the immutable checkpoint"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_waits_for_reconciliation_copy_before_recovery_inventory() {
+        let inner = Arc::new(FakeGcs::new());
+        // Seed a valid encrypted database and a day-one checkpoint. Reconcile
+        // on day two so it must create a new immutable recovery copy.
+        let seed = store_with_checkpoint_time(Arc::clone(&inner), 1_767_268_800);
+        write_and_save(&seed, "checkpoint-delete-race", "seed")
+            .await
+            .expect("seed encrypted user database");
+        drop(seed);
+
+        let checkpoint_time = 1_767_355_200;
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "checkpoint-delete-race",
+            UNIX_EPOCH + Duration::from_secs(checkpoint_time),
+        );
+        let blocked = Arc::new(BlockingPutGcs::copy_to(
+            Arc::clone(&inner),
+            checkpoint.clone(),
+        ));
+        let mut raw_store =
+            make_store_with_limit(Arc::new(FakeKms), blocked.clone(), inner.clone(), 1);
+        raw_store.checkpoint_clock =
+            Arc::new(move || UNIX_EPOCH + Duration::from_secs(checkpoint_time));
+        let store = Arc::new(raw_store);
+
+        let reconcile_store = Arc::clone(&store);
+        let reconcile = tokio::spawn(async move {
+            reconcile_store
+                .reconcile_legacy_recovery_checkpoints_once()
+                .await
+        });
+        blocked.wait_until_blocked().await;
+
+        let delete_store = Arc::clone(&store);
+        let mut deletion =
+            tokio::spawn(async move { delete_store.delete_user("checkpoint-delete-race").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait until its reconciliation copy has settled"
+        );
+
+        blocked.release();
+        reconcile
+            .await
+            .expect("reconciler task panicked")
+            .expect("reconciler failed after copy release");
+        deletion
+            .await
+            .expect("deletion task panicked")
+            .expect("deletion failed after reconciliation settled");
+        assert_eq!(inner.version_count(&checkpoint), 0);
+        assert!(inner
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|name| !name.starts_with("legacy-recovery/checkpoint-delete-race/")));
     }
 
     #[tokio::test]
@@ -6524,6 +6738,62 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_content_put_child_lease_keeps_deletion_behind_provider_settlement() {
+        let database_gcs = Arc::new(FakeGcs::new());
+        let media_inner = Arc::new(FakeGcs::new());
+        let media_name = "raw/content-lease-user/late.enc";
+        let blocked_media = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&media_inner),
+            media_name.to_string(),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            database_gcs,
+            blocked_media.clone(),
+            1,
+        ));
+
+        let request_lease = store
+            .acquire_content_write("content-lease-user")
+            .await
+            .expect("admit content write");
+        let put_lease = request_lease.child();
+        let put_store = Arc::clone(&store);
+        let put = tokio::spawn(async move {
+            let _put_lease = put_lease;
+            put_store
+                .put_media(media_name, b"ciphertext", "wrapped")
+                .await
+        });
+        blocked_media.wait_until_blocked().await;
+
+        // Model an aborted HTTP request: its owned provider task continues.
+        drop(request_lease);
+        let delete_store = Arc::clone(&store);
+        let mut deletion =
+            tokio::spawn(async move { delete_store.delete_user("content-lease-user").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait for an admitted provider PUT"
+        );
+
+        blocked_media.release();
+        put.await
+            .expect("owned provider PUT panicked")
+            .expect("owned provider PUT failed");
+        deletion
+            .await
+            .expect("deletion task panicked")
+            .expect("deletion failed after provider settlement");
+        assert!(matches!(
+            media_inner.get_object(media_name).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deletion_fence_wins_against_an_inflight_first_load() {
         let inner = Arc::new(FakeGcs::new());
         let blocked = Arc::new(BlockingGetGcs::new(
@@ -6752,7 +7022,6 @@ pub(crate) mod tests {
             actors: HashMap::new(),
             open_users: HashMap::new(),
             blocked_users: HashSet::new(),
-            pending_deletion_media: HashMap::new(),
             recent_clean_evictions: HashMap::new(),
             access_clock: 0,
         };
@@ -6763,7 +7032,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn failed_deletion_releases_capacity_without_losing_retry_inventory() {
+    async fn failed_deletion_durably_flushes_local_media_inventory_for_restart_retry() {
         let database_gcs = Arc::new(FakeGcs::new());
         let media_inner = Arc::new(FakeGcs::new());
         let media_key = "media/local-only";
@@ -6810,46 +7079,27 @@ pub(crate) mod tests {
                 registry.open_users.is_empty(),
                 "failed delete pinned capacity"
             );
-            assert_eq!(
-                registry
-                    .pending_deletion_media
-                    .get("delete-user")
-                    .map(AsRef::as_ref),
-                Some([media_key.to_string()].as_slice())
-            );
         }
 
-        // Phase 0d deliberately has no durable deletion ledger: a restarted
-        // Store does not inherit this locally-only inventory. The remote DB is
-        // retained on failure, but unsaved media keys require the later
-        // encrypted ADR-0022 deletion ledger for crash-safe recovery.
+        // The forced pre-delete snapshot is the durable inventory. A new Store
+        // must rederive and delete the locally-created key without relying on
+        // any process-local deletion state.
+        assert!(database_gcs
+            .get_object(&gcs_object_name("delete-user"))
+            .await
+            .is_ok());
+        drop(store);
         let restarted =
             make_store_with_limit(Arc::new(FakeKms), database_gcs, failing_media.clone(), 1);
-        assert!(restarted
-            .registry
-            .lock()
-            .await
-            .pending_deletion_media
-            .is_empty());
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            store.with_user("unrelated-user", |_| Ok(())).await?;
-            store.save_user("unrelated-user").await
+            restarted.delete_user("delete-user").await
         })
         .await
-        .expect("blocked failed deletion starved the only open slot")
-        .expect("unrelated user failed after deletion error");
-
-        store
-            .delete_user("delete-user")
-            .await
-            .expect("deletion retry should use retained media inventory");
+        .expect("restart retry stalled")
+        .expect("restart retry lost local media inventory");
         assert_eq!(failing_media.delete_calls.load(Ordering::SeqCst), 2);
         assert!(!media_inner.objects.lock().unwrap().contains_key(media_key));
-        let registry = store.registry.lock().await;
-        assert!(!registry.pending_deletion_media.contains_key("delete-user"));
-        assert_eq!(registry.open_users.len(), 1);
-        assert!(registry.open_users.contains_key("unrelated-user"));
     }
 
     #[tokio::test]
