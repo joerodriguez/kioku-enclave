@@ -27,7 +27,11 @@
 //!   - `google.subject` == the Confidential Space workload identity
 //!   - `attribute.image_digest` == the published, provenance-verified digest
 //!
-//! No human principal has decrypt permission on the KEK.
+//! Production deployment policy is expected to pair the digest-scoped allow binding
+//! with a project-level deny of direct KMS decrypt for every other principal. That
+//! removes standing inherited decrypt authority, but project control-plane admins can
+//! still change policy; see `SECURITY.md` rather than treating source code as proof of
+//! operator-independent key control.
 
 use aes_gcm::{
     aead::{Aead, OsRng},
