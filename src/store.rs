@@ -4739,6 +4739,7 @@ pub(crate) mod tests {
                                 name: name.clone(),
                                 generation: object.generation,
                                 size: object.ciphertext.len() as u64,
+                                hard_delete_time: None,
                             })
                     })
                 })
