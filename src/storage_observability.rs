@@ -161,8 +161,7 @@ impl StorageMetrics {
     /// `Some` is a durable whole-snapshot upload. The middle value is the
     /// pre-checkpoint WAL-file length: a changed-page proxy which includes WAL
     /// framing and can be affected by SQLite auto-checkpointing/reuse. `None`
-    /// is reserved for a later, proven-clean dirty-save path: Phase 0 does not
-    /// claim a skipped save unless a caller can actually observe that state.
+    /// is a proven-clean save or eviction that skipped the snapshot path.
     pub(crate) fn record_save_completed(
         &self,
         durable_snapshot: Option<(u64, u64, u64)>,
