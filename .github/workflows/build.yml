@@ -143,8 +143,11 @@ jobs:
             exit 1
           fi
 
-      - name: Build profile contract tests
-        run: python3 scripts/test_select_build_configuration.py
+      - name: Release tooling contract tests
+        run: |
+          python3 scripts/test_select_build_configuration.py
+          python3 scripts/test_release.py
+          scripts/test_release_race.sh
 
       - name: Formatting
         run: cargo fmt --all -- --check
