@@ -238,16 +238,37 @@ buffer to avoid retry copies, but it is intentionally not truncated because trun
 would make deletion incomplete. Its memory remains proportional to the number of legacy
 media references.
 
-This is containment, not the later ADR-0022 deletion ledger. The fence, pending inventory,
-and recent-eviction completion markers are process-local. The remote database is retained
-until deletion succeeds, so saved references can be rediscovered after restart; media
-keys present only in an unsaved local database are not crash-safe across a failed deletion
-until a durable encrypted deletion ledger exists. If all configured handle slots are
-actively loading/evicting, a new cold user waits for a slot; and a corrupt database that
-cannot enumerate deletion media must remain fenced and retained rather than discard an
-unknown inventory. These cases do not reintroduce a registry lock across remote I/O, but
-they remain capacity/repair limits. Store diagnostics in this path are content-free and
-do not emit user IDs or object names.
+This is containment, not the later ADR-0022 content-addressed deletion ledger. The fence,
+exact media-key inventory, and recent-eviction completion markers remain process-local.
+The encrypted control database does persist a content-free deletion operation: an opaque
+random operation ID, `pending`/`failed_retryable`/`physical_complete` status,
+machine-readable reason, retry delay, and provider `hardDeleteTime` when GCS reports one.
+`DELETE /api/account` returns HTTP 202 until physical completion, and the same tombstoned
+authentication is accepted only by that retry route and `GET /api/account/deletion`.
+A bounded serial background sweep starts
+at boot and retries eligible `deleting` rows, so clients that sign out after any 2xx do not
+prevent eventual finalization after provider retention expires. Sweep logs contain only
+aggregate outcome counts.
+
+Before each remote attempt, the control operation is durably marked
+`content_deletion_attempt_unconfirmed`. That marker remains `pending`: cancellation or a
+restart safely retries the ordered Store protocol. If an exact legacy database generation
+disappears between listing and either the generation-pinned metadata or media GET,
+deletion records `failed_retryable` with reason `legacy_generation_unavailable`. The
+512 MiB compatibility-reader cap is also `failed_retryable` until a streaming converter
+ships. A restart or later empty listing cannot turn either failed case into completion;
+explicit inventory remediation/migration is required. Other KMS, GCS, or
+decrypt/inventory failures remain separately pending and retryable and must not be
+mistaken for the irreversible missing-generation gap.
+
+The remote database is otherwise retained until deletion succeeds, so saved references
+can be rediscovered after restart. Media keys present only in an unsaved local database
+are not crash-safe across a failed deletion until a durable encrypted content ledger
+exists. If all configured handle slots are actively loading/evicting, a new cold user
+waits for a slot; and a corrupt database that cannot enumerate deletion media must remain
+fenced and retained rather than discard an unknown inventory. These cases do not
+reintroduce a registry lock across remote I/O, but they remain capacity/repair limits.
+Store diagnostics in this path are content-free and do not emit user IDs or object names.
 
 ## Attestation and TLS
 

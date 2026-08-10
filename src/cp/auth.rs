@@ -275,6 +275,23 @@ mod reviewer_tests {
             assert!(exact_reviewer_identity(&config(), vec![rejected]).is_err());
         }
     }
+
+    #[test]
+    fn only_delete_and_status_routes_accept_tombstoned_authentication() {
+        use axum::http::Method;
+
+        assert!(deletion_status_access(&Method::DELETE, "/api/account"));
+        assert!(deletion_status_access(
+            &Method::GET,
+            "/api/account/deletion"
+        ));
+        assert!(!deletion_status_access(&Method::GET, "/api/account"));
+        assert!(!deletion_status_access(
+            &Method::POST,
+            "/api/account/deletion"
+        ));
+        assert!(!deletion_status_access(&Method::GET, "/api/export"));
+    }
 }
 
 /// 401 with the MCP discovery hint, matching the Node behaviour.
@@ -311,6 +328,11 @@ fn auth_store_error() -> Response {
         .into_response()
 }
 
+fn deletion_status_access(method: &axum::http::Method, path: &str) -> bool {
+    (*method == axum::http::Method::DELETE && path == "/api/account")
+        || (*method == axum::http::Method::GET && path == "/api/account/deletion")
+}
+
 /// axum middleware: resolve the caller to a user id (our JWT, else Google ID
 /// token) and attach [`AuthUser`]. 403 if an otherwise-valid Google account is
 /// not on the `ALLOWED_EMAILS` list.
@@ -320,8 +342,7 @@ pub async fn require_auth(
     next: Next,
 ) -> Response {
     let base = &state.config.base_url;
-    let deletion_retry =
-        req.method() == axum::http::Method::DELETE && req.uri().path() == "/api/account";
+    let deletion_status_access = deletion_status_access(req.method(), req.uri().path());
     let token = match req
         .headers()
         .get("Authorization")
@@ -339,7 +360,8 @@ pub async fn require_auth(
         match state.control.user_status(&user_id).await {
             Ok(Some(status))
                 if status == "active"
-                    || (deletion_retry && matches!(status.as_str(), "deleting" | "deleted")) =>
+                    || (deletion_status_access
+                        && matches!(status.as_str(), "deleting" | "deleted")) =>
             {
                 req.extensions_mut().insert(AuthUser(user_id));
                 return next.run(req).await;
@@ -362,7 +384,7 @@ pub async fn require_auth(
                 )
                     .into_response();
             }
-            if deletion_retry {
+            if deletion_status_access {
                 let user_id = tokens::derive_stable_uuid(&google_sub);
                 match state.control.user_status(&user_id).await {
                     Ok(Some(status)) if matches!(status.as_str(), "deleting" | "deleted") => {
