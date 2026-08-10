@@ -653,7 +653,7 @@ impl Store {
                 // A concurrent account deletion either waits for this exact
                 // copy/verification or prevents it from starting before its
                 // recovery-prefix inventory becomes authoritative.
-                let _lease = match self.acquire_content_write(&user_id).await {
+                let lease = match self.acquire_content_write(&user_id).await {
                     Ok(lease) => lease,
                     Err(_) => {
                         return self
@@ -681,7 +681,12 @@ impl Store {
                 }
                 progress.live_archives_checked = progress.live_archives_checked.saturating_add(1);
                 if self
-                    .ensure_legacy_recovery_checkpoint(&user_id, live.generation, now)
+                    .ensure_legacy_recovery_checkpoint(
+                        &user_id,
+                        live.generation,
+                        now,
+                        lease.child(),
+                    )
                     .await
                     .is_err()
                 {
@@ -757,13 +762,29 @@ impl Store {
     /// durable database save; move a child into an owned provider task when a
     /// request cancellation must not abandon an in-flight PUT.
     pub async fn acquire_content_write(&self, user_id: &str) -> Result<ContentWriteLease> {
+        self.acquire_content_write_inner(user_id, false)
+    }
+
+    /// The deletion path has already closed admission before it reaches its
+    /// forced local flush.  It still needs a lease for any cancellation-safe
+    /// provider work it starts, but must be allowed to obtain that lease after
+    /// installing its own fence.
+    fn acquire_content_write_for_deletion(&self, user_id: &str) -> Result<ContentWriteLease> {
+        self.acquire_content_write_inner(user_id, true)
+    }
+
+    fn acquire_content_write_inner(
+        &self,
+        user_id: &str,
+        allow_already_blocked: bool,
+    ) -> Result<ContentWriteLease> {
         validate_user_id(user_id)?;
         let mut state = self
             .content_write_barrier
             .state
             .lock()
             .expect("content barrier poisoned");
-        if state.blocked_users.contains(user_id) {
+        if state.blocked_users.contains(user_id) && !allow_already_blocked {
             return Err(deleted_user_error());
         }
         let count = state.active_writes.entry(user_id.to_string()).or_default();
@@ -951,7 +972,7 @@ impl Store {
             .as_mut()
             .ok_or_else(|| EnclaveError::Store("delete load lost its handle".into()))?;
         if handle.dirty || handle.blob_meta.retry_save_before_access {
-            self.flush_handle(handle).await?;
+            self.flush_handle_for_deletion(handle).await?;
         }
         let keys_to_delete: Arc<[String]> = media_keys(&handle.conn)?.into();
 
@@ -1707,6 +1728,21 @@ impl Store {
     }
 
     async fn flush_handle(&self, handle: &mut UserHandle) -> Result<()> {
+        self.flush_handle_with_admission(handle, false).await
+    }
+
+    /// Deletion closes normal admission before making its final local state
+    /// durable. Its own provider work remains visible to the barrier, while
+    /// ordinary writers remain rejected.
+    async fn flush_handle_for_deletion(&self, handle: &mut UserHandle) -> Result<()> {
+        self.flush_handle_with_admission(handle, true).await
+    }
+
+    async fn flush_handle_with_admission(
+        &self,
+        handle: &mut UserHandle,
+        deletion_owned: bool,
+    ) -> Result<()> {
         let started = Instant::now();
         self.storage_metrics.record_save_attempt();
         if !handle.dirty {
@@ -1726,7 +1762,17 @@ impl Store {
         // closure can observe an idempotency duplicate and return success.
         handle.blob_meta.retry_save_before_access = true;
 
-        let result = self.flush_handle_inner(handle).await;
+        // A flush can issue the authoritative index PUT and, on the first
+        // overwrite of a UTC day, a recovery-copy rewrite. Keep this parent
+        // lease for the whole transition; each provider operation receives an
+        // owned child below, so cancellation cannot make deletion outrun a
+        // request whose provider outcome remains unknown.
+        let content_write = if deletion_owned {
+            self.acquire_content_write_for_deletion(&handle.user_id)?
+        } else {
+            self.acquire_content_write_inner(&handle.user_id, false)?
+        };
+        let result = self.flush_handle_inner(handle, &content_write).await;
         let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         match &result {
             Ok((logical_db_bytes, changed_wal_bytes_proxy, encrypted_bytes)) => {
@@ -1744,7 +1790,11 @@ impl Store {
         result.map(|_| ())
     }
 
-    async fn flush_handle_inner(&self, handle: &mut UserHandle) -> Result<(u64, u64, u64)> {
+    async fn flush_handle_inner(
+        &self,
+        handle: &mut UserHandle,
+        content_write: &ContentWriteLease,
+    ) -> Result<(u64, u64, u64)> {
         // The WAL length before checkpoint is the best available Phase-0 proxy
         // for bytes changed since the previous flush. It is not exact dirty
         // page bytes: it includes WAL headers/frame metadata and SQLite may
@@ -1786,6 +1836,7 @@ impl Store {
                 &handle.user_id,
                 handle.blob_meta.generation,
                 checkpoint_now,
+                content_write.child(),
             )
             .await?;
             handle.blob_meta.verified_legacy_recovery_day = Some(checkpoint_day);
@@ -1795,15 +1846,24 @@ impl Store {
         let encrypted_bytes = ciphertext.len() as u64;
         self.storage_metrics
             .record_encrypted_upload_attempt(encrypted_bytes);
-        let put_result = self
-            .gcs
-            .put_object(
-                &object_name,
-                &ciphertext,
-                &handle.blob_meta.wrapped_dek_b64,
-                handle.blob_meta.generation,
-            )
-            .await;
+        let put_gcs = Arc::clone(&self.gcs);
+        let put_object_name = object_name.clone();
+        let put_wrapped_dek = handle.blob_meta.wrapped_dek_b64.clone();
+        let put_generation = handle.blob_meta.generation;
+        let put_lease = content_write.child();
+        let put_result = tokio::spawn(async move {
+            let _content_write = put_lease;
+            put_gcs
+                .put_object(
+                    &put_object_name,
+                    &ciphertext,
+                    &put_wrapped_dek,
+                    put_generation,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| EnclaveError::Store(format!("index persistence task failed: {error}")))?;
         let new_generation = match put_result {
             Ok(generation) => generation,
             Err(conflict @ EnclaveError::Conflict(_)) => {
@@ -1867,13 +1927,23 @@ impl Store {
         user_id: &str,
         source_generation: i64,
         now: SystemTime,
+        content_write: ContentWriteLease,
     ) -> Result<()> {
         let destination = legacy_recovery_checkpoint_name(user_id, now);
         let source = gcs_object_name(user_id);
-        let copied = self
-            .gcs
-            .copy_generation_if_absent(&source, source_generation, &destination)
-            .await?;
+        let copy_source = source.clone();
+        let copy_destination = destination.clone();
+        let copy_gcs = Arc::clone(&self.gcs);
+        let copied = tokio::spawn(async move {
+            let _content_write = content_write;
+            copy_gcs
+                .copy_generation_if_absent(&copy_source, source_generation, &copy_destination)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            EnclaveError::Store(format!("checkpoint persistence task failed: {error}"))
+        })??;
         if copied.source.generation != source_generation {
             return Err(EnclaveError::Gcs(
                 "legacy recovery source generation did not match requested generation".into(),
@@ -6789,6 +6859,135 @@ pub(crate) mod tests {
             .expect("deletion failed after provider settlement");
         assert!(matches!(
             media_inner.get_object(media_name).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_authoritative_index_put_keeps_deletion_behind_provider_settlement() {
+        let database_inner = Arc::new(FakeGcs::new());
+        let user_id = "cancelled-index-save-user";
+        let blocked_database = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&database_inner),
+            gcs_object_name(user_id),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked_database.clone(),
+            database_inner.clone(),
+            1,
+        ));
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'must not survive deletion')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("dirty first-write user");
+
+        let save_store = Arc::clone(&store);
+        let save = tokio::spawn(async move { save_store.save_user(user_id).await });
+        blocked_database.wait_until_blocked().await;
+
+        // The outer save future is the model for a cancelled HTTP request or
+        // worker. The owned provider task must keep its barrier child alive.
+        save.abort();
+        assert!(save
+            .await
+            .expect_err("save was not cancelled")
+            .is_cancelled());
+
+        let delete_store = Arc::clone(&store);
+        let mut deletion = tokio::spawn(async move { delete_store.delete_user(user_id).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait for a cancelled authoritative index PUT"
+        );
+
+        blocked_database.release();
+        deletion
+            .await
+            .expect("deletion task panicked")
+            .expect("deletion failed after index PUT settlement");
+        assert!(matches!(
+            database_inner.get_object(&gcs_object_name(user_id)).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_checkpoint_copy_keeps_deletion_behind_provider_settlement() {
+        let inner = Arc::new(FakeGcs::new());
+        let user_id = "cancelled-checkpoint-save-user";
+        let day_one = 1_767_268_800;
+        let day_two = 1_767_355_200;
+        let seed = store_with_checkpoint_time(Arc::clone(&inner), day_one);
+        write_and_save(&seed, user_id, "day one")
+            .await
+            .expect("seed user");
+        drop(seed);
+
+        let checkpoint =
+            legacy_recovery_checkpoint_name(user_id, UNIX_EPOCH + Duration::from_secs(day_two));
+        let blocked_database = Arc::new(BlockingPutGcs::copy_to(
+            Arc::clone(&inner),
+            checkpoint.clone(),
+        ));
+        let mut raw_store = make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked_database.clone(),
+            inner.clone(),
+            1,
+        );
+        raw_store.checkpoint_clock = Arc::new(move || UNIX_EPOCH + Duration::from_secs(day_two));
+        let store = Arc::new(raw_store);
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-02T00:00:00Z', 'checkpoint race')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("dirty checkpoint user");
+
+        let save_store = Arc::clone(&store);
+        let save = tokio::spawn(async move { save_store.save_user(user_id).await });
+        blocked_database.wait_until_blocked().await;
+        save.abort();
+        assert!(save
+            .await
+            .expect_err("save was not cancelled")
+            .is_cancelled());
+
+        let delete_store = Arc::clone(&store);
+        let mut deletion = tokio::spawn(async move { delete_store.delete_user(user_id).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait for a cancelled checkpoint copy"
+        );
+
+        blocked_database.release();
+        deletion
+            .await
+            .expect("deletion task panicked")
+            .expect("deletion failed after checkpoint settlement");
+        assert!(matches!(
+            inner.get_object(&checkpoint).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(matches!(
+            inner.get_object(&gcs_object_name(user_id)).await,
             Err(EnclaveError::NotFound)
         ));
     }
