@@ -1222,12 +1222,8 @@ impl Store {
         match self.load_user(user_id).await {
             Ok(handle) => {
                 let pending = PendingUserHandle::new(handle);
-                if let Err(error) = self
-                    .finish_load_registration(user_id, actor, &transition, true)
-                    .await
-                {
-                    return Err(error);
-                }
+                self.finish_load_registration(user_id, actor, &transition, true)
+                    .await?;
                 state.handle = Some(pending.take());
                 state.cleanly_evicted = false;
                 Ok(())
