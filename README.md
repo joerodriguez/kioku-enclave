@@ -311,6 +311,15 @@ records:
 python3 scripts/generate_capacity_fixture.py check
 ```
 
+`scripts/run_archive_capacity_harness.py` is an offline, deterministic SQLite **smoke**
+harness. CI smoke runs create a small real SQLite database, verify exact fixture counts,
+SQLite/FTS integrity, and a deterministic logical-export digest. Its report permanently
+sets both `release_evidence` and `sqlite_local_evidence` to `false`; full mode fails
+closed. The harness cannot bind its execution to a release image/VM or exercise the v3
+VFS, backend, witness, fault, lifecycle, production cache, concurrency, or query-mix
+gates required by ADR-0022. A later signed production release suite must supply that
+evidence rather than reclassifying this report.
+
 The optional generator streams numeric synthetic records to ignored `target/` output (or
 outside the checkout), so it does not allocate every record in memory. Its bounded smoke
 mode is exercised in unit tests. The explicit `power-user-c-1200-32gib` plus

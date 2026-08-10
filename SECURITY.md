@@ -146,6 +146,14 @@ Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-wa
 [`RELEASING.md`](RELEASING.md#one-time-legacy-blob-migration) before upgrading a
 ### ADR-0022 archive-v3 foundation is inactive
 
+The offline `scripts/run_archive_capacity_harness.py` creates deterministic,
+content-free SQLite smoke databases only outside the checkout or under ignored `target/`.
+Its exclusive run receipt rejects foreign/symlinked output and incompatible resume state.
+Its reports permanently classify as non-evidence (`release_evidence: false` and
+`sqlite_local_evidence: false`), and full mode fails closed. It cannot grant archive-v3
+authority or evidence the production image/VM, backend, VFS, witness, cache/concurrency,
+fault, deletion, lifecycle, or 32-GiB release gates.
+
 `src/archive_v3.rs` and `src/archive_v3_journal.rs` define only audited, unit-tested
 format primitives for the future
 immutable archive: opaque archive/database/key/object IDs; canonical context-bound
