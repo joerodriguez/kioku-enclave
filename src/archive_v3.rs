@@ -137,15 +137,14 @@ fn canonical_id_component(bytes: &[u8; 16]) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum ObjectRole {
-    // Tag 1 is reserved for a future bounded/streaming checkpoint-manifest
-    // format.  This foundation does not pretend a multi-GiB checkpoint fits
-    // inside one `MAX_CIPHERTEXT_BYTES` envelope.
+    CheckpointChunkV3 = 1,
     WalSegmentV3 = 2,
     ExtentV3 = 3,
     MerkleNodeV3 = 4,
     RootV3 = 5,
     KeyRegistryV3 = 6,
     StagingV3 = 7,
+    CheckpointManifestV3 = 8,
 }
 
 /// Key-registry namespaces are disjoint because archive and media DEKs may
@@ -169,6 +168,12 @@ impl KeyKind {
 /// Exact logical location, independent of a storage-provider object name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LogicalLocation {
+    CheckpointChunk {
+        checkpoint_id: ObjectId,
+        chunk_index: u32,
+        logical_offset: u64,
+        byte_len: u32,
+    },
     Wal {
         root_seq: u64,
         wal_generation: u64,
@@ -192,15 +197,42 @@ pub enum LogicalLocation {
     Staging {
         operation_id: ObjectId,
     },
+    CheckpointManifest {
+        checkpoint_id: ObjectId,
+        level: u8,
+        range_start: u32,
+        range_end: u32,
+    },
 }
 
 impl LogicalLocation {
     fn valid_for(&self, role: ObjectRole) -> bool {
         match (role, self) {
+            (
+                ObjectRole::CheckpointChunkV3,
+                Self::CheckpointChunk {
+                    logical_offset,
+                    byte_len,
+                    ..
+                },
+            ) => {
+                *byte_len > 0
+                    && *byte_len <= 1_048_576
+                    && byte_len.is_multiple_of(SQLITE_PAGE_SIZE)
+                    && logical_offset.is_multiple_of(u64::from(SQLITE_PAGE_SIZE))
+            }
             (ObjectRole::WalSegmentV3, Self::Wal { .. })
             | (ObjectRole::RootV3, Self::Root { .. })
             | (ObjectRole::KeyRegistryV3, Self::KeyRegistry { .. })
             | (ObjectRole::StagingV3, Self::Staging { .. }) => true,
+            (
+                ObjectRole::CheckpointManifestV3,
+                Self::CheckpointManifest {
+                    range_start,
+                    range_end,
+                    ..
+                },
+            ) => range_end > range_start,
             (ObjectRole::ExtentV3, Self::Extent { byte_len, .. }) => {
                 (1..=1_048_576).contains(byte_len) && byte_len.is_multiple_of(SQLITE_PAGE_SIZE)
             }
@@ -218,6 +250,18 @@ impl LogicalLocation {
 
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
+            Self::CheckpointChunk {
+                checkpoint_id,
+                chunk_index,
+                logical_offset,
+                byte_len,
+            } => {
+                out.push(1);
+                out.extend_from_slice(checkpoint_id.as_bytes());
+                push_u32(out, *chunk_index);
+                push_u64(out, *logical_offset);
+                push_u32(out, *byte_len);
+            }
             Self::Wal {
                 root_seq,
                 wal_generation,
@@ -257,6 +301,18 @@ impl LogicalLocation {
             Self::Staging { operation_id } => {
                 out.push(7);
                 out.extend_from_slice(operation_id.as_bytes());
+            }
+            Self::CheckpointManifest {
+                checkpoint_id,
+                level,
+                range_start,
+                range_end,
+            } => {
+                out.push(8);
+                out.extend_from_slice(checkpoint_id.as_bytes());
+                out.push(*level);
+                push_u32(out, *range_start);
+                push_u32(out, *range_end);
             }
         }
     }
@@ -358,6 +414,16 @@ impl ObjectContext {
         let key_epoch = canonical_id_component(self.key_epoch.as_bytes());
         let object = canonical_id_component(self.object_id.as_bytes());
         let name = match &self.location {
+            LogicalLocation::CheckpointChunk {
+                checkpoint_id,
+                chunk_index,
+                ..
+            } => {
+                let checkpoint = canonical_id_component(checkpoint_id.as_bytes());
+                format!(
+                    "archive/v3/{archive}/checkpoints/{database_epoch}/{checkpoint}/chunks/{chunk_index}-{object}.chkx"
+                )
+            }
             LogicalLocation::Wal { root_seq, .. } => {
                 format!("archive/v3/{archive}/wal/{database_epoch}/{root_seq}-{object}.walx")
             }
@@ -383,6 +449,17 @@ impl ObjectContext {
             LogicalLocation::Staging { operation_id } => {
                 let operation = canonical_id_component(operation_id.as_bytes());
                 format!("archive/v3/{archive}/staging/{operation}/{object}")
+            }
+            LogicalLocation::CheckpointManifest {
+                checkpoint_id,
+                level,
+                range_start,
+                range_end,
+            } => {
+                let checkpoint = canonical_id_component(checkpoint_id.as_bytes());
+                format!(
+                    "archive/v3/{archive}/checkpoints/{database_epoch}/{checkpoint}/manifest/{level}-{range_start}-{range_end}-{object}.cmfx"
+                )
             }
         };
         ObjectKey {
@@ -701,6 +778,7 @@ impl ArchiveCipher {
         if matches!(
             context.location(),
             LogicalLocation::Extent { byte_len, .. }
+                | LogicalLocation::CheckpointChunk { byte_len, .. }
                 if plaintext.len() != *byte_len as usize
         ) {
             return Err(ArchiveV3Error::InvalidContext);
@@ -1017,6 +1095,11 @@ pub struct ArchiveRoot {
     pub logical_file_length: u64,
     pub user_schema_version: u32,
     pub storage_format_version: u8,
+    /// Zero when no WAL chain is present. A non-zero generation and segment
+    /// count let recovery construct the exact final-segment context without
+    /// listing immutable storage.
+    pub wal_generation: u64,
+    pub wal_segment_count: u32,
     /// Reference to a future bounded/streaming checkpoint-manifest object.
     /// This foundation intentionally cannot create a monolithic checkpoint.
     pub checkpoint_root: Option<ImmutableReference>,
@@ -1046,6 +1129,16 @@ impl ArchiveRoot {
         }
         if self.wal_chain_root.is_some() && self.checkpoint_root.is_none() {
             return Err(ArchiveV3Error::Malformed("WAL root without checkpoint"));
+        }
+        if !matches!(
+            (
+                self.wal_chain_root.is_some(),
+                self.wal_generation,
+                self.wal_segment_count,
+            ),
+            (false, 0, 0) | (true, 1.., 1..)
+        ) {
+            return Err(ArchiveV3Error::Malformed("WAL root descriptor"));
         }
         if self.logical_file_length > 0
             && self.checkpoint_root.is_none()
@@ -1084,6 +1177,8 @@ impl ArchiveRoot {
         push_u64(&mut out, self.logical_file_length);
         push_u32(&mut out, self.user_schema_version);
         out.push(self.storage_format_version);
+        push_u64(&mut out, self.wal_generation);
+        push_u32(&mut out, self.wal_segment_count);
         encode_optional_parent(&mut out, &self.parent);
         encode_optional_reference(&mut out, &self.checkpoint_root);
         encode_optional_reference(&mut out, &self.extent_tree_root);
@@ -1098,7 +1193,7 @@ impl ArchiveRoot {
         if input.len() > MAX_ROOT_BYTES {
             return Err(ArchiveV3Error::TooLarge("root"));
         }
-        if input.len() < 78 || &input[..8] != ROOT_MAGIC || input[8] != ARCHIVE_FORMAT_VERSION {
+        if input.len() < 90 || &input[..8] != ROOT_MAGIC || input[8] != ARCHIVE_FORMAT_VERSION {
             return Err(ArchiveV3Error::Malformed("root header"));
         }
         let mut offset = 9;
@@ -1112,6 +1207,8 @@ impl ArchiveRoot {
         let storage_format_version = *take(input, &mut offset, 1)?
             .first()
             .ok_or(ArchiveV3Error::Malformed("root format"))?;
+        let wal_generation = take_u64(input, &mut offset)?;
+        let wal_segment_count = take_u32(input, &mut offset)?;
         let parent = decode_optional_parent(input, &mut offset)?;
         let checkpoint_root = decode_optional_reference(input, &mut offset)?;
         let extent_tree_root = decode_optional_reference(input, &mut offset)?;
@@ -1129,6 +1226,8 @@ impl ArchiveRoot {
             logical_file_length,
             user_schema_version,
             storage_format_version,
+            wal_generation,
+            wal_segment_count,
             checkpoint_root,
             extent_tree_root,
             wal_chain_root,
@@ -1821,6 +1920,8 @@ mod tests {
             logical_file_length: 8192,
             user_schema_version: 4,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
+            wal_generation: 0,
+            wal_segment_count: 0,
             checkpoint_root: Some(ImmutableReference {
                 object_id: ObjectId::from_bytes([6; 16]),
                 envelope_hash: [6; 32],
