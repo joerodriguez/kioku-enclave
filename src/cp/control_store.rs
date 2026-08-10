@@ -41,6 +41,29 @@ CREATE TABLE IF NOT EXISTS users (
     summarized_until TEXT,
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- Provider identities are separate from the canonical Kioku account; mutable
+-- email claims never link accounts.
+CREATE TABLE IF NOT EXISTS auth_identities (
+    provider       TEXT NOT NULL,
+    subject        TEXT NOT NULL,
+    user_id        TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    email          TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    last_seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (provider, subject),
+    UNIQUE (user_id, provider)
+);
+CREATE INDEX IF NOT EXISTS auth_identities_user_idx ON auth_identities(user_id);
+-- Existing rows predate provider-neutral identities and are Google accounts.
+INSERT OR IGNORE INTO auth_identities (provider, subject, user_id, email)
+SELECT 'google', u.google_sub, u.id, u.email FROM users u
+WHERE NOT EXISTS (SELECT 1 FROM auth_identities i WHERE i.user_id = u.id);
+CREATE TABLE IF NOT EXISTS apple_credentials (
+    user_id           TEXT PRIMARY KEY REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    refresh_token     TEXT NOT NULL,
+    last_validated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    revoked_at        TEXT
+);
 CREATE TABLE IF NOT EXISTS usage_daily (
     user_id              TEXT NOT NULL,
     day                  TEXT NOT NULL,
@@ -246,7 +269,6 @@ pub struct EpisodeEmailPreference {
     pub updated_at: String,
 }
 
-#[cfg(test)]
 fn is_active_user_conn(conn: &Connection, user_id: &str) -> Result<bool> {
     let active: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
@@ -254,6 +276,15 @@ fn is_active_user_conn(conn: &Connection, user_id: &str) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(active != 0)
+}
+
+fn is_deleted_identity_conn(conn: &Connection, provider: &str, subject: &str) -> Result<bool> {
+    let deleted: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deleted_identities WHERE provider = ?1 AND subject = ?2)",
+        rusqlite::params![provider, subject],
+        |row| row.get(0),
+    )?;
+    Ok(deleted != 0)
 }
 
 fn is_deleted_user_conn(conn: &Connection, stable_user_id: &str) -> Result<bool> {
@@ -964,6 +995,14 @@ impl ControlStore {
                             "UPDATE episode_email_preferences SET user_id = ?1 WHERE user_id = ?2",
                             rusqlite::params![stable_id, old_id],
                         )?;
+                        conn.execute(
+                            "UPDATE auth_identities SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE apple_credentials SET user_id = ?1 WHERE user_id = ?2",
+                            rusqlite::params![stable_id, old_id],
+                        )?;
                     } else {
                         conn.execute(
                             "UPDATE users SET email = ?1 WHERE google_sub = ?2",
@@ -976,6 +1015,13 @@ impl ControlStore {
                         rusqlite::params![stable_id, google_sub, email],
                     )?;
                 }
+                conn.execute(
+                    "INSERT INTO auth_identities (provider, subject, user_id, email) \\
+                     VALUES ('google', ?1, ?2, ?3) \\
+                     ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, \\
+                     last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    rusqlite::params![google_sub, stable_id, email],
+                )?;
                 Ok(())
             })();
 
@@ -990,6 +1036,197 @@ impl ControlStore {
                 id: stable_id,
                 email,
             })
+        })
+        .await
+    }
+
+    /// Resolve a linked provider identity without creating or merging an
+    /// account. Email equality is intentionally never an account-link signal.
+    pub async fn identity_user(&self, provider: &str, subject: &str) -> Result<Option<User>> {
+        let provider = provider.to_string();
+        let subject = subject.to_string();
+        self.read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT u.id, u.email FROM auth_identities i \\
+                     JOIN users u ON u.id = i.user_id \\
+                     WHERE i.provider = ?1 AND i.subject = ?2 AND u.status = 'active'",
+                    rusqlite::params![provider, subject],
+                    |row| {
+                        Ok(User {
+                            id: row.get(0)?,
+                            email: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Create or resume an Apple-primary account and retain the refresh token
+    /// that must be revoked before deletion.
+    pub async fn upsert_apple_user(
+        &self,
+        subject: &str,
+        email: &str,
+        refresh_token: &str,
+    ) -> Result<User> {
+        let provider = "apple".to_string();
+        let subject = subject.to_string();
+        let email = email.to_lowercase();
+        let refresh_token = refresh_token.to_string();
+        let compatibility_anchor = format!("apple:{subject}");
+        let stable_id = super::tokens::derive_provider_uuid(&provider, &subject);
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            if is_deleted_identity_conn(&tx, &provider, &subject)? || is_deleted_user_conn(&tx, &stable_id)? {
+                tx.rollback()?;
+                return Err(EnclaveError::Auth("account deleted".into()));
+            }
+            let existing: Option<(String, String, String)> = tx.query_row(
+                "SELECT u.id, u.email, u.status FROM auth_identities i \\
+                 JOIN users u ON u.id = i.user_id WHERE i.provider = ?1 AND i.subject = ?2",
+                rusqlite::params![provider, subject],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            let (user_id, primary_email) = match existing {
+                Some((user_id, primary_email, status)) if status == "active" => {
+                    tx.execute(
+                        "UPDATE auth_identities SET email = ?1, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \\
+                         WHERE provider = ?2 AND subject = ?3",
+                        rusqlite::params![email, provider, subject],
+                    )?;
+                    let anchor: String = tx.query_row("SELECT google_sub FROM users WHERE id = ?1", [&user_id], |row| row.get(0))?;
+                    if anchor == compatibility_anchor {
+                        tx.execute("UPDATE users SET email = ?1 WHERE id = ?2", rusqlite::params![email, user_id])?;
+                        (user_id, email.clone())
+                    } else { (user_id, primary_email) }
+                }
+                Some(_) => {
+                    tx.rollback()?;
+                    return Err(EnclaveError::Auth("account inactive".into()));
+                }
+                None => {
+                    let collision: Option<(String, String)> = tx.query_row(
+                        "SELECT google_sub, status FROM users WHERE id = ?1", [&stable_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).optional()?;
+                    match collision {
+                        None => tx.execute(
+                            "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![stable_id, compatibility_anchor, email],
+                        )?,
+                        Some((anchor, status)) if anchor == compatibility_anchor && status == "active" => 0,
+                        Some(_) => {
+                            tx.rollback()?;
+                            return Err(EnclaveError::Conflict("provider identity collision".into()));
+                        }
+                    };
+                    tx.execute(
+                        "INSERT INTO auth_identities (provider, subject, user_id, email) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![provider, subject, stable_id, email],
+                    )?;
+                    (stable_id, email.clone())
+                }
+            };
+            tx.execute(
+                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) \\
+                 ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, \\
+                 last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
+                rusqlite::params![user_id, refresh_token],
+            )?;
+            tx.commit()?;
+            Ok(User { id: user_id, email: primary_email })
+        }).await
+    }
+
+    /// Explicitly link an Apple identity to an authenticated account; it is
+    /// never moved from a different account.
+    pub async fn link_apple_identity(
+        &self,
+        user_id: &str,
+        subject: &str,
+        email: &str,
+        refresh_token: &str,
+    ) -> Result<()> {
+        let user_id = user_id.to_string();
+        let subject = subject.to_string();
+        let email = email.to_lowercase();
+        let refresh_token = refresh_token.to_string();
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            if !is_active_user_conn(&tx, &user_id)? {
+                tx.rollback()?;
+                return Err(EnclaveError::Auth("account inactive".into()));
+            }
+            if is_deleted_identity_conn(&tx, "apple", &subject)? {
+                tx.rollback()?;
+                return Err(EnclaveError::Auth("identity deleted".into()));
+            }
+            let owner: Option<String> = tx.query_row(
+                "SELECT user_id FROM auth_identities WHERE provider = 'apple' AND subject = ?1", [&subject], |row| row.get(0),
+            ).optional()?;
+            if owner.as_deref().is_some_and(|owner| owner != user_id) {
+                tx.rollback()?;
+                return Err(EnclaveError::Conflict("Apple identity is linked to another account".into()));
+            }
+            let other: Option<String> = tx.query_row(
+                "SELECT subject FROM auth_identities WHERE provider = 'apple' AND user_id = ?1", [&user_id], |row| row.get(0),
+            ).optional()?;
+            if other.as_deref().is_some_and(|linked| linked != subject) {
+                tx.rollback()?;
+                return Err(EnclaveError::Conflict("account already has a different Apple identity".into()));
+            }
+            tx.execute(
+                "INSERT INTO auth_identities (provider, subject, user_id, email) VALUES ('apple', ?1, ?2, ?3) \\
+                 ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, \\
+                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                rusqlite::params![subject, user_id, email],
+            )?;
+            tx.execute(
+                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) \\
+                 ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, \\
+                 last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
+                rusqlite::params![user_id, refresh_token],
+            )?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn linked_providers(&self, user_id: &str) -> Result<Vec<String>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT provider FROM auth_identities WHERE user_id = ?1 ORDER BY provider",
+            )?;
+            let rows = statement.query_map([user_id], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    pub async fn apple_refresh_token(&self, user_id: &str) -> Result<Option<String>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            Ok(conn.query_row(
+            "SELECT refresh_token FROM apple_credentials WHERE user_id = ?1 AND revoked_at IS NULL",
+            [user_id], |row| row.get(0),
+        ).optional()?)
+        })
+        .await
+    }
+
+    pub async fn mark_apple_credential_revoked(&self, user_id: &str) -> Result<()> {
+        let user_id = user_id.to_string();
+        self.write_if_changed(move |conn| {
+            let changed = conn.execute(
+                "UPDATE apple_credentials SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \\
+                 WHERE user_id = ?1 AND revoked_at IS NULL",
+                [user_id],
+            )? > 0;
+            Ok(((), changed))
         })
         .await
     }
