@@ -35,7 +35,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | Path | What it is |
 |---|---|
 | [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, attestation, per-user synchronized encrypted storage, search, episodes |
-| `src/archive_v3.rs` / `src/archive_v3_journal.rs` / `src/archive_v3_operation.rs` | Inactive ADR-0022 immutable archive foundation, bounded checkpoint/WAL formats, and transactional idempotency ledger; compiled/tested only, with no live persistence authority until shadow gates pass |
+| `src/archive_v3.rs` / `src/archive_v3_journal.rs` / `src/archive_v3_operation.rs` / `src/archive_v3_shadow.rs` | Inactive ADR-0022 immutable archive foundation, bounded checkpoint/WAL formats, transactional idempotency ledger, and fail-open synchronized WAL-capture state; compiled/tested only, with no registered VFS or live persistence authority until shadow gates pass |
 | `src/archive_v3_witness.rs` | Inactive ADR-0022 content-free witness/recovery contract with an in-memory linearizable model; it is compiled/tested only and has no provider or live-authority wiring |
 | `.github/workflows/` | CI, CodeQL/dependency checks, image build/scan, provenance, and SBOM attestations |
 | `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image; remaining rebuild limits are documented in `SECURITY.md` |
