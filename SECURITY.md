@@ -278,15 +278,28 @@ configured `PORT`.
 **Threat:** An operator with broad GCP IAM access attempts to decrypt user data or boot
 the approved image with weaker settings.
 
-**Mitigation:** The KEK's decrypt grant is limited to the attestation-gated
-`principalSet`; no human or service-account principal should hold that role. Changing
-code or baked configuration changes the image digest and invalidates the KMS condition.
+**Mitigation:** The KEK uses an authoritative decrypt binding containing only the
+attestation-gated `principalSet`. A project IAM deny policy separately denies the direct
+KMS decrypt permission to every principal except that exact workload identity; this is
+required because inherited roles such as project owner can otherwise carry decrypt even
+when the key-local policy contains no human member. Changing code or baked configuration
+changes the image digest and loses both the allow binding and the deny-policy exception.
 The launch policy permits only `PORT`, so an operator cannot replace KMS coordinates,
 trusted callers, auth policy, TLS policy, or the legacy-blob gate through VM metadata.
 
+**Residual risk:** A sufficiently privileged project control-plane administrator can
+change IAM deny policy, KMS policy, or the deployed workload and then authorize a new
+path. The deployed deny removes standing inherited decrypt authority; it is not an
+operator-independent cryptographic boundary. A literal guarantee against a malicious
+administrator with policy-changing authority requires user-held keys or an independently
+controlled key-authorization system.
+
 **Operator verification:** inspect the KMS IAM policy and confirm that
 `roles/cloudkms.cryptoKeyEncrypterDecrypter` has only the expected attestation-gated
-principal set—no `user:`, `group:`, or `serviceAccount:` member.
+principal set—no `user:`, `group:`, or `serviceAccount:` member. Also inspect the project
+deny policy and confirm that direct KMS decrypt is denied to all principals with only the
+same exact digest-scoped workload principal set excepted. Either check alone is
+insufficient.
 
 ### T2 — Compromised client token or legacy caller
 

@@ -100,11 +100,20 @@ AND "STABLE" in submods.confidential_space.support_attributes
 AND attribute.image_digest == <approved release digest>
 ```
 
-No human or service-account principal should have KMS decrypt permission. KMS calls use a
+The deployment must pair an authoritative, digest-scoped KEK binding with a project IAM
+deny policy that blocks direct KMS decrypt for every principal except the exact attested
+workload. The deny policy is necessary because broad inherited roles can otherwise carry
+decrypt permission even when the KEK's local binding looks exclusive. KMS calls use a
 short-lived access token derived from a Confidential Space token and Google STS; there is
 no VM metadata-service credential fallback for KMS. The VM service account is used for
 ciphertext-only GCS I/O, runtime Secret Manager access, and Vertex; it has no KMS decrypt
 path.
+
+This removes the standing human/service-account data-plane decrypt path, but it does not
+make a cloud-project control-plane administrator cryptographically unable to change IAM,
+KMS, or compute policy later. An operator-independent "only you can read" guarantee still
+requires user-held keys or an independently controlled authorization boundary. See
+[`SECURITY.md`](SECURITY.md#t1--malicious-operator-or-cloud-project-insider).
 
 ### Context-bound blob encryption
 
