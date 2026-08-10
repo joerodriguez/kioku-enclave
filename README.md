@@ -261,10 +261,10 @@ completed save. A zero-byte or absent WAL denominator records `u64::MAX` in the 
 bucket, exposing a full-database rewrite with no observed changed frames. WAL length is
 only a proxy: it includes WAL framing and can diverge from changed-page bytes after
 SQLite auto-checkpointing or WAL reuse, so this is not a claim of exact dirty-byte
-amplification. Logical database size remains a separate histogram. The current legacy
-path cannot prove and
-skip a clean save, so `save_skipped_total` remains zero rather than relabeling the
-observed no-op rewrite. Failed uploads contribute to attempted-upload bytes and
+amplification. Logical database size remains a separate histogram. The dirty-generation
+guard records a proven-clean save or eviction in `save_skipped_total` and skips
+checkpointing, KMS, encryption, plaintext file reads, and GCS upload work. Failed
+uploads contribute to attempted-upload bytes and
 failed/latency counters, but only durable successes contribute to upload and ratio
 histograms. Upload/download byte values measure the encrypted object payload, excluding
 HTTP metadata and multipart framing. All counters reset on process restart.

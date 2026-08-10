@@ -167,7 +167,7 @@ struct UserHandle {
 /// The shared store, wrapped in Arc so handlers can clone it cheaply.
 pub struct Store {
     registry: Mutex<StoreRegistry>,
-    registry_changed: Notify,
+    registry_changed: Arc<Notify>,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     pub media_gcs: Arc<dyn GcsClient>,
@@ -214,6 +214,10 @@ struct OpenUser {
     actor: Arc<UserActor>,
     last_used: u64,
     status: OpenStatus,
+    /// Weak liveness token for a cancellable Loading/Evicting transition. If
+    /// the owning future is dropped, the token expires and the next capacity
+    /// waiter can repair the process-local registry state.
+    transition: Option<Weak<RegistryTransition>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -221,17 +225,69 @@ enum OpenStatus {
     Loading,
     Open,
     Evicting,
+    /// An eviction future was cancelled. The handle may still be present, or
+    /// the flush may already have completed and removed it. Either case is
+    /// recoverable under the same actor lock.
+    RecoveredEviction,
 }
 
 struct EvictionCandidate {
     user_id: UserId,
     actor: Arc<UserActor>,
+    transition: Arc<RegistryTransition>,
 }
 
 enum CapacityAction {
-    Reserved,
+    Reserved(Arc<RegistryTransition>),
     Evict(EvictionCandidate),
     Wait,
+}
+
+/// A cancellable registry transition owns one strong token while the registry
+/// retains only a weak reference. Dropping the future expires the token and
+/// wakes a capacity waiter, which repairs the abandoned state without doing
+/// async work from `Drop`.
+struct RegistryTransition {
+    registry_changed: Arc<Notify>,
+}
+
+impl RegistryTransition {
+    fn new(registry_changed: &Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            registry_changed: Arc::clone(registry_changed),
+        })
+    }
+}
+
+impl Drop for RegistryTransition {
+    fn drop(&mut self) {
+        self.registry_changed.notify_one();
+    }
+}
+
+/// Own a freshly loaded handle until its registry reservation is committed.
+/// Cancellation while waiting for that final registry lock must close SQLite
+/// before removing its plaintext temp files.
+struct PendingUserHandle(Option<UserHandle>);
+
+impl PendingUserHandle {
+    fn new(handle: UserHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    fn take(mut self) -> UserHandle {
+        self.0.take().expect("pending user handle already consumed")
+    }
+}
+
+impl Drop for PendingUserHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let temp_path = handle.temp_path.clone();
+            drop(handle);
+            remove_temp_db_files(&temp_path);
+        }
+    }
 }
 
 enum SaveTarget {
@@ -296,6 +352,41 @@ impl StoreRegistry {
         self.recent_clean_evictions
             .insert(user_id.to_string(), access);
     }
+
+    /// Repair transitions whose owning request future was cancelled. Loading
+    /// handles are not installed until their reservation is committed, so an
+    /// abandoned Loading entry can be removed. An abandoned eviction may have
+    /// stopped before or after its flush; preserve the actor and let its next
+    /// holder resolve the handle state under the per-user lock.
+    fn recover_abandoned_transitions(&mut self) {
+        let abandoned_loads = self
+            .open_users
+            .iter()
+            .filter(|(_, open)| open.status == OpenStatus::Loading && transition_expired(open))
+            .map(|(user_id, _)| user_id.clone())
+            .collect::<Vec<_>>();
+        for user_id in abandoned_loads {
+            self.open_users.remove(&user_id);
+        }
+
+        for open in self.open_users.values_mut() {
+            if open.status == OpenStatus::Evicting && transition_expired(open) {
+                open.status = OpenStatus::RecoveredEviction;
+                open.transition = None;
+            }
+        }
+    }
+}
+
+fn transition_expired(open: &OpenUser) -> bool {
+    open.transition.as_ref().and_then(Weak::upgrade).is_none()
+}
+
+fn transition_matches(open: &OpenUser, transition: &Arc<RegistryTransition>) -> bool {
+    open.transition
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .is_some_and(|current| Arc::ptr_eq(&current, transition))
 }
 
 #[derive(Debug, Clone)]
@@ -356,7 +447,7 @@ impl Store {
                 recent_clean_evictions: HashMap::new(),
                 access_clock: 0,
             }),
-            registry_changed: Notify::new(),
+            registry_changed: Arc::new(Notify::new()),
             kms,
             gcs,
             media_gcs,
@@ -998,20 +1089,35 @@ impl Store {
     /// Reserve one of the bounded open-handle slots. Full-cache eviction is
     /// performed without the registry lock; loading/evicting reservations keep
     /// concurrent cache misses from exceeding `max_open`.
-    async fn reserve_open_slot(&self, user_id: &str, actor: &Arc<UserActor>) -> Result<()> {
+    async fn reserve_open_slot(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+    ) -> Result<Arc<RegistryTransition>> {
         loop {
             // `notify_one` retains a permit if a state transition lands between
             // the registry check and this await, avoiding a lost wakeup.
             let changed = self.registry_changed.notified();
             let action = {
                 let mut registry = self.registry.lock().await;
-                if registry.open_users.contains_key(user_id) {
+                registry.recover_abandoned_transitions();
+
+                let recovered_same_actor = registry.open_users.get(user_id).is_some_and(|open| {
+                    open.status == OpenStatus::RecoveredEviction && Arc::ptr_eq(&open.actor, actor)
+                });
+                if recovered_same_actor {
+                    // This method is called only while the actor state has no
+                    // handle. A cancelled eviction already removed it, so its
+                    // stale capacity registration can be released and reloaded.
+                    registry.open_users.remove(user_id);
+                } else if registry.open_users.contains_key(user_id) {
                     return Err(EnclaveError::Store(
                         "duplicate open-handle reservation for one user".into(),
                     ));
                 }
 
                 if registry.open_users.len() < self.max_open {
+                    let transition = RegistryTransition::new(&self.registry_changed);
                     let access = registry.next_access();
                     registry.open_users.insert(
                         user_id.to_string(),
@@ -1019,31 +1125,38 @@ impl Store {
                             actor: Arc::clone(actor),
                             last_used: access,
                             status: OpenStatus::Loading,
+                            transition: Some(Arc::downgrade(&transition)),
                         },
                     );
-                    CapacityAction::Reserved
+                    CapacityAction::Reserved(transition)
                 } else {
                     let candidate_id = registry
                         .open_users
                         .iter()
                         .filter(|(candidate_id, open)| {
                             candidate_id.as_str() != user_id
-                                && open.status == OpenStatus::Open
+                                && matches!(
+                                    open.status,
+                                    OpenStatus::Open | OpenStatus::RecoveredEviction
+                                )
                                 && !registry.blocked_users.contains(candidate_id.as_str())
                         })
                         .min_by_key(|(_, open)| open.last_used)
                         .map(|(candidate_id, _)| candidate_id.clone());
 
                     if let Some(candidate_id) = candidate_id {
+                        let transition = RegistryTransition::new(&self.registry_changed);
                         let Some(open) = registry.open_users.get_mut(&candidate_id) else {
                             return Err(EnclaveError::Store(
                                 "LRU candidate disappeared under registry lock".into(),
                             ));
                         };
                         open.status = OpenStatus::Evicting;
+                        open.transition = Some(Arc::downgrade(&transition));
                         CapacityAction::Evict(EvictionCandidate {
                             user_id: candidate_id,
                             actor: Arc::clone(&open.actor),
+                            transition,
                         })
                     } else {
                         CapacityAction::Wait
@@ -1052,7 +1165,7 @@ impl Store {
             };
 
             match action {
-                CapacityAction::Reserved => return Ok(()),
+                CapacityAction::Reserved(transition) => return Ok(transition),
                 CapacityAction::Evict(candidate) => self.evict_candidate(candidate).await?,
                 CapacityAction::Wait => changed.await,
             }
@@ -1063,11 +1176,14 @@ impl Store {
         &self,
         user_id: &str,
         actor: &Arc<UserActor>,
+        transition: &Arc<RegistryTransition>,
         loaded: bool,
     ) -> Result<()> {
         let mut registry = self.registry.lock().await;
         let valid = registry.open_users.get(user_id).is_some_and(|open| {
-            open.status == OpenStatus::Loading && Arc::ptr_eq(&open.actor, actor)
+            open.status == OpenStatus::Loading
+                && Arc::ptr_eq(&open.actor, actor)
+                && transition_matches(open, transition)
         });
         if !valid {
             return Err(EnclaveError::Store(
@@ -1082,6 +1198,7 @@ impl Store {
             })?;
             open.status = OpenStatus::Open;
             open.last_used = access;
+            open.transition = None;
             registry.recent_clean_evictions.remove(user_id);
         } else {
             registry.open_users.remove(user_id);
@@ -1101,23 +1218,23 @@ impl Store {
             return Ok(());
         }
 
-        self.reserve_open_slot(user_id, actor).await?;
+        let transition = self.reserve_open_slot(user_id, actor).await?;
         match self.load_user(user_id).await {
             Ok(handle) => {
-                state.handle = Some(handle);
-                state.cleanly_evicted = false;
-                if let Err(error) = self.finish_load_registration(user_id, actor, true).await {
-                    if let Some(handle) = state.handle.take() {
-                        let temp_path = handle.temp_path.clone();
-                        drop(handle);
-                        remove_temp_db_files(&temp_path);
-                    }
+                let pending = PendingUserHandle::new(handle);
+                if let Err(error) = self
+                    .finish_load_registration(user_id, actor, &transition, true)
+                    .await
+                {
                     return Err(error);
                 }
+                state.handle = Some(pending.take());
+                state.cleanly_evicted = false;
                 Ok(())
             }
             Err(load_error) => {
-                self.finish_load_registration(user_id, actor, false).await?;
+                self.finish_load_registration(user_id, actor, &transition, false)
+                    .await?;
                 Err(load_error)
             }
         }
@@ -1136,12 +1253,18 @@ impl Store {
         self.registry_changed.notify_one();
     }
 
-    async fn complete_clean_eviction_registration(&self, user_id: &str, actor: &Arc<UserActor>) {
+    async fn complete_clean_eviction_registration(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        transition: &Arc<RegistryTransition>,
+    ) {
         let mut registry = self.registry.lock().await;
-        let matches = registry
-            .open_users
-            .get(user_id)
-            .is_some_and(|open| Arc::ptr_eq(&open.actor, actor));
+        let matches = registry.open_users.get(user_id).is_some_and(|open| {
+            open.status == OpenStatus::Evicting
+                && Arc::ptr_eq(&open.actor, actor)
+                && transition_matches(open, transition)
+        });
         if matches {
             registry.open_users.remove(user_id);
         }
@@ -1181,8 +1304,12 @@ impl Store {
                 tracing::error!("user-handle eviction flush failed");
                 let mut registry = self.registry.lock().await;
                 if let Some(open) = registry.open_users.get_mut(&candidate.user_id) {
-                    if Arc::ptr_eq(&open.actor, &candidate.actor) {
+                    if open.status == OpenStatus::Evicting
+                        && Arc::ptr_eq(&open.actor, &candidate.actor)
+                        && transition_matches(open, &candidate.transition)
+                    {
                         open.status = OpenStatus::Open;
+                        open.transition = None;
                     }
                 }
                 drop(registry);
@@ -1198,8 +1325,12 @@ impl Store {
         }
         state.cleanly_evicted = had_handle;
         if had_handle {
-            self.complete_clean_eviction_registration(&candidate.user_id, &candidate.actor)
-                .await;
+            self.complete_clean_eviction_registration(
+                &candidate.user_id,
+                &candidate.actor,
+                &candidate.transition,
+            )
+            .await;
         } else {
             self.release_open_registration(&candidate.user_id, &candidate.actor)
                 .await;
@@ -1277,12 +1408,16 @@ impl Store {
     }
 
     async fn flush_handle(&self, handle: &mut UserHandle) -> Result<()> {
+        let started = Instant::now();
+        self.storage_metrics.record_save_attempt();
         if !handle.dirty {
             debug!(
                 mutation_generation = handle.mutation_generation,
                 persisted_mutation_generation = handle.persisted_mutation_generation,
                 "skipped clean user index save"
             );
+            let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.storage_metrics.record_save_completed(None, latency_us);
             return Ok(());
         }
 
@@ -1292,8 +1427,6 @@ impl Store {
         // closure can observe an idempotency duplicate and return success.
         handle.blob_meta.retry_save_before_access = true;
 
-        let started = Instant::now();
-        self.storage_metrics.record_save_attempt();
         let result = self.flush_handle_inner(handle).await;
         let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         match &result {
@@ -5163,9 +5296,31 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+        let metrics_before_clean_save = store.storage_metrics_snapshot();
         store.save_user("read-only-new").await.unwrap();
+        let metrics_after_clean_save = store.storage_metrics_snapshot();
         assert_eq!(gcs.put_attempts(), 0);
         assert_eq!(gcs.generation(&gcs_object_name("read-only-new")), None);
+        assert_eq!(
+            metrics_after_clean_save.save_attempts_total,
+            metrics_before_clean_save.save_attempts_total + 1
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_skipped_total,
+            metrics_before_clean_save.save_skipped_total + 1
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_completed_total,
+            metrics_before_clean_save.save_completed_total
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_failed_total,
+            metrics_before_clean_save.save_failed_total
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_latency_us.count,
+            metrics_before_clean_save.save_latency_us.count + 1
+        );
 
         store
             .with_user("read-only-existing", |conn| {
@@ -5665,6 +5820,102 @@ pub(crate) mod tests {
             .expect("second operation task panicked")
             .expect("second operation failed");
         assert_eq!(observed, 1, "second operation must observe the first");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_first_load_releases_its_capacity_reservation() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingGetGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("cancelled-load-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+
+        let load_store = Arc::clone(&store);
+        let load = tokio::spawn(async move {
+            load_store
+                .with_user("cancelled-load-user", |_| Ok(()))
+                .await
+        });
+        blocked.wait_until_blocked().await;
+        load.abort();
+        assert!(load
+            .await
+            .expect_err("load task was not cancelled")
+            .is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            store.with_user("post-cancel-user", |_| Ok(())).await
+        })
+        .await
+        .expect("cancelled Loading reservation permanently consumed STORE_MAX_OPEN")
+        .expect("cold load after cancelled reservation failed");
+
+        let registry = store.registry.lock().await;
+        assert!(!registry.open_users.contains_key("cancelled-load-user"));
+        assert!(registry.open_users.contains_key("post-cancel-user"));
+        assert_eq!(registry.open_users.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_eviction_restores_the_victim_and_capacity() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("cancelled-eviction-user"),
+        ));
+        let kms = Arc::new(FakeKms);
+        let store = Arc::new(make_store_with_limit(
+            kms.clone(),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+        store
+            .with_user("cancelled-eviction-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'survives cancellation')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate eviction victim");
+
+        let newcomer_store = Arc::clone(&store);
+        let newcomer = tokio::spawn(async move {
+            newcomer_store
+                .with_user("cancelled-new-user", |_| Ok(()))
+                .await
+        });
+        blocked.wait_until_blocked().await;
+        newcomer.abort();
+        assert!(newcomer
+            .await
+            .expect_err("eviction task was not cancelled")
+            .is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            store.with_user("post-eviction-cancel", |_| Ok(())).await
+        })
+        .await
+        .expect("cancelled Evicting transition permanently consumed STORE_MAX_OPEN")
+        .expect("cold load after cancelled eviction failed");
+
+        let fresh = Store::new(kms, inner);
+        let persisted: i64 = fresh
+            .with_user("cancelled-eviction-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("reload cancelled eviction victim");
+        assert_eq!(persisted, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
