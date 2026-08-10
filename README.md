@@ -37,8 +37,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 
 - Terminates public TLS inside Confidential Space and obtains/renews its certificate with
   ACME without exporting the private key.
-- Verifies Google identity, runs OAuth 2.1-style authorization with PKCE, and issues Kioku
-  access and refresh tokens.
+- Verifies Google and native Sign in with Apple identities, runs OAuth 2.1-style
+  authorization with PKCE, and issues Kioku access and refresh tokens.
 - Receives raw bounded audio/canonical screenshots plus timestamped application, window,
   display, and browser metadata from pure-Swift Kioku clients. Deterministically validated
   metadata-only screen references retain repeated observations without another encrypted
@@ -126,6 +126,14 @@ audiences, enforces a non-wildcard account allow-list, and issues Kioku tokens f
 query, MCP, and account routes. OAuth authorization uses PKCE, explicit consent,
 persisted single-use authorization codes, and client-bound refresh-token rotation.
 
+Native iPhone Apple login sends the signed identity token, single-use authorization code,
+and a per-request nonce to `/oauth/apple/native`. The enclave verifies Apple's signature,
+issuer, audience, expiry, verified email, subject, and nonce, exchanges the code directly
+with Apple, then issues the same resource-bound Kioku session used elsewhere. Apple and
+Google identities share an archive only through the authenticated `/api/auth/apple/link`
+action; matching email is never an account-link signal. Apple's refresh authorization is
+stored only in the encrypted control database and is revoked before account deletion.
+
 The published authorization endpoint is the operator's
 `WEB_ORIGIN/app/login`. Its normal path forwards to Google OAuth. An optional
 reviewer-only path accepts a short-lived Google Identity Platform token for one exact
@@ -200,6 +208,7 @@ The same binary serves all of these surfaces:
 |---|---|---|
 | Health and attestation | `/health`, `/v1/attestation` | Public |
 | OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/token` | Protocol-specific validation |
+| Native Apple identity | `/oauth/apple/native`, `/api/auth/session`, `/api/auth/apple/link` | Apple authorization or an existing authenticated account |
 | Device and account API | `/api/sync/*`, `/api/export`, `/api/account` | Kioku access token or accepted Google ID token |
 | Cloud Capture v2 | `/api/v2/capture/*`, `/api/v2/people*` | Kioku access token or accepted Google ID token |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
@@ -297,6 +306,9 @@ docker build --platform linux/amd64 \
   --build-arg GOOGLE_DESKTOP_CLIENT_ID=desktop-id.apps.googleusercontent.com \
   --build-arg GOOGLE_IOS_CLIENT_ID=ios-id.apps.googleusercontent.com \
   --build-arg GOOGLE_WEB_CLIENT_ID=web-id.apps.googleusercontent.com \
+  --build-arg APPLE_TEAM_ID=ABCDE12345 \
+  --build-arg APPLE_KEY_ID=FGHIJ67890 \
+  --build-arg APPLE_IOS_CLIENT_ID=com.kioku.ios \
   --build-arg ALLOWED_EMAILS=owner@example.com \
   --build-arg BASE_URL=https://api.example.com \
   --build-arg WEB_ORIGIN=https://app.example.com \
@@ -331,6 +343,7 @@ binding.
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
 | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
+| `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_IOS_CLIENT_ID` | Optional Sign in with Apple configuration; set all three or none. The client ID must identify the native iPhone app |
 | `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
@@ -342,7 +355,8 @@ binding.
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
 
-The web OAuth client secret is fetched at runtime from Secret Manager. The reviewer
+The web OAuth client secret and, when Apple login is configured, the P-256 Apple private
+key (`kioku-apple-sign-in-private-key`) are fetched at runtime from Secret Manager. The reviewer
 password remains only in Google Identity Platform, the review portal, and the operator's
 versioned `kioku-openai-reviewer-password` secret in project `kioku-joerodriguez`. JWT
 signing secrets are generated and stored in the KMS-protected control database; neither

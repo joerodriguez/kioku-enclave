@@ -47,6 +47,9 @@ name: Build & push enclave image
 #   GOOGLE_DESKTOP_CLIENT_ID  Google OAuth desktop audience
 #   GOOGLE_IOS_CLIENT_ID      Google OAuth iOS audience
 #   GOOGLE_WEB_CLIENT_ID      Google OAuth web audience
+#   APPLE_TEAM_ID             Optional Apple Developer team identifier
+#   APPLE_KEY_ID              Optional Sign in with Apple key identifier
+#   APPLE_IOS_CLIENT_ID       Optional native app identifier (com.kioku.ios)
 #   BASE_URL                  Public origin, e.g. https://api.kiokuu.com
 #   WEB_ORIGIN                 Browser application origin, e.g. https://kiokuu.com
 #   REVIEWER_AUTH_API_KEY     Firebase/Identity Platform web API key
@@ -222,6 +225,9 @@ jobs:
           PRODUCTION_GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.GOOGLE_DESKTOP_CLIENT_ID }}
           PRODUCTION_GOOGLE_IOS_CLIENT_ID: ${{ vars.GOOGLE_IOS_CLIENT_ID }}
           PRODUCTION_GOOGLE_WEB_CLIENT_ID: ${{ vars.GOOGLE_WEB_CLIENT_ID }}
+          PRODUCTION_APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          PRODUCTION_APPLE_KEY_ID: ${{ vars.APPLE_KEY_ID }}
+          PRODUCTION_APPLE_IOS_CLIENT_ID: ${{ vars.APPLE_IOS_CLIENT_ID }}
           PRODUCTION_ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           PRODUCTION_BASE_URL: ${{ vars.BASE_URL }}
           PRODUCTION_WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
@@ -246,6 +252,9 @@ jobs:
           EVALUATION_GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.EVAL_GOOGLE_DESKTOP_CLIENT_ID }}
           EVALUATION_GOOGLE_IOS_CLIENT_ID: ${{ vars.EVAL_GOOGLE_IOS_CLIENT_ID }}
           EVALUATION_GOOGLE_WEB_CLIENT_ID: ${{ vars.EVAL_GOOGLE_WEB_CLIENT_ID }}
+          EVALUATION_APPLE_TEAM_ID: ${{ vars.EVAL_APPLE_TEAM_ID }}
+          EVALUATION_APPLE_KEY_ID: ${{ vars.EVAL_APPLE_KEY_ID }}
+          EVALUATION_APPLE_IOS_CLIENT_ID: ${{ vars.EVAL_APPLE_IOS_CLIENT_ID }}
           EVALUATION_ALLOWED_EMAILS: ${{ secrets.EVAL_ALLOWED_EMAILS }}
           EVALUATION_BASE_URL: ${{ vars.EVAL_BASE_URL }}
           EVALUATION_WEB_ORIGIN: ${{ vars.EVAL_WEB_ORIGIN }}
@@ -302,6 +311,9 @@ jobs:
             --build-arg GOOGLE_DESKTOP_CLIENT_ID="${GOOGLE_DESKTOP_CLIENT_ID}" \
             --build-arg GOOGLE_IOS_CLIENT_ID="${GOOGLE_IOS_CLIENT_ID}" \
             --build-arg GOOGLE_WEB_CLIENT_ID="${GOOGLE_WEB_CLIENT_ID}" \
+            --build-arg APPLE_TEAM_ID="${APPLE_TEAM_ID}" \
+            --build-arg APPLE_KEY_ID="${APPLE_KEY_ID}" \
+            --build-arg APPLE_IOS_CLIENT_ID="${APPLE_IOS_CLIENT_ID}" \
             --build-arg ALLOWED_EMAILS="${ALLOWED_EMAILS}" \
             --build-arg BASE_URL="${BASE_URL}" \
             --build-arg WEB_ORIGIN="${WEB_ORIGIN}" \
@@ -330,6 +342,7 @@ jobs:
             ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET \
             ENCLAVE_RUN_SA_EMAIL ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE \
             GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID \
+            APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID \
             ALLOWED_EMAILS BASE_URL WEB_ORIGIN REVIEWER_AUTH_API_KEY \
             REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL VERTEX_PROJECT VERTEX_LOCATION \
             VERTEX_MODEL ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY \

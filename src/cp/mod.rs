@@ -11,6 +11,7 @@
 //! Identity and accounting live in [`control_store`] as an encrypted SQLite
 //! blob in GCS.
 
+pub mod apple;
 pub mod auth;
 pub mod control_store;
 pub mod cors;
@@ -73,6 +74,9 @@ pub struct CpConfig {
     pub google_ios_client_id: String,
     pub google_web_client_id: String,
     pub google_web_client_secret: String,
+    /// Optional Sign in with Apple public configuration. The private key is
+    /// fetched separately from Secret Manager and never enters image metadata.
+    pub apple_sign_in: Option<apple::AppleSignInConfig>,
     /// Lowercased allow-list. `None` is permitted only in debug test mode.
     pub allowed_emails: Option<Vec<String>>,
     pub scheduler_sa_email: Option<String>,
@@ -246,6 +250,46 @@ impl CpConfig {
             })
         };
 
+        let apple_values = [
+            std::env::var("APPLE_TEAM_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("APPLE_KEY_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("APPLE_IOS_CLIENT_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        ];
+        let apple_sign_in = if apple_values.iter().all(String::is_empty) {
+            None
+        } else if apple_values.iter().any(String::is_empty) {
+            return Err(crate::error::EnclaveError::Config(
+                "APPLE_TEAM_ID, APPLE_KEY_ID, and APPLE_IOS_CLIENT_ID must be set together".into(),
+            ));
+        } else {
+            let [team_id, key_id, client_id] = apple_values;
+            let identifier_valid = |value: &str| {
+                value.len() == 10 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            };
+            if !identifier_valid(&team_id)
+                || !identifier_valid(&key_id)
+                || client_id != "com.kioku.ios"
+            {
+                return Err(crate::error::EnclaveError::Config(
+                    "Sign in with Apple public configuration is invalid".into(),
+                ));
+            }
+            Some(apple::AppleSignInConfig {
+                team_id,
+                key_id,
+                client_id,
+            })
+        };
+
         let vertex_model = config_value("VERTEX_MODEL", "gemini-3.5-flash")?;
 
         Ok(Self {
@@ -264,6 +308,7 @@ impl CpConfig {
                 "test-ios.apps.googleusercontent.com",
             )?,
             google_web_client_secret,
+            apple_sign_in,
             allowed_emails,
             scheduler_sa_email: std::env::var("SCHEDULER_SA_EMAIL")
                 .ok()
@@ -314,6 +359,7 @@ pub struct CpState {
     pub config: Arc<CpConfig>,
     pub user_verifier: Arc<auth::UserIdTokenVerifier>,
     pub reviewer_verifier: Option<Arc<auth::ReviewerIdentityVerifier>>,
+    pub apple_provider: Option<Arc<apple::AppleIdentityProvider>>,
     pub sync_limiter: limits::RateLimiter,
     pub mcp_limiter: limits::RateLimiter,
     pub oauth_limiter: limits::RateLimiter,

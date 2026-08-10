@@ -42,6 +42,12 @@ CONFIGURATION = {
     "ENCLAVE_ACME_CONTACT": "mailto:owner@example.com",
 }
 
+APPLE_CONFIGURATION = {
+    "APPLE_TEAM_ID": "ABCDE12345",
+    "APPLE_KEY_ID": "FGHIJ67890",
+    "APPLE_IOS_CLIENT_ID": "com.kioku.ios",
+}
+
 
 def environment() -> dict[str, str]:
     result = {
@@ -110,6 +116,24 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("EVALUATION_ENCLAVE_GCS_BUCKET", completed.stderr)
         self.assertNotIn("kioku-production-indexes", completed.stderr)
 
+    def test_apple_configuration_is_optional_but_atomic(self) -> None:
+        env = environment()
+        completed, content = self.run_selector("production", env)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("APPLE_TEAM_ID=\n", content)
+
+        for key, value in APPLE_CONFIGURATION.items():
+            env[f"PRODUCTION_{key}"] = value
+        completed, content = self.run_selector("production", env)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("APPLE_IOS_CLIENT_ID=com.kioku.ios\n", content)
+
+        del env["PRODUCTION_APPLE_KEY_ID"]
+        completed, content = self.run_selector("production", env)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("PRODUCTION_APPLE_KEY_ID", completed.stderr)
+
     def test_every_evaluation_value_is_required(self) -> None:
         for key in CONFIGURATION:
             source_name = f"EVALUATION_{key}"
@@ -162,6 +186,9 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('KIOKU_BUILD_PROFILE == "evaluation"', workflow)
         self.assertIn('"build_profile": build_profile', workflow)
         for key in CONFIGURATION:
+            self.assertIn(f"EVALUATION_{key}:", workflow)
+            self.assertIn(f"EVAL_{key}", workflow)
+        for key in APPLE_CONFIGURATION:
             self.assertIn(f"EVALUATION_{key}:", workflow)
             self.assertIn(f"EVAL_{key}", workflow)
         clear = workflow.index("Clear selected build configuration")

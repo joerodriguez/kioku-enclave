@@ -69,7 +69,9 @@ pub fn new_uuid() -> String {
     )
 }
 
-/// Derive a stable, deterministic UUIDv5-like string from google_sub using SHA-256.
+/// Derive a stable, deterministic UUIDv5-like string from a legacy Google
+/// subject using SHA-256. This exact function is retained so existing Google
+/// accounts keep their encrypted archive object names.
 /// This prevents orphaning user index GCS blobs on control DB resets.
 pub fn derive_stable_uuid(google_sub: &str) -> String {
     // Fixed namespace UUID for Kioku user IDs (randomly generated once)
@@ -92,6 +94,17 @@ pub fn derive_stable_uuid(google_sub: &str) -> String {
     )
 }
 
+/// Derive the canonical Kioku account id for a newly created provider
+/// identity. Google deliberately preserves the historical derivation. Other
+/// providers are domain-separated so equal opaque subjects cannot collide.
+pub fn derive_provider_uuid(provider: &str, subject: &str) -> String {
+    if provider == "google" {
+        derive_stable_uuid(subject)
+    } else {
+        derive_stable_uuid(&format!("{provider}\0{subject}"))
+    }
+}
+
 // ── Access token (our own HS256 JWT) ────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -102,7 +115,7 @@ struct AccessClaims {
     exp: u64,
 }
 
-/// Issue a 1-hour HS256 access JWT for a user id.
+/// Issue a 15-minute HS256 access JWT for a user id.
 pub fn issue_access_token(secret: &str, base_url: &str, user_id: &str) -> Result<String> {
     let claims = AccessClaims {
         sub: user_id.to_string(),
@@ -384,5 +397,22 @@ mod tests {
 
         let u3 = derive_stable_uuid("different_sub");
         assert_ne!(u1, u3);
+    }
+
+    #[test]
+    fn provider_ids_preserve_google_and_domain_separate_apple() {
+        let subject = "same-provider-subject";
+        assert_eq!(
+            derive_provider_uuid("google", subject),
+            derive_stable_uuid(subject)
+        );
+        assert_ne!(
+            derive_provider_uuid("apple", subject),
+            derive_stable_uuid(subject)
+        );
+        assert_ne!(
+            derive_provider_uuid("apple", subject),
+            derive_provider_uuid("other", subject)
+        );
     }
 }

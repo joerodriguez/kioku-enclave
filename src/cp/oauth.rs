@@ -35,6 +35,10 @@ const MAX_CLIENT_STATE_BYTES: usize = 1024;
 const AUTH_CODE_TTL_SECS: i64 = 5 * 60;
 const REFRESH_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MCP_SCOPE: &str = "kioku:read";
+/// Fixed public first-party client used only by the signed iPhone app
+/// after the enclave has verified an Apple authorization grant. It is a UUID
+/// so the normal refresh-token validation path remains shared and auditable.
+pub const IOS_NATIVE_CLIENT_ID: &str = "a3f42956-2dc1-4e58-9f05-a83fac1f9328";
 
 fn is_valid_client_id(value: &str) -> bool {
     value.len() == 36
@@ -1831,6 +1835,51 @@ async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
             Err(_) => return server_error(),
         };
     token_response(&access, &raw_refresh)
+}
+
+/// Issue the first Kioku access/refresh pair for a server-verified native
+/// identity. The fixed first-party client is inserted idempotently and the
+/// refresh token is persisted atomically before it is returned.
+pub async fn issue_native_session(
+    s: &Arc<CpState>,
+    user_id: &str,
+) -> crate::error::Result<(String, String)> {
+    let access = tokens::issue_access_token(&s.config.jwt_secrets[0], &s.config.base_url, user_id)?;
+    let raw_refresh = tokens::random_token_hex();
+    let refresh_hash = tokens::sha256_hex(&raw_refresh);
+    let user_id = user_id.to_string();
+    s.control
+        .write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let active: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
+                [&user_id],
+                |row| row.get(0),
+            )?;
+            if active == 0 {
+                tx.rollback()?;
+                return Err(crate::error::EnclaveError::Auth("account inactive".into()));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO oauth_clients (client_id, client_name, redirect_uris) \
+                 VALUES (?1, 'Kioku for iPhone', '[]')",
+                [IOS_NATIVE_CLIENT_ID],
+            )?;
+            tx.execute(
+                "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
+                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
+                rusqlite::params![
+                    refresh_hash,
+                    user_id,
+                    IOS_NATIVE_CLIENT_ID,
+                    format!("+{REFRESH_TTL_SECS} seconds")
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok((access, raw_refresh))
 }
 
 fn token_response(access: &str, refresh: &str) -> Response {

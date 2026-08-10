@@ -1,6 +1,6 @@
 [package]
 name = "kioku-enclave"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 rust-version = "1.96"
 description = "Attested Kioku backend for encrypted personal-memory storage and retrieval"
@@ -93,13 +93,13 @@ urlencoding = "2.1.3"
 tempfile = "3.20.0"
 
 # JWT verification for caller ID-token auth (Google RS256 tokens).
-# "use-pem" / "use-native-tls" excluded; we use the rustls path everywhere.
-# rsa feature pulls in the rsa crate for RS256 verify; we exclude pem (not needed at runtime).
+# "use-native-tls" is excluded; we use the rustls path everywhere. "use_pem"
+# is required to load Apple's ES256 private key for client-secret signing.
 # rust_crypto = pure-Rust CryptoProvider (no C/system deps — required for the
 # musl static FROM-scratch build). WITHOUT a provider feature, jsonwebtoken 10
 # PANICS at signature-verify time ("Could not determine CryptoProvider"), which
 # crashed the enclave on every real ID token. "rsa" alone is NOT a provider.
-jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 
 # Self-signed certificate generation at boot for RA-TLS (ADR-0001).
 # Pinned to the same version instant-acme's ACME path uses (ADR-0003) so the

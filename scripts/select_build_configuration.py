@@ -49,6 +49,10 @@ PROFILE_KEYS = (
     "ENCLAVE_ACME_CONTACT",
 )
 
+OPTIONAL_PROFILE_GROUPS = (
+    ("APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_IOS_CLIENT_ID"),
+)
+
 PROJECT_PATTERN = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
 SERVICE_ACCOUNT_PATTERN = (
     r"[a-z0-9][a-z0-9-]{4,28}[a-z0-9]@"
@@ -138,6 +142,10 @@ def validate(configuration: dict[str, str]) -> None:
         "GOOGLE_WEB_CLIENT_ID",
     ):
         require_pattern(configuration, name, r"[A-Za-z0-9._-]+\.apps\.googleusercontent\.com")
+    if configuration.get("APPLE_TEAM_ID"):
+        require_pattern(configuration, "APPLE_TEAM_ID", r"[A-Za-z0-9]{10}")
+        require_pattern(configuration, "APPLE_KEY_ID", r"[A-Za-z0-9]{10}")
+        require_pattern(configuration, "APPLE_IOS_CLIENT_ID", r"com\.kioku\.ios")
     require_pattern(configuration, "REVIEWER_AUTH_API_KEY", r"[A-Za-z0-9_-]{20,256}")
     require_pattern(configuration, "REVIEWER_AUTH_UID", r"[A-Za-z0-9_-]{1,128}")
     require_pattern(configuration, "REVIEWER_AUTH_EMAIL", EMAIL_PATTERN)
@@ -177,6 +185,18 @@ def selected_configuration(profile: str, environment: dict[str, str]) -> dict[st
     for name in PROFILE_KEYS:
         source_name = f"{prefix}_{name}"
         configuration[name] = require_value(environment, source_name)
+    for group in OPTIONAL_PROFILE_GROUPS:
+        values = {
+            name: environment.get(f"{prefix}_{name}", "") for name in group
+        }
+        if any(values.values()) and not all(values.values()):
+            missing = ", ".join(
+                f"{prefix}_{name}" for name, value in values.items() if not value
+            )
+            raise SystemExit(
+                "incomplete optional repository configuration group; missing: " + missing
+            )
+        configuration.update(values)
     validate(configuration)
     return configuration
 
