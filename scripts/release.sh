@@ -463,6 +463,7 @@ EXPECTED_ASSET_NAMES="$(printf '%s\n' \
   enclave-release.json \
   enclave-sbom-attestation.jsonl \
   enclave-sbom.spdx.json | sort)"
+EXPECTED_ASSETS_CSV="$(tr '\n' ',' <<< "$EXPECTED_ASSET_NAMES" | sed 's/,$//')"
 EXPECTED_PRERELEASE=false
 PRERELEASE_ARGS=(--prerelease=false)
 if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -470,15 +471,120 @@ if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   PRERELEASE_ARGS=(--prerelease)
 fi
 
-if [[ "$RELEASE_EXISTS" == "false" ]]; then
-  # gh creates a draft internally, uploads every asset, and only then publishes;
-  # this is required because immutable releases lock assets at publication.
-  gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
+# A tagged workflow may publish an immutable release while this script is
+# waiting for and verifying its build evidence. Refresh immediately before the
+# first release mutation so a stale "missing" observation cannot lead to an
+# unsafe create attempt. Existing immutable assets are never modified.
+refresh_release_state_before_mutation() {
+  local release_json release_state
+  RELEASE_EXISTS=false
+  RELEASE_IS_DRAFT=false
+  RELEASE_IS_IMMUTABLE=false
+  RELEASE_IS_PRERELEASE=false
+  RELEASE_PUBLISHED_AT=""
+  RELEASE_ASSETS_CSV=""
+
+  if ! release_json="$(gh release view "$RELEASE_TAG" \
+    --repo "$REPOSITORY" \
+    --json isDraft,isImmutable,isPrerelease,publishedAt,assets 2>/dev/null)"; then
+    return 0
+  fi
+  if ! release_state="$(printf '%s' "$release_json" | python3 -c '
+from datetime import datetime
+import json, re, sys
+release = json.load(sys.stdin)
+for key in ("isDraft", "isImmutable", "isPrerelease"):
+    if type(release.get(key)) is not bool:
+        raise SystemExit("release state has a malformed boolean")
+published_at = release.get("publishedAt")
+if published_at is not None and not isinstance(published_at, str):
+    raise SystemExit("release state has a malformed publication time")
+if published_at:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", published_at):
+        raise SystemExit("release state has a malformed publication time")
+    normalized_published_at = published_at[:-1] + "+00:00" if published_at.endswith("Z") else published_at
+    try:
+        parsed_published_at = datetime.fromisoformat(normalized_published_at)
+    except ValueError as error:
+        raise SystemExit("release state has a malformed publication time") from error
+    if parsed_published_at.utcoffset() is None:
+        raise SystemExit("release state has a malformed publication time")
+assets = release.get("assets")
+if not isinstance(assets, list) or any(not isinstance(asset, dict) or not isinstance(asset.get("name"), str) for asset in assets):
+    raise SystemExit("release state has malformed assets")
+names = [asset["name"] for asset in assets]
+if len(names) != len(set(names)) or any("\t" in name or "\n" in name or "\r" in name for name in names):
+    raise SystemExit("release state has unsafe asset names")
+print("\t".join((str(release["isDraft"]).lower(), str(release["isImmutable"]).lower(), str(release["isPrerelease"]).lower(), published_at or "", ",".join(sorted(names)))))
+')"; then
+    echo "Error: release state is malformed; refusing to mutate the release." >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r RELEASE_IS_DRAFT RELEASE_IS_IMMUTABLE RELEASE_IS_PRERELEASE RELEASE_PUBLISHED_AT RELEASE_ASSETS_CSV <<< "$release_state"
+  RELEASE_EXISTS=true
+}
+
+reverify_published_immutable_release() {
+  local release_assets_dir asset_name
+  if [[ "$RELEASE_IS_DRAFT" != "false" || "$RELEASE_IS_IMMUTABLE" != "true" || "$RELEASE_IS_PRERELEASE" != "$EXPECTED_PRERELEASE" || -z "$RELEASE_PUBLISHED_AT" ]]; then
+    echo "Error: refreshed release is not a published immutable release matching the requested tag." >&2
+    exit 1
+  fi
+  if [[ "$RELEASE_ASSETS_CSV" != "$EXPECTED_ASSETS_CSV" ]]; then
+    echo "Error: refreshed immutable release does not contain exactly the expected assets." >&2
+    exit 1
+  fi
+  release_assets_dir="$WORK_DIR/refreshed-immutable-release"
+  mkdir -p "$release_assets_dir"
+  for asset_name in $EXPECTED_ASSET_NAMES; do
+    gh release download "$RELEASE_TAG" \
+      --repo "$REPOSITORY" \
+      --pattern "$asset_name" \
+      --dir "$release_assets_dir"
+    if ! cmp -s "$WORK_DIR/$asset_name" "$release_assets_dir/$asset_name"; then
+      echo "Error: refreshed immutable release asset does not match verified build evidence: $asset_name" >&2
+      exit 1
+    fi
+  done
+}
+
+create_release_or_reverify_publication_race() {
+  if gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
     --repo "$REPOSITORY" \
     --verify-tag \
     --title "Kioku enclave $RELEASE_TAG" \
     --notes-file "$NOTES_FILE" \
-    "${PRERELEASE_ARGS[@]}"
+    "${PRERELEASE_ARGS[@]}"; then
+    return 0
+  fi
+
+  # Close the remaining check/create race as well as the longer build-time
+  # race above. A failed create may mean the tagged workflow published first
+  # (or that the create response was lost). Only an exact immutable release is
+  # accepted; an absent or draft release remains an incomplete operation for a
+  # later explicit resume.
+  echo "Release create did not complete; checking for concurrent workflow publication..."
+  refresh_release_state_before_mutation
+  if [[ "$RELEASE_EXISTS" == "true" && "$RELEASE_IS_DRAFT" == "false" ]]; then
+    reverify_published_immutable_release
+    return 0
+  fi
+  echo "Error: release create failed without an exact published immutable release." >&2
+  return 1
+}
+
+refresh_release_state_before_mutation
+if [[ "$RELEASE_EXISTS" == "true" && "$RELEASE_IS_DRAFT" == "false" ]]; then
+  # This includes the publication race: only a complete immutable public
+  # release may replace the planned create path, and it is re-verified before
+  # proceeding without any edit or upload.
+  reverify_published_immutable_release
+fi
+
+if [[ "$RELEASE_EXISTS" == "false" ]]; then
+  # gh creates a draft internally, uploads every asset, and only then publishes;
+  # this is required because immutable releases lock assets at publication.
+  create_release_or_reverify_publication_race
 elif [[ "$RELEASE_IS_DRAFT" == "true" ]]; then
   # Repair an interrupted draft only when it contains no unexpected assets.
   while IFS= read -r asset_name; do
@@ -512,7 +618,6 @@ FINAL_RELEASE_STATE="$(gh release view "$RELEASE_TAG" \
   --json isDraft,isImmutable,isPrerelease,publishedAt,assets \
   --jq '[.isDraft, .isImmutable, .isPrerelease, (.publishedAt // ""), ([.assets[].name] | sort | join(","))] | @tsv')"
 IFS=$'\t' read -r FINAL_IS_DRAFT FINAL_IS_IMMUTABLE FINAL_IS_PRERELEASE FINAL_PUBLISHED_AT FINAL_ASSETS <<< "$FINAL_RELEASE_STATE"
-EXPECTED_ASSETS_CSV="$(tr '\n' ',' <<< "$EXPECTED_ASSET_NAMES" | sed 's/,$//')"
 if [[ "$FINAL_IS_DRAFT" != "false" || "$FINAL_IS_IMMUTABLE" != "true" || -z "$FINAL_PUBLISHED_AT" ]]; then
   echo "Error: release was not published immutably." >&2
   exit 1

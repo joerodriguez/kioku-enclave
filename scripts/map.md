@@ -12,6 +12,8 @@ None of these scripts runs in the enclave or in a Kioku client.
 | `check_voice_release_gate.py` | Classifies a release as exact owner-only/no-claim or invokes the Rust checker for a complete real-corpus trio. |
 | `test_check_voice_release_gate.py` | Fail-closed contract tests for owner-only and validated-real-corpus classifications. |
 | `release.sh` | Verifies the selected voice-quality classification, creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
+| `test_release.py` | Static fail-closed contracts for release-state refresh, immutable-publication races, and malformed release metadata. |
+| `test_release_race.sh` | Mocked execution test of release-state refresh: raced immutable releases are reverified without mutation, while mismatched assets fail closed. |
 | `select_build_configuration.py` | Atomically selects and validates one complete production or evaluation image profile without cross-profile fallback. |
 | `test_select_build_configuration.py` | Contract tests for profile isolation and the public build workflow. |
 | `generate_capacity_fixture.py` | Validates ADR-0022's checked-in capacity manifest and streams content-free synthetic distributions into ignored/out-of-tree output; an explicit option can create the declared 32-GiB logical sparse shape without writing 32 GiB of blocks. |
