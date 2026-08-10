@@ -18,6 +18,8 @@ None of these scripts runs in the enclave or in a Kioku client.
 | `test_select_build_configuration.py` | Contract tests for profile isolation and the public build workflow. |
 | `generate_capacity_fixture.py` | Validates ADR-0022's checked-in capacity manifest and streams content-free synthetic distributions into ignored/out-of-tree output; an explicit option can create the declared 32-GiB logical sparse shape without writing 32 GiB of blocks. |
 | `test_generate_capacity_fixture.py` | Validates exact 480/960/1,200-hour distributions and bounded deterministic generation without creating the 32-GiB shape. |
+| `run_archive_capacity_harness.py` | Offline ADR-0022 SQLite load harness: builds deterministic content-free smoke or full-size databases, records provenance/metric gates, and claims release evidence only after a full 32-GiB target run passes explicit gates. |
+| `test_run_archive_capacity_harness.py` | Contract tests for content-free SQLite smoke output, full-evidence prerequisites, and safe output locations. |
 
 The Python selector is CI/operator tooling only. The macOS and iOS clients remain pure
 Swift and the enclave runtime remains Rust.

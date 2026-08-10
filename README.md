@@ -311,6 +311,14 @@ records:
 python3 scripts/generate_capacity_fixture.py check
 ```
 
+`scripts/run_archive_capacity_harness.py` adds an offline, deterministic SQLite load
+harness. CI smoke runs create a small real SQLite database and are always non-evidence.
+The explicit full 32-GiB profile records VM/image, SQLite/extensions, cache/backend,
+concurrency, media-mix, sample/percentile, ingest/query/bytes/RSS gate metadata in a
+versioned report. It marks `release_evidence` only after the actual SQLite logical and
+file-size targets and all supplied gates pass; it does not replace the remaining v3 VFS,
+witness, backend, fault, or lifecycle evidence.
+
 The optional generator streams numeric synthetic records to ignored `target/` output (or
 outside the checkout), so it does not allocate every record in memory. Its bounded smoke
 mode is exercised in unit tests. The explicit `power-user-c-1200-32gib` plus

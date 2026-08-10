@@ -31,3 +31,25 @@ names, user IDs or object paths. `archive-shape.sparse` is deliberately not a SQ
 database and cannot establish query latency or correctness; it exercises only logical
 size/envelope/filesystem paths. Production-shaped SQLite and backend load evidence still
 requires the full ADR-0022 release harness and pinned report manifest.
+
+## SQLite capacity harness
+
+`scripts/run_archive_capacity_harness.py` is the offline SQLite portion of that
+evidence. Its deterministic records contain only manifest record kinds, ordinals, logical
+offsets, and numeric tokens. Output must be outside the checkout or under ignored
+`target/`; a durable progress receipt makes interrupted full runs resumable.
+
+Smoke mode is suitable for CI and is always marked `release_evidence: false`:
+
+```sh
+python3 scripts/run_archive_capacity_harness.py \
+  --profile power-user-a-480 --mode smoke \
+  --record-limit 100 --output target/capacity-harness/smoke-480
+```
+
+Only the 1,200-hours/year, three-year 32-GiB profile may run in full mode. It requires a
+public VM identifier, immutable image digest, cache/concurrency/sample metadata, and
+explicit ingest/query/RSS thresholds. It creates and queries a real SQLite database (not
+a sparse-file substitute); `release_evidence` is true only when both SQLite logical and
+database-file sizes reach 32 GiB and all supplied gates pass. The resulting report remains
+SQLite-only evidence and cannot authorize archive-v3 production authority.
