@@ -359,8 +359,24 @@ async fn handle_delete_user(
 
 // ── Health handler ────────────────────────────────────────────────────────────
 
-async fn handle_health() -> Json<serde_json::Value> {
-    Json(json!({"ok": true, "service": "kioku-enclave"}))
+async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let progress = state.store.legacy_checkpoint_reconciliation().await;
+    Json(health_json(progress))
+}
+
+fn health_json(progress: store::LegacyCheckpointReconciliation) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "service": "kioku-enclave",
+        "legacy_checkpoint_reconciliation_ready": progress.ready,
+        "legacy_checkpoint_reconciliation": {
+            "completed_scans": progress.completed_scans,
+            "listed_live_objects": progress.listed_live_objects,
+            "live_archives_checked": progress.live_archives_checked,
+            "checkpoints_verified": progress.checkpoints_verified,
+            "failures": progress.failures,
+        }
+    })
 }
 
 async fn limit_public_oauth(
@@ -624,6 +640,7 @@ async fn main() {
         media_gcs,
     ));
     Store::spawn_metrics_reporter(Arc::clone(&store));
+    Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
 
     // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
     // control store consumes the originals.
@@ -965,7 +982,8 @@ async fn serve_tls(
 
 #[cfg(test)]
 mod email_startup_tests {
-    use super::resolve_resend_api_key;
+    use super::{health_json, resolve_resend_api_key};
+    use crate::store::LegacyCheckpointReconciliation;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1025,5 +1043,29 @@ mod email_startup_tests {
             malformed.unwrap_err(),
             "Resend API key has an invalid format"
         );
+    }
+
+    #[test]
+    fn health_serializes_only_aggregate_checkpoint_readiness() {
+        let health = health_json(LegacyCheckpointReconciliation {
+            ready: true,
+            completed_scans: 2,
+            listed_live_objects: 3,
+            live_archives_checked: 3,
+            checkpoints_verified: 3,
+            failures: 0,
+        });
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["service"], "kioku-enclave");
+        assert_eq!(health["legacy_checkpoint_reconciliation_ready"], true);
+        assert_eq!(
+            health["legacy_checkpoint_reconciliation"]["checkpoints_verified"],
+            3
+        );
+        assert!(health
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.contains("user")));
     }
 }

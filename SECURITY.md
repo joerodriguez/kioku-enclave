@@ -191,6 +191,16 @@ and their content-free metadata are included in later export/deletion inventorie
 flush begins, any failure before the authoritative generation-checked PUT succeeds fences
 the local handle: its next access must retry persistence before request code can observe an
 idempotency duplicate and acknowledge it.
+
+At startup, a serial, bounded-memory reconciler also lists only live `indexes/` objects
+one page at a time and resolves each listed name through an explicit live-object read
+before copying it. It therefore never treats a listed noncurrent generation as current
+authority. It creates or
+verifies today's named immutable checkpoint with the same source-generation and
+destination-create preconditions, retries incomplete passes with bounded backoff, and
+reports only aggregate counts/readiness, including the public health readiness field.
+Readiness remains false until one error-free scan finishes; this worker does not enable
+lifecycle policy or change archive authority.
 If GCS committed that PUT but its response was lost or the caller was cancelled, the retry's
 generation conflict is accepted only after the current object carries the exact same wrapped
 DEK metadata and decrypts under that DEK/context to the exact pending SQLite image. A different

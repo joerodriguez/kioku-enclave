@@ -245,6 +245,16 @@ cargo fmt --all -- --check
 
 ## Archive capacity fixtures and observability
 
+Before legacy noncurrent-generation lifecycle rules may be promoted, startup also runs a
+bounded serial reconciliation of pre-existing `indexes/*.db.enc` objects. It lists only
+current GCS objects, then resolves each name through an explicit live-object read,
+and create-verifies the current UTC day's generation-pinned recovery checkpoint. A retry
+after a lost copy response or restart converges on the immutable named checkpoint; no user,
+archive, object, or generation identifier is logged. Aggregate readiness remains false
+until a complete error-free scan, and the runtime never activates bucket lifecycle itself.
+Successful scans run at most hourly; failures retry with bounded 5-second-to-5-minute
+backoff.
+
 ADR-0022 Phase-0a instruments the existing whole-encrypted-SQLite snapshot path with
 process-local, unlabeled counters and fixed-bucket histograms. Once per active minute the
 service emits one cumulative `archive_snapshot_v1` structured event through its existing

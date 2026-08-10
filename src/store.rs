@@ -174,6 +174,20 @@ pub struct Store {
     max_open: usize,
     checkpoint_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     storage_metrics: StorageMetrics,
+    legacy_checkpoint_reconciliation: Mutex<LegacyCheckpointReconciliation>,
+}
+
+/// Content-free startup reconciliation state. It deliberately has no archive,
+/// object, or account identifiers so it is safe to expose through aggregate
+/// logs and diagnostics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegacyCheckpointReconciliation {
+    pub ready: bool,
+    pub completed_scans: u64,
+    pub listed_live_objects: u64,
+    pub live_archives_checked: u64,
+    pub checkpoints_verified: u64,
+    pub failures: u64,
 }
 
 struct UserActor {
@@ -454,6 +468,7 @@ impl Store {
             max_open: max_open.max(1),
             checkpoint_clock: Arc::new(SystemTime::now),
             storage_metrics: StorageMetrics::default(),
+            legacy_checkpoint_reconciliation: Mutex::new(LegacyCheckpointReconciliation::default()),
         }
     }
 
@@ -479,6 +494,155 @@ impl Store {
 
     pub(crate) fn storage_metrics_snapshot(&self) -> StorageMetricsSnapshot {
         self.storage_metrics.snapshot()
+    }
+
+    /// Returns aggregate-only reconciliation progress. `ready` is false until
+    /// one complete, error-free pass has verified today's checkpoint for every
+    /// currently live legacy archive discovered through GCS listing.
+    pub async fn legacy_checkpoint_reconciliation(&self) -> LegacyCheckpointReconciliation {
+        self.legacy_checkpoint_reconciliation.lock().await.clone()
+    }
+
+    /// Reconcile legacy archives already present before the first new save.
+    /// This runs serially (one GCS operation chain at a time), retains only one
+    /// listing page, and retries later after failures. It never changes bucket
+    /// lifecycle policy or archive authority.
+    pub fn spawn_legacy_checkpoint_reconciler(store: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut retry_delay = Duration::from_secs(5);
+            loop {
+                match store.reconcile_legacy_recovery_checkpoints_once().await {
+                    Ok(progress) => {
+                        info!(
+                            target: "kioku::legacy_checkpoint_reconciliation",
+                            ready = progress.ready,
+                            completed_scans = progress.completed_scans,
+                            listed_live_objects = progress.listed_live_objects,
+                            live_archives_checked = progress.live_archives_checked,
+                            checkpoints_verified = progress.checkpoints_verified,
+                            failures = progress.failures,
+                            "legacy recovery checkpoint reconciliation completed"
+                        );
+                        retry_delay = Duration::from_secs(3600);
+                    }
+                    Err(()) => {
+                        let progress = store.legacy_checkpoint_reconciliation().await;
+                        warn!(
+                            target: "kioku::legacy_checkpoint_reconciliation",
+                            ready = false,
+                            listed_live_objects = progress.listed_live_objects,
+                            live_archives_checked = progress.live_archives_checked,
+                            checkpoints_verified = progress.checkpoints_verified,
+                            failures = progress.failures,
+                            retry_delay_seconds = retry_delay.as_secs(),
+                            "legacy recovery checkpoint reconciliation incomplete; retrying"
+                        );
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                    }
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+        });
+    }
+
+    /// One bounded-memory pass. Listing excludes noncurrent versions, and each
+    /// listed name is explicitly read without a generation to bind the
+    /// checkpoint to GCS's current live generation. Any listing/read mismatch
+    /// fails the pass closed so readiness cannot be asserted on an incomplete
+    /// view.
+    pub async fn reconcile_legacy_recovery_checkpoints_once(
+        &self,
+    ) -> std::result::Result<LegacyCheckpointReconciliation, ()> {
+        *self.legacy_checkpoint_reconciliation.lock().await =
+            LegacyCheckpointReconciliation::default();
+        let mut progress = LegacyCheckpointReconciliation::default();
+        let now = (self.checkpoint_clock)();
+        let mut page_token = None;
+        let mut seen_page_tokens = HashSet::new();
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = match self
+                .gcs
+                .list_live_objects("indexes/", page_token.as_deref())
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await
+                }
+            };
+            for listed in page.versions {
+                progress.listed_live_objects = progress.listed_live_objects.saturating_add(1);
+                let Some(user_id) = legacy_index_user_id(&listed.name) else {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await;
+                };
+                let live = match self.gcs.get_object(&listed.name).await {
+                    Ok(live) => live,
+                    Err(EnclaveError::NotFound) => {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await
+                    }
+                    Err(_) => {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await
+                    }
+                };
+                if live.generation <= 0 {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await;
+                }
+                progress.live_archives_checked = progress.live_archives_checked.saturating_add(1);
+                if self
+                    .ensure_legacy_recovery_checkpoint(&user_id, live.generation, now)
+                    .await
+                    .is_err()
+                {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await;
+                }
+                progress.checkpoints_verified = progress.checkpoints_verified.saturating_add(1);
+            }
+            match page.next_page_token {
+                Some(next) if seen_page_tokens.insert(next.clone()) => page_token = Some(next),
+                Some(_) => {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await
+                }
+                None => {
+                    progress.completed_scans = 1;
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, true)
+                        .await;
+                }
+            }
+        }
+        self.finish_legacy_checkpoint_reconciliation(progress, false)
+            .await
+    }
+
+    async fn finish_legacy_checkpoint_reconciliation(
+        &self,
+        mut progress: LegacyCheckpointReconciliation,
+        ready: bool,
+    ) -> std::result::Result<LegacyCheckpointReconciliation, ()> {
+        progress.ready = ready;
+        if !ready {
+            progress.failures = 1;
+        }
+        *self.legacy_checkpoint_reconciliation.lock().await = progress.clone();
+        if ready {
+            Ok(progress)
+        } else {
+            Err(())
+        }
     }
 
     pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<i64> {
@@ -2779,6 +2943,14 @@ pub trait GcsClient: Send + Sync {
         prefix: &str,
         page_token: Option<&str>,
     ) -> Result<GcsListVersionsResponse>;
+    /// Lists only the currently live objects under `prefix` (`versions=false`).
+    /// Reconciliation uses this instead of deriving liveness from a historical
+    /// version listing.
+    async fn list_live_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse>;
     /// Deletes exactly one generation. Not-found is success so deletion
     /// inventories can be retried after partial completion.
     async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()>;
@@ -3414,6 +3586,27 @@ impl GcsClient for GcpGcsClient {
         decode_gcs_versions_page(&response.bytes().await?, "listed")
     }
 
+    async fn list_live_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        let token = self.access_token().await?;
+        let mut url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o?maxResults={}&prefix={}",
+            self.bucket,
+            GCS_LIST_PAGE_SIZE,
+            urlencoding::encode(prefix)
+        );
+        if let Some(page_token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencoding::encode(page_token));
+        }
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
+        let response = response.error_for_status()?;
+        decode_gcs_versions_page(&response.bytes().await?, "live")
+    }
+
     async fn list_soft_deleted_objects(
         &self,
         prefix: &str,
@@ -3473,6 +3666,19 @@ fn legacy_recovery_prefix(user_id: &str) -> String {
 pub fn legacy_recovery_checkpoint_name(user_id: &str, now: SystemTime) -> String {
     let (year, month, day) = civil_from_unix_days(utc_epoch_day(now));
     format!("legacy-recovery/{user_id}/{year:04}-{month:02}-{day:02}.db.enc")
+}
+
+/// Accept only an exact legacy archive object name. Listing is not trusted to
+/// supply a source generation: callers must subsequently use `get_object` to
+/// resolve GCS's live generation explicitly.
+fn legacy_index_user_id(object_name: &str) -> Option<String> {
+    let user_id = object_name
+        .strip_prefix("indexes/")?
+        .strip_suffix(".db.enc")?;
+    if user_id.is_empty() || user_id.contains('/') || validate_user_id(user_id).is_err() {
+        return None;
+    }
+    Some(user_id.to_owned())
 }
 
 fn utc_epoch_day(now: SystemTime) -> i64 {
@@ -4010,6 +4216,7 @@ pub(crate) mod tests {
         repeat_version_cursor: StdMutex<bool>,
         listed_size_overrides: StdMutex<HashMap<String, u64>>,
         exact_generation_gets: StdMutex<usize>,
+        live_gets: StdMutex<Vec<String>>,
         copy_calls: StdMutex<Vec<(String, i64, String)>>,
         put_calls: StdMutex<Vec<(String, i64)>>,
     }
@@ -4027,6 +4234,7 @@ pub(crate) mod tests {
                 repeat_version_cursor: StdMutex::new(false),
                 listed_size_overrides: StdMutex::new(HashMap::new()),
                 exact_generation_gets: StdMutex::new(0),
+                live_gets: StdMutex::new(Vec::new()),
                 copy_calls: StdMutex::new(Vec::new()),
                 put_calls: StdMutex::new(Vec::new()),
             }
@@ -4060,6 +4268,10 @@ pub(crate) mod tests {
 
         fn exact_generation_get_count(&self) -> usize {
             *self.exact_generation_gets.lock().unwrap()
+        }
+
+        fn live_get_count(&self) -> usize {
+            self.live_gets.lock().unwrap().len()
         }
 
         fn version_count(&self, prefix: &str) -> usize {
@@ -4125,6 +4337,7 @@ pub(crate) mod tests {
     #[async_trait::async_trait]
     impl GcsClient for FakeGcs {
         async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.live_gets.lock().unwrap().push(object_name.into());
             let store = self.objects.lock().unwrap();
             store
                 .get(object_name)
@@ -4327,6 +4540,49 @@ pub(crate) mod tests {
             })
         }
 
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            const PAGE_SIZE: usize = 2;
+            let start = page_token
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| EnclaveError::Gcs("invalid fake GCS page cursor".into()))?
+                .unwrap_or(0);
+            let store = self.objects.lock().unwrap();
+            let mut versions = store
+                .iter()
+                .filter_map(|(name, objects)| {
+                    name.starts_with(prefix).then(|| {
+                        objects
+                            .iter()
+                            .rev()
+                            .find(|object| object.live)
+                            .map(|object| GcsObjectVersion {
+                                name: name.clone(),
+                                generation: object.generation,
+                                size: object.ciphertext.len() as u64,
+                            })
+                    })
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            versions.sort_by(|left, right| left.name.cmp(&right.name));
+            let end = (start + PAGE_SIZE).min(versions.len());
+            let next_page_token =
+                if *self.repeat_version_cursor.lock().unwrap() && page_token.is_some() {
+                    page_token.map(str::to_owned)
+                } else {
+                    (end < versions.len()).then(|| end.to_string())
+                };
+            Ok(GcsListVersionsResponse {
+                versions: versions[start..end].to_vec(),
+                next_page_token,
+            })
+        }
+
         async fn delete_object_generation(
             &self,
             object_name: &str,
@@ -4511,6 +4767,14 @@ pub(crate) mod tests {
             self.inner.list_object_versions(prefix, page_token).await
         }
 
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
         async fn delete_object_generation(
             &self,
             object_name: &str,
@@ -4628,6 +4892,14 @@ pub(crate) mod tests {
             self.inner.list_object_versions(prefix, page_token).await
         }
 
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
         async fn delete_object_generation(
             &self,
             object_name: &str,
@@ -4716,6 +4988,14 @@ pub(crate) mod tests {
             page_token: Option<&str>,
         ) -> crate::error::Result<GcsListVersionsResponse> {
             self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
         }
 
         async fn delete_object_generation(
@@ -4810,6 +5090,14 @@ pub(crate) mod tests {
             page_token: Option<&str>,
         ) -> crate::error::Result<GcsListVersionsResponse> {
             self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
         }
 
         async fn delete_object_generation(
@@ -4939,6 +5227,146 @@ pub(crate) mod tests {
         let calls = gcs.copy_calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "same-day saves must hit the process cache");
         assert_eq!(calls[0].1, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_checkpoints_only_the_current_live_generation_and_is_idempotent()
+    {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        let archive = gcs_object_name("backfill-user");
+        gcs.put_object(&archive, b"old", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.put_object(&archive, b"current", "wrapped", 1)
+            .await
+            .unwrap();
+        let gone = gcs_object_name("deleted-user");
+        gcs.put_object(&gone, b"gone", "wrapped", 0).await.unwrap();
+        gcs.delete_object(&gone).await.unwrap();
+        let gets_before = gcs.live_get_count();
+
+        let first = store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .unwrap();
+        assert!(first.ready);
+        assert_eq!(first.live_archives_checked, 1);
+        assert_eq!(gcs.live_get_count() - gets_before, 1);
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "backfill-user",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        assert_eq!(gcs.version_count(&checkpoint), 1);
+        let binding = gcs.objects.lock().unwrap()[&checkpoint]
+            .last()
+            .unwrap()
+            .legacy_recovery
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(binding.source_generation, 2);
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+
+        let second = store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .unwrap();
+        assert!(second.ready);
+        assert_eq!(
+            gcs.version_count(&checkpoint),
+            1,
+            "retry must not overwrite the immutable checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_fails_closed_for_malformed_governed_index_name() {
+        let gcs = Arc::new(FakeGcs::new());
+        gcs.put_object("indexes/not/a.db.enc", b"bad", "wrapped", 0)
+            .await
+            .unwrap();
+        let store = store_with_checkpoint_time(gcs, 1_767_268_800);
+        assert!(store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .is_err());
+        assert!(!store.legacy_checkpoint_reconciliation().await.ready);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_rejects_repeated_live_listing_cursor() {
+        let gcs = Arc::new(FakeGcs::new());
+        for user in ["cursor-a", "cursor-b", "cursor-c"] {
+            gcs.put_object(&gcs_object_name(user), b"current", "wrapped", 0)
+                .await
+                .unwrap();
+        }
+        gcs.set_repeat_version_cursor(true);
+        let store = store_with_checkpoint_time(gcs, 1_767_268_800);
+        assert!(store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .is_err());
+        assert!(!store.legacy_checkpoint_reconciliation().await.ready);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_is_not_ready_after_partial_failure_and_recovers_after_restart()
+    {
+        let gcs = Arc::new(FakeGcs::new());
+        let archive = gcs_object_name("retry-backfill");
+        gcs.put_object(&archive, b"current", "wrapped", 0)
+            .await
+            .unwrap();
+        *gcs.fail_copy.lock().unwrap() = Some(EnclaveError::Gcs("temporary copy failure".into()));
+        let first = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        assert!(first
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .is_err());
+        let failed = first.legacy_checkpoint_reconciliation().await;
+        assert!(!failed.ready);
+        assert_eq!(failed.failures, 1);
+
+        let restarted = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        let recovered = restarted
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .unwrap();
+        assert!(recovered.ready);
+        assert_eq!(recovered.completed_scans, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_converges_after_copy_precondition_race() {
+        let gcs = Arc::new(FakeGcs::new());
+        let archive = gcs_object_name("race-backfill");
+        gcs.put_object(&archive, b"current", "wrapped", 0)
+            .await
+            .unwrap();
+        *gcs.fail_copy_after_create.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost copy response".into()));
+        let first = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        assert!(first
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .is_err());
+        assert!(!first.legacy_checkpoint_reconciliation().await.ready);
+
+        let restarted = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        assert!(
+            restarted
+                .reconcile_legacy_recovery_checkpoints_once()
+                .await
+                .unwrap()
+                .ready
+        );
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "race-backfill",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        assert_eq!(gcs.version_count(&checkpoint), 1);
     }
 
     #[test]
