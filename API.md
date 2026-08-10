@@ -15,13 +15,28 @@ indicators and the product's cloud-processing disclosure.
 
 - Production requests use HTTPS terminated inside the attested enclave.
 - Send `Authorization: Bearer <token>` using either a Kioku access token or an
-  accepted Google ID token.
+  accepted Google ID token. Apple login always yields an ordinary Kioku access token.
 - Never put user IDs in a path, header, or manifest. The server derives the
   account from the verified token.
 - All identifiers are 1–128 ASCII letters, digits, `-`, or `_`. UUIDv7 is the
   recommended client format.
 - All times are RFC 3339/ISO 8601. Include the original IANA `timezone_id` and
   numeric UTC offset even when the timestamp is already expressed in UTC.
+
+### Sign in with Apple routes
+
+- `POST /oauth/apple/native` verifies an iPhone or Mac identity token, single-use
+  authorization code, and raw nonce before issuing a Kioku access/refresh pair.
+- `GET /oauth/apple/authorize` and Apple's exact `form_post`
+  `POST /oauth/apple/callback` verify the web Services ID response, then continue through
+  the same persisted consent, single-use authorization code, PKCE, and `/token` rotation
+  used by the OAuth facade.
+- `GET /api/auth/session` returns canonical account metadata and linked providers.
+  Authenticated native linking uses `POST /api/auth/apple/link`; browser linking begins at
+  `POST /api/auth/apple/web-link` and returns only to the fixed `WEB_ORIGIN` callback.
+- iPhone, Mac, and web use separate allow-listed Apple audiences. Provider subjects are
+  never joined by email. Apple refresh authorization is retained per issuing client and
+  all retained grants are revocation barriers for account deletion.
 
 ## Upload one capture event
 

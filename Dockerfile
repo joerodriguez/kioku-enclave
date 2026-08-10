@@ -46,8 +46,9 @@
 #                        workloadIdentityPools/<POOL>/providers/<PROVIDER>)
 #   GOOGLE_DESKTOP_CLIENT_ID / GOOGLE_IOS_CLIENT_ID / GOOGLE_WEB_CLIENT_ID
 #                                                 Google OAuth audiences
-#   APPLE_TEAM_ID / APPLE_KEY_ID / APPLE_IOS_CLIENT_ID
-#                        Optional Sign in with Apple identifiers; set all three
+#   APPLE_TEAM_ID / APPLE_KEY_ID / APPLE_IOS_CLIENT_ID /
+#   APPLE_MACOS_CLIENT_ID / APPLE_WEB_CLIENT_ID
+#                        Optional Sign in with Apple identifiers; set all five
 #                        or none. The private key is fetched from Secret Manager.
 #   ALLOWED_EMAILS       Comma-separated account allow-list
 #   BASE_URL / WEB_ORIGIN  Public API issuer and browser application origin
@@ -76,6 +77,8 @@
 #     --build-arg APPLE_TEAM_ID=ABCDE12345 \
 #     --build-arg APPLE_KEY_ID=FGHIJ67890 \
 #     --build-arg APPLE_IOS_CLIENT_ID=com.kioku.ios \
+#     --build-arg APPLE_MACOS_CLIENT_ID=com.kiokuu.app \
+#     --build-arg APPLE_WEB_CLIENT_ID=com.kiokuu.web \
 #     --build-arg ALLOWED_EMAILS=owner@example.com \
 #     --build-arg BASE_URL=https://api.example.com \
 #     --build-arg WEB_ORIGIN=https://app.example.com \
@@ -110,6 +113,8 @@ ARG GOOGLE_WEB_CLIENT_ID
 ARG APPLE_TEAM_ID
 ARG APPLE_KEY_ID
 ARG APPLE_IOS_CLIENT_ID
+ARG APPLE_MACOS_CLIENT_ID
+ARG APPLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
 ARG BASE_URL
 ARG WEB_ORIGIN
@@ -147,10 +152,12 @@ RUN set -eu \
          && [ -n "${REVIEWER_AUTH_EMAIL}" ]; \
        fi
 RUN set -eu \
-    && if [ -n "${APPLE_TEAM_ID}${APPLE_KEY_ID}${APPLE_IOS_CLIENT_ID}" ]; then \
+    && if [ -n "${APPLE_TEAM_ID}${APPLE_KEY_ID}${APPLE_IOS_CLIENT_ID}${APPLE_MACOS_CLIENT_ID}${APPLE_WEB_CLIENT_ID}" ]; then \
          [ -n "${APPLE_TEAM_ID}" ] \
          && [ -n "${APPLE_KEY_ID}" ] \
-         && [ "${APPLE_IOS_CLIENT_ID}" = "com.kioku.ios" ]; \
+         && [ "${APPLE_IOS_CLIENT_ID}" = "com.kioku.ios" ] \
+         && [ "${APPLE_MACOS_CLIENT_ID}" = "com.kiokuu.app" ] \
+         && [ "${APPLE_WEB_CLIENT_ID}" = "com.kiokuu.web" ]; \
        fi
 
 # Install musl toolchain (+ curl for the embedding-model download below)
@@ -315,6 +322,8 @@ ARG GOOGLE_WEB_CLIENT_ID
 ARG APPLE_TEAM_ID
 ARG APPLE_KEY_ID
 ARG APPLE_IOS_CLIENT_ID
+ARG APPLE_MACOS_CLIENT_ID
+ARG APPLE_WEB_CLIENT_ID
 ARG ALLOWED_EMAILS
 ARG BASE_URL
 ARG WEB_ORIGIN
@@ -333,6 +342,8 @@ ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     APPLE_TEAM_ID=${APPLE_TEAM_ID} \
     APPLE_KEY_ID=${APPLE_KEY_ID} \
     APPLE_IOS_CLIENT_ID=${APPLE_IOS_CLIENT_ID} \
+    APPLE_MACOS_CLIENT_ID=${APPLE_MACOS_CLIENT_ID} \
+    APPLE_WEB_CLIENT_ID=${APPLE_WEB_CLIENT_ID} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
     BASE_URL=${BASE_URL} \
     WEB_ORIGIN=${WEB_ORIGIN} \

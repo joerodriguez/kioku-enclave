@@ -59,10 +59,12 @@ INSERT OR IGNORE INTO auth_identities (provider, subject, user_id, email)
 SELECT 'google', u.google_sub, u.id, u.email FROM users u
 WHERE NOT EXISTS (SELECT 1 FROM auth_identities i WHERE i.user_id = u.id);
 CREATE TABLE IF NOT EXISTS apple_credentials (
-    user_id           TEXT PRIMARY KEY REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    user_id           TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    client_id         TEXT NOT NULL,
     refresh_token     TEXT NOT NULL,
     last_validated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    revoked_at        TEXT
+    revoked_at        TEXT,
+    PRIMARY KEY (user_id, client_id)
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     user_id              TEXT NOT NULL,
@@ -173,6 +175,51 @@ CREATE TABLE IF NOT EXISTS episode_email_preferences (
 -- ADR-0012 removes Gmail delivery and its stored OAuth credentials.
 DROP TABLE IF EXISTS user_gmail_configs;
 "#;
+
+fn migrate_apple_credentials_schema(conn: &Connection) -> Result<usize> {
+    let mut migrations = 0;
+    match conn.execute(
+        "ALTER TABLE apple_credentials ADD COLUMN client_id TEXT NOT NULL DEFAULT 'com.kioku.ios'",
+        [],
+    ) {
+        Ok(_) => migrations += 1,
+        Err(error) if error.to_string().contains("duplicate column name") => {}
+        Err(error) => return Err(error.into()),
+    }
+    let primary_key: Vec<String> = {
+        let mut statement = conn.prepare("PRAGMA table_info(apple_credentials)")?;
+        let columns = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?;
+        let mut primary = columns
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, position)| *position > 0)
+            .collect::<Vec<_>>();
+        primary.sort_by_key(|(_, position)| *position);
+        primary.into_iter().map(|(name, _)| name).collect()
+    };
+    if primary_key == ["user_id"] {
+        conn.execute_batch(
+            "ALTER TABLE apple_credentials RENAME TO apple_credentials_legacy;
+             CREATE TABLE apple_credentials (
+                user_id TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+                client_id TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                last_validated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                revoked_at TEXT,
+                PRIMARY KEY (user_id, client_id)
+             );
+             INSERT INTO apple_credentials
+                (user_id, client_id, refresh_token, last_validated_at, revoked_at)
+             SELECT user_id, client_id, refresh_token, last_validated_at, revoked_at
+             FROM apple_credentials_legacy;
+             DROP TABLE apple_credentials_legacy;",
+        )?;
+        migrations += 1;
+    }
+    Ok(migrations)
+}
 
 struct BlobMeta {
     generation: i64,
@@ -691,7 +738,7 @@ impl ControlStore {
         drop(temp_file);
         let conn = Connection::open(&temp_path)?;
         conn.execute_batch(SCHEMA)?;
-        let mut schema_migrations = 0;
+        let mut schema_migrations = migrate_apple_credentials_schema(&conn)?;
         for column in [
             "ALTER TABLE usage_daily ADD COLUMN vertex_requests INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE usage_daily ADD COLUMN vertex_output_tokens INTEGER NOT NULL DEFAULT 0",
@@ -1064,11 +1111,13 @@ impl ControlStore {
         &self,
         subject: &str,
         email: &str,
+        client_id: &str,
         refresh_token: &str,
     ) -> Result<User> {
         let provider = "apple".to_string();
         let subject = subject.to_string();
         let email = email.to_lowercase();
+        let client_id = client_id.to_string();
         let refresh_token = refresh_token.to_string();
         let compatibility_anchor = format!("apple:{subject}");
         let stable_id = super::tokens::derive_provider_uuid(&provider, &subject);
@@ -1123,8 +1172,8 @@ impl ControlStore {
                 }
             };
             tx.execute(
-                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
-                rusqlite::params![user_id, refresh_token],
+                "INSERT INTO apple_credentials (user_id, client_id, refresh_token, revoked_at) VALUES (?1, ?2, ?3, NULL) ON CONFLICT(user_id, client_id) DO UPDATE SET refresh_token = excluded.refresh_token, last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
+                rusqlite::params![user_id, client_id, refresh_token],
             )?;
             tx.commit()?;
             Ok(User { id: user_id, email: primary_email })
@@ -1138,11 +1187,13 @@ impl ControlStore {
         user_id: &str,
         subject: &str,
         email: &str,
+        client_id: &str,
         refresh_token: &str,
     ) -> Result<()> {
         let user_id = user_id.to_string();
         let subject = subject.to_string();
         let email = email.to_lowercase();
+        let client_id = client_id.to_string();
         let refresh_token = refresh_token.to_string();
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
@@ -1173,8 +1224,8 @@ impl ControlStore {
                 rusqlite::params![subject, user_id, email],
             )?;
             tx.execute(
-                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) VALUES (?1, ?2, NULL) ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
-                rusqlite::params![user_id, refresh_token],
+                "INSERT INTO apple_credentials (user_id, client_id, refresh_token, revoked_at) VALUES (?1, ?2, ?3, NULL) ON CONFLICT(user_id, client_id) DO UPDATE SET refresh_token = excluded.refresh_token, last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
+                rusqlite::params![user_id, client_id, refresh_token],
             )?;
             tx.commit()?;
             Ok(())
@@ -1193,23 +1244,31 @@ impl ControlStore {
         .await
     }
 
-    pub async fn apple_refresh_token(&self, user_id: &str) -> Result<Option<String>> {
+    pub async fn apple_refresh_credentials(&self, user_id: &str) -> Result<Vec<(String, String)>> {
         let user_id = user_id.to_string();
         self.read(move |conn| {
-            Ok(conn.query_row(
-            "SELECT refresh_token FROM apple_credentials WHERE user_id = ?1 AND revoked_at IS NULL",
-            [user_id], |row| row.get(0),
-        ).optional()?)
+            let mut statement = conn.prepare(
+                "SELECT client_id, refresh_token FROM apple_credentials
+                 WHERE user_id = ?1 AND revoked_at IS NULL ORDER BY client_id",
+            )?;
+            let rows = statement.query_map([user_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
         .await
     }
 
-    pub async fn mark_apple_credential_revoked(&self, user_id: &str) -> Result<()> {
+    pub async fn mark_apple_credential_revoked(
+        &self,
+        user_id: &str,
+        client_id: &str,
+    ) -> Result<()> {
         let user_id = user_id.to_string();
+        let client_id = client_id.to_string();
         self.write_if_changed(move |conn| {
             let changed = conn.execute(
-                "UPDATE apple_credentials SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1 AND revoked_at IS NULL",
-                [user_id],
+                "UPDATE apple_credentials SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE user_id = ?1 AND client_id = ?2 AND revoked_at IS NULL",
+                rusqlite::params![user_id, client_id],
             )? > 0;
             Ok(((), changed))
         })
@@ -1714,6 +1773,52 @@ mod tests {
             .unwrap();
         assert_eq!(gmail_table, 0);
         assert_eq!(webhook_table, 1);
+    }
+
+    #[test]
+    fn apple_credentials_migrate_from_one_user_row_to_one_row_per_client() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE users (id TEXT PRIMARY KEY);
+             INSERT INTO users VALUES ('user-1');
+             CREATE TABLE apple_credentials (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+                refresh_token TEXT NOT NULL,
+                last_validated_at TEXT NOT NULL,
+                revoked_at TEXT
+             );
+             INSERT INTO apple_credentials VALUES
+                ('user-1', 'ios-refresh', '2026-08-10T00:00:00Z', NULL);",
+        )
+        .unwrap();
+
+        assert_eq!(migrate_apple_credentials_schema(&conn).unwrap(), 2);
+        conn.execute(
+            "INSERT INTO apple_credentials
+             (user_id, client_id, refresh_token, last_validated_at)
+             VALUES ('user-1', 'com.kiokuu.app', 'mac-refresh', '2026-08-10T00:00:01Z')",
+            [],
+        )
+        .unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM apple_credentials WHERE user_id = 'user-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ios: String = conn
+            .query_row(
+                "SELECT refresh_token FROM apple_credentials
+                 WHERE user_id = 'user-1' AND client_id = 'com.kioku.ios'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(ios, "ios-refresh");
+        assert_eq!(migrate_apple_credentials_schema(&conn).unwrap(), 0);
     }
 
     #[test]

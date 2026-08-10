@@ -263,21 +263,31 @@ impl CpConfig {
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
+            std::env::var("APPLE_MACOS_CLIENT_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("APPLE_WEB_CLIENT_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         ];
         let apple_sign_in = if apple_values.iter().all(String::is_empty) {
             None
         } else if apple_values.iter().any(String::is_empty) {
             return Err(crate::error::EnclaveError::Config(
-                "APPLE_TEAM_ID, APPLE_KEY_ID, and APPLE_IOS_CLIENT_ID must be set together".into(),
+                "APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_IOS_CLIENT_ID, APPLE_MACOS_CLIENT_ID, and APPLE_WEB_CLIENT_ID must be set together".into(),
             ));
         } else {
-            let [team_id, key_id, client_id] = apple_values;
+            let [team_id, key_id, ios_client_id, macos_client_id, web_client_id] = apple_values;
             let identifier_valid = |value: &str| {
                 value.len() == 10 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
             };
             if !identifier_valid(&team_id)
                 || !identifier_valid(&key_id)
-                || client_id != "com.kioku.ios"
+                || ios_client_id != "com.kioku.ios"
+                || macos_client_id != "com.kiokuu.app"
+                || web_client_id != "com.kiokuu.web"
             {
                 return Err(crate::error::EnclaveError::Config(
                     "Sign in with Apple public configuration is invalid".into(),
@@ -286,7 +296,10 @@ impl CpConfig {
             Some(apple::AppleSignInConfig {
                 team_id,
                 key_id,
-                client_id,
+                ios_client_id,
+                macos_client_id,
+                web_client_id,
+                web_redirect_uri: format!("{base_url}/oauth/apple/callback"),
             })
         };
 

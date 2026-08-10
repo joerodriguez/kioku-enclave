@@ -76,7 +76,7 @@ The public build validates these non-secret GitHub Actions variables before Dock
 | KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_GCS_MEDIA_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
 | Internal KMS attestation exchange | `ENCLAVE_ATTEST_STS_AUDIENCE` |
 | OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
-| Native Apple login (optional, all or none) | `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_IOS_CLIENT_ID` |
+| Apple login (optional, all or none) | `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` |
 | Synthetic plugin reviewer | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` |
 | Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
 | Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |

@@ -37,8 +37,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 
 - Terminates public TLS inside Confidential Space and obtains/renews its certificate with
   ACME without exporting the private key.
-- Verifies Google identity, runs OAuth 2.1-style authorization with PKCE, and issues Kioku
-  access and refresh tokens.
+- Verifies Google and native/browser Apple identity, runs OAuth 2.1-style authorization
+  with PKCE, and issues Kioku access and refresh tokens.
 - Receives raw bounded audio/canonical screenshots plus timestamped application, window,
   display, and browser metadata from pure-Swift Kioku clients. Deterministically validated
   metadata-only screen references retain repeated observations without another encrypted
@@ -133,13 +133,18 @@ authentication. All production images enforce context-bound v2 encryption uncond
 
 ### Authentication and control plane
 
-The public OAuth flow validates Google tokens against the baked desktop and web client
-audiences, enforces a non-wildcard account allow-list, and issues Kioku tokens for sync,
-query, MCP, and account routes. OAuth authorization uses PKCE, explicit consent,
-persisted single-use authorization codes, and client-bound refresh-token rotation.
+The public OAuth flow validates Google tokens against the baked desktop/iOS/web clients
+and Sign in with Apple tokens against distinct iPhone App ID, Mac App ID, and web Services
+ID audiences. Native Apple requests require SHA-256 nonces; browser requests use Apple's
+server-returned raw nonce. All paths enforce a non-wildcard account allow-list and issue
+Kioku tokens for sync, query, MCP, and account routes. OAuth authorization uses PKCE,
+explicit consent, persisted single-use authorization codes, and client-bound refresh-token
+rotation. Provider subjects are namespaced and accounts are never linked by email.
 
 The published authorization endpoint is the operator's
-`WEB_ORIGIN/app/login`. Its normal path forwards to Google OAuth. An optional
+`WEB_ORIGIN/app/login`. Its normal paths forward to Google or Apple and return through the
+same consent/code machinery. The Kioku dashboard uses one fixed first-party PKCE client;
+third-party MCP clients retain bounded Dynamic Client Registration. An optional
 reviewer-only path accepts a short-lived Google Identity Platform token for one exact
 image-baked UID/email pair, creates only a namespaced synthetic account, and seeds that
 account with non-sensitive fixture data. Reviewer passwords are verified by Google and
@@ -211,8 +216,8 @@ The same binary serves all of these surfaces:
 | Surface | Representative paths | Authentication |
 |---|---|---|
 | Health and attestation | `/health`, `/v1/attestation` | Public |
-| OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/token` | Protocol-specific validation |
-| Native Apple identity | `/oauth/apple/native`, `/api/auth/session`, `/api/auth/apple/link` | Apple authorization or an existing authenticated account |
+| OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/oauth/apple/authorize`, `/oauth/apple/callback`, `/token` | Protocol-specific validation |
+| Apple identity/linking | `/oauth/apple/native`, `/api/auth/session`, `/api/auth/apple/link`, `/api/auth/apple/web-link` | Apple authorization or an existing authenticated account |
 | Device and account API | `/api/sync/*`, `/api/export`, `/api/account`, `/api/account/deletion` | Kioku access token or accepted Google ID token |
 | Cloud Capture v2 | `/api/v2/capture/*`, `/api/v2/people*` | Kioku access token or accepted Google ID token |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
@@ -368,6 +373,8 @@ binding.
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
 | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
+| `APPLE_TEAM_ID`, `APPLE_KEY_ID` | Optional Apple developer team/key identifiers; atomic with every Apple client ID |
+| `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` | Exact Apple audiences `com.kioku.ios`, `com.kiokuu.app`, and `com.kiokuu.web`; all five Apple values are set together or Apple auth stays off |
 | `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
@@ -379,7 +386,9 @@ binding.
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
 
-The web OAuth client secret is fetched at runtime from Secret Manager. The reviewer
+The Google web OAuth secret and optional Apple `.p8` key are fetched at runtime from
+Secret Manager. Apple refresh authorization is stored per issuing Apple client in the
+encrypted control database so deletion can revoke every retained platform grant. The reviewer
 password remains only in Google Identity Platform, the review portal, and the operator's
 versioned `kioku-openai-reviewer-password` secret in project `kioku-joerodriguez`. JWT
 signing secrets are generated and stored in the KMS-protected control database; neither

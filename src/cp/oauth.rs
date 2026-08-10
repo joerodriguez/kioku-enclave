@@ -2,7 +2,8 @@
 //! Public endpoints (no auth): discovery, /register, /authorize, the Google
 //! callback, the exact-match reviewer bridge, and /token. MCP clients
 //! (Claude/ChatGPT) use this to obtain our HS256 access tokens; Google is the
-//! upstream IdP for both normal and reviewer identities.
+//! upstream IdP for Google, while the sibling Apple module reuses the same
+//! validated downstream request and consent/code machinery.
 
 use std::{net::IpAddr, str::FromStr, sync::Arc};
 
@@ -35,10 +36,44 @@ const MAX_CLIENT_STATE_BYTES: usize = 1024;
 const AUTH_CODE_TTL_SECS: i64 = 5 * 60;
 const REFRESH_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MCP_SCOPE: &str = "kioku:read";
-/// Fixed public first-party client used only by the signed iPhone app
-/// after the enclave has verified an Apple authorization grant. It is a UUID
-/// so the normal refresh-token validation path remains shared and auditable.
-pub const IOS_NATIVE_CLIENT_ID: &str = "a3f42956-2dc1-4e58-9f05-a83fac1f9328";
+/// Fixed public first-party client used only by signed Kioku native apps after
+/// the enclave has verified an Apple authorization grant. It is a UUID so the
+/// normal refresh-token validation path remains shared and auditable.
+pub const FIRST_PARTY_NATIVE_CLIENT_ID: &str = "a3f42956-2dc1-4e58-9f05-a83fac1f9328";
+/// Fixed public browser client used by Kioku's own dashboard. Third-party MCP
+/// clients still use Dynamic Client Registration; normal dashboard logins must
+/// not consume the bounded registration table.
+pub const FIRST_PARTY_WEB_CLIENT_ID: &str = "b9b7d59f-3fdd-4cd4-93a2-a68972aef42f";
+
+pub(super) async fn ensure_first_party_web_client(s: &Arc<CpState>) -> crate::error::Result<()> {
+    let redirect_uri = format!("{}/app/apple-callback", s.config.web_origin);
+    let redirect_uris = serde_json::to_string(&[redirect_uri])?;
+    s.control
+        .write_if_changed(move |conn| {
+            let existing: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
+                    [FIRST_PARTY_WEB_CLIENT_ID],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((name, stored_redirects)) = existing {
+                if name.as_deref() != Some("Kioku Web") || stored_redirects != redirect_uris {
+                    return Err(crate::error::EnclaveError::Conflict(
+                        "first-party web OAuth client configuration mismatch".into(),
+                    ));
+                }
+                return Ok(((), false));
+            }
+            conn.execute(
+                "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
+                 VALUES (?1, 'Kioku Web', ?2)",
+                rusqlite::params![FIRST_PARTY_WEB_CLIENT_ID, redirect_uris],
+            )?;
+            Ok(((), true))
+        })
+        .await
+}
 
 fn is_valid_client_id(value: &str) -> bool {
     value.len() == 36
@@ -616,12 +651,17 @@ fn register_client_conn(
         return Ok((ClientRegistration::Existing(client_id), false));
     }
 
-    let mut count: i64 = tx.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+    let mut count: i64 = tx.query_row(
+        "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
+        rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
+        |r| r.get(0),
+    )?;
     let mut reclaimed = 0;
     if count >= MAX_OAUTH_CLIENTS {
         reclaimed = tx.execute(
             "DELETE FROM oauth_clients \
-             WHERE created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?1) \
+             WHERE client_id NOT IN (?2, ?3) \
+               AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?1) \
                AND NOT EXISTS (SELECT 1 FROM oauth_consents p \
                                WHERE p.client_id = oauth_clients.client_id \
                                  AND p.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
@@ -632,9 +672,17 @@ fn register_client_conn(
                                WHERE r.client_id = oauth_clients.client_id \
                                  AND r.revoked = 0 \
                                  AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            [format!("-{UNUSED_CLIENT_TTL_SECS} seconds")],
+            rusqlite::params![
+                format!("-{UNUSED_CLIENT_TTL_SECS} seconds"),
+                FIRST_PARTY_NATIVE_CLIENT_ID,
+                FIRST_PARTY_WEB_CLIENT_ID
+            ],
         )?;
-        count = tx.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+        count = tx.query_row(
+            "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
+            rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
+            |r| r.get(0),
+        )?;
     }
     if count >= MAX_OAUTH_CLIENTS {
         if reclaimed == 0 {
@@ -716,7 +764,7 @@ async fn register(State(s): State<Arc<CpState>>, Json(body): Json<RegisterBody>)
 // ── /authorize ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct AuthorizeQuery {
+pub(super) struct AuthorizeQuery {
     client_id: Option<String>,
     redirect_uri: Option<String>,
     state: Option<String>,
@@ -727,7 +775,7 @@ struct AuthorizeQuery {
     resource: Option<String>,
 }
 
-async fn validated_authorization_request(
+pub(super) async fn validated_authorization_request(
     s: &Arc<CpState>,
     q: AuthorizeQuery,
 ) -> std::result::Result<tokens::StateClaims, Response> {
@@ -811,6 +859,8 @@ async fn validated_authorization_request(
         client_state,
         code_challenge,
         resource,
+        apple_nonce: String::new(),
+        apple_link_user_id: String::new(),
         exp: 0,
     })
 }
@@ -1029,7 +1079,11 @@ struct GoogleTokenResp {
     id_token: String,
 }
 
-fn callback_error(status: StatusCode, heading: &'static str, message: &'static str) -> Response {
+pub(super) fn callback_error(
+    status: StatusCode,
+    heading: &'static str,
+    message: &'static str,
+) -> Response {
     let content = format!(
         r#"<section class="card" aria-labelledby="page-title">
       <div class="status-icon" aria-hidden="true">!</div>
@@ -1393,6 +1447,17 @@ async fn google_callback(
         }
     };
 
+    begin_authorization_consent(&s, state, &user.id).await
+}
+
+/// Continue a server-verified upstream identity through Kioku's ordinary
+/// explicit OAuth consent screen. Google and Apple both enter here so an
+/// assistant never gets a provider-specific consent bypass.
+pub(super) async fn begin_authorization_consent(
+    s: &Arc<CpState>,
+    state: tokens::StateClaims,
+    user_id: &str,
+) -> Response {
     let (client_id, redirect_uri) = (state.client_id.clone(), state.redirect_uri.clone());
     let registered = s
         .control
@@ -1423,7 +1488,7 @@ async fn google_callback(
     let consent_token = match tokens::issue_consent(
         &s.config.jwt_secrets[0],
         &tokens::ConsentClaims {
-            user_id: user.id.clone(),
+            user_id: user_id.to_string(),
             client_id: client_id.clone(),
             redirect_uri: redirect_uri.clone(),
             client_state: state.client_state,
@@ -1442,7 +1507,7 @@ async fn google_callback(
         }
     };
     let consent_hash = tokens::sha256_hex(&consent_token);
-    let user_id = user.id;
+    let user_id = user_id.to_string();
     let stored = s
         .control
         .write_if_changed(move |conn| {
@@ -1862,8 +1927,8 @@ pub async fn issue_native_session(
             }
             tx.execute(
                 "INSERT OR IGNORE INTO oauth_clients (client_id, client_name, redirect_uris) \
-                 VALUES (?1, 'Kioku for iPhone', '[]')",
-                [IOS_NATIVE_CLIENT_ID],
+                 VALUES (?1, 'Kioku Native Apps', '[]')",
+                [FIRST_PARTY_NATIVE_CLIENT_ID],
             )?;
             tx.execute(
                 "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
@@ -1871,7 +1936,7 @@ pub async fn issue_native_session(
                 rusqlite::params![
                     refresh_hash,
                     user_id,
-                    IOS_NATIVE_CLIENT_ID,
+                    FIRST_PARTY_NATIVE_CLIENT_ID,
                     format!("+{REFRESH_TTL_SECS} seconds")
                 ],
             )?;
@@ -2064,6 +2129,42 @@ mod tests {
         .unwrap();
         assert!(matches!(result, ClientRegistration::AtCapacity));
         assert!(!changed);
+    }
+
+    #[test]
+    fn registration_cap_excludes_and_preserves_fixed_first_party_clients() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
+             CREATE TABLE oauth_consents (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE oauth_authorization_codes (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE refresh_tokens (client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); \
+             INSERT INTO oauth_clients (client_id, redirect_uris, created_at) VALUES \
+                ('{FIRST_PARTY_NATIVE_CLIENT_ID}', '[]', '2000-01-01T00:00:00.000Z'), \
+                ('{FIRST_PARTY_WEB_CLIENT_ID}', '[\"https://kiokuu.com/app/apple-callback\"]', '2000-01-01T00:00:00.000Z'); \
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 256) \
+             INSERT INTO oauth_clients (client_id, redirect_uris) \
+             SELECT printf('client-%d', x), printf('[\"https://client-%d.example/cb\"]', x) FROM n;"
+        ))
+        .unwrap();
+
+        let (result, changed) = register_client_conn(
+            &conn,
+            CLIENT,
+            Some("Overflow"),
+            "[\"https://overflow.example/cb\"]",
+        )
+        .unwrap();
+        assert!(matches!(result, ClientRegistration::AtCapacity));
+        assert!(!changed);
+        let fixed_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM oauth_clients WHERE client_id IN (?1, ?2)",
+                rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fixed_count, 2);
     }
 
     #[test]
