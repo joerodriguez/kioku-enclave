@@ -28,9 +28,10 @@
 //!   - `attribute.image_digest` == the published, provenance-verified digest
 //!
 //! Production deployment policy is expected to pair the digest-scoped allow binding
-//! with a project-level deny of direct KMS decrypt for every other principal. That
-//! removes standing inherited decrypt authority, but project control-plane admins can
-//! still change policy; see `SECURITY.md` rather than treating source code as proof of
+//! with removal and continuous auditing of every inherited direct or delegated KMS
+//! decrypt grant at the project, key-ring, and key. The standalone project cannot host
+//! an organization-level IAM deny policy, and project control-plane admins can still
+//! change policy; see `SECURITY.md` rather than treating source code as proof of
 //! operator-independent key control.
 
 use aes_gcm::{
