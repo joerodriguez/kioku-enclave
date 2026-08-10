@@ -866,9 +866,16 @@ async fn main() {
             Arc::clone(&cp_state),
             cp::cors::cors_middleware,
         ));
-    let public_oauth = cp::oauth::router().merge(cp::apple::public_router()).layer(
-        middleware::from_fn_with_state(Arc::clone(&cp_state), limit_public_oauth),
-    );
+    let public_oauth = cp::oauth::router()
+        .merge(cp::apple::public_router())
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&cp_state),
+            limit_public_oauth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&cp_state),
+            cp::cors::cors_middleware,
+        ));
     let control_plane = public_oauth
         .merge(cp_authed)
         .with_state(Arc::clone(&cp_state));

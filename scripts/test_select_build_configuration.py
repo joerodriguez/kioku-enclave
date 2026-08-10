@@ -46,6 +46,8 @@ APPLE_CONFIGURATION = {
     "APPLE_TEAM_ID": "ABCDE12345",
     "APPLE_KEY_ID": "FGHIJ67890",
     "APPLE_IOS_CLIENT_ID": "com.kioku.ios",
+    "APPLE_MACOS_CLIENT_ID": "com.kiokuu.app",
+    "APPLE_WEB_CLIENT_ID": "com.kiokuu.web",
 }
 
 
@@ -127,6 +129,8 @@ class SelectorTests(unittest.TestCase):
         completed, content = self.run_selector("production", env)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("APPLE_IOS_CLIENT_ID=com.kioku.ios\n", content)
+        self.assertIn("APPLE_MACOS_CLIENT_ID=com.kiokuu.app\n", content)
+        self.assertIn("APPLE_WEB_CLIENT_ID=com.kiokuu.web\n", content)
 
         del env["PRODUCTION_APPLE_KEY_ID"]
         completed, content = self.run_selector("production", env)

@@ -339,12 +339,16 @@ authorization response, or the
 identity of the service account trusted by legacy `/v1/*` routes.
 
 **Mitigation:** Public OAuth validates configured Google audiences and the account
-allow-list. Native Apple login verifies Apple's signature, issuer, audience, expiry,
-verified email, nonce, and subject, exchanges the single-use code server-side, and never
-links accounts by email. Authenticated routes derive the user from the Kioku token rather
+allow-list. Native and browser Apple login verify Apple's signature, issuer, exact
+platform audience, expiry, verified email, nonce, and subject, exchange the single-use
+code server-side, and never link accounts by email. Native nonces are SHA-256 bound;
+browser state/raw nonce and downstream PKCE state are signed and short-lived.
+Authenticated routes derive the user from the Kioku token rather
 than trusting a caller-supplied identity. OAuth uses PKCE and persisted, single-use
-authorization-code state. Apple refresh authorization is held only in the encrypted
-control store and revoked before identity deletion. Legacy routes accept only
+authorization-code state. The first-party dashboard uses one fixed public PKCE client so
+normal sign-ins cannot exhaust bounded third-party registration. Apple refresh
+authorization is held per issuing iPhone/Mac/web client only in the encrypted control
+store and every retained grant is revoked before identity deletion. Legacy routes accept only
 Google-signed ID tokens with the baked audience and
 service-account email; there is no shared-secret or auth-disable fallback. User IDs are
 validated before use in paths or object names.

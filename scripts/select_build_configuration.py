@@ -50,7 +50,13 @@ PROFILE_KEYS = (
 )
 
 OPTIONAL_PROFILE_GROUPS = (
-    ("APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_IOS_CLIENT_ID"),
+    (
+        "APPLE_TEAM_ID",
+        "APPLE_KEY_ID",
+        "APPLE_IOS_CLIENT_ID",
+        "APPLE_MACOS_CLIENT_ID",
+        "APPLE_WEB_CLIENT_ID",
+    ),
 )
 
 PROJECT_PATTERN = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
@@ -146,6 +152,8 @@ def validate(configuration: dict[str, str]) -> None:
         require_pattern(configuration, "APPLE_TEAM_ID", r"[A-Za-z0-9]{10}")
         require_pattern(configuration, "APPLE_KEY_ID", r"[A-Za-z0-9]{10}")
         require_pattern(configuration, "APPLE_IOS_CLIENT_ID", r"com\.kioku\.ios")
+        require_pattern(configuration, "APPLE_MACOS_CLIENT_ID", r"com\.kiokuu\.app")
+        require_pattern(configuration, "APPLE_WEB_CLIENT_ID", r"com\.kiokuu\.web")
     require_pattern(configuration, "REVIEWER_AUTH_API_KEY", r"[A-Za-z0-9_-]{20,256}")
     require_pattern(configuration, "REVIEWER_AUTH_UID", r"[A-Za-z0-9_-]{1,128}")
     require_pattern(configuration, "REVIEWER_AUTH_EMAIL", EMAIL_PATTERN)

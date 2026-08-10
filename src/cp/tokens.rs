@@ -170,6 +170,17 @@ pub struct StateClaims {
     pub code_challenge: String,
     #[serde(default)]
     pub resource: String,
+    /// Present only while the browser Sign in with Apple round-trip is in
+    /// flight. It is signed into the same short-lived state token as the
+    /// downstream OAuth request, so the Apple identity token cannot be replayed
+    /// against a different assistant/web authorization.
+    #[serde(default)]
+    pub apple_nonce: String,
+    /// Present only for an authenticated browser request to attach an Apple
+    /// identity to an existing Kioku account. The user ID is signed and never
+    /// accepted from Apple's response or from a query parameter.
+    #[serde(default)]
+    pub apple_link_user_id: String,
     pub exp: u64,
 }
 
@@ -180,6 +191,8 @@ pub fn issue_state(secret: &str, claims: &StateClaims) -> Result<String> {
         client_state: claims.client_state.clone(),
         code_challenge: claims.code_challenge.clone(),
         resource: claims.resource.clone(),
+        apple_nonce: claims.apple_nonce.clone(),
+        apple_link_user_id: claims.apple_link_user_id.clone(),
         exp: now_secs() + STATE_TTL_SECS,
     };
     if claims.exp != 0 {
@@ -369,6 +382,28 @@ mod tests {
         assert_eq!(claims.redirect_uri, "https://client.example/cb");
         assert_eq!(claims.resource, "https://kioku.example");
         assert!(verify_consent("wrong", &token).is_err());
+    }
+
+    #[test]
+    fn apple_browser_state_round_trips_nonce_and_authenticated_link_target() {
+        let token = issue_state(
+            "secret",
+            &StateClaims {
+                client_id: String::new(),
+                redirect_uri: String::new(),
+                client_state: String::new(),
+                code_challenge: String::new(),
+                resource: String::new(),
+                apple_nonce: "n".repeat(43),
+                apple_link_user_id: "user-123".into(),
+                exp: 0,
+            },
+        )
+        .unwrap();
+        let claims = verify_state("secret", &token).unwrap();
+        assert_eq!(claims.apple_nonce, "n".repeat(43));
+        assert_eq!(claims.apple_link_user_id, "user-123");
+        assert!(verify_state("wrong", &token).is_err());
     }
 
     #[test]

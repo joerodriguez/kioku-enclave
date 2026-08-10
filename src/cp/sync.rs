@@ -614,17 +614,23 @@ async fn revoke_apple_before_content_delete(
     apple_provider: Option<&Arc<super::apple::AppleIdentityProvider>>,
     user_id: &str,
 ) -> EnclaveResult<()> {
-    let Some(refresh_token) = control.apple_refresh_token(user_id).await? else {
+    let credentials = control.apple_refresh_credentials(user_id).await?;
+    if credentials.is_empty() {
         return Ok(());
-    };
+    }
     let provider = apple_provider.ok_or_else(|| {
         EnclaveError::Store("Apple credential revocation provider is unavailable".into())
     })?;
-    provider
-        .revoke_refresh_token(&refresh_token)
-        .await
-        .map_err(|_| EnclaveError::Store("Apple credential revocation failed".into()))?;
-    control.mark_apple_credential_revoked(user_id).await
+    for (client_id, refresh_token) in credentials {
+        provider
+            .revoke_refresh_token(&client_id, &refresh_token)
+            .await
+            .map_err(|_| EnclaveError::Store("Apple credential revocation failed".into()))?;
+        control
+            .mark_apple_credential_revoked(user_id, &client_id)
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1054,10 +1060,21 @@ mod tests {
             .upsert_apple_user(
                 "cancelled-apple-deletion-subject",
                 "owner@privaterelay.appleid.com",
+                "com.kioku.ios",
                 "retained-refresh-token",
             )
             .await
             .unwrap();
+        let same_user_from_mac = control
+            .upsert_apple_user(
+                "cancelled-apple-deletion-subject",
+                "owner@privaterelay.appleid.com",
+                "com.kiokuu.app",
+                "retained-mac-refresh-token",
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_user_from_mac.id, user.id);
         control
             .begin_user_deletion(&user.id)
             .await
@@ -1099,10 +1116,13 @@ mod tests {
         assert_eq!(operation.status, "pending");
         assert_eq!(
             restarted_control
-                .apple_refresh_token(&user.id)
+                .apple_refresh_credentials(&user.id)
                 .await
                 .unwrap(),
-            Some("retained-refresh-token".into())
+            vec![
+                ("com.kioku.ios".into(), "retained-refresh-token".into()),
+                ("com.kiokuu.app".into(), "retained-mac-refresh-token".into())
+            ]
         );
     }
 
