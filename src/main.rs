@@ -75,6 +75,9 @@ mod acme;
 mod archive_v3;
 mod archive_v3_journal;
 mod archive_v3_operation;
+// ADR-0022's inactive, in-memory witness contract.  It intentionally has no
+// provider, Store, VFS, route, or authority wiring.
+mod archive_v3_witness;
 mod attestation;
 mod auth;
 mod cp;

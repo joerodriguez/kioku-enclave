@@ -171,7 +171,13 @@ epoch/object/hash must come from the independent witness so cold recovery can un
 key before decrypting the root. This foundation makes no KMS calls and has no live Store,
 SQLite VFS, GCS, witness, route, migration,
 export, or deletion wiring. The legacy context-bound v2 database blob remains the sole
-production authority. No image may acknowledge a write from archive-v3 until ADR-0022
+production authority. `src/archive_v3_witness.rs` additionally defines a compiled,
+in-memory-only content-free witness contract: fixed-size records nominate one exact root
+and archive-key-registry object/hash; fenced compare-and-advance, migration/deletion, and
+key-rotation transitions are linearizable in the test model. It has no GCS/Firestore
+client, Store/VFS/route connection, or production authority. Recovery must fetch only the
+exact witness-nominated object/hash and must never use prefix/list discovery. No image may
+acknowledge a write from archive-v3 until ADR-0022
 Phase 1 shadow recovery, VFS crash/conformance, witness, fault, lifecycle, and capacity
 gates have passed and an explicit authority change is reviewed.
 
