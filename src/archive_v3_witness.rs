@@ -1,33 +1,20 @@
-#![allow(
-    dead_code,
-    reason = "this deliberately private, inactive witness contract is compiled and unit-tested before ADR-0022 shadow-gate wiring"
-)]
-
-//! Inactive, content-free witness contract for ADR-0022 archive-v3 shadow recovery.
-//!
-//! The witness is the future authority for one exact immutable root, its
-//! archive key-registry commitment, and writer fencing.  Recovery receives
-//! only that exact nominated object/hash pair; it must never search a prefix
-//! or choose a plausible immutable object.  This module has no network,
-//! storage-provider, `Store`, VFS, route, or production-authority wiring.
-
-use std::{
-    collections::{BTreeMap, VecDeque},
-    fmt,
-    sync::Mutex,
-};
-
-use thiserror::Error;
+#![allow(dead_code, reason = "inactive ADR-0022 witness contract")]
+//! Content-free, inactive ADR-0022 witness contract. Provider persistence is
+//! fixed-size and contains every lease/fence/root commitment needed after restart.
 
 use crate::archive_v3::{ArchiveId, DatabaseEpoch, KeyEpoch, KeyKind, ObjectId};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use thiserror::Error;
 
-const WITNESS_MAGIC: &[u8; 8] = b"KAWITv1\0";
-const WITNESS_VERSION: u8 = 1;
-/// The one fixed-size encoded witness record.  Decoders reject every other
-/// length rather than allocating from provider-supplied length fields.
-pub const WITNESS_RECORD_BYTES: usize = 164;
+const MAGIC: &[u8; 8] = b"KAWITv2\0";
+const VERSION: u8 = 2;
+pub const WITNESS_RECORD_BYTES: usize = 423;
 const MAX_LEASE_TICKS: u64 = 86_400;
-const MAX_RESOLVED_OPERATIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum WitnessError {
@@ -41,45 +28,39 @@ pub enum WitnessError {
     Malformed,
     #[error("witness record is corrupted")]
     Corrupt,
+    #[error("trusted witness clock regressed or is unavailable")]
+    Clock,
     #[error("witness lease is absent, expired, or fenced")]
     Fenced,
     #[error("witness compare-and-advance precondition did not match")]
     CompareFailed,
     #[error("witness transition is invalid for the current state")]
     InvalidTransition,
-    #[error("witness operation identifier was reused with different contents")]
-    OperationMismatch,
     #[error("witness synchronization failed")]
     Synchronization,
 }
-
 type Result<T> = std::result::Result<T, WitnessError>;
 
-/// Opaque idempotency key for a root transition.  It is intentionally not a
-/// user/account identifier and its Debug form never reveals its bytes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WitnessOperationId([u8; 16]);
-
-impl WitnessOperationId {
-    pub const fn from_bytes(value: [u8; 16]) -> Self {
-        Self(value)
+/// Production providers derive this inside their transaction. Callers never supply time.
+trait TrustedClock: Send + Sync {
+    fn now_tick(&self) -> Result<u64>;
+}
+struct SystemClock;
+impl TrustedClock for SystemClock {
+    fn now_tick(&self) -> Result<u64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| WitnessError::Clock)
+            .map(|v| v.as_secs())
     }
 }
 
-impl fmt::Debug for WitnessOperationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("WitnessOperationId(<opaque>)")
-    }
-}
-
-/// Exact immutable-root reference nominated by the witness.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RootReference {
     sequence: u64,
     object_id: ObjectId,
     ciphertext_hash: [u8; 32],
 }
-
 impl RootReference {
     pub(crate) const fn new(sequence: u64, object_id: ObjectId, ciphertext_hash: [u8; 32]) -> Self {
         Self {
@@ -88,20 +69,106 @@ impl RootReference {
             ciphertext_hash,
         }
     }
-
-    fn valid(&self) -> bool {
+    fn valid(self) -> bool {
         nonzero_id(self.object_id.as_bytes()) && nonzero_hash(&self.ciphertext_hash)
     }
-}
 
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    pub fn ciphertext_hash(&self) -> [u8; 32] {
+        self.ciphertext_hash
+    }
+}
 impl fmt::Debug for RootReference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("RootReference(<opaque>)")
     }
 }
 
-/// Exact archive-key registry object nominated by the witness.  Media keys
-/// are deliberately excluded: a root can never substitute a media registry.
+/// Header fields independently verified from the encrypted root before witness CAS.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RootCommitment {
+    root: RootReference,
+    parent: Option<RootReference>,
+    database_epoch: DatabaseEpoch,
+    key_epoch: KeyEpoch,
+    owner_fencing_epoch: u64,
+}
+impl RootCommitment {
+    pub(crate) const fn genesis(
+        database_epoch: DatabaseEpoch,
+        key_epoch: KeyEpoch,
+        root: RootReference,
+    ) -> Self {
+        Self {
+            root,
+            parent: None,
+            database_epoch,
+            key_epoch,
+            owner_fencing_epoch: 0,
+        }
+    }
+    pub(crate) const fn candidate(
+        database_epoch: DatabaseEpoch,
+        key_epoch: KeyEpoch,
+        owner_fencing_epoch: u64,
+        parent: RootReference,
+        root: RootReference,
+    ) -> Self {
+        Self {
+            root,
+            parent: Some(parent),
+            database_epoch,
+            key_epoch,
+            owner_fencing_epoch,
+        }
+    }
+    fn valid(self) -> bool {
+        nonzero_id(self.database_epoch.as_bytes())
+            && nonzero_id(self.key_epoch.as_bytes())
+            && self.root.valid()
+            && match self.parent {
+                None => self.root.sequence == 0 && self.owner_fencing_epoch == 0,
+                Some(parent) => {
+                    parent.valid()
+                        && parent.sequence.checked_add(1) == Some(self.root.sequence)
+                        && self.owner_fencing_epoch != 0
+                }
+            }
+    }
+
+    pub fn root(&self) -> RootReference {
+        self.root
+    }
+
+    pub fn parent(&self) -> Option<RootReference> {
+        self.parent
+    }
+
+    pub fn database_epoch(&self) -> DatabaseEpoch {
+        self.database_epoch
+    }
+
+    pub fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+
+    pub fn owner_fencing_epoch(&self) -> u64 {
+        self.owner_fencing_epoch
+    }
+}
+impl fmt::Debug for RootCommitment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RootCommitment(<opaque>)")
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KeyRegistryReference {
     key_kind: KeyKind,
@@ -109,7 +176,6 @@ pub struct KeyRegistryReference {
     object_id: ObjectId,
     ciphertext_hash: [u8; 32],
 }
-
 impl KeyRegistryReference {
     pub(crate) const fn new(
         key_epoch: KeyEpoch,
@@ -123,15 +189,25 @@ impl KeyRegistryReference {
             ciphertext_hash,
         }
     }
-
-    fn valid_archive_registry(&self) -> bool {
+    fn valid(self) -> bool {
         self.key_kind == KeyKind::Archive
             && nonzero_id(self.key_epoch.as_bytes())
             && nonzero_id(self.object_id.as_bytes())
             && nonzero_hash(&self.ciphertext_hash)
     }
-}
 
+    pub fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+
+    pub fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    pub fn ciphertext_hash(&self) -> [u8; 32] {
+        self.ciphertext_hash
+    }
+}
 impl fmt::Debug for KeyRegistryReference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("KeyRegistryReference(<opaque>)")
@@ -142,35 +218,40 @@ impl fmt::Debug for KeyRegistryReference {
 #[repr(u8)]
 pub enum MigrationState {
     Legacy = 0,
-    Shadow = 1,
+    ShadowWal = 1,
     WalAuthoritative = 2,
-    ExtentShadow = 3,
+    ShadowExtents = 3,
     ExtentAuthoritative = 4,
+    LegacyRetired = 5,
+    Deleting = 6,
+    Deleted = 7,
 }
-
 impl MigrationState {
-    fn decode(value: u8) -> Result<Self> {
-        match value {
+    fn decode(v: u8) -> Result<Self> {
+        match v {
             0 => Ok(Self::Legacy),
-            1 => Ok(Self::Shadow),
+            1 => Ok(Self::ShadowWal),
             2 => Ok(Self::WalAuthoritative),
-            3 => Ok(Self::ExtentShadow),
+            3 => Ok(Self::ShadowExtents),
             4 => Ok(Self::ExtentAuthoritative),
+            5 => Ok(Self::LegacyRetired),
+            6 => Ok(Self::Deleting),
+            7 => Ok(Self::Deleted),
             _ => Err(WitnessError::Corrupt),
         }
     }
-
-    fn next(self) -> Option<Self> {
-        match self {
-            Self::Legacy => Some(Self::Shadow),
-            Self::Shadow => Some(Self::WalAuthoritative),
-            Self::WalAuthoritative => Some(Self::ExtentShadow),
-            Self::ExtentShadow => Some(Self::ExtentAuthoritative),
-            Self::ExtentAuthoritative => None,
-        }
+    fn permits(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Legacy, Self::ShadowWal)
+                | (Self::Legacy, Self::ShadowExtents)
+                | (Self::ShadowWal, Self::WalAuthoritative)
+                | (Self::WalAuthoritative, Self::ShadowExtents)
+                | (Self::ShadowExtents, Self::ExtentAuthoritative)
+                | (Self::ExtentAuthoritative, Self::LegacyRetired)
+        )
     }
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DeletionState {
@@ -180,10 +261,9 @@ pub enum DeletionState {
     LogicalObjectsAbsent = 3,
     PhysicalComplete = 4,
 }
-
 impl DeletionState {
-    fn decode(value: u8) -> Result<Self> {
-        match value {
+    fn decode(v: u8) -> Result<Self> {
+        match v {
             0 => Ok(Self::Active),
             1 => Ok(Self::Tombstoned),
             2 => Ok(Self::CryptographicallyErased),
@@ -192,7 +272,6 @@ impl DeletionState {
             _ => Err(WitnessError::Corrupt),
         }
     }
-
     fn next(self) -> Option<Self> {
         match self {
             Self::Active => Some(Self::Tombstoned),
@@ -203,119 +282,259 @@ impl DeletionState {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeletionEvidenceKind {
+    Tombstone = 1,
+    KeyErasure = 2,
+    Inventory = 3,
+    Retention = 4,
+}
+impl DeletionEvidenceKind {
+    fn decode(v: u8) -> Result<Self> {
+        match v {
+            1 => Ok(Self::Tombstone),
+            2 => Ok(Self::KeyErasure),
+            3 => Ok(Self::Inventory),
+            4 => Ok(Self::Retention),
+            _ => Err(WitnessError::Corrupt),
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DeletionEvidence {
+    kind: DeletionEvidenceKind,
+    commitment: [u8; 32],
+}
+impl DeletionEvidence {
+    pub(crate) const fn new(kind: DeletionEvidenceKind, commitment: [u8; 32]) -> Self {
+        Self { kind, commitment }
+    }
+    fn valid_for(self, state: DeletionState) -> bool {
+        nonzero_hash(&self.commitment)
+            && matches!(
+                (state, self.kind),
+                (DeletionState::Tombstoned, DeletionEvidenceKind::Tombstone)
+                    | (
+                        DeletionState::CryptographicallyErased,
+                        DeletionEvidenceKind::KeyErasure
+                    )
+                    | (
+                        DeletionState::LogicalObjectsAbsent,
+                        DeletionEvidenceKind::Inventory
+                    )
+                    | (
+                        DeletionState::PhysicalComplete,
+                        DeletionEvidenceKind::Retention
+                    )
+            )
+    }
+}
+impl fmt::Debug for DeletionEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeletionEvidence(<opaque>)")
+    }
+}
 
-/// Bounded current witness state.  This is exactly the recovery authority,
-/// not a directory of storage-provider prefixes or object listings.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Predecessor {
+    database_epoch: DatabaseEpoch,
+    root: RootReference,
+}
+
+/// The entire durable provider state; no fencing state is local-only.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WitnessRecord {
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
-    root: RootReference,
+    predecessor: Option<Predecessor>,
+    root: RootCommitment,
     registry: KeyRegistryReference,
+    owner_id: Option<ObjectId>,
+    current_fencing_epoch: u64,
+    next_fencing_epoch: u64,
+    lease_expires_at_tick: u64,
+    deletion_fencing_epoch: Option<u64>,
+    last_server_tick: u64,
     migration: MigrationState,
     deletion: DeletionState,
+    deletion_evidence: Option<DeletionEvidence>,
 }
-
 impl WitnessRecord {
     pub fn archive_id(&self) -> ArchiveId {
         self.archive_id
     }
-
     pub fn database_epoch(&self) -> DatabaseEpoch {
         self.database_epoch
     }
-
-    pub fn root(&self) -> RootReference {
+    pub fn root(&self) -> RootCommitment {
         self.root
     }
-
     pub fn registry(&self) -> KeyRegistryReference {
         self.registry
     }
-
     pub fn migration(&self) -> MigrationState {
         self.migration
     }
-
     pub fn deletion(&self) -> DeletionState {
         self.deletion
     }
-
     fn valid(&self) -> bool {
         nonzero_id(self.archive_id.as_bytes())
             && nonzero_id(self.database_epoch.as_bytes())
             && self.root.valid()
-            && self.registry.valid_archive_registry()
+            && self.root.database_epoch == self.database_epoch
+            && self.root.key_epoch == self.registry.key_epoch
+            && self.registry.valid()
+            && self.next_fencing_epoch > self.current_fencing_epoch
+            && match self.owner_id {
+                Some(v) => nonzero_id(v.as_bytes()) && self.lease_expires_at_tick != 0,
+                None => self.lease_expires_at_tick == 0,
+            }
+            && match self.deletion {
+                DeletionState::Active => {
+                    self.deletion_fencing_epoch.is_none() && self.deletion_evidence.is_none()
+                }
+                _ => {
+                    self.deletion_fencing_epoch
+                        .is_some_and(|v| v > self.current_fencing_epoch)
+                        && self.deletion_evidence.is_some()
+                }
+            }
     }
-
-    /// Fixed-size, content-free provider-record encoding.
     pub fn encode(&self) -> [u8; WITNESS_RECORD_BYTES] {
-        let mut out = [0u8; WITNESS_RECORD_BYTES];
-        let mut offset = 0;
-        put(&mut out, &mut offset, WITNESS_MAGIC);
-        put(&mut out, &mut offset, &[WITNESS_VERSION]);
-        put(&mut out, &mut offset, self.archive_id.as_bytes());
-        put(&mut out, &mut offset, self.database_epoch.as_bytes());
-        put(&mut out, &mut offset, &self.root.sequence.to_be_bytes());
-        put(&mut out, &mut offset, self.root.object_id.as_bytes());
-        put(&mut out, &mut offset, &self.root.ciphertext_hash);
-        put(&mut out, &mut offset, &[self.registry.key_kind as u8]);
-        put(&mut out, &mut offset, self.registry.key_epoch.as_bytes());
-        put(&mut out, &mut offset, self.registry.object_id.as_bytes());
-        put(&mut out, &mut offset, &self.registry.ciphertext_hash);
+        let mut out = [0; WITNESS_RECORD_BYTES];
+        let mut p = 0;
+        put(&mut out, &mut p, MAGIC);
+        put(&mut out, &mut p, &[VERSION]);
+        put(&mut out, &mut p, self.archive_id.as_bytes());
+        put(&mut out, &mut p, self.database_epoch.as_bytes());
+        put(&mut out, &mut p, &[self.predecessor.is_some() as u8]);
+        if let Some(x) = self.predecessor {
+            put(&mut out, &mut p, x.database_epoch.as_bytes());
+            root_put(&mut out, &mut p, x.root);
+        } else {
+            put(&mut out, &mut p, &[0; 16]);
+            root_put(&mut out, &mut p, zero_root());
+        }
+        root_put(&mut out, &mut p, self.root.root);
+        put(&mut out, &mut p, self.root.database_epoch.as_bytes());
+        put(&mut out, &mut p, self.root.key_epoch.as_bytes());
         put(
             &mut out,
-            &mut offset,
+            &mut p,
+            &self.root.owner_fencing_epoch.to_be_bytes(),
+        );
+        put(&mut out, &mut p, &[self.root.parent.is_some() as u8]);
+        root_put(&mut out, &mut p, self.root.parent.unwrap_or_else(zero_root));
+        put(&mut out, &mut p, self.registry.key_epoch.as_bytes());
+        put(&mut out, &mut p, &[self.registry.key_kind as u8]);
+        put(&mut out, &mut p, self.registry.object_id.as_bytes());
+        put(&mut out, &mut p, &self.registry.ciphertext_hash);
+        put(
+            &mut out,
+            &mut p,
+            self.owner_id
+                .unwrap_or_else(|| ObjectId::from_bytes([0; 16]))
+                .as_bytes(),
+        );
+        put(&mut out, &mut p, &self.current_fencing_epoch.to_be_bytes());
+        put(&mut out, &mut p, &self.next_fencing_epoch.to_be_bytes());
+        put(&mut out, &mut p, &self.lease_expires_at_tick.to_be_bytes());
+        put(
+            &mut out,
+            &mut p,
+            &self.deletion_fencing_epoch.unwrap_or(0).to_be_bytes(),
+        );
+        put(&mut out, &mut p, &self.last_server_tick.to_be_bytes());
+        put(
+            &mut out,
+            &mut p,
             &[self.migration as u8, self.deletion as u8],
         );
-        debug_assert_eq!(offset, WITNESS_RECORD_BYTES);
+        if let Some(x) = self.deletion_evidence {
+            put(&mut out, &mut p, &[x.kind as u8]);
+            put(&mut out, &mut p, &x.commitment);
+        } else {
+            put(&mut out, &mut p, &[0]);
+            put(&mut out, &mut p, &[0; 32]);
+        }
+        debug_assert_eq!(p, WITNESS_RECORD_BYTES);
         out
     }
-
     pub fn decode(input: &[u8]) -> Result<Self> {
         if input.len() != WITNESS_RECORD_BYTES {
             return Err(WitnessError::Corrupt);
         }
-        let mut offset = 0;
-        if take(input, &mut offset, WITNESS_MAGIC.len())? != WITNESS_MAGIC
-            || take(input, &mut offset, 1)?[0] != WITNESS_VERSION
-        {
+        let mut p = 0;
+        if take(input, &mut p, 8)? != MAGIC || take(input, &mut p, 1)?[0] != VERSION {
             return Err(WitnessError::Corrupt);
         }
-        let archive_id = ArchiveId::from_bytes(take_array(take(input, &mut offset, 16)?)?);
-        let database_epoch = DatabaseEpoch::from_bytes(take_array(take(input, &mut offset, 16)?)?);
-        let sequence = u64::from_be_bytes(take_array(take(input, &mut offset, 8)?)?);
-        let root_object = ObjectId::from_bytes(take_array(take(input, &mut offset, 16)?)?);
-        let root_hash = take_array(take(input, &mut offset, 32)?)?;
-        let key_kind = match take(input, &mut offset, 1)?[0] {
-            1 => KeyKind::Archive,
-            2 => KeyKind::Media,
-            _ => return Err(WitnessError::Corrupt),
+        let archive_id = ArchiveId::from_bytes(array(take(input, &mut p, 16)?)?);
+        let database_epoch = DatabaseEpoch::from_bytes(array(take(input, &mut p, 16)?)?);
+        let predecessor_present = boolean(take(input, &mut p, 1)?[0])?;
+        let pred_epoch = DatabaseEpoch::from_bytes(array(take(input, &mut p, 16)?)?);
+        let pred_root = root_take(input, &mut p)?;
+        let root_ref = root_take(input, &mut p)?;
+        let root_db = DatabaseEpoch::from_bytes(array(take(input, &mut p, 16)?)?);
+        let root_key = KeyEpoch::from_bytes(array(take(input, &mut p, 16)?)?);
+        let root_fence = u64::from_be_bytes(array(take(input, &mut p, 8)?)?);
+        let parent_present = boolean(take(input, &mut p, 1)?[0])?;
+        let parent = root_take(input, &mut p)?;
+        let registry_key = KeyEpoch::from_bytes(array(take(input, &mut p, 16)?)?);
+        let registry_kind = key_kind(take(input, &mut p, 1)?[0])?;
+        let registry_object = ObjectId::from_bytes(array(take(input, &mut p, 16)?)?);
+        let registry_hash = array(take(input, &mut p, 32)?)?;
+        let owner = ObjectId::from_bytes(array(take(input, &mut p, 16)?)?);
+        let current = u64::from_be_bytes(array(take(input, &mut p, 8)?)?);
+        let next = u64::from_be_bytes(array(take(input, &mut p, 8)?)?);
+        let expiry = u64::from_be_bytes(array(take(input, &mut p, 8)?)?);
+        let deletion_fence = u64::from_be_bytes(array(take(input, &mut p, 8)?)?);
+        let last_tick = u64::from_be_bytes(array(take(input, &mut p, 8)?)?);
+        let migration = MigrationState::decode(take(input, &mut p, 1)?[0])?;
+        let deletion = DeletionState::decode(take(input, &mut p, 1)?[0])?;
+        let evidence_kind = take(input, &mut p, 1)?[0];
+        let evidence_hash = array(take(input, &mut p, 32)?)?;
+        if p != input.len() {
+            return Err(WitnessError::Corrupt);
+        }
+        let deletion_evidence = if evidence_kind == 0 {
+            None
+        } else {
+            Some(DeletionEvidence {
+                kind: DeletionEvidenceKind::decode(evidence_kind)?,
+                commitment: evidence_hash,
+            })
         };
-        let key_epoch = KeyEpoch::from_bytes(take_array(take(input, &mut offset, 16)?)?);
-        let registry_object = ObjectId::from_bytes(take_array(take(input, &mut offset, 16)?)?);
-        let registry_hash = take_array(take(input, &mut offset, 32)?)?;
-        let migration = MigrationState::decode(take(input, &mut offset, 1)?[0])?;
-        let deletion = DeletionState::decode(take(input, &mut offset, 1)?[0])?;
-        if offset != input.len() {
-            return Err(WitnessError::Corrupt);
-        }
         let record = Self {
             archive_id,
             database_epoch,
-            root: RootReference {
-                sequence,
-                object_id: root_object,
-                ciphertext_hash: root_hash,
+            predecessor: predecessor_present.then_some(Predecessor {
+                database_epoch: pred_epoch,
+                root: pred_root,
+            }),
+            root: RootCommitment {
+                root: root_ref,
+                parent: parent_present.then_some(parent),
+                database_epoch: root_db,
+                key_epoch: root_key,
+                owner_fencing_epoch: root_fence,
             },
             registry: KeyRegistryReference {
-                key_kind,
-                key_epoch,
+                key_kind: registry_kind,
+                key_epoch: registry_key,
                 object_id: registry_object,
                 ciphertext_hash: registry_hash,
             },
+            owner_id: nonzero_id(owner.as_bytes()).then_some(owner),
+            current_fencing_epoch: current,
+            next_fencing_epoch: next,
+            lease_expires_at_tick: expiry,
+            deletion_fencing_epoch: (deletion_fence != 0).then_some(deletion_fence),
+            last_server_tick: last_tick,
             migration,
             deletion,
+            deletion_evidence,
         };
         record
             .valid()
@@ -323,28 +542,24 @@ impl WitnessRecord {
             .ok_or(WitnessError::Corrupt)
     }
 }
-
 impl fmt::Debug for WitnessRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("WitnessRecord(<content-free opaque commitments>)")
+        f.write_str("WitnessRecord(<opaque>)")
     }
 }
 
-/// Bootstrap is intentionally explicit: it nominates one genesis root and one
-/// archive key registry, without consulting a storage-provider listing.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WitnessBootstrap {
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
-    genesis_root: RootReference,
+    genesis_root: RootCommitment,
     registry: KeyRegistryReference,
 }
-
 impl WitnessBootstrap {
     pub(crate) const fn new(
         archive_id: ArchiveId,
         database_epoch: DatabaseEpoch,
-        genesis_root: RootReference,
+        genesis_root: RootCommitment,
         registry: KeyRegistryReference,
     ) -> Self {
         Self {
@@ -355,14 +570,12 @@ impl WitnessBootstrap {
         }
     }
 }
-
 impl fmt::Debug for WitnessBootstrap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("WitnessBootstrap(<opaque>)")
     }
 }
 
-/// Lease token returned only by a successful fenced acquire/renew operation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WitnessLease {
     archive_id: ArchiveId,
@@ -372,80 +585,104 @@ pub struct WitnessLease {
     fencing_epoch: u64,
     expires_at_tick: u64,
 }
-
 impl fmt::Debug for WitnessLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("WitnessLease(<opaque>)")
     }
 }
-
-/// Complete compare-and-advance precondition and candidate.  A caller must
-/// supply the parent sequence/hash and the exact candidate object/hash in the
-/// same fenced operation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DeletionAuthorization {
+    archive_id: ArchiveId,
+    database_epoch: DatabaseEpoch,
+    fencing_epoch: u64,
+}
+impl fmt::Debug for DeletionAuthorization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeletionAuthorization(<opaque>)")
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 pub struct RootAdvance {
-    operation_id: WitnessOperationId,
     lease: WitnessLease,
-    now_tick: u64,
-    expected_parent: RootReference,
+    expected_root: RootCommitment,
     expected_registry: KeyRegistryReference,
-    candidate_database_epoch: DatabaseEpoch,
-    candidate_key_epoch: KeyEpoch,
-    candidate: RootReference,
+    candidate: RootCommitment,
 }
-
 impl RootAdvance {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) const fn new(
-        operation_id: WitnessOperationId,
         lease: WitnessLease,
-        now_tick: u64,
-        expected_parent: RootReference,
+        expected_root: RootCommitment,
         expected_registry: KeyRegistryReference,
-        candidate_database_epoch: DatabaseEpoch,
-        candidate_key_epoch: KeyEpoch,
-        candidate: RootReference,
+        candidate: RootCommitment,
     ) -> Self {
         Self {
-            operation_id,
             lease,
-            now_tick,
-            expected_parent,
+            expected_root,
             expected_registry,
-            candidate_database_epoch,
-            candidate_key_epoch,
             candidate,
         }
     }
 }
-
-impl fmt::Debug for RootAdvance {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RootAdvance(<opaque>)")
-    }
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeletionAdvance {
+    authorization: DeletionAuthorization,
+    expected_root: RootCommitment,
+    expected_registry: KeyRegistryReference,
+    candidate: RootCommitment,
+    evidence: DeletionEvidence,
 }
-
-/// Exact witness result retained for idempotent lost-success resolution.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WitnessReceipt {
     record: WitnessRecord,
 }
-
 impl WitnessReceipt {
     pub fn record(&self) -> &WitnessRecord {
         &self.record
     }
 }
-
 impl fmt::Debug for WitnessReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("WitnessReceipt(<opaque>)")
     }
 }
+#[derive(Clone, PartialEq, Eq)]
+pub struct TombstoneReceipt {
+    receipt: WitnessReceipt,
+    authorization: DeletionAuthorization,
+}
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecoveryRoot {
+    root: RootCommitment,
+    registry: KeyRegistryReference,
+    predecessor: Option<Predecessor>,
+    migration: MigrationState,
+    deletion: DeletionState,
+}
+impl RecoveryRoot {
+    pub fn root(&self) -> RootCommitment {
+        self.root
+    }
+    pub fn registry(&self) -> KeyRegistryReference {
+        self.registry
+    }
+    pub fn predecessor_database_epoch(&self) -> Option<DatabaseEpoch> {
+        self.predecessor.map(|x| x.database_epoch)
+    }
+    pub fn migration(&self) -> MigrationState {
+        self.migration
+    }
+    pub fn deletion(&self) -> DeletionState {
+        self.deletion
+    }
+}
+impl fmt::Debug for RecoveryRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecoveryRoot(<opaque>)")
+    }
+}
 
-/// Content-free witness operations.  Provider implementations must make each
-/// mutation linearizable; no caller may compose a read, a listing, and a later
-/// write in lieu of the compare-and-advance operation.
+/// Lost success is resolved by reading and comparing the exact current candidate. The
+/// operation-result ledger remains inside the encrypted witnessed root, not a bounded cache.
 pub trait Witness: Send + Sync {
     fn read_current(&self, archive_id: ArchiveId) -> Result<Option<WitnessRecord>>;
     fn recovery_root(&self, archive_id: ArchiveId) -> Result<RecoveryRoot>;
@@ -455,731 +692,732 @@ pub trait Witness: Send + Sync {
         database_epoch: DatabaseEpoch,
         key_epoch: KeyEpoch,
         owner: ObjectId,
-        now_tick: u64,
         duration_ticks: u64,
     ) -> Result<WitnessLease>;
-    fn renew_lease(
-        &self,
-        lease: WitnessLease,
-        now_tick: u64,
-        duration_ticks: u64,
-    ) -> Result<WitnessLease>;
-    fn revoke_lease(&self, lease: WitnessLease, now_tick: u64) -> Result<()>;
+    fn renew_lease(&self, lease: WitnessLease, duration_ticks: u64) -> Result<WitnessLease>;
+    fn revoke_lease(&self, lease: WitnessLease) -> Result<()>;
     fn compare_and_advance_root(&self, advance: RootAdvance) -> Result<WitnessReceipt>;
     fn advance_migration(
         &self,
         advance: RootAdvance,
         next: MigrationState,
     ) -> Result<WitnessReceipt>;
-    fn advance_deletion(&self, advance: RootAdvance, next: DeletionState)
-        -> Result<WitnessReceipt>;
     fn rotate_key_registry(
         &self,
         advance: RootAdvance,
         next: KeyRegistryReference,
     ) -> Result<WitnessReceipt>;
-    fn resolve_operation(
+    fn cut_over_database_epoch(
         &self,
-        archive_id: ArchiveId,
-        operation_id: WitnessOperationId,
-    ) -> Result<Option<WitnessReceipt>>;
+        advance: RootAdvance,
+        next: DatabaseEpoch,
+    ) -> Result<WitnessReceipt>;
+    fn tombstone(
+        &self,
+        advance: RootAdvance,
+        evidence: DeletionEvidence,
+    ) -> Result<TombstoneReceipt>;
+    fn advance_deletion(
+        &self,
+        advance: DeletionAdvance,
+        next: DeletionState,
+    ) -> Result<WitnessReceipt>;
 }
 
-/// Exact root and archive key registry accepted for cold recovery.  The caller
-/// may fetch only these immutable object ids and verify these hashes.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RecoveryRoot {
-    root: RootReference,
-    registry: KeyRegistryReference,
-    migration: MigrationState,
-    deletion: DeletionState,
-}
-
-impl fmt::Debug for RecoveryRoot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RecoveryRoot(<opaque witness nomination>)")
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-enum Transition {
-    Root,
-    Migration(MigrationState),
-    Deletion(DeletionState),
-    Rotation(KeyRegistryReference),
-}
-
-#[derive(Clone)]
-struct ResolvedOperation {
-    operation_id: WitnessOperationId,
-    advance: RootAdvance,
-    transition: Transition,
-    receipt: WitnessReceipt,
-}
-
-struct LeaseState {
-    lease: WitnessLease,
-}
-
-struct ArchiveState {
-    record: WitnessRecord,
-    lease: Option<LeaseState>,
-    next_fencing_epoch: u64,
-    resolved: VecDeque<ResolvedOperation>,
-}
-
-struct InMemoryState {
+struct State {
     available: bool,
-    archives: BTreeMap<ArchiveId, ArchiveState>,
+    records: BTreeMap<ArchiveId, WitnessRecord>,
 }
-
-/// Mutex-backed model used only by contract tests.  One critical section per
-/// operation is the linearization point; it intentionally provides no durable
-/// storage or production failure semantics.
 pub struct InMemoryWitness {
-    state: Mutex<InMemoryState>,
+    clock: Arc<dyn TrustedClock>,
+    state: Mutex<State>,
 }
-
 impl InMemoryWitness {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+    fn with_clock(clock: Arc<dyn TrustedClock>) -> Self {
         Self {
-            state: Mutex::new(InMemoryState {
+            clock,
+            state: Mutex::new(State {
                 available: true,
-                archives: BTreeMap::new(),
+                records: BTreeMap::new(),
             }),
         }
     }
-
-    pub fn bootstrap(&self, bootstrap: WitnessBootstrap) -> Result<WitnessRecord> {
-        if !valid_bootstrap(&bootstrap) {
+    fn from_records(
+        clock: Arc<dyn TrustedClock>,
+        records: Vec<[u8; WITNESS_RECORD_BYTES]>,
+    ) -> Result<Self> {
+        let mut result = BTreeMap::new();
+        for bytes in records {
+            let r = WitnessRecord::decode(&bytes)?;
+            if result.insert(r.archive_id, r).is_some() {
+                return Err(WitnessError::Corrupt);
+            }
+        }
+        Ok(Self {
+            clock,
+            state: Mutex::new(State {
+                available: true,
+                records: result,
+            }),
+        })
+    }
+    pub fn bootstrap(&self, b: WitnessBootstrap) -> Result<WitnessRecord> {
+        if !nonzero_id(b.archive_id.as_bytes())
+            || !b.genesis_root.valid()
+            || b.genesis_root.database_epoch != b.database_epoch
+            || b.genesis_root.key_epoch != b.registry.key_epoch
+            || !b.registry.valid()
+        {
             return Err(WitnessError::Malformed);
         }
         let mut state = self.lock()?;
-        ensure_available(&state)?;
-        if state.archives.contains_key(&bootstrap.archive_id) {
+        available(&state)?;
+        if state.records.contains_key(&b.archive_id) {
             return Err(WitnessError::AlreadyExists);
         }
-        let record = WitnessRecord {
-            archive_id: bootstrap.archive_id,
-            database_epoch: bootstrap.database_epoch,
-            root: bootstrap.genesis_root,
-            registry: bootstrap.registry,
+        let r = WitnessRecord {
+            archive_id: b.archive_id,
+            database_epoch: b.database_epoch,
+            predecessor: None,
+            root: b.genesis_root,
+            registry: b.registry,
+            owner_id: None,
+            current_fencing_epoch: 0,
+            next_fencing_epoch: 1,
+            lease_expires_at_tick: 0,
+            deletion_fencing_epoch: None,
+            last_server_tick: 0,
             migration: MigrationState::Legacy,
             deletion: DeletionState::Active,
+            deletion_evidence: None,
         };
-        state.archives.insert(
-            bootstrap.archive_id,
-            ArchiveState {
-                record: record.clone(),
-                lease: None,
-                next_fencing_epoch: 1,
-                resolved: VecDeque::new(),
-            },
-        );
-        Ok(record)
+        state.records.insert(r.archive_id, r.clone());
+        Ok(r)
     }
-
-    #[cfg(test)]
-    fn set_available_for_test(&self, available: bool) {
-        self.state.lock().expect("test witness lock").available = available;
-    }
-
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, InMemoryState>> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>> {
         self.state.lock().map_err(|_| WitnessError::Synchronization)
     }
-
-    fn apply(&self, advance: RootAdvance, transition: Transition) -> Result<WitnessReceipt> {
-        let mut state = self.lock()?;
-        ensure_available(&state)?;
-        let archive = state
-            .archives
-            .get_mut(&advance.lease.archive_id)
+    fn now(&self, r: &mut WitnessRecord) -> Result<u64> {
+        let now = self.clock.now_tick()?;
+        if now < r.last_server_tick {
+            return Err(WitnessError::Clock);
+        }
+        r.last_server_tick = now;
+        Ok(now)
+    }
+    #[cfg(test)]
+    fn snapshots(&self) -> Vec<[u8; WITNESS_RECORD_BYTES]> {
+        self.state
+            .lock()
+            .expect("test lock")
+            .records
+            .values()
+            .map(WitnessRecord::encode)
+            .collect()
+    }
+    #[cfg(test)]
+    fn unavailable(&self) {
+        self.state.lock().expect("test lock").available = false;
+    }
+    fn normal(&self, a: RootAdvance, kind: Normal) -> Result<WitnessReceipt> {
+        let mut s = self.lock()?;
+        available(&s)?;
+        let r = s
+            .records
+            .get_mut(&a.lease.archive_id)
             .ok_or(WitnessError::MissingArchive)?;
-
-        if let Some(existing) = archive
-            .resolved
-            .iter()
-            .find(|item| item.operation_id == advance.operation_id)
-        {
-            return if existing.advance == advance && existing.transition == transition {
-                Ok(existing.receipt.clone())
-            } else {
-                Err(WitnessError::OperationMismatch)
-            };
+        let now = self.now(r)?;
+        normal_ok(r, &a, now, kind)?;
+        match kind {
+            Normal::Root => {}
+            Normal::Migration(x) => r.migration = x,
+            Normal::Rotation(x) => r.registry = x,
+            Normal::Epoch(x) => {
+                r.predecessor = Some(Predecessor {
+                    database_epoch: r.database_epoch,
+                    root: r.root.root,
+                });
+                r.database_epoch = x;
+                // A database-epoch cutover invalidates the old writer token. The
+                // owner must acquire a new higher fence against the new epoch.
+                r.owner_id = None;
+                r.lease_expires_at_tick = 0;
+            }
         }
-
-        validate_advance(archive, &advance, &transition)?;
-        apply_transition(&mut archive.record, &transition);
-        archive.record.root = advance.candidate;
-        let receipt = WitnessReceipt {
-            record: archive.record.clone(),
-        };
-        archive.resolved.push_back(ResolvedOperation {
-            operation_id: advance.operation_id,
-            advance,
-            transition,
-            receipt: receipt.clone(),
-        });
-        if archive.resolved.len() > MAX_RESOLVED_OPERATIONS {
-            let _ = archive.resolved.pop_front();
-        }
-        Ok(receipt)
+        r.root = a.candidate;
+        Ok(WitnessReceipt { record: r.clone() })
     }
 }
-
 impl Default for InMemoryWitness {
     fn default() -> Self {
         Self::new()
     }
 }
-
+#[derive(Clone, Copy)]
+enum Normal {
+    Root,
+    Migration(MigrationState),
+    Rotation(KeyRegistryReference),
+    Epoch(DatabaseEpoch),
+}
 impl Witness for InMemoryWitness {
-    fn read_current(&self, archive_id: ArchiveId) -> Result<Option<WitnessRecord>> {
-        let state = self.lock()?;
-        ensure_available(&state)?;
-        Ok(state
-            .archives
-            .get(&archive_id)
-            .map(|entry| entry.record.clone()))
+    fn read_current(&self, id: ArchiveId) -> Result<Option<WitnessRecord>> {
+        let s = self.lock()?;
+        available(&s)?;
+        Ok(s.records.get(&id).cloned())
     }
-
-    fn recovery_root(&self, archive_id: ArchiveId) -> Result<RecoveryRoot> {
-        let state = self.lock()?;
-        ensure_available(&state)?;
-        let record = &state
-            .archives
-            .get(&archive_id)
-            .ok_or(WitnessError::MissingArchive)?
-            .record;
+    fn recovery_root(&self, id: ArchiveId) -> Result<RecoveryRoot> {
+        let s = self.lock()?;
+        available(&s)?;
+        let r = s.records.get(&id).ok_or(WitnessError::MissingArchive)?;
         Ok(RecoveryRoot {
-            root: record.root,
-            registry: record.registry,
-            migration: record.migration,
-            deletion: record.deletion,
+            root: r.root,
+            registry: r.registry,
+            predecessor: r.predecessor,
+            migration: r.migration,
+            deletion: r.deletion,
         })
     }
-
     fn acquire_lease(
         &self,
-        archive_id: ArchiveId,
-        database_epoch: DatabaseEpoch,
-        key_epoch: KeyEpoch,
+        id: ArchiveId,
+        db: DatabaseEpoch,
+        key: KeyEpoch,
         owner: ObjectId,
-        now_tick: u64,
-        duration_ticks: u64,
+        duration: u64,
     ) -> Result<WitnessLease> {
-        let expires_at_tick = checked_expiry(now_tick, duration_ticks)?;
         if !nonzero_id(owner.as_bytes()) {
             return Err(WitnessError::Malformed);
         }
-        let mut state = self.lock()?;
-        ensure_available(&state)?;
-        let archive = state
-            .archives
-            .get_mut(&archive_id)
-            .ok_or(WitnessError::MissingArchive)?;
-        if archive.record.database_epoch != database_epoch
-            || archive.record.registry.key_epoch != key_epoch
-        {
+        let mut s = self.lock()?;
+        available(&s)?;
+        let r = s.records.get_mut(&id).ok_or(WitnessError::MissingArchive)?;
+        let now = self.now(r)?;
+        let expiry = expiry(now, duration)?;
+        if r.deletion != DeletionState::Active {
+            return Err(WitnessError::InvalidTransition);
+        }
+        if r.database_epoch != db || r.registry.key_epoch != key {
             return Err(WitnessError::CompareFailed);
         }
-        if archive
-            .lease
-            .as_ref()
-            .is_some_and(|current| now_tick < current.lease.expires_at_tick)
-        {
+        if r.owner_id.is_some() && now < r.lease_expires_at_tick {
             return Err(WitnessError::Fenced);
         }
-        let fencing_epoch = archive.next_fencing_epoch;
-        archive.next_fencing_epoch = fencing_epoch
-            .checked_add(1)
-            .ok_or(WitnessError::Malformed)?;
-        let lease = WitnessLease {
-            archive_id,
-            database_epoch,
-            key_epoch,
+        let fence = r.next_fencing_epoch;
+        r.next_fencing_epoch = fence.checked_add(1).ok_or(WitnessError::Malformed)?;
+        r.current_fencing_epoch = fence;
+        r.owner_id = Some(owner);
+        r.lease_expires_at_tick = expiry;
+        Ok(WitnessLease {
+            archive_id: id,
+            database_epoch: db,
+            key_epoch: key,
             owner,
-            fencing_epoch,
-            expires_at_tick,
-        };
-        archive.lease = Some(LeaseState { lease });
-        Ok(lease)
+            fencing_epoch: fence,
+            expires_at_tick: expiry,
+        })
     }
-
-    fn renew_lease(
-        &self,
-        lease: WitnessLease,
-        now_tick: u64,
-        duration_ticks: u64,
-    ) -> Result<WitnessLease> {
-        let expires_at_tick = checked_expiry(now_tick, duration_ticks)?;
-        let mut state = self.lock()?;
-        ensure_available(&state)?;
-        let archive = state
-            .archives
-            .get_mut(&lease.archive_id)
+    fn renew_lease(&self, l: WitnessLease, duration: u64) -> Result<WitnessLease> {
+        let mut s = self.lock()?;
+        available(&s)?;
+        let r = s
+            .records
+            .get_mut(&l.archive_id)
             .ok_or(WitnessError::MissingArchive)?;
-        validate_live_lease(archive, lease, now_tick)?;
-        let renewed = WitnessLease {
-            expires_at_tick,
-            ..lease
-        };
-        archive.lease = Some(LeaseState { lease: renewed });
-        Ok(renewed)
+        let now = self.now(r)?;
+        lease_ok(r, l, now)?;
+        let e = expiry(now, duration)?;
+        if e <= r.lease_expires_at_tick {
+            return Err(WitnessError::InvalidTransition);
+        }
+        r.lease_expires_at_tick = e;
+        Ok(WitnessLease {
+            expires_at_tick: e,
+            ..l
+        })
     }
-
-    fn revoke_lease(&self, lease: WitnessLease, now_tick: u64) -> Result<()> {
-        let mut state = self.lock()?;
-        ensure_available(&state)?;
-        let archive = state
-            .archives
-            .get_mut(&lease.archive_id)
+    fn revoke_lease(&self, l: WitnessLease) -> Result<()> {
+        let mut s = self.lock()?;
+        available(&s)?;
+        let r = s
+            .records
+            .get_mut(&l.archive_id)
             .ok_or(WitnessError::MissingArchive)?;
-        validate_live_lease(archive, lease, now_tick)?;
-        archive.lease = None;
+        let now = self.now(r)?;
+        lease_ok(r, l, now)?;
+        r.owner_id = None;
+        r.lease_expires_at_tick = 0;
         Ok(())
     }
-
-    fn compare_and_advance_root(&self, advance: RootAdvance) -> Result<WitnessReceipt> {
-        self.apply(advance, Transition::Root)
+    fn compare_and_advance_root(&self, a: RootAdvance) -> Result<WitnessReceipt> {
+        self.normal(a, Normal::Root)
     }
-
-    fn advance_migration(
-        &self,
-        advance: RootAdvance,
-        next: MigrationState,
-    ) -> Result<WitnessReceipt> {
-        self.apply(advance, Transition::Migration(next))
+    fn advance_migration(&self, a: RootAdvance, x: MigrationState) -> Result<WitnessReceipt> {
+        self.normal(a, Normal::Migration(x))
     }
-
-    fn advance_deletion(
-        &self,
-        advance: RootAdvance,
-        next: DeletionState,
-    ) -> Result<WitnessReceipt> {
-        self.apply(advance, Transition::Deletion(next))
-    }
-
     fn rotate_key_registry(
         &self,
-        advance: RootAdvance,
-        next: KeyRegistryReference,
+        a: RootAdvance,
+        x: KeyRegistryReference,
     ) -> Result<WitnessReceipt> {
-        self.apply(advance, Transition::Rotation(next))
+        self.normal(a, Normal::Rotation(x))
     }
-
-    fn resolve_operation(
-        &self,
-        archive_id: ArchiveId,
-        operation_id: WitnessOperationId,
-    ) -> Result<Option<WitnessReceipt>> {
-        let state = self.lock()?;
-        ensure_available(&state)?;
-        Ok(state.archives.get(&archive_id).and_then(|archive| {
-            archive
-                .resolved
-                .iter()
-                .find(|item| item.operation_id == operation_id)
-                .map(|item| item.receipt.clone())
-        }))
+    fn cut_over_database_epoch(&self, a: RootAdvance, x: DatabaseEpoch) -> Result<WitnessReceipt> {
+        self.normal(a, Normal::Epoch(x))
+    }
+    fn tombstone(&self, a: RootAdvance, evidence: DeletionEvidence) -> Result<TombstoneReceipt> {
+        if !evidence.valid_for(DeletionState::Tombstoned) {
+            return Err(WitnessError::Malformed);
+        }
+        let mut s = self.lock()?;
+        available(&s)?;
+        let r = s
+            .records
+            .get_mut(&a.lease.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        let now = self.now(r)?;
+        normal_ok(r, &a, now, Normal::Root)?;
+        let df = r.next_fencing_epoch;
+        r.next_fencing_epoch = df.checked_add(1).ok_or(WitnessError::Malformed)?;
+        r.root = a.candidate;
+        r.deletion = DeletionState::Tombstoned;
+        r.migration = MigrationState::Deleting;
+        r.deletion_evidence = Some(evidence);
+        r.owner_id = None;
+        r.lease_expires_at_tick = 0;
+        r.deletion_fencing_epoch = Some(df);
+        Ok(TombstoneReceipt {
+            receipt: WitnessReceipt { record: r.clone() },
+            authorization: DeletionAuthorization {
+                archive_id: r.archive_id,
+                database_epoch: r.database_epoch,
+                fencing_epoch: df,
+            },
+        })
+    }
+    fn advance_deletion(&self, a: DeletionAdvance, next: DeletionState) -> Result<WitnessReceipt> {
+        let mut s = self.lock()?;
+        available(&s)?;
+        let r = s
+            .records
+            .get_mut(&a.authorization.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        let _ = self.now(r)?;
+        deletion_ok(r, &a, next)?;
+        r.root = a.candidate;
+        r.deletion = next;
+        r.deletion_evidence = Some(a.evidence);
+        if next == DeletionState::PhysicalComplete {
+            r.migration = MigrationState::Deleted;
+        }
+        Ok(WitnessReceipt { record: r.clone() })
     }
 }
-
-fn valid_bootstrap(bootstrap: &WitnessBootstrap) -> bool {
-    nonzero_id(bootstrap.archive_id.as_bytes())
-        && nonzero_id(bootstrap.database_epoch.as_bytes())
-        && bootstrap.genesis_root.sequence == 0
-        && bootstrap.genesis_root.valid()
-        && bootstrap.registry.valid_archive_registry()
-        && bootstrap.registry.key_epoch != KeyEpoch::from_bytes([0; 16])
-}
-
-fn validate_advance(
-    archive: &ArchiveState,
-    advance: &RootAdvance,
-    transition: &Transition,
-) -> Result<()> {
-    let record = &archive.record;
-    if !advance.expected_parent.valid()
-        || !advance.expected_registry.valid_archive_registry()
-        || !advance.candidate.valid()
-        || advance.lease.archive_id != record.archive_id
-        || advance.lease.database_epoch != record.database_epoch
-        || advance.candidate_database_epoch != record.database_epoch
-        || advance.expected_parent != record.root
-        || advance.expected_registry != record.registry
-        || advance.candidate.sequence
-            != record
+fn normal_ok(r: &WitnessRecord, a: &RootAdvance, now: u64, kind: Normal) -> Result<()> {
+    if r.deletion != DeletionState::Active {
+        return Err(WitnessError::InvalidTransition);
+    }
+    lease_ok(r, a.lease, now)?;
+    if a.expected_root != r.root
+        || a.expected_registry != r.registry
+        || !a.candidate.valid()
+        || a.candidate.parent != Some(r.root.root)
+        || a.candidate.root.sequence
+            != r.root
                 .root
                 .sequence
                 .checked_add(1)
                 .ok_or(WitnessError::Malformed)?
-        || advance.candidate.object_id == record.root.object_id
+        || a.candidate.root.object_id == r.root.root.object_id
+        || a.candidate.owner_fencing_epoch != a.lease.fencing_epoch
     {
         return Err(WitnessError::CompareFailed);
     }
-    validate_live_lease(archive, advance.lease, advance.now_tick)?;
-    match transition {
-        Transition::Root => {
-            if record.deletion != DeletionState::Active
-                || advance.lease.key_epoch != record.registry.key_epoch
-                || advance.candidate_key_epoch != record.registry.key_epoch
+    match kind {
+        Normal::Root => {
+            if a.candidate.database_epoch != r.database_epoch
+                || a.candidate.key_epoch != r.registry.key_epoch
             {
                 return Err(WitnessError::InvalidTransition);
             }
         }
-        Transition::Migration(next) => {
-            if record.deletion != DeletionState::Active
-                || record.migration.next() != Some(*next)
-                || advance.lease.key_epoch != record.registry.key_epoch
-                || advance.candidate_key_epoch != record.registry.key_epoch
+        Normal::Migration(x) => {
+            if !r.migration.permits(x)
+                || a.candidate.database_epoch != r.database_epoch
+                || a.candidate.key_epoch != r.registry.key_epoch
             {
                 return Err(WitnessError::InvalidTransition);
             }
         }
-        Transition::Deletion(next) => {
-            if record.deletion.next() != Some(*next)
-                || advance.lease.key_epoch != record.registry.key_epoch
-                || advance.candidate_key_epoch != record.registry.key_epoch
+        Normal::Rotation(x) => {
+            if !x.valid()
+                || x == r.registry
+                || x.key_epoch == r.registry.key_epoch
+                || a.candidate.database_epoch != r.database_epoch
+                || a.candidate.key_epoch != x.key_epoch
             {
                 return Err(WitnessError::InvalidTransition);
             }
         }
-        Transition::Rotation(next) => {
-            if record.deletion != DeletionState::Active
-                || !next.valid_archive_registry()
-                || next == &record.registry
-                || next.key_epoch == record.registry.key_epoch
-                || advance.lease.key_epoch != record.registry.key_epoch
-                || advance.candidate_key_epoch != next.key_epoch
-                || advance.candidate.sequence
-                    != record
-                        .root
-                        .sequence
-                        .checked_add(1)
-                        .ok_or(WitnessError::Malformed)?
+        Normal::Epoch(x) => {
+            if !nonzero_id(x.as_bytes())
+                || x == r.database_epoch
+                || a.candidate.database_epoch != x
+                || a.candidate.key_epoch != r.registry.key_epoch
             {
                 return Err(WitnessError::InvalidTransition);
             }
         }
-    }
+    };
     Ok(())
 }
-
-fn apply_transition(record: &mut WitnessRecord, transition: &Transition) {
-    match transition {
-        Transition::Root => {}
-        Transition::Migration(next) => record.migration = *next,
-        Transition::Deletion(next) => record.deletion = *next,
-        Transition::Rotation(next) => record.registry = *next,
-    }
-}
-
-fn validate_live_lease(archive: &ArchiveState, lease: WitnessLease, now_tick: u64) -> Result<()> {
-    let current = archive.lease.as_ref().ok_or(WitnessError::Fenced)?.lease;
-    if current != lease
-        || now_tick >= current.expires_at_tick
-        || lease.database_epoch != archive.record.database_epoch
-        || lease.key_epoch != archive.record.registry.key_epoch
+fn deletion_ok(r: &WitnessRecord, a: &DeletionAdvance, next: DeletionState) -> Result<()> {
+    if r.deletion.next() != Some(next)
+        || !a.evidence.valid_for(next)
+        || a.authorization.archive_id != r.archive_id
+        || a.authorization.database_epoch != r.database_epoch
+        || Some(a.authorization.fencing_epoch) != r.deletion_fencing_epoch
+        || a.expected_root != r.root
+        || a.expected_registry != r.registry
+        || !a.candidate.valid()
+        || a.candidate.parent != Some(r.root.root)
+        || a.candidate.root.sequence
+            != r.root
+                .root
+                .sequence
+                .checked_add(1)
+                .ok_or(WitnessError::Malformed)?
+        || a.candidate.database_epoch != r.database_epoch
+        || a.candidate.key_epoch != r.registry.key_epoch
+        || a.candidate.owner_fencing_epoch != a.authorization.fencing_epoch
     {
-        return Err(WitnessError::Fenced);
+        return Err(WitnessError::CompareFailed);
     }
     Ok(())
 }
-
-fn checked_expiry(now_tick: u64, duration_ticks: u64) -> Result<u64> {
-    if !(1..=MAX_LEASE_TICKS).contains(&duration_ticks) {
+fn lease_ok(r: &WitnessRecord, l: WitnessLease, now: u64) -> Result<()> {
+    if r.deletion != DeletionState::Active
+        || r.owner_id != Some(l.owner)
+        || r.current_fencing_epoch != l.fencing_epoch
+        || r.lease_expires_at_tick != l.expires_at_tick
+        || now >= l.expires_at_tick
+        || l.database_epoch != r.database_epoch
+        || l.key_epoch != r.registry.key_epoch
+    {
+        Err(WitnessError::Fenced)
+    } else {
+        Ok(())
+    }
+}
+fn expiry(now: u64, duration: u64) -> Result<u64> {
+    if !(1..=MAX_LEASE_TICKS).contains(&duration) {
         return Err(WitnessError::Malformed);
     }
-    now_tick
-        .checked_add(duration_ticks)
-        .ok_or(WitnessError::Malformed)
+    now.checked_add(duration).ok_or(WitnessError::Malformed)
 }
-
-fn ensure_available(state: &InMemoryState) -> Result<()> {
-    state
-        .available
-        .then_some(())
-        .ok_or(WitnessError::Unavailable)
+fn available(s: &State) -> Result<()> {
+    s.available.then_some(()).ok_or(WitnessError::Unavailable)
 }
-
-fn nonzero_id(value: &[u8; 16]) -> bool {
-    value.iter().any(|byte| *byte != 0)
+fn nonzero_id(v: &[u8; 16]) -> bool {
+    v.iter().any(|x| *x != 0)
 }
-
-fn nonzero_hash(value: &[u8; 32]) -> bool {
-    value.iter().any(|byte| *byte != 0)
+fn nonzero_hash(v: &[u8; 32]) -> bool {
+    v.iter().any(|x| *x != 0)
 }
-
-fn put<const N: usize>(out: &mut [u8; N], offset: &mut usize, value: &[u8]) {
-    let end = *offset + value.len();
-    out[*offset..end].copy_from_slice(value);
-    *offset = end;
+fn boolean(v: u8) -> Result<bool> {
+    match v {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(WitnessError::Corrupt),
+    }
 }
-
-fn take<'a>(input: &'a [u8], offset: &mut usize, length: usize) -> Result<&'a [u8]> {
-    let end = offset.checked_add(length).ok_or(WitnessError::Corrupt)?;
-    let value = input.get(*offset..end).ok_or(WitnessError::Corrupt)?;
-    *offset = end;
-    Ok(value)
+fn key_kind(v: u8) -> Result<KeyKind> {
+    match v {
+        1 => Ok(KeyKind::Archive),
+        2 => Ok(KeyKind::Media),
+        _ => Err(WitnessError::Corrupt),
+    }
 }
-
-fn take_array<const N: usize>(input: &[u8]) -> Result<[u8; N]> {
-    input.try_into().map_err(|_| WitnessError::Corrupt)
+fn zero_root() -> RootReference {
+    RootReference::new(0, ObjectId::from_bytes([0; 16]), [0; 32])
+}
+fn root_put<const N: usize>(out: &mut [u8; N], p: &mut usize, r: RootReference) {
+    put(out, p, &r.sequence.to_be_bytes());
+    put(out, p, r.object_id.as_bytes());
+    put(out, p, &r.ciphertext_hash);
+}
+fn root_take(input: &[u8], p: &mut usize) -> Result<RootReference> {
+    Ok(RootReference::new(
+        u64::from_be_bytes(array(take(input, p, 8)?)?),
+        ObjectId::from_bytes(array(take(input, p, 16)?)?),
+        array(take(input, p, 32)?)?,
+    ))
+}
+fn put<const N: usize>(out: &mut [u8; N], p: &mut usize, v: &[u8]) {
+    let end = *p + v.len();
+    out[*p..end].copy_from_slice(v);
+    *p = end;
+}
+fn take<'a>(v: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8]> {
+    let end = p.checked_add(n).ok_or(WitnessError::Corrupt)?;
+    let r = v.get(*p..end).ok_or(WitnessError::Corrupt)?;
+    *p = end;
+    Ok(r)
+}
+fn array<const N: usize>(v: &[u8]) -> Result<[u8; N]> {
+    v.try_into().map_err(|_| WitnessError::Corrupt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn id(byte: u8) -> [u8; 16] {
-        [byte; 16]
-    }
-
-    fn hash(byte: u8) -> [u8; 32] {
-        [byte; 32]
-    }
-
-    fn bootstrap() -> WitnessBootstrap {
-        WitnessBootstrap {
-            archive_id: ArchiveId::from_bytes(id(1)),
-            database_epoch: DatabaseEpoch::from_bytes(id(2)),
-            genesis_root: RootReference {
-                sequence: 0,
-                object_id: ObjectId::from_bytes(id(3)),
-                ciphertext_hash: hash(4),
-            },
-            registry: KeyRegistryReference {
-                key_kind: KeyKind::Archive,
-                key_epoch: KeyEpoch::from_bytes(id(5)),
-                object_id: ObjectId::from_bytes(id(6)),
-                ciphertext_hash: hash(7),
-            },
+    struct FakeClock(Mutex<u64>);
+    impl FakeClock {
+        fn new(v: u64) -> Self {
+            Self(Mutex::new(v))
+        }
+        fn set(&self, v: u64) {
+            *self.0.lock().expect("test clock") = v;
         }
     }
-
-    fn setup() -> (InMemoryWitness, WitnessRecord, WitnessLease) {
-        let witness = InMemoryWitness::new();
-        let record = witness.bootstrap(bootstrap()).unwrap();
-        let lease = witness
+    impl TrustedClock for FakeClock {
+        fn now_tick(&self) -> Result<u64> {
+            Ok(*self.0.lock().map_err(|_| WitnessError::Synchronization)?)
+        }
+    }
+    fn id(v: u8) -> [u8; 16] {
+        [v; 16]
+    }
+    fn hash(v: u8) -> [u8; 32] {
+        [v; 32]
+    }
+    fn boot() -> WitnessBootstrap {
+        let db = DatabaseEpoch::from_bytes(id(2));
+        let key = KeyEpoch::from_bytes(id(5));
+        WitnessBootstrap::new(
+            ArchiveId::from_bytes(id(1)),
+            db,
+            RootCommitment::genesis(
+                db,
+                key,
+                RootReference::new(0, ObjectId::from_bytes(id(3)), hash(4)),
+            ),
+            KeyRegistryReference::new(key, ObjectId::from_bytes(id(6)), hash(7)),
+        )
+    }
+    fn setup() -> (InMemoryWitness, Arc<FakeClock>, WitnessRecord, WitnessLease) {
+        let c = Arc::new(FakeClock::new(10));
+        let w = InMemoryWitness::with_clock(c.clone());
+        let r = w.bootstrap(boot()).unwrap();
+        let l = w
             .acquire_lease(
-                record.archive_id,
-                record.database_epoch,
-                record.registry.key_epoch,
+                r.archive_id,
+                r.database_epoch,
+                r.registry.key_epoch,
                 ObjectId::from_bytes(id(8)),
-                10,
                 20,
             )
             .unwrap();
-        (witness, record, lease)
+        (w, c, r, l)
     }
-
-    fn advance(record: &WitnessRecord, lease: WitnessLease, operation: u8) -> RootAdvance {
-        RootAdvance {
-            operation_id: WitnessOperationId::from_bytes(id(operation)),
-            lease,
-            now_tick: 11,
-            expected_parent: record.root,
-            expected_registry: record.registry,
-            candidate_database_epoch: record.database_epoch,
-            candidate_key_epoch: record.registry.key_epoch,
-            candidate: RootReference {
-                sequence: record.root.sequence + 1,
-                object_id: ObjectId::from_bytes(id(operation.wrapping_add(20))),
-                ciphertext_hash: hash(operation.wrapping_add(30)),
-            },
+    fn cand(r: &WitnessRecord, fence: u64, v: u8) -> RootCommitment {
+        RootCommitment::candidate(
+            r.database_epoch,
+            r.registry.key_epoch,
+            fence,
+            r.root.root,
+            RootReference::new(
+                r.root.root.sequence + 1,
+                ObjectId::from_bytes(id(v)),
+                hash(v.wrapping_add(40)),
+            ),
+        )
+    }
+    fn adv(r: &WitnessRecord, l: WitnessLease, v: u8) -> RootAdvance {
+        RootAdvance::new(l, r.root, r.registry, cand(r, l.fencing_epoch, v))
+    }
+    fn del(
+        r: &WitnessRecord,
+        a: DeletionAuthorization,
+        v: u8,
+        k: DeletionEvidenceKind,
+    ) -> DeletionAdvance {
+        DeletionAdvance {
+            authorization: a,
+            expected_root: r.root,
+            expected_registry: r.registry,
+            candidate: cand(r, a.fencing_epoch, v),
+            evidence: DeletionEvidence::new(k, hash(v)),
         }
     }
-
     #[test]
-    fn recovery_returns_only_the_exact_witness_nominated_root() {
-        let (witness, record, lease) = setup();
-        let committed = witness
-            .compare_and_advance_root(advance(&record, lease, 9))
-            .unwrap();
-        let recovery = witness.recovery_root(record.archive_id).unwrap();
-        assert_eq!(recovery.root, committed.record.root);
-        assert_eq!(recovery.registry, committed.record.registry);
-    }
-
-    #[test]
-    fn stale_fence_and_expired_lease_cannot_advance() {
-        let (witness, record, stale) = setup();
-        let fresh = witness
+    fn durable_codec_round_trip_and_restart_never_reuses_fence() {
+        let (w, c, r, first) = setup();
+        let bytes = w.snapshots();
+        let decoded = WitnessRecord::decode(&bytes[0]).unwrap();
+        assert_eq!(decoded.encode(), bytes[0]);
+        c.set(31);
+        let restarted = InMemoryWitness::from_records(c.clone(), bytes).unwrap();
+        let next = restarted
             .acquire_lease(
-                record.archive_id,
-                record.database_epoch,
-                record.registry.key_epoch,
-                ObjectId::from_bytes(id(10)),
-                31,
+                r.archive_id,
+                r.database_epoch,
+                r.registry.key_epoch,
+                ObjectId::from_bytes(id(9)),
                 20,
             )
             .unwrap();
-        assert_eq!(
-            witness.compare_and_advance_root(advance(&record, stale, 11)),
-            Err(WitnessError::Fenced)
-        );
-        assert!(witness
-            .compare_and_advance_root(advance(&record, fresh, 12))
-            .is_ok());
+        assert!(next.fencing_epoch > first.fencing_epoch);
     }
-
     #[test]
-    fn renewal_requires_the_exact_fence_and_revoke_blocks_the_old_lease() {
-        let (witness, record, lease) = setup();
-        let renewed = witness.renew_lease(lease, 11, 20).unwrap();
+    fn trusted_clock_rejects_regression_and_expiry() {
+        let (w, c, r, l) = setup();
+        c.set(9);
+        assert_eq!(w.renew_lease(l, 20), Err(WitnessError::Clock));
+        c.set(30);
         assert_eq!(
-            witness.renew_lease(lease, 12, 20),
-            Err(WitnessError::Fenced)
-        );
-        witness.revoke_lease(renewed, 12).unwrap();
-        assert_eq!(
-            witness.compare_and_advance_root(advance(&record, renewed, 13)),
+            w.compare_and_advance_root(adv(&r, l, 9)),
             Err(WitnessError::Fenced)
         );
     }
-
     #[test]
-    fn compare_and_advance_rejects_cas_races_and_wrong_candidates() {
-        let (witness, record, lease) = setup();
-        let first = advance(&record, lease, 9);
-        let second = advance(&record, lease, 10);
-        witness.compare_and_advance_root(first).unwrap();
+    fn candidate_binds_parent_epochs_and_fence() {
+        let (w, _, r, l) = setup();
+        let mut a = adv(&r, l, 9);
+        a.candidate.owner_fencing_epoch += 1;
         assert_eq!(
-            witness.compare_and_advance_root(second),
+            w.compare_and_advance_root(a),
             Err(WitnessError::CompareFailed)
         );
-
-        let (witness, record, lease) = setup();
-        let mut wrong = advance(&record, lease, 11);
-        wrong.candidate.sequence += 1;
+        let mut a = adv(&r, l, 10);
+        a.candidate.key_epoch = KeyEpoch::from_bytes(id(99));
         assert_eq!(
-            witness.compare_and_advance_root(wrong),
-            Err(WitnessError::CompareFailed)
-        );
-        let mut wrong_epoch = advance(&record, lease, 12);
-        wrong_epoch.candidate_database_epoch = DatabaseEpoch::from_bytes(id(99));
-        assert_eq!(
-            witness.compare_and_advance_root(wrong_epoch),
-            Err(WitnessError::CompareFailed)
-        );
-    }
-
-    #[test]
-    fn lost_success_is_resolved_only_for_the_same_operation_contents() {
-        let (witness, record, lease) = setup();
-        let request = advance(&record, lease, 9);
-        let first = witness.compare_and_advance_root(request.clone()).unwrap();
-        let retried = witness.compare_and_advance_root(request.clone()).unwrap();
-        assert_eq!(first, retried);
-        assert_eq!(
-            witness
-                .resolve_operation(record.archive_id, request.operation_id)
-                .unwrap(),
-            Some(first.clone())
-        );
-        let mut changed = request;
-        changed.candidate.ciphertext_hash = hash(99);
-        assert_eq!(
-            witness.compare_and_advance_root(changed),
-            Err(WitnessError::OperationMismatch)
-        );
-    }
-
-    #[test]
-    fn key_registry_rotation_requires_the_exact_old_registry_and_new_epoch() {
-        let (witness, record, lease) = setup();
-        let mut request = advance(&record, lease, 9);
-        let next = KeyRegistryReference {
-            key_kind: KeyKind::Archive,
-            key_epoch: KeyEpoch::from_bytes(id(11)),
-            object_id: ObjectId::from_bytes(id(12)),
-            ciphertext_hash: hash(13),
-        };
-        request.candidate_key_epoch = next.key_epoch;
-        assert!(witness.rotate_key_registry(request.clone(), next).is_ok());
-
-        let (witness, record, lease) = setup();
-        request.expected_registry.object_id = ObjectId::from_bytes(id(99));
-        assert_eq!(
-            witness.rotate_key_registry(request, next),
-            Err(WitnessError::CompareFailed)
-        );
-        let same_epoch = KeyRegistryReference {
-            key_epoch: record.registry.key_epoch,
-            ..next
-        };
-        let mut same_epoch_request = advance(&record, lease, 10);
-        same_epoch_request.candidate_key_epoch = same_epoch.key_epoch;
-        assert_eq!(
-            witness.rotate_key_registry(same_epoch_request, same_epoch),
+            w.compare_and_advance_root(a),
             Err(WitnessError::InvalidTransition)
         );
     }
-
     #[test]
-    fn migration_and_deletion_are_forward_only_and_tombstone_blocks_writes() {
-        let (witness, record, lease) = setup();
-        let shadow = witness
-            .advance_migration(advance(&record, lease, 9), MigrationState::Shadow)
-            .unwrap();
-        let tombstoned = witness
-            .advance_deletion(
-                advance(shadow.record(), lease, 10),
-                DeletionState::Tombstoned,
+    fn lost_success_reads_exact_current_candidate() {
+        let (w, _, r, l) = setup();
+        let a = adv(&r, l, 9);
+        let receipt = w.compare_and_advance_root(a.clone()).unwrap();
+        assert_eq!(
+            w.read_current(r.archive_id).unwrap().unwrap().root,
+            a.candidate
+        );
+        assert_eq!(receipt.record.root, a.candidate);
+    }
+    #[test]
+    fn tombstone_fences_owner_and_requires_evidence() {
+        let (w, _, r, l) = setup();
+        let t = w
+            .tombstone(
+                adv(&r, l, 9),
+                DeletionEvidence::new(DeletionEvidenceKind::Tombstone, hash(10)),
             )
             .unwrap();
-        assert_eq!(tombstoned.record.deletion, DeletionState::Tombstoned);
+        let x = t.receipt.record;
         assert_eq!(
-            witness.compare_and_advance_root(advance(tombstoned.record(), lease, 11)),
-            Err(WitnessError::InvalidTransition)
-        );
-        assert_eq!(
-            witness.advance_migration(
-                advance(tombstoned.record(), lease, 12),
-                MigrationState::WalAuthoritative,
+            w.acquire_lease(
+                x.archive_id,
+                x.database_epoch,
+                x.registry.key_epoch,
+                ObjectId::from_bytes(id(9)),
+                1
             ),
             Err(WitnessError::InvalidTransition)
         );
-    }
-
-    #[test]
-    fn fixed_record_decoder_rejects_tamper_truncation_and_invalid_registry_kind() {
-        let (_, record, _) = setup();
-        let encoded = record.encode();
-        assert_eq!(WitnessRecord::decode(&encoded).unwrap(), record);
+        assert_eq!(w.renew_lease(l, 1), Err(WitnessError::Fenced));
         assert_eq!(
-            WitnessRecord::decode(&encoded[..WITNESS_RECORD_BYTES - 1]),
-            Err(WitnessError::Corrupt)
-        );
-        let mut tampered = encoded;
-        tampered[0] ^= 1;
-        assert_eq!(WitnessRecord::decode(&tampered), Err(WitnessError::Corrupt));
-        let mut media_registry = encoded;
-        media_registry[97] = KeyKind::Media as u8;
-        assert_eq!(
-            WitnessRecord::decode(&media_registry),
-            Err(WitnessError::Corrupt)
+            w.advance_deletion(
+                del(&x, t.authorization, 10, DeletionEvidenceKind::Inventory),
+                DeletionState::CryptographicallyErased
+            ),
+            Err(WitnessError::CompareFailed)
         );
     }
-
     #[test]
-    fn unavailable_witness_fails_closed_and_debug_is_content_free() {
-        let (witness, record, lease) = setup();
-        witness.set_available_for_test(false);
+    fn deletion_evidence_direct_extent_and_epoch_cutover() {
+        let (w, _, r, l) = setup();
+        let s = w
+            .advance_migration(adv(&r, l, 9), MigrationState::ShadowExtents)
+            .unwrap();
+        let e = w
+            .advance_migration(adv(s.record(), l, 10), MigrationState::ExtentAuthoritative)
+            .unwrap();
+        let retired = w
+            .advance_migration(adv(e.record(), l, 11), MigrationState::LegacyRetired)
+            .unwrap();
+        let mut a = adv(retired.record(), l, 12);
+        let db = DatabaseEpoch::from_bytes(id(44));
+        a.candidate.database_epoch = db;
+        let cut = w.cut_over_database_epoch(a, db).unwrap();
         assert_eq!(
-            witness.read_current(record.archive_id),
+            cut.record.predecessor.unwrap().database_epoch,
+            r.database_epoch
+        );
+        let cutover_lease = w
+            .acquire_lease(
+                cut.record.archive_id,
+                cut.record.database_epoch,
+                cut.record.registry.key_epoch,
+                ObjectId::from_bytes(id(8)),
+                20,
+            )
+            .unwrap();
+        let t = w
+            .tombstone(
+                adv(cut.record(), cutover_lease, 13),
+                DeletionEvidence::new(DeletionEvidenceKind::Tombstone, hash(1)),
+            )
+            .unwrap();
+        let er = w
+            .advance_deletion(
+                del(
+                    t.receipt.record(),
+                    t.authorization,
+                    14,
+                    DeletionEvidenceKind::KeyErasure,
+                ),
+                DeletionState::CryptographicallyErased,
+            )
+            .unwrap();
+        let absent = w
+            .advance_deletion(
+                del(
+                    er.record(),
+                    t.authorization,
+                    15,
+                    DeletionEvidenceKind::Inventory,
+                ),
+                DeletionState::LogicalObjectsAbsent,
+            )
+            .unwrap();
+        let complete = w
+            .advance_deletion(
+                del(
+                    absent.record(),
+                    t.authorization,
+                    16,
+                    DeletionEvidenceKind::Retention,
+                ),
+                DeletionState::PhysicalComplete,
+            )
+            .unwrap();
+        assert_eq!(complete.record.migration, MigrationState::Deleted);
+    }
+    #[test]
+    fn unavailable_and_debug_are_content_free() {
+        let (w, _, r, l) = setup();
+        w.unavailable();
+        assert_eq!(w.read_current(r.archive_id), Err(WitnessError::Unavailable));
+        assert_eq!(
+            w.compare_and_advance_root(adv(&r, l, 9)),
             Err(WitnessError::Unavailable)
         );
-        assert_eq!(
-            witness.compare_and_advance_root(advance(&record, lease, 9)),
-            Err(WitnessError::Unavailable)
-        );
-        let debug = format!(
-            "{record:?} {lease:?} {:?}",
-            WitnessOperationId::from_bytes([0xaa; 16])
-        );
-        assert!(!debug.contains("aa"));
-        assert!(!debug.contains("01"));
+        assert!(!format!("{r:?} {l:?}").contains("01"));
     }
 }

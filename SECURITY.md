@@ -173,8 +173,14 @@ SQLite VFS, GCS, witness, route, migration,
 export, or deletion wiring. The legacy context-bound v2 database blob remains the sole
 production authority. `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract: fixed-size records nominate one exact root
-and archive-key-registry object/hash; fenced compare-and-advance, migration/deletion, and
-key-rotation transitions are linearizable in the test model. It has no GCS/Firestore
+and archive-key-registry object/hash, including the root parent/database/key/fence
+commitment and the durable owner, current/next fencing epoch, server-derived lease expiry,
+and deletion-evidence commitment needed after restart. Its trusted-clock API never accepts
+caller-selected time; tombstoning invalidates normal ownership and later deletion states
+require opaque key-erasure, inventory, and retention commitments. Fenced compare-and-
+advance, direct large-archive extent shadowing, database-epoch predecessor retention,
+migration/deletion, and key-rotation transitions are linearizable only in the test model.
+It has no GCS/Firestore
 client, Store/VFS/route connection, or production authority. Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
 acknowledge a write from archive-v3 until ADR-0022
