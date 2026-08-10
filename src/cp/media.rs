@@ -790,6 +790,13 @@ async fn upload_capture_event(
         .media
         .as_ref()
         .map(|media| format!("raw/{user_id}/{}.enc", media.asset_id));
+    // Keep admission alive through the GCS object and durable SQLite record.
+    // DELETE /api/account closes this barrier before it inventories media, so
+    // an already-authorized capture cannot recreate an object afterward.
+    let _content_write = match state.store.acquire_content_write(&user_id).await {
+        Ok(lease) => lease,
+        Err(error) => return error.into_response(),
+    };
     let preflight = state
         .store
         .with_user(&user_id, |conn| {
@@ -843,13 +850,22 @@ async fn upload_capture_event(
                         .into_response();
                 }
             };
-        match state
-            .store
-            .put_media(object_key, &encrypted, &wrapped_dek)
-            .await
-        {
-            Ok(generation) => media_generation = Some(generation),
-            Err(put_error) => {
+        // The child keeps the provider PUT alive if the HTTP future is
+        // cancelled. Deletion waits for that child lease and therefore scans
+        // only after the provider has definitively accepted or rejected it.
+        let put_lease = _content_write.child();
+        let put_store = Arc::clone(&state.store);
+        let put_object_key = object_key.to_string();
+        let put_wrapped_dek = wrapped_dek.clone();
+        let put = tokio::spawn(async move {
+            let _put_lease = put_lease;
+            put_store
+                .put_media(&put_object_key, &encrypted, &put_wrapped_dek)
+                .await
+        });
+        match put.await {
+            Ok(Ok(generation)) => media_generation = Some(generation),
+            Ok(Err(put_error)) => {
                 if let Err(error) =
                     verify_existing_media(&state, &user_id, object_key, &media_context, media_bytes)
                         .await
@@ -866,6 +882,10 @@ async fn upload_capture_event(
                             .into_response();
                     }
                 };
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "capture media storage task failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
             }
         }
     }

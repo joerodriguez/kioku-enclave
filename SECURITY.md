@@ -201,6 +201,10 @@ destination-create preconditions, retries incomplete passes with bounded backoff
 reports only aggregate counts/readiness, including the public health readiness field.
 Readiness remains false until one error-free scan finishes; this worker does not enable
 lifecycle policy or change archive authority.
+Checkpoint copy/verification holds the same per-user content-write admission lease as raw
+capture. Account deletion first closes that lease, waits every admitted raw PUT and
+checkpoint copy to reach a provider outcome, and only then inventories remote objects; a
+checkpoint cannot appear after deletion's recovery-prefix scan.
 If GCS committed that PUT but its response was lost or the caller was cancelled, the retry's
 generation conflict is accepted only after the current object carries the exact same wrapped
 DEK metadata and decrypts under that DEK/context to the exact pending SQLite image. A different
@@ -230,17 +234,20 @@ users. Open-handle loading reservations count against `STORE_MAX_OPEN`; successf
 eviction flushes before dropping the handle, while a failed flush retains the exact live
 connection and temp files and fails the requesting cache miss.
 
-Deletion installs the process-local user fence before waiting for in-flight same-user
-work. It snapshots a sorted, deduplicated media-key inventory, releases the SQLite slot,
-and then performs remote deletes; failure retains the inventory for an idempotent retry
-without starving `STORE_MAX_OPEN`. The inventory is held through a shared immutable
-buffer to avoid retry copies, but it is intentionally not truncated because truncation
-would make deletion incomplete. Its memory remains proportional to the number of legacy
-media references.
+Deletion first closes a per-user content-write admission barrier, then waits for every
+already-admitted raw-media PUT (including a request-cancellation-safe owned PUT task) and
+checkpoint copy to settle before installing its actor fence and scanning remote objects.
+It force-flushes a dirty local SQLite image before any remote delete, so the authoritative
+encrypted database durably contains every media reference used by a restart retry. A failed
+flush retains the handle and leaves deletion pending; it never drops an unsaved inventory.
+After that durable point deletion can release the SQLite slot during slow remote deletes:
+the still-retained remote database reconstructs the exact sorted, deduplicated inventory
+on every retry without storing object names in the control database.
 
-This is containment, not the later ADR-0022 content-addressed deletion ledger. The fence,
-exact media-key inventory, and recent-eviction completion markers remain process-local.
-The encrypted control database does persist a content-free deletion operation: an opaque
+This is containment, not the later ADR-0022 content-addressed deletion ledger. The actor
+fence and recent-eviction completion markers remain process-local, but deletion inventory
+does not: it is recovered from the durable encrypted user database. The encrypted control
+database persists only a content-free deletion operation: an opaque
 random operation ID, `pending`/`failed_retryable`/`physical_complete` status,
 machine-readable reason, retry delay, and provider `hardDeleteTime` when GCS reports one.
 `DELETE /api/account` returns HTTP 202 until physical completion, and the same tombstoned
@@ -261,10 +268,9 @@ explicit inventory remediation/migration is required. Other KMS, GCS, or
 decrypt/inventory failures remain separately pending and retryable and must not be
 mistaken for the irreversible missing-generation gap.
 
-The remote database is otherwise retained until deletion succeeds, so saved references
-can be rediscovered after restart. Media keys present only in an unsaved local database
-are not crash-safe across a failed deletion until a durable encrypted content ledger
-exists. If all configured handle slots are actively loading/evicting, a new cold user
+The remote database is retained until deletion succeeds, so media references can be
+rediscovered after restart, including references that were local-only when deletion began
+because deletion force-flushes them before remote work. If all configured handle slots are actively loading/evicting, a new cold user
 waits for a slot; and a corrupt database that cannot enumerate deletion media must remain
 fenced and retained rather than discard an unknown inventory. These cases do not
 reintroduce a registry lock across remote I/O, but they remain capacity/repair limits.

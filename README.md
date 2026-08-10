@@ -264,7 +264,9 @@ cargo fmt --all -- --check
 Before legacy noncurrent-generation lifecycle rules may be promoted, startup also runs a
 bounded serial reconciliation of pre-existing `indexes/*.db.enc` objects. It lists only
 current GCS objects, then resolves each name through an explicit live-object read,
-and create-verifies the current UTC day's generation-pinned recovery checkpoint. A retry
+and create-verifies the current UTC day's generation-pinned recovery checkpoint. Checkpoint
+copy shares the per-user content-write barrier with raw capture, so account deletion closes
+new admission and waits for any admitted copy or raw PUT to settle before inventory. A retry
 after a lost copy response or restart converges on the immutable named checkpoint; no user,
 archive, object, or generation identifier is logged. Aggregate readiness remains false
 until a complete error-free scan, and the runtime never activates bucket lifecycle itself.
