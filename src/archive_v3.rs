@@ -38,7 +38,9 @@ const ROOT_MAGIC: &[u8; 8] = b"KARRv3\0\0";
 const KEY_REGISTRY_MAGIC: &[u8; 16] = b"KIOKU-KEYREG-v3\0";
 const KEY_REGISTRY_DOMAIN: &[u8] = b"kioku:archive:v3:kms-wrap\0";
 const GCM_TAG_BYTES: usize = 16;
-const FIXED_GCM_NONCE: [u8; 12] = [0; 12];
+const GCM_NONCE_BYTES: usize = 12;
+const ENVELOPE_HEADER_BYTES: usize =
+    ENVELOPE_MAGIC.len() + 1 + GCM_NONCE_BYTES + std::mem::size_of::<u32>();
 
 /// The format's fixed maximum encrypted payload, excluding envelope framing.
 pub const MAX_CIPHERTEXT_BYTES: usize = 1_048_576 + GCM_TAG_BYTES;
@@ -601,25 +603,28 @@ impl VerifiedRegistryDek {
     }
 }
 
-/// Versioned ciphertext envelope.  The fixed AES-GCM nonce is safe only
-/// because a fresh per-object HKDF key is derived from a unique object context.
+/// Versioned ciphertext envelope. The random nonce is carried in the envelope
+/// so a repeated object context remains cryptographically safe even if a
+/// restarted writer reaches immutable storage before the duplicate is rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiphertextEnvelope {
+    nonce: [u8; GCM_NONCE_BYTES],
     ciphertext: Vec<u8>,
 }
 
 impl CiphertextEnvelope {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(13 + self.ciphertext.len());
+        let mut out = Vec::with_capacity(ENVELOPE_HEADER_BYTES + self.ciphertext.len());
         out.extend_from_slice(ENVELOPE_MAGIC);
         out.push(ARCHIVE_FORMAT_VERSION);
+        out.extend_from_slice(&self.nonce);
         push_u32(&mut out, self.ciphertext.len() as u32);
         out.extend_from_slice(&self.ciphertext);
         out
     }
 
     pub fn decode(input: &[u8]) -> Result<Self> {
-        if input.len() < 13 {
+        if input.len() < ENVELOPE_HEADER_BYTES {
             return Err(ArchiveV3Error::Malformed("envelope truncated"));
         }
         if &input[..8] != ENVELOPE_MAGIC {
@@ -628,18 +633,23 @@ impl CiphertextEnvelope {
         if input[8] != ARCHIVE_FORMAT_VERSION {
             return Err(ArchiveV3Error::Malformed("envelope version"));
         }
-        let length = read_u32(&input[9..13])? as usize;
+        let mut nonce = [0u8; GCM_NONCE_BYTES];
+        nonce.copy_from_slice(&input[9..9 + GCM_NONCE_BYTES]);
+        let length_offset = 9 + GCM_NONCE_BYTES;
+        let payload_offset = length_offset + std::mem::size_of::<u32>();
+        let length = read_u32(&input[length_offset..payload_offset])? as usize;
         if length > MAX_CIPHERTEXT_BYTES {
             return Err(ArchiveV3Error::TooLarge("ciphertext"));
         }
         if length < GCM_TAG_BYTES {
             return Err(ArchiveV3Error::Malformed("ciphertext tag"));
         }
-        if input.len() != 13 + length {
+        if input.len() != payload_offset + length {
             return Err(ArchiveV3Error::Malformed("envelope length"));
         }
         Ok(Self {
-            ciphertext: input[13..].to_vec(),
+            nonce,
+            ciphertext: input[payload_offset..].to_vec(),
         })
     }
 
@@ -668,9 +678,9 @@ impl ArchiveDek {
     }
 }
 
-/// Seals every context at most once per process instance.  This catches local
-/// accidental fixed-nonce reuse; cross-process ID collisions are rejected by
-/// the immutable backend's different-ciphertext conflict.
+/// Seals every context at most once per process instance. This remains a local
+/// logical-misuse guard; nonce uniqueness does not depend on process memory or
+/// on the immutable backend rejecting a ciphertext after it has received it.
 pub struct ArchiveCipher {
     dek: ArchiveDek,
     sealed_contexts: Mutex<HashSet<[u8; 32]>>,
@@ -712,16 +722,18 @@ impl ArchiveCipher {
         let key = derive_object_key(&self.dek, &aad)?;
         let cipher =
             Aes256Gcm::new_from_slice(&key[..]).map_err(|_| ArchiveV3Error::Authentication)?;
+        let mut nonce = [0u8; GCM_NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
         let ciphertext = cipher
             .encrypt(
-                (&FIXED_GCM_NONCE).into(),
+                (&nonce).into(),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
                 },
             )
             .map_err(|_| ArchiveV3Error::Authentication)?;
-        Ok(CiphertextEnvelope { ciphertext })
+        Ok(CiphertextEnvelope { nonce, ciphertext })
     }
 
     pub fn open(&self, context: &ObjectContext, envelope: &CiphertextEnvelope) -> Result<Vec<u8>> {
@@ -737,7 +749,7 @@ impl ArchiveCipher {
             Aes256Gcm::new_from_slice(&key[..]).map_err(|_| ArchiveV3Error::Authentication)?;
         cipher
             .decrypt(
-                (&FIXED_GCM_NONCE).into(),
+                (&envelope.nonce).into(),
                 Payload {
                     msg: &envelope.ciphertext,
                     aad: &aad,
@@ -1576,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn object_context_cannot_be_sealed_twice_with_a_fixed_nonce() {
+    fn object_context_cannot_be_sealed_twice_in_one_process() {
         let context = extent_context(4);
         let archive_cipher = cipher();
         archive_cipher.seal(&context, &extent_payload(1)).unwrap();
@@ -1587,6 +1599,37 @@ mod tests {
         assert_eq!(
             cipher().seal(&extent_context(5), b"too short"),
             Err(ArchiveV3Error::InvalidContext)
+        );
+    }
+
+    #[test]
+    fn repeated_context_across_processes_uses_independent_nonces() {
+        let context = extent_context(4);
+        let first_process = cipher();
+        let second_process = cipher();
+        let first_plaintext = extent_payload(1);
+        let second_plaintext = extent_payload(2);
+
+        let first = first_process.seal(&context, &first_plaintext).unwrap();
+        let second = second_process.seal(&context, &second_plaintext).unwrap();
+
+        assert_ne!(first.nonce, second.nonce);
+        assert_eq!(
+            first_process.open(&context, &first).unwrap(),
+            first_plaintext
+        );
+        assert_eq!(
+            second_process.open(&context, &second).unwrap(),
+            second_plaintext
+        );
+        let backend = InMemoryImmutableBackend::new();
+        backend
+            .create_if_absent(context.object_key(), first)
+            .unwrap();
+        assert_eq!(
+            backend.create_if_absent(context.object_key(), second),
+            Err(ArchiveV3Error::Conflict),
+            "immutable rejection remains a logical conflict, not the nonce-safety boundary"
         );
     }
 
@@ -1647,6 +1690,7 @@ mod tests {
             cipher().open(
                 &archive_object_context,
                 &CiphertextEnvelope {
+                    nonce: [0; GCM_NONCE_BYTES],
                     ciphertext: vec![0; GCM_TAG_BYTES],
                 }
             ),
