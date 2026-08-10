@@ -2,8 +2,8 @@
 //! blob in GCS, replacing the legacy managed SQL store.
 //!
 //! Tables: `users`, provider-neutral `auth_identities`, provider credentials,
-//! `usage_daily`, `oauth_clients`, `refresh_tokens`, `query_log`, and
-//! user-configured webhook destinations. No captured user
+//! content-free deletion operations/tombstones, `usage_daily`, `oauth_clients`,
+//! `refresh_tokens`, `query_log`, and user-configured webhook destinations. No captured user
 //! *content* — that stays in the per-user index blobs ([`crate::store`]). One small control blob,
 //! `control/control.db.enc`, encrypted under its own KMS-wrapped DEK exactly like
 //! a user index, so identity state survives VM rolls without a managed database.
@@ -40,37 +40,6 @@ CREATE TABLE IF NOT EXISTS users (
     status           TEXT NOT NULL DEFAULT 'active',
     summarized_until TEXT,
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
--- Provider identities are separate from the canonical Kioku account. This is
--- what lets a user explicitly link Apple and Google without merging accounts
--- merely because two mutable email claims happen to match.
-CREATE TABLE IF NOT EXISTS auth_identities (
-    provider       TEXT NOT NULL,
-    subject        TEXT NOT NULL,
-    user_id        TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
-    email          TEXT NOT NULL,
-    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    last_seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    PRIMARY KEY (provider, subject),
-    UNIQUE (user_id, provider)
-);
-CREATE INDEX IF NOT EXISTS auth_identities_user_idx ON auth_identities(user_id);
--- Existing databases predate provider-neutral identities. At schema open all
--- such rows are Google accounts. The NOT EXISTS guard also prevents a later
--- open from misclassifying an Apple-primary account's compatibility anchor.
-INSERT OR IGNORE INTO auth_identities (provider, subject, user_id, email)
-SELECT 'google', u.google_sub, u.id, u.email
-FROM users u
-WHERE NOT EXISTS (
-    SELECT 1 FROM auth_identities i WHERE i.user_id = u.id
-);
--- Apple's long-lived refresh token is retained only inside this KMS-bound
--- encrypted control database so account deletion can revoke authorization.
-CREATE TABLE IF NOT EXISTS apple_credentials (
-    user_id           TEXT PRIMARY KEY REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
-    refresh_token     TEXT NOT NULL,
-    last_validated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    revoked_at        TEXT
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     user_id              TEXT NOT NULL,
@@ -131,6 +100,18 @@ CREATE TABLE IF NOT EXISTS deleted_identities (
     subject    TEXT NOT NULL,
     deleted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (provider, subject)
+);
+-- Stable, opaque status for an authenticated account-deletion retry/poll.
+-- This deliberately contains no email, object name, media key, or user content
+-- and remains after identity deletion alongside the stable tombstone.
+CREATE TABLE IF NOT EXISTS account_deletion_operations (
+    user_id             TEXT PRIMARY KEY,
+    operation_id        TEXT UNIQUE NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'failed_retryable', 'physical_complete')),
+    reason              TEXT NOT NULL,
+    retry_after_seconds INTEGER CHECK (retry_after_seconds IS NULL OR retry_after_seconds >= 0),
+    hard_delete_time    TEXT,
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE IF NOT EXISTS query_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,6 +215,16 @@ pub struct User {
     pub email: String,
 }
 
+/// Content-free, durable status for an account-deletion operation.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct AccountDeletionOperation {
+    pub operation_id: String,
+    pub status: String,
+    pub reason: String,
+    pub retry_after_seconds: Option<u64>,
+    pub hard_delete_time: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WebhookSubscription {
     pub id: String,
@@ -255,6 +246,7 @@ pub struct EpisodeEmailPreference {
     pub updated_at: String,
 }
 
+#[cfg(test)]
 fn is_active_user_conn(conn: &Connection, user_id: &str) -> Result<bool> {
     let active: i64 = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
@@ -269,15 +261,6 @@ fn is_deleted_user_conn(conn: &Connection, stable_user_id: &str) -> Result<bool>
         "SELECT EXISTS(SELECT 1 FROM deleted_users WHERE user_id = ?1)",
         [stable_user_id],
         |r| r.get(0),
-    )?;
-    Ok(deleted != 0)
-}
-
-fn is_deleted_identity_conn(conn: &Connection, provider: &str, subject: &str) -> Result<bool> {
-    let deleted: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM deleted_identities WHERE provider = ?1 AND subject = ?2)",
-        rusqlite::params![provider, subject],
-        |row| row.get(0),
     )?;
     Ok(deleted != 0)
 }
@@ -297,10 +280,51 @@ fn user_status_conn(conn: &Connection, user_id: &str) -> Result<Option<String>> 
     Ok(None)
 }
 
-/// Remove identity/accounting state and leave only stable, non-content
-/// account and provider tombstones. Returning credentials from any linked
-/// provider can then be denied instead of recreating the deleted account.
-fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<bool> {
+fn account_deletion_operation_conn(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<AccountDeletionOperation>> {
+    let row = conn
+        .query_row(
+            "SELECT operation_id, status, reason, retry_after_seconds, hard_delete_time
+             FROM account_deletion_operations WHERE user_id = ?1",
+            [user_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(operation_id, status, reason, retry_after_seconds, hard_delete_time)| {
+            let retry_after_seconds =
+                retry_after_seconds
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        EnclaveError::Store("invalid persisted account-deletion retry delay".into())
+                    })?;
+            Ok(AccountDeletionOperation {
+                operation_id,
+                status,
+                reason,
+                retry_after_seconds,
+                hard_delete_time,
+            })
+        },
+    )
+    .transpose()
+}
+
+/// Remove identity/accounting state and leave only a stable, non-content
+/// tombstone. Returning Google credentials can then be denied instead of
+/// recreating the just-deleted account.
+fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<AccountDeletionOperation> {
     let tx = conn.unchecked_transaction()?;
     let identity: Option<(String, String)> = tx
         .query_row(
@@ -311,15 +335,35 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<bool> {
         .optional()?;
     let Some((google_sub, status)) = identity else {
         // A prior finalization may have committed locally and then failed while
-        // uploading the encrypted control DB. Report the existing tombstone as
-        // a successful finalization so write_if_changed re-flushes that state.
+        // uploading the encrypted control DB. A retry also handles tombstones
+        // created by releases predating durable operation status.
         let tombstoned: i64 = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM deleted_users WHERE user_id = ?1)",
             [user_id],
             |r| r.get(0),
         )?;
-        tx.rollback()?;
-        return Ok(tombstoned != 0);
+        if tombstoned == 0 {
+            tx.rollback()?;
+            return Err(EnclaveError::Conflict("account is unavailable".into()));
+        }
+        let updated = tx.execute(
+            "UPDATE account_deletion_operations
+             SET status = 'physical_complete', reason = 'content_deleted',
+                 retry_after_seconds = NULL, hard_delete_time = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE user_id = ?1",
+            [user_id],
+        )?;
+        if updated != 1 {
+            tx.rollback()?;
+            return Err(EnclaveError::Conflict(
+                "account deletion operation was not initialized".into(),
+            ));
+        }
+        let operation = account_deletion_operation_conn(&tx, user_id)?
+            .ok_or_else(|| EnclaveError::Store("account deletion operation disappeared".into()))?;
+        tx.commit()?;
+        return Ok(operation);
     };
     if status != "deleting" {
         tx.rollback()?;
@@ -338,7 +382,7 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<bool> {
         [user_id],
     )?;
     tx.execute(
-        "INSERT OR IGNORE INTO deleted_identities (provider, subject) \
+        "INSERT OR IGNORE INTO deleted_identities (provider, subject) \\
          SELECT provider, subject FROM auth_identities WHERE user_id = ?1",
         [user_id],
     )?;
@@ -364,50 +408,134 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<bool> {
     )?;
     tx.execute("DELETE FROM auth_identities WHERE user_id = ?1", [user_id])?;
     let deleted = tx.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
+    if deleted != 1 {
+        tx.rollback()?;
+        return Err(EnclaveError::Store(
+            "account identity deletion affected an unexpected row count".into(),
+        ));
+    }
+    let operation_updated = tx.execute(
+        "UPDATE account_deletion_operations
+         SET status = 'physical_complete', reason = 'content_deleted',
+             retry_after_seconds = NULL, hard_delete_time = NULL,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE user_id = ?1",
+        [user_id],
+    )?;
+    if operation_updated != 1 {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account deletion operation was not initialized".into(),
+        ));
+    }
+    let operation = account_deletion_operation_conn(&tx, user_id)?
+        .ok_or_else(|| EnclaveError::Store("account deletion operation disappeared".into()))?;
     tx.commit()?;
-    Ok(deleted == 1)
+    Ok(operation)
 }
 
-fn begin_user_deletion_conn(conn: &Connection, user_id: &str) -> Result<bool> {
+fn begin_user_deletion_conn(
+    conn: &Connection,
+    user_id: &str,
+    proposed_operation_id: &str,
+) -> Result<Option<AccountDeletionOperation>> {
     let tx = conn.unchecked_transaction()?;
     let status: Option<String> = tx
         .query_row("SELECT status FROM users WHERE id = ?1", [user_id], |r| {
             r.get(0)
         })
         .optional()?;
-    if status.is_none() && is_deleted_user_conn(&tx, user_id)? {
-        // Permit an idempotent retry after local finalization succeeded but its
-        // encrypted GCS flush failed. The public wrapper flushes this state.
+    let tombstoned = status.is_none() && is_deleted_user_conn(&tx, user_id)?;
+    if !tombstoned && !matches!(status.as_deref(), Some("active" | "deleting")) {
         tx.rollback()?;
-        return Ok(true);
-    }
-    if !matches!(status.as_deref(), Some("active" | "deleting")) {
-        tx.rollback()?;
-        return Ok(false);
+        return Ok(None);
     }
 
+    if !tombstoned {
+        tx.execute(
+            "UPDATE users SET status = 'deleting' WHERE id = ?1",
+            [user_id],
+        )?;
+        tx.execute(
+            "DELETE FROM oauth_authorization_codes WHERE user_id = ?1",
+            [user_id],
+        )?;
+        tx.execute("DELETE FROM oauth_consents WHERE user_id = ?1", [user_id])?;
+        tx.execute("DELETE FROM refresh_tokens WHERE user_id = ?1", [user_id])?;
+        tx.execute(
+            "UPDATE webhook_subscriptions SET enabled = 0, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
+            [user_id],
+        )?;
+        tx.execute(
+            "UPDATE episode_email_preferences SET enabled = 0, include_content = 0, \
+             consented_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
+            [user_id],
+        )?;
+    }
     tx.execute(
-        "UPDATE users SET status = 'deleting' WHERE id = ?1",
-        [user_id],
+        "INSERT OR IGNORE INTO account_deletion_operations
+         (user_id, operation_id, status, reason, retry_after_seconds)
+         VALUES (?1, ?2, 'pending', 'content_deletion_in_progress', 30)",
+        rusqlite::params![user_id, proposed_operation_id],
     )?;
-    tx.execute(
-        "DELETE FROM oauth_authorization_codes WHERE user_id = ?1",
-        [user_id],
-    )?;
-    tx.execute("DELETE FROM oauth_consents WHERE user_id = ?1", [user_id])?;
-    tx.execute("DELETE FROM refresh_tokens WHERE user_id = ?1", [user_id])?;
-    tx.execute(
-        "UPDATE webhook_subscriptions SET enabled = 0, \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
-        [user_id],
-    )?;
-    tx.execute(
-        "UPDATE episode_email_preferences SET enabled = 0, include_content = 0, \
-         consented_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
-        [user_id],
-    )?;
+    let operation = account_deletion_operation_conn(&tx, user_id)?.ok_or_else(|| {
+        EnclaveError::Store("failed to initialize account deletion operation".into())
+    })?;
+    if !tombstoned && operation.status == "physical_complete" {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "physically complete deletion operation still has an identity row".into(),
+        ));
+    }
     tx.commit()?;
-    Ok(true)
+    Ok(Some(operation))
+}
+
+fn deletion_operation_status_for_reason(reason: &str) -> &'static str {
+    match reason {
+        "legacy_generation_unavailable" | "legacy_snapshot_too_large" => "failed_retryable",
+        _ => "pending",
+    }
+}
+
+fn update_user_deletion_status_conn(
+    conn: &Connection,
+    user_id: &str,
+    reason: &str,
+    retry_after_seconds: Option<u64>,
+    hard_delete_time: Option<&str>,
+) -> Result<AccountDeletionOperation> {
+    let retry_after_seconds = retry_after_seconds
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("account-deletion retry delay is too large".into()))?;
+    let tx = conn.unchecked_transaction()?;
+    let status = deletion_operation_status_for_reason(reason);
+    let updated = tx.execute(
+        "UPDATE account_deletion_operations
+         SET status = ?2, reason = ?3, retry_after_seconds = ?4,
+             hard_delete_time = ?5,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE user_id = ?1",
+        rusqlite::params![
+            user_id,
+            status,
+            reason,
+            retry_after_seconds,
+            hard_delete_time
+        ],
+    )?;
+    if updated != 1 {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "account deletion operation was not initialized".into(),
+        ));
+    }
+    let operation = account_deletion_operation_conn(&tx, user_id)?
+        .ok_or_else(|| EnclaveError::Store("account deletion operation disappeared".into()))?;
+    tx.commit()?;
+    Ok(operation)
 }
 
 impl ControlStore {
@@ -836,19 +964,6 @@ impl ControlStore {
                             "UPDATE episode_email_preferences SET user_id = ?1 WHERE user_id = ?2",
                             rusqlite::params![stable_id, old_id],
                         )?;
-                        // Provider identities and credentials were introduced
-                        // after stable IDs. Keep them attached while upgrading
-                        // a pre-stable Google account; the explicit updates are
-                        // required because SQLite foreign keys are not enabled
-                        // on every historical control database connection.
-                        conn.execute(
-                            "UPDATE auth_identities SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE apple_credentials SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
                     } else {
                         conn.execute(
                             "UPDATE users SET email = ?1 WHERE google_sub = ?2",
@@ -861,13 +976,6 @@ impl ControlStore {
                         rusqlite::params![stable_id, google_sub, email],
                     )?;
                 }
-                conn.execute(
-                    "INSERT INTO auth_identities (provider, subject, user_id, email) \
-                     VALUES ('google', ?1, ?2, ?3) \
-                     ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, \
-                     last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                    rusqlite::params![google_sub, stable_id, email],
-                )?;
                 Ok(())
             })();
 
@@ -882,254 +990,6 @@ impl ControlStore {
                 id: stable_id,
                 email,
             })
-        })
-        .await
-    }
-
-    /// Resolve a linked provider identity without creating or merging an
-    /// account. Email equality is intentionally never an account-link signal.
-    pub async fn identity_user(&self, provider: &str, subject: &str) -> Result<Option<User>> {
-        let provider = provider.to_string();
-        let subject = subject.to_string();
-        self.read(move |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT u.id, u.email FROM auth_identities i \
-                     JOIN users u ON u.id = i.user_id \
-                     WHERE i.provider = ?1 AND i.subject = ?2 AND u.status = 'active'",
-                    rusqlite::params![provider, subject],
-                    |row| {
-                        Ok(User {
-                            id: row.get(0)?,
-                            email: row.get(1)?,
-                        })
-                    },
-                )
-                .optional()?)
-        })
-        .await
-    }
-
-    /// Create or resume an Apple-primary account and atomically retain the
-    /// Apple refresh token needed for credential validation and deletion-time
-    /// revocation. Existing linked Apple identities retain their canonical
-    /// Kioku user id and primary account email.
-    pub async fn upsert_apple_user(
-        &self,
-        subject: &str,
-        email: &str,
-        refresh_token: &str,
-    ) -> Result<User> {
-        let provider = "apple".to_string();
-        let subject = subject.to_string();
-        let email = email.to_lowercase();
-        let refresh_token = refresh_token.to_string();
-        let compatibility_anchor = format!("apple:{subject}");
-        let stable_id = super::tokens::derive_provider_uuid(&provider, &subject);
-
-        self.write(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            if is_deleted_identity_conn(&tx, &provider, &subject)?
-                || is_deleted_user_conn(&tx, &stable_id)?
-            {
-                tx.rollback()?;
-                return Err(EnclaveError::Auth("account deleted".into()));
-            }
-
-            let existing: Option<(String, String, String)> = tx
-                .query_row(
-                    "SELECT u.id, u.email, u.status FROM auth_identities i \
-                     JOIN users u ON u.id = i.user_id \
-                     WHERE i.provider = ?1 AND i.subject = ?2",
-                    rusqlite::params![provider, subject],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-
-            let (user_id, primary_email) = match existing {
-                Some((user_id, primary_email, status)) if status == "active" => {
-                    tx.execute(
-                        "UPDATE auth_identities SET email = ?1, \
-                         last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-                         WHERE provider = ?2 AND subject = ?3",
-                        rusqlite::params![email, provider, subject],
-                    )?;
-                    let anchor: String = tx.query_row(
-                        "SELECT google_sub FROM users WHERE id = ?1",
-                        [&user_id],
-                        |row| row.get(0),
-                    )?;
-                    if anchor == compatibility_anchor {
-                        tx.execute(
-                            "UPDATE users SET email = ?1 WHERE id = ?2",
-                            rusqlite::params![email, user_id],
-                        )?;
-                        (user_id, email.clone())
-                    } else {
-                        (user_id, primary_email)
-                    }
-                }
-                Some(_) => {
-                    tx.rollback()?;
-                    return Err(EnclaveError::Auth("account inactive".into()));
-                }
-                None => {
-                    let collision: Option<(String, String)> = tx
-                        .query_row(
-                            "SELECT google_sub, status FROM users WHERE id = ?1",
-                            [&stable_id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .optional()?;
-                    match collision {
-                        None => {
-                            tx.execute(
-                                "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
-                                rusqlite::params![stable_id, compatibility_anchor, email],
-                            )?;
-                        }
-                        Some((anchor, status))
-                            if anchor == compatibility_anchor && status == "active" => {}
-                        Some(_) => {
-                            tx.rollback()?;
-                            return Err(EnclaveError::Conflict(
-                                "provider identity collision".into(),
-                            ));
-                        }
-                    }
-                    tx.execute(
-                        "INSERT INTO auth_identities (provider, subject, user_id, email) \
-                         VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![provider, subject, stable_id, email],
-                    )?;
-                    (stable_id, email.clone())
-                }
-            };
-
-            tx.execute(
-                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) \
-                 VALUES (?1, ?2, NULL) \
-                 ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, \
-                 last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
-                rusqlite::params![user_id, refresh_token],
-            )?;
-            tx.commit()?;
-            Ok(User {
-                id: user_id,
-                email: primary_email,
-            })
-        })
-        .await
-    }
-
-    /// Explicitly link an Apple identity to an already authenticated account.
-    /// A provider identity already owned by another account is never moved.
-    pub async fn link_apple_identity(
-        &self,
-        user_id: &str,
-        subject: &str,
-        email: &str,
-        refresh_token: &str,
-    ) -> Result<()> {
-        let user_id = user_id.to_string();
-        let subject = subject.to_string();
-        let email = email.to_lowercase();
-        let refresh_token = refresh_token.to_string();
-        self.write(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            if !is_active_user_conn(&tx, &user_id)? {
-                tx.rollback()?;
-                return Err(EnclaveError::Auth("account inactive".into()));
-            }
-            if is_deleted_identity_conn(&tx, "apple", &subject)? {
-                tx.rollback()?;
-                return Err(EnclaveError::Auth("identity deleted".into()));
-            }
-            let owner: Option<String> = tx
-                .query_row(
-                    "SELECT user_id FROM auth_identities WHERE provider = 'apple' AND subject = ?1",
-                    [&subject],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if owner.as_deref().is_some_and(|owner| owner != user_id) {
-                tx.rollback()?;
-                return Err(EnclaveError::Conflict(
-                    "Apple identity is linked to another account".into(),
-                ));
-            }
-            let other_for_user: Option<String> = tx
-                .query_row(
-                    "SELECT subject FROM auth_identities WHERE provider = 'apple' AND user_id = ?1",
-                    [&user_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if other_for_user
-                .as_deref()
-                .is_some_and(|linked| linked != subject)
-            {
-                tx.rollback()?;
-                return Err(EnclaveError::Conflict(
-                    "account already has a different Apple identity".into(),
-                ));
-            }
-            tx.execute(
-                "INSERT INTO auth_identities (provider, subject, user_id, email) \
-                 VALUES ('apple', ?1, ?2, ?3) \
-                 ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, \
-                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-                rusqlite::params![subject, user_id, email],
-            )?;
-            tx.execute(
-                "INSERT INTO apple_credentials (user_id, refresh_token, revoked_at) \
-                 VALUES (?1, ?2, NULL) \
-                 ON CONFLICT(user_id) DO UPDATE SET refresh_token = excluded.refresh_token, \
-                 last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
-                rusqlite::params![user_id, refresh_token],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn linked_providers(&self, user_id: &str) -> Result<Vec<String>> {
-        let user_id = user_id.to_string();
-        self.read(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT provider FROM auth_identities WHERE user_id = ?1 ORDER BY provider",
-            )?;
-            let rows = statement.query_map([user_id], |row| row.get::<_, String>(0))?;
-            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-        })
-        .await
-    }
-
-    pub async fn apple_refresh_token(&self, user_id: &str) -> Result<Option<String>> {
-        let user_id = user_id.to_string();
-        self.read(move |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT refresh_token FROM apple_credentials \
-                     WHERE user_id = ?1 AND revoked_at IS NULL",
-                    [user_id],
-                    |row| row.get(0),
-                )
-                .optional()?)
-        })
-        .await
-    }
-
-    pub async fn mark_apple_credential_revoked(&self, user_id: &str) -> Result<()> {
-        let user_id = user_id.to_string();
-        self.write_if_changed(move |conn| {
-            let changed = conn.execute(
-                "UPDATE apple_credentials SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-                 WHERE user_id = ?1 AND revoked_at IS NULL",
-                [user_id],
-            )? > 0;
-            Ok(((), changed))
         })
         .await
     }
@@ -1154,6 +1014,15 @@ impl ControlStore {
             .await
     }
 
+    pub async fn account_deletion_operation(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<AccountDeletionOperation>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| account_deletion_operation_conn(conn, &user_id))
+            .await
+    }
+
     /// All user ids (for the summarizer sweep).
     pub async fn all_user_ids(&self) -> Result<Vec<String>> {
         self.read(|conn| {
@@ -1162,6 +1031,31 @@ impl ControlStore {
                 .query_map([], |r| r.get::<_, String>(0))?
                 .filter_map(|x| x.ok())
                 .collect();
+            Ok(ids)
+        })
+        .await
+    }
+
+    /// A bounded, oldest-attempt-first sweep of pending deletion operations for
+    /// the serial reconciler. Returning ids is internal only; callers must not
+    /// log them. Failed-retryable rows require explicit remediation first.
+    pub async fn deleting_user_ids(&self, limit: usize) -> Result<Vec<String>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| EnclaveError::Store("account-deletion sweep limit is too large".into()))?;
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT users.id
+                 FROM users
+                 LEFT JOIN account_deletion_operations
+                   ON account_deletion_operations.user_id = users.id
+                 WHERE users.status = 'deleting'
+                   AND COALESCE(account_deletion_operations.status, 'pending') = 'pending'
+                 ORDER BY COALESCE(account_deletion_operations.updated_at, users.created_at), users.id
+                 LIMIT ?1",
+            )?;
+            let ids = stmt
+                .query_map([limit], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(ids)
         })
         .await
@@ -1195,21 +1089,48 @@ impl ControlStore {
     }
 
     /// Fail closed before content deletion: mark the account as deleting and
-    /// revoke every renewable/pending OAuth credential in one transaction.
-    pub async fn begin_user_deletion(&self, user_id: &str) -> Result<bool> {
+    /// revoke every renewable/pending OAuth credential while creating one
+    /// stable, opaque operation id in the same transaction.
+    pub async fn begin_user_deletion(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<AccountDeletionOperation>> {
         let user_id = user_id.to_string();
-        self.write(move |conn| begin_user_deletion_conn(conn, &user_id))
+        let proposed_operation_id = format!("del_{}", super::tokens::random_token_hex());
+        self.write(move |conn| begin_user_deletion_conn(conn, &user_id, &proposed_operation_id))
             .await
     }
 
-    /// Finalize identity deletion only after the content store has completed.
-    pub async fn finalize_user_deletion(&self, user_id: &str) -> Result<bool> {
+    /// Persist content-free pending/failed-retryable state before returning
+    /// HTTP 202. Provider deadline metadata is cleared when the new reason has
+    /// no current deadline, so polling never exposes stale retention data.
+    pub async fn update_user_deletion_status(
+        &self,
+        user_id: &str,
+        reason: &str,
+        retry_after_seconds: Option<u64>,
+        hard_delete_time: Option<&str>,
+    ) -> Result<AccountDeletionOperation> {
         let user_id = user_id.to_string();
-        self.write_if_changed(move |conn| {
-            let deleted = delete_user_identity_conn(conn, &user_id)?;
-            Ok((deleted, deleted))
+        let reason = reason.to_string();
+        let hard_delete_time = hard_delete_time.map(str::to_string);
+        self.write(move |conn| {
+            update_user_deletion_status_conn(
+                conn,
+                &user_id,
+                &reason,
+                retry_after_seconds,
+                hard_delete_time.as_deref(),
+            )
         })
         .await
+    }
+
+    /// Finalize identity deletion only after the content store has completed.
+    pub async fn finalize_user_deletion(&self, user_id: &str) -> Result<AccountDeletionOperation> {
+        let user_id = user_id.to_string();
+        self.write(move |conn| delete_user_identity_conn(conn, &user_id))
+            .await
     }
 
     pub async fn list_webhook_subscriptions(
@@ -1478,6 +1399,8 @@ mod tests {
 
     const USER_ID: &str = "11111111-1111-4111-8111-111111111111";
     const GOOGLE_SUB: &str = "google-subject-123";
+    const OPERATION_ID: &str =
+        "del_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn account_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1572,58 +1495,17 @@ mod tests {
     }
 
     #[test]
-    fn provider_rows_follow_a_stable_user_id_upgrade() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute(
-            "INSERT INTO users (id, google_sub, email) VALUES ('legacy-id', ?1, 'owner@example.com')",
-            [GOOGLE_SUB],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO auth_identities (provider, subject, user_id, email) \
-             VALUES ('google', ?1, 'legacy-id', 'owner@example.com')",
-            [GOOGLE_SUB],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO auth_identities (provider, subject, user_id, email) \
-             VALUES ('apple', 'apple-subject', 'legacy-id', 'relay@privaterelay.appleid.com')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO apple_credentials (user_id, refresh_token) VALUES ('legacy-id', 'refresh')",
-            [],
-        )
-        .unwrap();
-
-        conn.execute("UPDATE users SET id = ?1 WHERE id = 'legacy-id'", [USER_ID])
-            .unwrap();
-
-        let identities: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM auth_identities WHERE user_id = ?1",
-                [USER_ID],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let credential_owner: String = conn
-            .query_row("SELECT user_id FROM apple_credentials", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(identities, 2);
-        assert_eq!(credential_owner, USER_ID);
-    }
-
-    #[test]
     fn deletion_is_fail_closed_then_finalized_with_tombstone() {
         let conn = account_conn();
-        assert!(begin_user_deletion_conn(&conn, USER_ID).unwrap());
+        let first = begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID)
+            .unwrap()
+            .unwrap();
         // Initialization is idempotent so a failed content deletion can retry.
-        assert!(begin_user_deletion_conn(&conn, USER_ID).unwrap());
+        let retry = begin_user_deletion_conn(&conn, USER_ID, "del_different")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.operation_id, OPERATION_ID);
+        assert_eq!(retry.operation_id, OPERATION_ID);
         assert_eq!(
             conn.query_row("SELECT status FROM users WHERE id = ?1", [USER_ID], |r| {
                 r.get::<_, String>(0)
@@ -1654,7 +1536,10 @@ mod tests {
             .unwrap();
         assert_eq!(webhook_enabled, 0);
 
-        assert!(delete_user_identity_conn(&conn, USER_ID).unwrap());
+        let completed = delete_user_identity_conn(&conn, USER_ID).unwrap();
+        assert_eq!(completed.status, "physical_complete");
+        assert_eq!(completed.reason, "content_deleted");
+        assert_eq!(completed.operation_id, OPERATION_ID);
         assert!(!is_active_user_conn(&conn, USER_ID).unwrap());
         assert_eq!(
             conn.query_row(
@@ -1689,8 +1574,13 @@ mod tests {
             rusqlite::params![stable_id, GOOGLE_SUB],
         )
         .unwrap();
-        assert!(begin_user_deletion_conn(&conn, &stable_id).unwrap());
-        assert!(delete_user_identity_conn(&conn, &stable_id).unwrap());
+        assert!(begin_user_deletion_conn(&conn, &stable_id, OPERATION_ID)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            delete_user_identity_conn(&conn, &stable_id).unwrap().status,
+            "physical_complete"
+        );
 
         // This is the in-memory state left behind if the final control-DB GCS
         // upload fails. Authentication, begin, and finalize must all allow the
@@ -1699,8 +1589,62 @@ mod tests {
             user_status_conn(&conn, &stable_id).unwrap().as_deref(),
             Some("deleted")
         );
-        assert!(begin_user_deletion_conn(&conn, &stable_id).unwrap());
-        assert!(delete_user_identity_conn(&conn, &stable_id).unwrap());
+        let retry = begin_user_deletion_conn(&conn, &stable_id, "del_different")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.operation_id, OPERATION_ID);
+        assert_eq!(retry.status, "physical_complete");
+        assert_eq!(
+            delete_user_identity_conn(&conn, &stable_id).unwrap().status,
+            "physical_complete"
+        );
+    }
+
+    #[test]
+    fn deletion_status_metadata_is_current_and_queryable() {
+        let conn = account_conn();
+        begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID)
+            .unwrap()
+            .unwrap();
+        let pending = update_user_deletion_status_conn(
+            &conn,
+            USER_ID,
+            "soft_delete_retention",
+            Some(86_400),
+            Some("2026-08-14T00:00:00.000Z"),
+        )
+        .unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.reason, "soft_delete_retention");
+        assert_eq!(pending.retry_after_seconds, Some(86_400));
+        assert_eq!(
+            pending.hard_delete_time.as_deref(),
+            Some("2026-08-14T00:00:00.000Z")
+        );
+
+        let later_transient = update_user_deletion_status_conn(
+            &conn,
+            USER_ID,
+            "content_store_unavailable",
+            Some(30),
+            None,
+        )
+        .unwrap();
+        assert_eq!(later_transient.reason, "content_store_unavailable");
+        assert!(later_transient.hard_delete_time.is_none());
+        assert_eq!(
+            account_deletion_operation_conn(&conn, USER_ID).unwrap(),
+            Some(later_transient)
+        );
+
+        for reason in ["legacy_generation_unavailable", "legacy_snapshot_too_large"] {
+            let failed =
+                update_user_deletion_status_conn(&conn, USER_ID, reason, None, None).unwrap();
+            assert_eq!(failed.status, "failed_retryable");
+            assert_eq!(failed.reason, reason);
+            assert!(failed.retry_after_seconds.is_none());
+            assert!(failed.hard_delete_time.is_none());
+        }
     }
 
     #[tokio::test]
@@ -1725,149 +1669,6 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(first_generation, second_generation);
-    }
-
-    #[tokio::test]
-    async fn apple_primary_account_is_provider_namespaced_and_rotates_credential() {
-        use crate::store::tests::{FakeGcs, FakeKms};
-
-        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
-        let first = store
-            .upsert_apple_user(
-                "apple-subject",
-                "Opaque@privaterelay.appleid.com",
-                "refresh-one",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            first.id,
-            super::super::tokens::derive_provider_uuid("apple", "apple-subject")
-        );
-        assert_eq!(first.email, "opaque@privaterelay.appleid.com");
-        assert_eq!(
-            store.linked_providers(&first.id).await.unwrap(),
-            vec!["apple"]
-        );
-        assert_eq!(
-            store
-                .apple_refresh_token(&first.id)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("refresh-one")
-        );
-
-        let resumed = store
-            .upsert_apple_user("apple-subject", "new@example.com", "refresh-two")
-            .await
-            .unwrap();
-        assert_eq!(resumed.id, first.id);
-        assert_eq!(resumed.email, "new@example.com");
-        assert_eq!(
-            store
-                .apple_refresh_token(&first.id)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("refresh-two")
-        );
-    }
-
-    #[tokio::test]
-    async fn apple_linking_is_explicit_and_never_merges_matching_email() {
-        use crate::store::tests::{FakeGcs, FakeKms};
-
-        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
-        let google = store
-            .upsert_user("google-owner", "same@example.com")
-            .await
-            .unwrap();
-        let independent_apple = store
-            .upsert_apple_user(
-                "apple-independent",
-                "same@example.com",
-                "refresh-independent",
-            )
-            .await
-            .unwrap();
-        assert_ne!(google.id, independent_apple.id);
-        assert!(matches!(
-            store
-                .link_apple_identity(
-                    &google.id,
-                    "apple-independent",
-                    "same@example.com",
-                    "refresh-conflict"
-                )
-                .await,
-            Err(EnclaveError::Conflict(_))
-        ));
-
-        store
-            .link_apple_identity(
-                &google.id,
-                "apple-linked",
-                "relay@privaterelay.appleid.com",
-                "refresh-linked",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.linked_providers(&google.id).await.unwrap(),
-            vec!["apple", "google"]
-        );
-        assert_eq!(
-            store
-                .identity_user("apple", "apple-linked")
-                .await
-                .unwrap()
-                .unwrap()
-                .id,
-            google.id
-        );
-        assert_eq!(
-            store
-                .apple_refresh_token(&google.id)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("refresh-linked")
-        );
-    }
-
-    #[tokio::test]
-    async fn deletion_tombstones_linked_apple_identity_and_erases_credential() {
-        use crate::store::tests::{FakeGcs, FakeKms};
-
-        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
-        let user = store
-            .upsert_user("google-delete", "owner@example.com")
-            .await
-            .unwrap();
-        store
-            .link_apple_identity(
-                &user.id,
-                "apple-delete",
-                "owner@example.com",
-                "refresh-delete",
-            )
-            .await
-            .unwrap();
-        assert!(store.begin_user_deletion(&user.id).await.unwrap());
-        assert!(store.finalize_user_deletion(&user.id).await.unwrap());
-        assert!(store.apple_refresh_token(&user.id).await.unwrap().is_none());
-        assert!(store
-            .identity_user("apple", "apple-delete")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(matches!(
-            store
-                .upsert_apple_user("apple-delete", "owner@example.com", "refresh-recreate")
-                .await,
-            Err(EnclaveError::Auth(_))
-        ));
     }
 
     #[test]

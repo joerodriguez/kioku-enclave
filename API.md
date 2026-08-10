@@ -357,6 +357,36 @@ Large histories are available without growing the profile response:
 positive `next_cursor` as the next `before_id`. A missing, unnamed, or tentative
 person returns `404`. Unknown query fields return `400`.
 
+## Account-deletion status (ADR-0022 Phase 0 bridge)
+
+`DELETE /api/account` begins or retries account deletion. It returns `202` until
+physical deletion finishes and `200` only once it is complete. Each response has
+the same opaque `operation_id` for that account deletion:
+
+```json
+{
+  "deleted": false,
+  "operation_id": "del_opaque",
+  "status": "pending",
+  "reason": "soft_delete_retention",
+  "retry_after_seconds": 3600,
+  "hard_delete_time": "2026-08-14T00:00:00.000Z"
+}
+```
+
+`GET /api/account/deletion` returns `200` with the same shape for all states.
+States are `pending`, `failed_retryable`, and `physical_complete`; `deleted` is
+true only in `physical_complete`. The latter has no retry delay or provider
+deadline. `Retry-After` is supplied when a retry delay is known.
+
+This Phase-0 bridge uses the caller's ordinary account authentication; it does
+not introduce a separate polling credential or claim the future ADR-0022 v3
+content ledger. Deleting or deleted credentials are accepted only for these
+deletion routes. A missing listed legacy generation and the temporary 512 MiB
+historical-snapshot compatibility limit report `failed_retryable`; provider
+retention and transient infrastructure/inventory failures remain `pending` for
+the bounded server-side reconciler.
+
 ## Processing and privacy semantics
 
 - The enclave encrypts raw objects with a per-user KMS-wrapped DEK and binds

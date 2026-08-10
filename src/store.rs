@@ -61,7 +61,7 @@ use crate::{
     crypto::{
         decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient,
     },
-    error::{EnclaveError, Result},
+    error::{DeletionPending, DeletionPendingReason, EnclaveError, Result},
     storage_observability::{
         StorageMetrics, StorageMetricsSnapshot, AMPLIFICATION_PPM_BUCKET_UPPER_BOUNDS,
         BYTE_BUCKET_UPPER_BOUNDS, LATENCY_US_BUCKET_UPPER_BOUNDS,
@@ -840,8 +840,8 @@ impl Store {
         // `versions=true` excludes soft-deleted objects. Record pre-existing
         // residue, but continue removing anything still live/noncurrent. Final
         // verification below remains fail-closed.
-        let _preexisting_soft_deleted = self
-            .has_soft_deleted_account_objects(user_id, &keys_to_delete)
+        let mut soft_deleted = self
+            .soft_deleted_account_inventory(user_id, &keys_to_delete)
             .await?;
 
         // Delete every historical raw-media generation, including objects no
@@ -859,20 +859,27 @@ impl Store {
         // evidence that the live DB no longer references. Inventory one exact
         // generation at a time, delete its media, and only then erase that DB
         // generation. Any unreadable generation leaves deletion incomplete.
-        self.inventory_and_delete_legacy_databases(user_id, &gcs_object_name(user_id), true)
-            .await?;
+        self.inventory_and_delete_legacy_databases(
+            user_id,
+            &gcs_object_name(user_id),
+            true,
+            &mut soft_deleted,
+        )
+        .await?;
         self.inventory_and_delete_legacy_databases(
             user_id,
             &legacy_recovery_prefix(user_id),
             false,
+            &mut soft_deleted,
         )
         .await?;
 
-        if self
-            .has_soft_deleted_account_objects(user_id, &keys_to_delete)
-            .await?
-        {
-            return Err(soft_deleted_account_objects_error());
+        soft_deleted.merge(
+            self.soft_deleted_account_inventory(user_id, &keys_to_delete)
+                .await?,
+        );
+        if soft_deleted.found {
+            return Err(soft_deleted_account_objects_error(soft_deleted));
         }
 
         self.registry
@@ -883,27 +890,26 @@ impl Store {
         Ok(())
     }
 
-    async fn has_soft_deleted_account_objects(
+    async fn soft_deleted_account_inventory(
         &self,
         user_id: &str,
         referenced_media_keys: &[String],
-    ) -> Result<bool> {
+    ) -> Result<SoftDeletedInventory> {
+        let mut inventory = SoftDeletedInventory::default();
         let namespaces = [
             (&self.gcs, gcs_object_name(user_id), true),
             (&self.gcs, legacy_recovery_prefix(user_id), false),
             (&self.media_gcs, media_prefix(user_id), false),
         ];
         for (gcs, selector, exact_name) in namespaces {
-            if has_matching_soft_deleted_object(gcs.as_ref(), &selector, exact_name).await? {
-                return Ok(true);
-            }
+            inventory
+                .merge(matching_soft_deleted_inventory(gcs.as_ref(), &selector, exact_name).await?);
         }
         for name in referenced_media_keys {
-            if has_matching_soft_deleted_object(self.media_gcs.as_ref(), name, true).await? {
-                return Ok(true);
-            }
+            inventory
+                .merge(matching_soft_deleted_inventory(self.media_gcs.as_ref(), name, true).await?);
         }
-        Ok(false)
+        Ok(inventory)
     }
 
     async fn delete_all_versions_for_name(
@@ -927,6 +933,7 @@ impl Store {
         user_id: &str,
         selector: &str,
         exact_name: bool,
+        soft_deleted: &mut SoftDeletedInventory,
     ) -> Result<()> {
         let mut page_token = None;
         for _ in 0..MAX_GCS_LIST_PAGES {
@@ -952,19 +959,28 @@ impl Store {
                         .await
                     {
                         Ok(keys) => keys,
-                        // A concurrent/idempotent retry may have already
-                        // removed the exact generation after it was listed.
-                        Err(EnclaveError::NotFound) => Vec::new(),
+                        Err(EnclaveError::NotFound) => {
+                            return Err(legacy_generation_unavailable_error())
+                        }
+                        Err(error @ EnclaveError::DeletionPending(_)) => return Err(error),
                         Err(_) => return Err(legacy_inventory_incomplete_error()),
                     };
+                    let mut blocked_media = SoftDeletedInventory::default();
                     for key in keys {
                         self.delete_all_versions_for_name(&self.media_gcs, &key)
                             .await?;
-                        if has_matching_soft_deleted_object(self.media_gcs.as_ref(), &key, true)
-                            .await?
-                        {
-                            return Err(soft_deleted_account_objects_error());
-                        }
+                        blocked_media.merge(
+                            matching_soft_deleted_inventory(self.media_gcs.as_ref(), &key, true)
+                                .await?,
+                        );
+                    }
+                    if blocked_media.found {
+                        soft_deleted.merge(blocked_media);
+                        // Retain this exact legacy generation as the durable
+                        // inventory for unscoped media until provider retention
+                        // expires. The process-local inventory alone is not
+                        // sufficient across a restart.
+                        return Err(soft_deleted_account_objects_error(soft_deleted.clone()));
                     }
                     self.gcs
                         .delete_object_generation(&version.name, version.generation)
@@ -996,7 +1012,11 @@ impl Store {
         version: &GcsObjectVersion,
     ) -> Result<Vec<String>> {
         if version.size > MAX_LEGACY_DELETION_SNAPSHOT_BYTES {
-            return Err(legacy_inventory_incomplete_error());
+            return Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacySnapshotTooLarge,
+                retry_after_seconds: None,
+                hard_delete_time: None,
+            }));
         }
         let response = self
             .gcs
@@ -2886,6 +2906,9 @@ pub struct GcsObjectVersion {
     pub name: String,
     pub generation: i64,
     pub size: u64,
+    /// Present only for provider soft-deleted inventory. GCS owns this
+    /// immutable deadline; callers preserve it for deletion-status reporting.
+    pub hard_delete_time: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -2971,17 +2994,84 @@ const MAX_GCS_LIST_PAGES: usize = 1_000_000;
 /// archive converter replaces this compatibility path.
 const MAX_LEGACY_DELETION_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 
-fn soft_deleted_account_objects_error() -> EnclaveError {
-    EnclaveError::Conflict(
-        "GCS soft-deleted account objects remain until their provider hard-delete deadline".into(),
-    )
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SoftDeletedInventory {
+    found: bool,
+    latest_hard_delete_time: Option<String>,
+}
+
+impl SoftDeletedInventory {
+    fn include(&mut self, version: GcsObjectVersion) {
+        self.found = true;
+        self.include_deadline(version.hard_delete_time);
+    }
+
+    fn include_deadline(&mut self, hard_delete_time: Option<String>) {
+        let Some(candidate) = hard_delete_time else {
+            return;
+        };
+        let replace = match self.latest_hard_delete_time.as_deref() {
+            None => true,
+            Some(current) => match (
+                crate::cp::isotime::parse_epoch_millis(current),
+                crate::cp::isotime::parse_epoch_millis(&candidate),
+            ) {
+                (Some(current), Some(candidate)) => candidate > current,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => candidate.as_str() > current,
+            },
+        };
+        if replace {
+            self.latest_hard_delete_time = Some(candidate);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if !other.found {
+            return;
+        }
+        self.found = true;
+        self.include_deadline(other.latest_hard_delete_time);
+    }
+}
+
+fn soft_deleted_account_objects_error(inventory: SoftDeletedInventory) -> EnclaveError {
+    let retry_after_seconds = inventory
+        .latest_hard_delete_time
+        .as_deref()
+        .and_then(crate::cp::isotime::parse_epoch_millis)
+        .and_then(|deadline_ms| {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .try_into()
+                .ok()?;
+            let remaining_ms = deadline_ms.saturating_sub(now_ms).max(1);
+            u64::try_from(remaining_ms.saturating_add(999) / 1_000).ok()
+        });
+    EnclaveError::DeletionPending(DeletionPending {
+        reason: DeletionPendingReason::SoftDeleteRetention,
+        retry_after_seconds,
+        hard_delete_time: inventory.latest_hard_delete_time,
+    })
 }
 
 fn legacy_inventory_incomplete_error() -> EnclaveError {
-    EnclaveError::Conflict(
-        "a retained legacy database generation could not be inventoried; deletion is incomplete"
-            .into(),
-    )
+    EnclaveError::DeletionPending(DeletionPending {
+        reason: DeletionPendingReason::LegacyInventoryIncomplete,
+        retry_after_seconds: None,
+        hard_delete_time: None,
+    })
+}
+
+fn legacy_generation_unavailable_error() -> EnclaveError {
+    EnclaveError::DeletionPending(DeletionPending {
+        reason: DeletionPendingReason::LegacyGenerationUnavailable,
+        retry_after_seconds: None,
+        hard_delete_time: None,
+    })
 }
 
 /// Deletes at most one provider page at a time, then restarts at the first
@@ -3031,26 +3121,27 @@ async fn delete_matching_object_versions(
     ))
 }
 
-/// Streams soft-deleted inventory and returns as soon as one account-owned
-/// object is found. No content inventory is accumulated in enclave memory.
-async fn has_matching_soft_deleted_object(
+/// Streams one selector's soft-deleted inventory and preserves only the latest
+/// provider hard-delete deadline. No content inventory is accumulated.
+async fn matching_soft_deleted_inventory(
     gcs: &dyn GcsClient,
     selector: &str,
     exact_name: bool,
-) -> Result<bool> {
+) -> Result<SoftDeletedInventory> {
     let mut page_token = None;
+    let mut inventory = SoftDeletedInventory::default();
     for _ in 0..MAX_GCS_LIST_PAGES {
         let page = gcs
             .list_soft_deleted_objects(selector, page_token.as_deref())
             .await?;
-        if page.versions.into_iter().any(|version| {
+        for version in page.versions.into_iter().filter(|version| {
             if exact_name {
                 version.name == selector
             } else {
                 version.name.starts_with(selector)
             }
         }) {
-            return Ok(true);
+            inventory.include(version);
         }
         match page.next_page_token {
             Some(next) if page_token.as_deref() != Some(next.as_str()) => page_token = Some(next),
@@ -3059,7 +3150,7 @@ async fn has_matching_soft_deleted_object(
                     "GCS soft-delete listing repeated a page cursor".into(),
                 ))
             }
-            None => return Ok(false),
+            None => return Ok(inventory),
         }
     }
     Err(EnclaveError::Gcs(
@@ -3110,6 +3201,8 @@ struct GcsVersionMetadata {
     name: String,
     generation: String,
     size: String,
+    #[serde(rename = "hardDeleteTime")]
+    hard_delete_time: Option<String>,
 }
 
 fn decode_gcs_versions_page(
@@ -3130,6 +3223,7 @@ fn decode_gcs_versions_page(
                     .size
                     .parse()
                     .map_err(|_| EnclaveError::Gcs("invalid listed object size".into()))?,
+                hard_delete_time: item.hard_delete_time,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3263,23 +3357,44 @@ impl GcsCustomMetadata {
 pub struct GcpGcsClient {
     http: reqwest::Client,
     bucket: String,
+    /// Kept as explicit client configuration so the exact-generation HTTP
+    /// sequence can be exercised against a local server. Production always
+    /// uses Google's canonical API origin.
+    api_base: String,
+    metadata_token_url: String,
 }
 
 impl GcpGcsClient {
     pub fn from_env() -> Result<Self> {
         let bucket = std::env::var("GCS_BUCKET")
             .map_err(|_| EnclaveError::Gcs("GCS_BUCKET not set".into()))?;
-        Ok(Self {
-            http: gcs_http_client(),
-            bucket,
-        })
+        Ok(Self::from_parts(bucket, "https://storage.googleapis.com".into(), "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token".into()))
     }
 
     pub fn from_bucket(bucket: String) -> Self {
+        Self::from_parts(
+            bucket,
+            "https://storage.googleapis.com".into(),
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token".into(),
+        )
+    }
+
+    fn from_parts(bucket: String, api_base: String, metadata_token_url: String) -> Self {
         Self {
             http: gcs_http_client(),
             bucket,
+            api_base,
+            metadata_token_url,
         }
+    }
+
+    #[cfg(test)]
+    fn for_test_endpoint(bucket: String, endpoint: String) -> Self {
+        Self::from_parts(
+            bucket,
+            endpoint.clone(),
+            format!("{endpoint}/computeMetadata/v1/instance/service-accounts/default/token"),
+        )
     }
 
     async fn access_token(&self) -> Result<String> {
@@ -3289,7 +3404,7 @@ impl GcpGcsClient {
         }
         let tok: Tok = self
             .http
-            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .get(&self.metadata_token_url)
             .header("Metadata-Flavor", "Google")
             .timeout(Duration::from_secs(3))
             .send()
@@ -3310,8 +3425,8 @@ impl GcpGcsClient {
             .map(|g| format!("?generation={g}"))
             .unwrap_or_default();
         let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}{}",
-            self.bucket, encoded, generation_query
+            "{}/storage/v1/b/{}/o/{}{}",
+            self.api_base, self.bucket, encoded, generation_query
         );
         let response = self.http.get(url).bearer_auth(token).send().await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -3337,23 +3452,25 @@ impl GcpGcsClient {
         let encoded = urlencoding::encode(object_name);
 
         let data_url = format!(
-            "https://storage.googleapis.com/download/storage/v1/b/{}/o/{}?alt=media&generation={}",
-            self.bucket, encoded, generation
+            "{}/download/storage/v1/b/{}/o/{}?alt=media&generation={}",
+            self.api_base, self.bucket, encoded, generation
         );
-        let bytes = self
-            .http
-            .get(&data_url)
-            .bearer_auth(&token)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+        let response = self.http.get(&data_url).bearer_auth(&token).send().await?;
+        exact_generation_download_status(response.status())?;
+        let bytes = response.error_for_status()?.bytes().await?;
         Ok(GcsGetResponse {
             ciphertext: bytes.to_vec(),
             wrapped_dek_b64: metadata.wrapped_dek_b64,
             generation,
         })
+    }
+}
+
+fn exact_generation_download_status(status: reqwest::StatusCode) -> Result<()> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        Err(EnclaveError::NotFound)
+    } else {
+        Ok(())
     }
 }
 
@@ -3392,8 +3509,8 @@ impl GcsClient for GcpGcsClient {
 
         // Multipart upload with metadata
         let upload_url = format!(
-            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=multipart&name={}&ifGenerationMatch={}",
-            self.bucket, encoded, if_generation_match
+            "{}/upload/storage/v1/b/{}/o?uploadType=multipart&name={}&ifGenerationMatch={}",
+            self.api_base, self.bucket, encoded, if_generation_match
         );
 
         // Build multipart body (metadata JSON + binary data)
@@ -3490,8 +3607,8 @@ impl GcsClient for GcpGcsClient {
             }
         });
         let mut url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0",
-            self.bucket,
+            "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0",
+            self.api_base, self.bucket,
             source_encoded,
             self.bucket,
             destination_encoded,
@@ -3541,8 +3658,8 @@ impl GcsClient for GcpGcsClient {
                 .rewrite_token
                 .ok_or_else(|| EnclaveError::Gcs("GCS rewrite incomplete without token".into()))?;
             url = format!(
-                "https://storage.googleapis.com/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0&rewriteToken={}",
-                self.bucket, source_encoded, self.bucket, destination_encoded,
+                "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0&rewriteToken={}",
+                self.api_base, self.bucket, source_encoded, self.bucket, destination_encoded,
                 source_generation, source_generation,
                 urlencoding::encode(&token)
             );
@@ -3553,8 +3670,8 @@ impl GcsClient for GcpGcsClient {
         let token = self.access_token().await?;
         let encoded = urlencoding::encode(object_name);
         let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
-            self.bucket, encoded
+            "{}/storage/v1/b/{}/o/{}",
+            self.api_base, self.bucket, encoded
         );
         let resp = self.http.delete(&url).bearer_auth(&token).send().await?;
         // 404 means already gone — treat as success for idempotency.
@@ -3572,7 +3689,8 @@ impl GcsClient for GcpGcsClient {
     ) -> Result<GcsListVersionsResponse> {
         let token = self.access_token().await?;
         let mut url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o?versions=true&maxResults={}&prefix={}",
+            "{}/storage/v1/b/{}/o?versions=true&maxResults={}&prefix={}",
+            self.api_base,
             self.bucket,
             GCS_LIST_PAGE_SIZE,
             urlencoding::encode(prefix)
@@ -3614,7 +3732,8 @@ impl GcsClient for GcpGcsClient {
     ) -> Result<GcsListVersionsResponse> {
         let token = self.access_token().await?;
         let mut url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o?softDeleted=true&maxResults={}&prefix={}",
+            "{}/storage/v1/b/{}/o?softDeleted=true&maxResults={}&prefix={}",
+            self.api_base,
             self.bucket,
             GCS_LIST_PAGE_SIZE,
             urlencoding::encode(prefix)
@@ -3632,7 +3751,8 @@ impl GcsClient for GcpGcsClient {
     async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()> {
         let token = self.access_token().await?;
         let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}?generation={}",
+            "{}/storage/v1/b/{}/o/{}?generation={}",
+            self.api_base,
             self.bucket,
             urlencoding::encode(object_name),
             generation
@@ -4200,6 +4320,7 @@ pub(crate) mod tests {
         generation: i64,
         live: bool,
         soft_deleted: bool,
+        hard_delete_time: Option<String>,
         crc32c: String,
         md5_hash: Option<String>,
         legacy_recovery: Option<LegacyRecoveryBinding>,
@@ -4212,7 +4333,9 @@ pub(crate) mod tests {
         fail_put: StdMutex<Option<EnclaveError>>,
         fail_put_after_commit: StdMutex<Option<EnclaveError>>,
         fail_generation_delete: StdMutex<Option<(String, i64)>>,
+        vanish_generation_on_get: StdMutex<Option<(String, i64)>>,
         soft_delete_enabled: StdMutex<bool>,
+        soft_delete_hard_delete_time: StdMutex<Option<String>>,
         repeat_version_cursor: StdMutex<bool>,
         listed_size_overrides: StdMutex<HashMap<String, u64>>,
         exact_generation_gets: StdMutex<usize>,
@@ -4230,7 +4353,11 @@ pub(crate) mod tests {
                 fail_put: StdMutex::new(None),
                 fail_put_after_commit: StdMutex::new(None),
                 fail_generation_delete: StdMutex::new(None),
+                vanish_generation_on_get: StdMutex::new(None),
                 soft_delete_enabled: StdMutex::new(false),
+                soft_delete_hard_delete_time: StdMutex::new(Some(
+                    "2099-01-01T00:00:00.000Z".into(),
+                )),
                 repeat_version_cursor: StdMutex::new(false),
                 listed_size_overrides: StdMutex::new(HashMap::new()),
                 exact_generation_gets: StdMutex::new(0),
@@ -4251,8 +4378,13 @@ pub(crate) mod tests {
             }
         }
 
-        fn set_soft_delete_enabled(&self, enabled: bool) {
+        pub(crate) fn set_soft_delete_enabled(&self, enabled: bool) {
             *self.soft_delete_enabled.lock().unwrap() = enabled;
+        }
+
+        fn set_soft_delete_hard_delete_time(&self, hard_delete_time: Option<&str>) {
+            *self.soft_delete_hard_delete_time.lock().unwrap() =
+                hard_delete_time.map(str::to_string);
         }
 
         fn set_repeat_version_cursor(&self, enabled: bool) {
@@ -4304,7 +4436,25 @@ pub(crate) mod tests {
                 .sum()
         }
 
+        pub(crate) fn expire_soft_deleted(&self, prefix: &str) {
+            let mut objects = self.objects.lock().unwrap();
+            objects.retain(|name, versions| {
+                if name.starts_with(prefix) {
+                    versions.retain(|version| !version.soft_deleted);
+                }
+                !versions.is_empty()
+            });
+        }
+
+        pub(crate) fn purge_versions(&self, prefix: &str) {
+            self.objects
+                .lock()
+                .unwrap()
+                .retain(|name, _| !name.starts_with(prefix));
+        }
+
         fn soft_delete_generation(&self, object_name: &str, generation: i64) {
+            let hard_delete_time = self.soft_delete_hard_delete_time.lock().unwrap().clone();
             if let Some(versions) = self.objects.lock().unwrap().get_mut(object_name) {
                 if let Some(version) = versions
                     .iter_mut()
@@ -4312,8 +4462,13 @@ pub(crate) mod tests {
                 {
                     version.live = false;
                     version.soft_deleted = true;
+                    version.hard_delete_time = hard_delete_time;
                 }
             }
+        }
+
+        pub(crate) fn vanish_next_exact_generation_get(&self, object_name: &str, generation: i64) {
+            *self.vanish_generation_on_get.lock().unwrap() = Some((object_name.into(), generation));
         }
 
         fn fail_next_generation_delete(&self, object_name: &str, generation: i64) {
@@ -4356,7 +4511,24 @@ pub(crate) mod tests {
             generation: i64,
         ) -> crate::error::Result<GcsGetResponse> {
             *self.exact_generation_gets.lock().unwrap() += 1;
-            let store = self.objects.lock().unwrap();
+            let mut vanish = self.vanish_generation_on_get.lock().unwrap();
+            let should_vanish = vanish
+                .as_ref()
+                .is_some_and(|target| target.0 == object_name && target.1 == generation);
+            if should_vanish {
+                *vanish = None;
+            }
+            drop(vanish);
+            let mut store = self.objects.lock().unwrap();
+            if should_vanish {
+                if let Some(versions) = store.get_mut(object_name) {
+                    versions.retain(|version| version.generation != generation);
+                    if versions.is_empty() {
+                        store.remove(object_name);
+                    }
+                }
+                return Err(crate::error::EnclaveError::NotFound);
+            }
             store
                 .get(object_name)
                 .and_then(|versions| {
@@ -4404,6 +4576,7 @@ pub(crate) mod tests {
                 generation: new_gen,
                 live: true,
                 soft_deleted: false,
+                hard_delete_time: None,
                 crc32c: format!("fake-crc32c-{}", ciphertext.len()),
                 md5_hash: Some(format!("fake-md5-{}", ciphertext.len())),
                 legacy_recovery: None,
@@ -4460,6 +4633,7 @@ pub(crate) mod tests {
             destination.generation = 1;
             destination.live = true;
             destination.soft_deleted = false;
+            destination.hard_delete_time = None;
             destination.legacy_recovery = Some(LegacyRecoveryBinding {
                 format_version: 1,
                 source_object: source_name.to_string(),
@@ -4519,6 +4693,7 @@ pub(crate) mod tests {
                             name: name.clone(),
                             generation: object.generation,
                             size: size_override.unwrap_or(object.ciphertext.len() as u64),
+                            hard_delete_time: None,
                         })
                 })
                 .collect::<Vec<_>>();
@@ -4601,6 +4776,7 @@ pub(crate) mod tests {
                 ));
             }
             let soft_delete_enabled = *self.soft_delete_enabled.lock().unwrap();
+            let hard_delete_time = self.soft_delete_hard_delete_time.lock().unwrap().clone();
             let mut store = self.objects.lock().unwrap();
             if let Some(versions) = store.get_mut(object_name) {
                 if soft_delete_enabled {
@@ -4610,6 +4786,7 @@ pub(crate) mod tests {
                     {
                         version.live = false;
                         version.soft_deleted = true;
+                        version.hard_delete_time = hard_delete_time;
                     }
                 } else {
                     versions.retain(|version| version.generation != generation);
@@ -4649,6 +4826,7 @@ pub(crate) mod tests {
                             name: name.clone(),
                             generation: object.generation,
                             size: size_override.unwrap_or(object.ciphertext.len() as u64),
+                            hard_delete_time: object.hard_delete_time.clone(),
                         })
                 })
                 .collect::<Vec<_>>();
@@ -5133,7 +5311,7 @@ pub(crate) mod tests {
         Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()))
     }
 
-    fn insert_screenshot_evidence(conn: &Connection, object_key: &str) -> Result<()> {
+    pub(crate) fn insert_screenshot_evidence(conn: &Connection, object_key: &str) -> Result<()> {
         conn.execute(
             "INSERT INTO screenshots(id,captured_at) VALUES (1,'2026-01-01T00:00:00Z')",
             [],
@@ -5679,6 +5857,7 @@ pub(crate) mod tests {
                 generation: 1,
                 live: true,
                 soft_deleted: false,
+                hard_delete_time: None,
                 crc32c: "fake-crc32c".into(),
                 md5_hash: None,
                 legacy_recovery: None,
@@ -5700,6 +5879,7 @@ pub(crate) mod tests {
                 generation: 1,
                 live: true,
                 soft_deleted: false,
+                hard_delete_time: None,
                 crc32c: "fake-crc32c".into(),
                 md5_hash: None,
                 legacy_recovery: None,
@@ -7036,7 +7216,11 @@ pub(crate) mod tests {
 
         assert!(matches!(
             store.delete_user("alice").await,
-            Err(EnclaveError::Conflict(_))
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                hard_delete_time: Some(ref deadline),
+                ..
+            })) if deadline == "2099-01-01T00:00:00.000Z"
         ));
         assert_eq!(gcs.version_count(&index), 0);
         assert_eq!(gcs.soft_deleted_count(&index), 2);
@@ -7054,7 +7238,11 @@ pub(crate) mod tests {
 
         assert!(matches!(
             store.delete_user("alice").await,
-            Err(EnclaveError::Conflict(_))
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                hard_delete_time: Some(ref deadline),
+                ..
+            })) if deadline == "2099-01-01T00:00:00.000Z"
         ));
         assert!(gcs.soft_deleted_count(&gcs_object_name("alice")) > 0);
         assert_eq!(gcs.soft_deleted_count("raw/alice/"), 1);
@@ -7111,6 +7299,43 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn exact_generation_disappearing_after_inventory_fails_closed() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let media = "media/historical-race-evidence";
+        store
+            .with_user("alice", |conn| insert_screenshot_evidence(conn, media))
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        let index = gcs_object_name("alice");
+        let historical_generation = gcs.get_object(&index).await.unwrap().generation;
+        store
+            .with_user("alice", |conn| {
+                conn.execute("DELETE FROM screenshot_images", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        gcs.put_object(media, b"historical", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.vanish_next_exact_generation_get(&index, historical_generation);
+
+        let deletion = store.delete_user("alice").await;
+        assert!(matches!(
+            deletion,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyGenerationUnavailable,
+                ..
+            }))
+        ));
+        assert_eq!(gcs.version_count(media), 1);
+        assert_eq!(gcs.version_count(&index), 1);
+    }
+
+    #[tokio::test]
     async fn unreadable_recovery_generation_keeps_deletion_incomplete() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
@@ -7129,7 +7354,10 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 deletion,
-                Err(EnclaveError::Conflict(ref message)) if message.contains("inventor")
+                Err(EnclaveError::DeletionPending(DeletionPending {
+                    reason: DeletionPendingReason::LegacyInventoryIncomplete,
+                    ..
+                }))
             ),
             "unexpected deletion result: {deletion:?}"
         );
@@ -7146,7 +7374,10 @@ pub(crate) mod tests {
 
         assert!(matches!(
             store.delete_user("alice").await,
-            Err(EnclaveError::Conflict(_))
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacySnapshotTooLarge,
+                ..
+            }))
         ));
         assert_eq!(gcs.exact_generation_get_count(), 0);
         assert_eq!(gcs.version_count(&index), 1);
@@ -7186,9 +7417,34 @@ pub(crate) mod tests {
         gcs.set_soft_delete_enabled(true);
         gcs.set_repeat_version_cursor(true);
         assert!(matches!(
-            has_matching_soft_deleted_object(gcs.as_ref(), "indexes/alice.db.enc", true).await,
+            matching_soft_deleted_inventory(gcs.as_ref(), "indexes/alice.db.enc", true).await,
             Err(EnclaveError::Gcs(message)) if message.contains("repeated")
         ));
+    }
+
+    #[tokio::test]
+    async fn soft_deleted_inventory_preserves_latest_provider_deadline_across_pages() {
+        let gcs = Arc::new(FakeGcs::new());
+        gcs.set_soft_delete_enabled(true);
+        for (suffix, deadline) in [
+            ("a", "2026-08-12T00:00:00.000Z"),
+            ("b", "2026-08-14T00:00:00Z"),
+            ("c", "2026-08-13T00:00:00.000Z"),
+        ] {
+            let name = format!("raw/alice/{suffix}.enc");
+            let generation = gcs.put_object(&name, b"data", "wrapped", 0).await.unwrap();
+            gcs.set_soft_delete_hard_delete_time(Some(deadline));
+            gcs.soft_delete_generation(&name, generation);
+        }
+
+        let inventory = matching_soft_deleted_inventory(gcs.as_ref(), "raw/alice/", false)
+            .await
+            .unwrap();
+        assert!(inventory.found);
+        assert_eq!(
+            inventory.latest_hard_delete_time.as_deref(),
+            Some("2026-08-14T00:00:00Z")
+        );
     }
 
     #[test]
@@ -7201,6 +7457,123 @@ pub(crate) mod tests {
             decode_soft_deleted_list_response(reqwest::StatusCode::BAD_REQUEST, body, false,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn soft_delete_listing_decodes_provider_hard_delete_time() {
+        let body = br#"{"items":[{"name":"raw/alice/a.enc","generation":"7","size":"12","hardDeleteTime":"2026-08-14T00:00:00.000Z"}]}"#;
+        let page = decode_soft_deleted_list_response(reqwest::StatusCode::OK, body, true).unwrap();
+        assert_eq!(
+            page.versions[0].hard_delete_time.as_deref(),
+            Some("2026-08-14T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn production_exact_generation_download_maps_second_window_404_to_not_found() {
+        assert!(matches!(
+            exact_generation_download_status(reqwest::StatusCode::NOT_FOUND),
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(exact_generation_download_status(reqwest::StatusCode::OK).is_ok());
+        assert!(exact_generation_download_status(reqwest::StatusCode::BAD_GATEWAY).is_ok());
+    }
+
+    #[tokio::test]
+    async fn production_exact_generation_media_404_after_metadata_is_not_found() {
+        use axum::{
+            extract::Request, http::StatusCode, response::IntoResponse, routing::any, Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let metadata_hits = Arc::new(AtomicUsize::new(0));
+        let media_hits = Arc::new(AtomicUsize::new(0));
+        let metadata_hits_for_app = Arc::clone(&metadata_hits);
+        let media_hits_for_app = Arc::clone(&media_hits);
+        let app = Router::new().fallback(any(move |request: Request| {
+            let metadata_hits = Arc::clone(&metadata_hits_for_app);
+            let media_hits = Arc::clone(&media_hits_for_app);
+            async move {
+                match request.uri().path() {
+                    "/computeMetadata/v1/instance/service-accounts/default/token" => {
+                        Json(json!({"access_token": "test-token"})).into_response()
+                    }
+                    path if path.starts_with("/storage/v1/b/test-bucket/o/") => {
+                        metadata_hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "generation": "7",
+                            "size": "12",
+                            "crc32c": "test-crc32c",
+                            "metadata": {"x-kioku-wrapped-dek": "test-wrapped-dek"}
+                        }))
+                        .into_response()
+                    }
+                    path if path.starts_with("/download/storage/v1/b/test-bucket/o/") => {
+                        media_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = GcpGcsClient::for_test_endpoint("test-bucket".into(), endpoint);
+        let result = client
+            .get_object_generation("indexes/opaque.db.enc", 7)
+            .await;
+
+        assert!(matches!(result, Err(EnclaveError::NotFound)));
+        assert_eq!(metadata_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(media_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_exact_generation_metadata_404_is_not_found_without_download() {
+        use axum::{
+            extract::Request, http::StatusCode, response::IntoResponse, routing::any, Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let media_hits = Arc::new(AtomicUsize::new(0));
+        let media_hits_for_app = Arc::clone(&media_hits);
+        let app = Router::new().fallback(any(move |request: Request| {
+            let media_hits = Arc::clone(&media_hits_for_app);
+            async move {
+                match request.uri().path() {
+                    "/computeMetadata/v1/instance/service-accounts/default/token" => {
+                        Json(json!({"access_token": "test-token"})).into_response()
+                    }
+                    path if path.starts_with("/storage/v1/b/test-bucket/o/") => {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                    path if path.starts_with("/download/storage/v1/b/test-bucket/o/") => {
+                        media_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = GcpGcsClient::for_test_endpoint("test-bucket".into(), endpoint);
+        let result = client
+            .get_object_generation("indexes/opaque.db.enc", 7)
+            .await;
+
+        assert!(matches!(result, Err(EnclaveError::NotFound)));
+        assert_eq!(media_hits.load(Ordering::SeqCst), 0);
     }
 
     #[test]

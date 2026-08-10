@@ -829,6 +829,7 @@ async fn main() {
     // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
     cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
     cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
+    cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
 
     // ── Legacy data-plane routes ──────────────────────────────────────────────
     let authenticated = Router::new()
