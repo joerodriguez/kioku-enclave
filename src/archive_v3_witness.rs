@@ -220,8 +220,9 @@ impl fmt::Debug for RootReference {
 /// Read-after-create boundary for root publication. The witness derives a
 /// commitment only from the exact immutable object returned for the nominated
 /// context; sealing bytes in memory is insufficient to advance authority.
+#[async_trait::async_trait]
 pub(crate) trait ExactRootProvider: Send + Sync {
-    fn read_exact(&self, context: &ObjectContext) -> Result<CiphertextEnvelope>;
+    async fn read_exact(&self, context: &ObjectContext) -> Result<CiphertextEnvelope>;
 }
 
 /// Header fields independently verified from the encrypted root before witness CAS.
@@ -265,7 +266,7 @@ impl RootCommitment {
 
     /// Authenticate, decode, and context-check the exact immutable root envelope
     /// before producing the only commitment accepted by non-test advance builders.
-    pub(crate) fn from_authenticated_provider_object(
+    pub(crate) async fn from_authenticated_provider_object(
         expected_archive_id: ArchiveId,
         expected_registry: KeyRegistryReference,
         context: &ObjectContext,
@@ -281,7 +282,7 @@ impl RootCommitment {
         {
             return Err(WitnessError::Malformed);
         }
-        let envelope = provider.read_exact(context)?;
+        let envelope = provider.read_exact(context).await?;
         let plaintext = cipher
             .open(context, &envelope)
             .map_err(|_| WitnessError::Malformed)?;
@@ -826,7 +827,7 @@ impl WitnessBootstrap {
         }
     }
 
-    pub(crate) fn from_authenticated_genesis(
+    pub(crate) async fn from_authenticated_genesis(
         archive_id: ArchiveId,
         registry: KeyRegistryReference,
         context: &ObjectContext,
@@ -835,7 +836,8 @@ impl WitnessBootstrap {
     ) -> Result<Self> {
         let genesis_root = RootCommitment::from_authenticated_provider_object(
             archive_id, registry, context, provider, cipher,
-        )?;
+        )
+        .await?;
         if genesis_root.parent.is_some()
             || genesis_root.root.sequence != 0
             || genesis_root.key_epoch != registry.key_epoch
@@ -907,7 +909,7 @@ impl RootAdvance {
         }
     }
 
-    pub(crate) fn from_authenticated_candidate(
+    pub(crate) async fn from_authenticated_candidate(
         lease: WitnessLease,
         expected_root: RootCommitment,
         expected_registry: KeyRegistryReference,
@@ -927,7 +929,8 @@ impl RootAdvance {
                 context,
                 provider,
                 cipher,
-            )?,
+            )
+            .await?,
         })
     }
 }
@@ -1832,8 +1835,9 @@ mod tests {
         object_id: ObjectId,
         stored: Option<CiphertextEnvelope>,
     }
+    #[async_trait::async_trait]
     impl ExactRootProvider for FakeRootProvider {
-        fn read_exact(&self, context: &ObjectContext) -> Result<CiphertextEnvelope> {
+        async fn read_exact(&self, context: &ObjectContext) -> Result<CiphertextEnvelope> {
             if context.object_id() != self.object_id {
                 return Err(WitnessError::MissingRootObject);
             }
@@ -1853,8 +1857,9 @@ mod tests {
         registry_object_id: ObjectId,
         plaintext: Vec<u8>,
     }
+    #[async_trait::async_trait]
     impl ExactKeyRegistryProvider for FakeKeyRegistryProvider {
-        fn read_exact_wrapped(
+        async fn read_exact_wrapped(
             &self,
             _context: &KeyRegistryContext,
             object_id: ObjectId,
@@ -1867,7 +1872,7 @@ mod tests {
             Ok(WRAPPED_REGISTRY.len())
         }
 
-        fn kms_unwrap_exact(
+        async fn kms_unwrap_exact(
             &self,
             _context: &KeyRegistryContext,
             wrapped_registry_ciphertext: &[u8],
@@ -1968,7 +1973,7 @@ mod tests {
     fn wrapped_registry_hash() -> [u8; 32] {
         Sha256::digest(WRAPPED_REGISTRY).into()
     }
-    fn verified_cipher(
+    async fn verified_cipher(
         archive_id: ArchiveId,
         key_epoch: KeyEpoch,
         rotation_generation: u64,
@@ -1993,6 +1998,7 @@ mod tests {
             wrapped_registry_hash(),
             &provider,
         )
+        .await
         .unwrap()
     }
     fn boot() -> WitnessBootstrap {
@@ -2289,8 +2295,8 @@ mod tests {
             Err(WitnessError::InvalidTransition)
         );
     }
-    #[test]
-    fn authenticated_root_envelope_is_the_only_non_test_candidate_builder() {
+    #[tokio::test]
+    async fn authenticated_root_envelope_is_the_only_non_test_candidate_builder() {
         let (w, _, r, lease) = setup();
         let cipher = verified_cipher(
             r.archive_id,
@@ -2298,7 +2304,8 @@ mod tests {
             r.registry.rotation_generation,
             r.registry.object_id,
             [0x55; 32],
-        );
+        )
+        .await;
         let parent = ParentReference {
             object_id: r.root.root.object_id,
             envelope_hash: r.root.root.ciphertext_hash,
@@ -2343,13 +2350,15 @@ mod tests {
                 &context,
                 &missing_provider,
                 &cipher,
-            ),
+            )
+            .await,
             Err(WitnessError::MissingRootObject)
         ));
         let provider = stored_root_provider(&context, &envelope);
         let advance = RootAdvance::from_authenticated_candidate(
             lease, r.root, r.registry, r.registry, &context, &provider, &cipher,
         )
+        .await
         .unwrap();
         assert_eq!(advance.candidate.root.object_id, context.object_id());
         assert_eq!(advance.candidate.root.ciphertext_hash, envelope.hash());
@@ -2362,7 +2371,8 @@ mod tests {
                 &context,
                 &provider,
                 &cipher,
-            ),
+            )
+            .await,
             Err(WitnessError::Malformed)
         );
         let same_epoch_wrong_registry = KeyRegistryReference::new(
@@ -2378,7 +2388,8 @@ mod tests {
                 &context,
                 &provider,
                 &cipher,
-            ),
+            )
+            .await,
             Err(WitnessError::Malformed)
         );
         let mut tampered_wire = envelope.encode();
@@ -2393,12 +2404,13 @@ mod tests {
                 &context,
                 &tampered_provider,
                 &cipher,
-            ),
+            )
+            .await,
             Err(WitnessError::Malformed)
         );
     }
-    #[test]
-    fn authenticated_genesis_envelope_is_required_for_non_test_bootstrap() {
+    #[tokio::test]
+    async fn authenticated_genesis_envelope_is_required_for_non_test_bootstrap() {
         let archive_id = ArchiveId::from_bytes(id(1));
         let database_epoch = DatabaseEpoch::from_bytes(id(2));
         let key_epoch = KeyEpoch::from_bytes(id(5));
@@ -2440,12 +2452,14 @@ mod tests {
             registry.rotation_generation,
             registry.object_id,
             [0x77; 32],
-        );
+        )
+        .await;
         let envelope = cipher.seal(&context, &root.encode().unwrap()).unwrap();
         let provider = stored_root_provider(&context, &envelope);
         let bootstrap = WitnessBootstrap::from_authenticated_genesis(
             archive_id, registry, &context, &provider, &cipher,
         )
+        .await
         .unwrap();
         let witness = InMemoryWitness::with_clock(Arc::new(FakeClock::new(10)));
         let record = witness.bootstrap(bootstrap).unwrap();
@@ -2464,7 +2478,8 @@ mod tests {
                 &context,
                 &provider,
                 &cipher,
-            ),
+            )
+            .await,
             Err(WitnessError::Malformed)
         ));
     }

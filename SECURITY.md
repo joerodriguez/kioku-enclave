@@ -171,7 +171,14 @@ epoch/object/hash must come from the independent witness so cold recovery can un
 key before decrypting the root. This foundation makes no KMS calls and has no live Store,
 SQLite VFS, GCS, witness, route, migration,
 export, or deletion wiring. The legacy context-bound v2 database blob remains the sole
-production authority. `src/archive_v3_witness.rs` additionally defines a compiled,
+production authority. `src/archive_v3_gcs.rs` is likewise inactive: it specifies and
+tests a redacted async GCS-shaped transport boundary (conditional immutable creation,
+read-after-create equality, bounded canonical-name pagination, and a contract requiring
+exact all-generation deletion) plus canonical KMS AAD for bounded registry unwrap. Its
+fake verifies delegation and multi-generation absence semantics; provider-level deletion
+evidence still requires the pending concrete GCP transport and live drill. It intentionally has no
+concrete GCP HTTP transport, credentials, runtime/deploy wiring, or authority connection;
+its provider errors never contain object paths, IDs, hashes, or cursors. `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
 read the exact immutable root object back through a provider boundary, authenticate and
 decrypt that stored envelope, validate its `ArchiveRoot` against the
