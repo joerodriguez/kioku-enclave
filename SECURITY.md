@@ -146,7 +146,8 @@ Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-wa
 [`RELEASING.md`](RELEASING.md#one-time-legacy-blob-migration) before upgrading a
 ### ADR-0022 archive-v3 foundation is inactive
 
-`src/archive_v3.rs` defines only audited, unit-tested format primitives for the future
+`src/archive_v3.rs` and `src/archive_v3_journal.rs` define only audited, unit-tested
+format primitives for the future
 immutable archive: opaque archive/database/key/object IDs; canonical context-bound
 HKDF-SHA-256 subkeys with randomly nonced AES-256-GCM envelopes; bounded root/Merkle decoding; and an
 immutable-object backend contract. Key-registry entries are explicitly outside the
@@ -166,15 +167,29 @@ production authority. No image may acknowledge a write from archive-v3 until ADR
 Phase 1 shadow recovery, VFS crash/conformance, witness, fault, lifecycle, and capacity
 gates have passed and an explicit authority change is reviewed.
 
+The journal foundation uses independently authenticated, page-aligned checkpoint chunks
+and a persistent fixed-fanout encrypted manifest tree; neither the manifest root nor any
+node grows with database size. Immutable WAL segments repeat the exact SQLite WAL header,
+carry the prior rolling-checksum state, and verify every frame salt and checksum. A large
+SQLite commit may span many bounded predecessor-linked segments; only the final segment
+may contain its commit frame, and the root fixes the exact final reference, WAL generation,
+and segment count. Chain validation rejects frame gaps, checksum discontinuity, wrong
+predecessors, root-sequence substitution, locally valid orphan candidates, and a commit
+marker anywhere but the final frame. These checks do not turn post-commit WAL-file
+scraping into a valid capture mechanism: Phase 1 still requires a SQLite VFS shim that
+observes the exact `xSync` boundary, plus independent shadow recovery and crash
+conformance.
+
 Root objects are explicitly named as candidates. Crashes and CAS races may leave more
 than one immutable candidate for a sequence; none has authority unless the independent
 witness names its exact object ID and ciphertext hash, and recovery never selects one by
 listing a storage prefix.
 
-The foundation also refuses a monolithic checkpoint object: its generic envelope is
-bounded near 1 MiB, so the checkpoint role/tag remains reserved until a reviewed bounded
-streaming/chunk-manifest format exists. A WAL-bearing root must still name a checkpoint
-base reference, preventing publication of an unrecoverable WAL chain.
+The foundation refuses a monolithic checkpoint object: each encrypted checkpoint chunk is
+at most 1 MiB and each manifest node is at most 32 KiB with fixed fanout. A WAL-bearing
+root must still name the checkpoint-manifest base reference, preventing publication of an
+unrecoverable WAL chain. Chunking/manifest construction and recovery remain inactive until
+their storage/witness fault gates pass.
 
 During the ADR-0022 legacy lifecycle transition, before the first whole-blob overwrite
 for each user and UTC day, the service creates or verifies one immutable server-side
