@@ -78,6 +78,9 @@ mod archive_v3;
 mod archive_v3_gcs;
 mod archive_v3_journal;
 mod archive_v3_operation;
+// ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
+// registered SQLite VFS and has no Store, provider, route, or authority wiring.
+mod archive_v3_shadow;
 // ADR-0022's inactive, in-memory witness contract.  It intentionally has no
 // provider, Store, VFS, route, or authority wiring.
 mod archive_v3_witness;

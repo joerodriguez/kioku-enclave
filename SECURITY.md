@@ -154,7 +154,7 @@ Its reports permanently classify as non-evidence (`release_evidence: false` and
 authority or evidence the production image/VM, backend, VFS, witness, cache/concurrency,
 fault, deletion, lifecycle, or 32-GiB release gates.
 
-`src/archive_v3.rs` and `src/archive_v3_journal.rs` define only audited, unit-tested
+`src/archive_v3.rs`, `src/archive_v3_journal.rs`, and `src/archive_v3_shadow.rs` define only audited, unit-tested
 format primitives for the future
 immutable archive: opaque archive/database/key/object IDs; canonical context-bound
 HKDF-SHA-256 subkeys with randomly nonced AES-256-GCM envelopes; bounded root/Merkle decoding; and an
@@ -178,7 +178,10 @@ exact all-generation deletion) plus canonical KMS AAD for bounded registry unwra
 fake verifies delegation and multi-generation absence semantics; provider-level deletion
 evidence still requires the pending concrete GCP transport and live drill. It intentionally has no
 concrete GCP HTTP transport, credentials, runtime/deploy wiring, or authority connection;
-its provider errors never contain object paths, IDs, hashes, or cursors. `src/archive_v3_witness.rs` additionally defines a compiled,
+its provider errors never contain object paths, IDs, hashes, or cursors. The shadow module
+is bounded synchronous capture state only: no
+SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
+`src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
 read the exact immutable root object back through a provider boundary, authenticate and
 decrypt that stored envelope, validate its `ArchiveRoot` against the
