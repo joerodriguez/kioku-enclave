@@ -26,6 +26,7 @@ from typing import Any
 from generate_capacity_fixture import (
     DEFAULT_MANIFEST,
     ManifestError,
+    RECORD_KINDS,
     load_manifest,
     synthetic_records,
     validate_manifest,
@@ -181,11 +182,14 @@ def reject_full_mode(args: argparse.Namespace, profile: dict[str, Any]) -> None:
     )
 
 
-def run_config(args: argparse.Namespace, manifest_hash: str) -> dict[str, Any]:
+def run_config(
+    args: argparse.Namespace, manifest_hash: str, expected_records_sha256: str
+) -> dict[str, Any]:
     """All state that must remain identical across an interrupted smoke run."""
     return {
         "schema": RUN_SCHEMA,
         "manifest_sha256": manifest_hash,
+        "expected_records_sha256": expected_records_sha256,
         "profile": args.profile,
         "mode": args.mode,
         "record_limit": args.record_limit,
@@ -307,12 +311,39 @@ def expected_counts(profile: dict[str, Any], record_limit: int) -> dict[str, int
     }
 
 
+def normalized_record(record: dict[str, Any]) -> tuple[str, int, int, int]:
+    return (
+        str(record["kind"]),
+        int(record["ordinal"]),
+        int(record["logical_offset_ms"]),
+        int(record["token"] & 0x7FFF_FFFF_FFFF_FFFF),
+    )
+
+
+def update_records_digest(digest: Any, row: tuple[str, int, int, int]) -> None:
+    digest.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}\n".encode("ascii"))
+
+
+def expected_records_digest(
+    profile: dict[str, Any], seed: int, record_limit: int
+) -> str:
+    digest = hashlib.sha256()
+    for record in synthetic_records(profile, seed, record_limit):
+        update_records_digest(digest, normalized_record(record))
+    return digest.hexdigest()
+
+
 def records_digest(connection: sqlite3.Connection) -> str:
     digest = hashlib.sha256()
-    for row in connection.execute(
-        "SELECT kind, ordinal, logical_offset_ms, token FROM synthetic_records ORDER BY kind, ordinal"
-    ):
-        digest.update(f"{row[0]}:{row[1]}:{row[2]}:{row[3]}\n".encode("ascii"))
+    kind_order = " ".join(
+        f"WHEN ? THEN {index}" for index, _ in enumerate(RECORD_KINDS)
+    )
+    query = (
+        "SELECT kind, ordinal, logical_offset_ms, token FROM synthetic_records "
+        f"ORDER BY CASE kind {kind_order} ELSE {len(RECORD_KINDS)} END, ordinal"
+    )
+    for row in connection.execute(query, tuple(RECORD_KINDS)):
+        update_records_digest(digest, (str(row[0]), int(row[1]), int(row[2]), int(row[3])))
     return digest.hexdigest()
 
 
@@ -368,7 +399,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         fail("smoke mode cannot accept production provenance or release-gate claims")
 
     manifest_hash = hashlib.sha256(raw).hexdigest()
-    config = run_config(args, manifest_hash)
+    expected_export_digest = expected_records_digest(
+        profile, manifest["seed"], args.record_limit
+    )
+    config = run_config(args, manifest_hash, expected_export_digest)
     output = prepare_output(safe_output(args.output), resume=args.resume, config=config)
     database = output / DATABASE_NAME
     report_path = output / REPORT_NAME
@@ -403,14 +437,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         batch: list[tuple[str, int, int, int]] = []
         for record in synthetic_records(profile, manifest["seed"], args.record_limit):
-            batch.append(
-                (
-                    str(record["kind"]),
-                    int(record["ordinal"]),
-                    int(record["logical_offset_ms"]),
-                    int(record["token"] & 0x7FFF_FFFF_FFFF_FFFF),
-                )
-            )
+            batch.append(normalized_record(record))
             if len(batch) == args.batch_size:
                 connection.executemany("INSERT OR IGNORE INTO synthetic_records VALUES (?, ?, ?, ?)", batch)
                 connection.commit()
@@ -433,6 +460,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         expected = expected_counts(profile, args.record_limit)
         if counts != expected:
             fail("resumed SQLite records do not exactly match the requested fixture distribution")
+        export_digest = records_digest(connection)
+        if export_digest != expected_export_digest:
+            fail("resumed SQLite record content does not match the deterministic fixture")
         connection.execute("DROP TABLE IF EXISTS synthetic_fts")
         connection.execute("CREATE VIRTUAL TABLE synthetic_fts USING fts5(kind, token)")
         connection.execute(
@@ -462,7 +492,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             query_latencies.append((time.monotonic_ns() - query_started) // 1_000_000)
         page_size = connection.execute("PRAGMA page_size").fetchone()[0]
         logical_bytes = connection.execute("PRAGMA page_count").fetchone()[0] * page_size
-        export_digest = records_digest(connection)
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         connection.close()
@@ -511,6 +540,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "cumulative_elapsed_seconds": receipt["cumulative_elapsed_seconds"],
             "cumulative_rss_peak_bytes": receipt["cumulative_rss_peak_bytes"],
             "logical_export_sha256": export_digest,
+            "expected_logical_export_sha256": expected_export_digest,
             "sqlite_integrity": integrity,
             "fts_integrity": "ok",
         },

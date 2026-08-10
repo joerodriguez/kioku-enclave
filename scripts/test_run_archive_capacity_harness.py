@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -91,6 +92,30 @@ class HarnessTests(unittest.TestCase):
             resumed = self.run_harness(*self.smoke_args(output, "--record-limit", "3", "--resume"))
             self.assertNotEqual(resumed.returncode, 0)
             self.assertIn("do not match", resumed.stderr)
+
+    def test_resume_rejects_content_tampering_that_preserves_counts_and_integrity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "capacity"
+            first = self.run_harness(*self.smoke_args(output))
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            receipt_path = output / "capacity-run.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["state"] = "running"
+            receipt_path.write_text(
+                json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+            )
+            (output / "capacity-report.json").unlink()
+            with sqlite3.connect(output / "archive-capacity.sqlite") as connection:
+                connection.execute(
+                    "UPDATE synthetic_records SET token = token + 1 "
+                    "WHERE (kind, ordinal) = (SELECT kind, ordinal FROM synthetic_records LIMIT 1)"
+                )
+                connection.commit()
+
+            resumed = self.run_harness(*self.smoke_args(output, "--resume"))
+            self.assertNotEqual(resumed.returncode, 0)
+            self.assertIn("record content does not match", resumed.stderr)
 
     def test_foreign_and_symlink_outputs_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
