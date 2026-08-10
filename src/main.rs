@@ -665,6 +665,22 @@ async fn main() {
         cp::CpConfig::from_env(jwt_secrets, google_web_client_secret)
             .expect("control-plane config"),
     );
+    let apple_provider = if let Some(config) = cp_config.apple_sign_in.clone() {
+        let private_key = if test_mode_enabled() {
+            std::env::var("APPLE_PRIVATE_KEY_PEM")
+                .unwrap_or_else(|_| panic!("APPLE_PRIVATE_KEY_PEM is required when Apple sign-in is configured in test mode"))
+        } else {
+            cp::fetch_secret_from_manager("kioku-apple-sign-in-private-key", "latest")
+                .await
+                .unwrap_or_else(|e| panic!("Failed to fetch Sign in with Apple private key: {e}"))
+        };
+        Some(Arc::new(
+            cp::apple::AppleIdentityProvider::new(config, &private_key)
+                .expect("valid Sign in with Apple private key"),
+        ))
+    } else {
+        None
+    };
 
     // ── TLS & Attestation setup ───────────────────────────────────────────────
     let port: u16 = std::env::var("PORT")
@@ -782,6 +798,7 @@ async fn main() {
             .reviewer_auth
             .as_ref()
             .map(|config| Arc::new(cp::auth::ReviewerIdentityVerifier::new(config.clone()))),
+        apple_provider,
         sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
         mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
         oauth_limiter: cp::limits::RateLimiter::new(120.0, 2.0),
@@ -822,6 +839,7 @@ async fn main() {
     let cp_authed = cp::sync::router()
         .merge(cp::media::router())
         .merge(cp::query::router())
+        .merge(cp::apple::authenticated_router())
         .layer(middleware::from_fn_with_state(
             Arc::clone(&cp_state),
             cp::auth::require_auth,
@@ -830,10 +848,9 @@ async fn main() {
             Arc::clone(&cp_state),
             cp::cors::cors_middleware,
         ));
-    let public_oauth = cp::oauth::router().layer(middleware::from_fn_with_state(
-        Arc::clone(&cp_state),
-        limit_public_oauth,
-    ));
+    let public_oauth = cp::oauth::router().merge(cp::apple::public_router()).layer(
+        middleware::from_fn_with_state(Arc::clone(&cp_state), limit_public_oauth),
+    );
     let control_plane = public_oauth
         .merge(cp_authed)
         .with_state(Arc::clone(&cp_state));

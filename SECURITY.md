@@ -3,7 +3,7 @@
 ## Scope
 
 `kioku-enclave` is the production Kioku backend, not only a storage data plane. The
-same attested Rust process terminates TLS and implements Google OAuth, token issuance,
+same attested Rust process terminates TLS and implements Google/Apple authentication, token issuance,
 device sync, MCP and REST queries, account export/deletion, quotas, summarisation, and
 encrypted persistence. This threat model therefore includes those control-plane
 surfaces.
@@ -272,13 +272,18 @@ principal set—no `user:`, `group:`, or `serviceAccount:` member.
 
 ### T2 — Compromised client token or legacy caller
 
-**Threat:** An attacker steals a Kioku bearer token, a Google identity token, or the
+**Threat:** An attacker steals a Kioku bearer token, a Google identity token, an Apple
+authorization response, or the
 identity of the service account trusted by legacy `/v1/*` routes.
 
 **Mitigation:** Public OAuth validates configured Google audiences and the account
-allow-list. Authenticated routes derive the user from the Kioku token rather than trusting
-a caller-supplied identity. OAuth uses PKCE and persisted, single-use authorization-code
-state. Legacy routes accept only Google-signed ID tokens with the baked audience and
+allow-list. Native Apple login verifies Apple's signature, issuer, audience, expiry,
+verified email, nonce, and subject, exchanges the single-use code server-side, and never
+links accounts by email. Authenticated routes derive the user from the Kioku token rather
+than trusting a caller-supplied identity. OAuth uses PKCE and persisted, single-use
+authorization-code state. Apple refresh authorization is held only in the encrypted
+control store and revoked before identity deletion. Legacy routes accept only
+Google-signed ID tokens with the baked audience and
 service-account email; there is no shared-secret or auth-disable fallback. User IDs are
 validated before use in paths or object names.
 
@@ -365,9 +370,12 @@ signatures, or response bodies.
 
 ### Stable user identifiers are linkable
 
-User IDs are deterministically derived from the Google subject identifier. Anyone who
-already knows that subject can derive the corresponding `indexes/{user_id}.db.enc` name.
-This is an accepted availability trade-off, not an encryption bypass.
+Google-primary user IDs preserve their deterministic historical derivation. New
+Apple-primary IDs are deterministically derived from a provider-domain-separated Apple
+subject; explicitly linked providers retain the existing canonical account ID. Anyone who
+already knows a primary subject and provider can derive the corresponding
+`indexes/{user_id}.db.enc` name. This is an accepted availability trade-off, not an
+encryption bypass.
 
 ### Aggregate storage telemetry reveals process-wide activity
 

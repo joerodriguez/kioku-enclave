@@ -469,7 +469,46 @@ async fn delete_account(
         }
     }
 
-    // 2. Delete content. On failure the durable `deleting` status remains, so
+    // 2. Revoke Apple's retained refresh token before erasing it. A transient
+    // provider failure leaves the durable `deleting` status in place so this
+    // same DELETE can retry while every other authenticated route stays denied.
+    let apple_refresh = match s.control.apple_refresh_token(&user_id).await {
+        Ok(token) => token,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "identity_cleanup_failed"})),
+            )
+                .into_response()
+        }
+    };
+    if let Some(refresh_token) = apple_refresh {
+        let Some(provider) = s.apple_provider.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "apple_revocation_unavailable"})),
+            )
+                .into_response();
+        };
+        if let Err(error) = provider.revoke_refresh_token(&refresh_token).await {
+            warn!(error = %error, "Apple credential revocation failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "apple_revocation_failed"})),
+            )
+                .into_response();
+        }
+        if let Err(error) = s.control.mark_apple_credential_revoked(&user_id).await {
+            warn!(error = %error, "Apple credential revocation state failed to persist");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "identity_cleanup_failed"})),
+            )
+                .into_response();
+        }
+    }
+
+    // 3. Delete content. On failure the durable `deleting` status remains, so
     // all non-deletion access stays denied and this endpoint can safely retry.
     if let Err(e) = s.store.delete_user(&user_id).await {
         warn!(error = %e, "enclave delete failed");
@@ -479,7 +518,7 @@ async fn delete_account(
         )
             .into_response();
     }
-    // 3. Remove identity/accounting rows and leave a stable deletion tombstone.
+    // 4. Remove identity/accounting rows and leave stable account/provider tombstones.
     match s.control.finalize_user_deletion(&user_id).await {
         Ok(deleted) => Json(json!({ "deleted": deleted })).into_response(),
         Err(_) => (
