@@ -18,9 +18,11 @@
 //!
 //! GCS object versioning provides `generation` numbers.  On every PUT we pass
 //! `ifGenerationMatch=<generation-we-read>`.  If another enclave instance wrote
-//! between our read and write GCS returns 412 Precondition Failed, which we
-//! surface as [`crate::error::EnclaveError::Conflict`].  The caller (handler)
-//! should reload, re-apply changes, and retry.  In the current single-node MIG
+//! between our read and write GCS returns 412 Precondition Failed. A retry after
+//! a lost successful PUT reconciles only when the current object has the exact
+//! wrapped DEK and authenticated plaintext we intended to persist; every other
+//! 412 surfaces as [`crate::error::EnclaveError::Conflict`]. The caller (handler)
+//! should then reload, re-apply changes, and retry. In the current single-node
 //! topology conflicts are rare; this is future-proofing for horizontal scale-out.
 //!
 //! # LRU cache
@@ -1361,7 +1363,7 @@ impl Store {
         let encrypted_bytes = ciphertext.len() as u64;
         self.storage_metrics
             .record_encrypted_upload_attempt(encrypted_bytes);
-        let new_generation = self
+        let put_result = self
             .gcs
             .put_object(
                 &object_name,
@@ -1369,7 +1371,33 @@ impl Store {
                 &handle.blob_meta.wrapped_dek_b64,
                 handle.blob_meta.generation,
             )
-            .await?;
+            .await;
+        let new_generation = match put_result {
+            Ok(generation) => generation,
+            Err(conflict @ EnclaveError::Conflict(_)) => {
+                // A generation mismatch can be the retry of a PUT that GCS
+                // committed before its response was lost or the caller was
+                // cancelled. Reconcile only against the current immutable
+                // snapshot: the wrapped DEK metadata must be byte-for-byte the
+                // same, that DEK must authenticate the current envelope, and
+                // the plaintext SQLite image must exactly equal this pending
+                // save. Any genuine concurrent write remains a conflict.
+                match self
+                    .reconcile_committed_snapshot(
+                        &object_name,
+                        &handle.blob_meta.wrapped_dek_b64,
+                        &dek,
+                        &context,
+                        &db_bytes,
+                    )
+                    .await
+                {
+                    Some(generation) => generation,
+                    None => return Err(conflict),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         // Invariant: record the post-write generation, or the NEXT save's
         // `ifGenerationMatch` conflicts against our own previous write.
         handle.blob_meta.generation = new_generation;
@@ -1379,6 +1407,27 @@ impl Store {
 
         debug!("flushed user index to GCS");
         Ok((logical_db_bytes, changed_wal_bytes_proxy, encrypted_bytes))
+    }
+
+    async fn reconcile_committed_snapshot(
+        &self,
+        object_name: &str,
+        expected_wrapped_dek_b64: &str,
+        expected_dek: &Dek,
+        context: &[u8],
+        expected_plaintext: &[u8],
+    ) -> Option<i64> {
+        let current = self.gcs.get_object(object_name).await.ok()?;
+        self.storage_metrics
+            .record_encrypted_download(current.ciphertext.len() as u64);
+        if current.generation <= 0 || current.wrapped_dek_b64 != expected_wrapped_dek_b64 {
+            return None;
+        }
+        let opened = decrypt_bound_blob(expected_dek, &current.ciphertext, context).ok()?;
+        if opened.requires_rewrite || opened.plaintext != expected_plaintext {
+            return None;
+        }
+        Some(current.generation)
     }
 
     async fn ensure_legacy_recovery_checkpoint(
@@ -3826,6 +3875,7 @@ pub(crate) mod tests {
         fail_copy: StdMutex<Option<EnclaveError>>,
         fail_copy_after_create: StdMutex<Option<EnclaveError>>,
         fail_put: StdMutex<Option<EnclaveError>>,
+        fail_put_after_commit: StdMutex<Option<EnclaveError>>,
         fail_generation_delete: StdMutex<Option<(String, i64)>>,
         soft_delete_enabled: StdMutex<bool>,
         repeat_version_cursor: StdMutex<bool>,
@@ -3842,6 +3892,7 @@ pub(crate) mod tests {
                 fail_copy: StdMutex::new(None),
                 fail_copy_after_create: StdMutex::new(None),
                 fail_put: StdMutex::new(None),
+                fail_put_after_commit: StdMutex::new(None),
                 fail_generation_delete: StdMutex::new(None),
                 soft_delete_enabled: StdMutex::new(false),
                 repeat_version_cursor: StdMutex::new(false),
@@ -4022,6 +4073,9 @@ pub(crate) mod tests {
                 versions.push(new_obj);
             } else {
                 store.insert(object_name.to_string(), vec![new_obj]);
+            }
+            if let Some(error) = self.fail_put_after_commit.lock().unwrap().take() {
+                return Err(error);
             }
             Ok(new_gen)
         }
@@ -5327,6 +5381,124 @@ pub(crate) mod tests {
         assert_eq!(gcs.generation(&gcs_object_name("dirty-retry")), None);
         store.save_user("dirty-retry").await.unwrap();
         assert_eq!(gcs.generation(&gcs_object_name("dirty-retry")), Some(1));
+    }
+
+    #[tokio::test]
+    async fn lost_put_success_reconciles_exact_snapshot_before_access() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = Store::new(kms.clone(), gcs.clone());
+        store
+            .with_user("lost-put-success", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-01-01T00:00:00Z', 'durable despite lost response')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        *gcs.fail_put_after_commit.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost PUT response".into()));
+
+        assert!(matches!(
+            store.save_user("lost-put-success").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        let object_name = gcs_object_name("lost-put-success");
+        assert_eq!(gcs.generation(&object_name), Some(1));
+
+        // Access retries with the old generation, receives a conflict, and
+        // accepts the current generation only after exact authenticated
+        // plaintext/DEK reconciliation.
+        let count: i64 = store
+            .with_user_read("lost-put-success", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(gcs.version_count(&object_name), 1);
+        assert_eq!(
+            gcs.put_calls.lock().unwrap().as_slice(),
+            &[(object_name.clone(), 0), (object_name.clone(), 0)]
+        );
+
+        let restarted = Store::new(kms, gcs);
+        let durable_count: i64 = restarted
+            .with_user_read("lost-put-success", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(durable_count, 1);
+    }
+
+    #[tokio::test]
+    async fn generation_conflict_with_different_snapshot_remains_conflict() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let local = Store::new(kms.clone(), gcs.clone());
+        write_and_save(&local, "real-conflict", "baseline")
+            .await
+            .unwrap();
+        local
+            .with_user("real-conflict", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-01-02T00:00:00Z', 'local pending state')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let concurrent = Store::new(kms, gcs.clone());
+        write_and_save(&concurrent, "real-conflict", "different remote state")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            local.save_user("real-conflict").await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(gcs.generation(&gcs_object_name("real-conflict")), Some(2));
+    }
+
+    #[tokio::test]
+    async fn lost_put_success_with_changed_wrapped_dek_remains_conflict() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .with_user("lost-put-dek-mismatch", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        *gcs.fail_put_after_commit.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost PUT response".into()));
+        assert!(store.save_user("lost-put-dek-mismatch").await.is_err());
+
+        let object_name = gcs_object_name("lost-put-dek-mismatch");
+        gcs.objects
+            .lock()
+            .unwrap()
+            .get_mut(&object_name)
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .wrapped_dek_b64 = B64.encode([9_u8; 32]);
+
+        assert!(matches!(
+            store.save_user("lost-put-dek-mismatch").await,
+            Err(EnclaveError::Conflict(_))
+        ));
     }
 
     #[tokio::test]

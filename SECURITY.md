@@ -187,6 +187,10 @@ and their content-free metadata are included in later export/deletion inventorie
 flush begins, any failure before the authoritative generation-checked PUT succeeds fences
 the local handle: its next access must retry persistence before request code can observe an
 idempotency duplicate and acknowledge it.
+If GCS committed that PUT but its response was lost or the caller was cancelled, the retry's
+generation conflict is accepted only after the current object carries the exact same wrapped
+DEK metadata and decrypts under that DEK/context to the exact pending SQLite image. A different
+or unverifiable current object remains a conflict; reconciliation never overwrites it.
 
 Legacy whole-database persistence tracks a process-local dirty generation around every
 SQLite operation. Cumulative row changes include SQL-trigger effects; schema version,
