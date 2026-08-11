@@ -94,7 +94,7 @@ pub struct UploadedExtentTree {
     extent_slots: u64,
     tree_height: u8,
     extent_count: u64,
-    plaintext_hash: [u8; 32],
+    sparse_content_commitment: [u8; 32],
 }
 impl UploadedExtentTree {
     pub fn root(&self) -> &ImmutableReference {
@@ -112,8 +112,12 @@ impl UploadedExtentTree {
     pub const fn extent_count(&self) -> u64 {
         self.extent_count
     }
-    pub const fn plaintext_hash(&self) -> [u8; 32] {
-        self.plaintext_hash
+    /// Domain-separated commitment to this sparse source stream, including
+    /// its logical length, stored extent numbers, lengths, and bytes. It is
+    /// not a hash of a logical SQLite image because omitted sparse holes are
+    /// represented by their absence rather than hashed zero-filled bytes.
+    pub const fn sparse_content_commitment(&self) -> [u8; 32] {
+        self.sparse_content_commitment
     }
 }
 impl std::fmt::Debug for UploadedExtentTree {
@@ -134,6 +138,10 @@ pub struct AuthenticatedExtentRoot {
     tree_height: u8,
 }
 impl AuthenticatedExtentRoot {
+    /// Builds traversal facts from an archive root that the caller has already
+    /// decrypted, context-validated, and bound to the exact independent-witness
+    /// commitment. This constructor validates only local root format facts; it
+    /// does not itself authenticate a caller-supplied root object.
     pub fn from_authenticated_archive_root(
         archive_id: ArchiveId,
         root: &ArchiveRoot,
@@ -185,7 +193,10 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
     let mut root = None;
     let mut last = None;
     let mut count = 0u64;
-    let mut hash = Sha256::new();
+    let mut sparse_content_commitment = Sha256::new();
+    sparse_content_commitment.update(b"kioku:archive:v3:sparse-extent-content\0");
+    sparse_content_commitment.update([crate::archive_v3::ARCHIVE_FORMAT_VERSION]);
+    sparse_content_commitment.update(logical_file_length.to_be_bytes());
     while let Some(item) = source.next_extent(buffer.as_mut_slice())? {
         validate_source_extent(item, slots, logical_file_length, last)?;
         let bytes = &buffer[..item.logical_byte_len as usize];
@@ -202,15 +213,19 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
         backend
             .create_if_absent(context.object_key(), envelope.clone())
             .await?;
-        hash.update(bytes);
+        let reference = ImmutableReference {
+            object_id,
+            envelope_hash: envelope.hash(),
+        };
+        verify_created_extent(backend, cipher, &context, &reference, bytes).await?;
+        sparse_content_commitment.update(item.extent_no.to_be_bytes());
+        sparse_content_commitment.update(item.logical_byte_len.to_be_bytes());
+        sparse_content_commitment.update(bytes);
         leaves.push(ExtentReference {
             extent_no: item.extent_no,
             logical_byte_len: item.logical_byte_len,
             revision: 1,
-            reference: ImmutableReference {
-                object_id,
-                envelope_hash: envelope.hash(),
-            },
+            reference,
         });
         last = Some(item.extent_no);
         count = count
@@ -302,7 +317,7 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
         extent_slots: slots,
         tree_height,
         extent_count: count,
-        plaintext_hash: hash.finalize().into(),
+        sparse_content_commitment: sparse_content_commitment.finalize().into(),
     })
 }
 
@@ -360,6 +375,11 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
             MerkleEntries::Leaf(entries) => {
                 for entry in entries {
                     if entry.extent_no >= first && entry.extent_no <= last {
+                        validate_recovery_extent_reference(
+                            &entry,
+                            root.extent_slots,
+                            root.logical_file_length,
+                        )?;
                         copy_intersection(
                             backend,
                             cipher,
@@ -458,6 +478,30 @@ fn validate_source_extent(
         )
     {
         return Err(ExtentTreeError::Source);
+    }
+    Ok(())
+}
+fn validate_recovery_extent_reference(
+    entry: &ExtentReference,
+    slots: u64,
+    logical_file_length: u64,
+) -> Result<()> {
+    entry.validate()?;
+    if entry.extent_no >= slots {
+        return Err(ArchiveV3Error::Authentication.into());
+    }
+    let offset = entry
+        .extent_no
+        .checked_mul(u64::from(EXTENT_BYTES))
+        .ok_or(ArchiveV3Error::Authentication)?;
+    let expected = min(
+        logical_file_length
+            .checked_sub(offset)
+            .ok_or(ArchiveV3Error::Authentication)?,
+        u64::from(EXTENT_BYTES),
+    );
+    if u64::from(entry.logical_byte_len) != expected {
+        return Err(ArchiveV3Error::Authentication.into());
     }
     Ok(())
 }
@@ -567,14 +611,19 @@ async fn seal_node<C: ExtentCipher>(
     backend
         .create_if_absent(context.object_key(), envelope.clone())
         .await?;
+    let reference = ImmutableReference {
+        object_id,
+        envelope_hash: envelope.hash(),
+    };
+    let readback = load_node(backend, cipher, &context, &reference).await?;
+    if readback != node {
+        return Err(ArchiveV3Error::Authentication.into());
+    }
     Ok(NodeSpan {
         level: node.level,
         range_start: node.range_start,
         range_end: node.range_end,
-        reference: ImmutableReference {
-            object_id,
-            envelope_hash: envelope.hash(),
-        },
+        reference,
     })
 }
 #[allow(clippy::too_many_arguments)]
@@ -696,6 +745,20 @@ async fn load_node<C: ExtentCipher>(
     }
     Ok(node)
 }
+async fn verify_created_extent<C: ExtentCipher>(
+    backend: &dyn ImmutableObjectBackend,
+    cipher: &C,
+    context: &ObjectContext,
+    reference: &ImmutableReference,
+    expected: &[u8],
+) -> Result<()> {
+    let envelope = load_exact(backend, context, reference).await?;
+    let plaintext = Zeroizing::new(cipher.open(context, &envelope)?);
+    if plaintext.as_slice() != expected {
+        return Err(ArchiveV3Error::Authentication.into());
+    }
+    Ok(())
+}
 fn validate_node_shape(node: &MerkleNode, level: u8, start: u64, end: u64) -> Result<()> {
     node.validate()?;
     if node.level != level || node.range_start != start || node.range_end != end {
@@ -807,28 +870,6 @@ mod tests {
             }))
         }
     }
-    struct PatternSource {
-        length: u64,
-        count: u64,
-        next: u64,
-    }
-    impl ExtentSource for PatternSource {
-        fn logical_file_length(&self) -> Result<u64> {
-            Ok(self.length)
-        }
-        fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
-            if self.next == self.count {
-                return Ok(None);
-            }
-            output.fill((self.next % 251) as u8);
-            let extent_no = self.next;
-            self.next += 1;
-            Ok(Some(SourceExtent {
-                extent_no,
-                logical_byte_len: EXTENT_BYTES,
-            }))
-        }
-    }
     #[derive(Default)]
     struct FaultBackend {
         inner: InMemoryImmutableBackend,
@@ -840,6 +881,8 @@ mod tests {
         None,
         Missing(ObjectId),
         Tamper(ObjectId),
+        MissingOnRead(usize),
+        TamperOnRead(usize),
         Substitute(ObjectId, CiphertextEnvelope),
         Block,
     }
@@ -853,6 +896,37 @@ mod tests {
             self.inner.create_if_absent(k, v).await
         }
         async fn get(&self, k: &ObjectKey) -> ArchiveResult<Option<CiphertextEnvelope>> {
+            let one_shot = {
+                let mut fault = self.fault.lock().unwrap();
+                match &mut *fault {
+                    Fault::MissingOnRead(reads) if *reads == 1 => {
+                        *fault = Fault::None;
+                        Some(true)
+                    }
+                    Fault::TamperOnRead(reads) if *reads == 1 => {
+                        *fault = Fault::None;
+                        Some(false)
+                    }
+                    Fault::MissingOnRead(reads) | Fault::TamperOnRead(reads) => {
+                        *reads -= 1;
+                        None
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(missing) = one_shot {
+                if missing {
+                    return Ok(None);
+                }
+                let mut encoded = self
+                    .inner
+                    .get(k)
+                    .await?
+                    .ok_or(ArchiveV3Error::Authentication)?
+                    .encode();
+                *encoded.last_mut().ok_or(ArchiveV3Error::Authentication)? ^= 0x01;
+                return Ok(Some(CiphertextEnvelope::decode(&encoded)?));
+            }
             let fault = { self.fault.lock().unwrap().clone() };
             match fault {
                 Fault::Missing(id) if id == k.object_id() => Ok(None),
@@ -910,6 +984,88 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[tokio::test]
+    async fn accepted_creates_require_extent_and_node_readback() {
+        let (a, d, k) = ids();
+        for fault in [
+            Fault::MissingOnRead(1),
+            Fault::TamperOnRead(1),
+            Fault::MissingOnRead(2),
+            Fault::TamperOnRead(2),
+        ] {
+            let cipher = TestCipher::new(a, k);
+            let backend = FaultBackend::default();
+            *backend.fault.lock().unwrap() = fault;
+            let mut source = VecSource {
+                length: u64::from(EXTENT_BYTES),
+                entries: vec![(0, bytes(256, 0x6a))],
+                next: 0,
+            };
+            assert!(upload_extent_tree(&backend, &cipher, a, d, &mut source)
+                .await
+                .is_err());
+        }
+    }
+    #[tokio::test]
+    async fn authenticated_short_nonfinal_extent_is_not_a_sparse_hole() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let node_id = ObjectId::from_bytes([0x61; 16]);
+        let node = MerkleNode {
+            level: 0,
+            range_start: 0,
+            range_end: 1,
+            entries: MerkleEntries::Leaf(vec![ExtentReference {
+                extent_no: 0,
+                logical_byte_len: SQLITE_PAGE_SIZE,
+                revision: 1,
+                reference: ImmutableReference {
+                    object_id: ObjectId::from_bytes([0x62; 16]),
+                    envelope_hash: [0x63; 32],
+                },
+            }]),
+        };
+        let context = node_context(a, d, k, 0, 0, 1, node_id).unwrap();
+        let envelope = cipher.seal(&context, &node.encode().unwrap()).unwrap();
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await
+            .unwrap();
+        let root = AuthenticatedExtentRoot::from_authenticated_archive_root(
+            a,
+            &ArchiveRoot {
+                root_seq: 0,
+                parent: None,
+                database_epoch: d,
+                key_epoch: k,
+                owner_fencing_epoch: 0,
+                sqlite_page_size: SQLITE_PAGE_SIZE,
+                logical_file_length: u64::from(EXTENT_BYTES),
+                user_schema_version: 1,
+                storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
+                wal_generation: 0,
+                wal_segment_count: 0,
+                checkpoint_root: None,
+                extent_tree_root: Some(ImmutableReference {
+                    object_id: node_id,
+                    envelope_hash: envelope.hash(),
+                }),
+                wal_chain_root: None,
+            },
+        )
+        .unwrap();
+        let mut output = vec![0; SQLITE_PAGE_SIZE as usize];
+        assert!(reconstruct_extent_range(
+            &backend,
+            &cipher,
+            &root,
+            SQLITE_PAGE_SIZE.into(),
+            &mut output,
+        )
+        .await
+        .is_err());
     }
     #[tokio::test]
     async fn sparse_final_partial_and_range_recovery_are_bounded() {

@@ -418,9 +418,13 @@ their storage/witness fault gates pass.
 caller-owned, page-aligned 1 MiB buffer at a time into context-bound immutable
 extent objects and persistent 256-way sparse Merkle nodes. Exact-root range
 recovery derives every node/extent key from an already authenticated root,
-never lists storage, verifies each envelope hash, AEAD context, node range and
-level, bounded traversal/object counts, and extent length before copying an
-intersection into a caller-owned buffer; missing sparse extents are zeroes.
+never lists storage, verifies every accepted create by exact readback before it
+is linked, then verifies each envelope hash, AEAD context, node range and
+level, bounded traversal/object counts, and exact full-or-final extent length
+before copying an intersection into a caller-owned buffer; only absent sparse
+extents are zeroes. Its returned sparse-content commitment is domain-separated
+and binds the logical length plus every stored extent number, length, and byte
+stream; it is not a hash of a zero-filled logical SQLite image.
 This is not a live recovery or authority path: it has no Store, VFS, provider,
 witness, route, flag, or credential wiring. The current codec intentionally
 has no authenticated empty-tree representation, so an all-hole file is
