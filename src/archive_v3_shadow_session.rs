@@ -257,6 +257,18 @@ impl ShadowSessionBinding {
     pub const fn database_epoch(self) -> [u8; 16] {
         self.database_epoch
     }
+    pub(crate) const fn registry_epoch(self) -> [u8; 16] {
+        self.registry_epoch
+    }
+    pub(crate) const fn base_root_seq(self) -> u64 {
+        self.base_root_seq
+    }
+    pub(crate) const fn base_root_object_id(self) -> [u8; 16] {
+        self.base_root_object_id
+    }
+    pub(crate) const fn base_root_ciphertext_hash(self) -> [u8; 32] {
+        self.base_root_ciphertext_hash
+    }
     pub const fn operation_id(self) -> [u8; 16] {
         self.operation_id
     }
