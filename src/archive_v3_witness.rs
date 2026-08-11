@@ -697,6 +697,18 @@ impl WitnessRecord {
         forged.root = root;
         forged
     }
+    #[cfg(test)]
+    pub(crate) fn with_deletion_for_test(&self, deletion: DeletionState) -> Self {
+        let mut forged = self.clone();
+        forged.deletion = deletion;
+        forged
+    }
+    #[cfg(test)]
+    pub(crate) fn with_migration_for_test(&self, migration: MigrationState) -> Self {
+        let mut forged = self.clone();
+        forged.migration = migration;
+        forged
+    }
     pub fn migration(&self) -> MigrationState {
         self.migration
     }

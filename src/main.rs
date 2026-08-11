@@ -63,6 +63,10 @@ mod acme;
 // intentionally not connected to the live Store, SQLite VFS, witness, routes,
 // or write authority.
 mod archive_v3;
+// Inactive archive-v3 export parity seam. Its cancellation-aware witness,
+// exact walker, deletion-safe publication admission, and canonical product
+// adapter are sealed test-only blockers; live `/api/export` remains legacy.
+mod archive_v3_export;
 // Inactive ADR-0022 GCS semantic adapters. Runtime/authority wiring remains
 // intentionally absent.
 mod archive_v3_gcs;
