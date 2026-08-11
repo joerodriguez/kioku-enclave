@@ -47,6 +47,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, retry semantics, browser metadata, processing status, and learned people profiles |
 | [eval/](eval/map.md) | Public, content-free voice/identity quality scoring plus archive-capacity contracts, synthetic regression inputs, and real-corpus methodology |
 | [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, versioning, build-profile, and signed-release operator tools |
+| [TASKS.md](TASKS.md) | Scoped ADR-0022 implementation evidence and intentionally remaining authority gates |
 | `SECURITY.md` | **Threat model + residual risks — read before touching crypto/auth/attestation** |
 | `CONTRIBUTING.md` | PR rules; the three pre-commit checks |
 | `rust-toolchain.toml` | Pinned toolchain |

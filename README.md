@@ -330,6 +330,15 @@ blocks; that file is not SQLite and is not query-performance evidence. See
 [`eval/capacity/README.md`](eval/capacity/README.md) for commands and release-evidence
 limitations.
 
+The separate `scripts/run_archive_capacity_gate.py` consumes the v2 12-month 40/80/100
+hours-per-month fixture only after an operator has reviewed its no-I/O `plan`, supplied an
+empty safe output directory, passed the free-space preflight, and explicitly acknowledged
+the production-shaped and sparse-extent paths. It measures local SQLite DB/WAL/checkpoint
+behavior using bounded zero-filled per-kind payload and vector-shape BLOBs, plus 32-GiB
+page/extent assumptions, but is still non-authority local evidence:
+it never materializes, downloads, or encrypts a 32-GiB snapshot and cannot satisfy the
+archive-v3 release gate.
+
 The production Docker build has no permissive configuration defaults. Supply every
 deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` or
 `WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the

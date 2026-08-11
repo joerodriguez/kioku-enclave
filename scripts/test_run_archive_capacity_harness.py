@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,7 +107,7 @@ class HarnessTests(unittest.TestCase):
                 json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8"
             )
             (output / "capacity-report.json").unlink()
-            with sqlite3.connect(output / "archive-capacity.sqlite") as connection:
+            with closing(sqlite3.connect(output / "archive-capacity.sqlite")) as connection:
                 connection.execute(
                     "UPDATE synthetic_records SET token = token + 1 "
                     "WHERE (kind, ordinal) = (SELECT kind, ordinal FROM synthetic_records LIMIT 1)"

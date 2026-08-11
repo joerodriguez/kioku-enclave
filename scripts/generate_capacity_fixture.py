@@ -17,7 +17,10 @@ from typing import Any, Iterator
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = REPOSITORY_ROOT / "eval/capacity/archive-fixtures-v1.json"
-EXPECTED_SCHEMA = "kioku-archive-capacity-fixture-v1"
+EXPECTED_SCHEMAS = {
+    "kioku-archive-capacity-fixture-v1",
+    "kioku-archive-capacity-fixture-v2",
+}
 PROFILE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 RECORD_KINDS = (
     "audio_segments",
@@ -49,9 +52,61 @@ def _mapping(value: Any, field: str) -> dict[str, Any]:
     return value
 
 
+def validate_temporal_payload_shape(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate v2's numeric time/cadence/payload geometry without accepting content."""
+    if manifest.get("schema") != "kioku-archive-capacity-fixture-v2":
+        return None
+    shape = _mapping(manifest.get("temporal_payload_shape"), "temporal_payload_shape")
+    if _integer(shape.get("recording_days_per_month"), "temporal_payload_shape.recording_days_per_month") > 31:
+        raise ManifestError("recording_days_per_month must not exceed 31")
+    _integer(
+        shape.get("sessions_per_active_day"),
+        "temporal_payload_shape.sessions_per_active_day",
+    )
+    if _integer(shape.get("retention_months"), "temporal_payload_shape.retention_months") != 12:
+        raise ManifestError("v2 retention geometry must cover exactly 12 months")
+    payloads = _mapping(shape.get("payload_bytes_by_kind"), "temporal_payload_shape.payload_bytes_by_kind")
+    if set(payloads) != set(RECORD_KINDS):
+        raise ManifestError("payload_bytes_by_kind must contain exactly the capacity record kinds")
+    for kind in RECORD_KINDS:
+        _integer(payloads[kind], f"payload_bytes_by_kind.{kind}", minimum=1)
+        if payloads[kind] > 4096:
+            raise ManifestError("synthetic payload geometry must remain bounded at 4096 bytes")
+    embedding = _mapping(shape.get("embedding"), "temporal_payload_shape.embedding")
+    dimensions = _integer(embedding.get("dimensions"), "temporal_payload_shape.embedding.dimensions")
+    element_bytes = _integer(embedding.get("element_bytes"), "temporal_payload_shape.embedding.element_bytes")
+    logical_bytes = _integer(embedding.get("logical_bytes"), "temporal_payload_shape.embedding.logical_bytes")
+    if dimensions != manifest["vector_dimensions"] or element_bytes != 4 or logical_bytes != dimensions * element_bytes:
+        raise ManifestError("embedding geometry must be the 384-dimension float32 logical shape")
+    return shape
+
+
 def expected_profile(manifest: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
-    horizon_years = _integer(manifest.get("horizon_years"), "horizon_years")
-    weeks = _integer(manifest.get("recording_weeks_per_year"), "recording_weeks_per_year")
+    schema = manifest.get("schema")
+    if schema == "kioku-archive-capacity-fixture-v1":
+        horizon_years = _integer(manifest.get("horizon_years"), "horizon_years")
+        weeks = _integer(manifest.get("recording_weeks_per_year"), "recording_weeks_per_year")
+        annual_hours = _integer(
+            profile.get("recording_hours_per_year"), "profile.recording_hours_per_year"
+        )
+        active_week_hours = _integer(
+            profile.get("recording_hours_per_active_week"),
+            "profile.recording_hours_per_active_week",
+        )
+        if active_week_hours * weeks != annual_hours:
+            raise ManifestError("annual recording hours must equal active-week hours times weeks")
+        recording_hours = annual_hours * horizon_years
+    elif schema == "kioku-archive-capacity-fixture-v2":
+        horizon_months = _integer(manifest.get("horizon_months"), "horizon_months")
+        if horizon_months != 12:
+            raise ManifestError("v2 capacity fixtures must span exactly 12 months")
+        monthly_hours = _integer(
+            profile.get("recording_hours_per_month"), "profile.recording_hours_per_month"
+        )
+        annual_hours = monthly_hours * horizon_months
+        recording_hours = annual_hours
+    else:
+        raise ManifestError("unsupported capacity fixture schema")
     interval = _integer(
         manifest.get("screen_observation_interval_seconds"),
         "screen_observation_interval_seconds",
@@ -66,17 +121,6 @@ def expected_profile(manifest: dict[str, Any], profile: dict[str, Any]) -> dict[
         raise ManifestError("canonical screen ratio must be strictly between zero and one")
 
     rates = _mapping(manifest.get("rates_per_recording_hour"), "rates_per_recording_hour")
-    annual_hours = _integer(
-        profile.get("recording_hours_per_year"), "profile.recording_hours_per_year"
-    )
-    active_week_hours = _integer(
-        profile.get("recording_hours_per_active_week"),
-        "profile.recording_hours_per_active_week",
-    )
-    if active_week_hours * weeks != annual_hours:
-        raise ManifestError("annual recording hours must equal active-week hours times weeks")
-
-    recording_hours = annual_hours * horizon_years
     screen_observations = recording_hours * (3600 // interval)
     canonical_numerator = screen_observations * numerator
     if canonical_numerator % denominator:
@@ -131,19 +175,20 @@ def expected_profile(manifest: dict[str, Any], profile: dict[str, Any]) -> dict[
 
 
 def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    if manifest.get("schema") != EXPECTED_SCHEMA:
-        raise ManifestError(f"schema must be {EXPECTED_SCHEMA!r}")
+    if manifest.get("schema") not in EXPECTED_SCHEMAS:
+        raise ManifestError(f"schema must be one of {sorted(EXPECTED_SCHEMAS)!r}")
     seed = _integer(manifest.get("seed"), "seed", minimum=0)
     if seed > 0xFFFFFFFFFFFFFFFF:
         raise ManifestError("seed must fit in an unsigned 64-bit integer")
     if _integer(manifest.get("vector_dimensions"), "vector_dimensions") != 384:
         raise ManifestError("vector_dimensions must match the production 384-dimension model")
+    temporal_payload_shape = validate_temporal_payload_shape(manifest)
     profiles = manifest.get("profiles")
     if not isinstance(profiles, list) or not profiles:
         raise ManifestError("profiles must be a non-empty array")
 
     validated: dict[str, dict[str, Any]] = {}
-    annual_hours_seen: set[int] = set()
+    capacity_shapes_seen: set[int] = set()
     for index, raw_profile in enumerate(profiles):
         profile = _mapping(raw_profile, f"profiles[{index}]")
         profile_id = profile.get("id")
@@ -161,13 +206,27 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
             if sparse_bytes != 32 * 1024**3:
                 raise ManifestError("the sparse power-user shape must be exactly 32 GiB")
         validated[profile_id] = profile
-        annual_hours_seen.add(profile["recording_hours_per_year"])
+        if manifest["schema"] == "kioku-archive-capacity-fixture-v1":
+            capacity_shapes_seen.add(profile["recording_hours_per_year"])
+        else:
+            capacity_shapes_seen.add(profile["recording_hours_per_month"])
 
-    missing_hours = {480, 960, 1200} - annual_hours_seen
-    if missing_hours:
-        raise ManifestError(f"profiles are missing annual recording hours: {sorted(missing_hours)}")
+    expected_shapes = (
+        {480, 960, 1200}
+        if manifest["schema"] == "kioku-archive-capacity-fixture-v1"
+        else {40, 80, 100}
+    )
+    missing_shapes = expected_shapes - capacity_shapes_seen
+    if missing_shapes:
+        unit = "annual recording hours" if manifest["schema"] == "kioku-archive-capacity-fixture-v1" else "monthly recording hours"
+        raise ManifestError(f"profiles are missing {unit}: {sorted(missing_shapes)}")
     if not any(profile.get("sparse_archive_bytes") == 32 * 1024**3 for profile in profiles):
         raise ManifestError("profiles are missing the 32-GiB sparse shape")
+    if temporal_payload_shape is not None:
+        for profile in validated.values():
+            monthly_hours = profile["recording_hours_per_month"]
+            if monthly_hours % temporal_payload_shape["recording_days_per_month"]:
+                raise ManifestError("monthly recording hours must divide evenly across active recording days")
     return validated
 
 
@@ -191,7 +250,8 @@ def _splitmix64(value: int) -> int:
 
 
 def synthetic_records(
-    profile: dict[str, Any], seed: int, max_records_per_kind: int | None = None
+    profile: dict[str, Any], seed: int, max_records_per_kind: int | None = None,
+    temporal_payload_shape: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, int | str]]:
     expected = profile["expected"]
     duration_ms = expected["recording_hours"] * 3600 * 1000
@@ -199,12 +259,25 @@ def synthetic_records(
         count = expected["records"][kind]
         emitted = count if max_records_per_kind is None else min(count, max_records_per_kind)
         for ordinal in range(emitted):
-            yield {
+            record: dict[str, int | str] = {
                 "kind": kind,
                 "ordinal": ordinal,
                 "logical_offset_ms": (ordinal * duration_ms) // count,
                 "token": _splitmix64(seed ^ (kind_index << 48) ^ ordinal),
             }
+            if temporal_payload_shape is not None:
+                monthly_duration_ms = profile["recording_hours_per_month"] * 3600 * 1000
+                record["month_index"] = min(11, int(record["logical_offset_ms"]) // monthly_duration_ms)
+                record["cadence_slot"] = ordinal % (
+                    temporal_payload_shape["recording_days_per_month"]
+                    * temporal_payload_shape["sessions_per_active_day"]
+                )
+                record["retention_months"] = temporal_payload_shape["retention_months"]
+                record["payload_bytes"] = temporal_payload_shape["payload_bytes_by_kind"][kind]
+                if kind == "vectors":
+                    record["embedding_dimensions"] = temporal_payload_shape["embedding"]["dimensions"]
+                    record["embedding_logical_bytes"] = temporal_payload_shape["embedding"]["logical_bytes"]
+            yield record
 
 
 def _safe_output_directory(output: Path) -> Path:
@@ -245,7 +318,12 @@ def generate_fixture(
     with records_path.open("xb") as raw_output:
         with gzip.GzipFile(fileobj=raw_output, mode="wb", filename="", mtime=0) as compressed:
             with io.TextIOWrapper(compressed, encoding="utf-8", newline="\n") as text_output:
-                for record in synthetic_records(profile, manifest["seed"], max_records_per_kind):
+                for record in synthetic_records(
+                    profile,
+                    manifest["seed"],
+                    max_records_per_kind,
+                    validate_temporal_payload_shape(manifest),
+                ):
                     text_output.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
                     text_output.write("\n")
 
