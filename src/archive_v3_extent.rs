@@ -7,9 +7,10 @@
 //!
 //! This is a data-format seam, not a persistence path. It has no `Store`,
 //! SQLite VFS, GCS provider/credential, witness, route, flag, or authority
-//! connection. A future coordinator must authenticate the exact [`ArchiveRoot`]
-//! selected by the independent witness before it constructs an
-//! [`AuthenticatedExtentRoot`]. This module never lists storage.
+//! connection. A future coordinator must mint a sealed recovery capability only
+//! after authenticating the exact [`ArchiveRoot`] selected by the independent
+//! witness. No production constructor exists yet; this is an activation
+//! blocker. This module never lists storage.
 
 use std::cmp::{max, min};
 
@@ -17,18 +18,22 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::archive_v3::ArchiveRoot;
 use crate::archive_v3::{
-    ArchiveId, ArchiveRoot, ArchiveV3Error, CiphertextEnvelope, DatabaseEpoch, ExtentReference,
+    ArchiveId, ArchiveV3Error, CiphertextEnvelope, DatabaseEpoch, ExtentReference,
     ImmutableObjectBackend, ImmutableReference, KeyEpoch, LogicalLocation, MerkleChild,
     MerkleEntries, MerkleNode, ObjectContext, ObjectId, ObjectRole, Result as ArchiveResult,
-    SQLITE_PAGE_SIZE,
+    MAX_DATABASE_BYTES, MAX_DATABASE_EXTENT_SLOTS, SQLITE_PAGE_SIZE,
 };
 
 pub const EXTENT_BYTES: u32 = 1_048_576;
 pub const MAX_RANGE_RECONSTRUCTION_BYTES: usize = EXTENT_BYTES as usize;
 pub const MAX_EXTENT_TREE_DEPTH: u8 = 8;
 pub const MAX_EXTENT_TREE_STACK: usize = 1_024;
-pub const MAX_EXTENT_TREE_OBJECTS_PER_RANGE: usize = 1_024;
+/// Total immutable `get` operations (both nodes and extents) permitted for one
+/// bounded reconstruction request.
+pub const MAX_EXTENT_TREE_OBJECT_GETS_PER_RANGE: usize = 1_024;
 
 #[derive(Debug, Error)]
 pub enum ExtentTreeError {
@@ -81,7 +86,10 @@ pub struct SourceExtent {
 }
 
 /// `next_extent` must return strictly increasing extent numbers and fill exactly
-/// `logical_byte_len` bytes at the start of the caller-owned 1 MiB buffer.
+/// `logical_byte_len` bytes at the start of the caller-owned 1 MiB buffer. The
+/// caller clears that buffer before every invocation, so an underfilling buggy
+/// source is deterministic (zero-filled) rather than able to reuse prior
+/// extent bytes; it still violates this source contract.
 pub trait ExtentSource: Send {
     fn logical_file_length(&self) -> Result<u64>;
     fn next_extent(&mut self, destination: &mut [u8]) -> Result<Option<SourceExtent>>;
@@ -126,7 +134,10 @@ impl std::fmt::Debug for UploadedExtentTree {
     }
 }
 
-/// Exact root facts already authenticated against the independent witness.
+/// Exact root facts intended to be minted only after independent-witness root
+/// verification. Its constructor is test-only until a sealed production mint
+/// exists, so no production caller can turn a raw `ArchiveRoot` into recovery
+/// authority.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedExtentRoot {
     archive_id: ArchiveId,
@@ -138,14 +149,11 @@ pub struct AuthenticatedExtentRoot {
     tree_height: u8,
 }
 impl AuthenticatedExtentRoot {
-    /// Builds traversal facts from an archive root that the caller has already
-    /// decrypted, context-validated, and bound to the exact independent-witness
-    /// commitment. This constructor validates only local root format facts; it
-    /// does not itself authenticate a caller-supplied root object.
-    pub fn from_authenticated_archive_root(
-        archive_id: ArchiveId,
-        root: &ArchiveRoot,
-    ) -> Result<Self> {
+    /// Test-only stand-in for a future sealed capability minted by exact
+    /// witness-root verification. Production code has no constructor: that
+    /// missing minting path is an explicit activation blocker.
+    #[cfg(test)]
+    fn from_test_verified_archive_root(archive_id: ArchiveId, root: &ArchiveRoot) -> Result<Self> {
         root.validate()?;
         let extent_slots = extent_slots(root.logical_file_length)?;
         Ok(Self {
@@ -197,7 +205,14 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
     sparse_content_commitment.update(b"kioku:archive:v3:sparse-extent-content\0");
     sparse_content_commitment.update([crate::archive_v3::ARCHIVE_FORMAT_VERSION]);
     sparse_content_commitment.update(logical_file_length.to_be_bytes());
-    while let Some(item) = source.next_extent(buffer.as_mut_slice())? {
+    loop {
+        // The trait requires an exact fill. Clearing nevertheless makes an
+        // underfilling buggy source deterministic rather than allowing bytes
+        // from a prior extent to cross an immutable object boundary.
+        buffer.fill(0);
+        let Some(item) = source.next_extent(buffer.as_mut_slice())? else {
+            break;
+        };
         validate_source_extent(item, slots, logical_file_length, last)?;
         let bytes = &buffer[..item.logical_byte_len as usize];
         let object_id = ObjectId::random();
@@ -321,8 +336,10 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
     })
 }
 
-/// Bounded no-list reconstruction. The destination is zeroed before every
-/// read, so an omitted sparse extent has deterministic output.
+/// Bounded no-list reconstruction. All bytes are staged in a zeroizing
+/// caller-bounded scratch buffer and copied to `destination` only after every
+/// selected object has authenticated, so failure or cancellation cannot expose
+/// a trusted-looking partial reconstruction.
 pub async fn reconstruct_extent_range<C: ExtentCipher>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
@@ -333,11 +350,12 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
     if cipher.archive_id() != root.archive_id || cipher.key_epoch() != root.key_epoch {
         return Err(ArchiveV3Error::InvalidContext.into());
     }
+    validate_database_length(root.logical_file_length)?;
     validate_range(root.logical_file_length, logical_offset, destination.len())?;
-    destination.fill(0);
     if destination.is_empty() {
         return Ok(());
     }
+    let mut staged = Zeroizing::new(vec![0u8; destination.len()]);
     let end = logical_offset
         .checked_add(destination.len() as u64)
         .ok_or(ExtentTreeError::Range)?;
@@ -349,17 +367,12 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
         range_end: root.extent_slots,
         reference: root.root.clone(),
     }];
-    let mut objects = 0usize;
+    let mut budget = RecoveryGetBudget::default();
     while let Some(task) = stack.pop() {
         if stack.len() > MAX_EXTENT_TREE_STACK {
             return Err(ArchiveV3Error::TooLarge("extent traversal stack").into());
         }
-        objects = objects
-            .checked_add(1)
-            .ok_or(ArchiveV3Error::TooLarge("extent traversal objects"))?;
-        if objects > MAX_EXTENT_TREE_OBJECTS_PER_RANGE {
-            return Err(ArchiveV3Error::TooLarge("extent traversal objects").into());
-        }
+        budget.consume()?;
         let context = node_context(
             root.archive_id,
             root.database_epoch,
@@ -387,7 +400,8 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
                             &entry,
                             logical_offset,
                             end,
-                            destination,
+                            staged.as_mut_slice(),
+                            &mut budget,
                         )
                         .await?;
                     }
@@ -414,6 +428,7 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
             }
         }
     }
+    destination.copy_from_slice(staged.as_slice());
     Ok(())
 }
 
@@ -429,14 +444,40 @@ struct NodeTask {
     range_end: u64,
     reference: ImmutableReference,
 }
+#[derive(Default)]
+struct RecoveryGetBudget {
+    gets: usize,
+}
+impl RecoveryGetBudget {
+    fn consume(&mut self) -> Result<()> {
+        self.gets = self
+            .gets
+            .checked_add(1)
+            .ok_or(ArchiveV3Error::TooLarge("extent recovery object gets"))?;
+        if self.gets > MAX_EXTENT_TREE_OBJECT_GETS_PER_RANGE {
+            return Err(ArchiveV3Error::TooLarge("extent recovery object gets").into());
+        }
+        Ok(())
+    }
+}
 
 fn extent_slots(length: u64) -> Result<u64> {
+    validate_database_length(length)?;
+    Ok(length.div_ceil(u64::from(EXTENT_BYTES)))
+}
+fn validate_database_length(length: u64) -> Result<()> {
     if length == 0 || !length.is_multiple_of(u64::from(SQLITE_PAGE_SIZE)) {
         return Err(ArchiveV3Error::Malformed("extent logical file length").into());
     }
-    Ok(length.div_ceil(u64::from(EXTENT_BYTES)))
+    if length > MAX_DATABASE_BYTES {
+        return Err(ArchiveV3Error::TooLarge("logical database").into());
+    }
+    Ok(())
 }
 fn extent_tree_height(slots: u64) -> Result<u8> {
+    if slots == 0 || slots > MAX_DATABASE_EXTENT_SLOTS {
+        return Err(ArchiveV3Error::TooLarge("extent tree slots").into());
+    }
     let leaves = slots.div_ceil(crate::archive_v3::MAX_NODE_FANOUT as u64);
     let mut height = 0u8;
     let mut capacity = 1u64;
@@ -766,6 +807,7 @@ fn validate_node_shape(node: &MerkleNode, level: u8, start: u64, end: u64) -> Re
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 async fn copy_intersection<C: ExtentCipher>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
@@ -774,6 +816,7 @@ async fn copy_intersection<C: ExtentCipher>(
     requested_start: u64,
     requested_end: u64,
     destination: &mut [u8],
+    budget: &mut RecoveryGetBudget,
 ) -> Result<()> {
     let extent_start = entry
         .extent_no
@@ -793,6 +836,7 @@ async fn copy_intersection<C: ExtentCipher>(
         entry.logical_byte_len,
         entry.reference.object_id,
     )?;
+    budget.consume()?;
     let envelope = load_exact(backend, &context, &entry.reference).await?;
     let plaintext = Zeroizing::new(cipher.open(&context, &envelope)?);
     if plaintext.len() != entry.logical_byte_len as usize {
@@ -870,6 +914,35 @@ mod tests {
             }))
         }
     }
+    struct UnderfillingSource {
+        next: u8,
+    }
+    impl ExtentSource for UnderfillingSource {
+        fn logical_file_length(&self) -> Result<u64> {
+            Ok(u64::from(EXTENT_BYTES) * 2)
+        }
+        fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
+            match self.next {
+                0 => {
+                    self.next = 1;
+                    output.fill(0x7e);
+                    Ok(Some(SourceExtent {
+                        extent_no: 0,
+                        logical_byte_len: EXTENT_BYTES,
+                    }))
+                }
+                1 => {
+                    self.next = 2;
+                    output[..SQLITE_PAGE_SIZE as usize].fill(0x6e);
+                    Ok(Some(SourceExtent {
+                        extent_no: 1,
+                        logical_byte_len: EXTENT_BYTES,
+                    }))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
     #[derive(Default)]
     struct FaultBackend {
         inner: InMemoryImmutableBackend,
@@ -883,6 +956,8 @@ mod tests {
         Tamper(ObjectId),
         MissingOnRead(usize),
         TamperOnRead(usize),
+        BlockOnRead(usize),
+        CreateReturnsAlreadyPresent,
         Substitute(ObjectId, CiphertextEnvelope),
         Block,
     }
@@ -893,7 +968,15 @@ mod tests {
             k: ObjectKey,
             v: CiphertextEnvelope,
         ) -> ArchiveResult<CreateIfAbsent> {
-            self.inner.create_if_absent(k, v).await
+            let created = self.inner.create_if_absent(k, v).await?;
+            if matches!(
+                &*self.fault.lock().unwrap(),
+                Fault::CreateReturnsAlreadyPresent
+            ) {
+                Ok(CreateIfAbsent::AlreadyPresentIdentical)
+            } else {
+                Ok(created)
+            }
         }
         async fn get(&self, k: &ObjectKey) -> ArchiveResult<Option<CiphertextEnvelope>> {
             let one_shot = {
@@ -901,31 +984,40 @@ mod tests {
                 match &mut *fault {
                     Fault::MissingOnRead(reads) if *reads == 1 => {
                         *fault = Fault::None;
-                        Some(true)
+                        Some(1u8)
                     }
                     Fault::TamperOnRead(reads) if *reads == 1 => {
                         *fault = Fault::None;
-                        Some(false)
+                        Some(2u8)
                     }
-                    Fault::MissingOnRead(reads) | Fault::TamperOnRead(reads) => {
+                    Fault::BlockOnRead(reads) if *reads == 1 => {
+                        *fault = Fault::None;
+                        Some(3u8)
+                    }
+                    Fault::MissingOnRead(reads)
+                    | Fault::TamperOnRead(reads)
+                    | Fault::BlockOnRead(reads) => {
                         *reads -= 1;
                         None
                     }
                     _ => None,
                 }
             };
-            if let Some(missing) = one_shot {
-                if missing {
-                    return Ok(None);
+            if let Some(action) = one_shot {
+                match action {
+                    1 => return Ok(None),
+                    2 => {
+                        let mut encoded = self
+                            .inner
+                            .get(k)
+                            .await?
+                            .ok_or(ArchiveV3Error::Authentication)?
+                            .encode();
+                        *encoded.last_mut().ok_or(ArchiveV3Error::Authentication)? ^= 0x01;
+                        return Ok(Some(CiphertextEnvelope::decode(&encoded)?));
+                    }
+                    _ => return std::future::pending().await,
                 }
-                let mut encoded = self
-                    .inner
-                    .get(k)
-                    .await?
-                    .ok_or(ArchiveV3Error::Authentication)?
-                    .encode();
-                *encoded.last_mut().ok_or(ArchiveV3Error::Authentication)? ^= 0x01;
-                return Ok(Some(CiphertextEnvelope::decode(&encoded)?));
             }
             let fault = { self.fault.lock().unwrap().clone() };
             match fault {
@@ -964,7 +1056,7 @@ mod tests {
         key: KeyEpoch,
         uploaded: &UploadedExtentTree,
     ) -> AuthenticatedExtentRoot {
-        AuthenticatedExtentRoot::from_authenticated_archive_root(
+        AuthenticatedExtentRoot::from_test_verified_archive_root(
             archive,
             &ArchiveRoot {
                 root_seq: 0,
@@ -984,6 +1076,188 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    async fn sparse_commitment(
+        archive: ArchiveId,
+        database: DatabaseEpoch,
+        key: KeyEpoch,
+        length: u64,
+        entries: Vec<(u64, Vec<u8>)>,
+    ) -> [u8; 32] {
+        let cipher = TestCipher::new(archive, key);
+        let backend = FaultBackend::default();
+        let mut source = VecSource {
+            length,
+            entries,
+            next: 0,
+        };
+        upload_extent_tree(&backend, &cipher, archive, database, &mut source)
+            .await
+            .unwrap()
+            .sparse_content_commitment()
+    }
+    #[tokio::test]
+    async fn sparse_content_commitment_binds_length_position_and_data() {
+        let (a, d, k) = ids();
+        let base =
+            sparse_commitment(a, d, k, u64::from(EXTENT_BYTES), vec![(0, bytes(256, 1))]).await;
+        let length = sparse_commitment(
+            a,
+            d,
+            k,
+            u64::from(EXTENT_BYTES) * 2,
+            vec![(0, bytes(256, 1))],
+        )
+        .await;
+        let position = sparse_commitment(
+            a,
+            d,
+            k,
+            u64::from(EXTENT_BYTES) * 2,
+            vec![(1, bytes(256, 1))],
+        )
+        .await;
+        let data =
+            sparse_commitment(a, d, k, u64::from(EXTENT_BYTES), vec![(0, bytes(256, 2))]).await;
+        assert_ne!(base, length);
+        assert_ne!(length, position);
+        assert_ne!(base, data);
+    }
+    #[tokio::test]
+    async fn max_database_geometry_accepts_a_high_sparse_extent_and_rejects_over_cap() {
+        let (a, d, k) = ids();
+        assert_eq!(
+            MAX_DATABASE_BYTES / u64::from(SQLITE_PAGE_SIZE),
+            u64::from(crate::archive_v3::MAX_DATABASE_PAGES)
+        );
+        assert_eq!(extent_tree_height(255).unwrap(), 0);
+        assert_eq!(extent_tree_height(256).unwrap(), 0);
+        assert_eq!(extent_tree_height(257).unwrap(), 1);
+        assert_eq!(
+            extent_tree_height(MAX_DATABASE_BYTES / u64::from(EXTENT_BYTES)).unwrap(),
+            1
+        );
+        assert!(extent_tree_height(MAX_DATABASE_BYTES / u64::from(EXTENT_BYTES) + 1).is_err());
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let last_extent = MAX_DATABASE_BYTES / u64::from(EXTENT_BYTES) - 1;
+        let mut source = VecSource {
+            length: MAX_DATABASE_BYTES,
+            entries: vec![(last_extent, bytes(256, 0x4c))],
+            next: 0,
+        };
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source)
+            .await
+            .unwrap();
+        let root = descriptor(a, d, k, &uploaded);
+        let mut output = vec![0; SQLITE_PAGE_SIZE as usize];
+        reconstruct_extent_range(
+            &backend,
+            &cipher,
+            &root,
+            last_extent * u64::from(EXTENT_BYTES),
+            &mut output,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, vec![0x4c; SQLITE_PAGE_SIZE as usize]);
+        let mut rejected = VecSource {
+            length: MAX_DATABASE_BYTES + u64::from(SQLITE_PAGE_SIZE),
+            entries: Vec::new(),
+            next: 0,
+        };
+        assert!(upload_extent_tree(&backend, &cipher, a, d, &mut rejected)
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn all_hole_and_underfilled_sources_are_deterministic() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let mut all_hole = VecSource {
+            length: u64::from(SQLITE_PAGE_SIZE),
+            entries: Vec::new(),
+            next: 0,
+        };
+        assert!(upload_extent_tree(&backend, &cipher, a, d, &mut all_hole)
+            .await
+            .is_err());
+        let mut underfilled = UnderfillingSource { next: 0 };
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut underfilled)
+            .await
+            .unwrap();
+        let root = descriptor(a, d, k, &uploaded);
+        let mut output = vec![0xff; SQLITE_PAGE_SIZE as usize];
+        reconstruct_extent_range(
+            &backend,
+            &cipher,
+            &root,
+            u64::from(EXTENT_BYTES) + u64::from(SQLITE_PAGE_SIZE),
+            &mut output,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, vec![0; SQLITE_PAGE_SIZE as usize]);
+    }
+    #[tokio::test]
+    async fn reconstruction_failure_or_cancellation_never_changes_caller_output() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES) * 2,
+            entries: vec![(0, bytes(256, 0x11)), (1, bytes(256, 0x22))],
+            next: 0,
+        };
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source)
+            .await
+            .unwrap();
+        let root = descriptor(a, d, k, &uploaded);
+        for fault in [Fault::MissingOnRead(3), Fault::TamperOnRead(3)] {
+            *backend.fault.lock().unwrap() = fault;
+            let mut output = vec![0xa5; 8192];
+            assert!(reconstruct_extent_range(
+                &backend,
+                &cipher,
+                &root,
+                u64::from(EXTENT_BYTES) - 4096,
+                &mut output,
+            )
+            .await
+            .is_err());
+            assert_eq!(output, vec![0xa5; 8192]);
+        }
+        *backend.fault.lock().unwrap() = Fault::BlockOnRead(3);
+        let mut output = vec![0xa5; 8192];
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            reconstruct_extent_range(
+                &backend,
+                &cipher,
+                &root,
+                u64::from(EXTENT_BYTES) - 4096,
+                &mut output,
+            ),
+        )
+        .await
+        .is_err());
+        assert_eq!(output, vec![0xa5; 8192]);
+    }
+    #[tokio::test]
+    async fn already_present_identical_is_read_back_before_linking() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        *backend.fault.lock().unwrap() = Fault::CreateReturnsAlreadyPresent;
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+        };
+        assert!(upload_extent_tree(&backend, &cipher, a, d, &mut source)
+            .await
+            .is_ok());
     }
     #[tokio::test]
     async fn accepted_creates_require_extent_and_node_readback() {
@@ -1033,7 +1307,7 @@ mod tests {
             .create_if_absent(context.object_key(), envelope.clone())
             .await
             .unwrap();
-        let root = AuthenticatedExtentRoot::from_authenticated_archive_root(
+        let root = AuthenticatedExtentRoot::from_test_verified_archive_root(
             a,
             &ArchiveRoot {
                 root_seq: 0,
@@ -1172,7 +1446,9 @@ mod tests {
         assert!(extent_slots(0).is_err());
         assert!(extent_slots(1).is_err());
         assert_eq!(extent_tree_height(257).unwrap(), 1);
-        assert_eq!(extent_tree_height(65_537).unwrap(), 2);
+        // A sparse unary height-two tree would require more than the shared
+        // 32-GiB ceiling, so it is intentionally unrepresentable.
+        assert!(extent_tree_height(65_537).is_err());
         assert!(validate_range(4096, 0, MAX_RANGE_RECONSTRUCTION_BYTES + 1).is_err());
         assert!(validate_source_extent(
             SourceExtent {
