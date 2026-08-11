@@ -621,20 +621,30 @@ impl ShadowObjectFacts {
     fn matches_binding(&self, binding: ShadowSessionBinding) -> bool {
         let archive = hex_opaque_id(binding.archive_id());
         let epoch = hex_opaque_id(binding.database_epoch());
-        if !self
-            .object_key
-            .starts_with(&format!("archive/v3/{archive}/"))
-        {
+        let components: Vec<_> = self.object_key.split('/').collect();
+        if components.get(0..3) != Some(&["archive", "v3", archive.as_str()]) {
             return false;
         }
         match self.object_role {
-            ObjectRole::CheckpointChunkV3
-            | ObjectRole::CheckpointManifestV3
-            | ObjectRole::RootV3
-            | ObjectRole::WalSegmentV3
-            | ObjectRole::ExtentV3
-            | ObjectRole::MerkleNodeV3 => self.object_key.contains(&format!("/{epoch}/")),
-            ObjectRole::KeyRegistryV3 | ObjectRole::StagingV3 => true,
+            ObjectRole::CheckpointChunkV3 | ObjectRole::CheckpointManifestV3 => {
+                components.get(3) == Some(&"checkpoints")
+                    && components.get(4) == Some(&epoch.as_str())
+            }
+            ObjectRole::RootV3 => {
+                components.get(3) == Some(&"root-candidates")
+                    && components.get(4) == Some(&epoch.as_str())
+            }
+            ObjectRole::WalSegmentV3 => {
+                components.get(3) == Some(&"wal") && components.get(4) == Some(&epoch.as_str())
+            }
+            ObjectRole::ExtentV3 => {
+                components.get(3) == Some(&"extents") && components.get(4) == Some(&epoch.as_str())
+            }
+            ObjectRole::MerkleNodeV3 => {
+                components.get(3) == Some(&"nodes") && components.get(4) == Some(&epoch.as_str())
+            }
+            ObjectRole::KeyRegistryV3 => components.get(3) == Some(&"keys"),
+            ObjectRole::StagingV3 => components.get(3) == Some(&"staging"),
         }
     }
 }
@@ -652,6 +662,9 @@ fn hex_opaque_id(value: [u8; 16]) -> String {
 }
 
 fn valid_shadow_object_key(value: &str, role: ObjectRole, object_id: ObjectId) -> bool {
+    if crate::archive_v3_gcs::canonical_object_id(value) != Some(object_id) {
+        return false;
+    }
     let lexical = !value.is_empty()
         && value.len() <= MAX_SHADOW_OBJECT_CONTEXT_BYTES
         && value.starts_with("archive/v3/")
@@ -665,27 +678,19 @@ fn valid_shadow_object_key(value: &str, role: ObjectRole, object_id: ObjectId) -
     if !lexical {
         return false;
     }
-    let object = object_id
-        .as_bytes()
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(b"0123456789abcdef"[usize::from(byte >> 4)]),
-                char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]),
-            ]
-        })
-        .collect::<String>();
-    let (required_path, required_suffix) = match role {
-        ObjectRole::CheckpointChunkV3 => ("/checkpoints/", format!("-{object}.chkx")),
-        ObjectRole::CheckpointManifestV3 => ("/checkpoints/", format!("-{object}.cmfx")),
-        ObjectRole::RootV3 => ("/root-candidates/", format!("-{object}.rootx")),
-        ObjectRole::WalSegmentV3 => ("/wal/", format!("-{object}.walx")),
-        ObjectRole::ExtentV3 => ("/extents/", format!("/{object}.extx")),
-        ObjectRole::MerkleNodeV3 => ("/nodes/", format!("/{object}.nodex")),
-        ObjectRole::KeyRegistryV3 => ("/keys/", format!("/{object}.keyx")),
-        ObjectRole::StagingV3 => ("/staging/", format!("/{object}")),
-    };
-    value.contains(required_path) && value.ends_with(&required_suffix)
+    let role_component = value.split('/').nth(3);
+    matches!(
+        (role, role_component),
+        (
+            ObjectRole::CheckpointChunkV3 | ObjectRole::CheckpointManifestV3,
+            Some("checkpoints")
+        ) | (ObjectRole::RootV3, Some("root-candidates"))
+            | (ObjectRole::WalSegmentV3, Some("wal"))
+            | (ObjectRole::ExtentV3, Some("extents"))
+            | (ObjectRole::MerkleNodeV3, Some("nodes"))
+            | (ObjectRole::KeyRegistryV3, Some("keys"))
+            | (ObjectRole::StagingV3, Some("staging"))
+    )
 }
 
 impl fmt::Debug for ShadowObjectFacts {
@@ -1170,6 +1175,19 @@ impl OperationLedger {
         }
         if Self::read_record(&transaction, completion.operation_id())?.is_some() {
             return Err(OperationLedgerError::Corrupt);
+        }
+        let reserved: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM archive_v3_shadow_objects
+             WHERE session_id = ? AND attempt_id = ? AND state = ?",
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                ShadowObjectState::Reserved as i64,
+            ],
+            |row| row.get(0),
+        )?;
+        if reserved != 0 {
+            return Err(OperationLedgerError::ResultConflict);
         }
         let before = session.encode()?;
         session.transition(ShadowSessionState::Witnessed)?;
@@ -2213,9 +2231,10 @@ mod tests {
                         ObjectRole::CheckpointManifestV3 as i64,
                         b"opaque".as_slice(),
                         format!(
-                            "archive/v3/{}/checkpoints/{}/x/manifest/0-0-1-{}.cmfx",
+                            "archive/v3/{}/checkpoints/{}/{}/manifest/0-0-1-{}.cmfx",
                             "a1".repeat(16),
                             "b2".repeat(16),
+                            "c3".repeat(16),
                             hex_id(object_id),
                         ),
                         [0x61u8; 32].as_slice(),
@@ -2232,9 +2251,10 @@ mod tests {
             root_seq: None,
             context_aad: Zeroizing::new(b"one-too-many".to_vec()),
             object_key: format!(
-                "archive/v3/{}/checkpoints/{}/x/manifest/0-0-1-{}.cmfx",
+                "archive/v3/{}/checkpoints/{}/{}/manifest/0-0-1-{}.cmfx",
                 "a1".repeat(16),
                 "b2".repeat(16),
+                "c3".repeat(16),
                 hex_id([0xff; 16]),
             ),
             ciphertext_hash: [0x62; 32],
@@ -2249,6 +2269,30 @@ mod tests {
             ),
             Err(OperationLedgerError::TooLarge("shadow objects per attempt"))
         ));
+        let mut after = None;
+        let mut traversed = 0usize;
+        let mut pages = 0usize;
+        loop {
+            let page = OperationLedger::load_exact_shadow_object_page(
+                &connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                after,
+            )
+            .unwrap();
+            traversed += page.entries().len();
+            pages += 1;
+            match page.next_ordinal() {
+                Some(next) => {
+                    assert!(after.is_none_or(|previous| next > previous));
+                    after = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(traversed, MAX_SHADOW_OBJECTS_PER_ATTEMPT);
+        assert_eq!(pages, 129);
     }
 
     #[test]
@@ -2267,9 +2311,10 @@ mod tests {
                     root_seq: None,
                     context_aad: Zeroizing::new(vec![ordinal as u8]),
                     object_key: format!(
-                        "archive/v3/{}/checkpoints/{}/x/manifest/0-0-1-{}.cmfx",
+                        "archive/v3/{}/checkpoints/{}/{}/manifest/0-0-1-{}.cmfx",
                         "a1".repeat(16),
                         "b2".repeat(16),
+                        "c3".repeat(16),
                         hex_id(object),
                     ),
                     ciphertext_hash: [ordinal as u8; 32],
@@ -2307,6 +2352,56 @@ mod tests {
             } else {
                 assert_eq!(first.next_ordinal(), None);
             }
+        }
+    }
+
+    #[test]
+    fn exact_inventory_rejects_cross_archive_epoch_object_and_role_keys() {
+        let mut connection = setup();
+        let session = shadow_session(0x5e, 0x6f);
+        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        let facts = materialized_root(&mut connection, &session);
+        let correct = facts.object_key.clone();
+        let replacements = [
+            "not-a-key".to_owned(),
+            correct.replacen(&"a1".repeat(16), &"c3".repeat(16), 1),
+            correct.replacen(&"b2".repeat(16), &"d4".repeat(16), 1),
+            correct.replacen(&hex_id(*facts.object_id.as_bytes()), &hex_id([0xee; 16]), 1),
+            correct.replacen("root-candidates", "checkpoints", 1),
+        ];
+        for replacement in replacements {
+            connection
+                .execute(
+                    "UPDATE archive_v3_shadow_objects SET object_key = ?
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                    params![
+                        replacement,
+                        session.session_id().as_bytes().as_slice(),
+                        session.attempt_id().as_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
+            assert!(matches!(
+                OperationLedger::load_exact_shadow_object_page(
+                    &connection,
+                    session.session_id(),
+                    session.attempt_id(),
+                    session.binding(),
+                    None,
+                ),
+                Err(OperationLedgerError::Corrupt)
+            ));
+            connection
+                .execute(
+                    "UPDATE archive_v3_shadow_objects SET object_key = ?
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                    params![
+                        correct.as_str(),
+                        session.session_id().as_bytes().as_slice(),
+                        session.attempt_id().as_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
         }
     }
 
