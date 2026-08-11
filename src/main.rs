@@ -63,9 +63,12 @@ mod acme;
 // intentionally not connected to the live Store, SQLite VFS, witness, routes,
 // or write authority.
 mod archive_v3;
-// Inactive ADR-0022 GCS semantic adapters. A concrete GCP HTTP transport and
-// all runtime/authority wiring remain intentionally absent.
+// Inactive ADR-0022 GCS semantic adapters. Runtime/authority wiring remains
+// intentionally absent.
 mod archive_v3_gcs;
+// Concrete but inactive REST transport. It has no environment constructor,
+// token acquisition, Store/VFS/witness connection, or production authority.
+mod archive_v3_gcs_http;
 mod archive_v3_journal;
 mod archive_v3_operation;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a

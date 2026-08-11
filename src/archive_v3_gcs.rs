@@ -5,11 +5,9 @@
 
 //! Inactive ADR-0022 GCS adapter boundary.
 //!
-//! This module has production-safe *semantics* and test fakes, but no concrete
-//! GCP HTTP/runtime implementation.  It is deliberately not wired to Store,
-//! routes, the VFS, the witness service, authority, Terraform, or deployment.
-//! A concrete transport must be added behind [`ArchiveV3GcsTransport`] before
-//! it can perform real GCS I/O.
+//! This module has production-safe *semantics* and test fakes. Its concrete
+//! sibling HTTP transport is also compiled and tested, but neither is wired to
+//! Store, routes, the VFS, the witness, authority, Terraform, or deployment.
 
 use crate::{
     archive_v3::{
@@ -116,9 +114,9 @@ pub(crate) trait ArchiveV3GcsTransport: Send + Sync {
         bytes: &[u8],
     ) -> std::result::Result<GcsArchiveV3CreateResult, GcsArchiveV3TransportError>;
 
-    /// Read exactly one current object while enforcing `max_bytes` during
-    /// transfer, before allocating more than `max_bytes + 1`. `None` is a
-    /// definitive absence, not an empty object.
+    /// Read exactly one current object while enforcing `max_bytes` on declared
+    /// length and accumulated body bytes. The HTTP/TLS implementation must use
+    /// bounded internal buffers. `None` is definitive absence, not an empty object.
     async fn read_exact(
         &self,
         canonical_key: &str,
@@ -544,7 +542,7 @@ fn key_archive_prefix(key: &str) -> Result<&str> {
         .ok_or(ArchiveV3Error::InvalidContext)
 }
 
-fn valid_archive_prefix(prefix: &str) -> bool {
+pub(super) fn valid_archive_prefix(prefix: &str) -> bool {
     let Some(id) = prefix.strip_prefix("archive/v3/") else {
         return false;
     };
@@ -553,7 +551,7 @@ fn valid_archive_prefix(prefix: &str) -> bool {
 
 /// Validate every canonical form emitted by `ObjectContext::object_key` and
 /// recover the unique immutable ID from its terminal component.
-fn canonical_object_id(key: &str) -> Option<ObjectId> {
+pub(super) fn canonical_object_id(key: &str) -> Option<ObjectId> {
     if key.len() > MAX_CANONICAL_OBJECT_KEY_BYTES
         || !key.starts_with("archive/v3/")
         || key.contains("//")
