@@ -27,7 +27,7 @@ use crate::{
     archive_v3::{
         ArchiveId, ArchiveV3Error, CiphertextEnvelope, DatabaseEpoch, ImmutableObjectBackend,
         ImmutableReference, LogicalLocation, ObjectContext, ObjectId, ObjectRole, ParentReference,
-        Result as ArchiveResult, SQLITE_PAGE_SIZE,
+        Result as ArchiveResult, MAX_DATABASE_BYTES, SQLITE_PAGE_SIZE,
     },
     archive_v3_journal::{
         CheckpointChunkEntry, CheckpointManifestChild, CheckpointManifestEntries,
@@ -530,6 +530,9 @@ struct ManifestExpectation {
 fn validate_snapshot_length(length: u64) -> Result<u32> {
     if length == 0 || !length.is_multiple_of(u64::from(SQLITE_PAGE_SIZE)) {
         return Err(ArchiveV3Error::Malformed("checkpoint file length").into());
+    }
+    if length > MAX_DATABASE_BYTES {
+        return Err(ArchiveV3Error::TooLarge("SQLite database").into());
     }
     let chunks = length.div_ceil(u64::from(CHECKPOINT_CHUNK_BYTES));
     u32::try_from(chunks).map_err(|_| ArchiveV3Error::TooLarge("checkpoint chunk count").into())
@@ -1071,6 +1074,20 @@ mod tests {
         }
     }
 
+    struct CountingLengthSource {
+        length: u64,
+        reads: usize,
+    }
+    impl CheckpointSource for CountingLengthSource {
+        fn logical_file_length(&self) -> Result<u64> {
+            Ok(self.length)
+        }
+        fn read_exact(&mut self, _offset: u64, _destination: &mut [u8]) -> Result<()> {
+            self.reads += 1;
+            Err(ShadowCheckpointError::Source)
+        }
+    }
+
     #[derive(Default)]
     struct VecSink {
         bytes: Vec<u8>,
@@ -1101,6 +1118,7 @@ mod tests {
     struct FaultBackend {
         inner: InMemoryImmutableBackend,
         fault: Mutex<Fault>,
+        creates: Mutex<usize>,
     }
     #[derive(Clone, Copy, Default)]
     enum Fault {
@@ -1117,6 +1135,7 @@ mod tests {
             Self {
                 inner: InMemoryImmutableBackend::new(),
                 fault: Mutex::new(Fault::None),
+                creates: Mutex::new(0),
             }
         }
     }
@@ -1127,6 +1146,7 @@ mod tests {
             key: ObjectKey,
             value: CiphertextEnvelope,
         ) -> ArchiveResult<CreateIfAbsent> {
+            *self.creates.lock().unwrap() += 1;
             self.inner.create_if_absent(key, value).await
         }
         async fn get(&self, key: &ObjectKey) -> ArchiveResult<Option<CiphertextEnvelope>> {
@@ -1349,6 +1369,16 @@ mod tests {
             validate_snapshot_length(1),
             Err(ShadowCheckpointError::Archive(_))
         ));
+        assert_eq!(
+            validate_snapshot_length(MAX_DATABASE_BYTES).unwrap(),
+            (MAX_DATABASE_BYTES / u64::from(CHECKPOINT_CHUNK_BYTES)) as u32
+        );
+        assert!(matches!(
+            validate_snapshot_length(MAX_DATABASE_BYTES + u64::from(SQLITE_PAGE_SIZE)),
+            Err(ShadowCheckpointError::Archive(ArchiveV3Error::TooLarge(
+                "SQLite database"
+            )))
+        ));
         assert_eq!(manifest_tree_height(1).unwrap(), 0);
         assert_eq!(manifest_tree_height(256).unwrap(), 0);
         assert_eq!(manifest_tree_height(257).unwrap(), 1);
@@ -1358,6 +1388,27 @@ mod tests {
             manifest_tree_height(257 * MAX_CHECKPOINT_MANIFEST_FANOUT as u32).unwrap(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_checkpoint_is_rejected_before_any_source_read_or_immutable_create() {
+        let archive_id = ArchiveId::from_bytes([1; 16]);
+        let database_epoch = DatabaseEpoch::from_bytes([2; 16]);
+        let key_epoch = KeyEpoch::from_bytes([3; 16]);
+        let cipher = TestCipher::new(archive_id, key_epoch);
+        let backend = FaultBackend::new();
+        let mut source = CountingLengthSource {
+            length: MAX_DATABASE_BYTES + u64::from(SQLITE_PAGE_SIZE),
+            reads: 0,
+        };
+        assert!(matches!(
+            upload_checkpoint(&backend, &cipher, archive_id, database_epoch, &mut source).await,
+            Err(ShadowCheckpointError::Archive(ArchiveV3Error::TooLarge(
+                "SQLite database"
+            )))
+        ));
+        assert_eq!(source.reads, 0);
+        assert_eq!(*backend.creates.lock().unwrap(), 0);
     }
 
     fn tmpfs_test_path() -> PathBuf {

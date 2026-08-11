@@ -224,6 +224,18 @@ pub struct WalCaptureState {
     metrics: ShadowCaptureMetrics,
 }
 
+impl Drop for WalCaptureState {
+    fn drop(&mut self) {
+        // `completed` owns `CapturedWalCommit`s, whose Drop implementation
+        // zeroizes their frame/header/checksum material. Clear explicitly so
+        // that invariant remains visible at this owning boundary too.
+        self.completed.clear();
+        self.image.zeroize();
+        self.accepted_header_prefix.zeroize();
+        self.covered.clear();
+    }
+}
+
 impl Default for WalCaptureState {
     fn default() -> Self {
         Self::new()
@@ -310,7 +322,13 @@ impl WalCaptureState {
             self.metrics.oversized_writes = self.metrics.oversized_writes.saturating_add(1);
             return;
         }
-        self.image.truncate(length);
+        // `Vec::truncate` drops the logical tail but deliberately preserves
+        // its allocation. Scrub raw WAL bytes before shrinking so a later
+        // resize/write cannot expose a previous generation's contents.
+        if length < self.image.len() {
+            self.image[length..].zeroize();
+            self.image.truncate(length);
+        }
         for range in &mut self.covered {
             range.1 = range.1.min(length);
         }
@@ -489,8 +507,10 @@ impl WalCaptureState {
             return false;
         };
         self.wal_generation = next;
+        self.image.zeroize();
         self.image = Vec::new();
         self.covered = Vec::new();
+        self.accepted_header_prefix.zeroize();
         self.accepted_header_prefix = None;
         self.published_frames = 0;
         self.disabled = None;
@@ -502,8 +522,10 @@ impl WalCaptureState {
             self.metrics.generations_dropped = self.metrics.generations_dropped.saturating_add(1);
         }
         self.disabled = Some(fault);
+        self.image.zeroize();
         self.image = Vec::new();
         self.covered = Vec::new();
+        self.accepted_header_prefix.zeroize();
         self.accepted_header_prefix = None;
         self.published_frames = 0;
     }
