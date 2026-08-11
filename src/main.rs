@@ -69,6 +69,10 @@ mod archive_v3_gcs;
 // Concrete but inactive REST transport. It has no environment constructor,
 // token acquisition, Store/VFS/witness connection, or production authority.
 mod archive_v3_gcs_http;
+// Inactive, archive-GCS-only Confidential Space bearer path. It deliberately
+// has its own audience type, launcher boundary, STS client, cache, and no
+// Store/VFS/route/transport/authority connection.
+mod archive_v3_gcs_auth;
 // Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
 // REST transport. They have no runtime construction, Store, VFS, route, or
 // authority wiring.
