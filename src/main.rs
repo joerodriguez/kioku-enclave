@@ -109,6 +109,10 @@ mod archive_v3_shadow_parity;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
 // Store/VFS runtime connection, provider construction, flag, route, or authority.
 mod archive_v3_shadow_checkpoint;
+// Inactive ADR-0022 immutable WAL upload/readback and exact witness-nominated
+// recovery seam. It has no VFS, Store, runtime, flag, provider, or authority
+// wiring; legacy whole-snapshot persistence remains authoritative.
+mod archive_v3_shadow_wal;
 // Inactive ADR-0022 checkpoint publication composition with durable exact-
 // candidate reconciliation. It has no Store, VFS, route, flag, provider
 // construction, or authority wiring.

@@ -60,6 +60,11 @@ pub const MAX_NODE_FANOUT: usize = 256;
 pub const MAX_ENUMERATION_PAGE: usize = 1_000;
 /// The initial format supports only the ADR's fixed SQLite page size.
 pub const SQLITE_PAGE_SIZE: u32 = 4096;
+/// ADR-0022's fixed archive capacity ceiling. Every checkpoint, root, extent,
+/// and WAL commit must remain within this many SQLite pages.
+pub const MAX_DATABASE_PAGES: u32 = 8_388_608;
+/// Byte form of [`MAX_DATABASE_PAGES`] for length-bearing archive formats.
+pub const MAX_DATABASE_BYTES: u64 = (MAX_DATABASE_PAGES as u64) * (SQLITE_PAGE_SIZE as u64);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ArchiveV3Error {
@@ -1322,6 +1327,9 @@ impl ArchiveRoot {
             .is_multiple_of(u64::from(self.sqlite_page_size))
         {
             return Err(ArchiveV3Error::Malformed("logical file length"));
+        }
+        if self.logical_file_length > MAX_DATABASE_BYTES {
+            return Err(ArchiveV3Error::TooLarge("SQLite database"));
         }
         if self.storage_format_version != ARCHIVE_FORMAT_VERSION {
             return Err(ArchiveV3Error::Malformed("root format version"));

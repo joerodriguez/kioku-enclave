@@ -12,8 +12,9 @@
 use crate::archive_v3::{
     ArchiveCipher, ArchiveRoot, ArchiveV3Error, CiphertextEnvelope, ImmutableReference,
     LogicalLocation, ObjectContext, ObjectId, ObjectRole, Result, ARCHIVE_FORMAT_VERSION,
-    SQLITE_PAGE_SIZE,
+    MAX_DATABASE_BYTES, MAX_DATABASE_PAGES, SQLITE_PAGE_SIZE,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 const CHECKPOINT_MANIFEST_MAGIC: &[u8; 8] = b"KACMv3\0\0";
 const WAL_SEGMENT_MAGIC: &[u8; 8] = b"KAWLv3\0\0";
@@ -78,6 +79,7 @@ impl CheckpointManifestNode {
             return Err(ArchiveV3Error::Malformed("checkpoint page size"));
         }
         if self.logical_file_length == 0
+            || self.logical_file_length > MAX_DATABASE_BYTES
             || !self
                 .logical_file_length
                 .is_multiple_of(u64::from(self.sqlite_page_size))
@@ -317,6 +319,14 @@ pub struct WalSegment {
     pub frames: Vec<u8>,
 }
 
+impl Drop for WalSegment {
+    fn drop(&mut self) {
+        self.frames.zeroize();
+        self.wal_header.zeroize();
+        self.checksum_before.zeroize();
+    }
+}
+
 impl WalSegment {
     pub fn is_final(&self) -> bool {
         self.segment_index.checked_add(1) == Some(self.segment_count)
@@ -376,11 +386,17 @@ impl WalSegment {
         for frame_index in 0..frame_count as usize {
             let start = frame_index * frame_bytes;
             let frame = &self.frames[start..start + frame_bytes];
-            if read_be_u32(&frame[0..4])? == 0
+            let page_number = read_be_u32(&frame[0..4])?;
+            if page_number == 0
+                || page_number > MAX_DATABASE_PAGES
                 || &frame[8..12] != salts.0
                 || &frame[12..16] != salts.1
             {
                 return Err(ArchiveV3Error::Malformed("WAL frame header"));
+            }
+            let commit_size = read_be_u32(&frame[4..8])?;
+            if commit_size > MAX_DATABASE_PAGES {
+                return Err(ArchiveV3Error::TooLarge("SQLite database pages"));
             }
             checksum = wal_checksum(checksum_order, &frame[..8], checksum)?;
             checksum = wal_checksum(checksum_order, &frame[24..], checksum)?;
@@ -388,7 +404,6 @@ impl WalSegment {
             if checksum != stored {
                 return Err(ArchiveV3Error::Malformed("WAL frame checksum"));
             }
-            let commit_size = read_be_u32(&frame[4..8])?;
             let is_last_frame = frame_index + 1 == frame_count as usize;
             if commit_size != 0 && !(self.is_final() && is_last_frame) {
                 return Err(ArchiveV3Error::Malformed("WAL commit placement"));
@@ -399,6 +414,26 @@ impl WalSegment {
             return Err(ArchiveV3Error::Malformed("WAL segment not commit bounded"));
         }
         Ok(())
+    }
+
+    /// The final commit frame's SQLite database page count. Only a fully
+    /// validated final segment can expose it, preventing a caller from using
+    /// an earlier non-authoritative frame as the recovered file length.
+    pub fn final_commit_page_count(&self) -> Result<u32> {
+        self.validate()?;
+        if !self.is_final() {
+            return Err(ArchiveV3Error::Malformed("WAL final segment"));
+        }
+        let frame_bytes = SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAGE_SIZE as usize;
+        let final_frame = self
+            .frames
+            .get(self.frames.len() - frame_bytes..)
+            .ok_or(ArchiveV3Error::Malformed("WAL final frame"))?;
+        let page_count = read_be_u32(&final_frame[4..8])?;
+        if page_count == 0 {
+            return Err(ArchiveV3Error::Malformed("WAL final commit size"));
+        }
+        Ok(page_count)
     }
 
     pub fn validate_for_context(&self, context: &ObjectContext) -> Result<()> {
@@ -509,6 +544,18 @@ pub struct ResolvedWalSegment {
     segment: WalSegment,
 }
 
+impl ResolvedWalSegment {
+    /// Both values are available only after the envelope hash, AEAD context,
+    /// encoded segment, and segment context have been verified together.
+    pub(crate) fn reference(&self) -> &ImmutableReference {
+        &self.reference
+    }
+
+    pub(crate) fn segment(&self) -> &WalSegment {
+        &self.segment
+    }
+}
+
 pub fn resolve_wal_segment(
     cipher: &ArchiveCipher,
     context: ObjectContext,
@@ -520,8 +567,36 @@ pub fn resolve_wal_segment(
     {
         return Err(ArchiveV3Error::Authentication);
     }
-    let plaintext = cipher.open(&context, &envelope)?;
-    let segment = WalSegment::decode(&plaintext)?;
+    // `WalSegment::decode` copies the authenticated frame bytes into its
+    // bounded owned representation. Keep the transient AEAD plaintext
+    // zeroized even when decoding or context validation rejects it.
+    let plaintext = Zeroizing::new(cipher.open(&context, &envelope)?);
+    let segment = WalSegment::decode(plaintext.as_slice())?;
+    segment.validate_for_context(&context)?;
+    Ok(ResolvedWalSegment {
+        reference: expected_reference,
+        segment,
+    })
+}
+
+/// The verified archive cipher is the production-shaped cipher boundary. Keep
+/// this twin of [`resolve_wal_segment`] explicit rather than allowing callers
+/// to reach inside `VerifiedArchiveCipher` for its raw DEK.
+pub fn resolve_verified_wal_segment(
+    cipher: &crate::archive_v3::VerifiedArchiveCipher,
+    context: ObjectContext,
+    expected_reference: ImmutableReference,
+    envelope: CiphertextEnvelope,
+) -> Result<ResolvedWalSegment> {
+    if context.object_id() != expected_reference.object_id
+        || envelope.hash() != expected_reference.envelope_hash
+    {
+        return Err(ArchiveV3Error::Authentication);
+    }
+    // See `resolve_wal_segment`: the raw AEAD plaintext has no reason to
+    // survive after the validated segment owns its bounded frame copy.
+    let plaintext = Zeroizing::new(cipher.open(&context, &envelope)?);
+    let segment = WalSegment::decode(plaintext.as_slice())?;
     segment.validate_for_context(&context)?;
     Ok(ResolvedWalSegment {
         reference: expected_reference,
@@ -569,6 +644,18 @@ pub fn validate_wal_commit_chain(root: &ArchiveRoot, entries: &[ResolvedWalSegme
             .ok_or(ArchiveV3Error::Malformed("WAL frame sequence overflow"))?;
         expected_checksum = segment.terminal_checksum()?;
         previous_reference = Some(&entry.reference);
+    }
+    let effective_length = u64::from(
+        entries
+            .last()
+            .ok_or(ArchiveV3Error::Malformed("WAL root chain"))?
+            .segment
+            .final_commit_page_count()?,
+    )
+    .checked_mul(u64::from(SQLITE_PAGE_SIZE))
+    .ok_or(ArchiveV3Error::TooLarge("SQLite database"))?;
+    if effective_length != root.logical_file_length {
+        return Err(ArchiveV3Error::Malformed("WAL effective length"));
     }
     Ok(())
 }
@@ -970,7 +1057,23 @@ mod tests {
         );
         assert_ne!(
             Sha256::digest(segment.encode().unwrap()),
-            Sha256::digest(tampered.frames)
+            Sha256::digest(&tampered.frames)
+        );
+
+        let mut over_cap_page = fixture_wal_segment();
+        over_cap_page.frames[..4].copy_from_slice(&(MAX_DATABASE_PAGES + 1).to_be_bytes());
+        assert_eq!(
+            over_cap_page.validate(),
+            Err(ArchiveV3Error::Malformed("WAL frame header"))
+        );
+
+        let mut over_cap_length = fixture_wal_segment();
+        let frame_bytes = SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAGE_SIZE as usize;
+        over_cap_length.frames[frame_bytes + 4..frame_bytes + 8]
+            .copy_from_slice(&(MAX_DATABASE_PAGES + 1).to_be_bytes());
+        assert_eq!(
+            over_cap_length.validate(),
+            Err(ArchiveV3Error::TooLarge("SQLite database pages"))
         );
     }
 
@@ -1082,6 +1185,15 @@ mod tests {
         .unwrap();
         let entries = [resolved_first.clone(), resolved_second.clone()];
         assert_eq!(validate_wal_commit_chain(&root, &entries), Ok(()));
+
+        let inconsistent_length_root = ArchiveRoot {
+            logical_file_length: u64::from(SQLITE_PAGE_SIZE),
+            ..root.clone()
+        };
+        assert_eq!(
+            validate_wal_commit_chain(&inconsistent_length_root, &entries),
+            Err(ArchiveV3Error::Malformed("WAL effective length"))
+        );
 
         let mut wrong_hash = first_reference.clone();
         wrong_hash.envelope_hash[0] ^= 1;

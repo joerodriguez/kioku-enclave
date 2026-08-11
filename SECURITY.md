@@ -289,7 +289,7 @@ credential, or deployment wiring.
 The shadow module
 is bounded synchronous capture state only: no
 SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
-The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its exact session-and-attempt-derived owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes; a later attempt in the same stable session cannot drain its predecessor's commits. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
+The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its image tail is zeroized before a nonzero truncate, and reset, fault, and owner-drop paths zeroize raw image/header bytes; queued captures independently zeroize on drop. Its exact session-and-attempt-derived owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes; a later attempt in the same stable session cannot drain its predecessor's commits. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
 
 `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
@@ -686,8 +686,10 @@ lost-update races, and v2 AAD binds each blob to its intended logical object and
 Account deletion enumerates every exact live and noncurrent object generation, deletes
 each generation explicitly, and verifies no matching generation remains.
 
-**ADR-0022 inactive checkpoint seam:** the compiled-but-unwired checkpoint module uses
-independently authenticated 1 MiB chunks and bounded 256-way manifest nodes. Recovery accepts
+**ADR-0022 inactive checkpoint seam:** the compiled-but-unwired checkpoint module rejects a
+declared length over the shared 32-GiB ceiling before source reads, hashing, encryption, or any
+immutable create, then uses independently authenticated 1 MiB chunks and bounded 256-way manifest
+nodes. Recovery accepts
 only the exact root commitment returned by the witness; it derives every manifest and chunk
 context from that root and never selects objects by GCS listing. It checks envelope hashes, AEAD
 context, manifest coverage, per-chunk hashes, and the full plaintext hash before atomically
@@ -720,6 +722,25 @@ subsequent advance may race it. Failures can leave unreachable ciphertext for th
 GC/deletion walker. The seam never truncates WAL, mutates legacy persistence, or performs cleanup,
 and no Store, VFS registration, provider construction, flag, route, startup path, or production
 authority wires it.
+
+**ADR-0022 inactive captured-WAL seam:** a post-successful-`xSync`, checksum-validated VFS
+capture can now be split only at bounded SQLite frame boundaries into independently encrypted,
+predecessor-linked immutable WAL segments. Every create is followed by an exact readback,
+envelope-hash, AEAD-context, and format check before its reference can appear in a candidate root.
+That root retains the exact checkpoint base and final WAL reference; composition rejects a prior
+WAL chain or extent base so it cannot discard history. WAL page numbers and the final commit's
+page-count-derived length are bounded by the fixed 8,388,608-page/32-GiB ceiling; because the
+current root format has one logical length also used to derive checkpoint-manifest contexts, this
+slice rejects WAL growth and shrink unless that effective length exactly equals its checkpoint
+base. A future root-format revision must bind distinct checkpoint and post-WAL lengths before
+enabling growth or shrink. Capture frames, decoded segment frames, and transient encoded plaintext
+are zeroized when their owners drop. Recovery begins only with one
+witness-nominated root, requires its exact registry epoch/rotation/object/hash to match the
+already resolved verified cipher, authenticates that root plus every reverse predecessor link
+before a staging sink receives a byte, and never enumerates storage. This is still not an authority or
+restore path: no VFS capture is drained, no `Store`/provider/flag/route/startup path calls it,
+no local WAL is truncated, and no composite staging adapter yet atomically joins checkpoint and
+WAL recovery before exposing a database.
 
 ### T5 — Hypervisor or memory inspection
 
