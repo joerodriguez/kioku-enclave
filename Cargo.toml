@@ -62,6 +62,12 @@ serde_json = { version = "1.0.140", features = ["raw_value"] }
 
 # Crypto: AES-256-GCM
 aes-gcm = { version = "0.10.3", features = ["std"] }
+# Direct, locked primitives used only by the inactive legacy-GCM migration
+# reader. Keeping them explicit makes the low-level composition auditable.
+aes = { version = "0.8.4", features = ["zeroize"] }
+ctr = { version = "0.9.2", features = ["zeroize"] }
+ghash = { version = "0.5.1", features = ["zeroize"] }
+subtle = "2.6.1"
 # Direct declaration of the already-locked HKDF implementation used by the
 # inactive ADR-0022 archive-v3 format foundation.  Keeping this explicit makes
 # the archive KDF auditable rather than relying on a transitive dependency.
