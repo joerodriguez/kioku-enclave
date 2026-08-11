@@ -957,7 +957,7 @@ mod tests {
     };
     use crate::archive_v3_operation::{
         BoundedOperationResult, OperationId, OperationResultStatus, RequestFingerprint,
-        RetentionClass,
+        RetentionClass, ShadowObjectState,
     };
     use crate::archive_v3_witness::{
         InMemoryWitness, KeyRegistryReference, RootCommitment, Witness, WitnessBootstrap,
@@ -1937,6 +1937,169 @@ mod tests {
         assert!(session_events.contains(&"persist_aborted"));
         drop(session_events);
         assert!(!backend.events.lock().unwrap().contains(&"create"));
+    }
+
+    #[tokio::test]
+    async fn durable_prepared_restart_exact_gets_matching_or_missing_rows_and_tamper_blocks_abort()
+    {
+        for scenario in ["matching", "missing", "tampered"] {
+            let (backend, cipher, witness, prepared, request, _) = setup(Outcome::Ok).await;
+            let temporary = tempfile::NamedTempFile::new().unwrap();
+            let mut connection = Connection::open(temporary.path()).unwrap();
+            OperationLedger::initialize(&connection).unwrap();
+            let record = prepared.record.lock().unwrap().clone();
+            OperationLedger::prepare_shadow_session(&mut connection, &record).unwrap();
+            let binding = record.binding();
+            let context = ObjectContext::new(
+                request.archive_id,
+                crate::archive_v3::DatabaseEpoch::from_bytes(binding.database_epoch()),
+                KeyEpoch::from_bytes(binding.registry_epoch()),
+                ObjectRole::RootV3,
+                LogicalLocation::Root {
+                    root_seq: binding.base_root_seq() + 1,
+                },
+                ObjectId::from_bytes([0x61; 16]),
+                Some(ParentReference {
+                    object_id: ObjectId::from_bytes(binding.base_root_object_id()),
+                    envelope_hash: binding.base_root_ciphertext_hash(),
+                }),
+            )
+            .unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE test_shadow_state_audit(old_state INTEGER, new_state INTEGER);
+                     CREATE TRIGGER test_shadow_state_transition
+                     AFTER UPDATE OF state ON archive_v3_shadow_objects
+                     BEGIN
+                        INSERT INTO test_shadow_state_audit(old_state, new_state)
+                        VALUES (OLD.state, NEW.state);
+                     END;",
+                )
+                .unwrap();
+            let envelope = cipher.seal(&context, b"restart-reservation").unwrap();
+            let facts = ShadowObjectFacts::from_sealed(&context, &envelope, 0).unwrap();
+            OperationLedger::reserve_shadow_object(
+                &mut connection,
+                request.session_id,
+                request.attempt_id,
+                binding,
+                &facts,
+            )
+            .unwrap();
+            if scenario != "missing" {
+                let value = if scenario == "tampered" {
+                    let mut encoded = envelope.encode();
+                    let last = encoded.len() - 1;
+                    encoded[last] ^= 1;
+                    CiphertextEnvelope::decode(&encoded).unwrap()
+                } else {
+                    envelope.clone()
+                };
+                backend
+                    .inner
+                    .create_if_absent(context.object_key(), value)
+                    .await
+                    .unwrap();
+            }
+            backend.events.lock().unwrap().clear();
+            let persistence = Arc::new(EncryptedSqliteShadowSessionPersistence::new(Arc::new(
+                Mutex::new(connection),
+            )));
+            let result = reconcile_durable_shadow_session(
+                witness,
+                persistence.clone(),
+                &backend,
+                request.session_id,
+                request.attempt_id,
+                completion(),
+            )
+            .await;
+            let events = backend.events.lock().unwrap().clone();
+            assert_eq!(events, vec!["read"]);
+            match scenario {
+                "tampered" => {
+                    assert!(matches!(
+                        result,
+                        Err(ShadowCoordinatorError::Checkpoint(
+                            ShadowCheckpointError::Archive(ArchiveV3Error::Authentication)
+                        ))
+                    ));
+                    let connection = persistence.connection.lock().unwrap();
+                    assert_eq!(
+                        OperationLedger::load_shadow_session(
+                            &connection,
+                            request.session_id,
+                            request.attempt_id,
+                        )
+                        .unwrap()
+                        .unwrap()
+                        .state(),
+                        ShadowSessionState::Prepared
+                    );
+                    assert_eq!(
+                        OperationLedger::shadow_object_state(
+                            &connection,
+                            request.session_id,
+                            request.attempt_id,
+                            binding,
+                            &facts,
+                        )
+                        .unwrap(),
+                        Some(ShadowObjectState::Reserved)
+                    );
+                    assert_eq!(
+                        connection
+                            .query_row("SELECT COUNT(*) FROM test_shadow_state_audit", [], |row| {
+                                row.get::<_, i64>(0)
+                            },)
+                            .unwrap(),
+                        0
+                    );
+                }
+                _ => {
+                    assert_eq!(result.unwrap(), ShadowReconcileDecision::Aborted);
+                    let connection = persistence.connection.lock().unwrap();
+                    assert_eq!(
+                        OperationLedger::shadow_object_state(
+                            &connection,
+                            request.session_id,
+                            request.attempt_id,
+                            binding,
+                            &facts,
+                        )
+                        .unwrap(),
+                        Some(ShadowObjectState::OrphanPendingGrace)
+                    );
+                    let transitions: Vec<(i64, i64)> = connection
+                        .prepare("SELECT old_state, new_state FROM test_shadow_state_audit ORDER BY rowid")
+                        .unwrap()
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .unwrap()
+                        .map(|row| row.unwrap())
+                        .collect();
+                    assert_eq!(
+                        transitions,
+                        if scenario == "matching" {
+                            vec![
+                                (
+                                    ShadowObjectState::Reserved as i64,
+                                    ShadowObjectState::Materialized as i64,
+                                ),
+                                (
+                                    ShadowObjectState::Materialized as i64,
+                                    ShadowObjectState::OrphanPendingGrace as i64,
+                                ),
+                            ]
+                        } else {
+                            vec![(
+                                ShadowObjectState::Reserved as i64,
+                                ShadowObjectState::OrphanPendingGrace as i64,
+                            )]
+                        }
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
