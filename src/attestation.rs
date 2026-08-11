@@ -41,8 +41,42 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-use crate::archive_v3_firestore_witness::FirestoreWitnessAudience;
-use crate::error::{EnclaveError, Result};
+use crate::{
+    archive_v3_firestore_witness::FirestoreWitnessAudience,
+    archive_v3_gcs_auth::ArchiveV3GcsAudience,
+    error::{EnclaveError, Result},
+};
+
+/// A non-public, type-preserving handle for an internal WIF audience.
+///
+/// This trait shares only the launcher socket serialization. Each credential
+/// boundary owns its concrete audience type, STS client, cache, and secrets;
+/// an arbitrary `String` can never be passed to this helper.
+pub(crate) trait InternalWifAudience: internal_wif_audience_seal::Sealed {
+    fn internal_wif_audience(&self) -> &str;
+}
+
+// The launcher helper must not become a generic minting oracle: these are the
+// only two credential-boundary types allowed to use its no-nonce WIF request.
+// Keeping this supertrait private means other crate modules cannot implement
+// `InternalWifAudience` for an arbitrary string-owning type.
+mod internal_wif_audience_seal {
+    pub trait Sealed {}
+}
+
+impl internal_wif_audience_seal::Sealed for FirestoreWitnessAudience {}
+impl InternalWifAudience for FirestoreWitnessAudience {
+    fn internal_wif_audience(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl internal_wif_audience_seal::Sealed for ArchiveV3GcsAudience {}
+impl InternalWifAudience for ArchiveV3GcsAudience {
+    fn internal_wif_audience(&self) -> &str {
+        self.as_str()
+    }
+}
 
 // ── Token-server socket ───────────────────────────────────────────────────────
 
@@ -293,10 +327,10 @@ async fn fetch_launcher_token_zeroizing(
 ///
 /// The returned token is zeroized when dropped, and this helper neither caches
 /// it nor logs it.
-pub(crate) async fn fetch_internal_wif_attestation_token(
-    audience: &FirestoreWitnessAudience,
+pub(crate) async fn fetch_internal_wif_attestation_token<A: InternalWifAudience + ?Sized>(
+    audience: &A,
 ) -> Result<Zeroizing<String>> {
-    fetch_launcher_token_zeroizing(audience.as_str(), None).await
+    fetch_launcher_token_zeroizing(audience.internal_wif_audience(), None).await
 }
 
 /// Build the JSON contract accepted by the Confidential Space launcher.

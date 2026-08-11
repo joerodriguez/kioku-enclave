@@ -98,6 +98,7 @@ impl GcpArchiveV3HttpTransport {
             .use_rustls_tls()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
             .build()
@@ -1275,6 +1276,47 @@ mod tests {
             Err(GcsArchiveV3TransportError::OutcomeUnknown)
         );
         let _ = server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn create_if_absent_does_not_retransmit_after_accepted_connection_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await.unwrap();
+            let first_request = read_request(&mut first_stream).await;
+            // Close only after the complete mutation request reached the
+            // server. The listener deliberately remains available so any
+            // automatic retransmission is observable as a second accept.
+            drop(first_stream);
+            let retransmit =
+                match tokio::time::timeout(Duration::from_secs(1), listener.accept()).await {
+                    Ok(Ok((mut stream, _))) => Some(read_request(&mut stream).await),
+                    Ok(Err(error)) => panic!("loopback listener failed: {error}"),
+                    Err(_) => None,
+                };
+            (first_request, retransmit)
+        });
+        let transport = GcpArchiveV3HttpTransport::new_with_endpoint(
+            &endpoint,
+            "test-bucket".to_owned(),
+            Arc::new(FixedToken),
+            Arc::new(FixedDrainGate(true)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            transport.create_if_absent(object_key(), b"bytes").await,
+            Err(GcsArchiveV3TransportError::OutcomeUnknown)
+        );
+        let (first_request, retransmit) = server.await.unwrap();
+        assert_eq!(first_request.method, "POST");
+        assert!(first_request.target.contains("ifGenerationMatch=0"));
+        assert_eq!(first_request.body_len, 5);
+        assert!(
+            retransmit.is_none(),
+            "create_if_absent retransmitted after provider acceptance"
+        );
     }
 
     #[tokio::test]

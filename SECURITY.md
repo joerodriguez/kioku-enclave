@@ -195,7 +195,7 @@ read-after-create equality, bounded canonical-name pagination, and a contract re
 exact all-generation deletion) plus canonical KMS AAD for bounded registry unwrap. Its
 fake verifies delegation and multi-generation absence semantics; provider-level deletion
 evidence still requires a live drill. `src/archive_v3_gcs_http.rs` provides a concrete,
-caller-token-only REST implementation with exact URL encoding, bounded streamed reads/listing,
+caller-token-only rustls-only/no-proxy/no-redirect/no-retry REST implementation with exact URL encoding, bounded streamed reads/listing,
 generation-zero creates, durable claim CAS, and bounded all-generation deletion. Disabled-policy
 deletion succeeds only through an external provider/audit-and-trusted-time drain gate; no such live
 gate is wired. The transport intentionally has no metadata-service access, environment constructor,
@@ -432,6 +432,19 @@ runtime witness authority. The three paths share only the bounded launcher socke
 the Firestore audience type, STS client, secret-owning request/response buffers, and cache are
 separate. Its STS client is rustls-only, proxy-free, redirect-free, retry-disabled, and
 bounded; neither OIDC/STS tokens, audience, nor provider bodies are logged.
+
+The compiled-but-inactive ADR-0022 archive-GCS bearer is a fourth, separately typed
+credential path. It accepts only the dedicated
+`archive-gcs-attest/archive-gcs` provider-resource audience, requests a no-nonce launcher
+OIDC token for that audience, and exchanges it only at fixed Google STS for the fixed
+`devstorage.read_write` scope. Its audience type derives the exact provider resource only from
+a validated project number (never a full caller-controlled audience); its launcher boundary, rustls-only
+no-proxy/no-redirect/no-retry STS client, zeroizing request/response material, and
+mutex-coalesced cache are independent of KMS, public attestation, and Firestore. It has no
+environment/request/header authority selection, metadata/default credentials, service-account
+impersonation, transport/Store/VFS/route connection, or runtime authority. Launcher and STS
+responses are bounded with finite timeouts and strict RFC 8693/response parsing; cancellation
+or refresh failure drops expired cached secret material.
 
 TLS terminates inside the attested binary, so no external reverse proxy receives request
 plaintext. ACME generates the private key inside the TEE and persists account,
