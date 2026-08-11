@@ -228,9 +228,24 @@ and accepts only the documented named-database grammar; a future token source is
 to receive and use the one dedicated `archive-witness-attest/providers/archive-witness` WIF
 provider-resource audience on every mint. Batch-get transport is capped before JSON parsing
 and accepts exactly one response, while record/base64, transaction, token, `readTime`, and
-`updateTime` material are bounded and fail closed. It intentionally has no concrete HTTP
-transport, token source (including no metadata-token fallback), IAM, queries/lists/deletes,
-additional fields, Store/VFS/route connection, deployment flag, or production authority.
+`updateTime` material are bounded and fail closed. `src/archive_v3_firestore_http.rs` is a
+compiled but equally inactive concrete transport: its production origin is fixed to
+`https://firestore.googleapis.com/v1` (a plaintext loopback origin is test-only), it uses
+rustls with no proxy or redirects and finite connect/request/body timeouts, and it validates
+only the adapter's begin/read/commit request shapes before sending them. It caps every body
+before parsing; batch-get accepts only a JSON array containing exactly one strict response
+object and rejects bare, empty, multi-object, nested, or trailing JSON shapes. Canonical
+bounded Google error envelopes are accepted either bare or in an exact one-element array,
+validated, and never logged or returned. Automatic HTTP retries are disabled so a refused
+connection is known unsent while every failure after acceptance remains ambiguous. Update-time
+preconditions are canonical UTC and microsecond-aligned; a found document may omit `createTime`,
+but if present it must be canonical and no later than `updateTime`. A post-send commit
+transport/timeout/429/5xx or
+malformed success remains `OutcomeUnknown`; `ABORTED` and `FAILED_PRECONDITION` retain their
+typed meanings, and an HTTP 404 is only an endpoint/database failure, never a missing
+witness document. It intentionally has no token source (including no metadata-token fallback),
+IAM, queries/lists/deletes/batch-write/create-document, additional fields, Store/VFS/route
+connection, deployment flag, or production authority.
 Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
 acknowledge a write from archive-v3 until ADR-0022
