@@ -1277,6 +1277,7 @@ impl DeletionRecovery {
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryRoot {
+    archive_id: ArchiveId,
     root: RootCommitment,
     registry: KeyRegistryReference,
     predecessor: Option<Predecessor>,
@@ -1284,6 +1285,10 @@ pub struct RecoveryRoot {
     deletion: DeletionState,
 }
 impl RecoveryRoot {
+    pub fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
     pub fn root(&self) -> RootCommitment {
         self.root
     }
@@ -1674,6 +1679,7 @@ impl Witness for InMemoryWitness {
             return Err(WitnessError::InvalidTransition);
         }
         Ok(RecoveryRoot {
+            archive_id: r.archive_id,
             root: r.root,
             registry: r.registry,
             predecessor: r.predecessor,

@@ -7,10 +7,10 @@
 //!
 //! This is a data-format seam, not a persistence path. It has no `Store`,
 //! SQLite VFS, GCS provider/credential, witness, route, flag, or authority
-//! connection. A future coordinator must mint a sealed recovery capability only
-//! after authenticating the exact [`ArchiveRoot`] selected by the independent
-//! witness. No production constructor exists yet; this is an activation
-//! blocker. This module never lists storage.
+//! connection. A crate-private mint accepts only an active [`RecoveryRoot`],
+//! then reads, hashes, decrypts, and validates the exact [`ArchiveRoot`]
+//! selected by the independent witness before issuing the sealed recovery
+//! capability. This module never lists storage.
 
 use std::cmp::{max, min};
 
@@ -18,14 +18,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-#[cfg(test)]
-use crate::archive_v3::ArchiveRoot;
 use crate::archive_v3::{
-    ArchiveId, ArchiveV3Error, CiphertextEnvelope, DatabaseEpoch, ExtentReference,
+    ArchiveId, ArchiveRoot, ArchiveV3Error, CiphertextEnvelope, DatabaseEpoch, ExtentReference,
     ImmutableObjectBackend, ImmutableReference, KeyEpoch, LogicalLocation, MerkleChild,
-    MerkleEntries, MerkleNode, ObjectContext, ObjectId, ObjectRole, Result as ArchiveResult,
-    MAX_DATABASE_BYTES, MAX_DATABASE_EXTENT_SLOTS, SQLITE_PAGE_SIZE,
+    MerkleEntries, MerkleNode, ObjectContext, ObjectId, ObjectRole, ParentReference,
+    Result as ArchiveResult, VerifiedArchiveCipher, MAX_DATABASE_BYTES, MAX_DATABASE_EXTENT_SLOTS,
+    SQLITE_PAGE_SIZE,
 };
+use crate::archive_v3_witness::{DeletionState, RecoveryRoot};
 
 pub const EXTENT_BYTES: u32 = 1_048_576;
 pub const MAX_RANGE_RECONSTRUCTION_BYTES: usize = EXTENT_BYTES as usize;
@@ -134,10 +134,9 @@ impl std::fmt::Debug for UploadedExtentTree {
     }
 }
 
-/// Exact root facts intended to be minted only after independent-witness root
-/// verification. Its constructor is test-only until a sealed production mint
-/// exists, so no production caller can turn a raw `ArchiveRoot` into recovery
-/// authority.
+/// Exact root facts minted only from an independently witness-selected and
+/// readback-authenticated root object. No generic production constructor
+/// exists.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedExtentRoot {
     archive_id: ArchiveId,
@@ -149,9 +148,8 @@ pub struct AuthenticatedExtentRoot {
     tree_height: u8,
 }
 impl AuthenticatedExtentRoot {
-    /// Test-only stand-in for a future sealed capability minted by exact
-    /// witness-root verification. Production code has no constructor: that
-    /// missing minting path is an explicit activation blocker.
+    /// Test-only fixture constructor. Production code cannot turn a raw root
+    /// into recovery authority.
     #[cfg(test)]
     fn from_test_verified_archive_root(archive_id: ArchiveId, root: &ArchiveRoot) -> Result<Self> {
         root.validate()?;
@@ -176,6 +174,80 @@ impl AuthenticatedExtentRoot {
     pub const fn logical_file_length(&self) -> u64 {
         self.logical_file_length
     }
+}
+
+/// Mint the sealed extent-recovery capability from the active exact root named
+/// by the witness. This performs one exact object read and never enumerates or
+/// deletes storage. The resolved archive cipher is itself bound to the exact
+/// witness registry object/hash before this function can use it.
+pub(crate) async fn mint_authenticated_extent_root(
+    backend: &dyn ImmutableObjectBackend,
+    cipher: &VerifiedArchiveCipher,
+    recovery: &RecoveryRoot,
+) -> Result<AuthenticatedExtentRoot> {
+    let commitment = recovery.root();
+    let registry = recovery.registry();
+    if recovery.deletion() != DeletionState::Active
+        || cipher.archive_id() != recovery.archive_id()
+        || cipher.key_epoch() != commitment.key_epoch()
+        || commitment.key_epoch() != registry.key_epoch()
+        || cipher.registry_rotation_generation() != registry.rotation_generation()
+        || cipher.registry_object_id() != registry.object_id()
+        || cipher.registry_ciphertext_hash() != registry.ciphertext_hash()
+    {
+        return Err(ArchiveV3Error::InvalidContext.into());
+    }
+
+    let root_reference = commitment.root();
+    let parent = commitment.parent().map(|parent| ParentReference {
+        object_id: parent.object_id(),
+        envelope_hash: parent.ciphertext_hash(),
+    });
+    let context = ObjectContext::new(
+        recovery.archive_id(),
+        commitment.database_epoch(),
+        commitment.key_epoch(),
+        ObjectRole::RootV3,
+        LogicalLocation::Root {
+            root_seq: root_reference.sequence(),
+        },
+        root_reference.object_id(),
+        parent,
+    )?;
+    let envelope = load_exact(
+        backend,
+        &context,
+        &ImmutableReference {
+            object_id: root_reference.object_id(),
+            envelope_hash: root_reference.ciphertext_hash(),
+        },
+    )
+    .await?;
+    let plaintext = Zeroizing::new(cipher.open(&context, &envelope)?);
+    let root = ArchiveRoot::decode(plaintext.as_slice())?;
+    root.validate_for_context(&context)?;
+    if root.root_seq != root_reference.sequence()
+        || root.parent.as_ref() != context.parent()
+        || root.database_epoch != commitment.database_epoch()
+        || root.key_epoch != commitment.key_epoch()
+        || root.owner_fencing_epoch != commitment.owner_fencing_epoch()
+    {
+        return Err(ArchiveV3Error::InvalidContext.into());
+    }
+    let logical_file_length = root.logical_file_length;
+    let root = root
+        .extent_tree_root
+        .ok_or(ArchiveV3Error::Malformed("root has no extent tree"))?;
+    let extent_slots = extent_slots(logical_file_length)?;
+    Ok(AuthenticatedExtentRoot {
+        archive_id: recovery.archive_id(),
+        database_epoch: commitment.database_epoch(),
+        key_epoch: commitment.key_epoch(),
+        root,
+        logical_file_length,
+        extent_slots,
+        tree_height: extent_tree_height(extent_slots)?,
+    })
 }
 
 /// Streams bounded immutable extent objects and fixed-fanout persistent nodes.
@@ -862,9 +934,19 @@ async fn copy_intersection<C: ExtentCipher>(
 mod tests {
     use super::*;
     use crate::archive_v3::{
-        ArchiveCipher, ArchiveDek, CreateIfAbsent, InMemoryImmutableBackend, ObjectKey,
+        resolve_archive_cipher, ArchiveCipher, ArchiveDek, CreateIfAbsent,
+        ExactKeyRegistryProvider, InMemoryImmutableBackend, KeyKind, KeyRegistryContext,
+        KeyRegistryPlaintext, ObjectKey,
     };
-    use std::sync::Mutex;
+    use crate::archive_v3_witness::{
+        deletion_driver_test_fixture, InMemoryWitness, KeyRegistryReference, RootCommitment,
+        RootReference, Witness, WitnessBootstrap, WitnessError,
+    };
+    use sha2::{Digest, Sha256};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    };
     struct TestCipher {
         archive: ArchiveId,
         epoch: KeyEpoch,
@@ -942,6 +1024,259 @@ mod tests {
                 _ => Ok(None),
             }
         }
+    }
+    const WRAPPED_REGISTRY: &[u8] = b"extent-root-test-registry";
+
+    struct FakeKeyRegistryProvider {
+        registry_object_id: ObjectId,
+        plaintext: Vec<u8>,
+    }
+    #[async_trait::async_trait]
+    impl ExactKeyRegistryProvider for FakeKeyRegistryProvider {
+        async fn read_exact_wrapped(
+            &self,
+            _context: &KeyRegistryContext,
+            object_id: ObjectId,
+            destination: &mut [u8],
+        ) -> ArchiveResult<usize> {
+            if object_id != self.registry_object_id {
+                return Err(ArchiveV3Error::InvalidContext);
+            }
+            destination[..WRAPPED_REGISTRY.len()].copy_from_slice(WRAPPED_REGISTRY);
+            Ok(WRAPPED_REGISTRY.len())
+        }
+
+        async fn kms_unwrap_exact(
+            &self,
+            _context: &KeyRegistryContext,
+            wrapped_registry_ciphertext: &[u8],
+            destination: &mut [u8],
+        ) -> ArchiveResult<usize> {
+            if wrapped_registry_ciphertext != WRAPPED_REGISTRY {
+                return Err(ArchiveV3Error::InvalidContext);
+            }
+            destination[..self.plaintext.len()].copy_from_slice(&self.plaintext);
+            Ok(self.plaintext.len())
+        }
+    }
+
+    async fn verified_cipher(
+        archive_id: ArchiveId,
+        key_epoch: KeyEpoch,
+        registry: KeyRegistryReference,
+    ) -> VerifiedArchiveCipher {
+        let context = KeyRegistryContext::with_rotation_generation(
+            archive_id,
+            KeyKind::Archive,
+            key_epoch,
+            registry.rotation_generation(),
+        );
+        let provider = FakeKeyRegistryProvider {
+            registry_object_id: registry.object_id(),
+            plaintext: KeyRegistryPlaintext::encode_archive(
+                &context,
+                &ArchiveDek::from_bytes([7; 32]),
+            )
+            .unwrap()
+            .to_vec(),
+        };
+        resolve_archive_cipher(
+            &context,
+            registry.object_id(),
+            registry.ciphertext_hash(),
+            &provider,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A deliberately get-only adapter. Any accidental enumerate/delete call
+    /// fails the mint test immediately, while the exact read count remains
+    /// observable.
+    #[derive(Default)]
+    struct ExactGetOnlyBackend {
+        inner: InMemoryImmutableBackend,
+        gets: AtomicUsize,
+        enumerations: AtomicUsize,
+        missing: AtomicBool,
+        substitutions: Mutex<Option<CiphertextEnvelope>>,
+    }
+    #[async_trait::async_trait]
+    impl ImmutableObjectBackend for ExactGetOnlyBackend {
+        async fn create_if_absent(
+            &self,
+            key: ObjectKey,
+            value: CiphertextEnvelope,
+        ) -> ArchiveResult<CreateIfAbsent> {
+            self.inner.create_if_absent(key, value).await
+        }
+
+        async fn get(&self, key: &ObjectKey) -> ArchiveResult<Option<CiphertextEnvelope>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            if self.missing.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            if let Some(substitution) = self.substitutions.lock().unwrap().clone() {
+                return Ok(Some(substitution));
+            }
+            self.inner.get(key).await
+        }
+
+        async fn enumerate(
+            &self,
+            _prefix: &crate::archive_v3::ArchivePrefix,
+            _cursor: Option<&crate::archive_v3::EnumerationCursor>,
+            _limit: crate::archive_v3::EnumerationLimit,
+        ) -> ArchiveResult<crate::archive_v3::EnumerationPage> {
+            self.enumerations.fetch_add(1, Ordering::Relaxed);
+            Err(ArchiveV3Error::Authentication)
+        }
+
+        async fn delete_exact(&self, _key: &ObjectKey) -> ArchiveResult<bool> {
+            panic!("the extent-root mint must never delete")
+        }
+    }
+
+    fn root_fixture() -> ArchiveRoot {
+        ArchiveRoot {
+            root_seq: 0,
+            parent: None,
+            database_epoch: DatabaseEpoch::from_bytes([2; 16]),
+            key_epoch: KeyEpoch::from_bytes([3; 16]),
+            owner_fencing_epoch: 0,
+            sqlite_page_size: SQLITE_PAGE_SIZE,
+            logical_file_length: u64::from(SQLITE_PAGE_SIZE),
+            user_schema_version: 1,
+            storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
+            wal_generation: 0,
+            wal_segment_count: 0,
+            checkpoint_root: None,
+            extent_tree_root: Some(ImmutableReference {
+                object_id: ObjectId::from_bytes([8; 16]),
+                envelope_hash: [9; 32],
+            }),
+            wal_chain_root: None,
+        }
+    }
+
+    async fn mint_fixture(
+        wire_root: ArchiveRoot,
+    ) -> (ExactGetOnlyBackend, VerifiedArchiveCipher, RecoveryRoot) {
+        mint_fixture_bytes(wire_root.encode().unwrap(), false).await
+    }
+
+    async fn mint_fixture_bytes(
+        wire_root: Vec<u8>,
+        tamper_envelope: bool,
+    ) -> (ExactGetOnlyBackend, VerifiedArchiveCipher, RecoveryRoot) {
+        let archive = ArchiveId::from_bytes([1; 16]);
+        let database = DatabaseEpoch::from_bytes([2; 16]);
+        let key = KeyEpoch::from_bytes([3; 16]);
+        let registry = KeyRegistryReference::new(
+            key,
+            0,
+            ObjectId::from_bytes([4; 16]),
+            Sha256::digest(WRAPPED_REGISTRY).into(),
+        );
+        let cipher = verified_cipher(archive, key, registry).await;
+        let root_id = ObjectId::from_bytes([5; 16]);
+        let context = ObjectContext::new(
+            archive,
+            database,
+            key,
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: 0 },
+            root_id,
+            None,
+        )
+        .unwrap();
+        let mut envelope = cipher.seal(&context, &wire_root).unwrap();
+        if tamper_envelope {
+            let mut encoded = envelope.encode();
+            *encoded.last_mut().unwrap() ^= 1;
+            envelope = CiphertextEnvelope::decode(&encoded).unwrap();
+        }
+        let backend = ExactGetOnlyBackend::default();
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await
+            .unwrap();
+        let witness = InMemoryWitness::new();
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive,
+                database,
+                RootCommitment::genesis(
+                    database,
+                    key,
+                    RootReference::new(0, root_id, envelope.hash()),
+                ),
+                registry,
+            ))
+            .unwrap();
+        (backend, cipher, witness.recovery_root(archive).unwrap())
+    }
+
+    async fn minted_sparse_root_fixture(
+    ) -> (ExactGetOnlyBackend, VerifiedArchiveCipher, RecoveryRoot) {
+        let archive = ArchiveId::from_bytes([1; 16]);
+        let database = DatabaseEpoch::from_bytes([2; 16]);
+        let key = KeyEpoch::from_bytes([3; 16]);
+        let registry = KeyRegistryReference::new(
+            key,
+            0,
+            ObjectId::from_bytes([4; 16]),
+            Sha256::digest(WRAPPED_REGISTRY).into(),
+        );
+        let cipher = verified_cipher(archive, key, registry).await;
+        let backend = ExactGetOnlyBackend::default();
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x6a))],
+            next: 0,
+        };
+        let uploaded = upload_extent_tree(
+            &backend,
+            &TestCipher::new(archive, key),
+            archive,
+            database,
+            &mut source,
+        )
+        .await
+        .unwrap();
+        let root_id = ObjectId::from_bytes([5; 16]);
+        let context = ObjectContext::new(
+            archive,
+            database,
+            key,
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: 0 },
+            root_id,
+            None,
+        )
+        .unwrap();
+        let mut root = root_fixture();
+        root.logical_file_length = uploaded.logical_file_length();
+        root.extent_tree_root = Some(uploaded.root().clone());
+        let envelope = cipher.seal(&context, &root.encode().unwrap()).unwrap();
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await
+            .unwrap();
+        let witness = InMemoryWitness::new();
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive,
+                database,
+                RootCommitment::genesis(
+                    database,
+                    key,
+                    RootReference::new(0, root_id, envelope.hash()),
+                ),
+                registry,
+            ))
+            .unwrap();
+        (backend, cipher, witness.recovery_root(archive).unwrap())
     }
     #[derive(Default)]
     struct FaultBackend {
@@ -1096,6 +1431,199 @@ mod tests {
             .unwrap()
             .sparse_content_commitment()
     }
+
+    #[tokio::test]
+    async fn witness_recovery_root_mints_extent_capability_from_one_exact_get() {
+        let (backend, cipher, recovery) = mint_fixture(root_fixture()).await;
+
+        let capability = mint_authenticated_extent_root(&backend, &cipher, &recovery)
+            .await
+            .unwrap();
+
+        assert_eq!(capability.root().object_id, ObjectId::from_bytes([8; 16]));
+        assert_eq!(
+            capability.logical_file_length(),
+            u64::from(SQLITE_PAGE_SIZE)
+        );
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn witness_root_mint_requires_the_exact_authenticated_nonempty_root() {
+        let (backend, cipher, recovery) = mint_fixture(root_fixture()).await;
+        backend.missing.store(true, Ordering::Relaxed);
+        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
+            .await
+            .is_err());
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+
+        let (backend, cipher, recovery) =
+            mint_fixture_bytes(root_fixture().encode().unwrap(), true).await;
+        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
+            .await
+            .is_err());
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+
+        let mut all_hole = root_fixture();
+        all_hole.logical_file_length = 0;
+        all_hole.extent_tree_root = None;
+        let (backend, cipher, recovery) = mint_fixture(all_hole).await;
+        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
+            .await
+            .is_err());
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn witness_root_mint_retains_root_length_bounds_before_capability_issue() {
+        let encoded = root_fixture().encode().unwrap();
+        let mut over_capacity = encoded.clone();
+        over_capacity[61..69]
+            .copy_from_slice(&(MAX_DATABASE_BYTES + u64::from(SQLITE_PAGE_SIZE)).to_be_bytes());
+        let mut misaligned = encoded;
+        misaligned[61..69].copy_from_slice(&1u64.to_be_bytes());
+        for malformed in [over_capacity, misaligned] {
+            let (backend, cipher, recovery) = mint_fixture_bytes(malformed, false).await;
+            assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
+                .await
+                .is_err());
+            assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+            assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn witness_root_mint_rejects_envelope_and_root_field_substitutions() {
+        let (backend, cipher, recovery) = mint_fixture(root_fixture()).await;
+        let substituted = cipher
+            .seal(
+                &ObjectContext::new(
+                    recovery.archive_id(),
+                    recovery.root().database_epoch(),
+                    recovery.root().key_epoch(),
+                    ObjectRole::RootV3,
+                    LogicalLocation::Root { root_seq: 0 },
+                    ObjectId::from_bytes([47; 16]),
+                    None,
+                )
+                .unwrap(),
+                b"substituted root envelope",
+            )
+            .unwrap();
+        *backend.substitutions.lock().unwrap() = Some(substituted);
+        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
+            .await
+            .is_err());
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+
+        let mut wrong_database = root_fixture();
+        wrong_database.database_epoch = DatabaseEpoch::from_bytes([41; 16]);
+        let mut wrong_key = root_fixture();
+        wrong_key.key_epoch = KeyEpoch::from_bytes([42; 16]);
+        let mut wrong_sequence_and_parent = root_fixture();
+        wrong_sequence_and_parent.root_seq = 1;
+        wrong_sequence_and_parent.parent = Some(ParentReference {
+            object_id: ObjectId::from_bytes([43; 16]),
+            envelope_hash: [44; 32],
+        });
+        let mut wrong_fence = root_fixture();
+        wrong_fence.owner_fencing_epoch = 1;
+        for root in [
+            wrong_database,
+            wrong_key,
+            wrong_sequence_and_parent,
+            wrong_fence,
+        ] {
+            let (backend, cipher, recovery) = mint_fixture(root).await;
+            assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
+                .await
+                .is_err());
+            assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
+            assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+        }
+
+        let (backend, _cipher, recovery) = mint_fixture(root_fixture()).await;
+        let wrong_registry = KeyRegistryReference::new(
+            recovery.registry().key_epoch(),
+            recovery.registry().rotation_generation(),
+            ObjectId::from_bytes([45; 16]),
+            recovery.registry().ciphertext_hash(),
+        );
+        let wrong_registry_cipher = verified_cipher(
+            recovery.archive_id(),
+            recovery.root().key_epoch(),
+            wrong_registry,
+        )
+        .await;
+        assert!(
+            mint_authenticated_extent_root(&backend, &wrong_registry_cipher, &recovery)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+
+        let wrong_archive_cipher = verified_cipher(
+            ArchiveId::from_bytes([46; 16]),
+            recovery.root().key_epoch(),
+            recovery.registry(),
+        )
+        .await;
+        assert!(
+            mint_authenticated_extent_root(&backend, &wrong_archive_cipher, &recovery)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deletion_closure_cannot_supply_a_recovery_root_to_the_mint() {
+        let fixture = deletion_driver_test_fixture();
+        let archive = fixture.tombstone.receipt().record().archive_id();
+        assert_eq!(
+            fixture.witness.recovery_root(archive),
+            Err(WitnessError::InvalidTransition)
+        );
+    }
+
+    #[tokio::test]
+    async fn minted_capability_keeps_reconstruction_output_transactional() {
+        let (backend, cipher, recovery) = minted_sparse_root_fixture().await;
+        let capability = mint_authenticated_extent_root(&backend, &cipher, &recovery)
+            .await
+            .unwrap();
+        let mut successful_output = vec![0; SQLITE_PAGE_SIZE as usize];
+        reconstruct_extent_range(&backend, &cipher, &capability, 0, &mut successful_output)
+            .await
+            .unwrap();
+        assert_eq!(successful_output, vec![0x6a; SQLITE_PAGE_SIZE as usize]);
+        let context = node_context(
+            recovery.archive_id(),
+            recovery.root().database_epoch(),
+            recovery.root().key_epoch(),
+            capability.tree_height,
+            0,
+            capability.extent_slots,
+            capability.root.object_id,
+        )
+        .unwrap();
+        *backend.substitutions.lock().unwrap() =
+            Some(cipher.seal(&context, b"wrong node").unwrap());
+        let mut output = vec![0xa5; SQLITE_PAGE_SIZE as usize];
+        assert!(
+            reconstruct_extent_range(&backend, &cipher, &capability, 0, &mut output)
+                .await
+                .is_err()
+        );
+        assert_eq!(output, vec![0xa5; SQLITE_PAGE_SIZE as usize]);
+    }
+
     #[tokio::test]
     async fn sparse_content_commitment_binds_length_position_and_data() {
         let (a, d, k) = ids();
