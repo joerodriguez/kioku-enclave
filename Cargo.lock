@@ -1794,6 +1794,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "http-body",
+ "httpdate",
  "hyper",
  "hyper-util",
  "instant-acme",

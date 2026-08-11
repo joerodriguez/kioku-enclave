@@ -867,12 +867,13 @@ async fn upload_capture_event(
         // only after the provider has definitively accepted or rejected it.
         let put_lease = _content_write.child();
         let put_store = Arc::clone(&state.store);
+        let put_user_id = user_id.clone();
         let put_object_key = object_key.to_string();
         let put_wrapped_dek = wrapped_dek.clone();
         let put = tokio::spawn(async move {
             let _put_lease = put_lease;
             put_store
-                .put_media(&put_object_key, &encrypted, &put_wrapped_dek)
+                .put_user_media(&put_user_id, &put_object_key, &encrypted, &put_wrapped_dek)
                 .await
         });
         match put.await {

@@ -12,6 +12,7 @@ pub enum DeletionPendingReason {
     LegacySnapshotTooLarge,
     LegacyGenerationUnavailable,
     LegacyInventoryIncomplete,
+    LegacyWriteIntentUnsettled,
 }
 
 impl DeletionPendingReason {
@@ -21,6 +22,7 @@ impl DeletionPendingReason {
             Self::LegacySnapshotTooLarge => "legacy_snapshot_too_large",
             Self::LegacyGenerationUnavailable => "legacy_generation_unavailable",
             Self::LegacyInventoryIncomplete => "legacy_inventory_incomplete",
+            Self::LegacyWriteIntentUnsettled => "legacy_write_intent_unsettled",
         }
     }
 }

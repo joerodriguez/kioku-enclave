@@ -80,6 +80,9 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 # webpki-roots bundles Mozilla's CA roots into the binary so the FROM-scratch
 # container image needs no /etc/ssl/certs on the filesystem.
 reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+# Strict parsing of the authenticated GCS response Date used for durable
+# legacy-write intent leases. Already present transitively through hyper.
+httpdate = "1.0.3"
 
 # Async trait support (used by KmsClient and GcsClient traits)
 async-trait = "0.1.88"
@@ -153,7 +156,7 @@ kaldi-native-fbank = "0.1.0"
 tract-onnx = { version = "0.23.4", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.45.1", features = ["rt", "macros"] }
+tokio = { version = "1.45.1", features = ["rt", "macros", "test-util"] }
 tempfile = "3.20.0"
 
 [profile.release]

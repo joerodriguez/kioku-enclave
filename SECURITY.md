@@ -205,7 +205,52 @@ epoch/object/hash must come from the independent witness so cold recovery can un
 key before decrypting the root. This foundation makes no KMS calls and has no live Store,
 SQLite VFS, GCS, witness, route, migration,
 export, or deletion wiring. The legacy context-bound v2 database blob remains the sole
-production authority. `src/archive_v3_gcs.rs` is likewise inactive: it specifies and
+production authority. The encrypted control database now assigns each canonical account
+one independently random opaque archive ID and retains an internal-only tombstone plus
+bounded opaque inventory-cursor slots before identity removal. This is a local fencing
+prerequisite only: it does not construct any v3 transport/witness/VFS/shadow runtime,
+does not send a provider request, and has no cryptographic, logical, or physical-complete
+state. Finalization erases the identity-to-archive binding while retaining only the
+archive-keyed tombstone, so a deleted identity cannot reconnect old ciphertext. Archive
+IDs, fences, and cursors are neither logged nor exposed through API/export models.
+Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
+rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
+source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the
+first provider mutation. Store then locks and blocks both process-local namespaces together,
+drains admitted raw writes, and force-flushes the latest actor. A content-free GCS marker fences
+the old namespace across instances. Its retained object name is a domain-separated HMAC under
+the KMS-protected control-store DEK rather than the legacy user ID or a public hash. The key is
+installed only from an exact durable control generation, is absent from the decrypted control
+rows, and cannot be changed in a live process; therefore the archive-keyed deletion ledger does
+not preserve an enumerable identity-to-archive link. Every legacy index write (including generation zero), raw
+media create, recovery-checkpoint copy, and stable create first persists a provider-side exact
+write intent. The intent binds a random request ID, owner namespace, destination backend/name,
+generation precondition or exact copy source, encrypted request bytes, and their commitments.
+Only after rereading the retained marker does a writer CAS a bounded ownership lease and issue the
+data request in an owned task. Lease timestamps come from the strict HTTP `Date` on an authenticated,
+read-only metadata GET of the exact existing intent generation, never a clock write or the process
+wall clock; missing, malformed, or regressing provider time fails closed. The provider future remains
+owned by the intent executor: caller
+cancellation drops it, and its awaited timeout expires before the lease plus a conservative margin,
+so no detached request is authorized beyond lease expiry. Ambiguous responses are reconciled
+against the exact destination; an expired lease can be CAS-taken over from the encrypted request
+only after that provider timeout window.
+Marker creation precedes strongly consistent bounded intent inventory: prepared intents are
+fenced without data I/O, active requests keep deletion/rebind pending, and expired requests are
+taken over. Terminal tombstones erase request bytes and purge their noncurrent payload generations
+but remain live through Phase 6. Rebind then performs a same-plaintext generation-CAS bump, so a
+pre-fence writer is either incorporated by an exact durable rebase or loses without an
+acknowledged mutation. Stable creation remains generation-zero conditional and exact-validated;
+old generations are deleted exactly and idempotently. Startup drains operations in bounded
+64-row pages before request admission (failing closed above a global safety cap), without user
+reauthentication. A live account-deletion retry actively resumes `SourceFreezing` or
+`StableWriting` under the same lifecycle and durable intent ownership instead of waiting for a
+restart. Deletion creates/adopts retained markers for both exact namespaces, drains intents before
+inventory, drains again after physical purge, and cannot finalize identity state until rebind reaches
+`deletion_reconciled`. The content-free old-namespace marker is intentionally retained as a
+ledger-known no-resurrection tombstone; only the later Phase-6 authority-drain/witness cutover may
+retire it.
+`src/archive_v3_gcs.rs` is likewise inactive: it specifies and
 tests a redacted async GCS-shaped transport boundary (conditional immutable creation,
 read-after-create equality, bounded canonical-name pagination, and a contract requiring
 exact all-generation deletion) plus canonical KMS AAD for bounded registry unwrap. Its
@@ -479,9 +524,12 @@ on every retry without storing object names in the control database.
 This is containment, not the later ADR-0022 content-addressed deletion ledger. The actor
 fence and recent-eviction completion markers remain process-local, but deletion inventory
 does not: it is recovered from the durable encrypted user database. The encrypted control
-database persists only a content-free deletion operation: an opaque
-random operation ID, `pending`/`failed_retryable`/`physical_complete` status,
-machine-readable reason, retry delay, and provider `hardDeleteTime` when GCS reports one.
+database persists a content-free legacy deletion operation—an opaque random operation ID,
+`pending`/`failed_retryable`/`physical_complete` status, machine-readable reason, retry
+delay, and provider `hardDeleteTime`—plus a separately internal random archive binding and
+pre-v3 tombstone. That tombstone retains only a random fence and bounded opaque cursor
+slots for a future exact v3 inventory; it neither authorizes v3 I/O nor records any
+cryptographic/logical/physical-complete outcome.
 `DELETE /api/account` returns HTTP 202 until physical completion, and the same tombstoned
 authentication is accepted only by that retry route and `GET /api/account/deletion`.
 A bounded serial background sweep starts
