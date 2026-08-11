@@ -31,6 +31,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// Archive-v3 format version.  Decoders reject every other version.
 pub const ARCHIVE_FORMAT_VERSION: u8 = 3;
 const AAD_DOMAIN: &[u8] = b"kioku:archive:v3:aad\0";
+// Domain/version/three opaque IDs/role, longest (checkpoint-chunk) tagged
+// location, object ID, parent tag, and full optional parent reference.
+const MAX_CANONICAL_AAD_BYTES: usize = AAD_DOMAIN.len() + 1 + (16 * 3) + 1 + 33 + 16 + 1 + 48;
 const HKDF_SALT: &[u8] = b"kioku:archive:v3:hkdf-sha256\0";
 const ENVELOPE_MAGIC: &[u8; 8] = b"KARCv3\0\0";
 const NODE_MAGIC: &[u8; 8] = b"KARNv3\0\0";
@@ -426,6 +429,101 @@ impl ObjectContext {
             None => out.push(0),
         }
         out
+    }
+
+    /// Decode the complete canonical AAD representation used by immutable
+    /// archive objects.  This is crate-private deliberately: persisted shadow
+    /// inventory needs to verify its durable comparison facts after restart,
+    /// but no caller may treat arbitrary bytes as an object context.
+    pub(crate) fn decode_canonical_aad(input: &[u8]) -> Result<Self> {
+        if input.len() > MAX_CANONICAL_AAD_BYTES || !input.starts_with(AAD_DOMAIN) {
+            return Err(ArchiveV3Error::Malformed("object context domain"));
+        }
+        let mut offset = AAD_DOMAIN.len();
+        if take(input, &mut offset, 1)?[0] != ARCHIVE_FORMAT_VERSION {
+            return Err(ArchiveV3Error::Malformed("object context version"));
+        }
+        let archive_id = ArchiveId::from_bytes(take_array(take(input, &mut offset, 16)?)?);
+        let database_epoch = DatabaseEpoch::from_bytes(take_array(take(input, &mut offset, 16)?)?);
+        let key_epoch = KeyEpoch::from_bytes(take_array(take(input, &mut offset, 16)?)?);
+        let role = match take(input, &mut offset, 1)?[0] {
+            1 => ObjectRole::CheckpointChunkV3,
+            2 => ObjectRole::WalSegmentV3,
+            3 => ObjectRole::ExtentV3,
+            4 => ObjectRole::MerkleNodeV3,
+            5 => ObjectRole::RootV3,
+            6 => ObjectRole::KeyRegistryV3,
+            7 => ObjectRole::StagingV3,
+            8 => ObjectRole::CheckpointManifestV3,
+            _ => return Err(ArchiveV3Error::Malformed("object context role")),
+        };
+        let location = match take(input, &mut offset, 1)?[0] {
+            1 => LogicalLocation::CheckpointChunk {
+                checkpoint_id: ObjectId::from_bytes(take_array(take(input, &mut offset, 16)?)?),
+                chunk_index: take_u32(input, &mut offset)?,
+                logical_offset: take_u64(input, &mut offset)?,
+                byte_len: take_u32(input, &mut offset)?,
+            },
+            2 => LogicalLocation::Wal {
+                root_seq: take_u64(input, &mut offset)?,
+                wal_generation: take_u64(input, &mut offset)?,
+                segment_index: take_u32(input, &mut offset)?,
+            },
+            3 => LogicalLocation::Extent {
+                extent_no: take_u64(input, &mut offset)?,
+                byte_len: take_u32(input, &mut offset)?,
+            },
+            4 => LogicalLocation::MerkleNode {
+                level: take(input, &mut offset, 1)?[0],
+                range_start: take_u64(input, &mut offset)?,
+                range_end: take_u64(input, &mut offset)?,
+            },
+            5 => LogicalLocation::Root {
+                root_seq: take_u64(input, &mut offset)?,
+            },
+            6 => LogicalLocation::KeyRegistry {
+                key_kind: match take(input, &mut offset, 1)?[0] {
+                    1 => KeyKind::Archive,
+                    2 => KeyKind::Media,
+                    _ => return Err(ArchiveV3Error::Malformed("object context key kind")),
+                },
+            },
+            7 => LogicalLocation::Staging {
+                operation_id: ObjectId::from_bytes(take_array(take(input, &mut offset, 16)?)?),
+            },
+            8 => LogicalLocation::CheckpointManifest {
+                checkpoint_id: ObjectId::from_bytes(take_array(take(input, &mut offset, 16)?)?),
+                level: take(input, &mut offset, 1)?[0],
+                range_start: take_u32(input, &mut offset)?,
+                range_end: take_u32(input, &mut offset)?,
+            },
+            _ => return Err(ArchiveV3Error::Malformed("object context location")),
+        };
+        let object_id = ObjectId::from_bytes(take_array(take(input, &mut offset, 16)?)?);
+        let parent = match take(input, &mut offset, 1)?[0] {
+            0 => None,
+            1 => Some(ParentReference {
+                object_id: ObjectId::from_bytes(take_array(take(input, &mut offset, 16)?)?),
+                envelope_hash: take_array(take(input, &mut offset, 32)?)?,
+            }),
+            _ => return Err(ArchiveV3Error::Malformed("object context parent")),
+        };
+        if offset != input.len() {
+            return Err(ArchiveV3Error::Malformed("object context trailing bytes"));
+        }
+        let context = Self::new(
+            archive_id,
+            database_epoch,
+            key_epoch,
+            role,
+            location,
+            object_id,
+            parent,
+        )?;
+        if context.canonical_aad() != input {
+            return Err(ArchiveV3Error::Malformed("noncanonical object context"));
+        }
+        Ok(context)
     }
 
     /// Canonical provider-neutral namespace from ADR-0022.  No user identity
@@ -1788,6 +1886,35 @@ mod tests {
             },
             object,
         )
+    }
+
+    #[test]
+    fn canonical_aad_decode_round_trips_the_longest_parent_bearing_context() {
+        let (archive, database, key) = ids();
+        let context = ObjectContext::new(
+            archive,
+            database,
+            key,
+            ObjectRole::CheckpointChunkV3,
+            LogicalLocation::CheckpointChunk {
+                checkpoint_id: ObjectId::from_bytes([4; 16]),
+                chunk_index: 7,
+                logical_offset: 4096,
+                byte_len: 4096,
+            },
+            ObjectId::from_bytes([5; 16]),
+            Some(ParentReference {
+                object_id: ObjectId::from_bytes([6; 16]),
+                envelope_hash: [7; 32],
+            }),
+        )
+        .unwrap();
+        let aad = context.canonical_aad();
+        assert_eq!(aad.len(), MAX_CANONICAL_AAD_BYTES);
+        assert_eq!(ObjectContext::decode_canonical_aad(&aad).unwrap(), context);
+        let mut trailing = aad;
+        trailing.push(0);
+        assert!(ObjectContext::decode_canonical_aad(&trailing).is_err());
     }
     fn cipher() -> ArchiveCipher {
         ArchiveCipher::new(ArchiveDek::from_bytes([9; 32]))
