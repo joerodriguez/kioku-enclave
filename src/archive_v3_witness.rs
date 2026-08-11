@@ -235,7 +235,7 @@ pub struct RootCommitment {
     owner_fencing_epoch: u64,
 }
 impl RootCommitment {
-    const fn genesis(
+    pub(crate) const fn genesis(
         database_epoch: DatabaseEpoch,
         key_epoch: KeyEpoch,
         root: RootReference,
@@ -587,6 +587,9 @@ impl WitnessRecord {
     pub fn deletion(&self) -> DeletionState {
         self.deletion
     }
+    pub(crate) fn last_server_tick(&self) -> u64 {
+        self.last_server_tick
+    }
     fn valid(&self) -> bool {
         nonzero_id(self.archive_id.as_bytes())
             && nonzero_id(self.database_epoch.as_bytes())
@@ -812,6 +815,9 @@ pub struct WitnessBootstrap {
     registry: KeyRegistryReference,
 }
 impl WitnessBootstrap {
+    pub(crate) fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
     #[cfg(test)]
     pub(crate) const fn new(
         archive_id: ArchiveId,
@@ -868,6 +874,11 @@ pub struct WitnessLease {
     fencing_epoch: u64,
     expires_at_tick: u64,
 }
+impl WitnessLease {
+    pub(crate) fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+}
 impl fmt::Debug for WitnessLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("WitnessLease(<opaque>)")
@@ -893,6 +904,9 @@ pub struct RootAdvance {
     candidate: RootCommitment,
 }
 impl RootAdvance {
+    pub(crate) fn archive_id(&self) -> ArchiveId {
+        self.lease.archive_id
+    }
     #[cfg(test)]
     pub(crate) const fn new(
         lease: WitnessLease,
@@ -941,6 +955,9 @@ pub struct DeletionAdvance {
     expected_registry: KeyRegistryReference,
 }
 impl DeletionAdvance {
+    pub(crate) fn archive_id(&self) -> ArchiveId {
+        self.authorization.archive_id
+    }
     pub(crate) const fn new(
         authorization: DeletionAuthorization,
         expected_root: RootCommitment,
@@ -1103,6 +1120,22 @@ impl InMemoryWitness {
     fn with_clock(clock: Arc<dyn TrustedClock>) -> Self {
         Self::with_clock_and_authenticator(clock, Arc::new(DenyDeletionWorkers))
     }
+    /// Replays one provider record against a provider-supplied, transaction
+    /// read-time-derived tick.  This is deliberately crate-private: concrete
+    /// witness adapters use it to reuse the audited transition rules without
+    /// treating a local wall clock as authority.
+    pub(crate) fn from_provider_record_at_tick(
+        record: Option<[u8; WITNESS_RECORD_BYTES]>,
+        tick: u64,
+    ) -> Result<Self> {
+        struct FixedClock(u64);
+        impl TrustedClock for FixedClock {
+            fn now_tick(&self) -> Result<u64> {
+                Ok(self.0)
+            }
+        }
+        Self::from_records(Arc::new(FixedClock(tick)), record.into_iter().collect())
+    }
     fn with_clock_and_authenticator(
         clock: Arc<dyn TrustedClock>,
         deletion_authenticator: Arc<dyn DeletionWorkerAuthenticator>,
@@ -1178,6 +1211,21 @@ impl InMemoryWitness {
         };
         state.records.insert(r.archive_id, r.clone());
         Ok(r)
+    }
+    /// Bootstrap while persisting the transaction's trusted provider clock.
+    pub(crate) fn bootstrap_at_tick(
+        &self,
+        b: WitnessBootstrap,
+        tick: u64,
+    ) -> Result<WitnessRecord> {
+        let record = self.bootstrap(b)?;
+        let mut state = self.lock()?;
+        let record = state
+            .records
+            .get_mut(&record.archive_id)
+            .ok_or(WitnessError::Synchronization)?;
+        record.last_server_tick = tick;
+        Ok(record.clone())
     }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>> {
         self.state.lock().map_err(|_| WitnessError::Synchronization)
