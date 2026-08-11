@@ -309,6 +309,8 @@ mod tests {
         )
         .is_err());
         assert!(FirestoreWitnessBearerToken::new("").is_err());
+        assert!(FirestoreWitnessBearerToken::new("contains\"quote").is_err());
+        assert!(FirestoreWitnessBearerToken::new("contains\\backslash").is_err());
         assert!(FirestoreWitnessBearerToken::new(&"x".repeat(MAX_BEARER_TOKEN_BYTES + 1)).is_err());
         assert!(FirestoreTransaction::new(&[]).is_err());
         assert!(FirestoreTransaction::new(&vec![0; MAX_TRANSACTION_BYTES + 1]).is_err());
@@ -531,7 +533,7 @@ impl FirestoreWitnessAudience {
         Ok(Self(value.to_owned()))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -551,7 +553,9 @@ impl FirestoreWitnessBearerToken {
     pub(crate) fn new(value: &str) -> std::result::Result<Self, FirestoreWitnessTransportError> {
         if value.is_empty()
             || value.len() > MAX_BEARER_TOKEN_BYTES
-            || !value.bytes().all(|byte| byte.is_ascii_graphic())
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
         {
             return Err(FirestoreWitnessTransportError::Protocol);
         }
@@ -566,6 +570,11 @@ impl FirestoreWitnessBearerToken {
     fn as_str(&self) -> &str {
         // `new` copied only valid bytes from a Rust `str`.
         std::str::from_utf8(&self.bytes[..self.len]).expect("validated bearer token")
+    }
+
+    pub(crate) fn duplicate(&self) -> Self {
+        // The source is a bounded, UTF-8 token constructed by `new`.
+        Self::new(self.as_str()).expect("duplicate validated bearer token")
     }
 }
 impl fmt::Debug for FirestoreWitnessBearerToken {
