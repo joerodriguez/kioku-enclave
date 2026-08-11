@@ -400,7 +400,7 @@ binding.
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
 | `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE` | Exact matching HTTPS billing-service origin and Google OIDC audience |
-| `BILLING_ENFORCEMENT_MODE` | Image-baked recording rollout mode; signed production builds are gated to `shadow` until native clients are ready |
+| `BILLING_ENFORCEMENT_MODE` | Image-baked recording rollout mode: `shadow` observes without blocking, while `enforce` rejects new capture without an active allowance lease |
 | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
 | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration; the model is a 1–128 byte billing-safe name using only ASCII letters, digits, `.`, `_`, `:`, or `-` |
 | `QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY` | Optional per-user UTC-day maximum-output reservation ceiling; defaults to `524288`. Each request reserves its full configured output maximum before Vertex is called and fails closed when exhausted |

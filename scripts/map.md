@@ -11,10 +11,10 @@ None of these scripts runs in the enclave or in a Kioku client.
 | `fetch_voice_eval_assets.sh` | Downloads licensed evaluation inputs and records hashes outside Git. |
 | `check_voice_release_gate.py` | Classifies a release as exact owner-only/no-claim or invokes the Rust checker for a complete real-corpus trio. |
 | `test_check_voice_release_gate.py` | Fail-closed contract tests for owner-only and validated-real-corpus classifications. |
-| `release.sh` | Verifies the selected voice-quality classification, creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
+| `release.sh` | Verifies the selected voice-quality classification and repository-bound billing mode, creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
 | `test_release.py` | Static fail-closed contracts for release-state refresh, immutable-publication races, and malformed release metadata. |
 | `test_release_race.sh` | Mocked execution test of release-state refresh: raced immutable releases are reverified without mutation, while mismatched assets fail closed. |
-| `select_build_configuration.py` | Atomically selects and validates one complete production or evaluation image profile without cross-profile fallback. |
+| `select_build_configuration.py` | Atomically selects and validates one complete production or evaluation image profile, including the reviewed `shadow|enforce` billing mode, without cross-profile fallback. |
 | `test_select_build_configuration.py` | Contract tests for profile isolation and the public build workflow. |
 | `generate_capacity_fixture.py` | Validates ADR-0022's versioned v1/v2 capacity manifests and streams content-free synthetic distributions into ignored/out-of-tree output; an explicit option can create the declared 32-GiB logical sparse shape without writing 32 GiB of blocks. |
 | `test_generate_capacity_fixture.py` | Validates v1 480/960/1,200-hour and v2 12-month 40/80/100-hour distributions plus bounded deterministic generation without creating the 32-GiB shape. |

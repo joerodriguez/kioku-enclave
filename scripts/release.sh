@@ -10,6 +10,7 @@ DEPLOYMENT_REPO="${DEPLOYMENT_REPO:-}"
 RELEASE_SIGNER_FINGERPRINT="${RELEASE_SIGNER_FINGERPRINT:-}"
 ROLL=false
 EXPECTED_VOICE_QUALITY_GATE=""
+EXPECTED_BILLING_ENFORCEMENT_MODE=""
 
 usage() {
   echo "Usage: $0 <vMAJOR.MINOR.PATCH> [--roll]"
@@ -86,6 +87,7 @@ REQUIRED_REPO_VARIABLES=(
   GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID BASE_URL WEB_ORIGIN
   REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL
   VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
+  BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE
   ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY
 )
 CONFIGURED_VARIABLES="$(gh variable list --repo "$REPOSITORY" --json name --jq '.[].name')"
@@ -198,6 +200,11 @@ if [[ "$ROLLBACK_EXISTING" == "false" && "$RESUME_EXISTING" == "false" ]]; then
   cargo clippy --locked --all-targets -- -D warnings
   VOICE_QUALITY_GATE="$(python3 scripts/check_voice_release_gate.py)"
   EXPECTED_VOICE_QUALITY_GATE="$VOICE_QUALITY_GATE"
+  EXPECTED_BILLING_ENFORCEMENT_MODE="$(gh variable get BILLING_ENFORCEMENT_MODE --repo "$REPOSITORY")"
+  if [[ "$EXPECTED_BILLING_ENFORCEMENT_MODE" != "shadow" && "$EXPECTED_BILLING_ENFORCEMENT_MODE" != "enforce" ]]; then
+    echo "Error: BILLING_ENFORCEMENT_MODE must be either shadow or enforce." >&2
+    exit 1
+  fi
 fi
 
 verify_tag_signer() {
@@ -332,8 +339,8 @@ if [[ "$SCHEMA_VERSION" == "3" ]]; then
     echo "Error: schema-v3 build metadata has an invalid voice-quality gate classification." >&2
     exit 1
   fi
-  if [[ "$BILLING_ENFORCEMENT_MODE" != "shadow" ]]; then
-    echo "Error: production release metadata must attest shadow billing enforcement." >&2
+  if [[ "$BILLING_ENFORCEMENT_MODE" != "shadow" && "$BILLING_ENFORCEMENT_MODE" != "enforce" ]]; then
+    echo "Error: schema-v3 build metadata has an invalid billing-enforcement mode." >&2
     exit 1
   fi
 elif [[ "$SCHEMA_VERSION" != "1" && "$SCHEMA_VERSION" != "2" ]] || [[ "$BILLING_ENFORCEMENT_MODE" != "legacy_unclassified" || "$ROLLBACK_EXISTING" != "true" ]]; then
@@ -342,6 +349,10 @@ elif [[ "$SCHEMA_VERSION" != "1" && "$SCHEMA_VERSION" != "2" ]] || [[ "$BILLING_
 fi
 if [[ -n "$EXPECTED_VOICE_QUALITY_GATE" && "$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE" ]]; then
   echo "Error: build metadata voice-quality classification does not match the checked source." >&2
+  exit 1
+fi
+if [[ -n "$EXPECTED_BILLING_ENFORCEMENT_MODE" && "$BILLING_ENFORCEMENT_MODE" != "$EXPECTED_BILLING_ENFORCEMENT_MODE" ]]; then
+  echo "Error: build metadata billing-enforcement mode does not match the checked repository configuration." >&2
   exit 1
 fi
 if [[ "$BUILT_REF" != "$RELEASE_TAG" || "$BUILT_COMMIT" != "$REMOTE_TAG_COMMIT" ]]; then
