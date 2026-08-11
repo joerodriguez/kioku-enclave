@@ -3927,7 +3927,7 @@ impl ControlStore {
                             EnclaveError::Config("invalid active recording lease expiry".into())
                         })?;
                     if active_lease_id != lease_id
-                        && !retry_now_ms.is_some_and(|now_ms| active_expires_ms <= now_ms)
+                        && retry_now_ms.is_none_or(|now_ms| active_expires_ms > now_ms)
                     {
                         return Err(EnclaveError::Conflict(
                             "a different recording lease became active".into(),
