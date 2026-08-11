@@ -26,6 +26,7 @@ use crate::archive_v3::{
     Result as ArchiveResult, VerifiedArchiveCipher, MAX_DATABASE_BYTES, MAX_DATABASE_EXTENT_SLOTS,
     SQLITE_PAGE_SIZE,
 };
+use crate::archive_v3_shadow_checkpoint::{ShadowCheckpointError, ShadowObjectStaging};
 use crate::archive_v3_witness::{DeletionState, ExactCurrentRecoveryAdmission, RecoveryRoot};
 
 pub const EXTENT_BYTES: u32 = 1_048_576;
@@ -35,6 +36,15 @@ pub const MAX_EXTENT_TREE_STACK: usize = 1_024;
 /// Total immutable `get` operations (both nodes and extents) permitted for one
 /// bounded reconstruction request.
 pub const MAX_EXTENT_TREE_OBJECT_GETS_PER_RANGE: usize = 1_024;
+/// The largest representable sparse extent tree has one object per extent,
+/// 128 leaf nodes, and one root node. The separately staged root candidate
+/// consumes the final shared attempt slot.
+pub const MAX_EXTENT_TREE_STAGED_OBJECTS: usize = MAX_DATABASE_EXTENT_SLOTS as usize
+    + (MAX_DATABASE_EXTENT_SLOTS as usize / crate::archive_v3::MAX_NODE_FANOUT)
+    + 1;
+const _: () = assert!(
+    MAX_EXTENT_TREE_STAGED_OBJECTS < crate::archive_v3_operation::MAX_SHADOW_OBJECTS_PER_ATTEMPT
+);
 
 #[derive(Debug, Error)]
 pub enum ExtentTreeError {
@@ -42,6 +52,8 @@ pub enum ExtentTreeError {
     Archive(#[from] ArchiveV3Error),
     #[error("extent source did not produce a valid bounded stream")]
     Source,
+    #[error(transparent)]
+    Staging(#[from] ShadowCheckpointError),
     #[error("the exact immutable extent-tree object is absent")]
     MissingObject,
     #[error("extent range is outside the authenticated logical file")]
@@ -264,12 +276,13 @@ pub(crate) async fn mint_authenticated_extent_root(
 /// Streams bounded immutable extent objects and fixed-fanout persistent nodes.
 /// Sparse holes have no object and reconstruct as zeroes. An all-hole file is
 /// rejected: the existing on-wire Merkle codec deliberately has no empty root.
-pub async fn upload_extent_tree<C: ExtentCipher>(
+pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
     source: &mut dyn ExtentSource,
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<UploadedExtentTree> {
     if cipher.archive_id() != archive_id {
         return Err(ArchiveV3Error::InvalidContext.into());
@@ -308,14 +321,15 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
             object_id,
         )?;
         let envelope = cipher.seal(&context, bytes)?;
-        backend
-            .create_if_absent(context.object_key(), envelope.clone())
+        staging
+            .create_and_readback_verified(backend, &context, envelope.clone(), |readback| {
+                verify_staged_extent(cipher, &context, bytes, readback)
+            })
             .await?;
         let reference = ImmutableReference {
             object_id,
             envelope_hash: envelope.hash(),
         };
-        verify_created_extent(backend, cipher, &context, &reference, bytes).await?;
         sparse_content_commitment.update(item.extent_no.to_be_bytes());
         sparse_content_commitment.update(item.logical_byte_len.to_be_bytes());
         sparse_content_commitment.update(bytes);
@@ -338,6 +352,7 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
                 std::mem::take(&mut leaves),
                 tree_height == 0,
                 slots,
+                staging.clone(),
             )
             .await?;
             add_span(
@@ -350,6 +365,7 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
                 &mut pending,
                 &mut root,
                 span,
+                staging.clone(),
             )
             .await?;
         }
@@ -363,6 +379,7 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
             std::mem::take(&mut leaves),
             tree_height == 0,
             slots,
+            staging.clone(),
         )
         .await?;
         add_span(
@@ -375,6 +392,7 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
             &mut pending,
             &mut root,
             span,
+            staging.clone(),
         )
         .await?;
     }
@@ -389,6 +407,7 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
                 level as u8,
                 level + 1 == usize::from(tree_height),
                 slots,
+                staging.clone(),
             )
             .await?;
             add_span(
@@ -401,6 +420,7 @@ pub async fn upload_extent_tree<C: ExtentCipher>(
                 &mut pending,
                 &mut root,
                 span,
+                staging.clone(),
             )
             .await?;
         }
@@ -645,6 +665,7 @@ fn overlaps(start: u64, end: u64, wanted_start: u64, wanted_end: u64) -> bool {
     start < wanted_end && wanted_start < end
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn seal_leaf<C: ExtentCipher>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
@@ -653,6 +674,7 @@ async fn seal_leaf<C: ExtentCipher>(
     entries: Vec<ExtentReference>,
     is_root: bool,
     slots: u64,
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<NodeSpan> {
     let first = entries.first().ok_or(ExtentTreeError::Source)?.extent_no;
     let last = entries
@@ -672,6 +694,7 @@ async fn seal_leaf<C: ExtentCipher>(
             range_end: if is_root { slots } else { last },
             entries: MerkleEntries::Leaf(entries),
         },
+        staging,
     )
     .await
 }
@@ -685,6 +708,7 @@ async fn seal_parent<C: ExtentCipher>(
     child_level: u8,
     is_root: bool,
     slots: u64,
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<NodeSpan> {
     let first = spans.first().ok_or(ExtentTreeError::Source)?.range_start;
     let last = spans.last().ok_or(ExtentTreeError::Source)?.range_end;
@@ -710,6 +734,7 @@ async fn seal_parent<C: ExtentCipher>(
             range_end: if is_root { slots } else { last },
             entries: MerkleEntries::Internal(entries),
         },
+        staging,
     )
     .await
 }
@@ -719,6 +744,7 @@ async fn seal_node<C: ExtentCipher>(
     archive: ArchiveId,
     epoch: DatabaseEpoch,
     node: MerkleNode,
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<NodeSpan> {
     node.validate()?;
     let object_id = ObjectId::random();
@@ -732,17 +758,15 @@ async fn seal_node<C: ExtentCipher>(
         object_id,
     )?;
     let envelope = cipher.seal(&context, &node.encode()?)?;
-    backend
-        .create_if_absent(context.object_key(), envelope.clone())
+    staging
+        .create_and_readback_verified(backend, &context, envelope.clone(), |readback| {
+            verify_staged_node(cipher, &context, &node, readback)
+        })
         .await?;
     let reference = ImmutableReference {
         object_id,
         envelope_hash: envelope.hash(),
     };
-    let readback = load_node(backend, cipher, &context, &reference).await?;
-    if readback != node {
-        return Err(ArchiveV3Error::Authentication.into());
-    }
     Ok(NodeSpan {
         level: node.level,
         range_start: node.range_start,
@@ -761,6 +785,7 @@ async fn add_span<C: ExtentCipher>(
     pending: &mut [Vec<NodeSpan>],
     root: &mut Option<NodeSpan>,
     mut span: NodeSpan,
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<()> {
     loop {
         if span.level == height {
@@ -789,6 +814,7 @@ async fn add_span<C: ExtentCipher>(
             child_level,
             child_level + 1 == height,
             slots,
+            staging.clone(),
         )
         .await?;
     }
@@ -869,17 +895,33 @@ async fn load_node<C: ExtentCipher>(
     }
     Ok(node)
 }
-async fn verify_created_extent<C: ExtentCipher>(
-    backend: &dyn ImmutableObjectBackend,
+fn verify_staged_extent<C: ExtentCipher>(
     cipher: &C,
     context: &ObjectContext,
-    reference: &ImmutableReference,
     expected: &[u8],
-) -> Result<()> {
-    let envelope = load_exact(backend, context, reference).await?;
-    let plaintext = Zeroizing::new(cipher.open(context, &envelope)?);
+    envelope: &CiphertextEnvelope,
+) -> ArchiveResult<()> {
+    let plaintext = Zeroizing::new(cipher.open(context, envelope)?);
     if plaintext.as_slice() != expected {
-        return Err(ArchiveV3Error::Authentication.into());
+        return Err(ArchiveV3Error::Authentication);
+    }
+    Ok(())
+}
+fn verify_staged_node<C: ExtentCipher>(
+    cipher: &C,
+    context: &ObjectContext,
+    expected: &MerkleNode,
+    envelope: &CiphertextEnvelope,
+) -> ArchiveResult<()> {
+    let plaintext = Zeroizing::new(cipher.open(context, envelope)?);
+    let node = MerkleNode::decode(plaintext.as_slice())?;
+    if node != *expected || plaintext.as_slice() != expected.encode()?.as_slice() {
+        return Err(ArchiveV3Error::Authentication);
+    }
+    node.validate()?;
+    if !matches!(context.location(), LogicalLocation::MerkleNode { level, range_start, range_end } if *level == node.level && *range_start == node.range_start && *range_end == node.range_end)
+    {
+        return Err(ArchiveV3Error::InvalidContext);
     }
     Ok(())
 }
@@ -949,6 +991,13 @@ mod tests {
         ExactKeyRegistryProvider, InMemoryImmutableBackend, KeyKind, KeyRegistryContext,
         KeyRegistryPlaintext, ObjectKey,
     };
+    use crate::archive_v3_operation::{
+        RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage, MAX_SHADOW_OBJECTS_PER_ATTEMPT,
+    };
+    use crate::archive_v3_shadow_checkpoint::{ShadowObjectInventory, ShadowObjectInventoryError};
+    use crate::archive_v3_shadow_session::{
+        ShadowAttemptId, ShadowSessionBinding, ShadowSessionId,
+    };
     use crate::archive_v3_witness::{
         deletion_driver_test_fixture, InMemoryWitness, KeyRegistryReference, RootCommitment,
         RootReference, Witness, WitnessBootstrap, WitnessError,
@@ -962,6 +1011,14 @@ mod tests {
         archive: ArchiveId,
         epoch: KeyEpoch,
         cipher: ArchiveCipher,
+        seal_fault: Option<(usize, TestSealFault)>,
+        seal_count: AtomicUsize,
+        verify_events: Option<Arc<Mutex<Vec<&'static str>>>>,
+    }
+    #[derive(Clone, Copy)]
+    enum TestSealFault {
+        WrongPlaintext,
+        WrongContext,
     }
     impl TestCipher {
         fn new(archive: ArchiveId, epoch: KeyEpoch) -> Self {
@@ -969,7 +1026,37 @@ mod tests {
                 archive,
                 epoch,
                 cipher: ArchiveCipher::new(ArchiveDek::from_bytes([7; 32])),
+                seal_fault: None,
+                seal_count: AtomicUsize::new(0),
+                verify_events: None,
             }
+        }
+
+        fn with_seal_fault(
+            archive: ArchiveId,
+            epoch: KeyEpoch,
+            seal_index: usize,
+            seal_fault: TestSealFault,
+            verify_events: Arc<Mutex<Vec<&'static str>>>,
+        ) -> Self {
+            Self {
+                archive,
+                epoch,
+                cipher: ArchiveCipher::new(ArchiveDek::from_bytes([7; 32])),
+                seal_fault: Some((seal_index, seal_fault)),
+                seal_count: AtomicUsize::new(0),
+                verify_events: Some(verify_events),
+            }
+        }
+
+        fn with_verify_events(
+            archive: ArchiveId,
+            epoch: KeyEpoch,
+            verify_events: Arc<Mutex<Vec<&'static str>>>,
+        ) -> Self {
+            let mut cipher = Self::new(archive, epoch);
+            cipher.verify_events = Some(verify_events);
+            cipher
         }
     }
     impl ExtentCipher for TestCipher {
@@ -980,9 +1067,54 @@ mod tests {
             self.epoch
         }
         fn seal(&self, c: &ObjectContext, p: &[u8]) -> ArchiveResult<CiphertextEnvelope> {
-            self.cipher.seal(c, p)
+            let seal_index = self.seal_count.fetch_add(1, Ordering::Relaxed);
+            match self.seal_fault.filter(|(index, _)| *index == seal_index) {
+                Some((_, TestSealFault::WrongPlaintext)) => {
+                    let mut wrong = Zeroizing::new(p.to_vec());
+                    let byte = wrong
+                        .first_mut()
+                        .ok_or(ArchiveV3Error::Malformed("test plaintext"))?;
+                    *byte ^= 0x01;
+                    self.cipher.seal(c, wrong.as_slice())
+                }
+                Some((_, TestSealFault::WrongContext)) => {
+                    let location = match c.location() {
+                        LogicalLocation::Extent {
+                            extent_no,
+                            byte_len,
+                        } => LogicalLocation::Extent {
+                            extent_no: extent_no.saturating_add(1),
+                            byte_len: *byte_len,
+                        },
+                        LogicalLocation::MerkleNode {
+                            level,
+                            range_start,
+                            range_end,
+                        } => LogicalLocation::MerkleNode {
+                            level: *level,
+                            range_start: *range_start,
+                            range_end: range_end.saturating_add(1),
+                        },
+                        _ => return Err(ArchiveV3Error::InvalidContext),
+                    };
+                    let wrong = ObjectContext::new(
+                        c.archive_id(),
+                        c.database_epoch(),
+                        c.key_epoch(),
+                        c.role(),
+                        location,
+                        c.object_id(),
+                        None,
+                    )?;
+                    self.cipher.seal(&wrong, p)
+                }
+                None => self.cipher.seal(c, p),
+            }
         }
         fn open(&self, c: &ObjectContext, e: &CiphertextEnvelope) -> ArchiveResult<Vec<u8>> {
+            if let Some(events) = &self.verify_events {
+                events.lock().unwrap().push("verify");
+            }
             self.cipher.open(c, e)
         }
     }
@@ -1009,6 +1141,140 @@ mod tests {
     }
     struct UnderfillingSource {
         next: u8,
+    }
+
+    struct AcceptingInventory;
+    #[async_trait::async_trait]
+    impl ShadowObjectInventory for AcceptingInventory {
+        async fn reserve_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            Ok(RecordOutcome::Recorded)
+        }
+
+        async fn mark_materialized_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            Ok(RecordOutcome::Recorded)
+        }
+
+        async fn load_exact_attempt_page(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _after_ordinal: Option<u32>,
+        ) -> std::result::Result<ShadowObjectInventoryPage, ShadowObjectInventoryError> {
+            Ok(ShadowObjectInventoryPage::empty())
+        }
+    }
+    static ACCEPTING_INVENTORY: AcceptingInventory = AcceptingInventory;
+
+    fn staging_for(inventory: &dyn ShadowObjectInventory) -> ShadowObjectStaging<'_> {
+        ShadowObjectStaging::new(
+            inventory,
+            ShadowSessionId::from_bytes([0x91; 16]),
+            ShadowAttemptId::from_bytes([0x92; 16]),
+            ShadowSessionBinding::new(
+                [1; 16], [2; 16], 1, [3; 16], 1, [4; 16], [5; 32], 1, [6; 16], [7; 32], 1, [8; 16],
+                [9; 32], 1, 1, 1, 1,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn staging() -> ShadowObjectStaging<'static> {
+        staging_for(&ACCEPTING_INVENTORY)
+    }
+
+    struct EventInventory {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        reserve_failure: bool,
+        materialize_failure: bool,
+        reserved: AtomicUsize,
+        materialized: AtomicUsize,
+    }
+    impl EventInventory {
+        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                events,
+                reserve_failure: false,
+                materialize_failure: false,
+                reserved: AtomicUsize::new(0),
+                materialized: AtomicUsize::new(0),
+            }
+        }
+
+        fn rejecting(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                events,
+                reserve_failure: true,
+                materialize_failure: false,
+                reserved: AtomicUsize::new(0),
+                materialized: AtomicUsize::new(0),
+            }
+        }
+
+        fn materialize_failing(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                events,
+                reserve_failure: false,
+                materialize_failure: true,
+                reserved: AtomicUsize::new(0),
+                materialized: AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl ShadowObjectInventory for EventInventory {
+        async fn reserve_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            self.events.lock().unwrap().push("reserve");
+            if self.reserve_failure {
+                Err(ShadowObjectInventoryError::Unavailable)
+            } else {
+                self.reserved.fetch_add(1, Ordering::Relaxed);
+                Ok(RecordOutcome::Recorded)
+            }
+        }
+
+        async fn mark_materialized_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            self.events.lock().unwrap().push("materialize");
+            if self.materialize_failure {
+                return Err(ShadowObjectInventoryError::Unavailable);
+            }
+            self.materialized.fetch_add(1, Ordering::Relaxed);
+            Ok(RecordOutcome::Recorded)
+        }
+
+        async fn load_exact_attempt_page(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _after_ordinal: Option<u32>,
+        ) -> std::result::Result<ShadowObjectInventoryPage, ShadowObjectInventoryError> {
+            Ok(ShadowObjectInventoryPage::empty())
+        }
     }
     impl ExtentSource for UnderfillingSource {
         fn logical_file_length(&self) -> Result<u64> {
@@ -1271,6 +1537,7 @@ mod tests {
             archive,
             database,
             &mut source,
+            staging(),
         )
         .await
         .unwrap();
@@ -1313,6 +1580,7 @@ mod tests {
     struct FaultBackend {
         inner: InMemoryImmutableBackend,
         fault: Mutex<Fault>,
+        events: Arc<Mutex<Vec<&'static str>>>,
     }
     #[derive(Clone, Default)]
     enum Fault {
@@ -1323,6 +1591,7 @@ mod tests {
         MissingOnRead(usize),
         TamperOnRead(usize),
         BlockOnRead(usize),
+        CreateUnavailable,
         CreateReturnsAlreadyPresent,
         Substitute(ObjectId, CiphertextEnvelope),
         Block,
@@ -1334,6 +1603,10 @@ mod tests {
             k: ObjectKey,
             v: CiphertextEnvelope,
         ) -> ArchiveResult<CreateIfAbsent> {
+            self.events.lock().unwrap().push("create");
+            if matches!(&*self.fault.lock().unwrap(), Fault::CreateUnavailable) {
+                return Err(ArchiveV3Error::Unavailable);
+            }
             let created = self.inner.create_if_absent(k, v).await?;
             if matches!(
                 &*self.fault.lock().unwrap(),
@@ -1345,6 +1618,7 @@ mod tests {
             }
         }
         async fn get(&self, k: &ObjectKey) -> ArchiveResult<Option<CiphertextEnvelope>> {
+            self.events.lock().unwrap().push("get");
             let one_shot = {
                 let mut fault = self.fault.lock().unwrap();
                 match &mut *fault {
@@ -1400,9 +1674,11 @@ mod tests {
             c: Option<&crate::archive_v3::EnumerationCursor>,
             l: crate::archive_v3::EnumerationLimit,
         ) -> ArchiveResult<crate::archive_v3::EnumerationPage> {
+            self.events.lock().unwrap().push("enumerate");
             self.inner.enumerate(p, c, l).await
         }
         async fn delete_exact(&self, k: &ObjectKey) -> ArchiveResult<bool> {
+            self.events.lock().unwrap().push("delete");
             self.inner.delete_exact(k).await
         }
     }
@@ -1457,7 +1733,7 @@ mod tests {
             entries,
             next: 0,
         };
-        upload_extent_tree(&backend, &cipher, archive, database, &mut source)
+        upload_extent_tree(&backend, &cipher, archive, database, &mut source, staging())
             .await
             .unwrap()
             .sparse_content_commitment()
@@ -1763,6 +2039,11 @@ mod tests {
             MAX_DATABASE_BYTES / u64::from(SQLITE_PAGE_SIZE),
             u64::from(crate::archive_v3::MAX_DATABASE_PAGES)
         );
+        assert_eq!(MAX_EXTENT_TREE_STAGED_OBJECTS, 32_897);
+        assert_eq!(
+            MAX_EXTENT_TREE_STAGED_OBJECTS + 1,
+            MAX_SHADOW_OBJECTS_PER_ATTEMPT
+        );
         assert_eq!(extent_tree_height(255).unwrap(), 0);
         assert_eq!(extent_tree_height(256).unwrap(), 0);
         assert_eq!(extent_tree_height(257).unwrap(), 1);
@@ -1779,7 +2060,7 @@ mod tests {
             entries: vec![(last_extent, bytes(256, 0x4c))],
             next: 0,
         };
-        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source)
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source, staging())
             .await
             .unwrap();
         let root = descriptor(a, d, k, &uploaded);
@@ -1799,9 +2080,11 @@ mod tests {
             entries: Vec::new(),
             next: 0,
         };
-        assert!(upload_extent_tree(&backend, &cipher, a, d, &mut rejected)
-            .await
-            .is_err());
+        assert!(
+            upload_extent_tree(&backend, &cipher, a, d, &mut rejected, staging())
+                .await
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn all_hole_and_underfilled_sources_are_deterministic() {
@@ -1813,11 +2096,13 @@ mod tests {
             entries: Vec::new(),
             next: 0,
         };
-        assert!(upload_extent_tree(&backend, &cipher, a, d, &mut all_hole)
-            .await
-            .is_err());
+        assert!(
+            upload_extent_tree(&backend, &cipher, a, d, &mut all_hole, staging())
+                .await
+                .is_err()
+        );
         let mut underfilled = UnderfillingSource { next: 0 };
-        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut underfilled)
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut underfilled, staging())
             .await
             .unwrap();
         let root = descriptor(a, d, k, &uploaded);
@@ -1843,7 +2128,7 @@ mod tests {
             entries: vec![(0, bytes(256, 0x11)), (1, bytes(256, 0x22))],
             next: 0,
         };
-        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source)
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source, staging())
             .await
             .unwrap();
         let root = descriptor(a, d, k, &uploaded);
@@ -1878,41 +2163,311 @@ mod tests {
         assert_eq!(output, vec![0xa5; 8192]);
     }
     #[tokio::test]
-    async fn already_present_identical_is_read_back_before_linking() {
+    async fn extent_and_node_each_reserve_create_read_back_and_materialize_before_linking() {
         let (a, d, k) = ids();
-        let cipher = TestCipher::new(a, k);
         let backend = FaultBackend::default();
-        *backend.fault.lock().unwrap() = Fault::CreateReturnsAlreadyPresent;
+        let cipher = TestCipher::with_verify_events(a, k, Arc::clone(&backend.events));
+        let inventory = EventInventory::new(Arc::clone(&backend.events));
         let mut source = VecSource {
             length: u64::from(EXTENT_BYTES),
             entries: vec![(0, bytes(256, 0x71))],
             next: 0,
         };
-        assert!(upload_extent_tree(&backend, &cipher, a, d, &mut source)
-            .await
-            .is_ok());
+        upload_extent_tree(
+            &backend,
+            &cipher,
+            a,
+            d,
+            &mut source,
+            staging_for(&inventory),
+        )
+        .await
+        .unwrap();
+        // One source extent produces exactly one leaf/root node at this
+        // geometry, so the two complete sequences prove both kinds of object
+        // are durable before either reference can be linked into the tree.
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            [
+                "reserve",
+                "create",
+                "get",
+                "verify",
+                "materialize",
+                "reserve",
+                "create",
+                "get",
+                "verify",
+                "materialize",
+            ]
+        );
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 2);
     }
+
     #[tokio::test]
-    async fn accepted_creates_require_extent_and_node_readback() {
+    async fn already_present_identical_is_exactly_read_back_before_materialization_or_linking() {
         let (a, d, k) = ids();
-        for fault in [
-            Fault::MissingOnRead(1),
-            Fault::TamperOnRead(1),
-            Fault::MissingOnRead(2),
-            Fault::TamperOnRead(2),
+        let backend = FaultBackend::default();
+        let cipher = TestCipher::with_verify_events(a, k, Arc::clone(&backend.events));
+        *backend.fault.lock().unwrap() = Fault::CreateReturnsAlreadyPresent;
+        let inventory = EventInventory::new(Arc::clone(&backend.events));
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+        };
+        upload_extent_tree(
+            &backend,
+            &cipher,
+            a,
+            d,
+            &mut source,
+            staging_for(&inventory),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            [
+                "reserve",
+                "create",
+                "get",
+                "verify",
+                "materialize",
+                "reserve",
+                "create",
+                "get",
+                "verify",
+                "materialize",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_failure_makes_zero_provider_calls() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let inventory = EventInventory::rejecting(Arc::clone(&backend.events));
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+        };
+        assert!(upload_extent_tree(
+            &backend,
+            &cipher,
+            a,
+            d,
+            &mut source,
+            staging_for(&inventory),
+        )
+        .await
+        .is_err());
+        assert_eq!(*backend.events.lock().unwrap(), ["reserve"]);
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_or_tampered_readback_never_materializes_or_links_that_object() {
+        let (a, d, k) = ids();
+        for (fault, prior_materializations) in [
+            (Fault::MissingOnRead(1), 0),
+            (Fault::TamperOnRead(1), 0),
+            // A one-extent source creates its extent first and then its root
+            // node, so the second read exercises the node path.
+            (Fault::MissingOnRead(2), 1),
+            (Fault::TamperOnRead(2), 1),
         ] {
             let cipher = TestCipher::new(a, k);
             let backend = FaultBackend::default();
+            let inventory = EventInventory::new(Arc::clone(&backend.events));
             *backend.fault.lock().unwrap() = fault;
             let mut source = VecSource {
                 length: u64::from(EXTENT_BYTES),
                 entries: vec![(0, bytes(256, 0x6a))],
                 next: 0,
             };
-            assert!(upload_extent_tree(&backend, &cipher, a, d, &mut source)
-                .await
-                .is_err());
+            assert!(upload_extent_tree(
+                &backend,
+                &cipher,
+                a,
+                d,
+                &mut source,
+                staging_for(&inventory),
+            )
+            .await
+            .is_err());
+            let events = backend.events.lock().unwrap();
+            assert_eq!(events.last(), Some(&"get"));
+            assert_eq!(
+                events.len(),
+                prior_materializations * 4 + 3,
+                "the failed object is never materialized or linked onward"
+            );
+            assert_eq!(
+                inventory.materialized.load(Ordering::Relaxed),
+                prior_materializations
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn missealed_extent_or_node_is_verified_before_materialization_or_linking() {
+        let (a, d, k) = ids();
+        for (seal_index, fault, prior_materializations) in [
+            (0, TestSealFault::WrongPlaintext, 0),
+            (0, TestSealFault::WrongContext, 0),
+            // One extent is sealed first and the root node second.
+            (1, TestSealFault::WrongPlaintext, 1),
+            (1, TestSealFault::WrongContext, 1),
+        ] {
+            let backend = FaultBackend::default();
+            let cipher =
+                TestCipher::with_seal_fault(a, k, seal_index, fault, Arc::clone(&backend.events));
+            let inventory = EventInventory::new(Arc::clone(&backend.events));
+            let mut source = VecSource {
+                length: u64::from(EXTENT_BYTES),
+                entries: vec![(0, bytes(256, 0x6a))],
+                next: 0,
+            };
+            assert!(upload_extent_tree(
+                &backend,
+                &cipher,
+                a,
+                d,
+                &mut source,
+                staging_for(&inventory),
+            )
+            .await
+            .is_err());
+            let events = backend.events.lock().unwrap();
+            for sequence in events[..prior_materializations * 5].chunks_exact(5) {
+                assert_eq!(
+                    sequence,
+                    ["reserve", "create", "get", "verify", "materialize"]
+                );
+            }
+            assert_eq!(
+                &events[prior_materializations * 5..],
+                ["reserve", "create", "get", "verify"]
+            );
+            assert_eq!(
+                inventory.materialized.load(Ordering::Relaxed),
+                prior_materializations
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_or_materialization_transient_leaves_the_reserved_object_unlinked() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let inventory = EventInventory::new(Arc::clone(&backend.events));
+        *backend.fault.lock().unwrap() = Fault::CreateUnavailable;
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+        };
+        assert!(upload_extent_tree(
+            &backend,
+            &cipher,
+            a,
+            d,
+            &mut source,
+            staging_for(&inventory),
+        )
+        .await
+        .is_err());
+        assert_eq!(*backend.events.lock().unwrap(), ["reserve", "create"]);
+        assert_eq!(inventory.reserved.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 0);
+
+        let backend = FaultBackend::default();
+        let cipher = TestCipher::with_verify_events(a, k, Arc::clone(&backend.events));
+        let inventory = EventInventory::materialize_failing(Arc::clone(&backend.events));
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+        };
+        assert!(upload_extent_tree(
+            &backend,
+            &cipher,
+            a,
+            d,
+            &mut source,
+            staging_for(&inventory),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            ["reserve", "create", "get", "verify", "materialize"]
+        );
+        assert_eq!(inventory.reserved.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_create_leaves_the_durable_object_reserved() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let inventory = EventInventory::new(Arc::clone(&backend.events));
+        *backend.fault.lock().unwrap() = Fault::BlockOnRead(1);
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+        };
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            upload_extent_tree(
+                &backend,
+                &cipher,
+                a,
+                d,
+                &mut source,
+                staging_for(&inventory),
+            ),
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            ["reserve", "create", "get"]
+        );
+        assert_eq!(inventory.reserved.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinal_cap_rejects_the_node_before_any_node_provider_call() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let inventory = EventInventory::new(Arc::clone(&backend.events));
+        let staging = staging_for(&inventory);
+        staging.set_next_ordinal_for_test((MAX_SHADOW_OBJECTS_PER_ATTEMPT - 1) as u32);
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+        };
+        assert!(matches!(
+            upload_extent_tree(&backend, &cipher, a, d, &mut source, staging).await,
+            Err(ExtentTreeError::Staging(ShadowCheckpointError::Inventory(
+                ShadowObjectInventoryError::AttemptExhausted
+            )))
+        ));
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            ["reserve", "create", "get", "materialize"]
+        );
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 1);
     }
     #[tokio::test]
     async fn authenticated_short_nonfinal_extent_is_not_a_sparse_hole() {
@@ -1989,7 +2544,7 @@ mod tests {
             ],
             next: 0,
         };
-        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source)
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source, staging())
             .await
             .unwrap();
         let root = descriptor(a, d, k, &uploaded);
@@ -2027,7 +2582,7 @@ mod tests {
             entries: vec![(0, bytes(256, 0x52))],
             next: 0,
         };
-        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source)
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source, staging())
             .await
             .unwrap();
         let root = descriptor(a, d, k, &uploaded);
