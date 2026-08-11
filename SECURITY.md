@@ -436,11 +436,12 @@ witness, route, flag, or credential wiring. The current codec intentionally
 has no authenticated empty-tree representation, so an all-hole file is
 rejected. These tests and format bounds do not satisfy the 32-GiB release gate.
 `AuthenticatedExtentRoot` now has a crate-private mint that accepts only an
-active `RecoveryRoot`, exact-gets the witness-nominated root object, verifies
-its retained envelope hash and AEAD/context, and binds archive, database/key
-epochs, registry object/hash/rotation, sequence, parent, fence, and a present
-extent tree before returning the sealed capability. It never enumerates or
-deletes provider objects. The generic constructor remains test-only; durable
+active `RecoveryRoot` plus an injected exact-current witness admission; it
+re-admits that full snapshot before and after exact-getting the witness-nominated
+root object, verifies its retained envelope hash and AEAD/context, and binds
+archive, database/key epochs, registry object/hash/rotation, sequence, parent,
+fence, and a present extent tree before returning the sealed capability. It
+never enumerates or deletes provider objects. The generic constructor remains test-only; durable
 publication-session/orphan-inventory/reconciliation integration remains an
 explicit activation blocker.
 

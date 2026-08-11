@@ -1317,6 +1317,17 @@ impl fmt::Debug for RecoveryRoot {
     }
 }
 
+/// Narrow exact-current admission seam for inactive recovery consumers.  A
+/// retained `RecoveryRoot` is only a snapshot; callers must re-admit it at
+/// the witness immediately before issuing any recovery capability.
+#[async_trait::async_trait]
+pub(crate) trait ExactCurrentRecoveryAdmission: Send + Sync {
+    async fn admit_exact_current(
+        &self,
+        expected: &RecoveryRoot,
+    ) -> std::result::Result<(), WitnessError>;
+}
+
 /// Lost success is resolved by reading and comparing the exact current candidate. The
 /// operation-result ledger remains inside the encrypted witnessed root, not a bounded cache.
 pub trait Witness: Send + Sync {
@@ -1539,6 +1550,15 @@ impl InMemoryWitness {
     #[cfg(test)]
     fn unavailable(&self) {
         self.state.lock().expect("test lock").available = false;
+    }
+    #[cfg(test)]
+    pub(crate) fn replace_current_for_test(&self, record: WitnessRecord) -> Result<()> {
+        let mut state = self.lock()?;
+        if !state.records.contains_key(&record.archive_id) {
+            return Err(WitnessError::MissingArchive);
+        }
+        state.records.insert(record.archive_id, record);
+        Ok(())
     }
     fn normal(&self, a: RootAdvance, kind: Normal) -> Result<WitnessReceipt> {
         let mut s = self.lock()?;
@@ -1905,6 +1925,20 @@ impl Witness for InMemoryWitness {
             r.migration = MigrationState::Deleted;
         }
         Ok(WitnessReceipt { record: r.clone() })
+    }
+}
+
+#[async_trait::async_trait]
+impl ExactCurrentRecoveryAdmission for InMemoryWitness {
+    async fn admit_exact_current(
+        &self,
+        expected: &RecoveryRoot,
+    ) -> std::result::Result<(), WitnessError> {
+        let current = self.recovery_root(expected.archive_id())?;
+        if current != *expected {
+            return Err(WitnessError::CompareFailed);
+        }
+        Ok(())
     }
 }
 fn normal_ok(r: &WitnessRecord, a: &RootAdvance, now: u64, kind: Normal) -> Result<()> {

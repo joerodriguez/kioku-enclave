@@ -9,8 +9,9 @@
 //! SQLite VFS, GCS provider/credential, witness, route, flag, or authority
 //! connection. A crate-private mint accepts only an active [`RecoveryRoot`],
 //! then reads, hashes, decrypts, and validates the exact [`ArchiveRoot`]
-//! selected by the independent witness before issuing the sealed recovery
-//! capability. This module never lists storage.
+//! selected by the independent witness, and re-admits that exact current
+//! witness state after the asynchronous object read before issuing the sealed
+//! recovery capability. This module never lists storage.
 
 use std::cmp::{max, min};
 
@@ -25,7 +26,7 @@ use crate::archive_v3::{
     Result as ArchiveResult, VerifiedArchiveCipher, MAX_DATABASE_BYTES, MAX_DATABASE_EXTENT_SLOTS,
     SQLITE_PAGE_SIZE,
 };
-use crate::archive_v3_witness::{DeletionState, RecoveryRoot};
+use crate::archive_v3_witness::{DeletionState, ExactCurrentRecoveryAdmission, RecoveryRoot};
 
 pub const EXTENT_BYTES: u32 = 1_048_576;
 pub const MAX_RANGE_RECONSTRUCTION_BYTES: usize = EXTENT_BYTES as usize;
@@ -177,13 +178,15 @@ impl AuthenticatedExtentRoot {
 }
 
 /// Mint the sealed extent-recovery capability from the active exact root named
-/// by the witness. This performs one exact object read and never enumerates or
-/// deletes storage. The resolved archive cipher is itself bound to the exact
-/// witness registry object/hash before this function can use it.
+/// by the witness. This re-admits the exact current witness state before and
+/// after one exact object read, and never enumerates or deletes storage. The
+/// resolved archive cipher is itself bound to the exact witness registry
+/// object/hash before this function can use it.
 pub(crate) async fn mint_authenticated_extent_root(
     backend: &dyn ImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     recovery: &RecoveryRoot,
+    admission: &dyn ExactCurrentRecoveryAdmission,
 ) -> Result<AuthenticatedExtentRoot> {
     let commitment = recovery.root();
     let registry = recovery.registry();
@@ -197,6 +200,10 @@ pub(crate) async fn mint_authenticated_extent_root(
     {
         return Err(ArchiveV3Error::InvalidContext.into());
     }
+    admission
+        .admit_exact_current(recovery)
+        .await
+        .map_err(|_| ArchiveV3Error::InvalidContext)?;
 
     let root_reference = commitment.root();
     let parent = commitment.parent().map(|parent| ParentReference {
@@ -239,6 +246,10 @@ pub(crate) async fn mint_authenticated_extent_root(
         .extent_tree_root
         .ok_or(ArchiveV3Error::Malformed("root has no extent tree"))?;
     let extent_slots = extent_slots(logical_file_length)?;
+    admission
+        .admit_exact_current(recovery)
+        .await
+        .map_err(|_| ArchiveV3Error::InvalidContext)?;
     Ok(AuthenticatedExtentRoot {
         archive_id: recovery.archive_id(),
         database_epoch: commitment.database_epoch(),
@@ -945,7 +956,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Mutex,
+        Arc, Mutex,
     };
     struct TestCipher {
         archive: ArchiveId,
@@ -1100,6 +1111,7 @@ mod tests {
         enumerations: AtomicUsize,
         missing: AtomicBool,
         substitutions: Mutex<Option<CiphertextEnvelope>>,
+        on_next_get: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
     #[async_trait::async_trait]
     impl ImmutableObjectBackend for ExactGetOnlyBackend {
@@ -1113,6 +1125,9 @@ mod tests {
 
         async fn get(&self, key: &ObjectKey) -> ArchiveResult<Option<CiphertextEnvelope>> {
             self.gets.fetch_add(1, Ordering::Relaxed);
+            if let Some(callback) = self.on_next_get.lock().unwrap().take() {
+                callback();
+            }
             if self.missing.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -1161,14 +1176,24 @@ mod tests {
 
     async fn mint_fixture(
         wire_root: ArchiveRoot,
-    ) -> (ExactGetOnlyBackend, VerifiedArchiveCipher, RecoveryRoot) {
+    ) -> (
+        ExactGetOnlyBackend,
+        VerifiedArchiveCipher,
+        RecoveryRoot,
+        Arc<InMemoryWitness>,
+    ) {
         mint_fixture_bytes(wire_root.encode().unwrap(), false).await
     }
 
     async fn mint_fixture_bytes(
         wire_root: Vec<u8>,
         tamper_envelope: bool,
-    ) -> (ExactGetOnlyBackend, VerifiedArchiveCipher, RecoveryRoot) {
+    ) -> (
+        ExactGetOnlyBackend,
+        VerifiedArchiveCipher,
+        RecoveryRoot,
+        Arc<InMemoryWitness>,
+    ) {
         let archive = ArchiveId::from_bytes([1; 16]);
         let database = DatabaseEpoch::from_bytes([2; 16]);
         let key = KeyEpoch::from_bytes([3; 16]);
@@ -1201,7 +1226,7 @@ mod tests {
             .create_if_absent(context.object_key(), envelope.clone())
             .await
             .unwrap();
-        let witness = InMemoryWitness::new();
+        let witness = Arc::new(InMemoryWitness::new());
         witness
             .bootstrap(WitnessBootstrap::new(
                 archive,
@@ -1214,11 +1239,16 @@ mod tests {
                 registry,
             ))
             .unwrap();
-        (backend, cipher, witness.recovery_root(archive).unwrap())
+        let recovery = witness.recovery_root(archive).unwrap();
+        (backend, cipher, recovery, witness)
     }
 
-    async fn minted_sparse_root_fixture(
-    ) -> (ExactGetOnlyBackend, VerifiedArchiveCipher, RecoveryRoot) {
+    async fn minted_sparse_root_fixture() -> (
+        ExactGetOnlyBackend,
+        VerifiedArchiveCipher,
+        RecoveryRoot,
+        Arc<InMemoryWitness>,
+    ) {
         let archive = ArchiveId::from_bytes([1; 16]);
         let database = DatabaseEpoch::from_bytes([2; 16]);
         let key = KeyEpoch::from_bytes([3; 16]);
@@ -1263,7 +1293,7 @@ mod tests {
             .create_if_absent(context.object_key(), envelope.clone())
             .await
             .unwrap();
-        let witness = InMemoryWitness::new();
+        let witness = Arc::new(InMemoryWitness::new());
         witness
             .bootstrap(WitnessBootstrap::new(
                 archive,
@@ -1276,7 +1306,8 @@ mod tests {
                 registry,
             ))
             .unwrap();
-        (backend, cipher, witness.recovery_root(archive).unwrap())
+        let recovery = witness.recovery_root(archive).unwrap();
+        (backend, cipher, recovery, witness)
     }
     #[derive(Default)]
     struct FaultBackend {
@@ -1434,9 +1465,9 @@ mod tests {
 
     #[tokio::test]
     async fn witness_recovery_root_mints_extent_capability_from_one_exact_get() {
-        let (backend, cipher, recovery) = mint_fixture(root_fixture()).await;
+        let (backend, cipher, recovery, witness) = mint_fixture(root_fixture()).await;
 
-        let capability = mint_authenticated_extent_root(&backend, &cipher, &recovery)
+        let capability = mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
             .await
             .unwrap();
 
@@ -1451,29 +1482,35 @@ mod tests {
 
     #[tokio::test]
     async fn witness_root_mint_requires_the_exact_authenticated_nonempty_root() {
-        let (backend, cipher, recovery) = mint_fixture(root_fixture()).await;
+        let (backend, cipher, recovery, witness) = mint_fixture(root_fixture()).await;
         backend.missing.store(true, Ordering::Relaxed);
-        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
-            .await
-            .is_err());
+        assert!(
+            mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                .await
+                .is_err()
+        );
         assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
         assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
 
-        let (backend, cipher, recovery) =
+        let (backend, cipher, recovery, witness) =
             mint_fixture_bytes(root_fixture().encode().unwrap(), true).await;
-        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
-            .await
-            .is_err());
+        assert!(
+            mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                .await
+                .is_err()
+        );
         assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
         assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
 
         let mut all_hole = root_fixture();
         all_hole.logical_file_length = 0;
         all_hole.extent_tree_root = None;
-        let (backend, cipher, recovery) = mint_fixture(all_hole).await;
-        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
-            .await
-            .is_err());
+        let (backend, cipher, recovery, witness) = mint_fixture(all_hole).await;
+        assert!(
+            mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                .await
+                .is_err()
+        );
         assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
         assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
     }
@@ -1487,10 +1524,12 @@ mod tests {
         let mut misaligned = encoded;
         misaligned[61..69].copy_from_slice(&1u64.to_be_bytes());
         for malformed in [over_capacity, misaligned] {
-            let (backend, cipher, recovery) = mint_fixture_bytes(malformed, false).await;
-            assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
-                .await
-                .is_err());
+            let (backend, cipher, recovery, witness) = mint_fixture_bytes(malformed, false).await;
+            assert!(
+                mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                    .await
+                    .is_err()
+            );
             assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
             assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
         }
@@ -1498,7 +1537,7 @@ mod tests {
 
     #[tokio::test]
     async fn witness_root_mint_rejects_envelope_and_root_field_substitutions() {
-        let (backend, cipher, recovery) = mint_fixture(root_fixture()).await;
+        let (backend, cipher, recovery, witness) = mint_fixture(root_fixture()).await;
         let substituted = cipher
             .seal(
                 &ObjectContext::new(
@@ -1515,9 +1554,11 @@ mod tests {
             )
             .unwrap();
         *backend.substitutions.lock().unwrap() = Some(substituted);
-        assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
-            .await
-            .is_err());
+        assert!(
+            mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                .await
+                .is_err()
+        );
         assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
 
         let mut wrong_database = root_fixture();
@@ -1538,15 +1579,17 @@ mod tests {
             wrong_sequence_and_parent,
             wrong_fence,
         ] {
-            let (backend, cipher, recovery) = mint_fixture(root).await;
-            assert!(mint_authenticated_extent_root(&backend, &cipher, &recovery)
-                .await
-                .is_err());
+            let (backend, cipher, recovery, witness) = mint_fixture(root).await;
+            assert!(
+                mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                    .await
+                    .is_err()
+            );
             assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
             assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
         }
 
-        let (backend, _cipher, recovery) = mint_fixture(root_fixture()).await;
+        let (backend, _cipher, recovery, witness) = mint_fixture(root_fixture()).await;
         let wrong_registry = KeyRegistryReference::new(
             recovery.registry().key_epoch(),
             recovery.registry().rotation_generation(),
@@ -1559,11 +1602,14 @@ mod tests {
             wrong_registry,
         )
         .await;
-        assert!(
-            mint_authenticated_extent_root(&backend, &wrong_registry_cipher, &recovery)
-                .await
-                .is_err()
-        );
+        assert!(mint_authenticated_extent_root(
+            &backend,
+            &wrong_registry_cipher,
+            &recovery,
+            &*witness
+        )
+        .await
+        .is_err());
         assert_eq!(backend.gets.load(Ordering::Relaxed), 0);
         assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
 
@@ -1573,12 +1619,71 @@ mod tests {
             recovery.registry(),
         )
         .await;
+        assert!(mint_authenticated_extent_root(
+            &backend,
+            &wrong_archive_cipher,
+            &recovery,
+            &*witness
+        )
+        .await
+        .is_err());
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_snapshot_is_denied_before_any_object_read() {
+        let (backend, cipher, recovery, witness) = mint_fixture(root_fixture()).await;
+        let current = witness
+            .read_current(recovery.archive_id())
+            .unwrap()
+            .unwrap();
+        witness
+            .replace_current_for_test(current.tombstoned_for_test())
+            .unwrap();
         assert!(
-            mint_authenticated_extent_root(&backend, &wrong_archive_cipher, &recovery)
+            mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
                 .await
                 .is_err()
         );
         assert_eq!(backend.gets.load(Ordering::Relaxed), 0);
+
+        let (backend, cipher, recovery, witness) = mint_fixture(root_fixture()).await;
+        let current = witness
+            .read_current(recovery.archive_id())
+            .unwrap()
+            .unwrap();
+        witness
+            .replace_current_for_test(current.with_candidate_root_for_test(
+                RootReference::new(1, ObjectId::from_bytes([48; 16]), [49; 32]),
+                1,
+            ))
+            .unwrap();
+        assert!(
+            mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn final_witness_reread_denies_tombstone_racing_the_exact_get() {
+        let (backend, cipher, recovery, witness) = mint_fixture(root_fixture()).await;
+        let race_witness = Arc::clone(&witness);
+        let race_archive = recovery.archive_id();
+        *backend.on_next_get.lock().unwrap() = Some(Arc::new(move || {
+            let current = race_witness.read_current(race_archive).unwrap().unwrap();
+            race_witness
+                .replace_current_for_test(current.tombstoned_for_test())
+                .unwrap();
+        }));
+        assert!(
+            mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.gets.load(Ordering::Relaxed), 1);
         assert_eq!(backend.enumerations.load(Ordering::Relaxed), 0);
     }
 
@@ -1594,8 +1699,8 @@ mod tests {
 
     #[tokio::test]
     async fn minted_capability_keeps_reconstruction_output_transactional() {
-        let (backend, cipher, recovery) = minted_sparse_root_fixture().await;
-        let capability = mint_authenticated_extent_root(&backend, &cipher, &recovery)
+        let (backend, cipher, recovery, witness) = minted_sparse_root_fixture().await;
+        let capability = mint_authenticated_extent_root(&backend, &cipher, &recovery, &*witness)
             .await
             .unwrap();
         let mut successful_output = vec![0; SQLITE_PAGE_SIZE as usize];
