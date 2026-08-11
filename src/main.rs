@@ -76,6 +76,10 @@ mod archive_v3_gcs_auth;
 // Inactive ADR-0022 restart-safe genesis coordinator. It has no provider
 // construction or authority wiring; only deterministic fake-tested contracts.
 mod archive_v3_genesis;
+// Inactive ADR-0022 deletion-driver seam. It accepts only witness-fenced
+// archive contexts and authenticated canonical metadata; no route, Store,
+// runtime/provider construction, or production authority is connected.
+mod archive_v3_deletion;
 // Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
 // REST transport. They have no runtime construction, Store, VFS, route, or
 // authority wiring.

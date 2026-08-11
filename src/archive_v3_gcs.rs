@@ -138,6 +138,38 @@ pub(crate) trait ArchiveV3GcsTransport: Send + Sync {
         &self,
         canonical_key: &str,
     ) -> std::result::Result<GcsArchiveV3DeleteResult, GcsArchiveV3TransportError>;
+
+    /// Read/list one exact canonical object and prove that neither live,
+    /// noncurrent, nor soft-deleted generations remain. This is used only to
+    /// reconcile an ambiguous delete response; it must not issue a mutation.
+    async fn verify_all_generations_absent_exact(
+        &self,
+        _canonical_key: &str,
+    ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
+        Err(GcsArchiveV3TransportError::Protocol)
+    }
+
+    /// Remove the permanent claim for one already-authenticated immutable
+    /// object ID.  Callers supply an archive prefix and opaque ID rather than
+    /// a claim path, so account deletion cannot manufacture a provider key.
+    /// The default deliberately fails closed until a concrete transport has
+    /// implemented the same all-generation/soft-delete proof as content.
+    async fn delete_claim_all_generations_exact(
+        &self,
+        _canonical_archive_prefix: &str,
+        _object_id: ObjectId,
+    ) -> std::result::Result<GcsArchiveV3DeleteResult, GcsArchiveV3TransportError> {
+        Err(GcsArchiveV3TransportError::Protocol)
+    }
+
+    /// Claim counterpart to [`Self::verify_all_generations_absent_exact`].
+    async fn verify_claim_all_generations_absent_exact(
+        &self,
+        _canonical_archive_prefix: &str,
+        _object_id: ObjectId,
+    ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
+        Err(GcsArchiveV3TransportError::Protocol)
+    }
 }
 
 /// Bounded registry KMS boundary. The adapter supplies canonical KMS AAD; no
