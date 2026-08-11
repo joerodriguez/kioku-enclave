@@ -171,21 +171,40 @@ deployment that contains pre-v2 objects.
 The repository also contains an **inactive, migration-only** bounded streaming reader for
 the exact historical `nonce[12] || ciphertext || tag[16]` AES-256-GCM envelope. It has no
 Store, GCS, route, environment-flag, or authority connection. A future migration adapter
-must pin the source generation, authenticate the entire ciphertext before starting a
-temporary plaintext sink, re-read that same generation in fixed-size chunks, and commit
-only after the second pass has the same ciphertext digest and valid GCM tag. The primitive
+must independently select and seal the source identity commitment, generation, and total;
+the primitive constant-time checks that commitment against the requested canonical identity
+before its first range read. It authenticates the entire ciphertext before starting temporary
+staging, re-reads that same pinned source in fixed-size chunks, and commits only after the
+second pass has the same ciphertext digest and valid GCM tag. The primitive
 uses async range and sink contracts; after staging begins, a synchronous-abort guard removes
 temporary plaintext even if the migration future is cancelled at an I/O await point.
 Staging creation itself is synchronous, so it cannot leave an unguarded temporary object on
-cancellation. Any future concrete adapter must live in the isolated legacy-GCM module (or a
-child), require an exact-generation GCS `206` response with a parsed `Content-Range` total
-and observed generation on every range, and receive dedicated review for atomic commit,
-non-observability, and reconciliation if cancellation races an externally completed commit.
+cancellation. First-pass authentication returns an internal sealed, non-seekable source;
+its pull and completion types are private to the module and its children. Pulled bytes are
+explicitly provisional and attacker-controlled until completion, so a future child
+composition may write them only to encrypted, non-observable, non-authoritative staging.
+The source retains the pinned identity commitment/generation/total, nonce/tag, first-pass
+digest, owned AAD, and zeroizing cipher state, and mints one non-cloneable completion carrying
+the exact source binding only after second-pass exact EOF, tag, digest, and range-receipt
+checks. Its fixed-size redacted binding is domain-separated SHA-256 over the fixed identity
+commitment, pinned lengths and generation, AAD profile discriminator, and first-pass digest;
+it never retains or logs a raw identity, path, user ID, or AAD in that binding. A future child
+composition may obtain the pre-staging binding, but it must consume the completion and
+constant-time equality-check its exact binding before persisting any root candidate or other
+authority-bearing record. The compatibility wrapper performs that consuming check before its
+atomic staging commit. Any future concrete adapter must live in the isolated legacy-GCM
+module (or a child), require an
+exact-generation GCS `206` response with a parsed `Content-Range` total and observed
+generation on every range, and receive dedicated review for atomic commit, non-observability,
+and reconciliation if cancellation races an externally completed commit. The in-memory
+receipt checks reject inconsistencies but cannot prove that a malicious concrete adapter
+reported provider metadata honestly.
 It accepts only an explicit historic empty-AAD profile (SQLite/control/ACME) or the exact
 historic media-user-id AAD profile; it never probes multiple AADs and explicitly rejects a
 v2 marker. Its AES/CTR/GHASH composition is intentionally isolated because it needs a
 dedicated low-level cryptographic review, including the production range-reader and
-all-or-nothing tmpfs sink implementations, before it can be connected to any runtime path.
+all-or-nothing encrypted staging implementation, before it can be connected to any runtime
+path.
 ### ADR-0022 archive-v3 foundation is inactive
 
 The offline `scripts/run_archive_capacity_harness.py` creates deterministic,
