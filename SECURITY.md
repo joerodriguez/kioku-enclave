@@ -416,11 +416,20 @@ their storage/witness fault gates pass.
 
 **ADR-0022 inactive extent-tree seam:** `src/archive_v3_extent.rs` streams one
 caller-owned, page-aligned 1 MiB buffer at a time into context-bound immutable
-extent objects and persistent 256-way sparse Merkle nodes. Exact-root range
-recovery is transactionally staged in zeroizing memory and derives every
-node/extent key from an already authenticated root,
-never lists storage, verifies every accepted create by exact readback before it
-is linked, then verifies each envelope hash, AEAD context, node range and
+extent objects and persistent 256-way sparse Merkle nodes. Each extent/node
+create uses the inactive session-bound shadow-object inventory: it durably
+reserves the exact canonical AAD, provider-neutral key, and ciphertext hash
+before create; then exact-gets the object, authenticates/decrypts it under the
+expected context, and checks the expected extent bytes or canonical decoded
+node before materializing that inventory row or linking its reference. A
+maximum 32-GiB tree consumes at most
+32,768 extent objects plus 129 nodes (32,897 rows), leaving the shared 32,898th
+attempt ordinal for the separately staged root candidate; this uploader does
+not create that root. A transient error or cancellation after reservation
+leaves the row Reserved for exact-key restart reconciliation, never a
+replacement/list/delete path. Exact-root range recovery is transactionally
+staged in zeroizing memory and derives every node/extent key from an already
+authenticated root, never lists storage, then verifies each envelope hash, AEAD context, node range and
 level, bounded traversal/object counts, and exact full-or-final extent length
 before copying an intersection into a caller-owned buffer; only absent sparse
 extents are zeroes. Its returned sparse-content commitment is domain-separated

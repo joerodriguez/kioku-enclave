@@ -39,6 +39,7 @@ use crate::{
     },
     archive_v3_operation::{
         RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage, ShadowObjectState,
+        MAX_SHADOW_OBJECTS_PER_ATTEMPT,
     },
     archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionBinding, ShadowSessionId},
     archive_v3_witness::{RecoveryRoot, RootReference, Witness, WitnessError},
@@ -104,6 +105,8 @@ pub(crate) enum ShadowObjectInventoryError {
     Unavailable,
     #[error("durable shadow-object inventory conflicts with the requested object")]
     Conflict,
+    #[error("durable shadow-object attempt exhausted its immutable-object budget")]
+    AttemptExhausted,
 }
 
 /// Restart-only exact-key reconciliation.  It reads one bound attempt and
@@ -203,7 +206,36 @@ impl<'a> ShadowObjectStaging<'a> {
         context: &ObjectContext,
         envelope: CiphertextEnvelope,
     ) -> Result<ShadowObjectFacts> {
-        let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
+        self.create_and_readback_verified(backend, context, envelope, |_| Ok(()))
+            .await
+    }
+
+    /// Reserve one exact sealed object, create it immutably, and exact-read it
+    /// back. The supplied verifier runs only after byte-for-byte readback and
+    /// before the one-way materialization transition, so a caller cannot link
+    /// an object whose authenticated contents or context are invalid.
+    pub(crate) async fn create_and_readback_verified(
+        &self,
+        backend: &dyn ImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+        verify: impl FnOnce(&CiphertextEnvelope) -> ArchiveResult<()>,
+    ) -> Result<ShadowObjectFacts> {
+        // The root candidate is staged by the coordinator after its uploaded
+        // immutable children. Refuse before even reserving when this attempt
+        // cannot retain another exact object, so no provider I/O can consume
+        // an object that the durable inventory cannot represent.
+        let ordinal = self
+            .next_ordinal
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ordinal| {
+                (usize::try_from(ordinal)
+                    .ok()
+                    .is_some_and(|value| value < MAX_SHADOW_OBJECTS_PER_ATTEMPT))
+                .then_some(ordinal.saturating_add(1))
+            })
+            .map_err(|_| {
+                ShadowCheckpointError::Inventory(ShadowObjectInventoryError::AttemptExhausted)
+            })?;
         let facts = ShadowObjectFacts::from_sealed(context, &envelope, ordinal)
             .map_err(|_| ShadowCheckpointError::Inventory(ShadowObjectInventoryError::Conflict))?;
         self.inventory
@@ -225,6 +257,7 @@ impl<'a> ShadowObjectStaging<'a> {
         if readback != envelope {
             return Err(ArchiveV3Error::Authentication.into());
         }
+        verify(&readback)?;
         self.inventory
             .mark_materialized_exact(
                 self.session_id,
@@ -235,6 +268,11 @@ impl<'a> ShadowObjectStaging<'a> {
             .await
             .map_err(ShadowCheckpointError::Inventory)?;
         Ok(facts)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_ordinal_for_test(&self, ordinal: u32) {
+        self.next_ordinal.store(ordinal, Ordering::Relaxed);
     }
 }
 
