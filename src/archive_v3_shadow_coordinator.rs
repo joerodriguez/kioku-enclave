@@ -1103,6 +1103,7 @@ mod tests {
             _binding: ShadowSessionBinding,
             _facts: ShadowObjectFacts,
         ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            self.events.lock().unwrap().push("reserve");
             Ok(RecordOutcome::Recorded)
         }
 
@@ -1113,6 +1114,7 @@ mod tests {
             _binding: ShadowSessionBinding,
             _facts: ShadowObjectFacts,
         ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            self.events.lock().unwrap().push("materialize");
             Ok(RecordOutcome::Recorded)
         }
 
@@ -1542,7 +1544,10 @@ mod tests {
         assert_eq!(events.first(), Some(&"read_witness"));
         assert_eq!(events.get(1), Some(&"load_session"));
         assert_eq!(events.get(2), Some(&"read"));
-        assert!(events[..commit].contains(&"create"));
+        let reserve = events.iter().position(|x| *x == "reserve").unwrap();
+        let create = events.iter().position(|x| *x == "create").unwrap();
+        let materialize = events.iter().position(|x| *x == "materialize").unwrap();
+        assert!(reserve < create && create < materialize && materialize < commit);
         assert_eq!(
             events.get(commit.wrapping_sub(1)),
             Some(&"persist_candidate")

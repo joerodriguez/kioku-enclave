@@ -2252,6 +2252,65 @@ mod tests {
     }
 
     #[test]
+    fn exact_inventory_pages_255_256_and_257_without_repeating_a_cursor() {
+        for count in [255usize, 256, 257] {
+            let mut connection = setup();
+            let session = shadow_session(0x5d, 0x6e);
+            OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+            for ordinal in 0..count {
+                let mut object = [0; 16];
+                object[..8].copy_from_slice(&(ordinal as u64).to_be_bytes());
+                let facts = ShadowObjectFacts {
+                    ordinal: ordinal as u32,
+                    object_id: ObjectId::from_bytes(object),
+                    object_role: ObjectRole::CheckpointManifestV3,
+                    root_seq: None,
+                    context_aad: Zeroizing::new(vec![ordinal as u8]),
+                    object_key: format!(
+                        "archive/v3/{}/checkpoints/{}/x/manifest/0-0-1-{}.cmfx",
+                        "a1".repeat(16),
+                        "b2".repeat(16),
+                        hex_id(object),
+                    ),
+                    ciphertext_hash: [ordinal as u8; 32],
+                };
+                OperationLedger::reserve_shadow_object(
+                    &mut connection,
+                    session.session_id(),
+                    session.attempt_id(),
+                    session.binding(),
+                    &facts,
+                )
+                .unwrap();
+            }
+            let first = OperationLedger::load_exact_shadow_object_page(
+                &connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(first.entries().len(), count.min(MAX_SHADOW_OBJECTS_PAGE));
+            if count == 257 {
+                assert_eq!(first.next_ordinal(), Some(255));
+                let second = OperationLedger::load_exact_shadow_object_page(
+                    &connection,
+                    session.session_id(),
+                    session.attempt_id(),
+                    session.binding(),
+                    first.next_ordinal(),
+                )
+                .unwrap();
+                assert_eq!(second.entries().len(), 1);
+                assert_eq!(second.next_ordinal(), None);
+            } else {
+                assert_eq!(first.next_ordinal(), None);
+            }
+        }
+    }
+
+    #[test]
     fn terminal_attempt_is_retained_before_a_new_attempt_for_the_same_operation() {
         let mut connection = setup();
         let first = shadow_session(0x45, 0x56);
