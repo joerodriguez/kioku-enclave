@@ -133,10 +133,12 @@ pub(crate) async fn reconcile_reserved_shadow_objects(
             let key = facts.object_key().map_err(|_| {
                 ShadowCheckpointError::Inventory(ShadowObjectInventoryError::Conflict)
             })?;
-            let readback = backend
-                .get(&key)
-                .await?
-                .ok_or(ShadowCheckpointError::MissingObject)?;
+            let Some(readback) = backend.get(&key).await? else {
+                // A crash may occur after reservation but before immutable
+                // create. Preserve the reservation for the terminal attempt;
+                // the coordinator must not silently replace it.
+                continue;
+            };
             if readback.hash() != facts.ciphertext_hash() {
                 return Err(ArchiveV3Error::Authentication.into());
             }

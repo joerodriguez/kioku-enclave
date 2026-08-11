@@ -747,12 +747,15 @@ candidate root. The encrypted SQLite ledger permits at most one active and 16 re
 candidate replacement is forbidden, and a root candidate cannot persist until its exact root
 inventory row is materialized. Witnessed completion atomically retains the attempt's inventory.
 A CAS-unknown outcome leaves its exact reserved/materialized rows unchanged for restart's exact-key
-reconciliation; only definitive rejection, supersession, or an explicit abort atomically changes
+reconciliation. A prepared partial upload is never resumed with replacement objects: restart gets
+only each recorded exact key, materializes matching ciphertext, leaves an exact missing key reserved,
+and then explicitly aborts the attempt; tampering blocks that abort. Only definitive rejection,
+supersession, or that explicit abort atomically changes
 them to orphan-pending-grace. There is no deletion in this slice. Every superseded/aborted attempt remains
 inventory-visible before a new attempt can be prepared. Unknown responses are durably marked before
 reread. Process restart reads one exact attempt and one exact witness record and can return only
-`Witnessed`, non-authorizing `RetrySameCandidate`, or `Superseded`; it never lists storage or invents a
-candidate. A witnessed attempt and its exact root-sequence operation replay result commit in one
+`Witnessed`, non-authorizing `RetrySameCandidate`, `Superseded`, or `Aborted`; it never lists storage,
+creates replacement objects, or invents a candidate. A witnessed attempt and its exact root-sequence operation replay result commit in one
 SQLite transaction. While the runtime remains alive, the cancellation-safe committing phase still
 owns its witness provider until reread finishes; a post-send task failure also returns an opaque
 in-memory handle. A non-nominating reread is never proof of non-commit because commit completion or a

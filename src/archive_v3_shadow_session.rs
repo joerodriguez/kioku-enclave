@@ -380,6 +380,7 @@ pub enum ShadowReconcileDecision {
     Witnessed,
     RetrySameCandidate,
     Superseded,
+    Aborted,
 }
 
 impl ShadowSessionRecord {

@@ -1022,7 +1022,7 @@ impl OperationLedger {
     /// ID or reuse of the archive/epoch/operation tuple with different bytes
     /// fails closed.
     pub fn prepare_shadow_session(
-        connection: &Connection,
+        connection: &mut Connection,
         record: &ShadowSessionRecord,
     ) -> Result<RecordOutcome> {
         if record.state() != ShadowSessionState::Prepared || record.candidate().is_some() {
@@ -1030,8 +1030,9 @@ impl OperationLedger {
                 ShadowSessionError::InvalidTransition,
             ));
         }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) =
-            Self::read_shadow_session(connection, record.session_id(), record.attempt_id())?
+            Self::read_shadow_session(&transaction, record.session_id(), record.attempt_id())?
         {
             return if &existing == record {
                 Ok(RecordOutcome::AlreadyRecorded)
@@ -1044,7 +1045,7 @@ impl OperationLedger {
             };
         }
         let binding = record.binding();
-        let existing = Self::read_shadow_session_family(connection, record.session_id())?;
+        let existing = Self::read_shadow_session_family(&transaction, record.session_id())?;
         if let Some(first) = existing.first() {
             let first_binding = first.binding();
             if first_binding.archive_id() != binding.archive_id()
@@ -1072,7 +1073,7 @@ impl OperationLedger {
             }
         }
         let encoded = record.encode()?;
-        let inserted = connection.execute(
+        let inserted = transaction.execute(
             "INSERT INTO archive_v3_shadow_sessions (
                 session_id, attempt_id, archive_id, database_epoch,
                 operation_id, request_fingerprint, state, record
@@ -1091,6 +1092,7 @@ impl OperationLedger {
         if inserted != 1 {
             return Err(OperationLedgerError::Corrupt);
         }
+        transaction.commit()?;
         Ok(RecordOutcome::Recorded)
     }
 
@@ -1988,6 +1990,12 @@ fn nonnegative_u64(value: i64) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
+
     use super::*;
     use crate::archive_v3_shadow_session::ShadowAttemptId;
 
@@ -2199,9 +2207,9 @@ mod tests {
         let session = shadow_session(0x3e, 0x4f);
         let facts;
         {
-            let connection = Connection::open(temporary.path()).unwrap();
+            let mut connection = Connection::open(temporary.path()).unwrap();
             OperationLedger::initialize(&connection).unwrap();
-            OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+            OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
             create_v1_shadow_object_fixture(&connection);
             facts = shadow_root_facts(&session, shadow_candidate());
             connection
@@ -2304,9 +2312,9 @@ mod tests {
 
     #[test]
     fn malformed_v1_aad_rolls_back_inventory_migration_without_advancing_version() {
-        let connection = setup();
+        let mut connection = setup();
         let session = shadow_session(0x3f, 0x50);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         create_v1_shadow_object_fixture(&connection);
         let facts = shadow_root_facts(&session, shadow_candidate());
         connection
@@ -2337,10 +2345,10 @@ mod tests {
     #[test]
     fn missing_or_mismatched_v1_session_rolls_back_inventory_migration() {
         for prepared in [false, true] {
-            let connection = setup();
+            let mut connection = setup();
             let session = shadow_session(0x40, 0x51);
             if prepared {
-                OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+                OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
             }
             create_v1_shadow_object_fixture(&connection);
             let facts = if prepared {
@@ -2444,17 +2452,17 @@ mod tests {
         let temporary = tempfile::NamedTempFile::new().unwrap();
         let session = shadow_session(0x41, 0x51);
         {
-            let connection = Connection::open(temporary.path()).unwrap();
+            let mut connection = Connection::open(temporary.path()).unwrap();
             OperationLedger::initialize(&connection).unwrap();
             assert_eq!(
-                OperationLedger::prepare_shadow_session(&connection, &session).unwrap(),
+                OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap(),
                 RecordOutcome::Recorded
             );
         }
-        let connection = Connection::open(temporary.path()).unwrap();
+        let mut connection = Connection::open(temporary.path()).unwrap();
         OperationLedger::initialize(&connection).unwrap();
         assert_eq!(
-            OperationLedger::prepare_shadow_session(&connection, &session).unwrap(),
+            OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap(),
             RecordOutcome::AlreadyRecorded
         );
         assert_eq!(
@@ -2469,7 +2477,7 @@ mod tests {
 
         let conflicting_fingerprint = shadow_session(0x41, 0x52);
         assert!(matches!(
-            OperationLedger::prepare_shadow_session(&connection, &conflicting_fingerprint),
+            OperationLedger::prepare_shadow_session(&mut connection, &conflicting_fingerprint),
             Err(OperationLedgerError::FingerprintConflict)
         ));
 
@@ -2480,8 +2488,89 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            OperationLedger::prepare_shadow_session(&connection, &conflicting_binding),
+            OperationLedger::prepare_shadow_session(&mut connection, &conflicting_binding),
             Err(OperationLedgerError::ResultConflict)
+        ));
+    }
+
+    #[test]
+    fn concurrent_prepare_uses_an_immediate_transaction_and_rereads_exact_conflicts() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let session = shadow_session(0x41, 0x61);
+        let competing = ShadowSessionRecord::prepared(
+            session.session_id(),
+            ShadowAttemptId::from_bytes([0x79; 16]),
+            session.binding(),
+        )
+        .unwrap();
+        let connection = Connection::open(temporary.path()).unwrap();
+        OperationLedger::initialize(&connection).unwrap();
+        drop(connection);
+        let barrier = Arc::new(Barrier::new(2));
+        let first_path = temporary.path().to_owned();
+        let first_barrier = Arc::clone(&barrier);
+        let first = thread::spawn(move || {
+            let mut connection = Connection::open(first_path).unwrap();
+            connection.busy_timeout(Duration::from_secs(2)).unwrap();
+            first_barrier.wait();
+            OperationLedger::prepare_shadow_session(&mut connection, &session)
+        });
+        let second_path = temporary.path().to_owned();
+        let second = thread::spawn(move || {
+            let mut connection = Connection::open(second_path).unwrap();
+            connection.busy_timeout(Duration::from_secs(2)).unwrap();
+            barrier.wait();
+            OperationLedger::prepare_shadow_session(&mut connection, &competing)
+        });
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(matches!(
+            (&first, &second),
+            (
+                Ok(RecordOutcome::Recorded),
+                Err(OperationLedgerError::ResultConflict)
+            ) | (
+                Err(OperationLedgerError::ResultConflict),
+                Ok(RecordOutcome::Recorded)
+            )
+        ));
+    }
+
+    #[test]
+    fn concurrent_exact_prepare_replays_only_after_the_immediate_transaction_reread() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let session = shadow_session(0x42, 0x62);
+        let connection = Connection::open(temporary.path()).unwrap();
+        OperationLedger::initialize(&connection).unwrap();
+        drop(connection);
+        let barrier = Arc::new(Barrier::new(2));
+        let first_path = temporary.path().to_owned();
+        let first_barrier = Arc::clone(&barrier);
+        let first_session = session.clone();
+        let first = thread::spawn(move || {
+            let mut connection = Connection::open(first_path).unwrap();
+            connection.busy_timeout(Duration::from_secs(2)).unwrap();
+            first_barrier.wait();
+            OperationLedger::prepare_shadow_session(&mut connection, &first_session)
+        });
+        let second_path = temporary.path().to_owned();
+        let second = thread::spawn(move || {
+            let mut connection = Connection::open(second_path).unwrap();
+            connection.busy_timeout(Duration::from_secs(2)).unwrap();
+            barrier.wait();
+            OperationLedger::prepare_shadow_session(&mut connection, &session)
+        });
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(matches!(
+            (&first, &second),
+            (
+                Ok(RecordOutcome::Recorded),
+                Ok(RecordOutcome::AlreadyRecorded)
+            ) | (
+                Ok(RecordOutcome::AlreadyRecorded),
+                Ok(RecordOutcome::Recorded)
+            )
         ));
     }
 
@@ -2492,7 +2581,7 @@ mod tests {
         {
             let mut connection = Connection::open(temporary.path()).unwrap();
             OperationLedger::initialize(&connection).unwrap();
-            OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+            OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
             let root_facts = materialized_root(&mut connection, &session);
             let persisted = OperationLedger::persist_shadow_candidate(
                 &mut connection,
@@ -2559,7 +2648,7 @@ mod tests {
     fn shadow_object_inventory_is_exact_bound_and_redacted() {
         let mut connection = setup();
         let session = shadow_session(0x46, 0x57);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         let facts = shadow_root_facts(&session, shadow_candidate());
         assert_eq!(
             OperationLedger::reserve_shadow_object(
@@ -2616,7 +2705,7 @@ mod tests {
     fn root_candidate_requires_prior_materialized_exact_object() {
         let mut connection = setup();
         let session = shadow_session(0x47, 0x58);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         let facts = shadow_root_facts(&session, shadow_candidate());
         assert!(matches!(
             OperationLedger::persist_shadow_candidate(
@@ -2645,7 +2734,7 @@ mod tests {
     fn terminal_session_transitions_atomically_retain_or_orphan_inventory() {
         let mut connection = setup();
         let retained = shadow_session(0x48, 0x59);
-        OperationLedger::prepare_shadow_session(&connection, &retained).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &retained).unwrap();
         let retained_facts = materialized_root(&mut connection, &retained);
         OperationLedger::persist_shadow_candidate(
             &mut connection,
@@ -2696,7 +2785,7 @@ mod tests {
         );
 
         let orphan = shadow_session(0x49, 0x5a);
-        OperationLedger::prepare_shadow_session(&connection, &orphan).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &orphan).unwrap();
         let orphan_facts = materialized_root(&mut connection, &orphan);
         OperationLedger::transition_shadow_session(
             &mut connection,
@@ -2723,7 +2812,7 @@ mod tests {
     fn inventory_cap_rejects_another_reservation_before_provider_io() {
         let mut connection = setup();
         let session = shadow_session(0x4a, 0x5b);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         let transaction = connection.transaction().unwrap();
         for value in 0..MAX_SHADOW_OBJECTS_PER_ATTEMPT {
             let facts = shadow_manifest_facts(&session, value as u32);
@@ -2790,7 +2879,7 @@ mod tests {
         for count in [255usize, 256, 257] {
             let mut connection = setup();
             let session = shadow_session(0x5d, 0x6e);
-            OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+            OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
             for ordinal in 0..count {
                 let facts = shadow_manifest_facts(&session, ordinal as u32);
                 OperationLedger::reserve_shadow_object(
@@ -2833,7 +2922,7 @@ mod tests {
     fn exact_inventory_rejects_cross_archive_epoch_object_and_role_keys() {
         let mut connection = setup();
         let session = shadow_session(0x5e, 0x6f);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         let facts = materialized_root(&mut connection, &session);
         let correct = facts.object_key.clone();
         let replacements = [
@@ -2883,7 +2972,7 @@ mod tests {
     fn exact_inventory_rejects_root_parent_or_sequence_outside_its_binding() {
         let mut connection = setup();
         let session = shadow_session(0x5f, 0x70);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         let facts = materialized_root(&mut connection, &session);
         let binding = session.binding();
         let altered_parent = ObjectContext::new(
@@ -2965,7 +3054,7 @@ mod tests {
     fn terminal_attempt_is_retained_before_a_new_attempt_for_the_same_operation() {
         let mut connection = setup();
         let first = shadow_session(0x45, 0x56);
-        OperationLedger::prepare_shadow_session(&connection, &first).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &first).unwrap();
         let second = ShadowSessionRecord::prepared(
             first.session_id(),
             ShadowAttemptId::from_bytes([0x77; 16]),
@@ -2973,7 +3062,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            OperationLedger::prepare_shadow_session(&connection, &second),
+            OperationLedger::prepare_shadow_session(&mut connection, &second),
             Err(OperationLedgerError::ResultConflict)
         ));
         OperationLedger::transition_shadow_session(
@@ -2985,7 +3074,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            OperationLedger::prepare_shadow_session(&connection, &second).unwrap(),
+            OperationLedger::prepare_shadow_session(&mut connection, &second).unwrap(),
             RecordOutcome::Recorded
         );
         assert_eq!(
@@ -3015,7 +3104,7 @@ mod tests {
         let mut connection = setup();
         let session = shadow_session(0x43, 0x54);
         let completion = shadow_completion(0x43, 0x54);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         let root_facts = materialized_root(&mut connection, &session);
         OperationLedger::persist_shadow_candidate(
             &mut connection,
@@ -3126,9 +3215,9 @@ mod tests {
 
     #[test]
     fn shadow_session_index_corruption_fails_closed() {
-        let connection = setup();
+        let mut connection = setup();
         let session = shadow_session(0x44, 0x55);
-        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &session).unwrap();
         connection
             .execute_batch("PRAGMA ignore_check_constraints = ON;")
             .unwrap();
