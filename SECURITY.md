@@ -200,6 +200,16 @@ generation on every range, and receive dedicated review for atomic commit, non-o
 and reconciliation if cancellation races an externally completed commit. The in-memory
 receipt checks reject inconsistencies but cannot prove that a malicious concrete adapter
 reported provider metadata honestly.
+The private `legacy_gcm/extent_candidate.rs` child is an inactive, provisional-only SQLite
+extent source: it accepts only nonzero, page-aligned authenticated lengths within the fixed
+32-GiB cap; validates the required first 100-byte SQLite header fields and their bounded
+header-only relations before it returns an extent; and emits every dense sequential
+1-MiB-or-final-page-aligned extent, including all-zero content. It does
+not authenticate B-tree, FTS, or vector contents, finish or verify the second pass, stage an
+object, construct a root candidate, or connect to a provider, Store, runtime, route, flag,
+witness, CAS, or cutover authority. A later reviewed coordinator must own the parent source,
+scope and drop this adapter, finish and consume its binding, re-read the witness, then perform
+any staging or publication.
 It accepts only an explicit historic empty-AAD profile (SQLite/control/ACME) or the exact
 historic media-user-id AAD profile; it never probes multiple AADs and explicitly rejects a
 v2 marker. Its AES/CTR/GHASH composition is intentionally isolated because it needs a
