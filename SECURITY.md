@@ -200,7 +200,32 @@ generation-zero creates, durable claim CAS, and bounded all-generation deletion.
 deletion succeeds only through an external provider/audit-and-trusted-time drain gate; no such live
 gate is wired. The transport intentionally has no metadata-service access, environment constructor,
 credentials/runtime/deploy wiring, or authority connection; its provider errors never contain
-object paths, IDs, hashes, or cursors. The shadow module
+object paths, IDs, hashes, or cursors.
+
+`src/archive_v3_deletion.rs` is a compiled-but-inactive deletion-driver seam. It accepts
+only a witness-issued tombstone/restart authorization and the opaque archive context
+authenticated by that witness; no caller can provide an account ID, object key, prefix, or
+list-all selector. It advances the existing key-erasure, inventory, and retention evidence
+stages only after exact all-generation content and permanent-claim deletion, and it reconciles
+a lost mutation response only by an exact absence read/list. GCS soft-delete residue remains a
+provider-drain gate. Immediately before any destructive I/O it reauthenticates the exact
+worker/operation/fence through deletion-only witness recovery, compares the fresh full record and
+authorization to its session, and passes every provider call an opaque execution binding. Final
+retention requires the provider to re-list exact content and claim generations (including
+soft-delete state) for the same inventory-bound commitment. Raw keys and object IDs are not
+provider capabilities: the sealed complete inventory mints an opaque capability for each indexed
+entry, and the concrete GCS adapter rechecks its inventory membership plus the full fresh
+archive/database/fence/worker/operation tuple before transport I/O. `PhysicalComplete` evidence
+hashes both the exact complete-inventory commitment and the freshly reverified provider-drain
+commitment; the driver derives that stage proof from the drain result rather than forwarding an
+unrelated retention assertion. The root/manifest formats do not yet
+carry all descendant location fields, so full activation is compile-time blocked: the inventory
+trait/builder/result are module-private and the full-reachability seal has no non-test constructor.
+Admitting an authenticated canonical metadata walker requires an explicit reviewed source change;
+that walker must enforce fixed global count/byte/depth/page bounds and cycle/duplicate rejection,
+and must not infer paths or discover objects by prefix. The driver has no Store, route, runtime,
+credential, or deployment wiring.
+The shadow module
 is bounded synchronous capture state only: no
 SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
 The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its exact owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
@@ -221,7 +246,8 @@ path requires provider authentication on every step, matches the exact durable
 worker/operation identity derived from that opaque credential (never from persisted IDs),
 and accepts only provider-verified stage proofs whose canonical commitments bind the
 archive, operation identity, deletion fence, target state, root, registry, prior evidence,
-and provider proof commitment. Database-epoch cutover requires extent authority, derives a
+and provider proof commitment. Physical-completion proofs additionally bind the exact sealed
+inventory and fresh provider-drain commitments. Database-epoch cutover requires extent authority, derives a
 never-reused next epoch from the durable generation/current root, consumes that gate into a
 post-cutover state, retains the predecessor, and only then permits legacy retirement. A
 durable decoder rejects any lifecycle field combination that could reopen the consumed

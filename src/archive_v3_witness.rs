@@ -23,7 +23,7 @@ const DELETION_EVIDENCE_STAGES: usize = 4;
 const MAX_LEASE_TICKS: u64 = 86_400;
 const ROOT_COMMITMENT_BYTES: usize = 153;
 const KEY_REGISTRY_REFERENCE_BYTES: usize = 73;
-const DELETION_EVIDENCE_DOMAIN: &[u8] = b"kioku:archive:v3:deletion-evidence\0";
+const DELETION_EVIDENCE_DOMAIN: &[u8] = b"kioku:archive:v3:deletion-evidence:v2\0";
 const DATABASE_EPOCH_DOMAIN: &[u8] = b"kioku:archive:v3:database-epoch\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -81,6 +81,8 @@ impl fmt::Debug for DeletionWorkerCredential {
 
 pub struct DeletionStageProof {
     provider_assertion: Zeroizing<Vec<u8>>,
+    inventory_commitment: Option<[u8; 32]>,
+    provider_drain_commitment: Option<[u8; 32]>,
 }
 impl DeletionStageProof {
     #[cfg(test)]
@@ -90,11 +92,36 @@ impl DeletionStageProof {
         }
         Ok(Self {
             provider_assertion: Zeroizing::new(provider_assertion.to_vec()),
+            inventory_commitment: None,
+            provider_drain_commitment: None,
         })
     }
 
     fn provider_assertion(&self) -> &[u8] {
         &self.provider_assertion
+    }
+
+    pub(crate) fn bind_inventory_drain(
+        &self,
+        inventory_commitment: [u8; 32],
+        provider_drain_commitment: [u8; 32],
+    ) -> Result<Self> {
+        if self.provider_assertion.is_empty()
+            || !nonzero_hash(&inventory_commitment)
+            || !nonzero_hash(&provider_drain_commitment)
+        {
+            return Err(WitnessError::Malformed);
+        }
+        Ok(Self {
+            provider_assertion: Zeroizing::new(self.provider_assertion.to_vec()),
+            inventory_commitment: Some(inventory_commitment),
+            provider_drain_commitment: Some(provider_drain_commitment),
+        })
+    }
+
+    pub(crate) fn drain_binding(&self) -> Option<([u8; 32], [u8; 32])> {
+        self.inventory_commitment
+            .zip(self.provider_drain_commitment)
     }
 }
 impl fmt::Debug for DeletionStageProof {
@@ -131,6 +158,8 @@ struct DeletionStageContext {
     target: DeletionState,
     root: RootCommitment,
     registry: KeyRegistryReference,
+    inventory_commitment: Option<[u8; 32]>,
+    provider_drain_commitment: Option<[u8; 32]>,
 }
 
 trait DeletionWorkerAuthenticator: Send + Sync {
@@ -164,6 +193,63 @@ impl DeletionWorkerAuthenticator for DenyDeletionWorkers {
         _proof: &DeletionStageProof,
     ) -> Result<[u8; 32]> {
         Err(WitnessError::Unauthorized)
+    }
+}
+
+#[cfg(test)]
+struct DeletionDriverTestAuthenticator {
+    archive_id: ArchiveId,
+}
+
+#[cfg(test)]
+impl DeletionWorkerAuthenticator for DeletionDriverTestAuthenticator {
+    fn authenticate(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+    ) -> Result<DeletionWorkerIdentity> {
+        if archive_id != self.archive_id || credential.provider_assertion() != b"driver-worker" {
+            return Err(WitnessError::Unauthorized);
+        }
+        DeletionWorkerIdentity::new(
+            ObjectId::from_bytes([70; 16]),
+            ObjectId::from_bytes([71; 16]),
+        )
+    }
+
+    fn verify_stage(
+        &self,
+        credential: &DeletionWorkerCredential,
+        context: DeletionStageContext,
+        proof: &DeletionStageProof,
+    ) -> Result<[u8; 32]> {
+        if self.authenticate(context.archive_id, credential)? != context.identity {
+            return Err(WitnessError::Unauthorized);
+        }
+        let expected = match context.target {
+            DeletionState::Active => return Err(WitnessError::InvalidTransition),
+            DeletionState::Tombstoned => b"driver-tombstone".as_slice(),
+            DeletionState::CryptographicallyErased => b"driver-erasure".as_slice(),
+            DeletionState::LogicalObjectsAbsent => b"driver-inventory".as_slice(),
+            DeletionState::PhysicalComplete => b"driver-retention".as_slice(),
+        };
+        if proof.provider_assertion() != expected {
+            return Err(WitnessError::Unauthorized);
+        }
+        match context.target {
+            DeletionState::PhysicalComplete
+                if context
+                    .inventory_commitment
+                    .is_some_and(|value| nonzero_hash(&value))
+                    && context
+                        .provider_drain_commitment
+                        .is_some_and(|value| nonzero_hash(&value)) => {}
+            DeletionState::PhysicalComplete => return Err(WitnessError::Unauthorized),
+            _ if context.inventory_commitment.is_none()
+                && context.provider_drain_commitment.is_none() => {}
+            _ => return Err(WitnessError::Unauthorized),
+        }
+        Ok(Sha256::digest(expected).into())
     }
 }
 
@@ -929,6 +1015,85 @@ pub struct DeletionAuthorization {
     database_epoch: DatabaseEpoch,
     fencing_epoch: u64,
 }
+#[cfg(test)]
+impl DeletionAuthorization {
+    pub(crate) fn with_fencing_epoch_for_test(self, fencing_epoch: u64) -> Self {
+        Self {
+            fencing_epoch,
+            ..self
+        }
+    }
+}
+
+/// Opaque, provider-authenticated destructive-operation binding.  It is
+/// derived only from a fresh deletion-only witness recovery and carries the
+/// archive/database/fence/worker/operation tuple without exposing its
+/// persisted identity fields to deletion providers or logs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeletionExecutionBinding {
+    archive_id: ArchiveId,
+    database_epoch: DatabaseEpoch,
+    deletion_fencing_epoch: u64,
+    worker_id: ObjectId,
+    operation_id: ObjectId,
+}
+
+impl DeletionExecutionBinding {
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) fn commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kioku/archive-v3/deletion-execution-binding/v1\0");
+        hasher.update(self.archive_id.as_bytes());
+        hasher.update(self.database_epoch.as_bytes());
+        hasher.update(self.deletion_fencing_epoch.to_be_bytes());
+        hasher.update(self.worker_id.as_bytes());
+        hasher.update(self.operation_id.as_bytes());
+        hasher.finalize().into()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_archive_id_for_test(self, archive_id: ArchiveId) -> Self {
+        Self { archive_id, ..self }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_database_epoch_for_test(self, database_epoch: DatabaseEpoch) -> Self {
+        Self {
+            database_epoch,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_fencing_epoch_for_test(self, deletion_fencing_epoch: u64) -> Self {
+        Self {
+            deletion_fencing_epoch,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_worker_for_test(self, worker_id: ObjectId) -> Self {
+        Self { worker_id, ..self }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_operation_for_test(self, operation_id: ObjectId) -> Self {
+        Self {
+            operation_id,
+            ..self
+        }
+    }
+}
+
+impl fmt::Debug for DeletionExecutionBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeletionExecutionBinding(<opaque>)")
+    }
+}
 impl fmt::Debug for DeletionAuthorization {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("DeletionAuthorization(<opaque>)")
@@ -1049,6 +1214,28 @@ impl DeletionRecovery {
 
     pub fn authorization(&self) -> DeletionAuthorization {
         self.authorization
+    }
+
+    pub(crate) fn execution_binding(&self) -> Result<DeletionExecutionBinding> {
+        let record = self.receipt.record();
+        let deletion_fencing_epoch = record.deletion_fencing_epoch.ok_or(WitnessError::Corrupt)?;
+        let worker_id = record.deletion_worker_id.ok_or(WitnessError::Corrupt)?;
+        let operation_id = record.deletion_operation_id.ok_or(WitnessError::Corrupt)?;
+        if record.deletion == DeletionState::Active
+            || record.deletion == DeletionState::PhysicalComplete
+            || self.authorization.archive_id != record.archive_id
+            || self.authorization.database_epoch != record.database_epoch
+            || self.authorization.fencing_epoch != deletion_fencing_epoch
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(DeletionExecutionBinding {
+            archive_id: record.archive_id,
+            database_epoch: record.database_epoch,
+            deletion_fencing_epoch,
+            worker_id,
+            operation_id,
+        })
     }
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -1363,6 +1550,79 @@ enum Normal {
     Rotation(KeyRegistryReference),
     Epoch(DatabaseEpoch),
 }
+
+#[cfg(test)]
+pub(crate) struct DeletionDriverTestFixture {
+    pub(crate) witness: InMemoryWitness,
+    pub(crate) tombstone: TombstoneReceipt,
+    pub(crate) credential: DeletionWorkerCredential,
+    pub(crate) wrong_credential: DeletionWorkerCredential,
+    pub(crate) key_erasure: DeletionStageProof,
+    pub(crate) inventory: DeletionStageProof,
+    pub(crate) retention: DeletionStageProof,
+}
+
+#[cfg(test)]
+pub(crate) fn deletion_driver_test_fixture() -> DeletionDriverTestFixture {
+    let archive_id = ArchiveId::from_bytes([1; 16]);
+    let database_epoch = DatabaseEpoch::from_bytes([2; 16]);
+    let key_epoch = KeyEpoch::from_bytes([3; 16]);
+    let registry = KeyRegistryReference::new(key_epoch, 0, ObjectId::from_bytes([6; 16]), [7; 32]);
+    let genesis = RootCommitment::genesis(
+        database_epoch,
+        key_epoch,
+        RootReference::new(0, ObjectId::from_bytes([4; 16]), [5; 32]),
+    );
+    let witness = InMemoryWitness::with_clock_and_authenticator(
+        Arc::new(SystemClock),
+        Arc::new(DeletionDriverTestAuthenticator { archive_id }),
+    );
+    witness
+        .bootstrap(WitnessBootstrap::new(
+            archive_id,
+            database_epoch,
+            genesis,
+            registry,
+        ))
+        .expect("driver fixture bootstrap");
+    let lease = witness
+        .acquire_lease(
+            archive_id,
+            database_epoch,
+            key_epoch,
+            ObjectId::from_bytes([9; 16]),
+            300,
+        )
+        .expect("driver fixture lease");
+    let candidate = RootCommitment::candidate(
+        database_epoch,
+        key_epoch,
+        lease.fencing_epoch,
+        genesis.root,
+        RootReference::new(1, ObjectId::from_bytes([10; 16]), [11; 32]),
+    );
+    let credential = DeletionWorkerCredential::new(b"driver-worker").expect("driver credential");
+    let tombstone_proof =
+        DeletionStageProof::new(b"driver-tombstone").expect("driver tombstone proof");
+    let tombstone = witness
+        .tombstone(
+            RootAdvance::new(lease, genesis, registry, candidate),
+            &credential,
+            &tombstone_proof,
+        )
+        .expect("driver fixture tombstone");
+    DeletionDriverTestFixture {
+        witness,
+        tombstone,
+        credential,
+        wrong_credential: DeletionWorkerCredential::new(b"wrong-worker")
+            .expect("wrong driver credential"),
+        key_erasure: DeletionStageProof::new(b"driver-erasure").expect("driver erasure proof"),
+        inventory: DeletionStageProof::new(b"driver-inventory").expect("driver inventory proof"),
+        retention: DeletionStageProof::new(b"driver-retention").expect("driver retention proof"),
+    }
+}
+
 impl Witness for InMemoryWitness {
     fn read_current(&self, id: ArchiveId) -> Result<Option<WitnessRecord>> {
         let s = self.lock()?;
@@ -1497,6 +1757,8 @@ impl Witness for InMemoryWitness {
                 target: DeletionState::Tombstoned,
                 root: a.candidate,
                 registry: r.registry,
+                inventory_commitment: None,
+                provider_drain_commitment: None,
             },
             credential,
             proof,
@@ -1570,6 +1832,15 @@ impl Witness for InMemoryWitness {
         let _ = self.now(r)?;
         deletion_ok(r, &a, next, identity)?;
         let deletion_fencing_epoch = r.deletion_fencing_epoch.ok_or(WitnessError::Corrupt)?;
+        let (inventory_commitment, provider_drain_commitment) = match (next, proof.drain_binding())
+        {
+            (DeletionState::PhysicalComplete, Some((inventory, drain))) => {
+                (Some(inventory), Some(drain))
+            }
+            (DeletionState::PhysicalComplete, None) => return Err(WitnessError::Malformed),
+            (_, None) => (None, None),
+            (_, Some(_)) => return Err(WitnessError::Malformed),
+        };
         let evidence = self.verified_deletion_evidence(
             r,
             DeletionStageContext {
@@ -1579,6 +1850,8 @@ impl Witness for InMemoryWitness {
                 target: next,
                 root: r.root,
                 registry: r.registry,
+                inventory_commitment,
+                provider_drain_commitment,
             },
             credential,
             proof,
@@ -1788,6 +2061,17 @@ fn deletion_evidence_from_verified_stage(
     {
         return Err(WitnessError::Malformed);
     }
+    match (
+        context.target,
+        context.inventory_commitment,
+        context.provider_drain_commitment,
+    ) {
+        (DeletionState::PhysicalComplete, Some(inventory), Some(drain))
+            if nonzero_hash(&inventory) && nonzero_hash(&drain) => {}
+        (DeletionState::PhysicalComplete, _, _) => return Err(WitnessError::Malformed),
+        (_, None, None) => {}
+        (_, _, _) => return Err(WitnessError::Malformed),
+    }
     let mut root_bytes = [0u8; ROOT_COMMITMENT_BYTES];
     let mut root_offset = 0;
     root_commitment_put(&mut root_bytes, &mut root_offset, context.root);
@@ -1809,6 +2093,20 @@ fn deletion_evidence_from_verified_stage(
     hasher.update([context.target as u8]);
     hasher.update(root_bytes);
     hasher.update(registry_bytes);
+    match context.inventory_commitment {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value);
+        }
+        None => hasher.update([0u8; 33]),
+    }
+    match context.provider_drain_commitment {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value);
+        }
+        None => hasher.update([0u8; 33]),
+    }
     for evidence in record.deletion_evidence {
         match evidence {
             Some(value) => {
@@ -2032,6 +2330,19 @@ mod tests {
             if proof.provider_assertion() != expected {
                 return Err(WitnessError::Unauthorized);
             }
+            match context.target {
+                DeletionState::PhysicalComplete
+                    if context
+                        .inventory_commitment
+                        .is_some_and(|value| nonzero_hash(&value))
+                        && context
+                            .provider_drain_commitment
+                            .is_some_and(|value| nonzero_hash(&value)) => {}
+                DeletionState::PhysicalComplete => return Err(WitnessError::Unauthorized),
+                _ if context.inventory_commitment.is_none()
+                    && context.provider_drain_commitment.is_none() => {}
+                _ => return Err(WitnessError::Unauthorized),
+            }
             Ok(Sha256::digest(proof.provider_assertion()).into())
         }
     }
@@ -2055,7 +2366,12 @@ mod tests {
             DeletionState::LogicalObjectsAbsent => b"provider-proof-inventory".as_slice(),
             DeletionState::PhysicalComplete => b"provider-proof-retention".as_slice(),
         };
-        DeletionStageProof::new(assertion).unwrap()
+        let proof = DeletionStageProof::new(assertion).unwrap();
+        if state == DeletionState::PhysicalComplete {
+            proof.bind_inventory_drain(hash(81), hash(82)).unwrap()
+        } else {
+            proof
+        }
     }
     fn wrapped_registry_hash() -> [u8; 32] {
         Sha256::digest(WRAPPED_REGISTRY).into()
@@ -2726,6 +3042,16 @@ mod tests {
         let resumed = after_inventory_restart
             .resume_deletion(r.archive_id, &deletion_credential())
             .unwrap();
+        let unbound_retention = DeletionStageProof::new(b"provider-proof-retention").unwrap();
+        assert_eq!(
+            after_inventory_restart.advance_deletion(
+                del(resumed.receipt().record(), resumed.authorization()),
+                DeletionState::PhysicalComplete,
+                &deletion_credential(),
+                &unbound_retention,
+            ),
+            Err(WitnessError::Malformed)
+        );
         let complete = after_inventory_restart
             .advance_deletion(
                 del(resumed.receipt().record(), resumed.authorization()),

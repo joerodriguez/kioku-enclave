@@ -373,7 +373,7 @@ impl GcpArchiveV3HttpTransport {
         }
     }
 
-    async fn list_generations_exact(
+    async fn list_generations_named(
         &self,
         key: &str,
     ) -> std::result::Result<Vec<String>, GcsArchiveV3TransportError> {
@@ -433,7 +433,7 @@ impl GcpArchiveV3HttpTransport {
     /// Seeing one therefore prevents this transport from claiming exact physical
     /// deletion. A 400 from `softDeleted=true` succeeds only when the separate
     /// authenticated drain gate proves earlier retained generations aged out.
-    async fn has_soft_deleted_generation_exact(
+    async fn has_soft_deleted_generation_named(
         &self,
         key: &str,
     ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
@@ -498,6 +498,49 @@ impl GcpArchiveV3HttpTransport {
             }
         }
         Err(GcsArchiveV3TransportError::TooLarge)
+    }
+
+    /// The caller has derived `key` from either a canonical object context or
+    /// the closed claim-key function above.  This helper never accepts a
+    /// provider prefix/list selector: every request is for that one exact
+    /// name, every generation is enumerated, and a final exact absence check
+    /// includes soft-deleted residue.
+    async fn delete_all_generations_named(
+        &self,
+        key: &str,
+    ) -> std::result::Result<GcsArchiveV3DeleteResult, GcsArchiveV3TransportError> {
+        let mut observed_any = false;
+        for _ in 0..MAX_DELETE_PASSES {
+            let generations = self.list_generations_named(key).await?;
+            if generations.is_empty() {
+                if self.has_soft_deleted_generation_named(key).await? {
+                    return Err(GcsArchiveV3TransportError::Protocol);
+                }
+                return Ok(if observed_any {
+                    GcsArchiveV3DeleteResult::DeletedAllGenerations
+                } else {
+                    GcsArchiveV3DeleteResult::Absent
+                });
+            }
+            observed_any = true;
+            for generation in generations {
+                // A lost mutation response stays OutcomeUnknown.  The caller
+                // reconciles by invoking this exact-name all-generation scan,
+                // never by replaying a guessed generation delete.
+                self.delete_generation(key, &generation).await?;
+            }
+        }
+        Err(GcsArchiveV3TransportError::Protocol)
+    }
+
+    async fn verify_all_generations_absent_named(
+        &self,
+        key: &str,
+    ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
+        if !self.list_generations_named(key).await?.is_empty() {
+            return Ok(false);
+        }
+        Ok(!self.has_soft_deleted_generation_named(key).await?)
     }
 
     async fn list_names_once(
@@ -755,30 +798,36 @@ impl ArchiveV3GcsTransport for GcpArchiveV3HttpTransport {
         if canonical_object_id(canonical_key).is_none() {
             return Err(GcsArchiveV3TransportError::Protocol);
         }
-        let mut observed_any = false;
-        for _ in 0..MAX_DELETE_PASSES {
-            let generations = self.list_generations_exact(canonical_key).await?;
-            if generations.is_empty() {
-                if self
-                    .has_soft_deleted_generation_exact(canonical_key)
-                    .await?
-                {
-                    return Err(GcsArchiveV3TransportError::Protocol);
-                }
-                return Ok(if observed_any {
-                    GcsArchiveV3DeleteResult::DeletedAllGenerations
-                } else {
-                    GcsArchiveV3DeleteResult::Absent
-                });
-            }
-            observed_any = true;
-            for generation in generations {
-                self.delete_generation(canonical_key, &generation).await?;
-            }
+        self.delete_all_generations_named(canonical_key).await
+    }
+
+    async fn delete_claim_all_generations_exact(
+        &self,
+        canonical_archive_prefix: &str,
+        object_id: ObjectId,
+    ) -> std::result::Result<GcsArchiveV3DeleteResult, GcsArchiveV3TransportError> {
+        let claim_key = Self::claim_key(canonical_archive_prefix, object_id)?;
+        self.delete_all_generations_named(&claim_key).await
+    }
+
+    async fn verify_all_generations_absent_exact(
+        &self,
+        canonical_key: &str,
+    ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
+        if canonical_object_id(canonical_key).is_none() {
+            return Err(GcsArchiveV3TransportError::Protocol);
         }
-        // New generations kept appearing while deleting. Do not report a
-        // successful deletion when the exact inventory cannot be proven empty.
-        Err(GcsArchiveV3TransportError::Protocol)
+        self.verify_all_generations_absent_named(canonical_key)
+            .await
+    }
+
+    async fn verify_claim_all_generations_absent_exact(
+        &self,
+        canonical_archive_prefix: &str,
+        object_id: ObjectId,
+    ) -> std::result::Result<bool, GcsArchiveV3TransportError> {
+        let claim_key = Self::claim_key(canonical_archive_prefix, object_id)?;
+        self.verify_all_generations_absent_named(&claim_key).await
     }
 }
 
@@ -1484,5 +1533,41 @@ mod tests {
         );
         let requests = server.finish().await;
         assert!(requests[1].target.contains("pageToken=loop"));
+    }
+
+    #[tokio::test]
+    async fn exact_claim_delete_preserves_ambiguity_and_reconciles_by_absence() {
+        let object_id = ObjectId::from_bytes([3; 16]);
+        let claim_key = GcpArchiveV3HttpTransport::claim_key(archive_prefix(), object_id).unwrap();
+        let server = MockServer::new(vec![
+            reply(
+                "200 OK",
+                &format!("{{\"items\":[{{\"name\":\"{claim_key}\",\"generation\":\"9\"}}]}}"),
+            ),
+            MockReply {
+                status: "",
+                body: Vec::new(),
+                close_without_response: true,
+            },
+            reply("200 OK", "{}"),
+            reply("400 Bad Request", "{}"),
+        ])
+        .await;
+        let transport = make_transport(&server);
+        assert_eq!(
+            transport
+                .delete_claim_all_generations_exact(archive_prefix(), object_id)
+                .await,
+            Err(GcsArchiveV3TransportError::OutcomeUnknown)
+        );
+        assert!(transport
+            .verify_claim_all_generations_absent_exact(archive_prefix(), object_id)
+            .await
+            .unwrap());
+        let requests = server.finish().await;
+        assert_eq!(requests[1].method, "DELETE");
+        assert!(requests
+            .iter()
+            .all(|request| request.target.contains("archive%2Fv3-claims%2F")));
     }
 }
