@@ -18,7 +18,9 @@ account pseudonym, a deterministic idempotency key, the stable meter name
 `recording_seconds_v1`, a bounded quantity, and server-observed time to an authenticated
 external control plane. It accepts only a bounded decision, public reason class, duplicate
 marker, and usage snapshot. No provider customer, transaction, product, price, invoice,
-or subscription identifier may cross this interface.
+or subscription identifier may appear as a structured entitlement field. A deprecated
+account-action facade may carry an opaque HTTPS URL whose contents the enclave neither
+parses nor persists; that compatibility exception is not authorization input.
 
 The authenticated client reserves server-timed wall-clock recording through a durable
 60-second lease. Null lease identity starts or reattaches; the returned per-user opaque
