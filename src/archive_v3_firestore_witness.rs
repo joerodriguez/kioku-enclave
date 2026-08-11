@@ -452,6 +452,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_path_preserves_lost_commit_response_without_internal_reread() {
+        let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
+        let adapter = witness(transport.clone());
+        let record = adapter.bootstrap_async(bootstrap()).await.unwrap();
+        transport.push_outcome(CommitOutcome::LostResponse);
+        let outcome = adapter
+            .update_unresolved(record.archive_id(), |local| {
+                local.acquire_lease(
+                    record.archive_id(),
+                    record.database_epoch(),
+                    record.registry().key_epoch(),
+                    ObjectId::from_bytes(id(8)),
+                    10,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            FirestoreUpdateOutcome::OutcomeUnknown { .. }
+        ));
+        // Begin + transactional batch-get + commit only: the unresolved path
+        // does not issue the ordinary adapter's fourth exact readback.
+        let state = transport.0.lock().unwrap();
+        assert_eq!(state.commits, 2);
+        assert_eq!(
+            state
+                .requests
+                .iter()
+                .filter(|request| request.get("documents").is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn trusted_clock_regression_and_redaction_fail_closed() {
         let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
         let adapter = witness(transport.clone());
@@ -772,6 +808,19 @@ impl FirestoreWitnessConfig {
             namespace,
             provider_audience,
         })
+    }
+
+    /// Return the already-validated namespace as a typed value.  The concrete
+    /// composition seam uses this instead of accepting an independently
+    /// configurable project/database selector.
+    pub(crate) fn namespace(&self) -> FirestoreWitnessNamespace {
+        self.namespace.clone()
+    }
+
+    /// Return the audience derived from the same deployment identity as the
+    /// namespace.  Callers cannot substitute a raw audience string.
+    pub(crate) fn provider_audience(&self) -> FirestoreWitnessAudience {
+        self.provider_audience.clone()
     }
 }
 impl fmt::Debug for FirestoreWitnessConfig {
@@ -1160,6 +1209,24 @@ pub(crate) struct FirestoreWitness {
     transport: Arc<dyn FirestoreWitnessTransport>,
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
 }
+
+/// A compare-and-advance result whose provider response may have been lost.
+/// The shadow coordinator must retain that distinction so it can return an
+/// exact opaque reconciliation handle instead of treating ambiguity as a
+/// definitive CAS rejection.
+pub(crate) enum FirestoreWitnessCommitError {
+    Rejected(WitnessError),
+    OutcomeUnknown,
+}
+
+enum FirestoreUpdateOutcome<T> {
+    Committed(T),
+    OutcomeUnknown {
+        output: T,
+        encoded: Box<[u8; WITNESS_RECORD_BYTES]>,
+    },
+}
+
 impl FirestoreWitness {
     pub(crate) fn new(
         config: FirestoreWitnessConfig,
@@ -1200,11 +1267,11 @@ impl FirestoreWitness {
         let record = decode_read(&read, archive_id)?;
         Ok((read, record))
     }
-    async fn update<T, F>(
+    async fn update_unresolved<T, F>(
         &self,
         archive_id: ArchiveId,
         apply: F,
-    ) -> std::result::Result<T, WitnessError>
+    ) -> std::result::Result<FirestoreUpdateOutcome<T>, WitnessError>
     where
         F: Fn(&InMemoryWitness) -> std::result::Result<T, WitnessError>,
     {
@@ -1244,23 +1311,46 @@ impl FirestoreWitness {
                 .commit_full_record(token.as_str(), &transaction, commit)
                 .await
             {
-                Ok(()) => return Ok(output),
+                Ok(()) => return Ok(FirestoreUpdateOutcome::Committed(output)),
                 Err(FirestoreWitnessTransportError::Aborted)
                     if attempt + 1 < MAX_ABORTED_ATTEMPTS =>
                 {
                     continue
                 }
                 Err(FirestoreWitnessTransportError::OutcomeUnknown) => {
-                    let (_, observed) = self.fresh_record(archive_id).await?;
-                    if observed.as_ref().is_some_and(|bytes| bytes == &encoded) {
-                        return Ok(output);
-                    }
-                    return Err(WitnessError::CompareFailed);
+                    return Ok(FirestoreUpdateOutcome::OutcomeUnknown {
+                        output,
+                        encoded: Box::new(encoded),
+                    });
                 }
                 Err(error) => return Err(map_transport(error)),
             }
         }
         Err(WitnessError::Unavailable)
+    }
+
+    async fn update<T, F>(
+        &self,
+        archive_id: ArchiveId,
+        apply: F,
+    ) -> std::result::Result<T, WitnessError>
+    where
+        F: Fn(&InMemoryWitness) -> std::result::Result<T, WitnessError>,
+    {
+        match self.update_unresolved(archive_id, apply).await? {
+            FirestoreUpdateOutcome::Committed(output) => Ok(output),
+            FirestoreUpdateOutcome::OutcomeUnknown { output, encoded } => {
+                let (_, observed) = self.fresh_record(archive_id).await?;
+                if observed
+                    .as_ref()
+                    .is_some_and(|bytes| bytes == encoded.as_ref())
+                {
+                    Ok(output)
+                } else {
+                    Err(WitnessError::CompareFailed)
+                }
+            }
+        }
     }
     pub(crate) async fn bootstrap_async(
         &self,
@@ -1372,6 +1462,27 @@ impl FirestoreWitness {
             local.compare_and_advance_root(advance.clone())
         })
         .await
+    }
+
+    /// Coordinator-only variant that deliberately does not resolve a lost
+    /// commit response internally.  The coordinator owns the exact candidate
+    /// and expected parent needed to build a durable reconciliation handle.
+    pub(crate) async fn compare_and_advance_root_unresolved_async(
+        &self,
+        advance: RootAdvance,
+    ) -> std::result::Result<WitnessReceipt, FirestoreWitnessCommitError> {
+        match self
+            .update_unresolved(advance.archive_id(), |local| {
+                local.compare_and_advance_root(advance.clone())
+            })
+            .await
+            .map_err(FirestoreWitnessCommitError::Rejected)?
+        {
+            FirestoreUpdateOutcome::Committed(receipt) => Ok(receipt),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
     }
     pub(crate) async fn advance_migration_async(
         &self,

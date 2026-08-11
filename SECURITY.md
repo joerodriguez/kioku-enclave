@@ -257,9 +257,13 @@ transport/timeout/429/5xx or
 malformed success remains `OutcomeUnknown`; `ABORTED` and `FAILED_PRECONDITION` retain their
 typed meanings, and an HTTP 404 is only an endpoint/database failure, never a missing
 witness document. The REST transport and the separately compiled bearer source have no runtime
-connection; neither uses metadata/default-token fallback or service-account impersonation. There
-is no Firestore IAM runtime wiring, query/list/delete/batch-write/create-document capability,
-additional field, Store/VFS/route connection, deployment flag, or production authority.
+connection; neither uses metadata/default-token fallback or service-account impersonation. An
+inactive composition seam constructs those fixed clients and the semantic adapter from one typed
+namespace/audience config without I/O. Its coordinator bridge preserves a lost commit response as
+`OutcomeUnknown` so the exact candidate/parent handle remains the only reconciliation path;
+ordinary adapter calls retain their exact fresh-read resolution. There is no Firestore IAM runtime
+wiring, query/list/delete/batch-write/create-document capability, additional field,
+Store/VFS/route/startup connection, environment flag, archive bootstrap, or production authority.
 Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
 acknowledge a write from archive-v3 until ADR-0022
