@@ -15,6 +15,8 @@
 
 use std::collections::VecDeque;
 
+use zeroize::Zeroize;
+
 use crate::archive_v3::{ArchiveV3Error, ImmutableReference, ObjectId, Result, SQLITE_PAGE_SIZE};
 use crate::archive_v3_journal::{WalSegment, MAX_WAL_SEGMENT_BYTES};
 
@@ -78,6 +80,14 @@ pub struct CapturedWalCommit {
     frames: Vec<u8>,
 }
 
+impl Drop for CapturedWalCommit {
+    fn drop(&mut self) {
+        self.frames.zeroize();
+        self.wal_header.zeroize();
+        self.checksum_before.zeroize();
+    }
+}
+
 impl CapturedWalCommit {
     pub fn wal_generation(&self) -> u64 {
         self.wal_generation
@@ -125,6 +135,9 @@ impl CapturedWalCommit {
         if frames_per_segment == 0 {
             return Err(ArchiveV3Error::TooLarge("WAL segment"));
         }
+        if self.frames.is_empty() || !self.frames.len().is_multiple_of(SQLITE_WAL_FRAME_BYTES) {
+            return Err(ArchiveV3Error::Malformed("WAL frame length"));
+        }
         let frame_count = self.frames.len() / SQLITE_WAL_FRAME_BYTES;
         let segment_count = frame_count.div_ceil(frames_per_segment);
         let predecessor = ImmutableReference {
@@ -163,6 +176,24 @@ impl CapturedWalCommit {
             .validate()?;
         }
         Ok(())
+    }
+
+    /// Effective SQLite database length stated by this commit's final frame.
+    /// The capture is first validated with the exact publication split so the
+    /// parsed marker is guaranteed to be the one final commit marker.
+    pub(crate) fn effective_logical_file_length(&self, root_seq: u64) -> Result<u64> {
+        self.validate_segments(root_seq)?;
+        let final_frame = self
+            .frames
+            .get(self.frames.len().saturating_sub(SQLITE_WAL_FRAME_BYTES)..)
+            .ok_or(ArchiveV3Error::Malformed("WAL final frame"))?;
+        let pages = read_be_u32(&final_frame[4..8]);
+        if pages == 0 {
+            return Err(ArchiveV3Error::Malformed("WAL final commit size"));
+        }
+        u64::from(pages)
+            .checked_mul(u64::from(SQLITE_PAGE_SIZE))
+            .ok_or(ArchiveV3Error::TooLarge("SQLite database"))
     }
 
     pub(crate) fn replay_header(&self) -> &[u8; SQLITE_WAL_HEADER_BYTES] {

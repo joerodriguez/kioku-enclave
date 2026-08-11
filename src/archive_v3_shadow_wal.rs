@@ -68,6 +68,7 @@ pub struct UploadedWalCommit {
     root_seq: u64,
     wal_generation: u64,
     segment_count: u32,
+    effective_logical_file_length: u64,
     final_segment: ImmutableReference,
 }
 
@@ -82,6 +83,10 @@ impl UploadedWalCommit {
 
     pub(crate) fn segment_count(&self) -> u32 {
         self.segment_count
+    }
+
+    pub(crate) fn effective_logical_file_length(&self) -> u64 {
+        self.effective_logical_file_length
     }
 
     pub(crate) fn final_segment(&self) -> &ImmutableReference {
@@ -112,7 +117,7 @@ pub(crate) async fn upload_captured_wal_commit(
     if cipher.archive_id() != archive_id || root_seq == 0 {
         return Err(ArchiveV3Error::InvalidContext.into());
     }
-    capture.validate_segments(root_seq)?;
+    let effective_logical_file_length = capture.effective_logical_file_length(root_seq)?;
     let frames = capture.replay_frames();
     if frames.is_empty() || !frames.len().is_multiple_of(SQLITE_WAL_FRAME_BYTES) {
         return Err(ArchiveV3Error::Malformed("captured WAL frames").into());
@@ -175,7 +180,10 @@ pub(crate) async fn upload_captured_wal_commit(
             segment_index,
             object_id,
         )?;
-        let envelope = cipher.seal(&context, &segment.encode()?)?;
+        // The encoded WAL object is plaintext until `seal` returns. Keep that
+        // bounded transient zeroized on success, error, and cancellation.
+        let encoded = Zeroizing::new(segment.encode()?);
+        let envelope = cipher.seal(&context, encoded.as_slice())?;
         backend
             .create_if_absent(context.object_key(), envelope.clone())
             .await?;
@@ -196,6 +204,7 @@ pub(crate) async fn upload_captured_wal_commit(
         root_seq,
         wal_generation: capture.wal_generation(),
         segment_count,
+        effective_logical_file_length,
         final_segment: previous_segment.ok_or(ArchiveV3Error::Malformed("empty WAL upload"))?,
     })
 }
@@ -220,6 +229,10 @@ pub(crate) fn compose_checkpoint_wal_root(
         || base.wal_segment_count != 0
         || base.root_seq.checked_add(1) != Some(root_seq)
         || uploaded.root_seq != root_seq
+        // ArchiveRoot presently has one logical length because it is also the
+        // deterministic checkpoint-manifest context input. Do not publish a
+        // WAL grow/shrink root until a new root format can bind both lengths.
+        || uploaded.effective_logical_file_length != base.logical_file_length
         || owner_fencing_epoch == 0
     {
         return Err(ArchiveV3Error::InvalidContext.into());
@@ -604,6 +617,10 @@ mod tests {
     }
 
     fn captured_commit(frames: usize) -> CapturedWalCommit {
+        captured_commit_with_page_count(frames, 1)
+    }
+
+    fn captured_commit_with_page_count(frames: usize, page_count: u32) -> CapturedWalCommit {
         let mut header = [0u8; SQLITE_WAL_HEADER_BYTES];
         header[..4].copy_from_slice(&0x377f_0682u32.to_be_bytes());
         header[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
@@ -622,7 +639,7 @@ mod tests {
                 [frame_index * SQLITE_WAL_FRAME_BYTES..(frame_index + 1) * SQLITE_WAL_FRAME_BYTES];
             frame[..4].copy_from_slice(&(frame_index as u32 + 1).to_be_bytes());
             if frame_index + 1 == frames {
-                frame[4..8].copy_from_slice(&1u32.to_be_bytes());
+                frame[4..8].copy_from_slice(&page_count.to_be_bytes());
             }
             frame[8..16].copy_from_slice(&header[16..24]);
             frame[24..].fill((frame_index % 251) as u8);
@@ -643,6 +660,7 @@ mod tests {
         frames: Vec<(u64, Vec<u8>)>,
         aborted: bool,
         reject: bool,
+        reject_frame_write: bool,
     }
 
     impl RecordingSink {
@@ -652,6 +670,7 @@ mod tests {
                 frames: Vec::new(),
                 aborted: false,
                 reject: false,
+                reject_frame_write: false,
             }
         }
     }
@@ -666,7 +685,7 @@ mod tests {
         }
 
         fn write_wal_frames(&mut self, first_frame_no: u64, frames: &[u8]) -> Result<()> {
-            if self.reject {
+            if self.reject || self.reject_frame_write {
                 return Err(ShadowWalError::Sink);
             }
             self.frames.push((first_frame_no, frames.to_vec()));
@@ -784,6 +803,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(uploaded.segment_count(), 2);
+        assert_eq!(uploaded.effective_logical_file_length(), SQLITE_PAGE_SIZE as u64);
 
         let checkpoint = ImmutableReference {
             object_id: ObjectId::from_bytes([4; 16]),
@@ -870,7 +890,7 @@ mod tests {
             wal_chain_root: Some(uploaded.final_segment().clone()),
         };
         let mut sink = RecordingSink::new();
-        sink.reject = true;
+        sink.reject_frame_write = true;
         assert!(
             recover_exact_root_wal(&root, &backend, &cipher, archive, &mut sink)
                 .await
@@ -911,6 +931,7 @@ mod tests {
             root_seq: 2,
             wal_generation: 2,
             segment_count: 1,
+            effective_logical_file_length: SQLITE_PAGE_SIZE as u64,
             final_segment: ImmutableReference {
                 object_id: ObjectId::from_bytes([6; 16]),
                 envelope_hash: [6; 32],
@@ -925,6 +946,118 @@ mod tests {
             },
             2,
             &uploaded,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_254_frame_boundary_stays_one_segment_and_255_splits() {
+        let archive = ArchiveId::from_bytes([51; 16]);
+        let database = DatabaseEpoch::from_bytes([52; 16]);
+        let key = KeyEpoch::from_bytes([53; 16]);
+        let cipher = test_cipher(archive, key).await;
+        let backend = InMemoryImmutableBackend::new();
+        assert_eq!(
+            upload_captured_wal_commit(
+                &backend,
+                &cipher,
+                archive,
+                database,
+                1,
+                &captured_commit(254),
+            )
+            .await
+            .unwrap()
+            .segment_count(),
+            1
+        );
+        assert_eq!(
+            upload_captured_wal_commit(
+                &backend,
+                &cipher,
+                archive,
+                database,
+                2,
+                &captured_commit(255),
+            )
+            .await
+            .unwrap()
+            .segment_count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn composition_rejects_wal_growth_and_shrink_until_root_format_binds_two_lengths() {
+        let archive = ArchiveId::from_bytes([61; 16]);
+        let database = DatabaseEpoch::from_bytes([62; 16]);
+        let key = KeyEpoch::from_bytes([63; 16]);
+        let cipher = test_cipher(archive, key).await;
+        let backend = InMemoryImmutableBackend::new();
+        let base = ArchiveRoot {
+            root_seq: 0,
+            parent: None,
+            database_epoch: database,
+            key_epoch: key,
+            owner_fencing_epoch: 0,
+            sqlite_page_size: SQLITE_PAGE_SIZE,
+            logical_file_length: SQLITE_PAGE_SIZE as u64,
+            user_schema_version: 1,
+            storage_format_version: ARCHIVE_FORMAT_VERSION,
+            wal_generation: 0,
+            wal_segment_count: 0,
+            checkpoint_root: Some(ImmutableReference {
+                object_id: ObjectId::from_bytes([64; 16]),
+                envelope_hash: [65; 32],
+            }),
+            extent_tree_root: None,
+            wal_chain_root: None,
+        };
+        let grow = upload_captured_wal_commit(
+            &backend,
+            &cipher,
+            archive,
+            database,
+            1,
+            &captured_commit_with_page_count(1, 2),
+        )
+        .await
+        .unwrap();
+        assert!(compose_checkpoint_wal_root(
+            &base,
+            1,
+            ParentReference {
+                object_id: ObjectId::from_bytes([66; 16]),
+                envelope_hash: [67; 32],
+            },
+            1,
+            &grow,
+        )
+        .is_err());
+
+        let shorter_base = ArchiveRoot {
+            logical_file_length: 2 * u64::from(SQLITE_PAGE_SIZE),
+            ..base
+        };
+        let shrink = upload_captured_wal_commit(
+            &backend,
+            &cipher,
+            archive,
+            database,
+            1,
+            &captured_commit(1),
+        )
+        .await
+        .unwrap();
+        assert!(compose_checkpoint_wal_root(
+            &shorter_base,
+            1,
+            ParentReference {
+                object_id: ObjectId::from_bytes([68; 16]),
+                envelope_hash: [69; 32],
+            },
+            1,
+            &shrink,
         )
         .is_err());
     }

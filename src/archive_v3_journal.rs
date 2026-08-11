@@ -12,9 +12,9 @@
 use crate::archive_v3::{
     ArchiveCipher, ArchiveRoot, ArchiveV3Error, CiphertextEnvelope, ImmutableReference,
     LogicalLocation, ObjectContext, ObjectId, ObjectRole, Result, ARCHIVE_FORMAT_VERSION,
-    SQLITE_PAGE_SIZE,
+    MAX_DATABASE_BYTES, MAX_DATABASE_PAGES, SQLITE_PAGE_SIZE,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const CHECKPOINT_MANIFEST_MAGIC: &[u8; 8] = b"KACMv3\0\0";
 const WAL_SEGMENT_MAGIC: &[u8; 8] = b"KAWLv3\0\0";
@@ -79,6 +79,7 @@ impl CheckpointManifestNode {
             return Err(ArchiveV3Error::Malformed("checkpoint page size"));
         }
         if self.logical_file_length == 0
+            || self.logical_file_length > MAX_DATABASE_BYTES
             || !self
                 .logical_file_length
                 .is_multiple_of(u64::from(self.sqlite_page_size))
@@ -318,6 +319,14 @@ pub struct WalSegment {
     pub frames: Vec<u8>,
 }
 
+impl Drop for WalSegment {
+    fn drop(&mut self) {
+        self.frames.zeroize();
+        self.wal_header.zeroize();
+        self.checksum_before.zeroize();
+    }
+}
+
 impl WalSegment {
     pub fn is_final(&self) -> bool {
         self.segment_index.checked_add(1) == Some(self.segment_count)
@@ -377,11 +386,17 @@ impl WalSegment {
         for frame_index in 0..frame_count as usize {
             let start = frame_index * frame_bytes;
             let frame = &self.frames[start..start + frame_bytes];
-            if read_be_u32(&frame[0..4])? == 0
+            let page_number = read_be_u32(&frame[0..4])?;
+            if page_number == 0
+                || page_number > MAX_DATABASE_PAGES
                 || &frame[8..12] != salts.0
                 || &frame[12..16] != salts.1
             {
                 return Err(ArchiveV3Error::Malformed("WAL frame header"));
+            }
+            let commit_size = read_be_u32(&frame[4..8])?;
+            if commit_size > MAX_DATABASE_PAGES {
+                return Err(ArchiveV3Error::TooLarge("SQLite database pages"));
             }
             checksum = wal_checksum(checksum_order, &frame[..8], checksum)?;
             checksum = wal_checksum(checksum_order, &frame[24..], checksum)?;
@@ -389,7 +404,6 @@ impl WalSegment {
             if checksum != stored {
                 return Err(ArchiveV3Error::Malformed("WAL frame checksum"));
             }
-            let commit_size = read_be_u32(&frame[4..8])?;
             let is_last_frame = frame_index + 1 == frame_count as usize;
             if commit_size != 0 && !(self.is_final() && is_last_frame) {
                 return Err(ArchiveV3Error::Malformed("WAL commit placement"));
@@ -400,6 +414,26 @@ impl WalSegment {
             return Err(ArchiveV3Error::Malformed("WAL segment not commit bounded"));
         }
         Ok(())
+    }
+
+    /// The final commit frame's SQLite database page count. Only a fully
+    /// validated final segment can expose it, preventing a caller from using
+    /// an earlier non-authoritative frame as the recovered file length.
+    pub fn final_commit_page_count(&self) -> Result<u32> {
+        self.validate()?;
+        if !self.is_final() {
+            return Err(ArchiveV3Error::Malformed("WAL final segment"));
+        }
+        let frame_bytes = SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAGE_SIZE as usize;
+        let final_frame = self
+            .frames
+            .get(self.frames.len() - frame_bytes..)
+            .ok_or(ArchiveV3Error::Malformed("WAL final frame"))?;
+        let page_count = read_be_u32(&final_frame[4..8])?;
+        if page_count == 0 {
+            return Err(ArchiveV3Error::Malformed("WAL final commit size"));
+        }
+        Ok(page_count)
     }
 
     pub fn validate_for_context(&self, context: &ObjectContext) -> Result<()> {
@@ -610,6 +644,18 @@ pub fn validate_wal_commit_chain(root: &ArchiveRoot, entries: &[ResolvedWalSegme
             .ok_or(ArchiveV3Error::Malformed("WAL frame sequence overflow"))?;
         expected_checksum = segment.terminal_checksum()?;
         previous_reference = Some(&entry.reference);
+    }
+    let effective_length = u64::from(
+        entries
+            .last()
+            .ok_or(ArchiveV3Error::Malformed("WAL root chain"))?
+            .segment
+            .final_commit_page_count()?,
+    )
+    .checked_mul(u64::from(SQLITE_PAGE_SIZE))
+    .ok_or(ArchiveV3Error::TooLarge("SQLite database"))?;
+    if effective_length != root.logical_file_length {
+        return Err(ArchiveV3Error::Malformed("WAL effective length"));
     }
     Ok(())
 }
@@ -1013,6 +1059,22 @@ mod tests {
             Sha256::digest(segment.encode().unwrap()),
             Sha256::digest(tampered.frames)
         );
+
+        let mut over_cap_page = fixture_wal_segment();
+        over_cap_page.frames[..4].copy_from_slice(&(MAX_DATABASE_PAGES + 1).to_be_bytes());
+        assert_eq!(
+            over_cap_page.validate(),
+            Err(ArchiveV3Error::Malformed("WAL frame header"))
+        );
+
+        let mut over_cap_length = fixture_wal_segment();
+        let frame_bytes = SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAGE_SIZE as usize;
+        over_cap_length.frames[frame_bytes + 4..frame_bytes + 8]
+            .copy_from_slice(&(MAX_DATABASE_PAGES + 1).to_be_bytes());
+        assert_eq!(
+            over_cap_length.validate(),
+            Err(ArchiveV3Error::TooLarge("SQLite database pages"))
+        );
     }
 
     #[test]
@@ -1123,6 +1185,15 @@ mod tests {
         .unwrap();
         let entries = [resolved_first.clone(), resolved_second.clone()];
         assert_eq!(validate_wal_commit_chain(&root, &entries), Ok(()));
+
+        let inconsistent_length_root = ArchiveRoot {
+            logical_file_length: u64::from(SQLITE_PAGE_SIZE),
+            ..root.clone()
+        };
+        assert_eq!(
+            validate_wal_commit_chain(&inconsistent_length_root, &entries),
+            Err(ArchiveV3Error::Malformed("WAL effective length"))
+        );
 
         let mut wrong_hash = first_reference.clone();
         wrong_hash.envelope_hash[0] ^= 1;

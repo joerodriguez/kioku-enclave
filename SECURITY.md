@@ -726,7 +726,13 @@ capture can now be split only at bounded SQLite frame boundaries into independen
 predecessor-linked immutable WAL segments. Every create is followed by an exact readback,
 envelope-hash, AEAD-context, and format check before its reference can appear in a candidate root.
 That root retains the exact checkpoint base and final WAL reference; composition rejects a prior
-WAL chain or extent base so it cannot discard history. Recovery begins only with one
+WAL chain or extent base so it cannot discard history. WAL page numbers and the final commit's
+page-count-derived length are bounded by the fixed 8,388,608-page/32-GiB ceiling; because the
+current root format has one logical length also used to derive checkpoint-manifest contexts, this
+slice rejects WAL growth and shrink unless that effective length exactly equals its checkpoint
+base. A future root-format revision must bind distinct checkpoint and post-WAL lengths before
+enabling growth or shrink. Capture frames, decoded segment frames, and transient encoded plaintext
+are zeroized when their owners drop. Recovery begins only with one
 witness-nominated root, requires its exact registry epoch/rotation/object/hash to match the
 already resolved verified cipher, authenticates that root plus every reverse predecessor link
 before a staging sink receives a byte, and never enumerates storage. This is still not an authority or
