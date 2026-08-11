@@ -435,10 +435,14 @@ This is not a live recovery or authority path: it has no Store, VFS, provider,
 witness, route, flag, or credential wiring. The current codec intentionally
 has no authenticated empty-tree representation, so an all-hole file is
 rejected. These tests and format bounds do not satisfy the 32-GiB release gate.
-There is also no sealed production capability minted by exact witness/root
-verification: `AuthenticatedExtentRoot` has a test-only constructor, making
-that minting path plus durable publication-session/orphan-inventory/
-reconciliation integration an explicit activation blocker.
+`AuthenticatedExtentRoot` now has a crate-private mint that accepts only an
+active `RecoveryRoot`, exact-gets the witness-nominated root object, verifies
+its retained envelope hash and AEAD/context, and binds archive, database/key
+epochs, registry object/hash/rotation, sequence, parent, fence, and a present
+extent tree before returning the sealed capability. It never enumerates or
+deletes provider objects. The generic constructor remains test-only; durable
+publication-session/orphan-inventory/reconciliation integration remains an
+explicit activation blocker.
 
 `src/archive_v3_export.rs` is an equally inactive, compiled export-parity seam. It accepts
 only an opaque `ArchiveId` and reads one exact active witness record through a sealed,
