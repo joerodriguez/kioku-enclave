@@ -41,6 +41,10 @@ pub const MAX_SHADOW_SESSION_ATTEMPTS: i64 = 16;
 pub const MAX_SHADOW_OBJECTS_PER_ATTEMPT: usize = 32_768 + 129 + 1;
 pub const MAX_SHADOW_OBJECTS_PAGE: usize = 256;
 const MAX_SHADOW_OBJECT_CONTEXT_BYTES: usize = 512;
+const SHADOW_OBJECT_SCHEMA_TABLE_SQL: &str = "CREATE TABLE archive_v3_shadow_object_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL CHECK(version BETWEEN 1 AND 2)) STRICT";
+const SHADOW_OBJECT_INDEX_SQL: &str = "CREATE INDEX archive_v3_shadow_objects_exact_attempt ON archive_v3_shadow_objects(session_id, attempt_id, state)";
+const SHADOW_OBJECT_TABLE_V1_SQL: &str = "CREATE TABLE archive_v3_shadow_objects (session_id BLOB NOT NULL CHECK(length(session_id) = 16), attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16), object_id BLOB NOT NULL CHECK(length(object_id) = 16), object_role INTEGER NOT NULL CHECK(object_role BETWEEN 1 AND 8), root_seq INTEGER, context_aad BLOB NOT NULL CHECK(length(context_aad) > 0 AND length(context_aad) <= 512), ciphertext_hash BLOB NOT NULL CHECK(length(ciphertext_hash) = 32), state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 4), PRIMARY KEY(session_id, attempt_id, object_id), CHECK(root_seq IS NULL OR root_seq > 0), CHECK((object_role = 5 AND root_seq IS NOT NULL) OR (object_role != 5 AND root_seq IS NULL))) STRICT";
+const SHADOW_OBJECT_TABLE_V2_SQL: &str = "CREATE TABLE archive_v3_shadow_objects (session_id BLOB NOT NULL CHECK(length(session_id) = 16), attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16), ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 32898), object_id BLOB NOT NULL CHECK(length(object_id) = 16), object_role INTEGER NOT NULL CHECK(object_role BETWEEN 1 AND 8), root_seq INTEGER, context_aad BLOB NOT NULL CHECK(length(context_aad) > 0 AND length(context_aad) <= 512), object_key TEXT NOT NULL CHECK(length(object_key) > 0 AND length(object_key) <= 512), ciphertext_hash BLOB NOT NULL CHECK(length(ciphertext_hash) = 32), state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 4), PRIMARY KEY(session_id, attempt_id, ordinal), UNIQUE(session_id, attempt_id, object_id), CHECK(root_seq IS NULL OR root_seq > 0), CHECK((object_role = 5 AND root_seq IS NOT NULL) OR (object_role != 5 AND root_seq IS NULL))) STRICT";
 
 #[derive(Debug, Error)]
 pub enum OperationLedgerError {
@@ -745,6 +749,18 @@ fn shadow_object_columns_v2() -> HashSet<String> {
     .collect()
 }
 
+fn normalized_schema_sql(input: &str) -> String {
+    input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(char::from)
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .replace("ifnotexists", "")
+        .trim_end_matches(';')
+        .to_owned()
+}
+
 impl fmt::Debug for ShadowObjectFacts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ShadowObjectFacts(<opaque>)")
@@ -815,6 +831,15 @@ impl OperationLedger {
     /// a stable per-attempt cursor ordinal; the migration reconstructs both
     /// only after decoding and re-encoding the authenticated context.
     fn initialize_shadow_object_inventory(transaction: &Transaction<'_>) -> Result<()> {
+        let schema_was_present = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table'
+                 AND name = 'archive_v3_shadow_object_schema'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS archive_v3_shadow_object_schema (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -830,31 +855,55 @@ impl OperationLedger {
             )
             .optional()?
             .is_some();
-        let version: Option<i64> = transaction
-            .query_row(
-                "SELECT version FROM archive_v3_shadow_object_schema WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
+        if !Self::has_exact_schema_descriptor(
+            transaction,
+            "archive_v3_shadow_object_schema",
+            SHADOW_OBJECT_SCHEMA_TABLE_SQL,
+        )? {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        let version = Self::read_shadow_object_schema_version(transaction)?;
         if !exists {
+            if schema_was_present {
+                return Err(OperationLedgerError::Corrupt);
+            }
             Self::create_shadow_object_table_v2(transaction)?;
             Self::create_shadow_object_index_v2(transaction)?;
             Self::set_shadow_object_schema_version(transaction, 2)?;
             return Ok(());
         }
         let columns = Self::shadow_object_columns(transaction)?;
-        let v2 = columns == shadow_object_columns_v2();
-        let v1 = columns == shadow_object_columns_v1();
+        let v2 = columns == shadow_object_columns_v2()
+            && Self::has_exact_schema_descriptor(
+                transaction,
+                "archive_v3_shadow_objects",
+                SHADOW_OBJECT_TABLE_V2_SQL,
+            )?
+            && Self::has_exact_index_descriptor(
+                transaction,
+                "archive_v3_shadow_objects_exact_attempt",
+                SHADOW_OBJECT_INDEX_SQL,
+            )?;
+        let v1 = columns == shadow_object_columns_v1()
+            && Self::has_exact_schema_descriptor(
+                transaction,
+                "archive_v3_shadow_objects",
+                SHADOW_OBJECT_TABLE_V1_SQL,
+            )?
+            && Self::has_exact_index_descriptor(
+                transaction,
+                "archive_v3_shadow_objects_exact_attempt",
+                SHADOW_OBJECT_INDEX_SQL,
+            )?;
         if v2 {
-            if version.is_some_and(|value| value != 2) {
+            if version != Some(2) {
                 return Err(OperationLedgerError::Corrupt);
             }
             Self::create_shadow_object_index_v2(transaction)?;
             Self::set_shadow_object_schema_version(transaction, 2)?;
             return Ok(());
         }
-        if !v1 || version.is_some_and(|value| value != 1) {
+        if !v1 || !matches!(version, None | Some(1)) {
             return Err(OperationLedgerError::Corrupt);
         }
         transaction.execute_batch(
@@ -879,6 +928,57 @@ impl OperationLedger {
             columns.insert(row?);
         }
         Ok(columns)
+    }
+
+    fn has_exact_schema_descriptor(
+        transaction: &Transaction<'_>,
+        name: &str,
+        expected: &str,
+    ) -> Result<bool> {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(actual.is_some_and(|actual| {
+            normalized_schema_sql(&actual) == normalized_schema_sql(expected)
+        }))
+    }
+
+    fn has_exact_index_descriptor(
+        transaction: &Transaction<'_>,
+        name: &str,
+        expected: &str,
+    ) -> Result<bool> {
+        let actual: Option<String> = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(actual.is_some_and(|actual| {
+            normalized_schema_sql(&actual) == normalized_schema_sql(expected)
+        }))
+    }
+
+    fn read_shadow_object_schema_version(transaction: &Transaction<'_>) -> Result<Option<i64>> {
+        let mut statement = transaction.prepare(
+            "SELECT singleton, version FROM archive_v3_shadow_object_schema ORDER BY singleton LIMIT 3",
+        )?;
+        let rows =
+            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row?);
+        }
+        match values.as_slice() {
+            [] => Ok(None),
+            [(1, version)] => Ok(Some(*version)),
+            _ => Err(OperationLedgerError::Corrupt),
+        }
     }
 
     fn create_shadow_object_table_v2(transaction: &Transaction<'_>) -> Result<()> {
@@ -2230,6 +2330,9 @@ mod tests {
                     ],
                 )
                 .unwrap();
+            connection
+                .execute("DELETE FROM archive_v3_shadow_object_schema", [])
+                .unwrap();
             OperationLedger::initialize(&connection).unwrap();
             assert_eq!(
                 connection
@@ -2265,6 +2368,98 @@ mod tests {
         assert_eq!(page.entries().len(), 1);
         assert_eq!(page.entries()[0].facts(), &facts);
         assert_eq!(page.entries()[0].state(), ShadowObjectState::Materialized);
+    }
+
+    #[test]
+    fn v2_inventory_requires_exact_descriptor_and_exactly_one_version_row() {
+        for version_sql in [
+            "DELETE FROM archive_v3_shadow_object_schema",
+            "UPDATE archive_v3_shadow_object_schema SET version = 1",
+        ] {
+            let connection = setup();
+            connection.execute_batch(version_sql).unwrap();
+            assert!(matches!(
+                OperationLedger::initialize(&connection),
+                Err(OperationLedgerError::Corrupt)
+            ));
+        }
+        let connection = setup();
+        connection
+            .execute_batch(
+                "DROP INDEX archive_v3_shadow_objects_exact_attempt;
+                 DROP TABLE archive_v3_shadow_objects;
+                 CREATE TABLE archive_v3_shadow_objects (
+                    session_id BLOB NOT NULL, attempt_id BLOB NOT NULL, ordinal INTEGER NOT NULL,
+                    object_id BLOB NOT NULL, object_role INTEGER NOT NULL, root_seq INTEGER,
+                    context_aad BLOB NOT NULL, object_key TEXT NOT NULL,
+                    ciphertext_hash BLOB NOT NULL, state INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, attempt_id, ordinal),
+                    UNIQUE(session_id, attempt_id, object_id)
+                 );
+                 CREATE INDEX archive_v3_shadow_objects_exact_attempt
+                    ON archive_v3_shadow_objects(session_id, attempt_id, state);",
+            )
+            .unwrap();
+        assert!(matches!(
+            OperationLedger::initialize(&connection),
+            Err(OperationLedgerError::Corrupt)
+        ));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM archive_v3_shadow_objects",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        let connection = setup();
+        connection
+            .execute_batch(
+                "DROP INDEX archive_v3_shadow_objects_exact_attempt;
+                 DROP TABLE archive_v3_shadow_objects;",
+            )
+            .unwrap();
+        assert!(matches!(
+            OperationLedger::initialize(&connection),
+            Err(OperationLedgerError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn weakened_v1_inventory_descriptor_fails_before_migration() {
+        let connection = setup();
+        create_v1_shadow_object_fixture(&connection);
+        connection
+            .execute_batch(
+                "DROP INDEX archive_v3_shadow_objects_exact_attempt;
+                 ALTER TABLE archive_v3_shadow_objects RENAME TO weak_shadow_objects;
+                 CREATE TABLE archive_v3_shadow_objects (
+                    session_id BLOB NOT NULL, attempt_id BLOB NOT NULL, object_id BLOB NOT NULL,
+                    object_role INTEGER NOT NULL, root_seq INTEGER, context_aad BLOB NOT NULL,
+                    ciphertext_hash BLOB NOT NULL, state INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, attempt_id, object_id)
+                 );
+                 DROP TABLE weak_shadow_objects;
+                 CREATE INDEX archive_v3_shadow_objects_exact_attempt
+                    ON archive_v3_shadow_objects(session_id, attempt_id, state);",
+            )
+            .unwrap();
+        assert!(matches!(
+            OperationLedger::initialize(&connection),
+            Err(OperationLedgerError::Corrupt)
+        ));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM archive_v3_shadow_objects",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
     }
 
     fn assert_v1_migration_rollback(connection: &Connection) {
