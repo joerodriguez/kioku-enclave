@@ -60,7 +60,7 @@ pub type Result<T> = std::result::Result<T, ShadowCheckpointError>;
 /// Read-only stable snapshot boundary.  Implementations must fill exactly
 /// `destination.len()` bytes for every accepted range.  The caller supplies a
 /// maximum 1 MiB destination, so a source must never force an unbounded read.
-pub trait CheckpointSource {
+pub trait CheckpointSource: Send {
     fn logical_file_length(&self) -> Result<u64>;
     fn read_exact(&mut self, logical_offset: u64, destination: &mut [u8]) -> Result<()>;
 }
@@ -111,16 +111,17 @@ impl CheckpointCipher for crate::archive_v3::VerifiedArchiveCipher {
 }
 
 /// Stable metadata returned after all immutable chunk and manifest creates
-/// have succeeded.  It is deliberately not an `ArchiveRoot`: a future
+/// have succeeded.  It is deliberately not an `ArchiveRoot`: a publication
 /// coordinator must still authenticate it in a root and advance that root via
 /// the witness before this checkpoint can have authority.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UploadedCheckpoint {
     checkpoint_id: ObjectId,
     root: ImmutableReference,
     logical_file_length: u64,
     total_chunks: u32,
     database_plaintext_hash: [u8; 32],
+    user_schema_version: u32,
 }
 
 impl UploadedCheckpoint {
@@ -143,6 +144,14 @@ impl UploadedCheckpoint {
     pub fn database_plaintext_hash(&self) -> [u8; 32] {
         self.database_plaintext_hash
     }
+    pub fn user_schema_version(&self) -> u32 {
+        self.user_schema_version
+    }
+}
+impl std::fmt::Debug for UploadedCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UploadedCheckpoint(<opaque>)")
+    }
 }
 
 /// Uploads a page-aligned SQLite snapshot as independently authenticated 1 MiB
@@ -164,7 +173,8 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
     // Hash first so the digest can be authenticated in *every* manifest node.
     // A stable snapshot source is read a second time for upload; the second
     // pass is checked against this digest before a root descriptor is returned.
-    let database_plaintext_hash = hash_snapshot(source, logical_file_length, total_chunks)?;
+    let (database_plaintext_hash, user_schema_version) =
+        hash_snapshot(source, logical_file_length, total_chunks)?;
     let checkpoint_id = ObjectId::random();
     let tree_height = manifest_tree_height(total_chunks)?;
     let mut pending: Vec<Vec<ManifestSpan>> =
@@ -298,6 +308,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
         logical_file_length,
         total_chunks,
         database_plaintext_hash,
+        user_schema_version,
     })
 }
 
@@ -490,6 +501,7 @@ async fn recover_checkpoint_from_recovery_root_inner<C: CheckpointCipher>(
         logical_file_length: root.logical_file_length,
         total_chunks,
         database_plaintext_hash: expected_hash,
+        user_schema_version: root.user_schema_version,
     })
 }
 
@@ -542,8 +554,9 @@ fn hash_snapshot(
     source: &mut dyn CheckpointSource,
     logical_file_length: u64,
     total_chunks: u32,
-) -> Result<[u8; 32]> {
+) -> Result<([u8; 32], u32)> {
     let mut hash = Sha256::new();
+    let mut user_schema_version = None;
     for chunk_index in 0..total_chunks {
         let logical_offset = u64::from(chunk_index) * u64::from(CHECKPOINT_CHUNK_BYTES);
         let remaining = logical_file_length
@@ -552,9 +565,34 @@ fn hash_snapshot(
         let byte_len = remaining.min(u64::from(CHECKPOINT_CHUNK_BYTES)) as usize;
         let mut bytes = Zeroizing::new(vec![0u8; byte_len]);
         source.read_exact(logical_offset, bytes.as_mut_slice())?;
+        if chunk_index == 0 {
+            if bytes.len() < 64 || &bytes[..16] != b"SQLite format 3\0" {
+                return Err(ArchiveV3Error::Malformed("checkpoint SQLite header").into());
+            }
+            let encoded_page_size = u16::from_be_bytes(
+                bytes[16..18]
+                    .try_into()
+                    .map_err(|_| ArchiveV3Error::Malformed("checkpoint SQLite page size"))?,
+            );
+            let header_page_size = if encoded_page_size == 1 {
+                65_536
+            } else {
+                u32::from(encoded_page_size)
+            };
+            if header_page_size != SQLITE_PAGE_SIZE {
+                return Err(ArchiveV3Error::Malformed("checkpoint SQLite page size").into());
+            }
+            user_schema_version =
+                Some(u32::from_be_bytes(bytes[60..64].try_into().map_err(
+                    |_| ArchiveV3Error::Malformed("checkpoint schema version"),
+                )?));
+        }
         hash.update(bytes.as_slice());
     }
-    Ok(hash.finalize().into())
+    Ok((
+        hash.finalize().into(),
+        user_schema_version.ok_or(ArchiveV3Error::Malformed("checkpoint schema version"))?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1150,6 +1188,9 @@ mod tests {
         for (index, value) in bytes.iter_mut().enumerate() {
             *value = (index % 251) as u8;
         }
+        bytes[..16].copy_from_slice(b"SQLite format 3\0");
+        bytes[16..18].copy_from_slice(&(SQLITE_PAGE_SIZE as u16).to_be_bytes());
+        bytes[60..64].copy_from_slice(&1u32.to_be_bytes());
         bytes
     }
 
@@ -1225,6 +1266,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(uploaded.total_chunks(), 3);
+        assert_eq!(uploaded.user_schema_version(), 1);
         assert_eq!(uploaded.root().object_id, uploaded.checkpoint_id());
         let witness =
             witness_for_checkpoint(&backend, &cipher, archive_id, database_epoch, &uploaded).await;
@@ -1270,6 +1312,30 @@ mod tests {
                     .is_err()
             );
             assert!(sink.aborted && sink.bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_non_4096_sqlite_header_page_sizes() {
+        let (archive_id, database_epoch, key_epoch) = ids();
+        let cipher = TestCipher::new(archive_id, key_epoch);
+        for encoded_page_size in [8_192u16, 1u16] {
+            let backend = FaultBackend::new();
+            let mut input = snapshot(0);
+            input[16..18].copy_from_slice(&encoded_page_size.to_be_bytes());
+            assert!(matches!(
+                upload_checkpoint(
+                    &backend,
+                    &cipher,
+                    archive_id,
+                    database_epoch,
+                    &mut VecSource(input),
+                )
+                .await,
+                Err(ShadowCheckpointError::Archive(ArchiveV3Error::Malformed(
+                    "checkpoint SQLite page size"
+                )))
+            ));
         }
     }
 
