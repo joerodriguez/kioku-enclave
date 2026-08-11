@@ -69,7 +69,10 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 - Enforces monthly wall-clock recording allowances through server-timed, idempotent
   60-second leases. A restarted client reattaches to an unexpired paid interval when more
   than the 20-second renewal headroom remains; otherwise the enclave reserves one fresh
-  minute instead of trapping the client in a lease-conflict loop. The API also exposes
+  minute instead of trapping the client in a lease-conflict loop. A durable pending
+  reservation is reconciled with its original billing idempotency key before any new
+  reservation, so a crash or failed local commit neither double-charges nor blocks that
+  user indefinitely. The API also exposes
   plan, remaining usage, reset, hosted checkout, and plan management. The launch catalog
   is Free (30 min), Plus ($15/3 h), Pro ($39/8 h), and
   hidden Max ($199/40 h), monthly only.

@@ -3746,6 +3746,42 @@ impl ControlStore {
         .await
     }
 
+    pub async fn pending_recording_lease_request(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<(String, RecordingLeaseRequestRow)>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            type StoredPendingLease = (String, Option<String>, String, String);
+            let row: Option<StoredPendingLease> = conn
+                .query_row(
+                    "SELECT request_id,requested_lease_id,issued_lease_id,expires_at
+                     FROM recording_lease_requests
+                     WHERE user_id=?1 AND state='pending'
+                     ORDER BY created_at,rowid LIMIT 1",
+                    [user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            Ok(row.map(
+                |(request_id, requested_lease_id, issued_lease_id, expires_at)| {
+                    (
+                        request_id,
+                        RecordingLeaseRequestRow {
+                            requested_lease_id,
+                            issued_lease_id,
+                            expires_at,
+                            state: "pending".into(),
+                            summary: None,
+                            denial_code: None,
+                        },
+                    )
+                },
+            ))
+        })
+        .await
+    }
+
     pub async fn begin_recording_lease_request(
         &self,
         user_id: &str,
@@ -3885,16 +3921,20 @@ impl ControlStore {
                 )
                 .optional()?;
             let active_expires_ms = match active {
-                Some((active_lease_id, _)) if active_lease_id != lease_id => {
-                    return Err(EnclaveError::Conflict(
-                        "a different recording lease became active".into(),
-                    ));
+                Some((active_lease_id, active_expires_at)) => {
+                    let active_expires_ms = super::isotime::parse_epoch_millis(&active_expires_at)
+                        .ok_or_else(|| {
+                            EnclaveError::Config("invalid active recording lease expiry".into())
+                        })?;
+                    if active_lease_id != lease_id
+                        && !retry_now_ms.is_some_and(|now_ms| active_expires_ms <= now_ms)
+                    {
+                        return Err(EnclaveError::Conflict(
+                            "a different recording lease became active".into(),
+                        ));
+                    }
+                    Some(active_expires_ms)
                 }
-                Some((_, active_expires_at)) => Some(
-                    super::isotime::parse_epoch_millis(&active_expires_at).ok_or_else(|| {
-                        EnclaveError::Config("invalid active recording lease expiry".into())
-                    })?,
-                ),
                 None => None,
             };
             let expires_ms = match retry_now_ms {
@@ -7114,6 +7154,14 @@ mod tests {
                 .await,
             Err(EnclaveError::Conflict(_))
         ));
+        let pending = control
+            .pending_recording_lease_request(&first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.0, "pending-0");
+        assert_eq!(pending.1.state, "pending");
+        assert_eq!(pending.1.issued_lease_id, "lease_pending_0");
         // One account at its cap cannot block an unrelated account.
         control
             .begin_recording_lease_request(
@@ -7313,12 +7361,14 @@ mod tests {
             })
             .await
             .unwrap();
+        let before_active_expiry =
+            super::super::isotime::parse_epoch_millis("2026-08-09T00:01:00.000Z").unwrap();
         assert!(matches!(
             control
                 .complete_recording_lease(
                     &user.id,
                     "request-first",
-                    None,
+                    Some(before_active_expiry),
                     &serde_json::json!({"recording":{"allowed":true}}),
                 )
                 .await,
@@ -7327,6 +7377,28 @@ mod tests {
         assert_eq!(
             control.active_recording_lease(&user.id).await.unwrap(),
             Some(("lease_other".into(), "2026-08-09T00:02:00.000Z".into()))
+        );
+
+        // Once that unrelated lease is expired, the still-pending, billed
+        // intent can take over and receive its full minute from recovery time.
+        let after_active_expiry =
+            super::super::isotime::parse_epoch_millis("2026-08-09T00:03:00.000Z").unwrap();
+        let recovered = control
+            .complete_recording_lease(
+                &user.id,
+                "request-first",
+                Some(after_active_expiry),
+                &serde_json::json!({"recording":{"allowed":true}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered,
+            ("lease_first".into(), "2026-08-09T00:04:00.000Z".into())
+        );
+        assert_eq!(
+            control.active_recording_lease(&user.id).await.unwrap(),
+            Some(recovered)
         );
     }
 

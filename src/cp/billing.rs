@@ -594,10 +594,6 @@ fn duplicate_is_conflict(existing_pending: bool, upstream_duplicate: bool) -> bo
     upstream_duplicate && !existing_pending
 }
 
-fn pending_retry_needs_expiry_rebase(existing_pending: bool, upstream_duplicate: bool) -> bool {
-    existing_pending && !upstream_duplicate
-}
-
 fn renewal_too_early(now_ms: i64, expires_ms: i64) -> bool {
     expires_ms.saturating_sub(now_ms) > RECORDING_LEASE_RENEWAL_HEADROOM_MS
 }
@@ -784,8 +780,24 @@ async fn create_recording_lease(
     }
 
     let now_ms = epoch_millis();
-    let existing_pending = existing.is_some();
-    if existing.is_none() {
+    let mut effective_request_id = request.request_id.clone();
+    let mut existing_pending = existing.is_some();
+    if !existing_pending {
+        let abandoned = match state.control.pending_recording_lease_request(&user.0).await {
+            Ok(value) => value,
+            Err(_) => return service_unavailable(),
+        };
+        if let Some((pending_request_id, _pending)) = abandoned {
+            // A billing response can succeed immediately before the enclave
+            // transaction fails or the process exits. Reconcile that durable
+            // intent with its original idempotency key before accepting a new
+            // reservation. A pending row was never granted locally, so its
+            // paid interval can safely start from recovery time exactly once.
+            effective_request_id = pending_request_id;
+            existing_pending = true;
+        }
+    }
+    if existing.is_none() && !existing_pending {
         let active = match state.control.active_recording_lease(&user.0).await {
             Ok(value) => value,
             Err(_) => return service_unavailable(),
@@ -810,18 +822,11 @@ async fn create_recording_lease(
                     };
                     return recording_lease_response(active_id, expires_at, summary);
                 }
-                if expires_ms > now_ms {
-                    // With at most the renewal headroom left, reserve one new
-                    // minute from server-now. This bounds the response to the
-                    // initial-client contract while replacing the unusably
-                    // short tail instead of returning a 409 loop.
-                    (active_id, now_ms)
-                } else {
-                    (
-                        format!("lease_{}", super::tokens::random_token_hex()),
-                        now_ms,
-                    )
-                }
+                // With at most the renewal headroom left, or after expiry,
+                // reserve one new minute from server-now. Lease ids are scoped
+                // to a user and opaque; reusing the identity also avoids an
+                // expired durable row racing activation of the paid interval.
+                (active_id, now_ms)
             }
             (None, _) => (
                 format!("lease_{}", super::tokens::random_token_hex()),
@@ -860,12 +865,12 @@ async fn create_recording_lease(
         }
     }
     let (summary, upstream_duplicate) =
-        match authorize_recording_seconds(&state, &user.0, &request.request_id).await {
+        match authorize_recording_seconds(&state, &user.0, &effective_request_id).await {
             Ok(result) => result,
             Err(RecordingAuthorizationFailure::Denied { code, summary }) => {
                 if state
                     .control
-                    .deny_recording_lease_request(&user.0, &request.request_id, &code, &summary)
+                    .deny_recording_lease_request(&user.0, &effective_request_id, &code, &summary)
                     .await
                     .is_err()
                 {
@@ -878,15 +883,14 @@ async fn create_recording_lease(
     if duplicate_is_conflict(existing_pending, upstream_duplicate) {
         let _ = state
             .control
-            .conflict_recording_lease_request(&user.0, &request.request_id)
+            .conflict_recording_lease_request(&user.0, &effective_request_id)
             .await;
         return idempotency_conflict();
     }
-    let retry_now_ms =
-        pending_retry_needs_expiry_rebase(existing_pending, upstream_duplicate).then(epoch_millis);
+    let retry_now_ms = existing_pending.then(epoch_millis);
     let (lease_id, expires_at) = match state
         .control
-        .complete_recording_lease(&user.0, &request.request_id, retry_now_ms, &summary)
+        .complete_recording_lease(&user.0, &effective_request_id, retry_now_ms, &summary)
         .await
     {
         Ok(receipt) => receipt,
@@ -1951,9 +1955,6 @@ mod tests {
         assert!(duplicate_is_conflict(false, true));
         assert!(!duplicate_is_conflict(true, true));
         assert!(!duplicate_is_conflict(false, false));
-        assert!(!pending_retry_needs_expiry_rebase(true, true));
-        assert!(pending_retry_needs_expiry_rebase(true, false));
-        assert!(!pending_retry_needs_expiry_rebase(false, false));
     }
 
     #[test]
