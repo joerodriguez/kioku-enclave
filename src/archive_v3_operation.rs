@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::archive_v3::{CiphertextEnvelope, LogicalLocation, ObjectContext, ObjectId, ObjectRole};
+use crate::archive_v3::{
+    CiphertextEnvelope, LogicalLocation, ObjectContext, ObjectId, ObjectKey, ObjectRole,
+};
 use crate::archive_v3_shadow_session::{
     ShadowAttemptId, ShadowCandidate, ShadowSessionBinding, ShadowSessionError, ShadowSessionId,
     ShadowSessionRecord, ShadowSessionState, SHADOW_SESSION_RECORD_BYTES,
@@ -37,6 +39,7 @@ pub const MAX_SHADOW_SESSION_ATTEMPTS: i64 = 16;
 /// fixed-fanout manifests, and one root candidate.  This bound is deliberately
 /// per durable attempt, rather than a process-local upload budget.
 pub const MAX_SHADOW_OBJECTS_PER_ATTEMPT: usize = 32_768 + 129 + 1;
+pub const MAX_SHADOW_OBJECTS_PAGE: usize = 256;
 const MAX_SHADOW_OBJECT_CONTEXT_BYTES: usize = 512;
 
 #[derive(Debug, Error)]
@@ -509,17 +512,62 @@ impl ShadowObjectState {
 /// makes context substitution detectable after a process crash.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ShadowObjectFacts {
+    ordinal: u32,
     object_id: ObjectId,
     object_role: ObjectRole,
     root_seq: Option<u64>,
     context_aad: Zeroizing<Vec<u8>>,
+    object_key: String,
     ciphertext_hash: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ShadowObjectInventoryEntry {
+    facts: ShadowObjectFacts,
+    state: ShadowObjectState,
+}
+
+impl ShadowObjectInventoryEntry {
+    pub(crate) const fn state(&self) -> ShadowObjectState {
+        self.state
+    }
+
+    pub(crate) fn facts(&self) -> &ShadowObjectFacts {
+        &self.facts
+    }
+}
+
+impl fmt::Debug for ShadowObjectInventoryEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ShadowObjectInventoryEntry(<opaque>)")
+    }
+}
+
+pub(crate) struct ShadowObjectInventoryPage {
+    entries: Vec<ShadowObjectInventoryEntry>,
+    next_ordinal: Option<u32>,
+}
+
+impl ShadowObjectInventoryPage {
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_ordinal: None,
+        }
+    }
+    pub(crate) fn entries(&self) -> &[ShadowObjectInventoryEntry] {
+        &self.entries
+    }
+    pub(crate) const fn next_ordinal(&self) -> Option<u32> {
+        self.next_ordinal
+    }
 }
 
 impl ShadowObjectFacts {
     pub(crate) fn from_sealed(
         context: &ObjectContext,
         envelope: &CiphertextEnvelope,
+        ordinal: u32,
     ) -> Result<Self> {
         let context_aad = context.canonical_aad();
         if context_aad.is_empty() || context_aad.len() > MAX_SHADOW_OBJECT_CONTEXT_BYTES {
@@ -532,11 +580,19 @@ impl ShadowObjectFacts {
             }
             _ => None,
         };
+        if usize::try_from(ordinal)
+            .ok()
+            .is_none_or(|value| value >= MAX_SHADOW_OBJECTS_PER_ATTEMPT)
+        {
+            return Err(OperationLedgerError::TooLarge("shadow object ordinal"));
+        }
         Ok(Self {
+            ordinal,
             object_id: context.object_id(),
             object_role: context.role(),
             root_seq,
             context_aad: Zeroizing::new(context_aad),
+            object_key: context.object_key().as_str().to_owned(),
             ciphertext_hash: envelope.hash(),
         })
     }
@@ -549,12 +605,87 @@ impl ShadowObjectFacts {
         self.ciphertext_hash
     }
 
+    pub(crate) fn object_key(&self) -> Result<ObjectKey> {
+        valid_shadow_object_key(&self.object_key, self.object_role, self.object_id)
+            .then(|| ObjectKey::from_validated_canonical(self.object_key.clone(), self.object_id))
+            .ok_or(OperationLedgerError::Corrupt)
+    }
+
     fn is_root_candidate(&self, candidate: ShadowCandidate) -> bool {
         self.object_role == ObjectRole::RootV3
             && self.root_seq == Some(candidate.root_seq())
             && self.object_id.as_bytes() == &candidate.object_id()
             && self.ciphertext_hash == candidate.ciphertext_hash()
     }
+
+    fn matches_binding(&self, binding: ShadowSessionBinding) -> bool {
+        let archive = hex_opaque_id(binding.archive_id());
+        let epoch = hex_opaque_id(binding.database_epoch());
+        if !self
+            .object_key
+            .starts_with(&format!("archive/v3/{archive}/"))
+        {
+            return false;
+        }
+        match self.object_role {
+            ObjectRole::CheckpointChunkV3
+            | ObjectRole::CheckpointManifestV3
+            | ObjectRole::RootV3
+            | ObjectRole::WalSegmentV3
+            | ObjectRole::ExtentV3
+            | ObjectRole::MerkleNodeV3 => self.object_key.contains(&format!("/{epoch}/")),
+            ObjectRole::KeyRegistryV3 | ObjectRole::StagingV3 => true,
+        }
+    }
+}
+
+fn hex_opaque_id(value: [u8; 16]) -> String {
+    value
+        .iter()
+        .flat_map(|byte| {
+            [
+                char::from(b"0123456789abcdef"[usize::from(byte >> 4)]),
+                char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]),
+            ]
+        })
+        .collect()
+}
+
+fn valid_shadow_object_key(value: &str, role: ObjectRole, object_id: ObjectId) -> bool {
+    let lexical = !value.is_empty()
+        && value.len() <= MAX_SHADOW_OBJECT_CONTEXT_BYTES
+        && value.starts_with("archive/v3/")
+        && value.as_bytes().iter().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'/' | b'-' | b'_' | b'.')
+        })
+        && !value.contains("//")
+        && !value.contains("..");
+    if !lexical {
+        return false;
+    }
+    let object = object_id
+        .as_bytes()
+        .iter()
+        .flat_map(|byte| {
+            [
+                char::from(b"0123456789abcdef"[usize::from(byte >> 4)]),
+                char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]),
+            ]
+        })
+        .collect::<String>();
+    let (required_path, required_suffix) = match role {
+        ObjectRole::CheckpointChunkV3 => ("/checkpoints/", format!("-{object}.chkx")),
+        ObjectRole::CheckpointManifestV3 => ("/checkpoints/", format!("-{object}.cmfx")),
+        ObjectRole::RootV3 => ("/root-candidates/", format!("-{object}.rootx")),
+        ObjectRole::WalSegmentV3 => ("/wal/", format!("-{object}.walx")),
+        ObjectRole::ExtentV3 => ("/extents/", format!("/{object}.extx")),
+        ObjectRole::MerkleNodeV3 => ("/nodes/", format!("/{object}.nodex")),
+        ObjectRole::KeyRegistryV3 => ("/keys/", format!("/{object}.keyx")),
+        ObjectRole::StagingV3 => ("/staging/", format!("/{object}")),
+    };
+    value.contains(required_path) && value.ends_with(&required_suffix)
 }
 
 impl fmt::Debug for ShadowObjectFacts {
@@ -617,14 +748,18 @@ impl OperationLedger {
             CREATE TABLE IF NOT EXISTS archive_v3_shadow_objects (
                 session_id BLOB NOT NULL CHECK(length(session_id) = 16),
                 attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+                ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 32898),
                 object_id BLOB NOT NULL CHECK(length(object_id) = 16),
                 object_role INTEGER NOT NULL CHECK(object_role BETWEEN 1 AND 8),
                 root_seq INTEGER,
                 context_aad BLOB NOT NULL
                     CHECK(length(context_aad) > 0 AND length(context_aad) <= 512),
+                object_key TEXT NOT NULL
+                    CHECK(length(object_key) > 0 AND length(object_key) <= 512),
                 ciphertext_hash BLOB NOT NULL CHECK(length(ciphertext_hash) = 32),
                 state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 4),
-                PRIMARY KEY(session_id, attempt_id, object_id),
+                PRIMARY KEY(session_id, attempt_id, ordinal),
+                UNIQUE(session_id, attempt_id, object_id),
                 CHECK(root_seq IS NULL OR root_seq > 0),
                 CHECK((object_role = 5 AND root_seq IS NOT NULL)
                     OR (object_role != 5 AND root_seq IS NULL))
@@ -735,18 +870,26 @@ impl OperationLedger {
         let session = Self::read_shadow_session(&transaction, session_id, attempt_id)?
             .ok_or(OperationLedgerError::Corrupt)?;
         session.require_binding(expected_binding)?;
+        if !facts.matches_binding(expected_binding) {
+            return Err(OperationLedgerError::ResultConflict);
+        }
         if session.state() != ShadowSessionState::Prepared {
             return Err(OperationLedgerError::ShadowSession(
                 ShadowSessionError::InvalidTransition,
             ));
         }
         if let Some(existing) =
-            Self::read_shadow_object(&transaction, session_id, attempt_id, facts.object_id)?
+            Self::read_shadow_object_ordinal(&transaction, session_id, attempt_id, facts.ordinal)?
         {
             if existing == *facts {
                 transaction.commit()?;
                 return Ok(RecordOutcome::AlreadyRecorded);
             }
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        if Self::read_shadow_object(&transaction, session_id, attempt_id, facts.object_id)?
+            .is_some()
+        {
             return Err(OperationLedgerError::ResultConflict);
         }
         let count: i64 = transaction.query_row(
@@ -767,16 +910,18 @@ impl OperationLedger {
         }
         let inserted = transaction.execute(
             "INSERT INTO archive_v3_shadow_objects (
-                session_id, attempt_id, object_id, object_role, root_seq,
-                context_aad, ciphertext_hash, state
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                session_id, attempt_id, ordinal, object_id, object_role, root_seq,
+                context_aad, object_key, ciphertext_hash, state
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 session_id.as_bytes().as_slice(),
                 attempt_id.as_bytes().as_slice(),
+                facts.ordinal as i64,
                 facts.object_id.as_bytes().as_slice(),
                 facts.object_role as i64,
                 facts.root_seq.map(|value| value as i64),
                 facts.context_aad.as_slice(),
+                facts.object_key.as_str(),
                 facts.ciphertext_hash.as_slice(),
                 ShadowObjectState::Reserved as i64,
             ],
@@ -857,6 +1002,63 @@ impl OperationLedger {
         }
     }
 
+    /// Read one exact attempt's bounded ordinal inventory.  This is the sole
+    /// restart seam: callers receive provider-neutral exact keys only and must
+    /// reconcile each row with `get`, never a prefix/list operation.
+    pub(crate) fn load_exact_shadow_object_page(
+        connection: &Connection,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        expected_binding: ShadowSessionBinding,
+        after_ordinal: Option<u32>,
+    ) -> Result<ShadowObjectInventoryPage> {
+        let session = Self::read_shadow_session(connection, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        session.require_binding(expected_binding)?;
+        let mut statement = connection.prepare(
+            "SELECT ordinal, object_id, object_role, root_seq, context_aad, object_key, ciphertext_hash, state
+             FROM archive_v3_shadow_objects
+             WHERE session_id = ? AND attempt_id = ? AND ordinal > ?
+             ORDER BY ordinal LIMIT 257",
+        )?;
+        let rows = statement.query_map(
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                after_ordinal.map(i64::from).unwrap_or(-1),
+            ],
+            |row| Ok((read_shadow_object_row(row)?, row.get::<_, i64>(7)?)),
+        )?;
+        let mut values = Vec::new();
+        let mut previous = after_ordinal;
+        for row in rows {
+            let (row, state) = row?;
+            let facts = Self::read_shadow_object_row(Some(row), None)?
+                .ok_or(OperationLedgerError::Corrupt)?;
+            if !facts.matches_binding(expected_binding) {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            if previous.is_some_and(|value| facts.ordinal <= value) {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            previous = Some(facts.ordinal);
+            values.push(ShadowObjectInventoryEntry {
+                facts,
+                state: ShadowObjectState::decode(state)?,
+            });
+        }
+        let next_ordinal = if values.len() > MAX_SHADOW_OBJECTS_PAGE {
+            values.pop().ok_or(OperationLedgerError::Corrupt)?;
+            values.last().map(|entry| entry.facts.ordinal)
+        } else {
+            None
+        };
+        Ok(ShadowObjectInventoryPage {
+            entries: values,
+            next_ordinal,
+        })
+    }
+
     /// Durably bind the one immutable root candidate before a witness CAS may
     /// be sent. Repeating the exact update is idempotent; replacing a candidate
     /// is forbidden.
@@ -918,12 +1120,6 @@ impl OperationLedger {
         let before = record.encode()?;
         record.transition(next)?;
         match next {
-            ShadowSessionState::ReconcileRequired => Self::terminalize_shadow_objects(
-                &transaction,
-                session_id,
-                attempt_id,
-                ShadowObjectState::RetainedByWitness,
-            )?,
             ShadowSessionState::Superseded | ShadowSessionState::Aborted => {
                 Self::terminalize_shadow_objects(
                     &transaction,
@@ -1108,10 +1304,9 @@ impl OperationLedger {
         attempt_id: ShadowAttemptId,
         object_id: ObjectId,
     ) -> Result<Option<ShadowObjectFacts>> {
-        type ObjectRow = (i64, Option<i64>, Vec<u8>, Vec<u8>);
-        let row: Option<ObjectRow> = connection
-            .query_row(
-                "SELECT object_role, root_seq, context_aad, ciphertext_hash
+        Self::read_shadow_object_row(
+            connection.query_row(
+                "SELECT ordinal, object_id, object_role, root_seq, context_aad, object_key, ciphertext_hash
                  FROM archive_v3_shadow_objects
                  WHERE session_id = ? AND attempt_id = ? AND object_id = ?",
                 params![
@@ -1119,38 +1314,82 @@ impl OperationLedger {
                     attempt_id.as_bytes().as_slice(),
                     object_id.as_bytes().as_slice(),
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        row.map(|(role, root_seq, context_aad, ciphertext_hash)| {
-            let object_role = match role {
-                1 => ObjectRole::CheckpointChunkV3,
-                2 => ObjectRole::WalSegmentV3,
-                3 => ObjectRole::ExtentV3,
-                4 => ObjectRole::MerkleNodeV3,
-                5 => ObjectRole::RootV3,
-                6 => ObjectRole::KeyRegistryV3,
-                7 => ObjectRole::StagingV3,
-                8 => ObjectRole::CheckpointManifestV3,
-                _ => return Err(OperationLedgerError::Corrupt),
-            };
-            if context_aad.is_empty() || context_aad.len() > MAX_SHADOW_OBJECT_CONTEXT_BYTES {
-                return Err(OperationLedgerError::Corrupt);
-            }
-            let root_seq = root_seq.map(positive_u64).transpose()?;
-            if (object_role == ObjectRole::RootV3) != root_seq.is_some() {
-                return Err(OperationLedgerError::Corrupt);
-            }
-            Ok(ShadowObjectFacts {
-                object_id,
-                object_role,
-                root_seq,
-                context_aad: Zeroizing::new(context_aad),
-                ciphertext_hash: ciphertext_hash
+                read_shadow_object_row,
+            ).optional()?,
+            Some(object_id),
+        )
+    }
+
+    fn read_shadow_object_ordinal(
+        connection: &Connection,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        ordinal: u32,
+    ) -> Result<Option<ShadowObjectFacts>> {
+        Self::read_shadow_object_row(
+            connection.query_row(
+                "SELECT ordinal, object_id, object_role, root_seq, context_aad, object_key, ciphertext_hash
+                 FROM archive_v3_shadow_objects
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = ?",
+                params![
+                    session_id.as_bytes().as_slice(),
+                    attempt_id.as_bytes().as_slice(),
+                    ordinal as i64,
+                ],
+                read_shadow_object_row,
+            ).optional()?,
+            None,
+        )
+    }
+
+    fn read_shadow_object_row(
+        row: Option<ShadowObjectRow>,
+        expected_object_id: Option<ObjectId>,
+    ) -> Result<Option<ShadowObjectFacts>> {
+        row.map(
+            |(ordinal, object_id, role, root_seq, context_aad, object_key, ciphertext_hash)| {
+                let object_id: [u8; 16] = object_id
                     .try_into()
-                    .map_err(|_| OperationLedgerError::Corrupt)?,
-            })
-        })
+                    .map_err(|_| OperationLedgerError::Corrupt)?;
+                let object_id = ObjectId::from_bytes(object_id);
+                if expected_object_id.is_some_and(|expected| expected != object_id) {
+                    return Err(OperationLedgerError::Corrupt);
+                }
+                let ordinal = u32::try_from(ordinal).map_err(|_| OperationLedgerError::Corrupt)?;
+                let object_role = match role {
+                    1 => ObjectRole::CheckpointChunkV3,
+                    2 => ObjectRole::WalSegmentV3,
+                    3 => ObjectRole::ExtentV3,
+                    4 => ObjectRole::MerkleNodeV3,
+                    5 => ObjectRole::RootV3,
+                    6 => ObjectRole::KeyRegistryV3,
+                    7 => ObjectRole::StagingV3,
+                    8 => ObjectRole::CheckpointManifestV3,
+                    _ => return Err(OperationLedgerError::Corrupt),
+                };
+                if context_aad.is_empty() || context_aad.len() > MAX_SHADOW_OBJECT_CONTEXT_BYTES {
+                    return Err(OperationLedgerError::Corrupt);
+                }
+                if !valid_shadow_object_key(&object_key, object_role, object_id) {
+                    return Err(OperationLedgerError::Corrupt);
+                }
+                let root_seq = root_seq.map(positive_u64).transpose()?;
+                if (object_role == ObjectRole::RootV3) != root_seq.is_some() {
+                    return Err(OperationLedgerError::Corrupt);
+                }
+                Ok(ShadowObjectFacts {
+                    object_id,
+                    ordinal,
+                    object_role,
+                    root_seq,
+                    context_aad: Zeroizing::new(context_aad),
+                    object_key,
+                    ciphertext_hash: ciphertext_hash
+                        .try_into()
+                        .map_err(|_| OperationLedgerError::Corrupt)?,
+                })
+            },
+        )
         .transpose()
     }
 
@@ -1427,6 +1666,8 @@ type ShadowSessionRow = (
     Vec<u8>,
 );
 
+type ShadowObjectRow = (i64, Vec<u8>, i64, Option<i64>, Vec<u8>, String, Vec<u8>);
+
 fn read_shadow_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShadowSessionRow> {
     Ok((
         row.get(0)?,
@@ -1437,6 +1678,18 @@ fn read_shadow_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShadowSe
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+    ))
+}
+
+fn read_shadow_object_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShadowObjectRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
     ))
 }
 
@@ -1580,12 +1833,24 @@ mod tests {
 
     fn shadow_root_facts(candidate: ShadowCandidate) -> ShadowObjectFacts {
         ShadowObjectFacts {
+            ordinal: 0,
             object_id: ObjectId::from_bytes(candidate.object_id()),
             object_role: ObjectRole::RootV3,
             root_seq: Some(candidate.root_seq()),
             context_aad: Zeroizing::new(b"test-opaque-root-context".to_vec()),
+            object_key: format!(
+                "archive/v3/{}/root-candidates/{}/{}-{}.rootx",
+                "a1".repeat(16),
+                "b2".repeat(16),
+                candidate.root_seq(),
+                hex_id(candidate.object_id()),
+            ),
             ciphertext_hash: candidate.ciphertext_hash(),
         }
+    }
+
+    fn hex_id(value: [u8; 16]) -> String {
+        value.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     fn shadow_completion(id: u8, request_byte: u8) -> OperationRecord {
@@ -1879,7 +2144,26 @@ mod tests {
                 &retained_facts,
             )
             .unwrap(),
-            Some(ShadowObjectState::RetainedByWitness)
+            Some(ShadowObjectState::Materialized)
+        );
+        OperationLedger::transition_shadow_session(
+            &mut connection,
+            retained.session_id(),
+            retained.attempt_id(),
+            retained.binding(),
+            ShadowSessionState::Superseded,
+        )
+        .unwrap();
+        assert_eq!(
+            OperationLedger::shadow_object_state(
+                &connection,
+                retained.session_id(),
+                retained.attempt_id(),
+                retained.binding(),
+                &retained_facts,
+            )
+            .unwrap(),
+            Some(ShadowObjectState::OrphanPendingGrace)
         );
 
         let orphan = shadow_session(0x49, 0x5a);
@@ -1918,15 +2202,22 @@ mod tests {
             transaction
                 .execute(
                     "INSERT INTO archive_v3_shadow_objects (
-                        session_id, attempt_id, object_id, object_role, root_seq,
-                        context_aad, ciphertext_hash, state
-                     ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
+                        session_id, attempt_id, ordinal, object_id, object_role, root_seq,
+                        context_aad, object_key, ciphertext_hash, state
+                     ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
                     params![
                         session.session_id().as_bytes().as_slice(),
                         session.attempt_id().as_bytes().as_slice(),
+                        value as i64,
                         object_id.as_slice(),
                         ObjectRole::CheckpointManifestV3 as i64,
                         b"opaque".as_slice(),
+                        format!(
+                            "archive/v3/{}/checkpoints/{}/x/manifest/0-0-1-{}.cmfx",
+                            "a1".repeat(16),
+                            "b2".repeat(16),
+                            hex_id(object_id),
+                        ),
                         [0x61u8; 32].as_slice(),
                         ShadowObjectState::Reserved as i64,
                     ],
@@ -1935,10 +2226,17 @@ mod tests {
         }
         transaction.commit().unwrap();
         let facts = ShadowObjectFacts {
+            ordinal: MAX_SHADOW_OBJECTS_PER_ATTEMPT as u32,
             object_id: ObjectId::from_bytes([0xff; 16]),
             object_role: ObjectRole::CheckpointManifestV3,
             root_seq: None,
             context_aad: Zeroizing::new(b"one-too-many".to_vec()),
+            object_key: format!(
+                "archive/v3/{}/checkpoints/{}/x/manifest/0-0-1-{}.cmfx",
+                "a1".repeat(16),
+                "b2".repeat(16),
+                hex_id([0xff; 16]),
+            ),
             ciphertext_hash: [0x62; 32],
         };
         assert!(matches!(

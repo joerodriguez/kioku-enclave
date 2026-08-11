@@ -16,6 +16,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
 use rand::{rngs::OsRng, RngCore};
@@ -33,7 +37,9 @@ use crate::{
         CheckpointChunkEntry, CheckpointManifestChild, CheckpointManifestEntries,
         CheckpointManifestNode, CHECKPOINT_CHUNK_BYTES, MAX_CHECKPOINT_MANIFEST_FANOUT,
     },
-    archive_v3_operation::{RecordOutcome, ShadowObjectFacts},
+    archive_v3_operation::{
+        RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage, ShadowObjectState,
+    },
     archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionBinding, ShadowSessionId},
     archive_v3_witness::{RecoveryRoot, RootReference, Witness, WitnessError},
 };
@@ -82,6 +88,14 @@ pub(crate) trait ShadowObjectInventory: Send + Sync {
         binding: ShadowSessionBinding,
         facts: ShadowObjectFacts,
     ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError>;
+
+    async fn load_exact_attempt_page(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        after_ordinal: Option<u32>,
+    ) -> std::result::Result<ShadowObjectInventoryPage, ShadowObjectInventoryError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -92,18 +106,81 @@ pub(crate) enum ShadowObjectInventoryError {
     Conflict,
 }
 
+/// Restart-only exact-key reconciliation.  It reads one bound attempt and
+/// issues `get` only for rows that were reserved before a crash; it neither
+/// creates replacement objects nor enumerates any provider namespace.
+pub(crate) async fn reconcile_reserved_shadow_objects(
+    backend: &dyn ImmutableObjectBackend,
+    staging: &ShadowObjectStaging<'_>,
+) -> Result<()> {
+    let mut after_ordinal = None;
+    for _ in 0..129 {
+        let page = staging
+            .inventory
+            .load_exact_attempt_page(
+                staging.session_id,
+                staging.attempt_id,
+                staging.binding,
+                after_ordinal,
+            )
+            .await
+            .map_err(ShadowCheckpointError::Inventory)?;
+        for entry in page.entries() {
+            if entry.state() != ShadowObjectState::Reserved {
+                continue;
+            }
+            let facts = entry.facts().clone();
+            let key = facts.object_key().map_err(|_| {
+                ShadowCheckpointError::Inventory(ShadowObjectInventoryError::Conflict)
+            })?;
+            let readback = backend
+                .get(&key)
+                .await?
+                .ok_or(ShadowCheckpointError::MissingObject)?;
+            if readback.hash() != facts.ciphertext_hash() {
+                return Err(ArchiveV3Error::Authentication.into());
+            }
+            staging
+                .inventory
+                .mark_materialized_exact(
+                    staging.session_id,
+                    staging.attempt_id,
+                    staging.binding,
+                    facts,
+                )
+                .await
+                .map_err(ShadowCheckpointError::Inventory)?;
+        }
+        match page.next_ordinal() {
+            Some(next) if after_ordinal.is_none_or(|previous| next > previous) => {
+                after_ordinal = Some(next)
+            }
+            Some(_) => {
+                return Err(ShadowCheckpointError::Inventory(
+                    ShadowObjectInventoryError::Conflict,
+                ))
+            }
+            None => return Ok(()),
+        }
+    }
+    Err(ShadowCheckpointError::Inventory(
+        ShadowObjectInventoryError::Conflict,
+    ))
+}
+
 /// Session-scoped capability passed through the checkpoint creation order.
 /// It deliberately contains only opaque attempt binding data.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ShadowObjectStaging<'a> {
     inventory: &'a dyn ShadowObjectInventory,
     session_id: ShadowSessionId,
     attempt_id: ShadowAttemptId,
     binding: ShadowSessionBinding,
+    next_ordinal: Arc<AtomicU32>,
 }
 
 impl<'a> ShadowObjectStaging<'a> {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         inventory: &'a dyn ShadowObjectInventory,
         session_id: ShadowSessionId,
         attempt_id: ShadowAttemptId,
@@ -114,6 +191,7 @@ impl<'a> ShadowObjectStaging<'a> {
             session_id,
             attempt_id,
             binding,
+            next_ordinal: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -122,8 +200,9 @@ impl<'a> ShadowObjectStaging<'a> {
         backend: &dyn ImmutableObjectBackend,
         context: &ObjectContext,
         envelope: CiphertextEnvelope,
-    ) -> Result<()> {
-        let facts = ShadowObjectFacts::from_sealed(context, &envelope)
+    ) -> Result<ShadowObjectFacts> {
+        let ordinal = self.next_ordinal.fetch_add(1, Ordering::Relaxed);
+        let facts = ShadowObjectFacts::from_sealed(context, &envelope, ordinal)
             .map_err(|_| ShadowCheckpointError::Inventory(ShadowObjectInventoryError::Conflict))?;
         self.inventory
             .reserve_exact(
@@ -145,19 +224,15 @@ impl<'a> ShadowObjectStaging<'a> {
             return Err(ArchiveV3Error::Authentication.into());
         }
         self.inventory
-            .mark_materialized_exact(self.session_id, self.attempt_id, self.binding, facts)
+            .mark_materialized_exact(
+                self.session_id,
+                self.attempt_id,
+                self.binding,
+                facts.clone(),
+            )
             .await
             .map_err(ShadowCheckpointError::Inventory)?;
-        Ok(())
-    }
-
-    pub(crate) fn facts_for(
-        &self,
-        context: &ObjectContext,
-        envelope: &CiphertextEnvelope,
-    ) -> std::result::Result<ShadowObjectFacts, ShadowObjectInventoryError> {
-        ShadowObjectFacts::from_sealed(context, envelope)
-            .map_err(|_| ShadowObjectInventoryError::Conflict)
+        Ok(facts)
     }
 }
 
@@ -346,7 +421,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 database_plaintext_hash,
                 CheckpointManifestEntries::Chunks(std::mem::take(&mut leaf_entries)),
                 tree_height == 0,
-                staging,
+                staging.clone(),
             )
             .await?;
             add_manifest_span(
@@ -362,7 +437,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 &mut root,
                 span,
                 database_plaintext_hash,
-                staging,
+                staging.clone(),
             )
             .await?;
         }
@@ -386,7 +461,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 level as u8,
                 children,
                 database_plaintext_hash,
-                staging,
+                staging.clone(),
             )
             .await?;
             add_manifest_span(
@@ -402,7 +477,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 &mut root,
                 span,
                 database_plaintext_hash,
-                staging,
+                staging.clone(),
             )
             .await?;
         }
@@ -751,7 +826,7 @@ async fn add_manifest_span<C: CheckpointCipher>(
             level as u8,
             children,
             database_plaintext_hash,
-            staging,
+            staging.clone(),
         )
         .await?;
     }
@@ -1145,6 +1220,16 @@ mod tests {
             _facts: ShadowObjectFacts,
         ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
             Ok(RecordOutcome::Recorded)
+        }
+
+        async fn load_exact_attempt_page(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _after_ordinal: Option<u32>,
+        ) -> std::result::Result<ShadowObjectInventoryPage, ShadowObjectInventoryError> {
+            Ok(ShadowObjectInventoryPage::empty())
         }
     }
     static TEST_INVENTORY: TestInventory = TestInventory;

@@ -745,9 +745,10 @@ can durably supersede an attempt. Before CAS, a fixed-size content-free record d
 one retained attempt, the exact base/registry/fence/migration/WAL boundary, and the authenticated
 candidate root. The encrypted SQLite ledger permits at most one active and 16 retained attempts;
 candidate replacement is forbidden, and a root candidate cannot persist until its exact root
-inventory row is materialized. Witnessed completion and a CAS-unknown reconciliation atomically
-retain the attempt's inventory; definitive rejection, supersession, or abort atomically changes it
-to orphan-pending-grace. There is no deletion in this slice. Every superseded/aborted attempt remains
+inventory row is materialized. Witnessed completion atomically retains the attempt's inventory.
+A CAS-unknown outcome leaves its exact reserved/materialized rows unchanged for restart's exact-key
+reconciliation; only definitive rejection, supersession, or an explicit abort atomically changes
+them to orphan-pending-grace. There is no deletion in this slice. Every superseded/aborted attempt remains
 inventory-visible before a new attempt can be prepared. Unknown responses are durably marked before
 reread. Process restart reads one exact attempt and one exact witness record and can return only
 `Witnessed`, non-authorizing `RetrySameCandidate`, or `Superseded`; it never lists storage or invents a

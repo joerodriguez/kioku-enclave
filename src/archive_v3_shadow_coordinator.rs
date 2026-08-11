@@ -243,6 +243,34 @@ impl ShadowObjectInventory for EncryptedSqliteShadowSessionPersistence {
         .await
         .map_err(|_| ShadowObjectInventoryError::Unavailable)?
     }
+
+    async fn load_exact_attempt_page(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        after_ordinal: Option<u32>,
+    ) -> std::result::Result<
+        crate::archive_v3_operation::ShadowObjectInventoryPage,
+        ShadowObjectInventoryError,
+    > {
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| ShadowObjectInventoryError::Unavailable)?;
+            OperationLedger::load_exact_shadow_object_page(
+                &connection,
+                session_id,
+                attempt_id,
+                binding,
+                after_ordinal,
+            )
+            .map_err(map_inventory_ledger_error)
+        })
+        .await
+        .map_err(|_| ShadowObjectInventoryError::Unavailable)?
+    }
 }
 
 #[async_trait]
@@ -463,7 +491,7 @@ pub(crate) async fn publish_shadow_checkpoint(
         request.archive_id,
         current.root().database_epoch(),
         source,
-        staging,
+        staging.clone(),
     )
     .await?;
 
@@ -502,7 +530,7 @@ pub(crate) async fn publish_shadow_checkpoint(
         wal_chain_root: None,
     };
     let envelope = cipher.seal(&context, &root.encode()?)?;
-    staging
+    let root_facts = staging
         .create_and_readback(backend, &context, envelope.clone())
         .await?;
     let candidate = RootReference::new(root_seq, context.object_id(), envelope.hash());
@@ -526,9 +554,6 @@ pub(crate) async fn publish_shadow_checkpoint(
     // the process. A failed persistence call prevents the CAS entirely.
     let session_candidate = ShadowCandidate::from_root_reference(candidate)
         .map_err(|_| ShadowCoordinatorError::StaleAuthority)?;
-    let root_facts = staging
-        .facts_for(&context, &envelope)
-        .map_err(ShadowCheckpointError::Inventory)?;
     let persisted = sessions
         .persist_candidate(
             request.session_id,
@@ -1089,6 +1114,19 @@ mod tests {
             _facts: ShadowObjectFacts,
         ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
             Ok(RecordOutcome::Recorded)
+        }
+
+        async fn load_exact_attempt_page(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _after_ordinal: Option<u32>,
+        ) -> std::result::Result<
+            crate::archive_v3_operation::ShadowObjectInventoryPage,
+            ShadowObjectInventoryError,
+        > {
+            Ok(crate::archive_v3_operation::ShadowObjectInventoryPage::empty())
         }
     }
 
