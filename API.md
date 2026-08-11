@@ -25,12 +25,17 @@ indicators and the product's cloud-processing disclosure.
 
 ### Sign in with Apple routes
 
-- `POST /oauth/apple/native` verifies an iPhone or Mac identity token, single-use
-  authorization code, and raw nonce before issuing a Kioku access/refresh pair.
+- `POST /oauth/apple/native` verifies an iPhone identity token, single-use authorization
+  code, and raw nonce before issuing a Kioku access/refresh pair. The allow-listed legacy
+  macOS audience remains accepted for forward compatibility, but directly distributed
+  Developer ID builds use the browser flow below because their profiles cannot authorize
+  Apple's native entitlement.
 - `GET /oauth/apple/authorize` and Apple's exact `form_post`
   `POST /oauth/apple/callback` verify the web Services ID response, then continue through
   the same persisted consent, single-use authorization code, PKCE, and `/token` rotation
-  used by the OAuth facade.
+  used by the OAuth facade. Kioku's fixed native client additionally accepts only
+  `http://127.0.0.1:<ephemeral-port>/oauth/callback`, enabling the Developer ID Mac app
+  without placing a bearer or refresh token in the browser return URL.
 - `GET /api/auth/session` returns canonical account metadata and linked providers.
   Authenticated native linking uses `POST /api/auth/apple/link`; browser linking begins at
   `POST /api/auth/apple/web-link` and returns only to the fixed `WEB_ORIGIN` callback.

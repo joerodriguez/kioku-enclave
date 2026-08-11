@@ -40,6 +40,7 @@ const MCP_SCOPE: &str = "kioku:read";
 /// the enclave has verified an Apple authorization grant. It is a UUID so the
 /// normal refresh-token validation path remains shared and auditable.
 pub const FIRST_PARTY_NATIVE_CLIENT_ID: &str = "a3f42956-2dc1-4e58-9f05-a83fac1f9328";
+const FIRST_PARTY_NATIVE_REDIRECT_URI: &str = "http://127.0.0.1/oauth/callback";
 /// Fixed public browser client used by Kioku's own dashboard. Third-party MCP
 /// clients still use Dynamic Client Registration; normal dashboard logins must
 /// not consume the bounded registration table.
@@ -71,6 +72,52 @@ pub(super) async fn ensure_first_party_web_client(s: &Arc<CpState>) -> crate::er
                 rusqlite::params![FIRST_PARTY_WEB_CLIENT_ID, redirect_uris],
             )?;
             Ok(((), true))
+        })
+        .await
+}
+
+/// Register the public first-party native client for the browser-based Apple
+/// flow used by directly distributed Developer ID builds. RFC 8252 requires
+/// the authorization server to allow an ephemeral loopback port for native
+/// clients; the stored URI deliberately omits that port and the matcher below
+/// still requires the exact loopback host and callback path.
+pub(super) async fn ensure_first_party_native_client(s: &Arc<CpState>) -> crate::error::Result<()> {
+    let redirect_uris = serde_json::to_string(&[FIRST_PARTY_NATIVE_REDIRECT_URI])?;
+    s.control
+        .write_if_changed(move |conn| {
+            let existing: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
+                    [FIRST_PARTY_NATIVE_CLIENT_ID],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((name, stored_redirects))
+                    if name.as_deref() == Some("Kioku Native Apps")
+                        && (stored_redirects == "[]" || stored_redirects == redirect_uris) =>
+                {
+                    if stored_redirects == redirect_uris {
+                        return Ok(((), false));
+                    }
+                    conn.execute(
+                        "UPDATE oauth_clients SET redirect_uris = ?1 WHERE client_id = ?2",
+                        rusqlite::params![redirect_uris, FIRST_PARTY_NATIVE_CLIENT_ID],
+                    )?;
+                    Ok(((), true))
+                }
+                Some(_) => Err(crate::error::EnclaveError::Conflict(
+                    "first-party native OAuth client configuration mismatch".into(),
+                )),
+                None => {
+                    conn.execute(
+                        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) \
+                         VALUES (?1, 'Kioku Native Apps', ?2)",
+                        rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, redirect_uris],
+                    )?;
+                    Ok(((), true))
+                }
+            }
         })
         .await
 }
@@ -1151,11 +1198,30 @@ fn registered_client_conn(
         return Ok(None);
     };
     let redirect_uris: Vec<String> = serde_json::from_str(&redirect_uris_json)?;
-    if !is_valid_redirect_uri(redirect_uri) || !redirect_uris.iter().any(|uri| uri == redirect_uri)
-    {
+    let exact_match = redirect_uris.iter().any(|uri| uri == redirect_uri);
+    let redirect_matches = if client_id == FIRST_PARTY_NATIVE_CLIENT_ID {
+        native_loopback_redirect_matches(redirect_uri)
+    } else {
+        exact_match
+    };
+    if !is_valid_redirect_uri(redirect_uri) || !redirect_matches {
         return Ok(None);
     }
     Ok(Some(RegisteredClient { name }))
+}
+
+fn native_loopback_redirect_matches(redirect_uri: &str) -> bool {
+    let Ok(uri) = Uri::from_str(redirect_uri) else {
+        return false;
+    };
+    uri.scheme_str() == Some("http")
+        && uri.host() == Some("127.0.0.1")
+        && uri
+            .authority()
+            .and_then(|authority| authority.port_u16())
+            .is_some()
+        && uri.path() == "/oauth/callback"
+        && uri.query().is_none()
 }
 
 fn consent_page(client_name: Option<&str>, origin: &str, consent_token: &str) -> Response {
@@ -2054,6 +2120,47 @@ mod tests {
             "https://client.example/{}",
             "x".repeat(MAX_REDIRECT_URI_BYTES)
         )));
+    }
+
+    #[test]
+    fn fixed_native_client_accepts_only_ephemeral_kioku_loopback_redirects() {
+        let conn = oauth_conn();
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) \
+             VALUES (?1, 'Kioku Native Apps', ?2)",
+            rusqlite::params![
+                FIRST_PARTY_NATIVE_CLIENT_ID,
+                serde_json::to_string(&[FIRST_PARTY_NATIVE_REDIRECT_URI]).unwrap()
+            ],
+        )
+        .unwrap();
+
+        assert!(registered_client_conn(
+            &conn,
+            FIRST_PARTY_NATIVE_CLIENT_ID,
+            "http://127.0.0.1:49152/oauth/callback"
+        )
+        .unwrap()
+        .is_some());
+        for rejected in [
+            FIRST_PARTY_NATIVE_REDIRECT_URI,
+            "http://localhost:49152/oauth/callback",
+            "http://127.0.0.1:49152/other",
+            "http://127.0.0.1:49152/oauth/callback?next=1",
+            "https://127.0.0.1:49152/oauth/callback",
+        ] {
+            assert!(
+                registered_client_conn(&conn, FIRST_PARTY_NATIVE_CLIENT_ID, rejected)
+                    .unwrap()
+                    .is_none(),
+                "accepted {rejected:?}"
+            );
+        }
+        assert!(
+            registered_client_conn(&conn, CLIENT, "http://127.0.0.1:49152/oauth/callback")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

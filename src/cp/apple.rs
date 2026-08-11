@@ -481,7 +481,11 @@ async fn web_authorize(
             "Sign in with Apple has not been configured for this Kioku deployment.",
         );
     };
-    if oauth::ensure_first_party_web_client(&state).await.is_err() {
+    if oauth::ensure_first_party_native_client(&state)
+        .await
+        .is_err()
+        || oauth::ensure_first_party_web_client(&state).await.is_err()
+    {
         return server_error();
     }
     let mut downstream = match oauth::validated_authorization_request(&state, query).await {

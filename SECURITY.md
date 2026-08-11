@@ -442,7 +442,11 @@ browser state/raw nonce and downstream PKCE state are signed and short-lived.
 Authenticated routes derive the user from the Kioku token rather
 than trusting a caller-supplied identity. OAuth uses PKCE and persisted, single-use
 authorization-code state. The first-party dashboard uses one fixed public PKCE client so
-normal sign-ins cannot exhaust bounded third-party registration. Apple refresh
+normal sign-ins cannot exhaust bounded third-party registration. The directly distributed
+Mac app uses a separate fixed public native client whose browser return must be exact
+HTTP `127.0.0.1`, include an explicit ephemeral port, use only `/oauth/callback`, and have
+no query before the server appends the single-use code and state; lookalike hosts and
+paths are rejected. Apple refresh
 authorization is held per issuing iPhone/Mac/web client only in the encrypted control
 store and every retained grant is revoked before identity deletion. Legacy routes accept only
 Google-signed ID tokens with the baked audience and
