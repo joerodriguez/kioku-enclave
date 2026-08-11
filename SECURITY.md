@@ -507,6 +507,32 @@ This is not a live recovery or authority path: it has no Store, VFS, provider,
 witness, route, flag, or credential wiring. The current codec intentionally
 has no authenticated empty-tree representation, so an all-hole file is
 rejected. These tests and format bounds do not satisfy the 32-GiB release gate.
+The separately compiled legacy-conversion session codec/ledger is likewise
+inactive and content-free: it persists only exact Active/Legacy witness/lease,
+registry/base-root/fence/request, witness-record digest, authenticated source
+completion commitment, and bounded object facts. Its distinct tables never
+reuse WAL shadow rows. Its stable session ID is domain-separated over the exact
+archive, database epoch, and operation, and every record must match that
+derivation. The separately bound request fingerprint is therefore conflict data
+inside that one family, so neither alternate IDs nor request substitutions can
+split the family or evade its 16-attempt cap. A candidate-ready root requires
+one contiguous fully materialized extent/node inventory followed by the final
+exact root, and is
+accepted only with an opaque admission committed to that exact canonical root
+context for an authenticated, decoded root whose parent/fence/length/epoch/
+conversion shape exactly match the session. Non-root contexts must have no
+parent. This slice
+has no production admission constructor: only a future centralized sealed
+authenticated-readback adapter may mint one, so the ledger does not claim to
+authenticate ciphertext and CandidateReady remains unreachable in production.
+Restart and orphaning rescan every exact canonical row. Orphan records retain an
+exact count and domain-separated ordered-inventory commitment, and schema checks
+reject triggers on all three legacy ledger tables. Opaque cursors bind bounded
+contiguous pages to one session/attempt and each page rechecks its complete prior
+ordinal prefix in one SQLite snapshot. CandidateReady is not
+witness-retained and grants no root advance. It has no source adapter, provider
+call, Store/VFS/runtime/route/flag, witness CAS, recovery, deletion, or cutover
+authority.
 `AuthenticatedExtentRoot` now has a crate-private mint that accepts only an
 active `RecoveryRoot` plus an injected exact-current witness admission; it
 re-admits that full snapshot before and after exact-getting the witness-nominated
