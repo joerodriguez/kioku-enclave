@@ -182,9 +182,13 @@ tests a redacted async GCS-shaped transport boundary (conditional immutable crea
 read-after-create equality, bounded canonical-name pagination, and a contract requiring
 exact all-generation deletion) plus canonical KMS AAD for bounded registry unwrap. Its
 fake verifies delegation and multi-generation absence semantics; provider-level deletion
-evidence still requires the pending concrete GCP transport and live drill. It intentionally has no
-concrete GCP HTTP transport, credentials, runtime/deploy wiring, or authority connection;
-its provider errors never contain object paths, IDs, hashes, or cursors. The shadow module
+evidence still requires a live drill. `src/archive_v3_gcs_http.rs` provides a concrete,
+caller-token-only REST implementation with exact URL encoding, bounded streamed reads/listing,
+generation-zero creates, durable claim CAS, and bounded all-generation deletion. Disabled-policy
+deletion succeeds only through an external provider/audit-and-trusted-time drain gate; no such live
+gate is wired. The transport intentionally has no metadata-service access, environment constructor,
+credentials/runtime/deploy wiring, or authority connection; its provider errors never contain
+object paths, IDs, hashes, or cursors. The shadow module
 is bounded synchronous capture state only: no
 SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
 The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its exact owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
