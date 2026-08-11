@@ -83,8 +83,11 @@ mod archive_v3_operation;
 // registered SQLite VFS and has no Store, provider, route, or authority wiring.
 mod archive_v3_shadow;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
-// coordinator, Store/VFS, witness-provider, flag, route, or write authority.
+// Store/VFS runtime connection, provider construction, flag, route, or authority.
 mod archive_v3_shadow_checkpoint;
+// Inactive ADR-0022 checkpoint publication composition only. It has no
+// Store, VFS, route, flag, provider construction, or authority wiring.
+mod archive_v3_shadow_coordinator;
 // ADR-0022's opt-in transparent SQLite VFS wrapper. It is compiled and
 // oracle-tested, but startup never registers it and it has no Store/provider/
 // witness/route/authority wiring.

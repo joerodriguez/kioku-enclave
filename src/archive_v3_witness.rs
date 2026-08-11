@@ -581,6 +581,24 @@ impl WitnessRecord {
     pub fn registry(&self) -> KeyRegistryReference {
         self.registry
     }
+    pub(crate) fn predecessor_root(&self) -> Option<RootCommitment> {
+        self.predecessor.map(|value| value.root)
+    }
+    pub(crate) fn predecessor_registry(&self) -> Option<KeyRegistryReference> {
+        self.predecessor.map(|value| value.registry)
+    }
+    #[cfg(test)]
+    pub(crate) fn with_registry_for_test(&self, registry: KeyRegistryReference) -> Self {
+        let mut forged = self.clone();
+        forged.registry = registry;
+        forged
+    }
+    #[cfg(test)]
+    pub(crate) fn with_archive_id_for_test(&self, archive_id: ArchiveId) -> Self {
+        let mut forged = self.clone();
+        forged.archive_id = archive_id;
+        forged
+    }
     pub fn migration(&self) -> MigrationState {
         self.migration
     }
@@ -877,6 +895,15 @@ pub struct WitnessLease {
 impl WitnessLease {
     pub(crate) fn archive_id(&self) -> ArchiveId {
         self.archive_id
+    }
+    pub(crate) fn database_epoch(&self) -> DatabaseEpoch {
+        self.database_epoch
+    }
+    pub(crate) fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+    pub(crate) fn fencing_epoch(&self) -> u64 {
+        self.fencing_epoch
     }
 }
 impl fmt::Debug for WitnessLease {

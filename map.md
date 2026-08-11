@@ -36,7 +36,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | Path | What it is |
 |---|---|
 | [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, separate KMS/public/Firestore-witness attestation boundaries, per-user synchronized encrypted storage, search, episodes |
-| `src/archive_v3.rs` / `src/archive_v3_journal.rs` / `src/archive_v3_operation.rs` / `src/archive_v3_shadow.rs` / `src/archive_v3_shadow_checkpoint.rs` / `src/archive_v3_sqlite_vfs.rs` | Inactive ADR-0022 immutable archive foundation, bounded checkpoint/WAL formats, transactional idempotency ledger, synchronized WAL capture and checkpoint upload/recovery state, and opt-in transparent SQLite VFS wrapper; compiled/tested only, with no startup VFS registration or live persistence authority until shadow gates pass |
+| `src/archive_v3.rs` / `src/archive_v3_journal.rs` / `src/archive_v3_operation.rs` / `src/archive_v3_shadow.rs` / `src/archive_v3_shadow_checkpoint.rs` / `src/archive_v3_shadow_coordinator.rs` / `src/archive_v3_sqlite_vfs.rs` | Inactive ADR-0022 immutable archive foundation, bounded checkpoint/WAL formats, transactional idempotency ledger, synchronized WAL capture, checkpoint upload/recovery, fail-closed shadow-publication coordination, and an opt-in transparent SQLite VFS wrapper; compiled/tested only, with no startup VFS registration or live persistence authority until shadow gates pass |
 | `src/archive_v3_witness.rs` | Inactive ADR-0022 content-free witness/recovery contract with an in-memory linearizable model; it is compiled/tested only and has no concrete provider or live-authority wiring |
 | `src/archive_v3_firestore_witness.rs` / `src/archive_v3_firestore_http.rs` | **Inactive ADR-0022 Firestore witness boundary and concrete REST transport:** provider-neutral read-write transaction, one named (never `(default)`) database/document and one fixed bytes field codec, readTime-derived monotonic clock, conditional full-record commit, bounded `ABORTED` retry, and lost-response readback rules. The compiled transport has a fixed rustls-only Firestore origin, disables HTTP retries, and issues only begin, exact one-object-array batch-get, and commit with bounded response/error parsing; it is test-loopback injectable only. The separately compiled bearer source mints only for the exact dedicated `archive-witness-attest` WIF provider. These pieces have no runtime connection or production authority. |
 | `src/archive_v3_firestore_auth.rs` | **Inactive ADR-0022 Firestore identity boundary:** type-separated exact dedicated WIF audience, no-nonce Confidential Space launcher token, fixed retry-disabled Google STS exchange, zeroizing request/response/cache ownership, and no metadata/default credentials, service-account impersonation, REST-transport connection, or runtime authority wiring |
@@ -67,3 +67,11 @@ encrypted chunks and fixed-fanout manifests. Its recovery entrypoint accepts onl
 named by the witness and never lists storage; it atomically exposes verified bytes to a `/tmp`
 sink only after all object, context, coverage, per-chunk, and full-file checks pass. It is not
 wired to Store, the VFS, a provider credential, a runtime flag, routing, or authority transition.
+
+`src/archive_v3_shadow_coordinator.rs` composes an injected async witness transaction with the
+checkpoint and immutable-backend contracts. It reads the witness as sole authority, creates and
+authenticates a parent-bound root candidate before its first witness CAS, and resolves a lost CAS
+response or post-send failure only through an opaque exact handle and witness reread. The owned
+task covers caller cancellation only while the runtime lives; process restart begins from the
+independent witness, with durable retry identity deferred to operation-ledger wiring. It does not
+list, clean up, truncate, mutate the legacy store, or connect to runtime authority.

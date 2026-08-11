@@ -514,6 +514,24 @@ context, manifest coverage, per-chunk hashes, and the full plaintext hash before
 exposing a `/tmp` output. This is not yet an authority path: no Store, SQLite VFS, runtime flag,
 provider token, or deployment wiring invokes it.
 
+**ADR-0022 inactive shadow coordinator:** publication first obtains and authenticates the exact
+independent witness-nominated current root, checks the lease's archive/database/key/fence binding
+(the witness transaction remains authoritative for trusted-time expiry), derives SQLite
+`user_version` from the same hash-checked two-pass checkpoint source, and rejects downgrades. Each
+immutable create must succeed and the candidate root is read back and authenticated before the
+witness CAS; later recovery authenticates the complete nominated checkpoint graph. Both a success
+and a lost transaction response are accepted only after an exact witness reread names the same
+root, parent, database/key/registry, fence, migration/deletion states, and predecessor
+commitments. While the process/runtime remains alive, the cancellation-safe committing phase owns
+its witness provider until that reread finishes; a post-send reread/task failure returns an opaque
+exact-reconciliation handle. The handle and task are not durable local state. Process/runtime
+shutdown recovery starts from the independent witness, with durable retry identity deferred to
+the later operation-ledger/runtime integration. A non-nominating reread is never treated as proof
+of non-commit because commit completion or a subsequent advance may race that read. Failures leave
+unreachable ciphertext objects for a later authorized GC phase. The seam never lists objects,
+truncates WAL, mutates legacy persistence, or performs cleanup, and is not wired to runtime
+authority.
+
 ### T5 — Hypervisor or memory inspection
 
 **Threat:** A co-tenant or hypervisor reads plaintext guest memory or persistent disk.
