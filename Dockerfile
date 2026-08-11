@@ -35,7 +35,8 @@
 #   KMS_KEY_RING         KMS key ring name
 #   KMS_KEY              KMS crypto key name
 #   GCS_BUCKET           GCS bucket holding encrypted index blobs
-#   GCS_MEDIA_BUCKET     GCS bucket holding encrypted bounded-retention media
+#   GCS_MEDIA_BUCKET     Required Phase-0 alias of GCS_BUCKET for encrypted
+#                        bounded-retention media
 #   RUN_SA_EMAIL         Service account email the control plane presents in its
 #                        Google ID token (format: name@project.iam.gserviceaccount.com)
 #   ENCLAVE_AUDIENCE     The enclave's own URL, used to validate the 'aud' claim
@@ -70,7 +71,7 @@
 #     --build-arg KMS_KEY_RING=my-keyring \
 #     --build-arg KMS_KEY=my-kek \
 #     --build-arg GCS_BUCKET=my-enclave-indexes \
-#     --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
+#     --build-arg GCS_MEDIA_BUCKET=my-enclave-indexes \
 #     --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
 #     --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
 #     --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/123.../... \
@@ -139,6 +140,9 @@ ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
 
+# Phase-0 keeps bounded-retention media in the existing encrypted index bucket.
+# A split bucket is a future, separately reviewed migration; do not emit a
+# digest that could be mistaken for the transitional binding.
 RUN set -eu \
     && case "${SOURCE_DATE_EPOCH}" in ''|*[!0-9]*) false;; *) true;; esac \
     && for value in \
@@ -150,6 +154,7 @@ RUN set -eu \
         "${VERTEX_PROJECT}" "${VERTEX_LOCATION}" "${VERTEX_MODEL}" \
         "${ENCLAVE_ACME_DIRECTORY}" "${ENCLAVE_ACME_CONTACT}"; \
        do [ -n "${value}" ]; done \
+    && [ "${GCS_MEDIA_BUCKET}" = "${GCS_BUCKET}" ] \
     && [ "${ENCLAVE_ACME}" = "1" ] \
     && [ "${ALLOWED_EMAILS}" != "*" ] \
     && case "${ADMIN_USER_IDS}" in *[!0-9A-Fa-f,-]*) false;; *) true;; esac \

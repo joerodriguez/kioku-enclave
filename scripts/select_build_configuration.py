@@ -167,6 +167,11 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         require_pattern(configuration, name, r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
     for name in ("ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET"):
         require_pattern(configuration, name, r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
+    if configuration["ENCLAVE_GCS_MEDIA_BUCKET"] != configuration["ENCLAVE_GCS_BUCKET"]:
+        raise SystemExit(
+            "ENCLAVE_GCS_MEDIA_BUCKET must exactly match ENCLAVE_GCS_BUCKET "
+            "for the Phase-0 transitional release"
+        )
     require_pattern(configuration, "VERTEX_MODEL", r"[A-Za-z0-9._:-]{1,128}")
 
     for name in (
