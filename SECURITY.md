@@ -160,7 +160,7 @@ Its reports permanently classify as non-evidence (`release_evidence: false` and
 authority or evidence the production image/VM, backend, VFS, witness, cache/concurrency,
 fault, deletion, lifecycle, or 32-GiB release gates.
 
-`src/archive_v3.rs`, `src/archive_v3_journal.rs`, and `src/archive_v3_shadow.rs` define only audited, unit-tested
+`src/archive_v3.rs`, `src/archive_v3_journal.rs`, `src/archive_v3_shadow.rs`, and `src/archive_v3_sqlite_vfs.rs` define only audited, unit-tested
 format primitives for the future
 immutable archive: opaque archive/database/key/object IDs; canonical context-bound
 HKDF-SHA-256 subkeys with randomly nonced AES-256-GCM envelopes; bounded root/Merkle decoding; and an
@@ -187,6 +187,8 @@ concrete GCP HTTP transport, credentials, runtime/deploy wiring, or authority co
 its provider errors never contain object paths, IDs, hashes, or cursors. The shadow module
 is bounded synchronous capture state only: no
 SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
+The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its exact owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
+
 `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
 read the exact immutable root object back through a provider boundary, authenticate and
