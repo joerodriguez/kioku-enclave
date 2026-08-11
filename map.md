@@ -36,7 +36,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | Path | What it is |
 |---|---|
 | [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, attestation, per-user synchronized encrypted storage, search, episodes |
-| `src/archive_v3.rs` / `src/archive_v3_journal.rs` / `src/archive_v3_operation.rs` / `src/archive_v3_shadow.rs` / `src/archive_v3_sqlite_vfs.rs` | Inactive ADR-0022 immutable archive foundation, bounded checkpoint/WAL formats, transactional idempotency ledger, synchronized WAL-capture state, and opt-in transparent SQLite VFS wrapper; compiled/tested only, with no startup VFS registration or live persistence authority until shadow gates pass |
+| `src/archive_v3.rs` / `src/archive_v3_journal.rs` / `src/archive_v3_operation.rs` / `src/archive_v3_shadow.rs` / `src/archive_v3_shadow_checkpoint.rs` / `src/archive_v3_sqlite_vfs.rs` | Inactive ADR-0022 immutable archive foundation, bounded checkpoint/WAL formats, transactional idempotency ledger, synchronized WAL capture and checkpoint upload/recovery state, and opt-in transparent SQLite VFS wrapper; compiled/tested only, with no startup VFS registration or live persistence authority until shadow gates pass |
 | `src/archive_v3_witness.rs` | Inactive ADR-0022 content-free witness/recovery contract with an in-memory linearizable model; it is compiled/tested only and has no concrete provider or live-authority wiring |
 | `src/archive_v3_firestore_witness.rs` | **Inactive ADR-0022 Firestore witness boundary:** provider-neutral read-write transaction, one named (never `(default)`) database/document and one fixed bytes field codec, readTime-derived monotonic clock, conditional full-record commit, bounded `ABORTED` retry, and lost-response readback rules. A future token source must mint only for the exact dedicated `archive-witness-attest` WIF provider; batch-get parsing is capped and accepts exactly one response. It has no concrete HTTP/token implementation or runtime/authority wiring. |
 | `.github/workflows/` | CI, CodeQL/dependency checks, image build/scan, provenance, and SBOM attestations |
@@ -60,3 +60,9 @@ and explicitly configured webhook events cross the TEE boundary as documented in
   documentation in sync, and coordinate breaking changes with downstream clients.
 - Record the enclave commit SHA + deployed image digest in the operator's deployment
   record.
+
+`src/archive_v3_shadow_checkpoint.rs` uploads a stable SQLite snapshot only through bounded
+encrypted chunks and fixed-fanout manifests. Its recovery entrypoint accepts only the exact root
+named by the witness and never lists storage; it atomically exposes verified bytes to a `/tmp`
+sink only after all object, context, coverage, per-chunk, and full-file checks pass. It is not
+wired to Store, the VFS, a provider credential, a runtime flag, routing, or authority transition.

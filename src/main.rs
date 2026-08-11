@@ -77,6 +77,9 @@ mod archive_v3_operation;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
 // registered SQLite VFS and has no Store, provider, route, or authority wiring.
 mod archive_v3_shadow;
+// ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
+// coordinator, Store/VFS, witness-provider, flag, route, or write authority.
+mod archive_v3_shadow_checkpoint;
 // ADR-0022's opt-in transparent SQLite VFS wrapper. It is compiled and
 // oracle-tested, but startup never registers it and it has no Store/provider/
 // witness/route/authority wiring.

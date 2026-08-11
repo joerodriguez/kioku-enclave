@@ -473,6 +473,14 @@ lost-update races, and v2 AAD binds each blob to its intended logical object and
 Account deletion enumerates every exact live and noncurrent object generation, deletes
 each generation explicitly, and verifies no matching generation remains.
 
+**ADR-0022 inactive checkpoint seam:** the compiled-but-unwired checkpoint module uses
+independently authenticated 1 MiB chunks and bounded 256-way manifest nodes. Recovery accepts
+only the exact root commitment returned by the witness; it derives every manifest and chunk
+context from that root and never selects objects by GCS listing. It checks envelope hashes, AEAD
+context, manifest coverage, per-chunk hashes, and the full plaintext hash before atomically
+exposing a `/tmp` output. This is not yet an authority path: no Store, SQLite VFS, runtime flag,
+provider token, or deployment wiring invokes it.
+
 ### T5 — Hypervisor or memory inspection
 
 **Threat:** A co-tenant or hypervisor reads plaintext guest memory or persistent disk.
