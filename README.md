@@ -72,10 +72,9 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   minute instead of trapping the client in a lease-conflict loop. A durable pending
   reservation is reconciled with its original billing idempotency key before any new
   reservation, so a crash or failed local commit neither double-charges nor blocks that
-  user indefinitely. The API also exposes
-  plan, remaining usage, reset, hosted checkout, and plan management. The launch catalog
-  is Free (30 min), Plus ($15/3 h), Pro ($39/8 h), and
-  hidden Max ($199/40 h), monthly only.
+  user indefinitely. The enclave knows only the provider-neutral allowance snapshot and
+  reservation decision. Catalog, pricing, payment, and subscription implementations live
+  behind the external control-plane port and are not part of this repository.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
   from inside the service. Synced OCR, app/window/URL and browser-tab metadata,

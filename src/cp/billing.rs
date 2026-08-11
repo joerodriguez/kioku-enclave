@@ -1,6 +1,6 @@
-//! Narrow, content-free billing-plane client used for Vertex cost telemetry,
-//! owner margin reporting, and deletion detach. End users never receive the
-//! internal credential or call this service directly.
+//! Narrow, content-free external-control-plane port for entitlement admission,
+//! inference telemetry, owner-only account economics, and deletion detach.
+//! Merchant and catalog implementations are deliberately outside this crate.
 
 use std::{
     collections::HashMap,
@@ -177,11 +177,11 @@ pub struct DetachResponse {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BillingError {
-    #[error("billing service unavailable")]
+    #[error("external control plane unavailable")]
     Unavailable,
-    #[error("billing service rejected request with status {0}")]
+    #[error("external control plane rejected request with status {0}")]
     Rejected(u16),
-    #[error("billing service returned an invalid response")]
+    #[error("external control plane returned an invalid response")]
     InvalidResponse,
 }
 
@@ -611,6 +611,28 @@ fn lease_authorized_summary(mut summary: Value) -> Value {
         recording.insert("allowed".into(), Value::Bool(true));
         recording.insert("reason".into(), Value::Null);
     }
+    if let Some(usage) = summary.get_mut("usage").and_then(Value::as_object_mut) {
+        let allowance = usage.get("allowance_seconds").and_then(Value::as_i64);
+        let used = usage.get("used_seconds").and_then(Value::as_i64);
+        let remaining = usage.get("remaining_seconds").and_then(Value::as_i64);
+        if let (Some(allowance), Some(used), Some(0)) = (allowance, used, remaining) {
+            // Shipped clients require an allowed snapshot to have positive
+            // remaining time and exact allowance arithmetic. The upstream
+            // authorization summary is post-reservation, so expose the final
+            // granted minute as still usable inside this lease response. A
+            // later ordinary summary remains post-reservation and denied.
+            if used >= RECORDING_LEASE_SECONDS && allowance.saturating_sub(used) == 0 {
+                usage.insert(
+                    "used_seconds".into(),
+                    Value::from(used - RECORDING_LEASE_SECONDS),
+                );
+                usage.insert(
+                    "remaining_seconds".into(),
+                    Value::from(RECORDING_LEASE_SECONDS),
+                );
+            }
+        }
+    }
     summary
 }
 
@@ -952,13 +974,11 @@ fn epoch_millis() -> i64 {
 fn public_denial_code(reason: Option<&str>) -> &'static str {
     match reason {
         Some("allowance_exhausted") => "recording_allowance_exhausted",
-        Some("subscription_inactive") => "subscription_inactive",
-        Some("payment_grace_expired") => "payment_grace_expired",
         _ => "recording_not_entitled",
     }
 }
 
-fn valid_hosted_url(url: &str, portal: bool) -> bool {
+fn valid_external_action_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -969,14 +989,7 @@ fn valid_hosted_url(url: &str, portal: bool) -> bool {
     {
         return false;
     }
-    matches!(
-        (portal, parsed.host_str()),
-        (false, Some("pay.paddle.io" | "sandbox.pay.paddle.io"))
-            | (
-                true,
-                Some("customer-portal.paddle.com" | "sandbox-customer-portal.paddle.com")
-            )
-    )
+    parsed.host_str().is_some()
 }
 
 async fn create_checkout(
@@ -998,7 +1011,7 @@ async fn create_checkout(
         Err(_) => return service_unavailable(),
     };
     match state.billing.checkout(&account_id, &request).await {
-        Ok(response) if valid_hosted_url(&response.url, false) => {
+        Ok(response) if valid_external_action_url(&response.url) => {
             no_store(Json(response).into_response())
         }
         _ => service_unavailable(),
@@ -1014,7 +1027,7 @@ async fn create_portal(
         Err(_) => return service_unavailable(),
     };
     match state.billing.portal(&account_id).await {
-        Ok(response) if valid_hosted_url(&response.url, true) => {
+        Ok(response) if valid_external_action_url(&response.url) => {
             no_store(Json(response).into_response())
         }
         _ => service_unavailable(),
@@ -1351,30 +1364,14 @@ fn validated_margin_account_ids(report: &Value, limit: u8) -> Option<Vec<String>
         {
             return None;
         }
-        if !row.get("paddle_observed")?.is_object()
-            || !row.get("allocated_gcp_observed_costs")?.is_object()
+        if !row.get("allocated_gcp_observed_costs")?.is_object()
             || !row
                 .get("allocated_gcp_observed_costs")?
                 .get("vertex")?
                 .is_object()
-            || row.contains_key("paddle_actuals")
             || row.contains_key("allocated_invoice_costs")
         {
             return None;
-        }
-        for key in [
-            "actual_seller_gross_usd_micros",
-            "actual_paddle_fee_usd_micros",
-            "actual_paddle_retained_fee_usd_micros",
-            "actual_paddle_chargeback_fee_usd_micros",
-            "actual_paddle_earnings_usd_micros",
-            "actual_paddle_net_payout_usd_micros",
-            "actual_pay_less_direct_vertex_usd_micros",
-            "actual_pay_cost_basis",
-        ] {
-            if !row.get(key).is_some_and(Value::is_null) {
-                return None;
-            }
         }
         let coverage = row
             .get("direct_vertex")?
@@ -1673,13 +1670,13 @@ impl BillingGateway for FakeBillingGateway {
         _request: &CheckoutRequest,
     ) -> Result<UrlResponse, BillingError> {
         Ok(UrlResponse {
-            url: "https://sandbox.pay.paddle.io/pay/hsc_test".into(),
+            url: "https://checkout.example.test/session".into(),
         })
     }
 
     async fn portal(&self, _account_id: &str) -> Result<UrlResponse, BillingError> {
         Ok(UrlResponse {
-            url: "https://sandbox-customer-portal.paddle.com/cpl_test".into(),
+            url: "https://account.example.test/session".into(),
         })
     }
 
@@ -1901,11 +1898,15 @@ mod tests {
             plan_id: "pro".into(),
             interval: "year".into(),
         }));
-        assert!(valid_hosted_url(
-            "https://sandbox.pay.paddle.io/pay/example",
-            false
+        assert!(valid_external_action_url(
+            "https://checkout.example.test/session"
         ));
-        assert!(!valid_hosted_url("https://attacker.example/pay", false));
+        assert!(!valid_external_action_url(
+            "http://checkout.example.test/session"
+        ));
+        assert!(!valid_external_action_url(
+            "https://user@checkout.example.test/session"
+        ));
         assert!(valid_margin_query(&MarginQuery {
             limit: Some(100),
             after: Some("a".repeat(43)),
@@ -1995,7 +1996,8 @@ mod tests {
             "usage":{"allowance_seconds":300,"used_seconds":300,"remaining_seconds":0},
             "recording":{"allowed":false,"reason":"allowance_exhausted"}
         }));
-        assert_eq!(summary["usage"]["remaining_seconds"], 0);
+        assert_eq!(summary["usage"]["used_seconds"], 240);
+        assert_eq!(summary["usage"]["remaining_seconds"], 60);
         assert_eq!(summary["recording"]["allowed"], true);
         assert_eq!(summary["recording"]["reason"], Value::Null);
     }
@@ -2052,15 +2054,7 @@ mod tests {
                 "generated_at":"2026-08-09T12:02:00.000Z",
                 "rows": [{
                     "account_id":"acct_random",
-                    "paddle_observed":{"presentment":[],"payout":[]},
-                    "actual_seller_gross_usd_micros":null,
-                    "actual_paddle_fee_usd_micros":null,
-                    "actual_paddle_retained_fee_usd_micros":null,
-                    "actual_paddle_chargeback_fee_usd_micros":null,
-                    "actual_paddle_earnings_usd_micros":null,
-                    "actual_paddle_net_payout_usd_micros":null,
-                    "actual_pay_less_direct_vertex_usd_micros":null,
-                    "actual_pay_cost_basis":null,
+                    "commercial":{"opaque":true},
                     "direct_vertex": {
                         "complete": true,
                         "estimated_total_usd_micros": 100,
@@ -2128,8 +2122,7 @@ mod tests {
             account["allocated_gcp_observed_costs"]["vertex"]["status"],
             "unallocated"
         );
-        assert!(account["paddle_observed"].is_object());
-        assert!(account["actual_paddle_net_payout_usd_micros"].is_null());
+        assert_eq!(account["commercial"]["opaque"], true);
         assert_eq!(
             decorated["allocation"]["unallocated_usd_micros"]["vertex"],
             90
@@ -2151,15 +2144,7 @@ mod tests {
         let row = |account_id: &str| {
             serde_json::json!({
                 "account_id":account_id,
-                "paddle_observed":{},
-                "actual_seller_gross_usd_micros":null,
-                "actual_paddle_fee_usd_micros":null,
-                "actual_paddle_retained_fee_usd_micros":null,
-                "actual_paddle_chargeback_fee_usd_micros":null,
-                "actual_paddle_earnings_usd_micros":null,
-                "actual_paddle_net_payout_usd_micros":null,
-                "actual_pay_less_direct_vertex_usd_micros":null,
-                "actual_pay_cost_basis":null,
+                "commercial":{"opaque":true},
                 "direct_vertex":{"producer_coverage":{
                     "reported":true,"age_seconds":1,"freshness_max_seconds":300,
                     "fresh":true,"basis":"bounded_recent_zero_backlog_snapshot",
@@ -2196,12 +2181,14 @@ mod tests {
             .insert("allocated_invoice_costs".into(), serde_json::json!({}));
         assert!(validated_margin_account_ids(&report(vec![legacy]), 50).is_none());
 
-        let mut unsafe_actual = row(&first);
-        unsafe_actual
+        let mut opaque_commercial_extension = row(&first);
+        opaque_commercial_extension
             .as_object_mut()
             .unwrap()
-            .insert("actual_paddle_net_payout_usd_micros".into(), Value::from(1));
-        assert!(validated_margin_account_ids(&report(vec![unsafe_actual]), 50).is_none());
+            .insert("commercial_extension".into(), Value::from(1));
+        assert!(
+            validated_margin_account_ids(&report(vec![opaque_commercial_extension]), 50).is_some()
+        );
     }
 
     #[tokio::test]

@@ -25,9 +25,10 @@ surfaces.
 ### Out of scope or accepted external trust
 
 - The macOS client, which is a separate binary with its own threat model.
-- Paddle payment processing, tax, invoices, subscription webhooks, and catalog pricing
-  occur in the external monorepo billing service. The enclave's pseudonymous metering,
-  entitlement enforcement, checkout/portal facade, and owner authorization are in scope.
+- Payment processing, tax, invoices, subscription webhooks, and catalog pricing occur in
+  an external control plane. The enclave's pseudonymous usage reservation, entitlement
+  enforcement, bounded compatibility facade, and owner authorization are in scope. This
+  repository contains no merchant adapter or commercial catalog.
 - CPU-level microarchitectural side channels. Confidential Space provides VM memory
   encryption, not complete Spectre-class protection.
 - **Vertex Gemini inference confidentiality.** Audio transcription/diarization,
@@ -940,16 +941,16 @@ enabled. The sender revalidates public DNS addresses on every attempt, pins the 
 address, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
 signatures, or response bodies.
 
-### Pseudonymous billing events cross the TEE boundary
+### Pseudonymous entitlement and usage events cross the TEE boundary
 
-The monorepo billing service receives a random account pseudonym and content-free usage
+The external control plane receives a random account pseudonym and content-free usage
 events over HTTPS authenticated with an exact-audience Google OIDC token. It does not
 receive email, Google subject, stable enclave user UUID, capture/episode identifiers, or
 model content. The random mapping, lease receipts, and deletion-detach outbox remain
 encrypted inside the enclave. This boundary reveals subscription usage and inference-cost
 shape; compromise of both databases could link those records.
 
-New capture depends on the billing service in enforce mode: a denial or inactive lease is
+New capture depends on the entitlement port in enforce mode: a denial or inactive lease is
 HTTP 402, idempotency/early-renewal conflict is HTTP 409, and unavailable durable state is
 HTTP 503 before persistence. Screenshots and references require an active lease but do not
 consume again. Existing cloud archive reads, search, export, and deletion remain ungated;
