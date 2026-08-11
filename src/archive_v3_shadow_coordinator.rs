@@ -27,9 +27,12 @@ use crate::{
         LogicalLocation, ObjectContext, ObjectId, ObjectRole, ParentReference,
         VerifiedArchiveCipher, ARCHIVE_FORMAT_VERSION, SQLITE_PAGE_SIZE,
     },
-    archive_v3_operation::{OperationLedger, OperationLedgerError, OperationRecord, RecordOutcome},
+    archive_v3_operation::{
+        OperationLedger, OperationLedgerError, OperationRecord, RecordOutcome, ShadowObjectFacts,
+    },
     archive_v3_shadow_checkpoint::{
-        upload_checkpoint, CheckpointSource, ShadowCheckpointError, UploadedCheckpoint,
+        upload_checkpoint, CheckpointSource, ShadowCheckpointError, ShadowObjectInventory,
+        ShadowObjectInventoryError, ShadowObjectStaging, UploadedCheckpoint,
     },
     archive_v3_shadow_session::{
         ShadowAttemptId, ShadowCandidate, ShadowReconcileDecision, ShadowSessionBinding,
@@ -99,7 +102,7 @@ pub enum ShadowSessionPersistenceError {
 /// the encrypted archive ledger; this inactive coordinator has no concrete
 /// Store, filesystem, or connection construction.
 #[async_trait]
-pub(crate) trait ShadowSessionPersistence: Send + Sync {
+pub(crate) trait ShadowSessionPersistence: ShadowObjectInventory + Send + Sync {
     async fn load_exact(
         &self,
         session_id: ShadowSessionId,
@@ -112,6 +115,7 @@ pub(crate) trait ShadowSessionPersistence: Send + Sync {
         attempt_id: ShadowAttemptId,
         binding: ShadowSessionBinding,
         candidate: ShadowCandidate,
+        root_facts: ShadowObjectFacts,
     ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError>;
 
     async fn require_reconciliation(
@@ -178,6 +182,69 @@ fn map_session_ledger_error(error: OperationLedgerError) -> ShadowSessionPersist
     }
 }
 
+fn map_inventory_ledger_error(error: OperationLedgerError) -> ShadowObjectInventoryError {
+    match error {
+        OperationLedgerError::FingerprintConflict
+        | OperationLedgerError::ResultConflict
+        | OperationLedgerError::ShadowSession(_)
+        | OperationLedgerError::TooLarge(_) => ShadowObjectInventoryError::Conflict,
+        _ => ShadowObjectInventoryError::Unavailable,
+    }
+}
+
+#[async_trait]
+impl ShadowObjectInventory for EncryptedSqliteShadowSessionPersistence {
+    async fn reserve_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| ShadowObjectInventoryError::Unavailable)?;
+            OperationLedger::reserve_shadow_object(
+                &mut connection,
+                session_id,
+                attempt_id,
+                binding,
+                &facts,
+            )
+            .map_err(map_inventory_ledger_error)
+        })
+        .await
+        .map_err(|_| ShadowObjectInventoryError::Unavailable)?
+    }
+
+    async fn mark_materialized_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| ShadowObjectInventoryError::Unavailable)?;
+            OperationLedger::mark_shadow_object_materialized(
+                &mut connection,
+                session_id,
+                attempt_id,
+                binding,
+                &facts,
+            )
+            .map_err(map_inventory_ledger_error)
+        })
+        .await
+        .map_err(|_| ShadowObjectInventoryError::Unavailable)?
+    }
+}
+
 #[async_trait]
 impl ShadowSessionPersistence for EncryptedSqliteShadowSessionPersistence {
     async fn load_exact(
@@ -201,10 +268,16 @@ impl ShadowSessionPersistence for EncryptedSqliteShadowSessionPersistence {
         attempt_id: ShadowAttemptId,
         binding: ShadowSessionBinding,
         candidate: ShadowCandidate,
+        root_facts: ShadowObjectFacts,
     ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError> {
         self.run_blocking(move |connection| {
             OperationLedger::persist_shadow_candidate(
-                connection, session_id, attempt_id, binding, candidate,
+                connection,
+                session_id,
+                attempt_id,
+                binding,
+                candidate,
+                &root_facts,
             )
         })
         .await
@@ -378,12 +451,19 @@ pub(crate) async fn publish_shadow_checkpoint(
     }
     let current_root = load_current_root(backend, cipher, request.archive_id, &current).await?;
 
+    let staging = ShadowObjectStaging::new(
+        sessions.as_ref(),
+        request.session_id,
+        request.attempt_id,
+        session_binding,
+    );
     let checkpoint = upload_checkpoint(
         backend,
         cipher,
         request.archive_id,
         current.root().database_epoch(),
         source,
+        staging,
     )
     .await?;
 
@@ -422,8 +502,8 @@ pub(crate) async fn publish_shadow_checkpoint(
         wal_chain_root: None,
     };
     let envelope = cipher.seal(&context, &root.encode()?)?;
-    backend
-        .create_if_absent(context.object_key(), envelope.clone())
+    staging
+        .create_and_readback(backend, &context, envelope.clone())
         .await?;
     let candidate = RootReference::new(root_seq, context.object_id(), envelope.hash());
 
@@ -446,12 +526,16 @@ pub(crate) async fn publish_shadow_checkpoint(
     // the process. A failed persistence call prevents the CAS entirely.
     let session_candidate = ShadowCandidate::from_root_reference(candidate)
         .map_err(|_| ShadowCoordinatorError::StaleAuthority)?;
+    let root_facts = staging
+        .facts_for(&context, &envelope)
+        .map_err(ShadowCheckpointError::Inventory)?;
     let persisted = sessions
         .persist_candidate(
             request.session_id,
             request.attempt_id,
             session_binding,
             session_candidate,
+            root_facts,
         )
         .await
         .map_err(ShadowCoordinatorError::SessionPersistence)?;
@@ -986,6 +1070,29 @@ mod tests {
     }
 
     #[async_trait]
+    impl ShadowObjectInventory for FakeSessions {
+        async fn reserve_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            Ok(RecordOutcome::Recorded)
+        }
+
+        async fn mark_materialized_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            Ok(RecordOutcome::Recorded)
+        }
+    }
+
+    #[async_trait]
     impl ShadowSessionPersistence for FakeSessions {
         async fn load_exact(
             &self,
@@ -1006,6 +1113,7 @@ mod tests {
             attempt_id: ShadowAttemptId,
             binding: ShadowSessionBinding,
             candidate: ShadowCandidate,
+            _root_facts: ShadowObjectFacts,
         ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError> {
             self.events.lock().unwrap().push("persist_candidate");
             if *self.fail_candidate_persist.lock().unwrap() {

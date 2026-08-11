@@ -720,7 +720,11 @@ each generation explicitly, and verifies no matching generation remains.
 **ADR-0022 inactive checkpoint seam:** the compiled-but-unwired checkpoint module rejects a
 declared length over the shared 32-GiB ceiling before source reads, hashing, encryption, or any
 immutable create, then uses independently authenticated 1 MiB chunks and bounded 256-way manifest
-nodes. Recovery accepts
+nodes. Before every create, a session/attempt-bound encrypted SQLite inventory reserves the exact
+opaque context-AAD and ciphertext commitment; it marks the row materialized only after exact-key
+readback equality, so an `AlreadyPresentIdentical` response still cannot link a parent without a
+readback. The bounded 32,898-row attempt inventory contains no user ID, provider name/URL, cursor,
+timestamp, plaintext, or debug payload. Recovery accepts
 only the exact root commitment returned by the witness; it derives every manifest and chunk
 context from that root and never selects objects by GCS listing. It checks envelope hashes, AEAD
 context, manifest coverage, per-chunk hashes, and the full plaintext hash before atomically
@@ -740,8 +744,10 @@ non-terminal token/begin/batch-get/provider failure, and ambiguous commit respon
 can durably supersede an attempt. Before CAS, a fixed-size content-free record durably binds one stable operation/session,
 one retained attempt, the exact base/registry/fence/migration/WAL boundary, and the authenticated
 candidate root. The encrypted SQLite ledger permits at most one active and 16 retained attempts;
-candidate replacement is forbidden, while a definitive CAS rejection is durably superseded and
-every superseded/aborted attempt remains
+candidate replacement is forbidden, and a root candidate cannot persist until its exact root
+inventory row is materialized. Witnessed completion and a CAS-unknown reconciliation atomically
+retain the attempt's inventory; definitive rejection, supersession, or abort atomically changes it
+to orphan-pending-grace. There is no deletion in this slice. Every superseded/aborted attempt remains
 inventory-visible before a new attempt can be prepared. Unknown responses are durably marked before
 reread. Process restart reads one exact attempt and one exact witness record and can return only
 `Witnessed`, non-authorizing `RetrySameCandidate`, or `Superseded`; it never lists storage or invents a
