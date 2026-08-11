@@ -7,8 +7,11 @@
 //!
 //! It accepts only `nonce[12] || ciphertext || tag[16]`, authenticates all
 //! ciphertext before opening a temporary sink, then re-reads the same pinned
-//! generation to decrypt in bounded chunks.  This is deliberately not wired
-//! into Store, GCS, routes, flags, or any production authority.
+//! generation to decrypt in bounded chunks. Its private pull marks every byte
+//! provisional and attacker-controlled until one-shot completion; a future
+//! child composition may place those bytes only in encrypted, non-observable,
+//! non-authoritative staging. This is deliberately not wired into Store, GCS,
+//! routes, flags, or any production authority.
 
 use aes::{
     cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit, KeyIvInit, StreamCipher},
@@ -31,6 +34,10 @@ const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const ENVELOPE_OVERHEAD: u64 = (NONCE_LEN + TAG_LEN) as u64;
 const MAX_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_SOURCE_IDENTITY_BYTES: usize = 256;
+const SOURCE_IDENTITY_COMMITMENT_DOMAIN: &[u8] =
+    b"KIOKU-LEGACY-GCM-SOURCE-IDENTITY-COMMITMENT-v1\0";
+const SOURCE_BINDING_DOMAIN: &[u8] = b"KIOKU-LEGACY-GCM-SOURCE-BINDING-v1\0";
 // SP 800-38D §5.2.1.1: 2^39 - 256 bits, or (2^32 - 2) AES blocks.
 const MAX_CIPHERTEXT_BYTES: u64 = ((u32::MAX as u64) - 1) * 16;
 const MAX_AAD_BYTES: u64 = 1 << 36;
@@ -57,6 +64,81 @@ impl LegacyGeneration {
     }
 }
 
+/// A narrow, canonical opaque identity for the object selected by a future
+/// adapter.  It is an adapter-defined stable byte string (for example an
+/// already canonical provider object identity), never a path, URL, or display
+/// name.  The adapter supplies it once to authentication and it is retained
+/// only as a hash binding thereafter.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LegacySourceIdentity(Zeroizing<Vec<u8>>);
+
+impl LegacySourceIdentity {
+    pub(crate) fn new(canonical: &[u8]) -> Result<Self> {
+        if canonical.is_empty() || canonical.len() > MAX_SOURCE_IDENTITY_BYTES {
+            return Err(crypto_error(
+                "legacy source identity must be nonempty and bounded",
+            ));
+        }
+        Ok(Self(Zeroizing::new(canonical.to_vec())))
+    }
+
+    fn compatibility_wrapper() -> Self {
+        // This preserves the historic wrapper signature only. New adapters
+        // must use `authenticate_legacy_source` with their canonical identity.
+        Self(Zeroizing::new(
+            b"legacy-gcm-staging-compatibility-v1".to_vec(),
+        ))
+    }
+
+    fn commitment(&self) -> LegacySourceIdentityCommitment {
+        let mut digest = Sha256::new();
+        digest.update(SOURCE_IDENTITY_COMMITMENT_DOMAIN);
+        digest.update((self.0.len() as u64).to_be_bytes());
+        digest.update(&*self.0);
+        LegacySourceIdentityCommitment(digest.finalize().into())
+    }
+}
+
+impl fmt::Debug for LegacySourceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegacySourceIdentity(<redacted>)")
+    }
+}
+
+/// Fixed-size, non-loggable binding for the authenticated source selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacySourceBinding([u8; 32]);
+
+impl fmt::Debug for LegacySourceBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegacySourceBinding(<redacted>)")
+    }
+}
+
+impl LegacySourceBinding {
+    fn matches(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).unwrap_u8() == 1
+    }
+}
+
+/// Fixed-size commitment to one canonical source identity. The raw identity
+/// is needed only while selecting metadata; all pinned state carries this
+/// commitment instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LegacySourceIdentityCommitment([u8; 32]);
+
+impl LegacySourceIdentityCommitment {
+    fn matches(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).unwrap_u8() == 1
+    }
+}
+
+impl fmt::Debug for LegacySourceIdentityCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LegacySourceIdentityCommitment(<redacted>)")
+    }
+}
+
 impl fmt::Debug for LegacyGeneration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("LegacyGeneration(<redacted>)")
@@ -69,6 +151,7 @@ impl fmt::Debug for LegacyGeneration {
 pub(crate) struct PinnedLegacyObject {
     generation: LegacyGeneration,
     byte_len: u64,
+    identity: LegacySourceIdentityCommitment,
 }
 
 impl fmt::Debug for PinnedLegacyObject {
@@ -78,21 +161,26 @@ impl fmt::Debug for PinnedLegacyObject {
 }
 
 impl PinnedLegacyObject {
-    pub(crate) fn new(generation: LegacyGeneration, byte_len: u64) -> Self {
+    fn new(identity: &LegacySourceIdentity, generation: LegacyGeneration, byte_len: u64) -> Self {
         Self {
             generation,
             byte_len,
+            identity: identity.commitment(),
         }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        let identity_matches = self.identity.matches(&other.identity);
+        identity_matches && self.generation == other.generation && self.byte_len == other.byte_len
     }
 }
 
 /// A range response receipt checked before this module consumes bytes.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LegacyRangeReceipt {
-    generation: LegacyGeneration,
+    object: PinnedLegacyObject,
     offset: u64,
     byte_len: u64,
-    total_len: u64,
 }
 
 impl fmt::Debug for LegacyRangeReceipt {
@@ -102,17 +190,11 @@ impl fmt::Debug for LegacyRangeReceipt {
 }
 
 impl LegacyRangeReceipt {
-    pub(crate) fn new(
-        generation: LegacyGeneration,
-        offset: u64,
-        byte_len: u64,
-        total_len: u64,
-    ) -> Self {
+    fn new(object: PinnedLegacyObject, offset: u64, byte_len: u64) -> Self {
         Self {
-            generation,
+            object,
             offset,
             byte_len,
-            total_len,
         }
     }
 }
@@ -122,8 +204,14 @@ impl LegacyRangeReceipt {
 /// range GET, require HTTP 206 plus a parsed `Content-Range` whose start,
 /// inclusive end, total, and observed generation match this receipt, and fill
 /// `destination` completely or error; it must not retry another generation.
+/// The in-memory contract detects inconsistent receipts but cannot make a
+/// malicious concrete adapter report provider metadata honestly; the future
+/// sealed child adapter therefore remains a dedicated review boundary.
 #[async_trait]
 pub(crate) trait PinnedLegacyRangeReader: sealed::RangeReader + Send {
+    /// Return the adapter's independently selected sealed object. The caller's
+    /// requested identity is deliberately not provided here, so the adapter
+    /// cannot satisfy pinning by merely echoing that request.
     async fn pin_legacy_object(&mut self) -> Result<PinnedLegacyObject>;
     async fn read_pinned_exact(
         &mut self,
@@ -147,6 +235,15 @@ pub(crate) enum LegacyEmptyAad {
 }
 
 impl LegacyGcmAad<'_> {
+    fn discriminator(&self) -> u8 {
+        match self {
+            Self::Empty(LegacyEmptyAad::Sqlite) => 1,
+            Self::Empty(LegacyEmptyAad::Control) => 2,
+            Self::Empty(LegacyEmptyAad::Acme) => 3,
+            Self::MediaUserId(_) => 4,
+        }
+    }
+
     fn bytes(&self) -> Result<&[u8]> {
         match self {
             Self::Empty(
@@ -173,6 +270,10 @@ impl LegacyGcmAad<'_> {
 /// under the RAII guard or has never existed when cancellation occurs.
 /// `commit` must itself be atomic: cancellation while it is awaited leaves the
 /// staging object abortable or already atomically committed, never half-visible.
+/// A future child composition must encrypt provisional bytes in staging and
+/// keep that staging non-observable and non-authoritative until completion and
+/// atomic commit. Rust traits cannot prove that a concrete adapter honors
+/// those provider-side properties, so such an adapter still requires review.
 #[async_trait]
 pub(crate) trait PlaintextStagingSink: sealed::Sink + Send {
     type Staging: Send;
@@ -224,7 +325,402 @@ pub(crate) struct LegacyGcmRead {
     pub(crate) plaintext_len: u64,
 }
 
-/// Two-pass authenticate, then stage-decrypt an exact historic envelope.
+/// Completion is minted only by a successful exact end-of-stream verification.
+/// It is deliberately linear: callers cannot clone or copy it.
+#[derive(Debug, PartialEq, Eq)]
+struct LegacyGcmCompletion {
+    plaintext_len: u64,
+    binding: LegacySourceBinding,
+}
+
+impl LegacyGcmCompletion {
+    /// Consume the one-shot completion and require its exact pre-staging
+    /// binding before any later root candidate or authority-bearing record may
+    /// be persisted.
+    fn verify_binding(self, expected: LegacySourceBinding) -> Result<LegacySourceBinding> {
+        if !self.binding.matches(&expected) {
+            return Err(crypto_error(
+                "legacy completion binding does not match the pre-staging source",
+            ));
+        }
+        Ok(self.binding)
+    }
+}
+
+/// A sealed, sequential source produced only after the first full GCM pass.
+/// It has neither seek nor replay operations. Dropping it is deliberately not
+/// completion and exposes no success signal. Its private pull yields
+/// provisional attacker-controlled plaintext, not authenticated output: only
+/// this module and reviewed child composition modules may consume those bytes,
+/// and only into encrypted, non-observable, non-authoritative staging.
+struct AuthenticatedLegacySource<'a, R: PinnedLegacyRangeReader> {
+    reader: &'a mut R,
+    object: PinnedLegacyObject,
+    binding: LegacySourceBinding,
+    ciphertext_len: u64,
+    nonce: [u8; NONCE_LEN],
+    tag: [u8; TAG_LEN],
+    first_digest: [u8; 32],
+    aad: Zeroizing<Vec<u8>>,
+    ctr: Option<Ctr32BE<Aes256>>,
+    authenticator: Option<GcmAuthenticator>,
+    digest: Sha256,
+    offset: u64,
+    state: LegacySourceState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegacySourceState {
+    Unstarted,
+    Reading,
+    Finished,
+    Failed,
+}
+
+/// A private marker for bytes decrypted during pass two. `len == 0` means the
+/// ciphertext body is exhausted, but the bytes already emitted remain
+/// provisional until `finish` returns its one-shot completion.
+struct ProvisionalPlaintextChunk {
+    len: usize,
+}
+
+impl ProvisionalPlaintextChunk {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Makes cancellation of a source operation terminal and scrubs retained
+/// cipher/authentication state. Successful operations explicitly disarm it.
+struct LegacySourceOperationGuard<'operation, 'reader, R: PinnedLegacyRangeReader> {
+    source: &'operation mut AuthenticatedLegacySource<'reader, R>,
+    completed: bool,
+}
+
+impl<'operation, 'reader, R: PinnedLegacyRangeReader>
+    LegacySourceOperationGuard<'operation, 'reader, R>
+{
+    fn new(source: &'operation mut AuthenticatedLegacySource<'reader, R>) -> Self {
+        Self {
+            source,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl<R: PinnedLegacyRangeReader> Drop for LegacySourceOperationGuard<'_, '_, R> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.source.state = LegacySourceState::Failed;
+            self.source.scrub();
+        }
+    }
+}
+
+impl<R: PinnedLegacyRangeReader> fmt::Debug for AuthenticatedLegacySource<'_, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedLegacySource(<redacted>)")
+    }
+}
+
+impl<R: PinnedLegacyRangeReader> Drop for AuthenticatedLegacySource<'_, R> {
+    fn drop(&mut self) {
+        self.scrub();
+    }
+}
+
+impl<'a, R: PinnedLegacyRangeReader> AuthenticatedLegacySource<'a, R> {
+    fn scrub(&mut self) {
+        self.nonce.zeroize();
+        self.tag.zeroize();
+        self.first_digest.zeroize();
+        self.aad.zeroize();
+        // `ctr` and `GcmAuthenticator::ghash` are built with their `zeroize`
+        // features. Taking them here makes the terminal cleanup explicit even
+        // when the source is cancelled at an async boundary.
+        drop(self.ctr.take());
+        drop(self.authenticator.take());
+    }
+    fn binding(&self) -> LegacySourceBinding {
+        self.binding
+    }
+
+    fn plaintext_len(&self) -> u64 {
+        self.ciphertext_len
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        if self.state != LegacySourceState::Unstarted {
+            return Ok(());
+        }
+        let mut nonce: [u8; NONCE_LEN] = Default::default();
+        if let Err(error) = read_exact(self.reader, &self.object, 0, &mut nonce).await {
+            nonce.zeroize();
+            return self.fail_with(error);
+        }
+        if nonce.ct_eq(&self.nonce).unwrap_u8() != 1 || nonce.starts_with(V2_MAGIC) {
+            nonce.zeroize();
+            return self.fail("legacy nonce changed between passes");
+        }
+        nonce.zeroize();
+        self.state = LegacySourceState::Reading;
+        Ok(())
+    }
+
+    /// Decrypt exactly the next bounded sequential chunk. The returned marker
+    /// certifies only how many bytes were initialized; `destination[..len]`
+    /// remains provisional attacker-controlled plaintext until `finish`.
+    /// A future child composition may write it only to encrypted,
+    /// non-observable, non-authoritative staging and must zeroize its buffer.
+    async fn read_provisional(
+        &mut self,
+        destination: &mut [u8],
+    ) -> Result<ProvisionalPlaintextChunk> {
+        if destination.is_empty() || destination.len() > MAX_CHUNK_BYTES {
+            return Err(crypto_error(
+                "legacy plaintext destination must be nonempty and bounded",
+            ));
+        }
+        // The sealed owner clears stale provisional plaintext up front. The
+        // exact-range guard separately clears any partial ciphertext written
+        // if the reader future is cancelled before CTR decryption.
+        destination.zeroize();
+        if self.state == LegacySourceState::Finished || self.state == LegacySourceState::Failed {
+            return Err(crypto_error("legacy authenticated source is terminal"));
+        }
+        let mut operation = LegacySourceOperationGuard::new(self);
+        let result = operation.source.read_provisional_inner(destination).await;
+        if result.is_ok() {
+            operation.complete();
+        }
+        result
+    }
+
+    async fn read_provisional_inner(
+        &mut self,
+        destination: &mut [u8],
+    ) -> Result<ProvisionalPlaintextChunk> {
+        self.start().await?;
+        let end = match (NONCE_LEN as u64).checked_add(self.ciphertext_len) {
+            Some(end) => end,
+            None => return self.fail("legacy ciphertext range overflow"),
+        };
+        if self.offset == end {
+            return Ok(ProvisionalPlaintextChunk { len: 0 });
+        }
+        let bytes = match usize::try_from((end - self.offset).min(destination.len() as u64)) {
+            Ok(bytes) => bytes,
+            Err(_) => return self.fail("legacy ciphertext chunk length overflow"),
+        };
+        let chunk = &mut destination[..bytes];
+        if let Err(error) = read_exact(self.reader, &self.object, self.offset, chunk).await {
+            chunk.zeroize();
+            return self.fail_with(error);
+        }
+        self.authenticator
+            .as_mut()
+            .expect("authenticated source has GHASH state")
+            .absorb_ciphertext(chunk);
+        self.digest.update(&*chunk);
+        if self
+            .ctr
+            .as_mut()
+            .expect("authenticated source has CTR state")
+            .try_apply_keystream(chunk)
+            .is_err()
+        {
+            chunk.zeroize();
+            return self.fail("legacy GCM counter exhausted during decrypt");
+        }
+        self.offset = match self.offset.checked_add(bytes as u64) {
+            Some(offset) => offset,
+            None => {
+                chunk.zeroize();
+                return self.fail("legacy ciphertext offset overflow");
+            }
+        };
+        Ok(ProvisionalPlaintextChunk { len: bytes })
+    }
+
+    /// Verify the second-pass tag, digest, exact EOF, and return the only
+    /// completion token. It can succeed exactly once.
+    async fn finish(&mut self) -> Result<LegacyGcmCompletion> {
+        if self.state == LegacySourceState::Finished || self.state == LegacySourceState::Failed {
+            return Err(crypto_error("legacy authenticated source is terminal"));
+        }
+        let mut operation = LegacySourceOperationGuard::new(self);
+        let result = operation.source.finish_inner().await;
+        if result.is_ok() {
+            operation.complete();
+        }
+        result
+    }
+
+    async fn finish_inner(&mut self) -> Result<LegacyGcmCompletion> {
+        self.start().await?;
+        let end = match (NONCE_LEN as u64).checked_add(self.ciphertext_len) {
+            Some(end) => end,
+            None => return self.fail("legacy ciphertext range overflow"),
+        };
+        if self.offset != end {
+            return self.fail("legacy authenticated source has unread plaintext");
+        }
+        let tag_offset = end;
+        let mut second_tag = [0u8; TAG_LEN];
+        if let Err(error) = read_exact(self.reader, &self.object, tag_offset, &mut second_tag).await
+        {
+            second_tag.zeroize();
+            return self.fail_with(error);
+        }
+        let tag_same = second_tag.ct_eq(&self.tag).unwrap_u8() == 1;
+        let mut calculated = match self
+            .authenticator
+            .take()
+            .expect("authenticated source has GHASH state")
+            .finish(self.ciphertext_len)
+        {
+            Ok(tag) => tag,
+            Err(error) => {
+                second_tag.zeroize();
+                return self.fail_with(error);
+            }
+        };
+        let tag_valid = calculated.ct_eq(&second_tag).unwrap_u8() == 1;
+        calculated.zeroize();
+        second_tag.zeroize();
+        let mut digest: [u8; 32] = std::mem::take(&mut self.digest).finalize().into();
+        let digest_same = digest.ct_eq(&self.first_digest).unwrap_u8() == 1;
+        digest.zeroize();
+        if !tag_same || !tag_valid || !digest_same {
+            return self.fail("legacy envelope changed or failed authentication in second pass");
+        }
+        self.state = LegacySourceState::Finished;
+        self.scrub();
+        Ok(LegacyGcmCompletion {
+            plaintext_len: self.ciphertext_len,
+            binding: self.binding,
+        })
+    }
+
+    fn fail<T>(&mut self, message: &'static str) -> Result<T> {
+        self.fail_with(crypto_error(message))
+    }
+
+    fn fail_with<T>(&mut self, error: EnclaveError) -> Result<T> {
+        self.state = LegacySourceState::Failed;
+        self.scrub();
+        Err(error)
+    }
+}
+
+/// Authenticate an exact historic envelope and return its sealed second-pass
+/// source. The binding is domain-separated SHA-256 over the caller-supplied
+/// canonical opaque identity's fixed commitment, pinned generation/lengths,
+/// AAD profile class, and first-pass ciphertext digest; raw identity and raw
+/// DEK are not retained.
+async fn authenticate_legacy_source<'a, R>(
+    reader: &'a mut R,
+    dek: &Dek,
+    aad_profile: LegacyGcmAad<'_>,
+    source_identity: &LegacySourceIdentity,
+) -> Result<AuthenticatedLegacySource<'a, R>>
+where
+    R: PinnedLegacyRangeReader,
+{
+    let requested_identity = source_identity.commitment();
+    let object = reader.pin_legacy_object().await?;
+    if !object.identity.matches(&requested_identity) {
+        return Err(crypto_error(
+            "pinned legacy source identity does not match the requested source",
+        ));
+    }
+    let ciphertext_len = validate_envelope_len(object.byte_len)?;
+    let aad = aad_profile.bytes()?;
+    validate_aad_len(aad)?;
+    let profile = aad_profile.discriminator();
+    let mut nonce: [u8; NONCE_LEN] = Default::default();
+    if let Err(error) = read_exact(reader, &object, 0, &mut nonce).await {
+        nonce.zeroize();
+        return Err(error);
+    }
+    if nonce.starts_with(V2_MAGIC) {
+        nonce.zeroize();
+        return Err(crypto_error("v2 envelope is not a historic legacy blob"));
+    }
+    let tag_offset = (NONCE_LEN as u64)
+        .checked_add(ciphertext_len)
+        .ok_or_else(|| crypto_error("legacy ciphertext offset overflow"))?;
+    let mut tag = [0u8; TAG_LEN];
+    if let Err(error) = read_exact(reader, &object, tag_offset, &mut tag).await {
+        nonce.zeroize();
+        tag.zeroize();
+        return Err(error);
+    }
+    let key = Zeroizing::new(dek.0);
+    let mut first_digest =
+        match authenticate_pass(reader, &object, &key, &nonce, aad, ciphertext_len, &tag).await {
+            Ok(digest) => digest,
+            Err(error) => {
+                nonce.zeroize();
+                tag.zeroize();
+                return Err(error);
+            }
+        };
+    let mut ctr_iv = match gcm_counter_start(&nonce) {
+        Ok(counter) => counter,
+        Err(error) => {
+            nonce.zeroize();
+            tag.zeroize();
+            first_digest.zeroize();
+            return Err(error);
+        }
+    };
+    let ctr = Ctr32BE::<Aes256>::new(
+        GenericArray::from_slice(&*key),
+        GenericArray::from_slice(&ctr_iv),
+    );
+    let authenticator = match GcmAuthenticator::new(&key, &nonce, aad) {
+        Ok(authenticator) => authenticator,
+        Err(error) => {
+            nonce.zeroize();
+            tag.zeroize();
+            first_digest.zeroize();
+            return Err(error);
+        }
+    };
+    drop(key);
+    ctr_iv.zeroize();
+    let binding = source_binding(
+        object.identity,
+        object.generation,
+        object.byte_len,
+        ciphertext_len,
+        profile,
+        &first_digest,
+    );
+    Ok(AuthenticatedLegacySource {
+        reader,
+        object,
+        binding,
+        ciphertext_len,
+        nonce,
+        tag,
+        first_digest,
+        aad: Zeroizing::new(aad.to_vec()),
+        ctr: Some(ctr),
+        authenticator: Some(authenticator),
+        digest: Sha256::new(),
+        offset: NONCE_LEN as u64,
+        state: LegacySourceState::Unstarted,
+    })
+}
+
+/// Compatibility wrapper retaining the existing all-or-nothing staging and
+/// cancellation/abort guard while consuming the authenticated source.
 pub(crate) async fn authenticate_then_stage_decrypt<R, S>(
     reader: &mut R,
     sink: &mut S,
@@ -235,88 +731,62 @@ where
     R: PinnedLegacyRangeReader,
     S: PlaintextStagingSink,
 {
-    let object = reader.pin_legacy_object().await?;
-    let ciphertext_len = validate_envelope_len(object.byte_len)?;
-    let aad = aad_profile.bytes()?;
-    validate_aad_len(aad)?;
-
-    let mut nonce: [u8; NONCE_LEN] = Default::default();
-    read_exact(reader, &object, 0, &mut nonce).await?;
-    if nonce.starts_with(V2_MAGIC) {
-        nonce.zeroize();
-        return Err(crypto_error("v2 envelope is not a historic legacy blob"));
-    }
-    let tag_offset = (NONCE_LEN as u64)
-        .checked_add(ciphertext_len)
-        .ok_or_else(|| crypto_error("legacy ciphertext offset overflow"))?;
-    let mut first_tag = [0u8; TAG_LEN];
-    read_exact(reader, &object, tag_offset, &mut first_tag).await?;
-
-    let key = Zeroizing::new(dek.0);
-    let first_digest = authenticate_pass(
-        reader,
-        &object,
-        &key,
-        &nonce,
-        aad,
-        ciphertext_len,
-        &first_tag,
-    )
-    .await;
-    drop(key);
-    let mut first_digest = match first_digest {
-        Ok(digest) => digest,
-        Err(error) => {
-            nonce.zeroize();
-            first_tag.zeroize();
-            return Err(error);
-        }
-    };
-
-    // No plaintext, even in a temporary sink, is written before authentication.
-    let staging = match sink.begin(ciphertext_len) {
+    let source_identity = LegacySourceIdentity::compatibility_wrapper();
+    let mut source = authenticate_legacy_source(reader, dek, aad_profile, &source_identity).await?;
+    let expected_binding = source.binding();
+    let staging = match sink.begin(source.plaintext_len()) {
         Ok(staging) => staging,
         Err(error) => {
-            first_digest.zeroize();
-            nonce.zeroize();
-            first_tag.zeroize();
             return Err(error);
         }
     };
     let mut staging = StagingGuard::new(sink, staging);
-    let second = {
+    let mut buffer = Zeroizing::new(vec![0u8; MAX_CHUNK_BYTES]);
+    loop {
+        let provisional = source.read_provisional(&mut buffer).await?;
+        let count = provisional.len();
+        if count == 0 {
+            break;
+        }
         let (sink, temporary_output) = staging.parts_mut();
-        decrypt_second_pass(
-            reader,
-            &object,
-            sink,
-            temporary_output,
-            dek,
-            aad,
-            ciphertext_len,
-            &nonce,
-            &first_tag,
-            &first_digest,
-        )
-        .await
-    };
-    first_digest.zeroize();
-    nonce.zeroize();
-    first_tag.zeroize();
-
-    match second {
-        Ok(()) => match staging.commit().await {
-            Ok(()) => Ok(LegacyGcmRead {
-                plaintext_len: ciphertext_len,
-            }),
-            Err(error) => Err(error),
-        },
+        sink.write(temporary_output, &buffer[..count]).await?;
+        buffer[..count].zeroize();
+    }
+    buffer.zeroize();
+    match source.finish().await {
+        Ok(completion) => {
+            let plaintext_len = completion.plaintext_len;
+            completion.verify_binding(expected_binding)?;
+            match staging.commit().await {
+                Ok(()) => Ok(LegacyGcmRead { plaintext_len }),
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     }
 }
 
 fn crypto_error(message: &'static str) -> EnclaveError {
     EnclaveError::Crypto(format!("legacy GCM migration: {message}"))
+}
+
+fn source_binding(
+    identity: LegacySourceIdentityCommitment,
+    generation: LegacyGeneration,
+    encrypted_len: u64,
+    plaintext_len: u64,
+    aad_profile: u8,
+    first_digest: &[u8; 32],
+) -> LegacySourceBinding {
+    let mut digest = Sha256::new();
+    digest.update(SOURCE_BINDING_DOMAIN);
+    digest.update(identity.0);
+    digest.update(generation.0.get().to_be_bytes());
+    digest.update(encrypted_len.to_be_bytes());
+    digest.update(plaintext_len.to_be_bytes());
+    digest.update([aad_profile]);
+    digest.update(first_digest);
+    LegacySourceBinding(digest.finalize().into())
 }
 
 fn validate_envelope_len(total_len: u64) -> Result<u64> {
@@ -344,6 +814,39 @@ fn validate_aad_len(aad: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Zeroizes a range destination unless the exact receipt is validated. This
+/// guard remains live across the reader await, so cancellation cannot leave a
+/// caller-owned buffer containing a partial ciphertext response.
+struct ExactRangeBuffer<'a> {
+    destination: &'a mut [u8],
+    validated: bool,
+}
+
+impl<'a> ExactRangeBuffer<'a> {
+    fn new(destination: &'a mut [u8]) -> Self {
+        Self {
+            destination,
+            validated: false,
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self.destination
+    }
+
+    fn validate(&mut self) {
+        self.validated = true;
+    }
+}
+
+impl Drop for ExactRangeBuffer<'_> {
+    fn drop(&mut self) {
+        if !self.validated {
+            self.destination.zeroize();
+        }
+    }
+}
+
 async fn read_exact<R: PinnedLegacyRangeReader>(
     reader: &mut R,
     object: &PinnedLegacyObject,
@@ -358,23 +861,23 @@ async fn read_exact<R: PinnedLegacyRangeReader>(
     if end > object.byte_len {
         return Err(crypto_error("legacy range exceeds pinned object length"));
     }
-    let receipt = match reader.read_pinned_exact(object, offset, destination).await {
+    let mut buffer = ExactRangeBuffer::new(destination);
+    let receipt = match reader
+        .read_pinned_exact(object, offset, buffer.bytes_mut())
+        .await
+    {
         Ok(receipt) => receipt,
-        Err(error) => {
-            destination.zeroize();
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
-    if receipt.generation != object.generation
+    if !receipt.object.matches(object)
         || receipt.offset != offset
         || receipt.byte_len != requested_len
-        || receipt.total_len != object.byte_len
     {
-        destination.zeroize();
         return Err(crypto_error(
-            "legacy range did not match pinned generation and extent",
+            "legacy range did not match pinned source, generation, and extent",
         ));
     }
+    buffer.validate();
     Ok(())
 }
 
@@ -417,99 +920,6 @@ async fn authenticate_pass<R: PinnedLegacyRangeReader>(
         return Err(crypto_error("legacy envelope authentication failed"));
     }
     Ok(digest.finalize().into())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn decrypt_second_pass<R, S>(
-    reader: &mut R,
-    object: &PinnedLegacyObject,
-    sink: &mut S,
-    staging: &mut S::Staging,
-    dek: &Dek,
-    aad: &[u8],
-    ciphertext_len: u64,
-    first_nonce: &[u8; NONCE_LEN],
-    first_tag: &[u8; TAG_LEN],
-    first_digest: &[u8; 32],
-) -> Result<()>
-where
-    R: PinnedLegacyRangeReader,
-    S: PlaintextStagingSink,
-{
-    let mut nonce: [u8; NONCE_LEN] = Default::default();
-    read_exact(reader, object, 0, &mut nonce).await?;
-    if nonce.ct_eq(first_nonce).unwrap_u8() != 1 || nonce.starts_with(V2_MAGIC) {
-        nonce.zeroize();
-        return Err(crypto_error("legacy nonce changed between passes"));
-    }
-    let key = Zeroizing::new(dek.0);
-    let mut authenticator = GcmAuthenticator::new(&key, &nonce, aad)?;
-    let mut ctr_iv = gcm_counter_start(&nonce)?;
-    let mut ctr = Ctr32BE::<Aes256>::new(
-        GenericArray::from_slice(&*key),
-        GenericArray::from_slice(&ctr_iv),
-    );
-    drop(key);
-    ctr_iv.zeroize();
-    let mut digest = Sha256::new();
-    let mut offset = NONCE_LEN as u64;
-    let end = offset
-        .checked_add(ciphertext_len)
-        .ok_or_else(|| crypto_error("legacy ciphertext range overflow"))?;
-    let mut buffer = Zeroizing::new(vec![0u8; MAX_CHUNK_BYTES]);
-    while offset < end {
-        let bytes = usize::try_from((end - offset).min(MAX_CHUNK_BYTES as u64))
-            .map_err(|_| crypto_error("legacy ciphertext chunk length overflow"))?;
-        let chunk = &mut buffer[..bytes];
-        if let Err(error) = read_exact(reader, object, offset, chunk).await {
-            buffer.zeroize();
-            nonce.zeroize();
-            return Err(error);
-        }
-        authenticator.absorb_ciphertext(chunk);
-        digest.update(&*chunk);
-        if ctr.try_apply_keystream(chunk).is_err() {
-            chunk.zeroize();
-            buffer.zeroize();
-            nonce.zeroize();
-            return Err(crypto_error("legacy GCM counter exhausted during decrypt"));
-        }
-        if let Err(error) = sink.write(staging, chunk).await {
-            chunk.zeroize();
-            buffer.zeroize();
-            nonce.zeroize();
-            return Err(error);
-        }
-        chunk.zeroize();
-        offset = offset
-            .checked_add(bytes as u64)
-            .ok_or_else(|| crypto_error("legacy ciphertext offset overflow"))?;
-    }
-    buffer.zeroize();
-    nonce.zeroize();
-
-    let tag_offset = (NONCE_LEN as u64)
-        .checked_add(ciphertext_len)
-        .ok_or_else(|| crypto_error("legacy ciphertext offset overflow"))?;
-    let mut second_tag = [0u8; TAG_LEN];
-    read_exact(reader, object, tag_offset, &mut second_tag).await?;
-    let tag_same = second_tag.ct_eq(first_tag).unwrap_u8() == 1;
-    let mut calculated_tag = authenticator.finish(ciphertext_len)?;
-    let tag_valid = calculated_tag.ct_eq(&second_tag).unwrap_u8() == 1;
-    calculated_tag.zeroize();
-    second_tag.zeroize();
-    if !tag_same || !tag_valid {
-        return Err(crypto_error(
-            "legacy envelope changed or failed authentication in second pass",
-        ));
-    }
-    let mut second_digest: [u8; 32] = digest.finalize().into();
-    let same_digest = second_digest.ct_eq(first_digest).unwrap_u8() == 1;
-    second_digest.zeroize();
-    if !same_digest {
-        return Err(crypto_error("legacy ciphertext changed between passes"));
-    }
-    Ok(())
 }
 
 /// Exact `inc32(J0)` used for the first GCM CTR block. The length bound above
@@ -656,6 +1066,8 @@ mod tests {
         receipt_fault_after_call: Option<usize>,
         second_pass_mutation: Option<(usize, u8)>,
         pending_after_call: Option<usize>,
+        pending_partial_bytes: usize,
+        selected_identity: LegacySourceIdentity,
         calls: usize,
     }
     impl Default for FakeReader {
@@ -668,6 +1080,8 @@ mod tests {
                 receipt_fault_after_call: None,
                 second_pass_mutation: None,
                 pending_after_call: None,
+                pending_partial_bytes: 0,
+                selected_identity: LegacySourceIdentity::compatibility_wrapper(),
                 calls: 0,
             }
         }
@@ -678,6 +1092,7 @@ mod tests {
         Offset,
         Length,
         Total,
+        Identity,
     }
     impl FakeReader {
         fn new(bytes: Vec<u8>) -> Self {
@@ -687,12 +1102,20 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        fn selected(bytes: Vec<u8>, identity: &LegacySourceIdentity) -> Self {
+            Self {
+                selected_identity: identity.clone(),
+                ..Self::new(bytes)
+            }
+        }
     }
     impl sealed::RangeReader for FakeReader {}
     #[async_trait::async_trait]
     impl PinnedLegacyRangeReader for FakeReader {
         async fn pin_legacy_object(&mut self) -> Result<PinnedLegacyObject> {
             Ok(PinnedLegacyObject::new(
+                &self.selected_identity,
                 self.generation,
                 self.bytes.len() as u64,
             ))
@@ -704,19 +1127,21 @@ mod tests {
             destination: &mut [u8],
         ) -> Result<LegacyRangeReceipt> {
             self.calls += 1;
-            if self
-                .pending_after_call
-                .is_some_and(|after| self.calls > after)
-            {
-                std::future::pending::<()>().await;
-                unreachable!("pending reader resumed")
-            }
             let start = usize::try_from(offset).map_err(|_| crypto_error("test offset"))?;
             let end = start
                 .checked_add(destination.len())
                 .ok_or_else(|| crypto_error("test range overflow"))?;
             if end > self.bytes.len() {
                 return Err(crypto_error("test source range unavailable"));
+            }
+            if self
+                .pending_after_call
+                .is_some_and(|after| self.calls > after)
+            {
+                let partial = self.pending_partial_bytes.min(destination.len());
+                destination[..partial].copy_from_slice(&self.bytes[start..start + partial]);
+                std::future::pending::<()>().await;
+                unreachable!("pending reader resumed")
             }
             let mut written = 0;
             while written < destination.len() {
@@ -737,23 +1162,24 @@ mod tests {
                     }
                 }
             }
-            let mut receipt = LegacyRangeReceipt::new(
-                object.generation,
-                offset,
-                destination.len() as u64,
-                object.byte_len,
-            );
+            let mut receipt =
+                LegacyRangeReceipt::new(object.clone(), offset, destination.len() as u64);
             let inject_fault = self
                 .receipt_fault_after_call
                 .map_or(true, |after| self.calls > after);
             match self.receipt_fault.filter(|_| inject_fault) {
                 Some(ReceiptFault::Generation) => {
-                    receipt.generation = LegacyGeneration::new(999).unwrap()
+                    receipt.object.generation = LegacyGeneration::new(999).unwrap()
                 }
                 Some(ReceiptFault::Offset) => receipt.offset = offset.saturating_add(1),
                 Some(ReceiptFault::Length) => receipt.byte_len = receipt.byte_len.saturating_sub(1),
                 Some(ReceiptFault::Total) => {
-                    receipt.total_len = receipt.total_len.saturating_add(1)
+                    receipt.object.byte_len = receipt.object.byte_len.saturating_add(1)
+                }
+                Some(ReceiptFault::Identity) => {
+                    receipt.object.identity = LegacySourceIdentity::new(b"other-receipt-source")
+                        .unwrap()
+                        .commitment()
                 }
                 None => {}
             }
@@ -766,6 +1192,7 @@ mod tests {
         writes: usize,
         commits: usize,
         aborts: usize,
+        begins: usize,
         fail_begin: bool,
         pending_write: bool,
         pending_commit: bool,
@@ -777,6 +1204,7 @@ mod tests {
     impl PlaintextStagingSink for FakeSink {
         type Staging = FakeStaging;
         fn begin(&mut self, _: u64) -> Result<Self::Staging> {
+            self.begins += 1;
             if self.fail_begin {
                 return Err(crypto_error("test sink begin failure"));
             }
@@ -811,6 +1239,9 @@ mod tests {
     }
     fn fixture_nonce(byte: u8) -> [u8; NONCE_LEN] {
         std::array::from_fn(|_| byte)
+    }
+    fn source_identity() -> LegacySourceIdentity {
+        LegacySourceIdentity::new(b"test-canonical-source").unwrap()
     }
     fn envelope(plaintext: &[u8], aad: &[u8], nonce: [u8; NONCE_LEN]) -> Vec<u8> {
         let cipher = Aes256Gcm::new_from_slice(&dek().0).unwrap();
@@ -922,6 +1353,27 @@ mod tests {
         assert!(sink.committed.is_empty());
     }
     #[tokio::test]
+    async fn wrong_independently_selected_object_fails_before_ranges_or_staging() {
+        let blob = envelope(b"identity-bound pin", &[], fixture_nonce(15));
+        let mut reader = FakeReader::new(blob);
+        reader.selected_identity =
+            LegacySourceIdentity::new(b"buggy-adapter-selected-another-source").unwrap();
+        let mut sink = FakeSink::default();
+        assert!(authenticate_then_stage_decrypt(
+            &mut reader,
+            &mut sink,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+        )
+        .await
+        .is_err());
+        assert_eq!(reader.calls, 0);
+        assert_eq!(sink.begins, 0);
+        assert_eq!(sink.writes, 0);
+        assert_eq!(sink.commits, 0);
+        assert_eq!(sink.aborts, 0);
+    }
+    #[tokio::test]
     async fn rejects_truncation_and_v2_marker_without_output() {
         for blob in [vec![], vec![0; NONCE_LEN + TAG_LEN - 1], V2_MAGIC.to_vec()] {
             let (result, _, sink) = run(blob, LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite)).await;
@@ -943,6 +1395,7 @@ mod tests {
             ReceiptFault::Offset,
             ReceiptFault::Length,
             ReceiptFault::Total,
+            ReceiptFault::Identity,
         ] {
             let mut reader = FakeReader::new(blob.clone());
             reader.receipt_fault = Some(fault);
@@ -1114,6 +1567,355 @@ mod tests {
         assert_eq!(sink.aborts, 1);
         assert!(sink.committed.is_empty());
     }
+    #[tokio::test]
+    async fn authenticated_source_is_bounded_sequential_and_finishes_once() {
+        let plaintext = b"source chunks are sequential".to_vec();
+        let blob = envelope(&plaintext, &[], fixture_nonce(11));
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob, &identity);
+        let mut source = authenticate_legacy_source(
+            &mut reader,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &identity,
+        )
+        .await
+        .unwrap();
+        let pre_staging_binding = source.binding();
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 7];
+        loop {
+            let count = source.read_provisional(&mut buffer).await.unwrap().len();
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count]);
+            buffer[..count].zeroize();
+        }
+        assert_eq!(output, plaintext);
+        let completion = source.finish().await.unwrap();
+        assert_eq!(completion.plaintext_len, output.len() as u64);
+        assert_eq!(
+            completion.verify_binding(pre_staging_binding).unwrap(),
+            pre_staging_binding
+        );
+        assert!(source.finish().await.is_err());
+        assert!(source.read_provisional(&mut buffer).await.is_err());
+    }
+    #[tokio::test]
+    async fn completion_binding_substitution_is_rejected() {
+        let plaintext = b"completion is bound to the exact first pass";
+        let blob = envelope(plaintext, &[], fixture_nonce(18));
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob, &identity);
+        let mut source = authenticate_legacy_source(
+            &mut reader,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &identity,
+        )
+        .await
+        .unwrap();
+        let mut buffer = [0u8; 64];
+        assert_eq!(
+            source.read_provisional(&mut buffer).await.unwrap().len(),
+            plaintext.len()
+        );
+        buffer.zeroize();
+        assert_eq!(source.read_provisional(&mut buffer).await.unwrap().len(), 0);
+        let mut substituted_binding = source.binding();
+        substituted_binding.0[0] ^= 1;
+        let completion = source.finish().await.unwrap();
+        assert!(completion.verify_binding(substituted_binding).is_err());
+        buffer.zeroize();
+    }
+    #[tokio::test]
+    async fn source_binding_is_identity_and_profile_specific_and_redacted() {
+        let blob = envelope(b"binding", &[], fixture_nonce(12));
+        let first = LegacySourceIdentity::new(b"canonical-source-a").unwrap();
+        let second = LegacySourceIdentity::new(b"canonical-source-b").unwrap();
+        let mut reader_a = FakeReader::selected(blob.clone(), &first);
+        let source_a = authenticate_legacy_source(
+            &mut reader_a,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &first,
+        )
+        .await
+        .unwrap();
+        let binding_a = source_a.binding();
+        drop(source_a);
+        let mut reader_b = FakeReader::selected(blob.clone(), &second);
+        let source_b = authenticate_legacy_source(
+            &mut reader_b,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &second,
+        )
+        .await
+        .unwrap();
+        assert_ne!(binding_a, source_b.binding());
+        drop(source_b);
+        let mut reader_profile = FakeReader::selected(blob.clone(), &first);
+        let source_profile = authenticate_legacy_source(
+            &mut reader_profile,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Control),
+            &first,
+        )
+        .await
+        .unwrap();
+        assert_ne!(binding_a, source_profile.binding());
+        drop(source_profile);
+        let mut reader_generation = FakeReader::selected(blob.clone(), &first);
+        reader_generation.generation = LegacyGeneration::new(124).unwrap();
+        let source_generation = authenticate_legacy_source(
+            &mut reader_generation,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &first,
+        )
+        .await
+        .unwrap();
+        assert_ne!(binding_a, source_generation.binding());
+        drop(source_generation);
+        let mut reader_digest =
+            FakeReader::selected(envelope(b"changed", &[], fixture_nonce(12)), &first);
+        let source_digest = authenticate_legacy_source(
+            &mut reader_digest,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &first,
+        )
+        .await
+        .unwrap();
+        assert_ne!(binding_a, source_digest.binding());
+        assert!(!format!("{first:?}").contains("canonical-source-a"));
+        assert!(!format!("{:?}", source_digest.binding()).contains("binding"));
+        assert!(LegacySourceIdentity::new(b"").is_err());
+        assert!(LegacySourceIdentity::new(&vec![1; MAX_SOURCE_IDENTITY_BYTES + 1]).is_err());
+    }
+    #[tokio::test]
+    async fn early_finish_is_terminal_and_cannot_be_retried_or_replayed() {
+        let blob = envelope(
+            b"finish must consume every plaintext byte",
+            &[],
+            fixture_nonce(13),
+        );
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob, &identity);
+        let mut source = authenticate_legacy_source(
+            &mut reader,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &identity,
+        )
+        .await
+        .unwrap();
+        let mut chunk = [0u8; 4];
+        assert!(source.finish().await.is_err());
+        assert!(source.finish().await.is_err());
+        assert!(source.read_provisional(&mut chunk).await.is_err());
+        chunk.zeroize();
+    }
+    #[tokio::test]
+    async fn source_owns_aad_state_after_first_pass() {
+        let mut aad = b"mutable-media-user".to_vec();
+        let plaintext = b"owned AAD protects the second pass".to_vec();
+        let blob = envelope(&plaintext, &aad, fixture_nonce(16));
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob, &identity);
+        let mut source = authenticate_legacy_source(
+            &mut reader,
+            &dek(),
+            LegacyGcmAad::MediaUserId(&aad),
+            &identity,
+        )
+        .await
+        .unwrap();
+        aad.zeroize();
+        aad.fill(b'x');
+
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 9];
+        loop {
+            let provisional = source.read_provisional(&mut chunk).await.unwrap();
+            if provisional.len() == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..provisional.len()]);
+            chunk.zeroize();
+        }
+        assert_eq!(output, plaintext);
+        assert_eq!(
+            source.finish().await.unwrap().plaintext_len,
+            output.len() as u64
+        );
+        chunk.zeroize();
+    }
+    #[tokio::test]
+    async fn cancelled_private_pull_zeroizes_partial_ciphertext_and_is_terminal() {
+        let blob = envelope(
+            b"partial ciphertext must not survive",
+            &[],
+            fixture_nonce(17),
+        );
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob, &identity);
+        // Calls 1-3 are first pass; call 4 revalidates the nonce. Call 5
+        // copies a partial ciphertext response and then remains pending.
+        reader.pending_after_call = Some(4);
+        reader.pending_partial_bytes = 5;
+        let mut source = authenticate_legacy_source(
+            &mut reader,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &identity,
+        )
+        .await
+        .unwrap();
+        let mut chunk = [0xa5; 64];
+        {
+            let future = source.read_provisional(&mut chunk);
+            tokio::pin!(future);
+            tokio::select! {
+                _ = &mut future => panic!("partial ciphertext fixture unexpectedly completed"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert!(chunk.iter().all(|byte| *byte == 0));
+        assert!(source.read_provisional(&mut chunk).await.is_err());
+        assert!(source.finish().await.is_err());
+        chunk.zeroize();
+    }
+    #[tokio::test]
+    async fn second_pass_nonce_tag_and_receipt_faults_leave_source_terminal() {
+        let blob = envelope(b"source second pass integrity", &[], fixture_nonce(14));
+        for mutation in [0, NONCE_LEN + 3, blob.len() - TAG_LEN] {
+            let identity = source_identity();
+            let mut reader = FakeReader::selected(blob.clone(), &identity);
+            reader.second_pass_mutation = Some((mutation, 0x80));
+            let mut source = authenticate_legacy_source(
+                &mut reader,
+                &dek(),
+                LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+                &identity,
+            )
+            .await
+            .unwrap();
+            let mut chunk = [0u8; 64];
+            if mutation == 0 {
+                assert!(source.read_provisional(&mut chunk).await.is_err());
+            } else {
+                assert!(source.read_provisional(&mut chunk).await.unwrap().len() > 0);
+                chunk.zeroize();
+                assert_eq!(source.read_provisional(&mut chunk).await.unwrap().len(), 0);
+                assert!(source.finish().await.is_err());
+            }
+            assert!(source.finish().await.is_err());
+            assert!(source.read_provisional(&mut chunk).await.is_err());
+            chunk.zeroize();
+        }
+
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob.clone(), &identity);
+        reader.receipt_fault = Some(ReceiptFault::Total);
+        reader.receipt_fault_after_call = Some(3);
+        let mut source = authenticate_legacy_source(
+            &mut reader,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &identity,
+        )
+        .await
+        .unwrap();
+        let mut chunk = [0u8; 64];
+        assert!(source.read_provisional(&mut chunk).await.is_err());
+        assert!(source.read_provisional(&mut chunk).await.is_err());
+        assert!(source.finish().await.is_err());
+        chunk.zeroize();
+
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob, &identity);
+        // First pass uses three reads; second-pass nonce and ciphertext use
+        // calls four and five, so only the exact tag/EOF receipt is malformed.
+        reader.receipt_fault = Some(ReceiptFault::Total);
+        reader.receipt_fault_after_call = Some(5);
+        let mut source = authenticate_legacy_source(
+            &mut reader,
+            &dek(),
+            LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+            &identity,
+        )
+        .await
+        .unwrap();
+        let mut chunk = [0u8; 64];
+        assert!(source.read_provisional(&mut chunk).await.unwrap().len() > 0);
+        chunk.zeroize();
+        assert_eq!(source.read_provisional(&mut chunk).await.unwrap().len(), 0);
+        assert!(source.finish().await.is_err());
+        assert!(source.read_provisional(&mut chunk).await.is_err());
+        chunk.zeroize();
+    }
+    #[tokio::test]
+    async fn early_source_drop_never_mints_completion() {
+        let blob = envelope(b"drop before completion", &[], fixture_nonce(13));
+        let identity = source_identity();
+        let mut reader = FakeReader::selected(blob, &identity);
+        {
+            let mut source = authenticate_legacy_source(
+                &mut reader,
+                &dek(),
+                LegacyGcmAad::Empty(LegacyEmptyAad::Sqlite),
+                &identity,
+            )
+            .await
+            .unwrap();
+            let mut buffer = [0u8; 4];
+            assert!(source.read_provisional(&mut buffer).await.unwrap().len() > 0);
+        }
+        // Source drop has no completion value and no plaintext staging authority.
+        assert!(reader.calls > 0);
+    }
+    #[test]
+    fn provisional_pull_and_completion_are_not_crate_visible() {
+        let source = include_str!("legacy_gcm.rs");
+        for (kind, name) in [
+            ("struct", "AuthenticatedLegacySource"),
+            ("struct", "LegacyGcmCompletion"),
+        ] {
+            let forbidden = ["pub(crate) ", kind, " ", name].concat();
+            assert!(!source.contains(&forbidden), "{name} became crate-visible");
+        }
+        for name in ["authenticate_legacy_source", "read_provisional"] {
+            let definition = source
+                .lines()
+                .find(|line| line.contains(&format!("fn {name}")))
+                .expect("sealed function definition exists");
+            assert!(
+                !definition.contains("pub(crate)"),
+                "{name} became callable from sibling runtime modules"
+            );
+        }
+        let parameterless_pin = [
+            "async fn pin_",
+            "legacy_object(&mut self) -> Result<PinnedLegacyObject>;",
+        ]
+        .concat();
+        assert!(
+            source.contains(&parameterless_pin),
+            "pinning must independently select an object without receiving the requested identity"
+        );
+        let completion = source
+            .find("struct LegacyGcmCompletion")
+            .expect("completion type exists");
+        let derive = source[..completion]
+            .rsplit_once("#[derive(")
+            .expect("completion derives are explicit")
+            .1;
+        assert!(!derive.contains("Clone"));
+        assert!(!derive.contains("Copy"));
+    }
     #[test]
     fn gcm_counter_starts_at_inc32_j0_and_enforces_bound() {
         let nonce = fixture_nonce(0xa5);
@@ -1128,8 +1930,9 @@ mod tests {
     #[test]
     fn rejects_zero_generation_and_redacts_source_debug() {
         assert!(LegacyGeneration::new(0).is_err());
-        let object = PinnedLegacyObject::new(LegacyGeneration::new(123).unwrap(), 28);
-        let receipt = LegacyRangeReceipt::new(LegacyGeneration::new(123).unwrap(), 0, 12, 28);
+        let identity = source_identity();
+        let object = PinnedLegacyObject::new(&identity, LegacyGeneration::new(123).unwrap(), 28);
+        let receipt = LegacyRangeReceipt::new(object.clone(), 0, 12);
         let object_debug = format!("{object:?}");
         let receipt_debug = format!("{receipt:?}");
         assert!(!object_debug.contains("123"));
