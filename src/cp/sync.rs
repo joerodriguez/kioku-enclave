@@ -18,6 +18,7 @@ use axum::{
 };
 use base64::Engine as _;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
@@ -102,20 +103,7 @@ async fn sync_status(
 
 async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUser>) -> Response {
     match dump_user_export(&s.store, &user.0).await {
-        Ok(data) => (
-            [
-                (
-                    header::CONTENT_TYPE,
-                    "application/json; charset=utf-8".to_string(),
-                ),
-                (
-                    header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"kioku-export.json\"".to_string(),
-                ),
-            ],
-            Json(data),
-        )
-            .into_response(),
+        Ok(data) => export_success_response(data),
         Err(e) => {
             warn!(error = %e, "export failed");
             (
@@ -127,27 +115,350 @@ async fn export(State(s): State<Arc<CpState>>, Extension(user): Extension<AuthUs
     }
 }
 
+fn export_success_response(data: serde_json::Value) -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/json; charset=utf-8".to_string(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"kioku-export.json\"".to_string(),
+            ),
+        ],
+        Json(data),
+    )
+        .into_response()
+}
+
 async fn dump_user_export(store: &Store, user_id: &str) -> EnclaveResult<serde_json::Value> {
     crate::store::validate_user_id(user_id)?;
-    store
-        .read_user(user_id, |conn| {
-            Ok(json!({
-                "utterances": dump_optional_table(conn, "utterances", "id")?,
-                "screenshots": dump_optional_table(conn, "screenshots", "id")?,
-                "screenshot_images": dump_optional_table(conn, "screenshot_images", "id")?,
-                "episodes": dump_optional_table(conn, "episodes", "id")?,
-                "episode_final_briefs": dump_optional_table(conn, "episode_final_briefs", "episode_id")?,
-                "capture_sessions": dump_optional_table(conn, "capture_sessions", "created_at")?,
-                "capture_streams": dump_optional_table(conn, "capture_streams", "created_at")?,
-                "capture_events": dump_optional_table(conn, "capture_events", "started_at, event_id")?,
-                "media_objects": dump_optional_table(conn, "media_objects", "created_at, event_id")?,
-                "speaker_observations": dump_optional_table(conn, "speaker_observations", "started_at, event_id, id")?,
-                "people": dump_optional_table(conn, "people", "display_name, id")?,
-                "voice_profiles": dump_optional_table(conn, "voice_profiles", "person_id, id")?,
-                "voice_samples": dump_optional_table(conn, "voice_samples", "speaker_observation_id, id")?,
-            }))
-        })
-        .await
+    store.read_user(user_id, canonical_logical_export).await
+}
+
+/// Version of the logical user export representation.  It is deliberately
+/// separate from the HTTP route: inactive ADR-0022 shadow verification uses
+/// the same pure value and hashes a version tag before comparing it.  Bump this
+/// when a reviewed export-schema change is intentionally incompatible.
+pub(crate) const CANONICAL_LOGICAL_EXPORT_VERSION: u16 = 1;
+
+#[derive(Clone, Copy)]
+struct CanonicalExportTable {
+    response_field: &'static str,
+    table: &'static str,
+    response_order: &'static str,
+    digest_order: &'static str,
+}
+
+/// This order is the existing `/api/export` object construction order and the
+/// versioned logical-export digest order. All strings are compile-time SQL,
+/// never caller input.
+const CANONICAL_EXPORT_TABLES: &[CanonicalExportTable] = &[
+    CanonicalExportTable {
+        response_field: "utterances",
+        table: "utterances",
+        response_order: "id",
+        digest_order: "id",
+    },
+    CanonicalExportTable {
+        response_field: "screenshots",
+        table: "screenshots",
+        response_order: "id",
+        digest_order: "id",
+    },
+    CanonicalExportTable {
+        response_field: "screenshot_images",
+        table: "screenshot_images",
+        response_order: "id",
+        digest_order: "id",
+    },
+    CanonicalExportTable {
+        response_field: "episodes",
+        table: "episodes",
+        response_order: "id",
+        digest_order: "id",
+    },
+    CanonicalExportTable {
+        response_field: "episode_final_briefs",
+        table: "episode_final_briefs",
+        response_order: "episode_id",
+        digest_order: "episode_id",
+    },
+    CanonicalExportTable {
+        response_field: "capture_sessions",
+        table: "capture_sessions",
+        response_order: "created_at",
+        digest_order: "created_at, id",
+    },
+    CanonicalExportTable {
+        response_field: "capture_streams",
+        table: "capture_streams",
+        response_order: "created_at",
+        digest_order: "created_at, id",
+    },
+    CanonicalExportTable {
+        response_field: "capture_events",
+        table: "capture_events",
+        response_order: "started_at, event_id",
+        digest_order: "started_at, event_id",
+    },
+    CanonicalExportTable {
+        response_field: "media_objects",
+        table: "media_objects",
+        response_order: "created_at, event_id",
+        digest_order: "created_at, event_id, asset_id",
+    },
+    CanonicalExportTable {
+        response_field: "speaker_observations",
+        table: "speaker_observations",
+        response_order: "started_at, event_id, id",
+        digest_order: "started_at, event_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "people",
+        table: "people",
+        response_order: "display_name, id",
+        digest_order: "display_name, id",
+    },
+    CanonicalExportTable {
+        response_field: "voice_profiles",
+        table: "voice_profiles",
+        response_order: "person_id, id",
+        digest_order: "person_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "voice_samples",
+        table: "voice_samples",
+        response_order: "speaker_observation_id, id",
+        digest_order: "speaker_observation_id, id",
+    },
+];
+
+const MAX_CANONICAL_EXPORT_ROWS_PER_TABLE: u64 = 2_000_000;
+const MAX_CANONICAL_EXPORT_TOTAL_ROWS: u64 = 8_000_000;
+const MAX_CANONICAL_EXPORT_COLUMNS: usize = 256;
+const MAX_CANONICAL_EXPORT_COLUMN_NAME_BYTES: usize = 256;
+const MAX_CANONICAL_EXPORT_FIELD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CANONICAL_EXPORT_ROW_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CANONICAL_EXPORT_TOTAL_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+
+/// The exact value served by `/api/export`, kept pure so an inactive shadow
+/// verifier can compare the same representation without a route, Store, or
+/// provider connection.  Keep field order and optional-table behavior stable:
+/// callers serialize this value exactly as before.
+pub(crate) fn canonical_logical_export(
+    conn: &rusqlite::Connection,
+) -> EnclaveResult<serde_json::Value> {
+    let mut value = serde_json::Map::new();
+    for table in CANONICAL_EXPORT_TABLES {
+        value.insert(
+            table.response_field.to_string(),
+            serde_json::Value::Array(dump_optional_table(
+                conn,
+                table.table,
+                table.response_order,
+            )?),
+        );
+    }
+    Ok(serde_json::Value::Object(value))
+}
+
+/// Version-bound, bounded-memory SHA-256 over the exact logical values exposed
+/// by `/api/export`. It streams rows and SQL values directly into the digest;
+/// the parity path never constructs or serializes the full export JSON value.
+#[cfg(test)]
+pub(crate) fn canonical_logical_export_stream_digest(
+    conn: &rusqlite::Connection,
+) -> EnclaveResult<[u8; 32]> {
+    canonical_logical_export_stream_digest_guarded(conn, || true)
+}
+
+pub(crate) fn canonical_logical_export_stream_digest_guarded<F>(
+    conn: &rusqlite::Connection,
+    guard: F,
+) -> EnclaveResult<[u8; 32]>
+where
+    F: FnMut() -> bool,
+{
+    canonical_logical_export_stream_digest_for_version(
+        conn,
+        CANONICAL_LOGICAL_EXPORT_VERSION,
+        guard,
+    )
+}
+
+fn canonical_logical_export_stream_digest_for_version<F>(
+    conn: &rusqlite::Connection,
+    version: u16,
+    mut guard: F,
+) -> EnclaveResult<[u8; 32]>
+where
+    F: FnMut() -> bool,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku.adr0022.logical-export-digest\0");
+    hasher.update(version.to_be_bytes());
+    let mut budget = CanonicalExportDigestBudget::default();
+    for table in CANONICAL_EXPORT_TABLES {
+        if !guard() {
+            return Err(EnclaveError::Store(
+                "canonical export digest cancelled".into(),
+            ));
+        }
+        hash_export_bytes(&mut hasher, table.response_field.as_bytes());
+        stream_canonical_export_table(conn, *table, &mut hasher, &mut budget, &mut guard)?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[derive(Default)]
+struct CanonicalExportDigestBudget {
+    total_rows: u64,
+    total_bytes: u64,
+}
+
+fn stream_canonical_export_table<F>(
+    conn: &rusqlite::Connection,
+    table: CanonicalExportTable,
+    hasher: &mut Sha256,
+    budget: &mut CanonicalExportDigestBudget,
+    guard: &mut F,
+) -> EnclaveResult<()>
+where
+    F: FnMut() -> bool,
+{
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table.table],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        hasher.update(0_u64.to_be_bytes());
+        return Ok(());
+    }
+    let mut statement = conn.prepare(&format!(
+        "SELECT * FROM {} ORDER BY {}",
+        table.table, table.digest_order
+    ))?;
+    if statement.column_count() > MAX_CANONICAL_EXPORT_COLUMNS {
+        return Err(EnclaveError::Store(
+            "canonical export digest column limit exceeded".into(),
+        ));
+    }
+    let column_names: Vec<String> = statement
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if column_names
+        .iter()
+        .any(|name| name.len() > MAX_CANONICAL_EXPORT_COLUMN_NAME_BYTES)
+    {
+        return Err(EnclaveError::Store(
+            "canonical export digest column-name limit exceeded".into(),
+        ));
+    }
+    let mut rows = statement.query([])?;
+    let mut table_rows = 0_u64;
+    while let Some(row) = rows.next()? {
+        if !guard() {
+            return Err(EnclaveError::Store(
+                "canonical export digest cancelled".into(),
+            ));
+        }
+        table_rows = table_rows.saturating_add(1);
+        budget.total_rows = budget.total_rows.saturating_add(1);
+        if table_rows > MAX_CANONICAL_EXPORT_ROWS_PER_TABLE
+            || budget.total_rows > MAX_CANONICAL_EXPORT_TOTAL_ROWS
+        {
+            return Err(EnclaveError::Store(
+                "canonical export digest row limit exceeded".into(),
+            ));
+        }
+        hasher.update(b"row\0");
+        let mut row_bytes = 0_u64;
+        for (index, column) in column_names.iter().enumerate() {
+            hash_export_bytes(hasher, column.as_bytes());
+            let value = row.get_ref(index)?;
+            let value_bytes = hash_canonical_export_value(hasher, value)?;
+            row_bytes = row_bytes.saturating_add(value_bytes);
+            budget.total_bytes = budget.total_bytes.saturating_add(value_bytes);
+            if row_bytes > MAX_CANONICAL_EXPORT_ROW_BYTES
+                || budget.total_bytes > MAX_CANONICAL_EXPORT_TOTAL_BYTES
+            {
+                return Err(EnclaveError::Store(
+                    "canonical export digest byte limit exceeded".into(),
+                ));
+            }
+        }
+    }
+    hasher.update(table_rows.to_be_bytes());
+    Ok(())
+}
+
+fn hash_canonical_export_value(
+    hasher: &mut Sha256,
+    value: rusqlite::types::ValueRef<'_>,
+) -> EnclaveResult<u64> {
+    use rusqlite::types::ValueRef;
+    let bytes = match value {
+        ValueRef::Null => {
+            hasher.update([0]);
+            1
+        }
+        ValueRef::Integer(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+            9
+        }
+        ValueRef::Real(value) if value.is_finite() => {
+            hasher.update([2]);
+            hasher.update(value.to_bits().to_be_bytes());
+            9
+        }
+        ValueRef::Real(_) => {
+            // `/api/export` maps non-JSON SQLite floats to JSON null.
+            hasher.update([0]);
+            1
+        }
+        ValueRef::Text(value) => {
+            hash_bounded_export_field(hasher, 3, value)?;
+            9_u64.saturating_add(value.len() as u64)
+        }
+        ValueRef::Blob(value) => {
+            // The HTTP representation is base64, a one-to-one encoding. Hash
+            // the exact source bytes with a distinct type tag without building
+            // the temporary base64 string.
+            hash_bounded_export_field(hasher, 4, value)?;
+            9_u64.saturating_add(value.len() as u64)
+        }
+    };
+    Ok(bytes)
+}
+
+fn hash_bounded_export_field(hasher: &mut Sha256, tag: u8, value: &[u8]) -> EnclaveResult<()> {
+    if value.len() > MAX_CANONICAL_EXPORT_FIELD_BYTES {
+        return Err(EnclaveError::Store(
+            "canonical export digest field limit exceeded".into(),
+        ));
+    }
+    hasher.update([tag]);
+    hash_export_bytes(hasher, value);
+    Ok(())
+}
+
+fn hash_export_bytes(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_logical_export_stream_digest_at_version(
+    conn: &rusqlite::Connection,
+    version: u16,
+) -> EnclaveResult<[u8; 32]> {
+    canonical_logical_export_stream_digest_for_version(conn, version, || true)
 }
 
 pub(crate) fn dump_optional_table(
@@ -633,6 +944,50 @@ mod tests {
         tests::{insert_screenshot_evidence, FakeGcs, FakeKms},
         GcsClient,
     };
+
+    #[tokio::test]
+    async fn canonical_export_helper_preserves_serialized_body_and_headers() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE utterances (id INTEGER PRIMARY KEY, text TEXT, payload BLOB);
+             INSERT INTO utterances VALUES (1, 'hello', X'010203');",
+        )
+        .unwrap();
+        let value = canonical_logical_export(&conn).unwrap();
+        let expected = json!({
+            "utterances": [{"id": 1, "text": "hello", "payload": "AQID"}],
+            "screenshots": [],
+            "screenshot_images": [],
+            "episodes": [],
+            "episode_final_briefs": [],
+            "capture_sessions": [],
+            "capture_streams": [],
+            "capture_events": [],
+            "media_objects": [],
+            "speaker_observations": [],
+            "people": [],
+            "voice_profiles": [],
+            "voice_samples": [],
+        });
+        let expected_bytes = serde_json::to_vec(&expected).unwrap();
+        assert_eq!(value, expected);
+        assert_eq!(serde_json::to_vec(&value).unwrap(), expected_bytes);
+
+        let response = export_success_response(value);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"kioku-export.json\""
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected_bytes.as_slice());
+    }
 
     #[tokio::test]
     async fn pending_response_is_machine_readable_and_sets_retry_after() {

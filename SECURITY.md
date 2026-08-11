@@ -68,6 +68,22 @@ surfaces.
   leave the enclave.
 - Decrypted databases exist only in the `/tmp` Confidential Space tmpfs and in process
   memory. User content and key material must never be logged.
+- The ADR-0022 SQLite shadow-parity checker is inactive and advisory-only. If future
+  rollout code invokes it, a separately reviewed recovery factory must mint two distinct
+  owner-private disposable staging copies; this release has no non-test constructor for
+  that capability. Normal inspections use independent read-only connections. It
+  streams every ordinary live table, the canonical export representation, and exact
+  vector row ids/encoded bytes under hard row/field/total budgets; bounded 64-row probes
+  remain diagnostic and are never the full parity gate. SQLite exposes FTS5's documented
+  no-op external-content integrity command only as an `INSERT`, so a private staging-only
+  connection may execute at most six compile-time FTS check commands after exact,
+  comment-rejecting verification of each expected virtual-table/source schema; it accepts
+  no caller SQL and grants no live persistence authority. Alias-bearing and `WITHOUT
+  ROWID` tables fail closed until an index-backed traversal is reviewed. It emits only
+  typed outcomes plus opaque versioned digests and
+  exposes cancellation/deadline checks. It has no Store, VFS, route,
+  credential, provider, scheduler, publication, recovery, deletion, or cutover
+  authority; a match never authorizes any of those actions.
 - Archive storage telemetry is process-aggregate and content-free. Its in-process state
   and structured events have no user/archive IDs, object names or paths, URLs, queries,
   content, keys, per-user labels, or timestamps sourced from user records. Only fixed
