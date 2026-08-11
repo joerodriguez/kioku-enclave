@@ -7,6 +7,8 @@ captured content, user identifiers, or capacity results belong in this directory
 |---|---|
 | `archive-fixtures-v1.json` | Versioned three-year 480/960/1,200-hour smoke-fixture contract consumed by `scripts/generate_capacity_fixture.py` |
 | `archive-fixtures-v2.json` | Versioned 12-month 40/80/100-hour-per-month production-shaped numeric contract, including the explicit 32-GiB sparse-extent target consumed by `scripts/run_archive_capacity_gate.py` |
+| `archive-v3-capacity-policy-v2.template.json` | Intentionally unusable preauthorization template: exact workload/environment/matrix contexts and freshness maxima may only tighten where documented; placeholder P-256/tool/time-wrapper values are not trust proofs |
+| `archive-v3-capacity-evidence-v2.schema.json` | Public top-level shape companion for restricted-JCS signed evidence; the verifier normatively enforces every workload-by-case/metric/result dimension and cross-field relation |
 
 The checked-in manifest is a planning and reproducibility contract, not release evidence.
 A release capacity report must additionally pin the VM/image, SQLite/extensions, cache
@@ -24,3 +26,12 @@ uses sparse regular-file probes for near-ceiling extents. It remains local non-a
 evidence: no 32-GiB snapshot is materialized, downloaded, or encrypted. V2 numeric rows
 also carry month/cadence and retention geometry while materializing bounded zero-filled
 per-kind payload and float32 embedding-shape BLOBs.
+
+The signed-evidence contract is inactive and has no runtime consumer. Its exact matrix
+repeats workload, 32-GiB/three-year, fixture/plan/config/environment, media/query/cache,
+sample, and percentile bindings on each result class. Paired policy-fixed 1-GiB/32-GiB
+write traces derive summaries and live-size growth from raw samples. Request, artifact,
+time, and replay files are strict hash-bound wrappers only: they do not establish an
+authenticated challenge, trusted clock, rollback protection, or provider provenance. The
+receipt lists those activation blockers, is preauthorization only, always denies authority,
+and cannot consume a nonce or prove that measurements occurred.

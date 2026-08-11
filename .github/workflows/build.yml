@@ -159,6 +159,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_generate_capacity_fixture.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_run_archive_capacity_harness.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_run_archive_capacity_gate.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_verify_archive_v3_capacity_report.py
 
       - name: Formatting
         run: cargo fmt --all -- --check
