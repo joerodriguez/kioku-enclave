@@ -99,6 +99,10 @@ mod archive_v3_firestore_auth;
 // bearer, fixed REST transport, and shadow-coordinator transaction boundary.
 mod archive_v3_firestore_shadow;
 mod archive_v3_journal;
+// Inactive ADR-0022 legacy-conversion session codec and inventory ledger.
+// It has no source adapter, provider, Store, VFS, route, witness CAS, recovery,
+// deletion, cutover, or other production authority.
+mod archive_v3_legacy_extent_session;
 mod archive_v3_operation;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
 // registered SQLite VFS and has no Store, provider, route, or authority wiring.
