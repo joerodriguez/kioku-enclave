@@ -77,6 +77,9 @@ mod archive_v3_firestore_witness;
 // Inactive, Firestore-witness-only Confidential Space bearer path. It is
 // deliberately distinct from the KMS and public attestation credential paths.
 mod archive_v3_firestore_auth;
+// Inactive, no-I/O composition of the exact Firestore namespace, dedicated
+// bearer, fixed REST transport, and shadow-coordinator transaction boundary.
+mod archive_v3_firestore_shadow;
 mod archive_v3_journal;
 mod archive_v3_operation;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
