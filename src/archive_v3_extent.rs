@@ -13,8 +13,15 @@
 //! witness state after the asynchronous object read before issuing the sealed
 //! recovery capability. This module never lists storage.
 
-use std::cmp::{max, min};
+use std::{
+    cmp::{max, min},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+};
 
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -28,6 +35,13 @@ use crate::archive_v3::{
 };
 use crate::archive_v3_shadow_checkpoint::{ShadowCheckpointError, ShadowObjectStaging};
 use crate::archive_v3_witness::{DeletionState, ExactCurrentRecoveryAdmission, RecoveryRoot};
+use crate::{
+    archive_v3_legacy_extent_session::{
+        LegacyExtentAttemptId, LegacyExtentRootAdmission, LegacyExtentSessionBinding,
+        LegacyExtentSessionError, LegacyExtentSessionId,
+    },
+    archive_v3_operation::{LegacyExtentObjectFacts, OperationLedger, OperationLedgerError},
+};
 
 pub const EXTENT_BYTES: u32 = 1_048_576;
 pub const MAX_RANGE_RECONSTRUCTION_BYTES: usize = EXTENT_BYTES as usize;
@@ -54,6 +68,12 @@ pub enum ExtentTreeError {
     Source,
     #[error(transparent)]
     Staging(#[from] ShadowCheckpointError),
+    #[error(transparent)]
+    LegacyLedger(#[from] OperationLedgerError),
+    #[error("durable legacy extent-object ledger task became unavailable")]
+    LegacyLedgerUnavailable,
+    #[error(transparent)]
+    LegacySession(#[from] LegacyExtentSessionError),
     #[error("the exact immutable extent-tree object is absent")]
     MissingObject,
     #[error("extent range is outside the authenticated logical file")]
@@ -137,6 +157,272 @@ pub(crate) trait ExtentObjectStaging: extent_staging_sealed::Sealed + Send + Syn
     ) -> Result<()>
     where
         F: FnOnce(&CiphertextEnvelope) -> ArchiveResult<()> + Send;
+}
+
+/// Exact root readback whose private fields can only be created after the
+/// immutable get is byte-for-byte equal to the envelope passed to create.
+/// It is intentionally not a general authenticated-root constructor.
+struct ExactLegacyRootReadback {
+    context: ObjectContext,
+    envelope: CiphertextEnvelope,
+}
+
+/// Opaque root facts minted only by [`LegacyExtentObjectStaging`] after exact
+/// immutable readback, AEAD open, decode, and `ArchiveRoot` context validation.
+/// The legacy-session module consumes this token to check its binding and mint
+/// its admission; no caller can construct one from raw root/context/hash data.
+pub(crate) struct AuthenticatedLegacyExtentRootReadback {
+    context: ObjectContext,
+    root: ArchiveRoot,
+    ciphertext_hash: [u8; 32],
+}
+impl AuthenticatedLegacyExtentRootReadback {
+    fn from_exact_readback(
+        readback: ExactLegacyRootReadback,
+        cipher: &VerifiedArchiveCipher,
+    ) -> ArchiveResult<Self> {
+        let plaintext = Zeroizing::new(cipher.open(&readback.context, &readback.envelope)?);
+        let root = ArchiveRoot::decode(plaintext.as_slice())?;
+        root.validate_for_context(&readback.context)?;
+        Ok(Self {
+            context: readback.context,
+            root,
+            ciphertext_hash: readback.envelope.hash(),
+        })
+    }
+
+    pub(crate) fn context(&self) -> &ObjectContext {
+        &self.context
+    }
+    pub(crate) fn root(&self) -> &ArchiveRoot {
+        &self.root
+    }
+    pub(crate) const fn ciphertext_hash(&self) -> [u8; 32] {
+        self.ciphertext_hash
+    }
+}
+
+/// Sealed legacy-specific immutable object staging.  One shared ordinal is
+/// consumed for every extent, node, and the separately staged root candidate.
+/// The generic uploader path cannot stage a root; that root must use the
+/// authenticated inherent method below.
+#[derive(Clone)]
+pub(crate) struct LegacyExtentObjectStaging {
+    connection: Arc<Mutex<Connection>>,
+    session_id: LegacyExtentSessionId,
+    attempt_id: LegacyExtentAttemptId,
+    binding: LegacyExtentSessionBinding,
+    next_ordinal: Arc<AtomicU32>,
+}
+
+impl LegacyExtentObjectStaging {
+    pub(crate) fn new(
+        connection: Arc<Mutex<Connection>>,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+    ) -> Self {
+        Self {
+            connection,
+            session_id,
+            attempt_id,
+            binding,
+            next_ordinal: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Stage the final root only after its exact readback has been opened with
+    /// the resolved cipher and validated as an `ArchiveRoot`.  The returned
+    /// admission is non-forgeable and remains non-authoritative on its own.
+    pub(crate) async fn create_root_and_readback_admitted(
+        &self,
+        backend: &dyn ImmutableObjectBackend,
+        cipher: &VerifiedArchiveCipher,
+        tree: &UploadedExtentTree,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+    ) -> Result<(LegacyExtentObjectFacts, LegacyExtentRootAdmission)> {
+        if context.role() != ObjectRole::RootV3
+            || cipher.archive_id().as_bytes() != &self.binding.archive_id()
+            || cipher.key_epoch().as_bytes() != &self.binding.key_epoch()
+            || cipher.registry_rotation_generation() != self.binding.registry_rotation_generation()
+            || cipher.registry_object_id().as_bytes() != &self.binding.registry_object_id()
+            || cipher.registry_ciphertext_hash() != self.binding.registry_ciphertext_hash()
+            || tree.logical_file_length() != self.binding.plaintext_len()
+        {
+            return Err(ArchiveV3Error::InvalidContext.into());
+        }
+        let facts = LegacyExtentObjectFacts::from_sealed(context, &envelope, self.claim_ordinal()?)
+            .map_err(|_| ArchiveV3Error::InvalidContext)?;
+        self.reserve_root_after_tree(facts.clone(), tree.root().clone())
+            .await?;
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await?;
+        let readback = backend
+            .get(&context.object_key())
+            .await?
+            .ok_or(ExtentTreeError::MissingObject)?;
+        if readback != envelope {
+            return Err(ArchiveV3Error::Authentication.into());
+        }
+        let authenticated = AuthenticatedLegacyExtentRootReadback::from_exact_readback(
+            ExactLegacyRootReadback {
+                context: context.clone(),
+                envelope: readback,
+            },
+            cipher,
+        )?;
+        if authenticated.root().extent_tree_root.as_ref() != Some(tree.root())
+            || authenticated.root().logical_file_length != tree.logical_file_length()
+        {
+            return Err(ArchiveV3Error::InvalidContext.into());
+        }
+        let admission =
+            LegacyExtentRootAdmission::from_authenticated_readback(self.binding, authenticated)
+                .map_err(|_| ArchiveV3Error::InvalidContext)?;
+        self.mark_materialized_exact(facts.clone()).await?;
+        Ok((facts, admission))
+    }
+
+    async fn reserve_create_readback<T, F>(
+        &self,
+        context: &ObjectContext,
+        backend: &dyn ImmutableObjectBackend,
+        envelope: CiphertextEnvelope,
+        verify: F,
+    ) -> Result<(LegacyExtentObjectFacts, T)>
+    where
+        F: FnOnce(&CiphertextEnvelope) -> ArchiveResult<T> + Send,
+    {
+        let ordinal = self.claim_ordinal()?;
+        let facts = LegacyExtentObjectFacts::from_sealed(context, &envelope, ordinal)
+            .map_err(|_| ArchiveV3Error::InvalidContext)?;
+        self.reserve_exact(facts.clone()).await?;
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await?;
+        let readback = backend
+            .get(&context.object_key())
+            .await?
+            .ok_or(ExtentTreeError::MissingObject)?;
+        if readback != envelope {
+            return Err(ArchiveV3Error::Authentication.into());
+        }
+        let verified = verify(&readback)?;
+        self.mark_materialized_exact(facts.clone()).await?;
+        Ok((facts, verified))
+    }
+
+    fn claim_ordinal(&self) -> Result<u32> {
+        self.next_ordinal
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ordinal| {
+                (usize::try_from(ordinal).ok().is_some_and(|value| {
+                    value < crate::archive_v3_operation::MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT
+                }))
+                .then_some(ordinal.saturating_add(1))
+            })
+            .map_err(|_| ArchiveV3Error::TooLarge("legacy extent objects per attempt").into())
+    }
+
+    async fn reserve_exact(&self, facts: LegacyExtentObjectFacts) -> Result<()> {
+        let connection = Arc::clone(&self.connection);
+        let session_id = self.session_id;
+        let attempt_id = self.attempt_id;
+        let binding = self.binding;
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| ExtentTreeError::LegacyLedgerUnavailable)?;
+            OperationLedger::reserve_legacy_extent_object(
+                &mut connection,
+                session_id,
+                attempt_id,
+                binding,
+                &facts,
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| ExtentTreeError::LegacyLedgerUnavailable)?
+    }
+
+    async fn mark_materialized_exact(&self, facts: LegacyExtentObjectFacts) -> Result<()> {
+        let connection = Arc::clone(&self.connection);
+        let session_id = self.session_id;
+        let attempt_id = self.attempt_id;
+        let binding = self.binding;
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| ExtentTreeError::LegacyLedgerUnavailable)?;
+            OperationLedger::mark_legacy_extent_object_materialized(
+                &mut connection,
+                session_id,
+                attempt_id,
+                binding,
+                &facts,
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| ExtentTreeError::LegacyLedgerUnavailable)?
+    }
+
+    async fn reserve_root_after_tree(
+        &self,
+        facts: LegacyExtentObjectFacts,
+        expected_tree_root: ImmutableReference,
+    ) -> Result<()> {
+        let connection = Arc::clone(&self.connection);
+        let session_id = self.session_id;
+        let attempt_id = self.attempt_id;
+        let binding = self.binding;
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| ExtentTreeError::LegacyLedgerUnavailable)?;
+            OperationLedger::reserve_legacy_extent_root_after_tree(
+                &mut connection,
+                session_id,
+                attempt_id,
+                binding,
+                &facts,
+                &expected_tree_root,
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| ExtentTreeError::LegacyLedgerUnavailable)?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_ordinal_for_test(&self, ordinal: u32) {
+        self.next_ordinal.store(ordinal, Ordering::Relaxed);
+    }
+}
+
+impl extent_staging_sealed::Sealed for LegacyExtentObjectStaging {}
+
+#[async_trait::async_trait]
+impl ExtentObjectStaging for LegacyExtentObjectStaging {
+    async fn create_and_readback_verified<F>(
+        &self,
+        backend: &dyn ImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+        verify: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&CiphertextEnvelope) -> ArchiveResult<()> + Send,
+    {
+        if context.role() == ObjectRole::RootV3 {
+            return Err(ArchiveV3Error::InvalidContext.into());
+        }
+        self.reserve_create_readback(context, backend, envelope, verify)
+            .await
+            .map(|_| ())
+    }
 }
 
 impl extent_staging_sealed::Sealed for ShadowObjectStaging<'_> {}
@@ -1042,6 +1328,9 @@ mod tests {
         ExactKeyRegistryProvider, InMemoryImmutableBackend, KeyKind, KeyRegistryContext,
         KeyRegistryPlaintext, ObjectKey,
     };
+    use crate::archive_v3_legacy_extent_session::{
+        LegacyExtentAttemptId, LegacyExtentSessionBinding, LegacyExtentSessionId,
+    };
     use crate::archive_v3_operation::{
         RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage, MAX_SHADOW_OBJECTS_PER_ATTEMPT,
     };
@@ -1507,6 +1796,60 @@ mod tests {
         ) -> std::result::Result<ShadowObjectInventoryPage, ShadowObjectInventoryError> {
             Ok(ShadowObjectInventoryPage::empty())
         }
+    }
+
+    fn legacy_binding(a: ArchiveId, d: DatabaseEpoch, k: KeyEpoch) -> LegacyExtentSessionBinding {
+        LegacyExtentSessionBinding::fixture_for_test(
+            *a.as_bytes(),
+            *d.as_bytes(),
+            *k.as_bytes(),
+            [0x0a; 16],
+            [0x0b; 32],
+        )
+    }
+
+    fn legacy_staging_for(
+        binding: LegacyExtentSessionBinding,
+    ) -> (Arc<Mutex<Connection>>, LegacyExtentObjectStaging) {
+        let mut connection = Connection::open_in_memory().unwrap();
+        OperationLedger::initialize(&connection).unwrap();
+        let session_id = LegacyExtentSessionId::for_binding(binding).unwrap();
+        let attempt_id = LegacyExtentAttemptId::from_bytes_for_test([0x0c; 16]);
+        OperationLedger::prepare_legacy_extent_session(
+            &mut connection,
+            &crate::archive_v3_legacy_extent_session::LegacyExtentSessionRecord::prepared(
+                session_id, attempt_id, binding,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let connection = Arc::new(Mutex::new(connection));
+        (
+            Arc::clone(&connection),
+            LegacyExtentObjectStaging::new(connection, session_id, attempt_id, binding),
+        )
+    }
+
+    fn legacy_counts(connection: &Arc<Mutex<Connection>>) -> (usize, usize) {
+        let connection = connection.lock().unwrap();
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_v3_legacy_extent_objects",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let materialized = connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_v3_legacy_extent_objects WHERE state = 2",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        (
+            usize::try_from(total).unwrap(),
+            usize::try_from(materialized).unwrap(),
+        )
     }
     #[async_trait::async_trait]
     impl ExtentSource for UnderfillingSource {
@@ -2975,6 +3318,262 @@ mod tests {
             ["reserve", "create", "get", "materialize"]
         );
         assert_eq!(inventory.materialized.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_staging_orders_idempotency_conflicts_and_reservations() {
+        let (a, d, k) = ids();
+        let backend = FaultBackend::default();
+        let binding = legacy_binding(a, d, k);
+        let context = extent_context(
+            a,
+            d,
+            k,
+            0,
+            SQLITE_PAGE_SIZE,
+            ObjectId::from_bytes([0x71; 16]),
+        )
+        .unwrap();
+        let cipher = TestCipher::new(a, k);
+        let envelope = cipher.seal(&context, &bytes(1, 0x71)).unwrap();
+
+        let (connection, staging) = legacy_staging_for(binding);
+        staging
+            .create_and_readback_verified(&backend, &context, envelope.clone(), |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(*backend.events.lock().unwrap(), ["create", "get"]);
+        assert_eq!(legacy_counts(&connection), (1, 1));
+
+        // A restart retries the same exact ordinal/facts and may see an
+        // immutable already-present success, but cannot substitute bytes.
+        let retry = LegacyExtentObjectStaging::new(
+            Arc::clone(&connection),
+            LegacyExtentSessionId::for_binding(binding).unwrap(),
+            LegacyExtentAttemptId::from_bytes_for_test([0x0c; 16]),
+            binding,
+        );
+        retry
+            .create_and_readback_verified(&backend, &context, envelope.clone(), |_| Ok(()))
+            .await
+            .unwrap();
+        // A restart shares the exact durable attempt inventory; replaying the
+        // same immutable bytes remains safe through create-if-absent equality.
+        assert_eq!(legacy_counts(&connection), (1, 1));
+
+        let conflict = TestCipher::new(a, k)
+            .seal(&context, &bytes(1, 0x72))
+            .unwrap();
+        assert!(staging
+            .create_and_readback_verified(&backend, &context, conflict, |_| Ok(()))
+            .await
+            .is_err());
+        assert_eq!(legacy_counts(&connection), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn legacy_staging_keeps_reserved_rows_on_provider_readback_or_verifier_failure() {
+        let (a, d, k) = ids();
+        let context = extent_context(
+            a,
+            d,
+            k,
+            0,
+            SQLITE_PAGE_SIZE,
+            ObjectId::from_bytes([0x72; 16]),
+        )
+        .unwrap();
+        let cipher = TestCipher::new(a, k);
+        let envelope = cipher.seal(&context, &bytes(1, 0x73)).unwrap();
+
+        for fault in [
+            Fault::CreateUnavailable,
+            Fault::MissingOnRead(1),
+            Fault::TamperOnRead(1),
+        ] {
+            let backend = FaultBackend::default();
+            *backend.fault.lock().unwrap() = fault;
+            let (connection, staging) = legacy_staging_for(legacy_binding(a, d, k));
+            assert!(staging
+                .create_and_readback_verified(&backend, &context, envelope.clone(), |_| Ok(()))
+                .await
+                .is_err());
+            assert_eq!(legacy_counts(&connection), (1, 0));
+        }
+
+        let backend = FaultBackend::default();
+        let (connection, staging) = legacy_staging_for(legacy_binding(a, d, k));
+        assert!(staging
+            .create_and_readback_verified(&backend, &context, envelope, |_| {
+                Err(ArchiveV3Error::Authentication)
+            })
+            .await
+            .is_err());
+        assert_eq!(legacy_counts(&connection), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn legacy_root_admission_requires_exact_authenticated_readback_and_uses_final_slot() {
+        let (a, d, k) = ids();
+        let registry_hash: [u8; 32] = Sha256::digest(WRAPPED_REGISTRY).into();
+        let binding = legacy_binding(a, d, k).with_registry_for_test(0, [4; 16], registry_hash);
+        let registry =
+            KeyRegistryReference::new(k, 0, ObjectId::from_bytes([4; 16]), registry_hash);
+        let cipher = verified_cipher(a, k, registry).await;
+        let parent = ParentReference {
+            object_id: ObjectId::from_bytes(binding.base_root_object_id()),
+            envelope_hash: binding.base_root_ciphertext_hash(),
+        };
+        let context = ObjectContext::new(
+            a,
+            d,
+            k,
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: 1 },
+            ObjectId::from_bytes([0x73; 16]),
+            Some(parent.clone()),
+        )
+        .unwrap();
+        let tree_context =
+            node_context(a, d, k, 0, 0, 1, ObjectId::from_bytes([0x74; 16])).unwrap();
+        let tree_node = MerkleNode {
+            level: 0,
+            range_start: 0,
+            range_end: 1,
+            entries: MerkleEntries::Leaf(vec![ExtentReference {
+                extent_no: 0,
+                logical_byte_len: SQLITE_PAGE_SIZE,
+                revision: 1,
+                reference: ImmutableReference {
+                    object_id: ObjectId::from_bytes([0x75; 16]),
+                    envelope_hash: [0x76; 32],
+                },
+            }]),
+        };
+        let tree_envelope = cipher
+            .seal(&tree_context, &tree_node.encode().unwrap())
+            .unwrap();
+        let tree = UploadedExtentTree {
+            root: ImmutableReference {
+                object_id: tree_context.object_id(),
+                envelope_hash: tree_envelope.hash(),
+            },
+            logical_file_length: binding.plaintext_len(),
+            extent_slots: 1,
+            tree_height: 0,
+            extent_count: 1,
+            sparse_content_commitment: [0x77; 32],
+        };
+        let root = ArchiveRoot {
+            root_seq: 1,
+            parent: Some(parent),
+            database_epoch: d,
+            key_epoch: k,
+            owner_fencing_epoch: binding.owner_fence(),
+            sqlite_page_size: SQLITE_PAGE_SIZE,
+            logical_file_length: binding.plaintext_len(),
+            user_schema_version: 1,
+            storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
+            wal_generation: 0,
+            wal_segment_count: 0,
+            checkpoint_root: None,
+            extent_tree_root: Some(tree.root().clone()),
+            wal_chain_root: None,
+        };
+        let envelope = cipher.seal(&context, &root.encode().unwrap()).unwrap();
+
+        let backend = FaultBackend::default();
+        let (connection, staging) = legacy_staging_for(binding);
+        staging
+            .create_and_readback_verified(
+                &backend,
+                &tree_context,
+                tree_envelope.clone(),
+                |readback| cipher.open(&tree_context, readback).map(|_| ()),
+            )
+            .await
+            .unwrap();
+        let (facts, admission) = staging
+            .create_root_and_readback_admitted(&backend, &cipher, &tree, &context, envelope.clone())
+            .await
+            .unwrap();
+        assert_eq!(facts.ordinal(), 1);
+        assert!(admission.matches(binding));
+        assert!(admission.matches_root_aad(&context.canonical_aad()));
+        assert_eq!(legacy_counts(&connection), (2, 2));
+
+        // The one reserved root slot is consumed; no later object can reach
+        // the provider, and a root cannot use the generic callback path.
+        assert!(staging
+            .create_and_readback_verified(&backend, &context, envelope.clone(), |_| Ok(()))
+            .await
+            .is_err());
+        assert!(
+            staging
+                .create_root_and_readback_admitted(
+                    &backend,
+                    &cipher,
+                    &tree,
+                    &context,
+                    envelope.clone(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(legacy_counts(&connection), (2, 2));
+
+        let backend = FaultBackend::default();
+        let (connection, staging) = legacy_staging_for(binding);
+        staging
+            .create_and_readback_verified(
+                &backend,
+                &tree_context,
+                tree_envelope.clone(),
+                |readback| cipher.open(&tree_context, readback).map(|_| ()),
+            )
+            .await
+            .unwrap();
+        *backend.fault.lock().unwrap() = Fault::MissingOnRead(1);
+        assert!(
+            staging
+                .create_root_and_readback_admitted(
+                    &backend,
+                    &cipher,
+                    &tree,
+                    &context,
+                    envelope.clone(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(legacy_counts(&connection), (2, 1));
+
+        // Equal object counts are insufficient: a tree reference from another
+        // attempt cannot name this attempt's final materialized object.
+        let backend = FaultBackend::default();
+        let (connection, staging) = legacy_staging_for(binding);
+        staging
+            .create_and_readback_verified(&backend, &tree_context, tree_envelope, |readback| {
+                cipher.open(&tree_context, readback).map(|_| ())
+            })
+            .await
+            .unwrap();
+        let mut substituted_tree = tree.clone();
+        substituted_tree.root = ImmutableReference {
+            object_id: ObjectId::from_bytes([0x78; 16]),
+            envelope_hash: [0x79; 32],
+        };
+        assert!(staging
+            .create_root_and_readback_admitted(
+                &backend,
+                &cipher,
+                &substituted_tree,
+                &context,
+                envelope,
+            )
+            .await
+            .is_err());
+        assert_eq!(legacy_counts(&connection), (1, 1));
     }
     #[tokio::test]
     async fn authenticated_short_nonfinal_extent_is_not_a_sparse_hole() {

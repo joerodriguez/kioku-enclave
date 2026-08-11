@@ -19,7 +19,8 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::archive_v3::{
-    CiphertextEnvelope, LogicalLocation, ObjectContext, ObjectId, ObjectKey, ObjectRole,
+    CiphertextEnvelope, ImmutableReference, LogicalLocation, ObjectContext, ObjectId, ObjectKey,
+    ObjectRole,
 };
 use crate::archive_v3_legacy_extent_session::{
     LegacyExtentAttemptId, LegacyExtentCandidate, LegacyExtentRootAdmission,
@@ -997,6 +998,7 @@ enum LegacyExtentInventoryRequirement {
 struct LegacyExtentInventoryScan {
     count: usize,
     root: Option<LegacyExtentObjectFacts>,
+    final_non_root: Option<LegacyExtentObjectFacts>,
     commitment: [u8; 32],
 }
 
@@ -2745,6 +2747,7 @@ impl OperationLedger {
         )?;
         let mut count = 0usize;
         let mut root = None;
+        let mut final_non_root = None;
         let mut commitment = Sha256::new();
         commitment.update(LEGACY_EXTENT_INVENTORY_DOMAIN);
         commitment.update(session_id.as_bytes());
@@ -2775,6 +2778,8 @@ impl OperationLedger {
             }
             if facts.object_role == ObjectRole::RootV3 {
                 root = Some(facts.clone());
+            } else {
+                final_non_root = Some(facts.clone());
             }
             commitment.update(facts.ordinal.to_be_bytes());
             commitment.update(facts.object_id.as_bytes());
@@ -2809,8 +2814,66 @@ impl OperationLedger {
         Ok(LegacyExtentInventoryScan {
             count,
             root,
+            final_non_root,
             commitment: commitment.finalize().into(),
         })
+    }
+
+    /// Atomically prove the exact materialized tree prefix and reserve its
+    /// root. A shared staging clone that claims a later ordinal cannot insert a
+    /// non-root between this proof and the root reservation.
+    pub(crate) fn reserve_legacy_extent_root_after_tree(
+        connection: &mut Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+        facts: &LegacyExtentObjectFacts,
+        expected_tree_root: &ImmutableReference,
+    ) -> Result<RecordOutcome> {
+        facts.validate_canonical()?;
+        if facts.object_role() != ObjectRole::RootV3
+            || !facts.matches_binding(binding)
+            || facts.ordinal() == 0
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = Self::read_legacy_extent_session(&tx, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        record.require_binding(binding)?;
+        if record.state() != LegacyExtentSessionState::Prepared {
+            return Err(OperationLedgerError::LegacyExtentSession(
+                LegacyExtentSessionError::InvalidTransition,
+            ));
+        }
+        let scan = Self::scan_legacy_extent_inventory(
+            &tx,
+            session_id,
+            attempt_id,
+            binding,
+            LegacyExtentInventoryRequirement::Materialized,
+        )?;
+        if scan.root.is_some()
+            || scan.count
+                != usize::try_from(facts.ordinal()).map_err(|_| OperationLedgerError::Corrupt)?
+            || !scan.final_non_root.as_ref().is_some_and(|facts| {
+                facts.object_role() == ObjectRole::MerkleNodeV3
+                    && facts.object_id() == expected_tree_root.object_id
+                    && facts.ciphertext_hash() == expected_tree_root.envelope_hash
+            })
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        if Self::read_legacy_extent_object_ordinal(&tx, session_id, attempt_id, facts.ordinal)?
+            .is_some()
+            || Self::read_legacy_extent_object(&tx, session_id, attempt_id, facts.object_id)?
+                .is_some()
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        if tx.execute("INSERT INTO archive_v3_legacy_extent_objects (session_id,attempt_id,ordinal,object_id,object_role,root_seq,context_aad,object_key,ciphertext_hash,state) VALUES (?,?,?,?,?,?,?,?,?,?)",params![session_id.as_bytes().as_slice(),attempt_id.as_bytes().as_slice(),i64::from(facts.ordinal),facts.object_id.as_bytes().as_slice(),facts.object_role as i64,facts.root_seq.map(|x|x as i64),facts.context_aad.as_slice(),facts.object_key.as_str(),facts.ciphertext_hash.as_slice(),LegacyExtentObjectState::Reserved as i64])? !=1 {return Err(OperationLedgerError::Corrupt)}
+        tx.commit()?;
+        Ok(RecordOutcome::Recorded)
     }
 
     /// One IMMEDIATE transaction admits only a complete contiguous materialized graph
