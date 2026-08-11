@@ -160,6 +160,18 @@ Its reports permanently classify as non-evidence (`release_evidence: false` and
 authority or evidence the production image/VM, backend, VFS, witness, cache/concurrency,
 fault, deletion, lifecycle, or 32-GiB release gates.
 
+`scripts/run_archive_capacity_gate.py` is a separate, explicit local gate over the v2
+12-month 40/80/100-hour-per-month numeric fixture. It requires an operator confirmation,
+an empty safe output directory, and a free-space preflight before it creates anything.
+Its canonical 32-GiB path streams bounded numeric SQLite batches, observes local WAL and
+checkpoint results, materializes only deterministic zero-filled bounded payload/vector-shape
+BLOBs, validates `max_page_count` geometry, and uses sparse regular-file
+extent probes one page below/at/above the ceiling. Those probes contain no SQLite or user
+content and first refuse filesystems without observable sparse allocation; they do not
+materialize, download, upload, or encrypt a 32-GiB snapshot. Its report
+is permanently marked local non-authority/non-release evidence; it cannot change runtime
+authority or satisfy the image/backend/VFS/witness/fault/lifecycle/cache/concurrency gates.
+
 `src/archive_v3.rs`, `src/archive_v3_journal.rs`, `src/archive_v3_shadow.rs`, and `src/archive_v3_sqlite_vfs.rs` define only audited, unit-tested
 format primitives for the future
 immutable archive: opaque archive/database/key/object IDs; canonical context-bound

@@ -79,6 +79,39 @@ class CapacityFixtureTest(unittest.TestCase):
                     create_sparse_shape=True,
                 )
 
+    def test_v2_manifest_pins_the_12_month_40_80_100_hour_profiles(self):
+        manifest_path = SCRIPT.parents[1] / "eval/capacity/archive-fixtures-v2.json"
+        manifest, _ = capacity.load_manifest(manifest_path)
+        profiles = capacity.validate_manifest(manifest)
+        self.assertEqual(manifest["horizon_months"], 12)
+        self.assertEqual(
+            {profile["recording_hours_per_month"] for profile in profiles.values()},
+            {40, 80, 100},
+        )
+        self.assertEqual(
+            profiles["power-user-c-100h-month-12m-32gib"]["sparse_archive_bytes"],
+            32 * 1024**3,
+        )
+        self.assertEqual(
+            profiles["power-user-c-100h-month-12m"]["expected"]["records"]["fts_entries"],
+            2_376_000,
+        )
+        shape = capacity.validate_temporal_payload_shape(manifest)
+        assert shape is not None
+        records = list(
+            capacity.synthetic_records(
+                profiles["power-user-c-100h-month-12m"],
+                manifest["seed"],
+                2,
+                shape,
+            )
+        )
+        self.assertEqual({record["month_index"] for record in records}, {0})
+        self.assertTrue(all(record["retention_months"] == 12 for record in records))
+        vector = next(record for record in records if record["kind"] == "vectors")
+        self.assertEqual(vector["embedding_dimensions"], 384)
+        self.assertEqual(vector["embedding_logical_bytes"], 1536)
+
 
 if __name__ == "__main__":
     unittest.main()

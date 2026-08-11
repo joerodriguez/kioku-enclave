@@ -154,6 +154,12 @@ jobs:
           python3 scripts/test_release.py
           scripts/test_release_race.sh
 
+      - name: ADR-0022 capacity tooling contract tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_generate_capacity_fixture.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_run_archive_capacity_harness.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_run_archive_capacity_gate.py
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
