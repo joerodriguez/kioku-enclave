@@ -100,14 +100,18 @@ mod archive_v3_operation;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
 // registered SQLite VFS and has no Store, provider, route, or authority wiring.
 mod archive_v3_shadow;
+// Inactive ADR-0022 durable shadow-session codec. The operation module persists
+// it, but no Store, VFS, startup, flag, route, or authority wiring constructs it.
+mod archive_v3_shadow_session;
 // Inactive ADR-0022 private-staging SQLite shadow-parity verifier. It has no
 // Store, VFS, provider, credential, route, scheduler, flag, or authority wiring.
 mod archive_v3_shadow_parity;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
 // Store/VFS runtime connection, provider construction, flag, route, or authority.
 mod archive_v3_shadow_checkpoint;
-// Inactive ADR-0022 checkpoint publication composition only. It has no
-// Store, VFS, route, flag, provider construction, or authority wiring.
+// Inactive ADR-0022 checkpoint publication composition with durable exact-
+// candidate reconciliation. It has no Store, VFS, route, flag, provider
+// construction, or authority wiring.
 mod archive_v3_shadow_coordinator;
 // ADR-0022's opt-in transparent SQLite VFS wrapper. It is compiled and
 // oracle-tested, but startup never registers it and it has no Store/provider/

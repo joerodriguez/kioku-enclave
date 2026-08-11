@@ -81,12 +81,29 @@ mod tests {
         }
     }
 
+    struct FailingToken;
+    #[async_trait::async_trait]
+    impl FirestoreWitnessBearerTokenProvider for FailingToken {
+        async fn bearer_token(
+            &self,
+            _expected_audience: &str,
+        ) -> std::result::Result<FirestoreWitnessBearerToken, FirestoreWitnessTransportError>
+        {
+            Err(FirestoreWitnessTransportError::Unavailable)
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum CommitOutcome {
         Ok,
         Aborted,
         LostResponse,
         CompetingWrite,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailureStage {
+        Begin,
+        BatchGet,
     }
     struct FakeState {
         record: Option<[u8; WITNESS_RECORD_BYTES]>,
@@ -95,6 +112,7 @@ mod tests {
         commits: usize,
         requests: Vec<Value>,
         time: String,
+        failure: Option<FailureStage>,
     }
     struct FakeTransport(Mutex<FakeState>);
     impl FakeTransport {
@@ -109,10 +127,14 @@ mod tests {
                 commits: 0,
                 requests: Vec::new(),
                 time: TIME.to_owned(),
+                failure: None,
             }))
         }
         fn push_outcome(&self, outcome: CommitOutcome) {
             self.0.lock().unwrap().outcomes.push_back(outcome);
+        }
+        fn fail_next(&self, stage: FailureStage) {
+            self.0.lock().unwrap().failure = Some(stage);
         }
         fn read(state: &FakeState) -> FirestoreWitnessRead {
             let read_time = FirestoreTimestamp::parse(&state.time).unwrap();
@@ -134,7 +156,12 @@ mod tests {
             _bearer: &str,
             request: Value,
         ) -> std::result::Result<FirestoreTransaction, FirestoreWitnessTransportError> {
-            self.0.lock().unwrap().requests.push(request);
+            let mut state = self.0.lock().unwrap();
+            state.requests.push(request);
+            if state.failure == Some(FailureStage::Begin) {
+                state.failure = None;
+                return Err(FirestoreWitnessTransportError::Unavailable);
+            }
             FirestoreTransaction::new(b"tx")
         }
         async fn batch_get_exact(
@@ -145,6 +172,10 @@ mod tests {
         ) -> std::result::Result<FirestoreWitnessRead, FirestoreWitnessTransportError> {
             let mut state = self.0.lock().unwrap();
             state.requests.push(request);
+            if state.failure == Some(FailureStage::BatchGet) {
+                state.failure = None;
+                return Err(FirestoreWitnessTransportError::Unavailable);
+            }
             Ok(Self::read(&state))
         }
         async fn read_exact(
@@ -485,6 +516,61 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn unresolved_failures_are_not_misclassified_as_definite_rejections() {
+        for stage in [FailureStage::Begin, FailureStage::BatchGet] {
+            let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
+            let adapter = witness(transport.clone());
+            let record = adapter.bootstrap_async(bootstrap()).await.unwrap();
+            transport.fail_next(stage);
+            assert!(matches!(
+                adapter
+                    .update_unresolved(record.archive_id(), |_| Ok(()))
+                    .await,
+                Err(FirestoreUpdateError::Failed(WitnessError::Unavailable))
+            ));
+            assert_eq!(transport.0.lock().unwrap().commits, 1);
+        }
+
+        let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
+        let record = witness(transport.clone())
+            .bootstrap_async(bootstrap())
+            .await
+            .unwrap();
+        let adapter = FirestoreWitness::new(
+            FirestoreWitnessConfig::new("project-1", "123456789", "witness-db").unwrap(),
+            Arc::new(FailingToken),
+            transport.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            adapter
+                .update_unresolved(record.archive_id(), |_| Ok(()))
+                .await,
+            Err(FirestoreUpdateError::Failed(WitnessError::Unavailable))
+        ));
+        assert_eq!(transport.0.lock().unwrap().commits, 1);
+
+        let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
+        let adapter = witness(transport.clone());
+        let record = adapter.bootstrap_async(bootstrap()).await.unwrap();
+        transport.push_outcome(CommitOutcome::CompetingWrite);
+        assert!(matches!(
+            adapter
+                .update_unresolved(record.archive_id(), |local| {
+                    local.acquire_lease(
+                        record.archive_id(),
+                        record.database_epoch(),
+                        record.registry().key_epoch(),
+                        ObjectId::from_bytes(id(8)),
+                        10,
+                    )
+                })
+                .await,
+            Err(FirestoreUpdateError::Rejected(WitnessError::CompareFailed))
+        ));
     }
 
     #[tokio::test]
@@ -1215,8 +1301,27 @@ pub(crate) struct FirestoreWitness {
 /// exact opaque reconciliation handle instead of treating ambiguity as a
 /// definitive CAS rejection.
 pub(crate) enum FirestoreWitnessCommitError {
+    /// The candidate was definitively rejected by the local exact-state
+    /// comparison or the provider's transaction precondition.
     Rejected(WitnessError),
+    /// No commit was accepted, but this is not evidence that the retained
+    /// candidate is stale (for example token, begin, or batch-get failure).
+    Failed(WitnessError),
     OutcomeUnknown,
+}
+
+#[derive(Debug)]
+enum FirestoreUpdateError {
+    Rejected(WitnessError),
+    Failed(WitnessError),
+}
+
+impl FirestoreUpdateError {
+    const fn into_witness(self) -> WitnessError {
+        match self {
+            Self::Rejected(error) | Self::Failed(error) => error,
+        }
+    }
 }
 
 enum FirestoreUpdateOutcome<T> {
@@ -1271,18 +1376,19 @@ impl FirestoreWitness {
         &self,
         archive_id: ArchiveId,
         apply: F,
-    ) -> std::result::Result<FirestoreUpdateOutcome<T>, WitnessError>
+    ) -> std::result::Result<FirestoreUpdateOutcome<T>, FirestoreUpdateError>
     where
         F: Fn(&InMemoryWitness) -> std::result::Result<T, WitnessError>,
     {
         let document = self.namespace.document(archive_id);
         for attempt in 0..MAX_ABORTED_ATTEMPTS {
-            let token = self.token().await?;
+            let token = self.token().await.map_err(FirestoreUpdateError::Failed)?;
             let transaction = self
                 .transport
                 .begin_read_write(token.as_str(), begin_request_json())
                 .await
-                .map_err(map_transport)?;
+                .map_err(map_transport)
+                .map_err(FirestoreUpdateError::Failed)?;
             let read = self
                 .transport
                 .batch_get_exact(
@@ -1291,14 +1397,19 @@ impl FirestoreWitness {
                     batch_get_request_json(&document, Some(&transaction)),
                 )
                 .await
-                .map_err(map_transport)?;
-            let current = decode_read(&read, archive_id)?.ok_or(WitnessError::MissingArchive)?;
+                .map_err(map_transport)
+                .map_err(FirestoreUpdateError::Failed)?;
+            let current = decode_read(&read, archive_id)
+                .map_err(FirestoreUpdateError::Failed)?
+                .ok_or(FirestoreUpdateError::Failed(WitnessError::MissingArchive))?;
             let local =
-                InMemoryWitness::from_provider_record_at_tick(Some(current), read.trusted_tick)?;
-            let output = apply(&local)?;
+                InMemoryWitness::from_provider_record_at_tick(Some(current), read.trusted_tick)
+                    .map_err(FirestoreUpdateError::Failed)?;
+            let output = apply(&local).map_err(FirestoreUpdateError::Rejected)?;
             let next = local
-                .read_current(archive_id)?
-                .ok_or(WitnessError::Synchronization)?;
+                .read_current(archive_id)
+                .map_err(FirestoreUpdateError::Failed)?
+                .ok_or(FirestoreUpdateError::Failed(WitnessError::Synchronization))?;
             let encoded = next.encode();
             let commit = commit_request_json(
                 &document,
@@ -1323,10 +1434,15 @@ impl FirestoreWitness {
                         encoded: Box::new(encoded),
                     });
                 }
-                Err(error) => return Err(map_transport(error)),
+                Err(FirestoreWitnessTransportError::PreconditionFailed) => {
+                    return Err(FirestoreUpdateError::Rejected(WitnessError::CompareFailed));
+                }
+                Err(error) => {
+                    return Err(FirestoreUpdateError::Failed(map_transport(error)));
+                }
             }
         }
-        Err(WitnessError::Unavailable)
+        Err(FirestoreUpdateError::Failed(WitnessError::Unavailable))
     }
 
     async fn update<T, F>(
@@ -1337,7 +1453,11 @@ impl FirestoreWitness {
     where
         F: Fn(&InMemoryWitness) -> std::result::Result<T, WitnessError>,
     {
-        match self.update_unresolved(archive_id, apply).await? {
+        match self
+            .update_unresolved(archive_id, apply)
+            .await
+            .map_err(FirestoreUpdateError::into_witness)?
+        {
             FirestoreUpdateOutcome::Committed(output) => Ok(output),
             FirestoreUpdateOutcome::OutcomeUnknown { output, encoded } => {
                 let (_, observed) = self.fresh_record(archive_id).await?;
@@ -1471,13 +1591,18 @@ impl FirestoreWitness {
         &self,
         advance: RootAdvance,
     ) -> std::result::Result<WitnessReceipt, FirestoreWitnessCommitError> {
-        match self
+        let outcome = self
             .update_unresolved(advance.archive_id(), |local| {
                 local.compare_and_advance_root(advance.clone())
             })
             .await
-            .map_err(FirestoreWitnessCommitError::Rejected)?
-        {
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
             FirestoreUpdateOutcome::Committed(receipt) => Ok(receipt),
             FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
                 Err(FirestoreWitnessCommitError::OutcomeUnknown)

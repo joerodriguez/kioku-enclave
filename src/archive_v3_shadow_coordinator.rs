@@ -11,11 +11,13 @@
 //! compare-and-advance.  It never lists objects, truncates WAL, mutates the
 //! legacy store, or deletes orphaned immutable objects after a failed attempt.
 //! The owned task protects caller-future cancellation only while this runtime
-//! remains alive. Process restart begins from the independent witness; durable
-//! retry identity belongs to later operation-ledger/runtime wiring.
+//! remains alive. Before CAS, the exact candidate is persisted in a bounded
+//! stable-session/attempt ledger; restart compares only that attempt with the
+//! independent witness. No runtime constructs this seam yet.
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use rusqlite::Connection;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -25,8 +27,13 @@ use crate::{
         LogicalLocation, ObjectContext, ObjectId, ObjectRole, ParentReference,
         VerifiedArchiveCipher, ARCHIVE_FORMAT_VERSION, SQLITE_PAGE_SIZE,
     },
+    archive_v3_operation::{OperationLedger, OperationLedgerError, OperationRecord, RecordOutcome},
     archive_v3_shadow_checkpoint::{
         upload_checkpoint, CheckpointSource, ShadowCheckpointError, UploadedCheckpoint,
+    },
+    archive_v3_shadow_session::{
+        ShadowAttemptId, ShadowCandidate, ShadowReconcileDecision, ShadowSessionBinding,
+        ShadowSessionId, ShadowSessionRecord, ShadowSessionState,
     },
     archive_v3_witness::{
         ExactRootProvider, RootAdvance, RootReference, WitnessError, WitnessLease, WitnessReceipt,
@@ -46,6 +53,8 @@ pub enum ShadowCoordinatorError {
     ReconciliationRequired(Box<ShadowReconciliation>),
     #[error("shadow publication request is not fenced to the exact witness state")]
     StaleAuthority,
+    #[error("durable shadow-session persistence failed closed")]
+    SessionPersistence(#[source] ShadowSessionPersistenceError),
 }
 
 pub type Result<T> = std::result::Result<T, ShadowCoordinatorError>;
@@ -55,9 +64,12 @@ pub type Result<T> = std::result::Result<T, ShadowCoordinatorError>;
 #[derive(Clone, PartialEq, Eq)]
 pub struct ShadowReconciliation {
     archive_id: ArchiveId,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
     candidate: RootReference,
     expected: WitnessRecord,
     lease_fence: u64,
+    binding: ShadowSessionBinding,
 }
 impl std::fmt::Debug for ShadowReconciliation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,7 +83,189 @@ impl std::fmt::Debug for ShadowReconciliation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShadowWitnessCommitError {
     Rejected(WitnessError),
+    Failed(WitnessError),
     OutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ShadowSessionPersistenceError {
+    #[error("durable shadow-session state is unavailable")]
+    Unavailable,
+    #[error("durable shadow-session state conflicts with the requested publication")]
+    Conflict,
+}
+
+/// Durable, content-free session boundary. A runtime adapter must persist into
+/// the encrypted archive ledger; this inactive coordinator has no concrete
+/// Store, filesystem, or connection construction.
+#[async_trait]
+pub(crate) trait ShadowSessionPersistence: Send + Sync {
+    async fn load_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+    ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError>;
+
+    async fn persist_candidate(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        candidate: ShadowCandidate,
+    ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError>;
+
+    async fn require_reconciliation(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+    ) -> std::result::Result<(), ShadowSessionPersistenceError>;
+
+    async fn mark_superseded(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+    ) -> std::result::Result<(), ShadowSessionPersistenceError>;
+
+    async fn complete_witnessed(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        completion: OperationRecord,
+    ) -> std::result::Result<RecordOutcome, ShadowSessionPersistenceError>;
+}
+
+/// Concrete but inactive adapter for the encrypted archive SQLite ledger.
+/// Every SQLite call is moved to Tokio's blocking lane; this type does not open
+/// a file, install a VFS, or construct production authority.
+pub(crate) struct EncryptedSqliteShadowSessionPersistence {
+    connection: Arc<Mutex<Connection>>,
+}
+
+impl EncryptedSqliteShadowSessionPersistence {
+    pub(crate) fn new(connection: Arc<Mutex<Connection>>) -> Self {
+        Self { connection }
+    }
+
+    async fn run_blocking<T, F>(
+        &self,
+        operation: F,
+    ) -> std::result::Result<T, ShadowSessionPersistenceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> std::result::Result<T, OperationLedgerError> + Send + 'static,
+    {
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| ShadowSessionPersistenceError::Unavailable)?;
+            operation(&mut connection).map_err(map_session_ledger_error)
+        })
+        .await
+        .map_err(|_| ShadowSessionPersistenceError::Unavailable)?
+    }
+}
+
+fn map_session_ledger_error(error: OperationLedgerError) -> ShadowSessionPersistenceError {
+    match error {
+        OperationLedgerError::FingerprintConflict
+        | OperationLedgerError::ResultConflict
+        | OperationLedgerError::ShadowSession(_) => ShadowSessionPersistenceError::Conflict,
+        _ => ShadowSessionPersistenceError::Unavailable,
+    }
+}
+
+#[async_trait]
+impl ShadowSessionPersistence for EncryptedSqliteShadowSessionPersistence {
+    async fn load_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+    ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError> {
+        self.run_blocking(move |connection| {
+            OperationLedger::load_shadow_session(connection, session_id, attempt_id)?.ok_or(
+                OperationLedgerError::ShadowSession(
+                    crate::archive_v3_shadow_session::ShadowSessionError::BindingConflict,
+                ),
+            )
+        })
+        .await
+    }
+
+    async fn persist_candidate(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        candidate: ShadowCandidate,
+    ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError> {
+        self.run_blocking(move |connection| {
+            OperationLedger::persist_shadow_candidate(
+                connection, session_id, attempt_id, binding, candidate,
+            )
+        })
+        .await
+    }
+
+    async fn require_reconciliation(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+    ) -> std::result::Result<(), ShadowSessionPersistenceError> {
+        self.run_blocking(move |connection| {
+            OperationLedger::transition_shadow_session(
+                connection,
+                session_id,
+                attempt_id,
+                binding,
+                ShadowSessionState::ReconcileRequired,
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    async fn mark_superseded(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+    ) -> std::result::Result<(), ShadowSessionPersistenceError> {
+        self.run_blocking(move |connection| {
+            OperationLedger::transition_shadow_session(
+                connection,
+                session_id,
+                attempt_id,
+                binding,
+                ShadowSessionState::Superseded,
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    async fn complete_witnessed(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        completion: OperationRecord,
+    ) -> std::result::Result<RecordOutcome, ShadowSessionPersistenceError> {
+        self.run_blocking(move |connection| {
+            OperationLedger::record_shadow_completion(
+                connection,
+                session_id,
+                attempt_id,
+                binding,
+                &completion,
+            )
+        })
+        .await
+    }
 }
 
 /// Async transaction boundary designed for the Firestore witness adapter. A
@@ -96,11 +290,23 @@ pub(crate) trait ShadowCheckpointWitnessProvider: Send + Sync {
 pub(crate) struct ShadowCheckpointPublishRequest {
     archive_id: ArchiveId,
     lease: WitnessLease,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
 }
 
 impl ShadowCheckpointPublishRequest {
-    pub(crate) const fn new(archive_id: ArchiveId, lease: WitnessLease) -> Self {
-        Self { archive_id, lease }
+    pub(crate) const fn new(
+        archive_id: ArchiveId,
+        lease: WitnessLease,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+    ) -> Self {
+        Self {
+            archive_id,
+            lease,
+            session_id,
+            attempt_id,
+        }
     }
 }
 
@@ -135,9 +341,11 @@ impl ShadowCheckpointPublication {
 /// cleanup because deletion/GC is a later separately-authorized phase.
 pub(crate) async fn publish_shadow_checkpoint(
     witness: Arc<dyn ShadowCheckpointWitnessProvider>,
+    sessions: Arc<dyn ShadowSessionPersistence>,
     backend: &dyn ImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     request: ShadowCheckpointPublishRequest,
+    completion: OperationRecord,
     source: &mut dyn CheckpointSource,
 ) -> Result<ShadowCheckpointPublication> {
     // This read is the required authority input, not a mutation.  No witness
@@ -148,6 +356,26 @@ pub(crate) async fn publish_shadow_checkpoint(
         .await
         .map_err(ShadowCoordinatorError::Witness)?;
     validate_authority(&current, cipher, request)?;
+    let prepared = sessions
+        .load_exact(request.session_id, request.attempt_id)
+        .await
+        .map_err(ShadowCoordinatorError::SessionPersistence)?;
+    prepared
+        .require_prepared_authority(&current, request.lease)
+        .map_err(|_| ShadowCoordinatorError::StaleAuthority)?;
+    let session_binding = prepared.binding();
+    let next_root_seq = current
+        .root()
+        .root()
+        .sequence()
+        .checked_add(1)
+        .ok_or(ArchiveV3Error::Malformed("root sequence overflow"))?;
+    if session_binding.operation_id() != *completion.operation_id().as_bytes()
+        || session_binding.request_fingerprint() != *completion.request_fingerprint().as_bytes()
+        || completion.committed_root_seq() != next_root_seq
+    {
+        return Err(ShadowCoordinatorError::StaleAuthority);
+    }
     let current_root = load_current_root(backend, cipher, request.archive_id, &current).await?;
 
     let checkpoint = upload_checkpoint(
@@ -163,11 +391,7 @@ pub(crate) async fn publish_shadow_checkpoint(
         return Err(ShadowCoordinatorError::StaleAuthority);
     }
     let expected = current.root();
-    let root_seq = expected
-        .root()
-        .sequence()
-        .checked_add(1)
-        .ok_or(ArchiveV3Error::Malformed("root sequence overflow"))?;
+    let root_seq = next_root_seq;
     let parent = ParentReference {
         object_id: expected.root().object_id(),
         envelope_hash: expected.root().ciphertext_hash(),
@@ -218,34 +442,127 @@ pub(crate) async fn publish_shadow_checkpoint(
     .await
     .map_err(ShadowCoordinatorError::Witness)?;
 
+    // The exact candidate must be durable before a witness request can leave
+    // the process. A failed persistence call prevents the CAS entirely.
+    let session_candidate = ShadowCandidate::from_root_reference(candidate)
+        .map_err(|_| ShadowCoordinatorError::StaleAuthority)?;
+    let persisted = sessions
+        .persist_candidate(
+            request.session_id,
+            request.attempt_id,
+            session_binding,
+            session_candidate,
+        )
+        .await
+        .map_err(ShadowCoordinatorError::SessionPersistence)?;
+    if persisted.state() != ShadowSessionState::CandidatePersisted
+        || persisted.candidate() != Some(session_candidate)
+        || persisted.require_binding(session_binding).is_err()
+    {
+        return Err(ShadowCoordinatorError::SessionPersistence(
+            ShadowSessionPersistenceError::Conflict,
+        ));
+    }
+
     let archive_id = request.archive_id;
     let lease_fence = request.lease.fencing_epoch();
     let reconciliation = ShadowReconciliation {
         archive_id,
+        session_id: request.session_id,
+        attempt_id: request.attempt_id,
         candidate,
         expected: current,
         lease_fence,
+        binding: session_binding,
     };
     let reconciliation_for_task = reconciliation.clone();
+    let completion_for_task = completion.clone();
     let phase = tokio::spawn(async move {
         let outcome = witness.compare_and_advance_root(advance).await;
         if let Err(ShadowWitnessCommitError::Rejected(error)) = outcome {
+            sessions
+                .mark_superseded(
+                    reconciliation_for_task.session_id,
+                    reconciliation_for_task.attempt_id,
+                    reconciliation_for_task.binding,
+                )
+                .await
+                .map_err(ShadowCoordinatorError::SessionPersistence)?;
+            return Err(ShadowCoordinatorError::Witness(error));
+        }
+        if let Err(ShadowWitnessCommitError::Failed(error)) = outcome {
             return Err(ShadowCoordinatorError::Witness(error));
         }
         let reconciled = matches!(outcome, Err(ShadowWitnessCommitError::OutcomeUnknown));
-        let observed = witness.read_current_exact(archive_id).await.map_err(|_| {
-            ShadowCoordinatorError::ReconciliationRequired(Box::new(
-                reconciliation_for_task.clone(),
-            ))
-        })?;
+        if reconciled {
+            sessions
+                .require_reconciliation(
+                    reconciliation_for_task.session_id,
+                    reconciliation_for_task.attempt_id,
+                    session_binding,
+                )
+                .await
+                .map_err(ShadowCoordinatorError::SessionPersistence)?;
+        }
+        let observed = match witness.read_current_exact(archive_id).await {
+            Ok(observed) => observed,
+            Err(_) => {
+                if !reconciled {
+                    sessions
+                        .require_reconciliation(
+                            reconciliation_for_task.session_id,
+                            reconciliation_for_task.attempt_id,
+                            session_binding,
+                        )
+                        .await
+                        .map_err(ShadowCoordinatorError::SessionPersistence)?;
+                }
+                return Err(ShadowCoordinatorError::ReconciliationRequired(Box::new(
+                    reconciliation_for_task,
+                )));
+            }
+        };
         if record_nominates(
             &observed,
             reconciliation_for_task.candidate,
             &reconciliation_for_task.expected,
             reconciliation_for_task.lease_fence,
         ) {
-            Ok(reconciled)
+            match sessions
+                .complete_witnessed(
+                    reconciliation_for_task.session_id,
+                    reconciliation_for_task.attempt_id,
+                    reconciliation_for_task.binding,
+                    completion_for_task,
+                )
+                .await
+            {
+                Ok(_) => Ok(reconciled),
+                Err(_) => {
+                    sessions
+                        .require_reconciliation(
+                            reconciliation_for_task.session_id,
+                            reconciliation_for_task.attempt_id,
+                            reconciliation_for_task.binding,
+                        )
+                        .await
+                        .map_err(ShadowCoordinatorError::SessionPersistence)?;
+                    Err(ShadowCoordinatorError::ReconciliationRequired(Box::new(
+                        reconciliation_for_task,
+                    )))
+                }
+            }
         } else {
+            if !reconciled {
+                sessions
+                    .require_reconciliation(
+                        reconciliation_for_task.session_id,
+                        reconciliation_for_task.attempt_id,
+                        session_binding,
+                    )
+                    .await
+                    .map_err(ShadowCoordinatorError::SessionPersistence)?;
+            }
             Err(ShadowCoordinatorError::ReconciliationRequired(Box::new(
                 reconciliation_for_task,
             )))
@@ -265,7 +582,9 @@ pub(crate) async fn publish_shadow_checkpoint(
 /// witness record encoded by `handle`. It never lists immutable storage.
 pub(crate) async fn reconcile_shadow_checkpoint(
     witness: Arc<dyn ShadowCheckpointWitnessProvider>,
+    sessions: Arc<dyn ShadowSessionPersistence>,
     handle: &ShadowReconciliation,
+    completion: OperationRecord,
 ) -> Result<()> {
     let observed = witness
         .read_current_exact(handle.archive_id)
@@ -277,12 +596,85 @@ pub(crate) async fn reconcile_shadow_checkpoint(
         &handle.expected,
         handle.lease_fence,
     ) {
-        Ok(())
+        sessions
+            .complete_witnessed(
+                handle.session_id,
+                handle.attempt_id,
+                handle.binding,
+                completion,
+            )
+            .await
+            .map(|_| ())
+            .map_err(ShadowCoordinatorError::SessionPersistence)
     } else {
         Err(ShadowCoordinatorError::ReconciliationRequired(Box::new(
             handle.clone(),
         )))
     }
+}
+
+/// Restart path for a persisted attempt. This reads one exact session and one
+/// exact witness document; it never creates a new candidate, lists storage, or
+/// grants write authority. `RetrySameCandidate` still requires a fresh valid
+/// lease check by the caller.
+pub(crate) async fn reconcile_durable_shadow_session(
+    witness: Arc<dyn ShadowCheckpointWitnessProvider>,
+    sessions: Arc<dyn ShadowSessionPersistence>,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    completion: OperationRecord,
+) -> Result<ShadowReconcileDecision> {
+    let session = sessions
+        .load_exact(session_id, attempt_id)
+        .await
+        .map_err(ShadowCoordinatorError::SessionPersistence)?;
+    let binding = session.binding();
+    if binding.operation_id() != *completion.operation_id().as_bytes()
+        || binding.request_fingerprint() != *completion.request_fingerprint().as_bytes()
+        || session
+            .candidate()
+            .is_some_and(|candidate| candidate.root_seq() != completion.committed_root_seq())
+    {
+        return Err(ShadowCoordinatorError::StaleAuthority);
+    }
+    match session.state() {
+        ShadowSessionState::Witnessed => {
+            sessions
+                .complete_witnessed(session_id, attempt_id, binding, completion)
+                .await
+                .map_err(ShadowCoordinatorError::SessionPersistence)?;
+            return Ok(ShadowReconcileDecision::Witnessed);
+        }
+        ShadowSessionState::Superseded => return Ok(ShadowReconcileDecision::Superseded),
+        ShadowSessionState::Prepared | ShadowSessionState::Aborted => {
+            return Err(ShadowCoordinatorError::StaleAuthority);
+        }
+        ShadowSessionState::CandidatePersisted | ShadowSessionState::ReconcileRequired => {}
+    }
+    let archive_id = ArchiveId::from_bytes(session.binding().archive_id());
+    let observed = witness
+        .read_current_exact(archive_id)
+        .await
+        .map_err(ShadowCoordinatorError::Witness)?;
+    let decision = session
+        .reconcile_against(&observed)
+        .map_err(|_| ShadowCoordinatorError::StaleAuthority)?;
+    match decision {
+        ShadowReconcileDecision::Witnessed => {
+            sessions
+                .complete_witnessed(session_id, attempt_id, binding, completion)
+                .await
+                .map_err(ShadowCoordinatorError::SessionPersistence)?;
+        }
+        ShadowReconcileDecision::Superseded => {
+            sessions
+                .mark_superseded(session_id, attempt_id, binding)
+                .await
+                .map_err(ShadowCoordinatorError::SessionPersistence)?;
+        }
+        ShadowReconcileDecision::RetrySameCandidate => {}
+    }
+    Ok(decision)
 }
 
 fn validate_authority(
@@ -414,6 +806,10 @@ mod tests {
         resolve_archive_cipher, ArchiveDek, CreateIfAbsent, ExactKeyRegistryProvider,
         InMemoryImmutableBackend, KeyEpoch, KeyKind, KeyRegistryContext, KeyRegistryPlaintext,
         ObjectKey,
+    };
+    use crate::archive_v3_operation::{
+        BoundedOperationResult, OperationId, OperationResultStatus, RequestFingerprint,
+        RetentionClass,
     };
     use crate::archive_v3_witness::{
         InMemoryWitness, KeyRegistryReference, RootCommitment, Witness, WitnessBootstrap,
@@ -558,6 +954,7 @@ mod tests {
     enum Outcome {
         Ok,
         Reject,
+        ProviderFailed,
         UnknownCommitted,
         UnknownUncommitted,
         UnknownDelayedCommitted,
@@ -579,6 +976,137 @@ mod tests {
         delayed_advance: Mutex<Option<RootAdvance>>,
         wrong_archive_initial_read: Mutex<bool>,
     }
+
+    struct FakeSessions {
+        record: Mutex<ShadowSessionRecord>,
+        completion: Mutex<Option<OperationRecord>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        fail_candidate_persist: Mutex<bool>,
+        fail_completion: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl ShadowSessionPersistence for FakeSessions {
+        async fn load_exact(
+            &self,
+            session_id: ShadowSessionId,
+            attempt_id: ShadowAttemptId,
+        ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError> {
+            self.events.lock().unwrap().push("load_session");
+            let record = self.record.lock().unwrap().clone();
+            if record.session_id() != session_id || record.attempt_id() != attempt_id {
+                return Err(ShadowSessionPersistenceError::Conflict);
+            }
+            Ok(record)
+        }
+
+        async fn persist_candidate(
+            &self,
+            session_id: ShadowSessionId,
+            attempt_id: ShadowAttemptId,
+            binding: ShadowSessionBinding,
+            candidate: ShadowCandidate,
+        ) -> std::result::Result<ShadowSessionRecord, ShadowSessionPersistenceError> {
+            self.events.lock().unwrap().push("persist_candidate");
+            if *self.fail_candidate_persist.lock().unwrap() {
+                return Err(ShadowSessionPersistenceError::Unavailable);
+            }
+            let mut record = self.record.lock().unwrap();
+            if record.session_id() != session_id
+                || record.attempt_id() != attempt_id
+                || record.require_binding(binding).is_err()
+            {
+                return Err(ShadowSessionPersistenceError::Conflict);
+            }
+            record
+                .persist_candidate(candidate)
+                .map_err(|_| ShadowSessionPersistenceError::Conflict)?;
+            Ok(record.clone())
+        }
+
+        async fn require_reconciliation(
+            &self,
+            session_id: ShadowSessionId,
+            attempt_id: ShadowAttemptId,
+            binding: ShadowSessionBinding,
+        ) -> std::result::Result<(), ShadowSessionPersistenceError> {
+            self.events.lock().unwrap().push("persist_reconcile");
+            let mut record = self.record.lock().unwrap();
+            if record.session_id() != session_id
+                || record.attempt_id() != attempt_id
+                || record.require_binding(binding).is_err()
+            {
+                return Err(ShadowSessionPersistenceError::Conflict);
+            }
+            if record.state() != ShadowSessionState::ReconcileRequired {
+                record
+                    .transition(ShadowSessionState::ReconcileRequired)
+                    .map_err(|_| ShadowSessionPersistenceError::Conflict)?;
+            }
+            Ok(())
+        }
+
+        async fn mark_superseded(
+            &self,
+            session_id: ShadowSessionId,
+            attempt_id: ShadowAttemptId,
+            binding: ShadowSessionBinding,
+        ) -> std::result::Result<(), ShadowSessionPersistenceError> {
+            self.events.lock().unwrap().push("persist_superseded");
+            let mut record = self.record.lock().unwrap();
+            if record.session_id() != session_id
+                || record.attempt_id() != attempt_id
+                || record.require_binding(binding).is_err()
+            {
+                return Err(ShadowSessionPersistenceError::Conflict);
+            }
+            if record.state() != ShadowSessionState::Superseded {
+                record
+                    .transition(ShadowSessionState::Superseded)
+                    .map_err(|_| ShadowSessionPersistenceError::Conflict)?;
+            }
+            Ok(())
+        }
+
+        async fn complete_witnessed(
+            &self,
+            session_id: ShadowSessionId,
+            attempt_id: ShadowAttemptId,
+            binding: ShadowSessionBinding,
+            completion: OperationRecord,
+        ) -> std::result::Result<RecordOutcome, ShadowSessionPersistenceError> {
+            self.events.lock().unwrap().push("complete_witnessed");
+            if *self.fail_completion.lock().unwrap() {
+                return Err(ShadowSessionPersistenceError::Unavailable);
+            }
+            let mut record = self.record.lock().unwrap();
+            if record.session_id() != session_id
+                || record.attempt_id() != attempt_id
+                || record.require_binding(binding).is_err()
+                || record.binding().operation_id() != *completion.operation_id().as_bytes()
+                || record.binding().request_fingerprint()
+                    != *completion.request_fingerprint().as_bytes()
+                || record.candidate().map(ShadowCandidate::root_seq)
+                    != Some(completion.committed_root_seq())
+            {
+                return Err(ShadowSessionPersistenceError::Conflict);
+            }
+            let mut persisted_completion = self.completion.lock().unwrap();
+            if record.state() == ShadowSessionState::Witnessed {
+                return if persisted_completion.as_ref() == Some(&completion) {
+                    Ok(RecordOutcome::AlreadyRecorded)
+                } else {
+                    Err(ShadowSessionPersistenceError::Conflict)
+                };
+            }
+            record
+                .transition(ShadowSessionState::Witnessed)
+                .map_err(|_| ShadowSessionPersistenceError::Conflict)?;
+            *persisted_completion = Some(completion);
+            Ok(RecordOutcome::Recorded)
+        }
+    }
+
     #[async_trait]
     impl ShadowCheckpointWitnessProvider for FakeWitness {
         async fn read_current_exact(
@@ -663,6 +1191,9 @@ mod tests {
                 Outcome::Reject => Err(ShadowWitnessCommitError::Rejected(
                     WitnessError::CompareFailed,
                 )),
+                Outcome::ProviderFailed => {
+                    Err(ShadowWitnessCommitError::Failed(WitnessError::Unavailable))
+                }
                 Outcome::UnknownCommitted => {
                     let _ = self
                         .inner
@@ -717,6 +1248,7 @@ mod tests {
         Backend,
         VerifiedArchiveCipher,
         Arc<FakeWitness>,
+        Arc<FakeSessions>,
         ShadowCheckpointPublishRequest,
         Arc<Mutex<Vec<&'static str>>>,
     ) {
@@ -778,7 +1310,25 @@ mod tests {
         let lease = witness
             .acquire_lease(archive, database, key, ObjectId::from_bytes([6; 16]), 60)
             .unwrap();
-        let request = ShadowCheckpointPublishRequest::new(archive, lease);
+        let operation_id = [7; 16];
+        let session_id = ShadowSessionId::for_operation(operation_id).unwrap();
+        let attempt_id = ShadowAttemptId::from_bytes([8; 16]);
+        let current = witness.read_current(archive).unwrap().unwrap();
+        let session = ShadowSessionRecord::prepared(
+            session_id,
+            attempt_id,
+            ShadowSessionBinding::from_witness(&current, lease, operation_id, [9; 32], 1, 1, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        let sessions = Arc::new(FakeSessions {
+            record: Mutex::new(session),
+            completion: Mutex::new(None),
+            events: events.clone(),
+            fail_candidate_persist: Mutex::new(false),
+            fail_completion: Mutex::new(false),
+        });
+        let request = ShadowCheckpointPublishRequest::new(archive, lease, session_id, attempt_id);
         (
             backend,
             cipher,
@@ -795,6 +1345,7 @@ mod tests {
                 delayed_advance: Mutex::new(None),
                 wrong_archive_initial_read: Mutex::new(false),
             }),
+            sessions,
             request,
             events,
         )
@@ -807,22 +1358,55 @@ mod tests {
         Source(bytes)
     }
 
+    fn completion() -> OperationRecord {
+        OperationRecord::new(
+            OperationId::from_bytes([7; 16]),
+            RequestFingerprint::from_bytes([9; 32]),
+            1,
+            OperationResultStatus::Succeeded,
+            BoundedOperationResult::inline(
+                OperationResultStatus::Succeeded,
+                b"shadow-checkpoint-result".to_vec(),
+            )
+            .unwrap(),
+            RetentionClass::RetryWindow,
+            101,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn publishes_only_after_immutable_upload_root_create_and_readback() {
-        let (backend, cipher, witness, request, events) = setup(Outcome::Ok).await;
-        let published =
-            publish_shadow_checkpoint(witness.clone(), &backend, &cipher, request, &mut source())
-                .await
-                .unwrap();
+        let (backend, cipher, witness, sessions, request, events) = setup(Outcome::Ok).await;
+        let published = publish_shadow_checkpoint(
+            witness.clone(),
+            sessions.clone(),
+            &backend,
+            &cipher,
+            request,
+            completion(),
+            &mut source(),
+        )
+        .await
+        .unwrap();
         assert!(!published.reconciled());
         assert_eq!(published.root().sequence(), 1);
         let events = events.lock().unwrap();
         let commit = events.iter().position(|x| *x == "commit_witness").unwrap();
         assert_eq!(events.first(), Some(&"read_witness"));
-        assert_eq!(events.get(1), Some(&"read"));
+        assert_eq!(events.get(1), Some(&"load_session"));
+        assert_eq!(events.get(2), Some(&"read"));
         assert!(events[..commit].contains(&"create"));
-        assert_eq!(events.get(commit.wrapping_sub(1)), Some(&"read"));
+        assert_eq!(
+            events.get(commit.wrapping_sub(1)),
+            Some(&"persist_candidate")
+        );
         assert_eq!(events.get(commit + 1), Some(&"read_witness"));
+        assert_eq!(events.get(commit + 2), Some(&"complete_witnessed"));
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::Witnessed
+        );
     }
     #[tokio::test]
     async fn failures_and_cas_rejection_never_publish_authority() {
@@ -833,13 +1417,15 @@ mod tests {
             BackendFault::RootCreateFails,
             BackendFault::RootReadCorrupt,
         ] {
-            let (backend, cipher, witness, request, events) = setup(Outcome::Ok).await;
+            let (backend, cipher, witness, sessions, request, events) = setup(Outcome::Ok).await;
             *backend.fault.lock().unwrap() = fault;
             assert!(publish_shadow_checkpoint(
                 witness.clone(),
+                sessions,
                 &backend,
                 &cipher,
                 request,
+                completion(),
                 &mut source()
             )
             .await
@@ -849,21 +1435,48 @@ mod tests {
                 assert!(!events.lock().unwrap().contains(&"create"));
             }
         }
-        let (backend, reject_cipher, witness, request, _) = setup(Outcome::Reject).await;
+        let (backend, reject_cipher, witness, sessions, request, _) = setup(Outcome::Reject).await;
         assert!(matches!(
             publish_shadow_checkpoint(
                 witness.clone(),
+                sessions.clone(),
                 &backend,
                 &reject_cipher,
                 request,
+                completion(),
                 &mut source()
             )
             .await,
             Err(ShadowCoordinatorError::Witness(WitnessError::CompareFailed))
         ));
         assert_eq!(*witness.commits.lock().unwrap(), 1);
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::Superseded
+        );
 
-        let (backend, _cipher, witness, request, _) = setup(Outcome::Ok).await;
+        let (backend, failed_cipher, witness, sessions, request, events) =
+            setup(Outcome::ProviderFailed).await;
+        assert!(matches!(
+            publish_shadow_checkpoint(
+                witness,
+                sessions.clone(),
+                &backend,
+                &failed_cipher,
+                request,
+                completion(),
+                &mut source(),
+            )
+            .await,
+            Err(ShadowCoordinatorError::Witness(WitnessError::Unavailable))
+        ));
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::CandidatePersisted
+        );
+        assert!(!events.lock().unwrap().contains(&"persist_superseded"));
+
+        let (backend, _cipher, witness, sessions, request, _) = setup(Outcome::Ok).await;
         let stale = cipher(
             ArchiveId::from_bytes([1; 16]),
             KeyEpoch::from_bytes([99; 16]),
@@ -871,64 +1484,154 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            publish_shadow_checkpoint(witness.clone(), &backend, &stale, request, &mut source())
-                .await,
+            publish_shadow_checkpoint(
+                witness.clone(),
+                sessions,
+                &backend,
+                &stale,
+                request,
+                completion(),
+                &mut source(),
+            )
+            .await,
             Err(ShadowCoordinatorError::StaleAuthority)
         ));
         assert_eq!(*witness.commits.lock().unwrap(), 0);
 
-        let (backend, cipher, witness, request, events) = setup(Outcome::Ok).await;
+        let (backend, cipher, witness, sessions, request, events) = setup(Outcome::Ok).await;
+        *sessions.fail_candidate_persist.lock().unwrap() = true;
+        assert!(matches!(
+            publish_shadow_checkpoint(
+                witness.clone(),
+                sessions,
+                &backend,
+                &cipher,
+                request,
+                completion(),
+                &mut source(),
+            )
+            .await,
+            Err(ShadowCoordinatorError::SessionPersistence(
+                ShadowSessionPersistenceError::Unavailable
+            ))
+        ));
+        assert_eq!(*witness.commits.lock().unwrap(), 0);
+        assert!(events.lock().unwrap().contains(&"persist_candidate"));
+
+        let (backend, cipher, witness, sessions, request, events) = setup(Outcome::Ok).await;
         *witness.wrong_archive_initial_read.lock().unwrap() = true;
         assert!(matches!(
-            publish_shadow_checkpoint(witness.clone(), &backend, &cipher, request, &mut source())
-                .await,
+            publish_shadow_checkpoint(
+                witness.clone(),
+                sessions,
+                &backend,
+                &cipher,
+                request,
+                completion(),
+                &mut source(),
+            )
+            .await,
             Err(ShadowCoordinatorError::StaleAuthority)
         ));
         assert_eq!(*witness.commits.lock().unwrap(), 0);
         assert!(!events.lock().unwrap().contains(&"create"));
 
-        let (backend, cipher, witness, request, _) = setup(Outcome::Ok).await;
+        let (backend, cipher, witness, sessions, request, _) = setup(Outcome::Ok).await;
         let mut downgraded = source();
         downgraded.0[60..64].copy_from_slice(&0u32.to_be_bytes());
         assert!(matches!(
-            publish_shadow_checkpoint(witness.clone(), &backend, &cipher, request, &mut downgraded)
-                .await,
+            publish_shadow_checkpoint(
+                witness.clone(),
+                sessions,
+                &backend,
+                &cipher,
+                request,
+                completion(),
+                &mut downgraded,
+            )
+            .await,
             Err(ShadowCoordinatorError::StaleAuthority)
         ));
         assert_eq!(*witness.commits.lock().unwrap(), 0);
     }
     #[tokio::test]
     async fn non_nominating_post_send_reads_retain_exact_reconciliation() {
-        let (backend, cipher, witness, request, _) = setup(Outcome::UnknownCommitted).await;
+        let (backend, cipher, witness, sessions, request, _) =
+            setup(Outcome::UnknownCommitted).await;
         assert!(publish_shadow_checkpoint(
             witness.clone(),
+            sessions.clone(),
             &backend,
             &cipher,
             request,
+            completion(),
             &mut source()
         )
         .await
         .unwrap()
         .reconciled());
-        let (backend, cipher, witness, request, _) = setup(Outcome::UnknownUncommitted).await;
-        let result =
-            publish_shadow_checkpoint(witness, &backend, &cipher, request, &mut source()).await;
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::Witnessed
+        );
+        assert_eq!(
+            reconcile_durable_shadow_session(
+                witness.clone(),
+                sessions.clone(),
+                request.session_id,
+                request.attempt_id,
+                completion(),
+            )
+            .await
+            .unwrap(),
+            ShadowReconcileDecision::Witnessed
+        );
+        let (backend, cipher, witness, sessions, request, _) =
+            setup(Outcome::UnknownUncommitted).await;
+        let result = publish_shadow_checkpoint(
+            witness.clone(),
+            sessions.clone(),
+            &backend,
+            &cipher,
+            request,
+            completion(),
+            &mut source(),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(ShadowCoordinatorError::ReconciliationRequired(_))
         ));
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::ReconcileRequired
+        );
+        assert_eq!(
+            reconcile_durable_shadow_session(
+                witness,
+                sessions,
+                request.session_id,
+                request.attempt_id,
+                completion(),
+            )
+            .await
+            .unwrap(),
+            ShadowReconcileDecision::RetrySameCandidate
+        );
 
         for outcome in [
             Outcome::UnknownDelayedCommitted,
             Outcome::OkWithStaleReread,
             Outcome::OkWithForgedRegistryReread,
         ] {
-            let (backend, cipher, witness, request, _) = setup(outcome).await;
+            let (backend, cipher, witness, sessions, request, _) = setup(outcome).await;
             let handle = match publish_shadow_checkpoint(
                 witness.clone(),
+                sessions.clone(),
                 &backend,
                 &cipher,
                 request,
+                completion(),
                 &mut source(),
             )
             .await
@@ -938,7 +1641,7 @@ mod tests {
             };
             timeout(
                 Duration::from_secs(5),
-                reconcile_shadow_checkpoint(witness, &handle),
+                reconcile_shadow_checkpoint(witness, sessions, &handle, completion()),
             )
             .await
             .expect("later exact reread must remain bounded")
@@ -947,16 +1650,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_atomic_completion_is_reconciled_and_retried_idempotently() {
+        let (backend, cipher, witness, sessions, request, _) = setup(Outcome::Ok).await;
+        *sessions.fail_completion.lock().unwrap() = true;
+        assert!(matches!(
+            publish_shadow_checkpoint(
+                witness.clone(),
+                sessions.clone(),
+                &backend,
+                &cipher,
+                request,
+                completion(),
+                &mut source(),
+            )
+            .await,
+            Err(ShadowCoordinatorError::ReconciliationRequired(_))
+        ));
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::ReconcileRequired
+        );
+        *sessions.fail_completion.lock().unwrap() = false;
+        for _ in 0..2 {
+            assert_eq!(
+                reconcile_durable_shadow_session(
+                    witness.clone(),
+                    sessions.clone(),
+                    request.session_id,
+                    request.attempt_id,
+                    completion(),
+                )
+                .await
+                .unwrap(),
+                ShadowReconcileDecision::Witnessed
+            );
+        }
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::Witnessed
+        );
+        assert_eq!(
+            sessions.completion.lock().unwrap().as_ref(),
+            Some(&completion())
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_attempt_is_terminal_across_restart_before_new_attempt() {
+        let (backend, cipher, witness, prepared, request, _) = setup(Outcome::Reject).await;
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(temporary.path()).unwrap();
+        OperationLedger::initialize(&connection).unwrap();
+        let prepared_record = prepared.record.lock().unwrap().clone();
+        OperationLedger::prepare_shadow_session(&connection, &prepared_record).unwrap();
+        let sessions = Arc::new(EncryptedSqliteShadowSessionPersistence::new(Arc::new(
+            Mutex::new(connection),
+        )));
+        assert!(matches!(
+            publish_shadow_checkpoint(
+                witness.clone(),
+                sessions.clone(),
+                &backend,
+                &cipher,
+                request,
+                completion(),
+                &mut source(),
+            )
+            .await,
+            Err(ShadowCoordinatorError::Witness(WitnessError::CompareFailed))
+        ));
+        drop(sessions);
+
+        let reopened = Connection::open(temporary.path()).unwrap();
+        OperationLedger::initialize(&reopened).unwrap();
+        assert_eq!(
+            OperationLedger::load_shadow_session(
+                &reopened,
+                request.session_id,
+                request.attempt_id,
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+            ShadowSessionState::Superseded
+        );
+        let shared = Arc::new(Mutex::new(reopened));
+        let restarted = Arc::new(EncryptedSqliteShadowSessionPersistence::new(shared.clone()));
+        assert_eq!(
+            reconcile_durable_shadow_session(
+                witness,
+                restarted,
+                request.session_id,
+                request.attempt_id,
+                completion(),
+            )
+            .await
+            .unwrap(),
+            ShadowReconcileDecision::Superseded
+        );
+        let next = ShadowSessionRecord::prepared(
+            prepared_record.session_id(),
+            ShadowAttemptId::from_bytes([0x44; 16]),
+            prepared_record.binding(),
+        )
+        .unwrap();
+        assert_eq!(
+            OperationLedger::prepare_shadow_session(&shared.lock().unwrap(), &next).unwrap(),
+            RecordOutcome::Recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_sqlite_candidate_and_reconciliation_survive_process_restart() {
+        let (backend, cipher, witness, prepared, request, _) =
+            setup(Outcome::UnknownUncommitted).await;
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(temporary.path()).unwrap();
+        OperationLedger::initialize(&connection).unwrap();
+        let prepared_record = prepared.record.lock().unwrap().clone();
+        OperationLedger::prepare_shadow_session(&connection, &prepared_record).unwrap();
+        let sessions = Arc::new(EncryptedSqliteShadowSessionPersistence::new(Arc::new(
+            Mutex::new(connection),
+        )));
+        assert!(matches!(
+            publish_shadow_checkpoint(
+                witness.clone(),
+                sessions.clone(),
+                &backend,
+                &cipher,
+                request,
+                completion(),
+                &mut source(),
+            )
+            .await,
+            Err(ShadowCoordinatorError::ReconciliationRequired(_))
+        ));
+        drop(sessions);
+
+        let reopened = Connection::open(temporary.path()).unwrap();
+        OperationLedger::initialize(&reopened).unwrap();
+        assert_eq!(
+            OperationLedger::load_shadow_session(
+                &reopened,
+                request.session_id,
+                request.attempt_id,
+            )
+            .unwrap()
+            .unwrap()
+            .state(),
+            ShadowSessionState::ReconcileRequired
+        );
+        let restarted = Arc::new(EncryptedSqliteShadowSessionPersistence::new(Arc::new(
+            Mutex::new(reopened),
+        )));
+        assert_eq!(
+            reconcile_durable_shadow_session(
+                witness,
+                restarted,
+                request.session_id,
+                request.attempt_id,
+                completion(),
+            )
+            .await
+            .unwrap(),
+            ShadowReconcileDecision::RetrySameCandidate
+        );
+    }
+
+    #[tokio::test]
     async fn post_send_failures_return_an_exact_reconciliation_handle() {
         for outcome in [Outcome::OkWithRereadError, Outcome::PanicAfterCommitted] {
-            let (backend, cipher, witness, request, _) = setup(outcome).await;
+            let (backend, cipher, witness, sessions, request, _) = setup(outcome).await;
             let result = timeout(
                 Duration::from_secs(5),
                 publish_shadow_checkpoint(
                     witness.clone(),
+                    sessions.clone(),
                     &backend,
                     &cipher,
                     request,
+                    completion(),
                     &mut source(),
                 ),
             )
@@ -969,7 +1842,7 @@ mod tests {
             assert_eq!(format!("{handle:?}"), "ShadowReconciliation(<opaque>)");
             timeout(
                 Duration::from_secs(5),
-                reconcile_shadow_checkpoint(witness.clone(), &handle),
+                reconcile_shadow_checkpoint(witness.clone(), sessions, &handle, completion()),
             )
             .await
             .expect("exact witness reread must remain bounded")
@@ -981,7 +1854,8 @@ mod tests {
     #[tokio::test]
     async fn committing_phase_survives_cancellation_after_send_and_during_reread() {
         for during_reread in [false, true] {
-            let (backend, cipher, witness, request, _) = setup(Outcome::UnknownCommitted).await;
+            let (backend, cipher, witness, sessions, request, _) =
+                setup(Outcome::UnknownCommitted).await;
             let entered = Arc::new(Notify::new());
             let release = Arc::new(Notify::new());
             let completed = Arc::new(Notify::new());
@@ -992,12 +1866,15 @@ mod tests {
                 *witness.after_send.lock().unwrap() = Some((entered.clone(), release.clone()));
             }
             let witness_for_call: Arc<dyn ShadowCheckpointWitnessProvider> = witness.clone();
+            let sessions_for_call = sessions.clone();
             let call = tokio::spawn(async move {
                 publish_shadow_checkpoint(
                     witness_for_call,
+                    sessions_for_call,
                     &backend,
                     &cipher,
                     request,
+                    completion(),
                     &mut source(),
                 )
                 .await
@@ -1026,6 +1903,10 @@ mod tests {
             );
             assert_eq!(*witness.commits.lock().unwrap(), 1);
             assert_eq!(witness.reads.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                sessions.record.lock().unwrap().state(),
+                ShadowSessionState::Witnessed
+            );
         }
     }
 }

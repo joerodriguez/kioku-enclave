@@ -289,7 +289,7 @@ credential, or deployment wiring.
 The shadow module
 is bounded synchronous capture state only: no
 SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
-The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its exact owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
+The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its exact session-and-attempt-derived owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes; a later attempt in the same stable session cannot drain its predecessor's commits. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
 
 `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
@@ -702,15 +702,24 @@ immutable create must succeed and the candidate root is read back and authentica
 witness CAS; later recovery authenticates the complete nominated checkpoint graph. Both a success
 and a lost transaction response are accepted only after an exact witness reread names the same
 root, parent, database/key/registry, fence, migration/deletion states, and predecessor
-commitments. While the process/runtime remains alive, the cancellation-safe committing phase owns
-its witness provider until that reread finishes; a post-send reread/task failure returns an opaque
-exact-reconciliation handle. The handle and task are not durable local state. Process/runtime
-shutdown recovery starts from the independent witness, with durable retry identity deferred to
-the later operation-ledger/runtime integration. A non-nominating reread is never treated as proof
-of non-commit because commit completion or a subsequent advance may race that read. Failures leave
-unreachable ciphertext objects for a later authorized GC phase. The seam never lists objects,
-truncates WAL, mutates legacy persistence, or performs cleanup, and is not wired to runtime
-authority.
+commitments. The Firestore boundary type-separates definitive comparison/precondition rejection,
+non-terminal token/begin/batch-get/provider failure, and ambiguous commit response; only the first
+can durably supersede an attempt. Before CAS, a fixed-size content-free record durably binds one stable operation/session,
+one retained attempt, the exact base/registry/fence/migration/WAL boundary, and the authenticated
+candidate root. The encrypted SQLite ledger permits at most one active and 16 retained attempts;
+candidate replacement is forbidden, while a definitive CAS rejection is durably superseded and
+every superseded/aborted attempt remains
+inventory-visible before a new attempt can be prepared. Unknown responses are durably marked before
+reread. Process restart reads one exact attempt and one exact witness record and can return only
+`Witnessed`, non-authorizing `RetrySameCandidate`, or `Superseded`; it never lists storage or invents a
+candidate. A witnessed attempt and its exact root-sequence operation replay result commit in one
+SQLite transaction. While the runtime remains alive, the cancellation-safe committing phase still
+owns its witness provider until reread finishes; a post-send task failure also returns an opaque
+in-memory handle. A non-nominating reread is never proof of non-commit because commit completion or a
+subsequent advance may race it. Failures can leave unreachable ciphertext for the later authorized
+GC/deletion walker. The seam never truncates WAL, mutates legacy persistence, or performs cleanup,
+and no Store, VFS registration, provider construction, flag, route, startup path, or production
+authority wires it.
 
 ### T5 — Hypervisor or memory inspection
 

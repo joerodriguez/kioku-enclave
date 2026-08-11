@@ -28,8 +28,10 @@ use std::{
 };
 
 use rusqlite::ffi;
+use sha2::{Digest, Sha256};
 
 use crate::archive_v3_shadow::{CapturedWalCommit, ShadowCaptureMetrics, WalCaptureState};
+use crate::archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionId};
 
 /// The registry deliberately has a small fixed owner count.  A caller must
 /// retire a path registration after closing its SQLite connection rather than
@@ -42,6 +44,7 @@ pub const MAX_CAPTURE_VFS_INSTALLATIONS: usize = 8;
 const MAX_CAPTURE_PATH_BYTES: usize = 4096;
 static CAPTURE_VFS_INSTALLATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+const CAPTURE_OWNER_DOMAIN: &[u8] = b"kioku:archive:v3:capture-owner\0";
 
 /// Opaque owner comparison data.  It is never formatted or logged by this
 /// module; its only purpose is preventing a caller from confusing a capture
@@ -50,6 +53,21 @@ static CAPTURE_VFS_INSTALLATIONS: std::sync::atomic::AtomicUsize =
 pub struct CaptureOwner([u8; 16]);
 
 impl CaptureOwner {
+    /// Bind a capture registration to one exact publication attempt. A later
+    /// attempt in the same stable session must install a fresh registration
+    /// and cannot drain commits retained by its predecessor.
+    pub fn for_shadow_attempt(session_id: ShadowSessionId, attempt_id: ShadowAttemptId) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(CAPTURE_OWNER_DOMAIN);
+        hash.update(session_id.as_bytes());
+        hash.update(attempt_id.as_bytes());
+        let digest: [u8; 32] = hash.finalize().into();
+        let mut owner = [0; 16];
+        owner.copy_from_slice(&digest[..16]);
+        Self(owner)
+    }
+
+    #[cfg(test)]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -62,6 +80,7 @@ pub enum CaptureRegistryError {
     PathNotCanonicalizable,
     DuplicatePath,
     OwnerMismatch,
+    StateUnavailable,
 }
 
 impl std::fmt::Display for CaptureRegistryError {
@@ -74,6 +93,7 @@ impl std::fmt::Display for CaptureRegistryError {
             }
             Self::DuplicatePath => "capture path is already registered",
             Self::OwnerMismatch => "capture registration owner does not match",
+            Self::StateUnavailable => "capture registration state is unavailable",
         })
     }
 }
@@ -254,11 +274,17 @@ fn canonical_scope_path(bytes: &[u8]) -> Result<Vec<u8>, CaptureRegistryError> {
 }
 
 impl CaptureRegistration {
-    pub fn drain_completed(&self) -> Vec<CapturedWalCommit> {
+    pub fn drain_completed(
+        &self,
+        owner: CaptureOwner,
+    ) -> Result<Vec<CapturedWalCommit>, CaptureRegistryError> {
+        if owner != self.owner {
+            return Err(CaptureRegistryError::OwnerMismatch);
+        }
         self.state
             .lock()
             .map(|mut state| state.drain_completed())
-            .unwrap_or_default()
+            .map_err(|_| CaptureRegistryError::StateUnavailable)
     }
 
     pub fn metrics(&self) -> ShadowCaptureMetrics {
@@ -1004,20 +1030,24 @@ mod tests {
         )
     }
 
-    fn setup() -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
+    fn setup_with_owner(
+        owner: CaptureOwner,
+    ) -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("capture.db");
         let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
         let registry = CaptureRegistry::new();
-        let registration = registry
-            .register(CaptureOwner::from_bytes([7; 16]), &c_path)
-            .unwrap();
+        let registration = registry.register(owner, &c_path).unwrap();
         let name = format!(
             "kioku-capture-test-{}",
             NEXT_VFS.fetch_add(1, Ordering::Relaxed)
         );
         let vfs = RegisteredCaptureVfs::install(&name, registry).unwrap();
         (directory, c_path, registration, vfs)
+    }
+
+    fn setup() -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
+        setup_with_owner(CaptureOwner::from_bytes([7; 16]))
     }
 
     fn open(path: &CStr, vfs: &RegisteredCaptureVfs) -> Connection {
@@ -1049,7 +1079,7 @@ mod tests {
         // The schema-creation commit predates this checkpoint and therefore
         // belongs to the prior base/generation. The future owner coordinates
         // checkpoint publication with this same drain boundary.
-        let _ = registration.drain_completed();
+        let _ = registration.drain_completed(registration.owner()).unwrap();
 
         connection
             .execute("INSERT INTO events(value) VALUES (41)", [])
@@ -1064,7 +1094,7 @@ mod tests {
                 .unwrap(),
             2
         );
-        let commits = registration.drain_completed();
+        let commits = registration.drain_completed(registration.owner()).unwrap();
         assert!(
             !commits.is_empty(),
             "a successful SQLite WAL commit must be observed"
@@ -1099,11 +1129,14 @@ mod tests {
         let (_directory, c_path, registration, vfs) = setup();
         let connection = open(&c_path, &vfs);
         wal_setup(&connection);
-        let _ = registration.drain_completed();
+        let _ = registration.drain_completed(registration.owner()).unwrap();
         connection
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO events VALUES (1); ROLLBACK;")
             .unwrap();
-        assert!(registration.drain_completed().is_empty());
+        assert!(registration
+            .drain_completed(registration.owner())
+            .unwrap()
+            .is_empty());
         connection
             .execute("INSERT INTO events VALUES (2)", [])
             .unwrap();
@@ -1117,7 +1150,7 @@ mod tests {
                 .unwrap(),
             5
         );
-        let commits = registration.drain_completed();
+        let commits = registration.drain_completed(registration.owner()).unwrap();
         assert!(!commits.is_empty());
         assert!(commits
             .windows(2)
@@ -1126,15 +1159,39 @@ mod tests {
     }
 
     #[test]
+    fn another_attempt_in_the_same_session_cannot_drain_a_registration() {
+        let session_id = ShadowSessionId::from_bytes([8; 16]);
+        let first_attempt = ShadowAttemptId::from_bytes([9; 16]);
+        let later_attempt = ShadowAttemptId::from_bytes([10; 16]);
+        let (_directory, c_path, registration, vfs) =
+            setup_with_owner(CaptureOwner::for_shadow_attempt(session_id, first_attempt));
+        let connection = open(&c_path, &vfs);
+        wal_setup(&connection);
+        connection
+            .execute("INSERT INTO events VALUES (9)", [])
+            .unwrap();
+        let wrong = CaptureOwner::for_shadow_attempt(session_id, later_attempt);
+        assert!(matches!(
+            registration.drain_completed(wrong),
+            Err(CaptureRegistryError::OwnerMismatch)
+        ));
+        assert!(!registration
+            .drain_completed(registration.owner())
+            .unwrap()
+            .is_empty());
+        drop(connection);
+    }
+
+    #[test]
     fn sqlite_wal_restart_truncate_starts_a_new_capture_generation() {
         let (_directory, c_path, registration, vfs) = setup();
         let connection = open(&c_path, &vfs);
         wal_setup(&connection);
-        let _ = registration.drain_completed();
+        let _ = registration.drain_completed(registration.owner()).unwrap();
         connection
             .execute("INSERT INTO events VALUES (10)", [])
             .unwrap();
-        let before_restart = registration.drain_completed();
+        let before_restart = registration.drain_completed(registration.owner()).unwrap();
         assert!(!before_restart.is_empty());
         let old_generation = before_restart.last().unwrap().wal_generation();
 
@@ -1144,7 +1201,7 @@ mod tests {
         connection
             .execute("INSERT INTO events VALUES (11)", [])
             .unwrap();
-        let after_restart = registration.drain_completed();
+        let after_restart = registration.drain_completed(registration.owner()).unwrap();
         assert!(!after_restart.is_empty());
         assert!(after_restart
             .iter()

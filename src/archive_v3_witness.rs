@@ -667,6 +667,15 @@ impl WitnessRecord {
     pub fn registry(&self) -> KeyRegistryReference {
         self.registry
     }
+    pub(crate) fn authorizes_lease(&self, lease: WitnessLease) -> bool {
+        self.archive_id == lease.archive_id
+            && self.database_epoch == lease.database_epoch
+            && self.registry.key_epoch == lease.key_epoch
+            && self.owner_id == Some(lease.owner)
+            && self.current_fencing_epoch == lease.fencing_epoch
+            && self.lease_expires_at_tick == lease.expires_at_tick
+            && self.deletion == DeletionState::Active
+    }
     pub(crate) fn predecessor_root(&self) -> Option<RootCommitment> {
         self.predecessor.map(|value| value.root)
     }
@@ -695,6 +704,22 @@ impl WitnessRecord {
     pub(crate) fn with_root_for_test(&self, root: RootCommitment) -> Self {
         let mut forged = self.clone();
         forged.root = root;
+        forged
+    }
+    #[cfg(test)]
+    pub(crate) fn with_candidate_root_for_test(
+        &self,
+        candidate: RootReference,
+        owner_fencing_epoch: u64,
+    ) -> Self {
+        let mut forged = self.clone();
+        forged.root = RootCommitment::candidate(
+            self.database_epoch,
+            self.registry.key_epoch,
+            owner_fencing_epoch,
+            self.root.root(),
+            candidate,
+        );
         forged
     }
     #[cfg(test)]
