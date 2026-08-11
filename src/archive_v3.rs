@@ -65,6 +65,8 @@ pub const SQLITE_PAGE_SIZE: u32 = 4096;
 pub const MAX_DATABASE_PAGES: u32 = 8_388_608;
 /// Byte form of [`MAX_DATABASE_PAGES`] for length-bearing archive formats.
 pub const MAX_DATABASE_BYTES: u64 = (MAX_DATABASE_PAGES as u64) * (SQLITE_PAGE_SIZE as u64);
+/// Exact count of 1 MiB extent slots inside the database ceiling.
+pub const MAX_DATABASE_EXTENT_SLOTS: u64 = MAX_DATABASE_BYTES / 1_048_576;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ArchiveV3Error {
@@ -245,8 +247,16 @@ impl LogicalLocation {
                     ..
                 },
             ) => range_end > range_start,
-            (ObjectRole::ExtentV3, Self::Extent { byte_len, .. }) => {
-                (1..=1_048_576).contains(byte_len) && byte_len.is_multiple_of(SQLITE_PAGE_SIZE)
+            (
+                ObjectRole::ExtentV3,
+                Self::Extent {
+                    extent_no,
+                    byte_len,
+                },
+            ) => {
+                *extent_no < MAX_DATABASE_EXTENT_SLOTS
+                    && (1..=1_048_576).contains(byte_len)
+                    && byte_len.is_multiple_of(SQLITE_PAGE_SIZE)
             }
             (
                 ObjectRole::MerkleNodeV3,
@@ -255,7 +265,7 @@ impl LogicalLocation {
                     range_end,
                     ..
                 },
-            ) => range_end > range_start,
+            ) => range_end > range_start && *range_end <= MAX_DATABASE_EXTENT_SLOTS,
             _ => false,
         }
     }
@@ -1805,6 +1815,66 @@ mod tests {
     }
 
     #[test]
+    fn extent_and_merkle_contexts_reject_over_cap_geometry() {
+        let (archive, database, key) = ids();
+        assert_eq!(MAX_DATABASE_EXTENT_SLOTS, 32_768);
+        assert!(ObjectContext::new(
+            archive,
+            database,
+            key,
+            ObjectRole::ExtentV3,
+            LogicalLocation::Extent {
+                extent_no: MAX_DATABASE_EXTENT_SLOTS - 1,
+                byte_len: SQLITE_PAGE_SIZE,
+            },
+            ObjectId::from_bytes([1; 16]),
+            None,
+        )
+        .is_ok());
+        assert!(ObjectContext::new(
+            archive,
+            database,
+            key,
+            ObjectRole::ExtentV3,
+            LogicalLocation::Extent {
+                extent_no: MAX_DATABASE_EXTENT_SLOTS,
+                byte_len: SQLITE_PAGE_SIZE,
+            },
+            ObjectId::from_bytes([2; 16]),
+            None,
+        )
+        .is_err());
+        assert!(ObjectContext::new(
+            archive,
+            database,
+            key,
+            ObjectRole::MerkleNodeV3,
+            LogicalLocation::MerkleNode {
+                level: 1,
+                range_start: 0,
+                range_end: MAX_DATABASE_EXTENT_SLOTS,
+            },
+            ObjectId::from_bytes([3; 16]),
+            None,
+        )
+        .is_ok());
+        assert!(ObjectContext::new(
+            archive,
+            database,
+            key,
+            ObjectRole::MerkleNodeV3,
+            LogicalLocation::MerkleNode {
+                level: 1,
+                range_start: 0,
+                range_end: MAX_DATABASE_EXTENT_SLOTS + 1,
+            },
+            ObjectId::from_bytes([4; 16]),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn envelope_round_trip_and_object_key_follow_the_canonical_namespace() {
         let context = extent_context(4);
         let cipher = cipher();
@@ -2281,6 +2351,21 @@ mod tests {
             wal_chain_root: None,
         };
         assert_eq!(ArchiveRoot::decode(&root.encode().unwrap()).unwrap(), root);
+        let over_cap_root = ArchiveRoot {
+            logical_file_length: MAX_DATABASE_BYTES + u64::from(SQLITE_PAGE_SIZE),
+            ..root.clone()
+        };
+        assert_eq!(
+            over_cap_root.encode(),
+            Err(ArchiveV3Error::TooLarge("SQLite database"))
+        );
+        let mut encoded_over_cap_root = root.encode().unwrap();
+        encoded_over_cap_root[61..69]
+            .copy_from_slice(&(MAX_DATABASE_BYTES + u64::from(SQLITE_PAGE_SIZE)).to_be_bytes());
+        assert_eq!(
+            ArchiveRoot::decode(&encoded_over_cap_root),
+            Err(ArchiveV3Error::TooLarge("SQLite database"))
+        );
         let matching_context = ObjectContext::new(
             ArchiveId::from_bytes([1; 16]),
             root.database_epoch,

@@ -84,6 +84,9 @@ mod archive_v3_genesis;
 // archive contexts and authenticated canonical metadata; no route, Store,
 // runtime/provider construction, or production authority is connected.
 mod archive_v3_deletion;
+// Inactive ADR-0022 immutable sparse-extent tree. It is fake-tested only and
+// has no Store/VFS/provider/witness/route/flag/authority wiring.
+mod archive_v3_extent;
 // Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
 // REST transport. They have no runtime construction, Store, VFS, route, or
 // authority wiring.
