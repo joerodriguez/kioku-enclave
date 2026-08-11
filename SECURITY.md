@@ -522,10 +522,18 @@ exact root, and is
 accepted only with an opaque admission committed to that exact canonical root
 context for an authenticated, decoded root whose parent/fence/length/epoch/
 conversion shape exactly match the session. Non-root contexts must have no
-parent. This slice
-has no production admission constructor: only a future centralized sealed
-authenticated-readback adapter may mint one, so the ledger does not claim to
-authenticate ciphertext and CandidateReady remains unreachable in production.
+parent. The sealed legacy staging capability shares that same 32,898-row ordinal
+with the tree: it reserves legacy-ledger facts before create, requires exact
+envelope readback equality, and materializes only after caller extent/node
+authentication. Its root-specific operation additionally requires the resolved
+cipher's exact registry generation/object/hash, verifies the complete
+materialized tree inventory in the same attempt, requires the decoded root's
+tree reference to equal that staged tree, then AEAD-opens/decodes/context-validates
+the root and checks every binding field before minting a private-field admission
+token. Production code cannot pass raw root/context/hash values to that seam,
+and the generic staging callback rejects roots. This remains no coordinator or
+publication path: the admission alone neither persists CandidateReady nor
+advances a witness root.
 Restart and orphaning rescan every exact canonical row. Orphan records retain an
 exact count and domain-separated ordered-inventory commitment, and schema checks
 reject triggers on all three legacy ledger tables. Opaque cursors bind bounded

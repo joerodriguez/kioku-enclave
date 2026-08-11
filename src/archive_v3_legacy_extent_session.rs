@@ -15,9 +15,9 @@ use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-#[cfg(test)]
-use crate::archive_v3::{ArchiveRoot, ObjectContext};
 use crate::{
+    archive_v3::{ArchiveRoot, ObjectContext},
+    archive_v3_extent::AuthenticatedLegacyExtentRootReadback,
     archive_v3_operation::{OperationId, RequestFingerprint},
     archive_v3_witness::{DeletionState, MigrationState, WitnessLease, WitnessRecord},
 };
@@ -157,10 +157,8 @@ impl fmt::Debug for LegacyExtentCandidate {
     }
 }
 
-/// Opaque proof that a root plaintext was authenticated and validated against
-/// its exact root object context.  This slice deliberately has no production
-/// constructor: only the future centralized sealed readback adapter may mint
-/// one, so CandidateReady remains unreachable in production for now.
+/// Opaque proof that an exact immutable root readback was authenticated,
+/// decoded, context-validated, and bound to this conversion session.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LegacyExtentRootAdmission {
     candidate: LegacyExtentCandidate,
@@ -182,8 +180,22 @@ impl LegacyExtentRootAdmission {
         self.root_aad_commitment == commitment
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_validated_root_for_test(
+    /// Only the sealed extent staging adapter can supply the private-field
+    /// readback token.  Raw root/context/hash values are deliberately not a
+    /// production admission API.
+    pub(crate) fn from_authenticated_readback(
+        binding: LegacyExtentSessionBinding,
+        readback: AuthenticatedLegacyExtentRootReadback,
+    ) -> Result<Self> {
+        Self::from_validated_root(
+            readback.root(),
+            readback.context(),
+            readback.ciphertext_hash(),
+            binding,
+        )
+    }
+
+    fn from_validated_root(
         root: &ArchiveRoot,
         context: &ObjectContext,
         ciphertext_hash: [u8; 32],
@@ -230,6 +242,16 @@ impl LegacyExtentRootAdmission {
             binding,
             root_aad_commitment: hash.finalize().into(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_validated_root_for_test(
+        root: &ArchiveRoot,
+        context: &ObjectContext,
+        ciphertext_hash: [u8; 32],
+        binding: LegacyExtentSessionBinding,
+    ) -> Result<Self> {
+        Self::from_validated_root(root, context, ciphertext_hash, binding)
     }
 }
 impl fmt::Debug for LegacyExtentRootAdmission {
@@ -339,6 +361,15 @@ impl LegacyExtentSessionBinding {
     pub(crate) const fn key_epoch(self) -> [u8; 16] {
         self.key_epoch
     }
+    pub(crate) const fn registry_rotation_generation(self) -> u64 {
+        self.rotation_generation
+    }
+    pub(crate) const fn registry_object_id(self) -> [u8; 16] {
+        self.registry_object_id
+    }
+    pub(crate) const fn registry_ciphertext_hash(self) -> [u8; 32] {
+        self.registry_ciphertext_hash
+    }
     pub(crate) const fn base_root_seq(self) -> u64 {
         self.base_root_seq
     }
@@ -388,6 +419,18 @@ impl LegacyExtentSessionBinding {
             sqlite_page_size: crate::archive_v3::SQLITE_PAGE_SIZE,
             archive_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_registry_for_test(
+        mut self,
+        rotation_generation: u64,
+        object_id: [u8; 16],
+        ciphertext_hash: [u8; 32],
+    ) -> Self {
+        self.rotation_generation = rotation_generation;
+        self.registry_object_id = object_id;
+        self.registry_ciphertext_hash = ciphertext_hash;
+        self
     }
 }
 impl fmt::Debug for LegacyExtentSessionBinding {
