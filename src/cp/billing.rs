@@ -29,6 +29,7 @@ const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_ID_TOKEN_BYTES: usize = 32 * 1024;
 const ID_TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 const RECORDING_LEASE_SECONDS: i64 = 60;
+const RECORDING_LEASE_RENEWAL_HEADROOM_MS: i64 = 20_000;
 
 pub struct RecordingLeaseGates {
     by_user: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -598,7 +599,59 @@ fn pending_retry_needs_expiry_rebase(existing_pending: bool, upstream_duplicate:
 }
 
 fn renewal_too_early(now_ms: i64, expires_ms: i64) -> bool {
-    expires_ms.saturating_sub(now_ms) > 15_000
+    expires_ms.saturating_sub(now_ms) > RECORDING_LEASE_RENEWAL_HEADROOM_MS
+}
+
+fn can_reattach_paid_lease(now_ms: i64, expires_ms: i64) -> bool {
+    expires_ms > now_ms && renewal_too_early(now_ms, expires_ms)
+}
+
+fn lease_authorized_summary(mut summary: Value) -> Value {
+    // A successful lease response describes the entitlement of this already
+    // reserved interval. The aggregate summary may simultaneously report zero
+    // remaining seconds after reserving the account's final minute; that must
+    // not make the client discard the minute that was just admitted.
+    if let Some(recording) = summary.get_mut("recording").and_then(Value::as_object_mut) {
+        recording.insert("allowed".into(), Value::Bool(true));
+        recording.insert("reason".into(), Value::Null);
+    }
+    summary
+}
+
+fn recording_lease_response(lease_id: String, expires_at: String, summary: Value) -> Response {
+    no_store(
+        Json(serde_json::json!({
+            "lease_id":lease_id,
+            "expires_at":expires_at,
+            "billing":lease_authorized_summary(summary)
+        }))
+        .into_response(),
+    )
+}
+
+async fn current_recording_summary(
+    state: &CpState,
+    user_id: &str,
+) -> Result<Value, RecordingAuthorizationFailure> {
+    let account_id = match state.control.billing_account_id(user_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(error = %error, "recording billing account mapping unavailable");
+            return if state.config.billing_enforcement_mode.enforces() {
+                Err(RecordingAuthorizationFailure::Unavailable)
+            } else {
+                Ok(serde_json::json!({"recording":{"allowed":true,"shadow":true}}))
+            };
+        }
+    };
+    match state.billing.summary(&account_id).await {
+        Ok(summary) => Ok(summary),
+        Err(_) if !state.config.billing_enforcement_mode.enforces() => {
+            warn!("recording billing shadow summary unavailable");
+            Ok(serde_json::json!({"recording":{"allowed":true,"shadow":true}}))
+        }
+        Err(_) => Err(RecordingAuthorizationFailure::Unavailable),
+    }
 }
 
 async fn authorize_recording_seconds(
@@ -702,13 +755,10 @@ async fn create_recording_lease(
             let Some(summary) = existing.summary.clone() else {
                 return service_unavailable();
             };
-            return no_store(
-                Json(serde_json::json!({
-                    "lease_id":existing.issued_lease_id,
-                    "expires_at":existing.expires_at,
-                    "billing":summary
-                }))
-                .into_response(),
+            return recording_lease_response(
+                existing.issued_lease_id.clone(),
+                existing.expires_at.clone(),
+                summary,
             );
         }
         if existing.state == "denied" {
@@ -741,11 +791,37 @@ async fn create_recording_lease(
             Err(_) => return service_unavailable(),
         };
         let (lease_id, base_ms) = match (&request.lease_id, active) {
-            (None, Some((_active_id, expires_at)))
-                if super::isotime::parse_epoch_millis(&expires_at)
-                    .is_some_and(|ms| ms > now_ms) =>
-            {
-                return lease_conflict("recording_lease_active");
+            (None, Some((active_id, expires_at))) => {
+                let Some(expires_ms) = super::isotime::parse_epoch_millis(&expires_at) else {
+                    return service_unavailable();
+                };
+                if can_reattach_paid_lease(now_ms, expires_ms) {
+                    // A stopped/restarted or relaunched first-party client may
+                    // have lost its in-memory lease id. Reattach it to the
+                    // already-paid interval without extending or double
+                    // charging it. Upload authorization is already per-user,
+                    // so this grants no capability beyond the active lease.
+                    let summary = match current_recording_summary(&state, &user.0).await {
+                        Ok(summary) => summary,
+                        Err(RecordingAuthorizationFailure::Unavailable) => {
+                            return service_unavailable();
+                        }
+                        Err(RecordingAuthorizationFailure::Denied { .. }) => unreachable!(),
+                    };
+                    return recording_lease_response(active_id, expires_at, summary);
+                }
+                if expires_ms > now_ms {
+                    // With at most the renewal headroom left, reserve one new
+                    // minute from server-now. This bounds the response to the
+                    // initial-client contract while replacing the unusably
+                    // short tail instead of returning a 409 loop.
+                    (active_id, now_ms)
+                } else {
+                    (
+                        format!("lease_{}", super::tokens::random_token_hex()),
+                        now_ms,
+                    )
+                }
             }
             (None, _) => (
                 format!("lease_{}", super::tokens::random_token_hex()),
@@ -816,14 +892,7 @@ async fn create_recording_lease(
         Ok(receipt) => receipt,
         Err(_) => return service_unavailable(),
     };
-    no_store(
-        Json(serde_json::json!({
-            "lease_id":lease_id,
-            "expires_at":expires_at,
-            "billing":summary
-        }))
-        .into_response(),
-    )
+    recording_lease_response(lease_id, expires_at, summary)
 }
 
 fn inactive_lease() -> Response {
@@ -1912,8 +1981,22 @@ mod tests {
                 lease_id: Some(row.issued_lease_id.clone()),
             }
         ));
-        assert!(renewal_too_early(1_000, 16_001));
-        assert!(!renewal_too_early(1_000, 16_000));
+        assert!(renewal_too_early(1_000, 21_001));
+        assert!(!renewal_too_early(1_000, 21_000));
+        assert!(can_reattach_paid_lease(1_000, 21_001));
+        assert!(!can_reattach_paid_lease(1_000, 21_000));
+        assert!(!can_reattach_paid_lease(21_001, 21_000));
+    }
+
+    #[test]
+    fn successful_final_minute_remains_an_authorized_lease() {
+        let summary = lease_authorized_summary(serde_json::json!({
+            "usage":{"allowance_seconds":300,"used_seconds":300,"remaining_seconds":0},
+            "recording":{"allowed":false,"reason":"allowance_exhausted"}
+        }));
+        assert_eq!(summary["usage"]["remaining_seconds"], 0);
+        assert_eq!(summary["recording"]["allowed"], true);
+        assert_eq!(summary["recording"]["reason"], Value::Null);
     }
 
     #[test]

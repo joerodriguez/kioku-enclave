@@ -67,8 +67,11 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   explicitly authorizes no speaker-quality claim and no external users.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Enforces monthly wall-clock recording allowances through server-timed, idempotent
-  60-second leases and exposes plan, remaining usage, reset, hosted checkout, and plan
-  management. The launch catalog is Free (30 min), Plus ($15/3 h), Pro ($39/8 h), and
+  60-second leases. A restarted client reattaches to an unexpired paid interval when more
+  than the 20-second renewal headroom remains; otherwise the enclave reserves one fresh
+  minute instead of trapping the client in a lease-conflict loop. The API also exposes
+  plan, remaining usage, reset, hosted checkout, and plan management. The launch catalog
+  is Free (30 min), Plus ($15/3 h), Pro ($39/8 h), and
   hidden Max ($199/40 h), monthly only.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
