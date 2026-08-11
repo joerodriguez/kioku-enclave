@@ -109,6 +109,56 @@ pub trait ExtentSource: Send {
     async fn next_extent(&mut self, destination: &mut [u8]) -> Result<Option<SourceExtent>>;
 }
 
+/// Attempt-scoped immutable-object publication capability used by the extent
+/// uploader. Implementations must preserve this indivisible order for every
+/// object: durable exact reservation, immutable create, exact readback,
+/// caller-supplied authenticated verification, then durable materialization.
+/// A failed or cancelled verification must leave the object unmaterialized.
+///
+/// Static dispatch is intentional. It lets a future legacy-conversion attempt
+/// provide its own durable, content-free binding without accepting or forging
+/// the WAL-only [`ShadowSessionBinding`](crate::archive_v3_shadow_session::ShadowSessionBinding),
+/// while keeping the verification callback inside the staging capability. The
+/// private supertrait keeps implementations centralized in this module for
+/// explicit review; callers cannot add an adapter that merely claims to honor
+/// the ordering contract.
+mod extent_staging_sealed {
+    pub trait Sealed {}
+}
+
+#[async_trait::async_trait]
+pub(crate) trait ExtentObjectStaging: extent_staging_sealed::Sealed + Send + Sync {
+    async fn create_and_readback_verified<F>(
+        &self,
+        backend: &dyn ImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+        verify: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&CiphertextEnvelope) -> ArchiveResult<()> + Send;
+}
+
+impl extent_staging_sealed::Sealed for ShadowObjectStaging<'_> {}
+
+#[async_trait::async_trait]
+impl ExtentObjectStaging for ShadowObjectStaging<'_> {
+    async fn create_and_readback_verified<F>(
+        &self,
+        backend: &dyn ImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+        verify: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&CiphertextEnvelope) -> ArchiveResult<()> + Send,
+    {
+        ShadowObjectStaging::create_and_readback_verified(self, backend, context, envelope, verify)
+            .await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct UploadedExtentTree {
     root: ImmutableReference,
@@ -277,13 +327,13 @@ pub(crate) async fn mint_authenticated_extent_root(
 /// Streams bounded immutable extent objects and fixed-fanout persistent nodes.
 /// Sparse holes have no object and reconstruct as zeroes. An all-hole file is
 /// rejected: the existing on-wire Merkle codec deliberately has no empty root.
-pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
+pub(crate) async fn upload_extent_tree<C: ExtentCipher, S: ExtentObjectStaging>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
     source: &mut dyn ExtentSource,
-    staging: ShadowObjectStaging<'_>,
+    staging: S,
 ) -> Result<UploadedExtentTree> {
     if cipher.archive_id() != archive_id {
         return Err(ArchiveV3Error::InvalidContext.into());
@@ -353,7 +403,7 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
                 std::mem::take(&mut leaves),
                 tree_height == 0,
                 slots,
-                staging.clone(),
+                &staging,
             )
             .await?;
             add_span(
@@ -366,7 +416,7 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
                 &mut pending,
                 &mut root,
                 span,
-                staging.clone(),
+                &staging,
             )
             .await?;
         }
@@ -380,7 +430,7 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
             std::mem::take(&mut leaves),
             tree_height == 0,
             slots,
-            staging.clone(),
+            &staging,
         )
         .await?;
         add_span(
@@ -393,7 +443,7 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
             &mut pending,
             &mut root,
             span,
-            staging.clone(),
+            &staging,
         )
         .await?;
     }
@@ -408,7 +458,7 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
                 level as u8,
                 level + 1 == usize::from(tree_height),
                 slots,
-                staging.clone(),
+                &staging,
             )
             .await?;
             add_span(
@@ -421,7 +471,7 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
                 &mut pending,
                 &mut root,
                 span,
-                staging.clone(),
+                &staging,
             )
             .await?;
         }
@@ -667,7 +717,7 @@ fn overlaps(start: u64, end: u64, wanted_start: u64, wanted_end: u64) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn seal_leaf<C: ExtentCipher>(
+async fn seal_leaf<C: ExtentCipher, S: ExtentObjectStaging>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
     archive: ArchiveId,
@@ -675,7 +725,7 @@ async fn seal_leaf<C: ExtentCipher>(
     entries: Vec<ExtentReference>,
     is_root: bool,
     slots: u64,
-    staging: ShadowObjectStaging<'_>,
+    staging: &S,
 ) -> Result<NodeSpan> {
     let first = entries.first().ok_or(ExtentTreeError::Source)?.extent_no;
     let last = entries
@@ -700,7 +750,7 @@ async fn seal_leaf<C: ExtentCipher>(
     .await
 }
 #[allow(clippy::too_many_arguments)]
-async fn seal_parent<C: ExtentCipher>(
+async fn seal_parent<C: ExtentCipher, S: ExtentObjectStaging>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
     archive: ArchiveId,
@@ -709,7 +759,7 @@ async fn seal_parent<C: ExtentCipher>(
     child_level: u8,
     is_root: bool,
     slots: u64,
-    staging: ShadowObjectStaging<'_>,
+    staging: &S,
 ) -> Result<NodeSpan> {
     let first = spans.first().ok_or(ExtentTreeError::Source)?.range_start;
     let last = spans.last().ok_or(ExtentTreeError::Source)?.range_end;
@@ -739,13 +789,13 @@ async fn seal_parent<C: ExtentCipher>(
     )
     .await
 }
-async fn seal_node<C: ExtentCipher>(
+async fn seal_node<C: ExtentCipher, S: ExtentObjectStaging>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
     archive: ArchiveId,
     epoch: DatabaseEpoch,
     node: MerkleNode,
-    staging: ShadowObjectStaging<'_>,
+    staging: &S,
 ) -> Result<NodeSpan> {
     node.validate()?;
     let object_id = ObjectId::random();
@@ -776,7 +826,7 @@ async fn seal_node<C: ExtentCipher>(
     })
 }
 #[allow(clippy::too_many_arguments)]
-async fn add_span<C: ExtentCipher>(
+async fn add_span<C: ExtentCipher, S: ExtentObjectStaging>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
     archive: ArchiveId,
@@ -786,7 +836,7 @@ async fn add_span<C: ExtentCipher>(
     pending: &mut [Vec<NodeSpan>],
     root: &mut Option<NodeSpan>,
     mut span: NodeSpan,
-    staging: ShadowObjectStaging<'_>,
+    staging: &S,
 ) -> Result<()> {
     loop {
         if span.level == height {
@@ -815,7 +865,7 @@ async fn add_span<C: ExtentCipher>(
             child_level,
             child_level + 1 == height,
             slots,
-            staging.clone(),
+            staging,
         )
         .await?;
     }
@@ -1250,6 +1300,115 @@ mod tests {
         }
     }
     static ACCEPTING_INVENTORY: AcceptingInventory = AcceptingInventory;
+
+    /// Deliberately has no shadow-session or WAL binding. This exercises the
+    /// generic extent staging contract a legacy conversion attempt will use,
+    /// while retaining the same ordered publication invariants.
+    #[derive(Clone)]
+    struct NonWalTestStaging {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        next_ordinal: Arc<AtomicUsize>,
+        materialized: Arc<AtomicUsize>,
+        records: Arc<Mutex<Vec<(ShadowObjectFacts, bool)>>>,
+        fail_materialize: Arc<AtomicBool>,
+    }
+
+    impl NonWalTestStaging {
+        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                events,
+                next_ordinal: Arc::new(AtomicUsize::new(0)),
+                materialized: Arc::new(AtomicUsize::new(0)),
+                records: Arc::new(Mutex::new(Vec::new())),
+                fail_materialize: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn record_counts(&self) -> (usize, usize) {
+            let records = self.records.lock().unwrap();
+            (
+                records.len(),
+                records
+                    .iter()
+                    .filter(|(_, materialized)| *materialized)
+                    .count(),
+            )
+        }
+    }
+
+    impl extent_staging_sealed::Sealed for NonWalTestStaging {}
+
+    #[async_trait::async_trait]
+    impl ExtentObjectStaging for NonWalTestStaging {
+        async fn create_and_readback_verified<F>(
+            &self,
+            backend: &dyn ImmutableObjectBackend,
+            context: &ObjectContext,
+            envelope: CiphertextEnvelope,
+            verify: F,
+        ) -> Result<()>
+        where
+            F: FnOnce(&CiphertextEnvelope) -> ArchiveResult<()> + Send,
+        {
+            let ordinal = self
+                .next_ordinal
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ordinal| {
+                    (ordinal < MAX_SHADOW_OBJECTS_PER_ATTEMPT).then_some(ordinal + 1)
+                })
+                .map_err(|_| {
+                    ExtentTreeError::Staging(ShadowCheckpointError::Inventory(
+                        ShadowObjectInventoryError::AttemptExhausted,
+                    ))
+                })?;
+            let facts = ShadowObjectFacts::from_sealed(context, &envelope, ordinal as u32)
+                .map_err(|_| ExtentTreeError::Source)?;
+            {
+                let mut records = self.records.lock().unwrap();
+                if records.iter().any(|(existing, _)| existing == &facts) {
+                    return Err(ExtentTreeError::Staging(ShadowCheckpointError::Inventory(
+                        ShadowObjectInventoryError::Conflict,
+                    )));
+                }
+                records.push((facts.clone(), false));
+            }
+            self.events.lock().unwrap().push("reserve");
+            backend
+                .create_if_absent(context.object_key(), envelope.clone())
+                .await?;
+            let readback = backend
+                .get(&context.object_key())
+                .await?
+                .ok_or(ExtentTreeError::MissingObject)?;
+            if readback != envelope {
+                return Err(ArchiveV3Error::Authentication.into());
+            }
+            self.events.lock().unwrap().push("verify");
+            verify(&readback)?;
+            self.events.lock().unwrap().push("materialize");
+            if self.fail_materialize.load(Ordering::Relaxed) {
+                return Err(ExtentTreeError::Staging(ShadowCheckpointError::Inventory(
+                    ShadowObjectInventoryError::Unavailable,
+                )));
+            }
+            let mut records = self.records.lock().unwrap();
+            let (_, materialized) = records
+                .iter_mut()
+                .find(|(reserved, _)| reserved == &facts)
+                .ok_or({
+                    ExtentTreeError::Staging(ShadowCheckpointError::Inventory(
+                        ShadowObjectInventoryError::Conflict,
+                    ))
+                })?;
+            if *materialized {
+                return Err(ExtentTreeError::Staging(ShadowCheckpointError::Inventory(
+                    ShadowObjectInventoryError::Conflict,
+                )));
+            }
+            *materialized = true;
+            self.materialized.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     fn staging_for(inventory: &dyn ShadowObjectInventory) -> ShadowObjectStaging<'_> {
         ShadowObjectStaging::new(
@@ -2431,6 +2590,182 @@ mod tests {
                 prior_materializations
             );
         }
+    }
+
+    #[tokio::test]
+    async fn non_wal_staging_drives_the_same_verified_extent_upload_order() {
+        let (a, d, k) = ids();
+        let backend = FaultBackend::default();
+        let cipher = TestCipher::new(a, k);
+        let staging = NonWalTestStaging::new(Arc::clone(&backend.events));
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x6b))],
+            next: 0,
+        };
+
+        let uploaded = upload_extent_tree(&backend, &cipher, a, d, &mut source, staging.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(uploaded.extent_count(), 1);
+        assert_eq!(staging.next_ordinal.load(Ordering::Relaxed), 2);
+        assert_eq!(staging.materialized.load(Ordering::Relaxed), 2);
+        assert_eq!(staging.record_counts(), (2, 2));
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            [
+                "reserve",
+                "create",
+                "get",
+                "verify",
+                "materialize",
+                "reserve",
+                "create",
+                "get",
+                "verify",
+                "materialize",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_wal_staging_never_materializes_failed_authenticated_readback() {
+        let (a, d, k) = ids();
+        let backend = FaultBackend::default();
+        let cipher = TestCipher::with_seal_fault(
+            a,
+            k,
+            0,
+            TestSealFault::WrongPlaintext,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let staging = NonWalTestStaging::new(Arc::clone(&backend.events));
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x6c))],
+            next: 0,
+        };
+
+        assert!(
+            upload_extent_tree(&backend, &cipher, a, d, &mut source, staging.clone(),)
+                .await
+                .is_err()
+        );
+        assert_eq!(staging.next_ordinal.load(Ordering::Relaxed), 1);
+        assert_eq!(staging.materialized.load(Ordering::Relaxed), 0);
+        assert_eq!(staging.record_counts(), (1, 0));
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            ["reserve", "create", "get", "verify"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_non_wal_adapter_retains_exact_reservation_on_provider_failure_or_cancel() {
+        let (a, d, k) = ids();
+        for fault in [
+            Fault::CreateUnavailable,
+            Fault::MissingOnRead(1),
+            Fault::TamperOnRead(1),
+        ] {
+            let backend = FaultBackend::default();
+            *backend.fault.lock().unwrap() = fault;
+            let staging = NonWalTestStaging::new(Arc::clone(&backend.events));
+            let mut source = VecSource {
+                length: u64::from(EXTENT_BYTES),
+                entries: vec![(0, bytes(256, 0x6d))],
+                next: 0,
+            };
+            assert!(upload_extent_tree(
+                &backend,
+                &TestCipher::new(a, k),
+                a,
+                d,
+                &mut source,
+                staging.clone(),
+            )
+            .await
+            .is_err());
+            assert_eq!(staging.record_counts(), (1, 0));
+        }
+
+        let backend = FaultBackend::default();
+        *backend.fault.lock().unwrap() = Fault::BlockOnRead(1);
+        let staging = NonWalTestStaging::new(Arc::clone(&backend.events));
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x6e))],
+            next: 0,
+        };
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            upload_extent_tree(
+                &backend,
+                &TestCipher::new(a, k),
+                a,
+                d,
+                &mut source,
+                staging.clone(),
+            ),
+        )
+        .await
+        .is_err());
+        assert_eq!(staging.record_counts(), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn sealed_non_wal_adapter_materialization_failure_and_attempt_cap_fail_closed() {
+        let (a, d, k) = ids();
+        let backend = FaultBackend::default();
+        let staging = NonWalTestStaging::new(Arc::clone(&backend.events));
+        staging.fail_materialize.store(true, Ordering::Relaxed);
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x6f))],
+            next: 0,
+        };
+        assert!(upload_extent_tree(
+            &backend,
+            &TestCipher::new(a, k),
+            a,
+            d,
+            &mut source,
+            staging.clone(),
+        )
+        .await
+        .is_err());
+        assert_eq!(staging.record_counts(), (1, 0));
+
+        let backend = FaultBackend::default();
+        let staging = NonWalTestStaging::new(Arc::clone(&backend.events));
+        staging
+            .next_ordinal
+            .store(MAX_SHADOW_OBJECTS_PER_ATTEMPT - 1, Ordering::Relaxed);
+        let mut source = VecSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x70))],
+            next: 0,
+        };
+        assert!(matches!(
+            upload_extent_tree(
+                &backend,
+                &TestCipher::new(a, k),
+                a,
+                d,
+                &mut source,
+                staging.clone(),
+            )
+            .await,
+            Err(ExtentTreeError::Staging(ShadowCheckpointError::Inventory(
+                ShadowObjectInventoryError::AttemptExhausted
+            )))
+        ));
+        assert_eq!(staging.record_counts(), (1, 1));
+        assert_eq!(
+            staging.next_ordinal.load(Ordering::Relaxed),
+            MAX_SHADOW_OBJECTS_PER_ATTEMPT
+        );
     }
 
     #[tokio::test]
