@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::archive_v3::{CiphertextEnvelope, LogicalLocation, ObjectContext, ObjectId, ObjectRole};
 use crate::archive_v3_shadow_session::{
     ShadowAttemptId, ShadowCandidate, ShadowSessionBinding, ShadowSessionError, ShadowSessionId,
     ShadowSessionRecord, ShadowSessionState, SHADOW_SESSION_RECORD_BYTES,
@@ -32,6 +33,11 @@ pub const MAX_CANONICAL_MUTATION_BYTES: usize = 1024 * 1024;
 pub const MAX_OWNER_BATCH_OPERATIONS: usize = 64;
 pub const MAX_OWNER_BATCH_LOGICAL_BYTES: u64 = 1_048_576;
 pub const MAX_SHADOW_SESSION_ATTEMPTS: i64 = 16;
+/// One 32 GiB checkpoint contains at most 32,768 1 MiB chunks, 129
+/// fixed-fanout manifests, and one root candidate.  This bound is deliberately
+/// per durable attempt, rather than a process-local upload budget.
+pub const MAX_SHADOW_OBJECTS_PER_ATTEMPT: usize = 32_768 + 129 + 1;
+const MAX_SHADOW_OBJECT_CONTEXT_BYTES: usize = 512;
 
 #[derive(Debug, Error)]
 pub enum OperationLedgerError {
@@ -473,6 +479,90 @@ pub enum RecordOutcome {
     AlreadyRecorded,
 }
 
+/// Lifecycle of one exact immutable object created by an inactive shadow
+/// attempt.  Rows contain only opaque archive context/AAD bytes and ciphertext
+/// commitments; they never contain a provider URL, cursor, user identity,
+/// timestamp, plaintext, or diagnostic string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ShadowObjectState {
+    Reserved = 1,
+    Materialized = 2,
+    RetainedByWitness = 3,
+    OrphanPendingGrace = 4,
+}
+
+impl ShadowObjectState {
+    fn decode(value: i64) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Reserved),
+            2 => Ok(Self::Materialized),
+            3 => Ok(Self::RetainedByWitness),
+            4 => Ok(Self::OrphanPendingGrace),
+            _ => Err(OperationLedgerError::Corrupt),
+        }
+    }
+}
+
+/// Exact, ciphertext-safe identity of one immutable object.  `context_aad` is
+/// the canonical authenticated context, not a provider name; persisting it
+/// makes context substitution detectable after a process crash.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ShadowObjectFacts {
+    object_id: ObjectId,
+    object_role: ObjectRole,
+    root_seq: Option<u64>,
+    context_aad: Zeroizing<Vec<u8>>,
+    ciphertext_hash: [u8; 32],
+}
+
+impl ShadowObjectFacts {
+    pub(crate) fn from_sealed(
+        context: &ObjectContext,
+        envelope: &CiphertextEnvelope,
+    ) -> Result<Self> {
+        let context_aad = context.canonical_aad();
+        if context_aad.is_empty() || context_aad.len() > MAX_SHADOW_OBJECT_CONTEXT_BYTES {
+            return Err(OperationLedgerError::TooLarge("shadow object context"));
+        }
+        let root_seq = match context.location() {
+            LogicalLocation::Root { root_seq } if *root_seq <= i64::MAX as u64 => Some(*root_seq),
+            LogicalLocation::Root { .. } => {
+                return Err(OperationLedgerError::Malformed("shadow root sequence"));
+            }
+            _ => None,
+        };
+        Ok(Self {
+            object_id: context.object_id(),
+            object_role: context.role(),
+            root_seq,
+            context_aad: Zeroizing::new(context_aad),
+            ciphertext_hash: envelope.hash(),
+        })
+    }
+
+    pub(crate) const fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+
+    pub(crate) const fn ciphertext_hash(&self) -> [u8; 32] {
+        self.ciphertext_hash
+    }
+
+    fn is_root_candidate(&self, candidate: ShadowCandidate) -> bool {
+        self.object_role == ObjectRole::RootV3
+            && self.root_seq == Some(candidate.root_seq())
+            && self.object_id.as_bytes() == &candidate.object_id()
+            && self.ciphertext_hash == candidate.ciphertext_hash()
+    }
+}
+
+impl fmt::Debug for ShadowObjectFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ShadowObjectFacts(<opaque>)")
+    }
+}
+
 pub struct OperationLedger;
 
 impl OperationLedger {
@@ -523,7 +613,24 @@ impl OperationLedger {
                 WHERE state IN (1, 2, 3);
             CREATE UNIQUE INDEX IF NOT EXISTS archive_v3_shadow_sessions_one_witnessed
                 ON archive_v3_shadow_sessions(session_id)
-                WHERE state = 4;",
+                WHERE state = 4;
+            CREATE TABLE IF NOT EXISTS archive_v3_shadow_objects (
+                session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+                attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+                object_id BLOB NOT NULL CHECK(length(object_id) = 16),
+                object_role INTEGER NOT NULL CHECK(object_role BETWEEN 1 AND 8),
+                root_seq INTEGER,
+                context_aad BLOB NOT NULL
+                    CHECK(length(context_aad) > 0 AND length(context_aad) <= 512),
+                ciphertext_hash BLOB NOT NULL CHECK(length(ciphertext_hash) = 32),
+                state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 4),
+                PRIMARY KEY(session_id, attempt_id, object_id),
+                CHECK(root_seq IS NULL OR root_seq > 0),
+                CHECK((object_role = 5 AND root_seq IS NOT NULL)
+                    OR (object_role != 5 AND root_seq IS NULL))
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS archive_v3_shadow_objects_exact_attempt
+                ON archive_v3_shadow_objects(session_id, attempt_id, state);",
         )?;
         Ok(())
     }
@@ -613,6 +720,143 @@ impl OperationLedger {
         Self::read_shadow_session(connection, session_id, attempt_id)
     }
 
+    /// Reserve the exact object/context/ciphertext tuple before the caller is
+    /// allowed to send an immutable-create request.  Repeating the *identical*
+    /// reservation is idempotent; an object ID, AAD, role, root sequence, or
+    /// ciphertext commitment substitution fails closed.
+    pub(crate) fn reserve_shadow_object(
+        connection: &mut Connection,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        expected_binding: ShadowSessionBinding,
+        facts: &ShadowObjectFacts,
+    ) -> Result<RecordOutcome> {
+        let transaction = connection.transaction()?;
+        let session = Self::read_shadow_session(&transaction, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        session.require_binding(expected_binding)?;
+        if session.state() != ShadowSessionState::Prepared {
+            return Err(OperationLedgerError::ShadowSession(
+                ShadowSessionError::InvalidTransition,
+            ));
+        }
+        if let Some(existing) =
+            Self::read_shadow_object(&transaction, session_id, attempt_id, facts.object_id)?
+        {
+            if existing == *facts {
+                transaction.commit()?;
+                return Ok(RecordOutcome::AlreadyRecorded);
+            }
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM archive_v3_shadow_objects
+             WHERE session_id = ? AND attempt_id = ?",
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )?;
+        if count < 0
+            || usize::try_from(count)
+                .ok()
+                .is_none_or(|value| value >= MAX_SHADOW_OBJECTS_PER_ATTEMPT)
+        {
+            return Err(OperationLedgerError::TooLarge("shadow objects per attempt"));
+        }
+        let inserted = transaction.execute(
+            "INSERT INTO archive_v3_shadow_objects (
+                session_id, attempt_id, object_id, object_role, root_seq,
+                context_aad, ciphertext_hash, state
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                facts.object_id.as_bytes().as_slice(),
+                facts.object_role as i64,
+                facts.root_seq.map(|value| value as i64),
+                facts.context_aad.as_slice(),
+                facts.ciphertext_hash.as_slice(),
+                ShadowObjectState::Reserved as i64,
+            ],
+        )?;
+        if inserted != 1 {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        transaction.commit()?;
+        Ok(RecordOutcome::Recorded)
+    }
+
+    /// Persist post-create exact readback.  The inventory never upgrades a
+    /// reservation based only on a create response: the caller must have read
+    /// the exact key and compared the complete immutable envelope first.
+    pub(crate) fn mark_shadow_object_materialized(
+        connection: &mut Connection,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        expected_binding: ShadowSessionBinding,
+        facts: &ShadowObjectFacts,
+    ) -> Result<RecordOutcome> {
+        let transaction = connection.transaction()?;
+        let session = Self::read_shadow_session(&transaction, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        session.require_binding(expected_binding)?;
+        let state =
+            Self::read_shadow_object(&transaction, session_id, attempt_id, facts.object_id)?
+                .filter(|existing| existing == facts)
+                .ok_or(OperationLedgerError::ResultConflict)?;
+        let current =
+            Self::read_shadow_object_state(&transaction, session_id, attempt_id, facts.object_id)?
+                .ok_or(OperationLedgerError::Corrupt)?;
+        let _ = state;
+        match current {
+            ShadowObjectState::Reserved => {
+                let changed = transaction.execute(
+                    "UPDATE archive_v3_shadow_objects SET state = ?
+                     WHERE session_id = ? AND attempt_id = ? AND object_id = ? AND state = ?",
+                    params![
+                        ShadowObjectState::Materialized as i64,
+                        session_id.as_bytes().as_slice(),
+                        attempt_id.as_bytes().as_slice(),
+                        facts.object_id.as_bytes().as_slice(),
+                        ShadowObjectState::Reserved as i64,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(OperationLedgerError::Corrupt);
+                }
+                transaction.commit()?;
+                Ok(RecordOutcome::Recorded)
+            }
+            ShadowObjectState::Materialized => {
+                transaction.commit()?;
+                Ok(RecordOutcome::AlreadyRecorded)
+            }
+            _ => Err(OperationLedgerError::ResultConflict),
+        }
+    }
+
+    pub(crate) fn shadow_object_state(
+        connection: &Connection,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        expected_binding: ShadowSessionBinding,
+        facts: &ShadowObjectFacts,
+    ) -> Result<Option<ShadowObjectState>> {
+        let session = Self::read_shadow_session(connection, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        session.require_binding(expected_binding)?;
+        let exact = Self::read_shadow_object(connection, session_id, attempt_id, facts.object_id)?;
+        match exact {
+            Some(existing) if existing == *facts => {
+                Self::read_shadow_object_state(connection, session_id, attempt_id, facts.object_id)
+            }
+            Some(_) => Err(OperationLedgerError::ResultConflict),
+            None => Ok(None),
+        }
+    }
+
     /// Durably bind the one immutable root candidate before a witness CAS may
     /// be sent. Repeating the exact update is idempotent; replacing a candidate
     /// is forbidden.
@@ -622,11 +866,25 @@ impl OperationLedger {
         attempt_id: ShadowAttemptId,
         expected_binding: ShadowSessionBinding,
         candidate: ShadowCandidate,
+        root_facts: &ShadowObjectFacts,
     ) -> Result<ShadowSessionRecord> {
         let transaction = connection.transaction()?;
         let mut record = Self::read_shadow_session(&transaction, session_id, attempt_id)?
             .ok_or(OperationLedgerError::Corrupt)?;
         record.require_binding(expected_binding)?;
+        if !root_facts.is_root_candidate(candidate)
+            || Self::read_shadow_object(&transaction, session_id, attempt_id, root_facts.object_id)?
+                .filter(|existing| existing == root_facts)
+                .is_none()
+            || Self::read_shadow_object_state(
+                &transaction,
+                session_id,
+                attempt_id,
+                root_facts.object_id,
+            )? != Some(ShadowObjectState::Materialized)
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
         let before = record.encode()?;
         record.persist_candidate(candidate)?;
         Self::replace_shadow_session(&transaction, &before, &record)?;
@@ -659,6 +917,23 @@ impl OperationLedger {
         }
         let before = record.encode()?;
         record.transition(next)?;
+        match next {
+            ShadowSessionState::ReconcileRequired => Self::terminalize_shadow_objects(
+                &transaction,
+                session_id,
+                attempt_id,
+                ShadowObjectState::RetainedByWitness,
+            )?,
+            ShadowSessionState::Superseded | ShadowSessionState::Aborted => {
+                Self::terminalize_shadow_objects(
+                    &transaction,
+                    session_id,
+                    attempt_id,
+                    ShadowObjectState::OrphanPendingGrace,
+                )?
+            }
+            _ => {}
+        }
         Self::replace_shadow_session(&transaction, &before, &record)?;
         transaction.commit()?;
         Ok(record)
@@ -705,6 +980,12 @@ impl OperationLedger {
         if Self::record(&transaction, completion)? != RecordOutcome::Recorded {
             return Err(OperationLedgerError::Corrupt);
         }
+        Self::terminalize_shadow_objects(
+            &transaction,
+            session_id,
+            attempt_id,
+            ShadowObjectState::RetainedByWitness,
+        )?;
         Self::replace_shadow_session(&transaction, &before, &session)?;
         transaction.commit()?;
         Ok(RecordOutcome::Recorded)
@@ -819,6 +1100,117 @@ impl OperationLedger {
             records.push(record);
         }
         Ok(records)
+    }
+
+    fn read_shadow_object(
+        connection: &Connection,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        object_id: ObjectId,
+    ) -> Result<Option<ShadowObjectFacts>> {
+        type ObjectRow = (i64, Option<i64>, Vec<u8>, Vec<u8>);
+        let row: Option<ObjectRow> = connection
+            .query_row(
+                "SELECT object_role, root_seq, context_aad, ciphertext_hash
+                 FROM archive_v3_shadow_objects
+                 WHERE session_id = ? AND attempt_id = ? AND object_id = ?",
+                params![
+                    session_id.as_bytes().as_slice(),
+                    attempt_id.as_bytes().as_slice(),
+                    object_id.as_bytes().as_slice(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(role, root_seq, context_aad, ciphertext_hash)| {
+            let object_role = match role {
+                1 => ObjectRole::CheckpointChunkV3,
+                2 => ObjectRole::WalSegmentV3,
+                3 => ObjectRole::ExtentV3,
+                4 => ObjectRole::MerkleNodeV3,
+                5 => ObjectRole::RootV3,
+                6 => ObjectRole::KeyRegistryV3,
+                7 => ObjectRole::StagingV3,
+                8 => ObjectRole::CheckpointManifestV3,
+                _ => return Err(OperationLedgerError::Corrupt),
+            };
+            if context_aad.is_empty() || context_aad.len() > MAX_SHADOW_OBJECT_CONTEXT_BYTES {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            let root_seq = root_seq.map(positive_u64).transpose()?;
+            if (object_role == ObjectRole::RootV3) != root_seq.is_some() {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            Ok(ShadowObjectFacts {
+                object_id,
+                object_role,
+                root_seq,
+                context_aad: Zeroizing::new(context_aad),
+                ciphertext_hash: ciphertext_hash
+                    .try_into()
+                    .map_err(|_| OperationLedgerError::Corrupt)?,
+            })
+        })
+        .transpose()
+    }
+
+    fn read_shadow_object_state(
+        connection: &Connection,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        object_id: ObjectId,
+    ) -> Result<Option<ShadowObjectState>> {
+        connection
+            .query_row(
+                "SELECT state FROM archive_v3_shadow_objects
+                 WHERE session_id = ? AND attempt_id = ? AND object_id = ?",
+                params![
+                    session_id.as_bytes().as_slice(),
+                    attempt_id.as_bytes().as_slice(),
+                    object_id.as_bytes().as_slice(),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(ShadowObjectState::decode)
+            .transpose()
+    }
+
+    fn terminalize_shadow_objects(
+        transaction: &Transaction<'_>,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        terminal: ShadowObjectState,
+    ) -> Result<()> {
+        let changed = match terminal {
+            ShadowObjectState::RetainedByWitness => transaction.execute(
+                "UPDATE archive_v3_shadow_objects SET state = ?
+                 WHERE session_id = ? AND attempt_id = ?
+                   AND state IN (?, ?)",
+                params![
+                    terminal as i64,
+                    session_id.as_bytes().as_slice(),
+                    attempt_id.as_bytes().as_slice(),
+                    ShadowObjectState::Reserved as i64,
+                    ShadowObjectState::Materialized as i64,
+                ],
+            )?,
+            ShadowObjectState::OrphanPendingGrace => transaction.execute(
+                "UPDATE archive_v3_shadow_objects SET state = ?
+                 WHERE session_id = ? AND attempt_id = ?
+                   AND state IN (?, ?)",
+                params![
+                    terminal as i64,
+                    session_id.as_bytes().as_slice(),
+                    attempt_id.as_bytes().as_slice(),
+                    ShadowObjectState::Reserved as i64,
+                    ShadowObjectState::Materialized as i64,
+                ],
+            )?,
+            _ => return Err(OperationLedgerError::Corrupt),
+        };
+        let _ = changed;
+        Ok(())
     }
 
     fn replace_shadow_session(
@@ -1155,6 +1547,47 @@ mod tests {
         ShadowCandidate::new(12, [0x28; 16], [0x39; 32]).unwrap()
     }
 
+    fn materialized_root(
+        connection: &mut Connection,
+        session: &ShadowSessionRecord,
+    ) -> ShadowObjectFacts {
+        let candidate = shadow_candidate();
+        let facts = shadow_root_facts(candidate);
+        assert_eq!(
+            OperationLedger::reserve_shadow_object(
+                connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &facts,
+            )
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            OperationLedger::mark_shadow_object_materialized(
+                connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &facts,
+            )
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        facts
+    }
+
+    fn shadow_root_facts(candidate: ShadowCandidate) -> ShadowObjectFacts {
+        ShadowObjectFacts {
+            object_id: ObjectId::from_bytes(candidate.object_id()),
+            object_role: ObjectRole::RootV3,
+            root_seq: Some(candidate.root_seq()),
+            context_aad: Zeroizing::new(b"test-opaque-root-context".to_vec()),
+            ciphertext_hash: candidate.ciphertext_hash(),
+        }
+    }
+
     fn shadow_completion(id: u8, request_byte: u8) -> OperationRecord {
         OperationRecord::new(
             OperationId::from_bytes([id; 16]),
@@ -1266,12 +1699,14 @@ mod tests {
             let mut connection = Connection::open(temporary.path()).unwrap();
             OperationLedger::initialize(&connection).unwrap();
             OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+            let root_facts = materialized_root(&mut connection, &session);
             let persisted = OperationLedger::persist_shadow_candidate(
                 &mut connection,
                 session.session_id(),
                 session.attempt_id(),
                 session.binding(),
                 shadow_candidate(),
+                &root_facts,
             )
             .unwrap();
             assert_eq!(persisted.state(), ShadowSessionState::CandidatePersisted);
@@ -1286,12 +1721,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(loaded.candidate(), Some(shadow_candidate()));
+        let root_facts = shadow_root_facts(shadow_candidate());
         OperationLedger::persist_shadow_candidate(
             &mut connection,
             session.session_id(),
             session.attempt_id(),
             session.binding(),
             shadow_candidate(),
+            &root_facts,
         )
         .unwrap();
         assert!(matches!(
@@ -1301,10 +1738,9 @@ mod tests {
                 session.attempt_id(),
                 session.binding(),
                 ShadowCandidate::new(12, [0x48; 16], [0x59; 32]).unwrap(),
+                &root_facts,
             ),
-            Err(OperationLedgerError::ShadowSession(
-                ShadowSessionError::CandidateConflict
-            ))
+            Err(OperationLedgerError::ResultConflict)
         ));
         let reconciled = OperationLedger::transition_shadow_session(
             &mut connection,
@@ -1323,6 +1759,198 @@ mod tests {
             ShadowSessionState::Witnessed,
         )
         .is_err());
+    }
+
+    #[test]
+    fn shadow_object_inventory_is_exact_bound_and_redacted() {
+        let mut connection = setup();
+        let session = shadow_session(0x46, 0x57);
+        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        let facts = shadow_root_facts(shadow_candidate());
+        assert_eq!(
+            OperationLedger::reserve_shadow_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &facts,
+            )
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            OperationLedger::reserve_shadow_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &facts,
+            )
+            .unwrap(),
+            RecordOutcome::AlreadyRecorded
+        );
+        let mut substituted = facts.clone();
+        substituted.ciphertext_hash[0] ^= 1;
+        assert!(matches!(
+            OperationLedger::reserve_shadow_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &substituted,
+            ),
+            Err(OperationLedgerError::ResultConflict)
+        ));
+        let other_binding =
+            shadow_binding(OperationId::from_bytes([0x46; 16]), fingerprint(0x57), 99);
+        assert!(matches!(
+            OperationLedger::shadow_object_state(
+                &connection,
+                session.session_id(),
+                session.attempt_id(),
+                other_binding,
+                &facts,
+            ),
+            Err(OperationLedgerError::ShadowSession(
+                ShadowSessionError::BindingConflict
+            ))
+        ));
+        assert!(!format!("{facts:?}").contains("test-opaque-root-context"));
+    }
+
+    #[test]
+    fn root_candidate_requires_prior_materialized_exact_object() {
+        let mut connection = setup();
+        let session = shadow_session(0x47, 0x58);
+        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        let facts = shadow_root_facts(shadow_candidate());
+        assert!(matches!(
+            OperationLedger::persist_shadow_candidate(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                shadow_candidate(),
+                &facts,
+            ),
+            Err(OperationLedgerError::ResultConflict)
+        ));
+        let facts = materialized_root(&mut connection, &session);
+        OperationLedger::persist_shadow_candidate(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            shadow_candidate(),
+            &facts,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn terminal_session_transitions_atomically_retain_or_orphan_inventory() {
+        let mut connection = setup();
+        let retained = shadow_session(0x48, 0x59);
+        OperationLedger::prepare_shadow_session(&connection, &retained).unwrap();
+        let retained_facts = materialized_root(&mut connection, &retained);
+        OperationLedger::persist_shadow_candidate(
+            &mut connection,
+            retained.session_id(),
+            retained.attempt_id(),
+            retained.binding(),
+            shadow_candidate(),
+            &retained_facts,
+        )
+        .unwrap();
+        OperationLedger::transition_shadow_session(
+            &mut connection,
+            retained.session_id(),
+            retained.attempt_id(),
+            retained.binding(),
+            ShadowSessionState::ReconcileRequired,
+        )
+        .unwrap();
+        assert_eq!(
+            OperationLedger::shadow_object_state(
+                &connection,
+                retained.session_id(),
+                retained.attempt_id(),
+                retained.binding(),
+                &retained_facts,
+            )
+            .unwrap(),
+            Some(ShadowObjectState::RetainedByWitness)
+        );
+
+        let orphan = shadow_session(0x49, 0x5a);
+        OperationLedger::prepare_shadow_session(&connection, &orphan).unwrap();
+        let orphan_facts = materialized_root(&mut connection, &orphan);
+        OperationLedger::transition_shadow_session(
+            &mut connection,
+            orphan.session_id(),
+            orphan.attempt_id(),
+            orphan.binding(),
+            ShadowSessionState::Aborted,
+        )
+        .unwrap();
+        assert_eq!(
+            OperationLedger::shadow_object_state(
+                &connection,
+                orphan.session_id(),
+                orphan.attempt_id(),
+                orphan.binding(),
+                &orphan_facts,
+            )
+            .unwrap(),
+            Some(ShadowObjectState::OrphanPendingGrace)
+        );
+    }
+
+    #[test]
+    fn inventory_cap_rejects_another_reservation_before_provider_io() {
+        let mut connection = setup();
+        let session = shadow_session(0x4a, 0x5b);
+        OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for value in 0..MAX_SHADOW_OBJECTS_PER_ATTEMPT {
+            let mut object_id = [0u8; 16];
+            object_id[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            transaction
+                .execute(
+                    "INSERT INTO archive_v3_shadow_objects (
+                        session_id, attempt_id, object_id, object_role, root_seq,
+                        context_aad, ciphertext_hash, state
+                     ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
+                    params![
+                        session.session_id().as_bytes().as_slice(),
+                        session.attempt_id().as_bytes().as_slice(),
+                        object_id.as_slice(),
+                        ObjectRole::CheckpointManifestV3 as i64,
+                        b"opaque".as_slice(),
+                        [0x61u8; 32].as_slice(),
+                        ShadowObjectState::Reserved as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let facts = ShadowObjectFacts {
+            object_id: ObjectId::from_bytes([0xff; 16]),
+            object_role: ObjectRole::CheckpointManifestV3,
+            root_seq: None,
+            context_aad: Zeroizing::new(b"one-too-many".to_vec()),
+            ciphertext_hash: [0x62; 32],
+        };
+        assert!(matches!(
+            OperationLedger::reserve_shadow_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &facts,
+            ),
+            Err(OperationLedgerError::TooLarge("shadow objects per attempt"))
+        ));
     }
 
     #[test]
@@ -1380,12 +2008,14 @@ mod tests {
         let session = shadow_session(0x43, 0x54);
         let completion = shadow_completion(0x43, 0x54);
         OperationLedger::prepare_shadow_session(&connection, &session).unwrap();
+        let root_facts = materialized_root(&mut connection, &session);
         OperationLedger::persist_shadow_candidate(
             &mut connection,
             session.session_id(),
             session.attempt_id(),
             session.binding(),
             shadow_candidate(),
+            &root_facts,
         )
         .unwrap();
         let wrong_root = OperationRecord::new(

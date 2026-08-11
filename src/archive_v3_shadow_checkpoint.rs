@@ -33,6 +33,8 @@ use crate::{
         CheckpointChunkEntry, CheckpointManifestChild, CheckpointManifestEntries,
         CheckpointManifestNode, CHECKPOINT_CHUNK_BYTES, MAX_CHECKPOINT_MANIFEST_FANOUT,
     },
+    archive_v3_operation::{RecordOutcome, ShadowObjectFacts},
+    archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionBinding, ShadowSessionId},
     archive_v3_witness::{RecoveryRoot, RootReference, Witness, WitnessError},
 };
 
@@ -53,9 +55,111 @@ pub enum ShadowCheckpointError {
     Source,
     #[error("checkpoint recovery sink rejected output")]
     Sink,
+    #[error("durable shadow-object inventory rejected the exact object")]
+    Inventory(#[source] ShadowObjectInventoryError),
 }
 
 pub type Result<T> = std::result::Result<T, ShadowCheckpointError>;
+
+/// Narrow staging-inventory boundary.  It authorizes no provider operation by
+/// itself: callers reserve an exact opaque context before I/O, then may mark it
+/// materialized only after an exact immutable readback.  The concrete adapter
+/// persists these transitions in the encrypted operation ledger.
+#[async_trait::async_trait]
+pub(crate) trait ShadowObjectInventory: Send + Sync {
+    async fn reserve_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError>;
+
+    async fn mark_materialized_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub(crate) enum ShadowObjectInventoryError {
+    #[error("durable shadow-object inventory is unavailable")]
+    Unavailable,
+    #[error("durable shadow-object inventory conflicts with the requested object")]
+    Conflict,
+}
+
+/// Session-scoped capability passed through the checkpoint creation order.
+/// It deliberately contains only opaque attempt binding data.
+#[derive(Clone, Copy)]
+pub(crate) struct ShadowObjectStaging<'a> {
+    inventory: &'a dyn ShadowObjectInventory,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    binding: ShadowSessionBinding,
+}
+
+impl<'a> ShadowObjectStaging<'a> {
+    pub(crate) const fn new(
+        inventory: &'a dyn ShadowObjectInventory,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+    ) -> Self {
+        Self {
+            inventory,
+            session_id,
+            attempt_id,
+            binding,
+        }
+    }
+
+    pub(crate) async fn create_and_readback(
+        &self,
+        backend: &dyn ImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+    ) -> Result<()> {
+        let facts = ShadowObjectFacts::from_sealed(context, &envelope)
+            .map_err(|_| ShadowCheckpointError::Inventory(ShadowObjectInventoryError::Conflict))?;
+        self.inventory
+            .reserve_exact(
+                self.session_id,
+                self.attempt_id,
+                self.binding,
+                facts.clone(),
+            )
+            .await
+            .map_err(ShadowCheckpointError::Inventory)?;
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await?;
+        let readback = backend
+            .get(&context.object_key())
+            .await?
+            .ok_or(ShadowCheckpointError::MissingObject)?;
+        if readback != envelope {
+            return Err(ArchiveV3Error::Authentication.into());
+        }
+        self.inventory
+            .mark_materialized_exact(self.session_id, self.attempt_id, self.binding, facts)
+            .await
+            .map_err(ShadowCheckpointError::Inventory)?;
+        Ok(())
+    }
+
+    pub(crate) fn facts_for(
+        &self,
+        context: &ObjectContext,
+        envelope: &CiphertextEnvelope,
+    ) -> std::result::Result<ShadowObjectFacts, ShadowObjectInventoryError> {
+        ShadowObjectFacts::from_sealed(context, envelope)
+            .map_err(|_| ShadowObjectInventoryError::Conflict)
+    }
+}
 
 /// Read-only stable snapshot boundary.  Implementations must fill exactly
 /// `destination.len()` bytes for every accepted range.  The caller supplies a
@@ -164,6 +268,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
     source: &mut dyn CheckpointSource,
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<UploadedCheckpoint> {
     if cipher.archive_id() != archive_id {
         return Err(ArchiveV3Error::InvalidContext.into());
@@ -208,8 +313,8 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
             None,
         )?;
         let envelope = cipher.seal(&context, chunk.as_slice())?;
-        backend
-            .create_if_absent(context.object_key(), envelope.clone())
+        staging
+            .create_and_readback(backend, &context, envelope.clone())
             .await?;
         leaf_entries.push(CheckpointChunkEntry {
             chunk_index,
@@ -241,6 +346,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 database_plaintext_hash,
                 CheckpointManifestEntries::Chunks(std::mem::take(&mut leaf_entries)),
                 tree_height == 0,
+                staging,
             )
             .await?;
             add_manifest_span(
@@ -256,6 +362,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 &mut root,
                 span,
                 database_plaintext_hash,
+                staging,
             )
             .await?;
         }
@@ -279,6 +386,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 level as u8,
                 children,
                 database_plaintext_hash,
+                staging,
             )
             .await?;
             add_manifest_span(
@@ -294,6 +402,7 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
                 &mut root,
                 span,
                 database_plaintext_hash,
+                staging,
             )
             .await?;
         }
@@ -612,6 +721,7 @@ async fn add_manifest_span<C: CheckpointCipher>(
     root: &mut Option<ManifestSpan>,
     mut span: ManifestSpan,
     database_plaintext_hash: [u8; 32],
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<()> {
     loop {
         if span.level == tree_height {
@@ -641,6 +751,7 @@ async fn add_manifest_span<C: CheckpointCipher>(
             level as u8,
             children,
             database_plaintext_hash,
+            staging,
         )
         .await?;
     }
@@ -659,6 +770,7 @@ async fn seal_parent_manifest<C: CheckpointCipher>(
     child_level: u8,
     children: Vec<ManifestSpan>,
     database_plaintext_hash: [u8; 32],
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<ManifestSpan> {
     let range_start = children
         .first()
@@ -693,6 +805,7 @@ async fn seal_parent_manifest<C: CheckpointCipher>(
         database_plaintext_hash,
         CheckpointManifestEntries::Children(entries),
         level == tree_height,
+        staging,
     )
     .await
 }
@@ -712,6 +825,7 @@ async fn seal_manifest<C: CheckpointCipher>(
     database_plaintext_hash: [u8; 32],
     entries: CheckpointManifestEntries,
     is_root: bool,
+    staging: ShadowObjectStaging<'_>,
 ) -> Result<ManifestSpan> {
     let object_id = if is_root {
         checkpoint_id
@@ -740,8 +854,8 @@ async fn seal_manifest<C: CheckpointCipher>(
         object_id,
     )?;
     let envelope = cipher.seal(&context, &node.encode()?)?;
-    backend
-        .create_if_absent(context.object_key(), envelope.clone())
+    staging
+        .create_and_readback(backend, &context, envelope.clone())
         .await?;
     Ok(ManifestSpan {
         level,
@@ -1009,6 +1123,44 @@ mod tests {
             InMemoryWitness, KeyRegistryReference, RootCommitment, RootReference, WitnessBootstrap,
         },
     };
+
+    struct TestInventory;
+    #[async_trait::async_trait]
+    impl ShadowObjectInventory for TestInventory {
+        async fn reserve_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            Ok(RecordOutcome::Recorded)
+        }
+
+        async fn mark_materialized_exact(
+            &self,
+            _session_id: ShadowSessionId,
+            _attempt_id: ShadowAttemptId,
+            _binding: ShadowSessionBinding,
+            _facts: ShadowObjectFacts,
+        ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+            Ok(RecordOutcome::Recorded)
+        }
+    }
+    static TEST_INVENTORY: TestInventory = TestInventory;
+
+    fn staging() -> ShadowObjectStaging<'static> {
+        ShadowObjectStaging::new(
+            &TEST_INVENTORY,
+            ShadowSessionId::from_bytes([0x91; 16]),
+            ShadowAttemptId::from_bytes([0x92; 16]),
+            ShadowSessionBinding::new(
+                [1; 16], [2; 16], 1, [3; 16], 1, [4; 16], [5; 32], 1, [6; 16], [7; 32], 1, [8; 16],
+                [9; 32], 1, 1, 1, 1,
+            )
+            .unwrap(),
+        )
+    }
 
     struct TestCipher {
         archive_id: ArchiveId,
@@ -1282,6 +1434,7 @@ mod tests {
             archive_id,
             database_epoch,
             &mut VecSource(input.clone()),
+            staging(),
         )
         .await
         .unwrap();
@@ -1312,6 +1465,7 @@ mod tests {
                 archive_id,
                 database_epoch,
                 &mut VecSource(snapshot(2)),
+                staging(),
             )
             .await
             .unwrap();
@@ -1350,6 +1504,7 @@ mod tests {
                     archive_id,
                     database_epoch,
                     &mut VecSource(input),
+                    staging(),
                 )
                 .await,
                 Err(ShadowCheckpointError::Archive(ArchiveV3Error::Malformed(
@@ -1402,7 +1557,15 @@ mod tests {
             reads: 0,
         };
         assert!(matches!(
-            upload_checkpoint(&backend, &cipher, archive_id, database_epoch, &mut source).await,
+            upload_checkpoint(
+                &backend,
+                &cipher,
+                archive_id,
+                database_epoch,
+                &mut source,
+                staging()
+            )
+            .await,
             Err(ShadowCheckpointError::Archive(ArchiveV3Error::TooLarge(
                 "SQLite database"
             )))
