@@ -98,14 +98,15 @@ pub struct SourceExtent {
     pub logical_byte_len: u32,
 }
 
-/// `next_extent` must return strictly increasing extent numbers and fill exactly
-/// `logical_byte_len` bytes at the start of the caller-owned 1 MiB buffer. The
-/// caller clears that buffer before every invocation, so an underfilling buggy
-/// source is deterministic (zero-filled) rather than able to reuse prior
-/// extent bytes; it still violates this source contract.
+/// `next_extent` asynchronously returns strictly increasing extent numbers and
+/// fills exactly `logical_byte_len` bytes at the start of the caller-owned 1 MiB
+/// buffer. The caller clears that buffer before every invocation, so an
+/// underfilling buggy source is deterministic (zero-filled) rather than able to
+/// reuse prior extent bytes; it still violates this source contract.
+#[async_trait::async_trait]
 pub trait ExtentSource: Send {
     fn logical_file_length(&self) -> Result<u64>;
-    fn next_extent(&mut self, destination: &mut [u8]) -> Result<Option<SourceExtent>>;
+    async fn next_extent(&mut self, destination: &mut [u8]) -> Result<Option<SourceExtent>>;
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -306,7 +307,7 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher>(
         // underfilling buggy source deterministic rather than allowing bytes
         // from a prior extent to cross an immutable object boundary.
         buffer.fill(0);
-        let Some(item) = source.next_extent(buffer.as_mut_slice())? else {
+        let Some(item) = source.next_extent(buffer.as_mut_slice()).await? else {
             break;
         };
         validate_source_extent(item, slots, logical_file_length, last)?;
@@ -1123,11 +1124,12 @@ mod tests {
         entries: Vec<(u64, Vec<u8>)>,
         next: usize,
     }
+    #[async_trait::async_trait]
     impl ExtentSource for VecSource {
         fn logical_file_length(&self) -> Result<u64> {
             Ok(self.length)
         }
-        fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
+        async fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
             let Some((no, bytes)) = self.entries.get(self.next) else {
                 return Ok(None);
             };
@@ -1141,6 +1143,77 @@ mod tests {
     }
     struct UnderfillingSource {
         next: u8,
+    }
+
+    /// A test source that can suspend an asynchronous upload before a chosen
+    /// pull. It deliberately owns no extent-sized buffer: production owns and
+    /// clears the sole bounded destination buffer.
+    struct PausingSource {
+        length: u64,
+        entries: Vec<(u64, Vec<u8>)>,
+        next: usize,
+        pause_at: usize,
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        resume: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+    #[async_trait::async_trait]
+    impl ExtentSource for PausingSource {
+        fn logical_file_length(&self) -> Result<u64> {
+            Ok(self.length)
+        }
+
+        async fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
+            if self.next == self.pause_at {
+                self.entered
+                    .take()
+                    .expect("test source pauses once")
+                    .send(())
+                    .expect("upload observes the source pause");
+                self.resume
+                    .take()
+                    .expect("test source has a resume channel")
+                    .await
+                    .map_err(|_| ExtentTreeError::Source)?;
+            }
+            let Some((no, bytes)) = self.entries.get(self.next) else {
+                return Ok(None);
+            };
+            self.next += 1;
+            output[..bytes.len()].copy_from_slice(bytes);
+            Ok(Some(SourceExtent {
+                extent_no: *no,
+                logical_byte_len: bytes.len() as u32,
+            }))
+        }
+    }
+
+    struct PointerTrackingSource {
+        length: u64,
+        entries: Vec<(u64, Vec<u8>)>,
+        next: usize,
+        destinations: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+    #[async_trait::async_trait]
+    impl ExtentSource for PointerTrackingSource {
+        fn logical_file_length(&self) -> Result<u64> {
+            Ok(self.length)
+        }
+
+        async fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
+            self.destinations
+                .lock()
+                .unwrap()
+                .push((output.as_ptr() as usize, output.len()));
+            let Some((no, bytes)) = self.entries.get(self.next) else {
+                return Ok(None);
+            };
+            self.next += 1;
+            output[..bytes.len()].copy_from_slice(bytes);
+            Ok(Some(SourceExtent {
+                extent_no: *no,
+                logical_byte_len: bytes.len() as u32,
+            }))
+        }
     }
 
     struct AcceptingInventory;
@@ -1276,11 +1349,12 @@ mod tests {
             Ok(ShadowObjectInventoryPage::empty())
         }
     }
+    #[async_trait::async_trait]
     impl ExtentSource for UnderfillingSource {
         fn logical_file_length(&self) -> Result<u64> {
             Ok(u64::from(EXTENT_BYTES) * 2)
         }
-        fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
+        async fn next_extent(&mut self, output: &mut [u8]) -> Result<Option<SourceExtent>> {
             match self.next {
                 0 => {
                     self.next = 1;
@@ -2442,6 +2516,104 @@ mod tests {
         );
         assert_eq!(inventory.reserved.load(Ordering::Relaxed), 1);
         assert_eq!(inventory.materialized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn async_source_can_pend_before_create_and_cancellation_leaves_no_inventory_entry() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let inventory = EventInventory::new(Arc::clone(&backend.events));
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (_resume, resume_rx) = tokio::sync::oneshot::channel();
+        let mut source = PausingSource {
+            length: u64::from(EXTENT_BYTES),
+            entries: vec![(0, bytes(256, 0x71))],
+            next: 0,
+            pause_at: 0,
+            entered: Some(entered),
+            resume: Some(resume_rx),
+        };
+        {
+            let future = upload_extent_tree(
+                &backend,
+                &cipher,
+                a,
+                d,
+                &mut source,
+                staging_for(&inventory),
+            );
+            tokio::pin!(future);
+            tokio::select! {
+                result = entered_rx => result.expect("source entered its async pause"),
+                result = &mut future => panic!("paused source unexpectedly completed: {result:?}"),
+            }
+        }
+        assert!(backend.events.lock().unwrap().is_empty());
+        assert_eq!(inventory.reserved.load(Ordering::Relaxed), 0);
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn async_source_can_pend_between_extents_and_keeps_prior_materialization_ledgered() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let inventory = EventInventory::new(Arc::clone(&backend.events));
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (_resume, resume_rx) = tokio::sync::oneshot::channel();
+        let mut source = PausingSource {
+            length: u64::from(EXTENT_BYTES) * 2,
+            entries: vec![(0, bytes(256, 0x71)), (1, bytes(256, 0x72))],
+            next: 0,
+            pause_at: 1,
+            entered: Some(entered),
+            resume: Some(resume_rx),
+        };
+        {
+            let future = upload_extent_tree(
+                &backend,
+                &cipher,
+                a,
+                d,
+                &mut source,
+                staging_for(&inventory),
+            );
+            tokio::pin!(future);
+            tokio::select! {
+                result = entered_rx => result.expect("source paused between extent pulls"),
+                result = &mut future => panic!("paused source unexpectedly completed: {result:?}"),
+            }
+        }
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            ["reserve", "create", "get", "materialize"]
+        );
+        assert_eq!(inventory.reserved.load(Ordering::Relaxed), 1);
+        assert_eq!(inventory.materialized.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn async_source_reuses_the_one_mib_caller_buffer_for_every_pull() {
+        let (a, d, k) = ids();
+        let cipher = TestCipher::new(a, k);
+        let backend = FaultBackend::default();
+        let destinations = Arc::new(Mutex::new(Vec::new()));
+        let mut source = PointerTrackingSource {
+            length: u64::from(EXTENT_BYTES) * 2,
+            entries: vec![(0, bytes(256, 0x71)), (1, bytes(256, 0x72))],
+            next: 0,
+            destinations: Arc::clone(&destinations),
+        };
+        upload_extent_tree(&backend, &cipher, a, d, &mut source, staging())
+            .await
+            .unwrap();
+        let destinations = destinations.lock().unwrap();
+        assert_eq!(destinations.len(), 3, "two extents plus the EOF pull");
+        assert!(destinations
+            .iter()
+            .all(|(_, length)| *length == EXTENT_BYTES as usize));
+        assert!(destinations.windows(2).all(|pair| pair[0].0 == pair[1].0));
     }
 
     #[tokio::test]
