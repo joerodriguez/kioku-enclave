@@ -12,9 +12,13 @@
   and content-free reports.
 - [x] Kept Phase-0a smoke tests fast and permanently non-evidence; the long gate is not
   executed in CI contract tests.
-- [ ] Bind a future release-only suite to a signed production image and exercise archive-v3
-  VFS, backend, witness, fault, lifecycle, cache, and concurrency paths before any
-  authority transition.
+- [x] Defined an inactive, offline, restricted-JCS preauthorization schema and policy
+  template, exact workload-by-result/environment/metric/formula verifier, explicit untrusted-wrapper activation
+  blockers, and adversarial test contract. The checked-in template has intentionally invalid
+  anchors; no current input authenticates time/challenge/provenance or consumes a replay nonce.
+- [ ] Populate a separately controlled release policy with real trust anchors, collect
+  signed production evidence, and exercise archive-v3 VFS, backend, witness, fault,
+  lifecycle, cache, and concurrency paths before any authority transition.
 
 The checked items do not authorize archive-v3 persistence or deployment. See
 [`eval/capacity/README.md`](eval/capacity/README.md) for the reproducible operator command

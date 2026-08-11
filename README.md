@@ -339,6 +339,50 @@ page/extent assumptions, but is still non-authority local evidence:
 it never materializes, downloads, or encrypts a 32-GiB snapshot and cannot satisfy the
 archive-v3 release gate.
 
+### Inactive signed 32-GiB release-evidence contract
+
+`eval/capacity/archive-v3-capacity-evidence-v2.schema.json` and
+`eval/capacity/archive-v3-capacity-policy-v2.template.json` define a restricted-JCS,
+preauthorization-only Phase-1 contract. The verifier itself fixes 32 GiB, exact three-year
+workloads/screen ratios, every ADR metric context and workload/fault/test scenario,
+paired 1-GiB/32-GiB raw write traces with derived amplification, ANN coverage, and
+conditional provider-recovery deletion.
+A policy can only tighten numeric limits and freshness maxima. The checked-in template has
+deliberately unusable anchors and is not evidence.
+
+When a separately reviewed release policy contains real out-of-band anchors, an operator
+may check the restricted canonical JSON report with its detached digest, DER-validated P-256
+public-key metadata, and hash-bound request, replay, time, and artifact wrappers. Those
+wrappers do not authenticate their claims. The command requires an absolute `openssl`
+path whose regular-file bytes match the policy-pinned SHA-256; the verifier then executes
+a private copy with a restricted environment:
+
+```sh
+python3 scripts/verify_archive_v3_capacity_report.py \
+  --report /secure/evidence/report.json \
+  --report-digest /secure/evidence/report.sha256 \
+  --signature /secure/evidence/report.sig.b64 \
+  --public-key-metadata /secure/evidence/pinned-public-key.json \
+  --policy /secure/release-policy.json \
+  --verification-request /secure/evidence/request.json \
+  --replay-ledger /secure/evidence/replay-ledger.json \
+  --time-assertion /secure/evidence/time-assertion.json \
+  --release-manifest /secure/evidence/release-manifest.json \
+  --provenance /secure/evidence/provenance.json \
+  --sbom /secure/evidence/sbom.json \
+  --fixture-manifest /secure/evidence/fixture.json \
+  --test-plan /secure/evidence/test-plan.json \
+  --test-config /secure/evidence/test-config.json \
+  --environment-attestation /secure/evidence/environment.json \
+  --openssl /secure/toolchain/openssl
+```
+
+The verifier emits `preauthorization_only: true`, `authority: false`, and six unsatisfied
+activation blockers. It does not establish a rollback-protected challenge or ledger,
+authenticated time, cryptographic provider/SLSA provenance or environment attestation, or
+independent measurement authenticity. A future separately reviewed deployment controller
+must satisfy those blockers and transactionally consume the receipt before authority.
+
 The production Docker build has no permissive configuration defaults. Supply every
 deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` or
 `WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the

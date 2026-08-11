@@ -228,6 +228,19 @@ materialize, download, upload, or encrypt a 32-GiB snapshot. Its report
 is permanently marked local non-authority/non-release evidence; it cannot change runtime
 authority or satisfy the image/backend/VFS/witness/fault/lifecycle/cache/concurrency gates.
 
+The inactive Phase-1 signed capacity-evidence contract adds no authority. Its offline
+verifier accepts a restricted ASCII/JCS profile only; enforces exact workload geometry,
+the workload-by-case/metric/result cross-product, policy-pinned environment, context-bound
+ADR metrics and transport components, strict bounds, paired live-size write traces with
+recomputed summaries and amplification growth,
+root/witness caps, ANN completeness, and conditional deletion semantics; and DER-validates
+a pinned P-256 SPKI. Request, time,
+replay-ledger, provenance, SBOM, and environment files are hash-bound wrappers, not trusted
+facts. The `preauthorization_only` receipt lists rollback-protected challenge issuance,
+transactional replay consumption, authenticated time, cryptographic provenance/environment
+verification, and independent measurement authenticity as unsatisfied activation blockers.
+It always carries `authority: false` and cannot authorize an archive-v3 transition.
+
 `src/archive_v3.rs`, `src/archive_v3_journal.rs`, `src/archive_v3_shadow.rs`, and `src/archive_v3_sqlite_vfs.rs` define only audited, unit-tested
 format primitives for the future
 immutable archive: opaque archive/database/key/object IDs; canonical context-bound
