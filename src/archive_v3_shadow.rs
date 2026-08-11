@@ -169,6 +169,12 @@ impl CapturedWalCommit {
         &self.wal_header
     }
 
+    /// The rolling checksum immediately before the first captured frame. This
+    /// is comparison data from the validated VFS capture, never caller input.
+    pub(crate) fn replay_checksum_before(&self) -> [u32; 2] {
+        self.checksum_before
+    }
+
     pub(crate) fn replay_frames(&self) -> &[u8] {
         &self.frames
     }

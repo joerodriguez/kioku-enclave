@@ -509,8 +509,43 @@ pub struct ResolvedWalSegment {
     segment: WalSegment,
 }
 
+impl ResolvedWalSegment {
+    /// Both values are available only after the envelope hash, AEAD context,
+    /// encoded segment, and segment context have been verified together.
+    pub(crate) fn reference(&self) -> &ImmutableReference {
+        &self.reference
+    }
+
+    pub(crate) fn segment(&self) -> &WalSegment {
+        &self.segment
+    }
+}
+
 pub fn resolve_wal_segment(
     cipher: &ArchiveCipher,
+    context: ObjectContext,
+    expected_reference: ImmutableReference,
+    envelope: CiphertextEnvelope,
+) -> Result<ResolvedWalSegment> {
+    if context.object_id() != expected_reference.object_id
+        || envelope.hash() != expected_reference.envelope_hash
+    {
+        return Err(ArchiveV3Error::Authentication);
+    }
+    let plaintext = cipher.open(&context, &envelope)?;
+    let segment = WalSegment::decode(&plaintext)?;
+    segment.validate_for_context(&context)?;
+    Ok(ResolvedWalSegment {
+        reference: expected_reference,
+        segment,
+    })
+}
+
+/// The verified archive cipher is the production-shaped cipher boundary. Keep
+/// this twin of [`resolve_wal_segment`] explicit rather than allowing callers
+/// to reach inside `VerifiedArchiveCipher` for its raw DEK.
+pub fn resolve_verified_wal_segment(
+    cipher: &crate::archive_v3::VerifiedArchiveCipher,
     context: ObjectContext,
     expected_reference: ImmutableReference,
     envelope: CiphertextEnvelope,
