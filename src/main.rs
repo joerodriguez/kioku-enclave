@@ -134,6 +134,9 @@ mod crypto;
 mod embedding;
 mod episodes;
 mod error;
+// Inactive migration-only reader for the historic GCM envelope. It has no
+// Store, GCS provider, route, flag, or authority wiring.
+mod legacy_gcm;
 // The retired local-sync route no longer calls this legacy ingestion surface,
 // but its core remains as migration/regression-test coverage for old indexes.
 #[allow(dead_code)]

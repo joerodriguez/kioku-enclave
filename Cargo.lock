@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -430,6 +431,7 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -1258,6 +1260,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -1781,6 +1784,7 @@ dependencies = [
 name = "kioku-enclave"
 version = "0.8.9"
 dependencies = [
+ "aes",
  "aes-gcm",
  "async-trait",
  "axum",
@@ -1789,8 +1793,10 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "ctr",
  "flate2",
  "futures-util",
+ "ghash",
  "hkdf",
  "hmac",
  "http-body",
@@ -1811,6 +1817,7 @@ dependencies = [
  "serde_urlencoded",
  "sha2",
  "sqlite-vec",
+ "subtle",
  "symphonia",
  "tar",
  "tempfile",

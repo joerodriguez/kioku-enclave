@@ -166,6 +166,26 @@ User databases, the control database, ACME state, and media evidence are rewritt
 to v2 immediately when successfully opened by an explicitly enabled migration image.
 Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-way; see
 [`RELEASING.md`](RELEASING.md#one-time-legacy-blob-migration) before upgrading a
+deployment that contains pre-v2 objects.
+
+The repository also contains an **inactive, migration-only** bounded streaming reader for
+the exact historical `nonce[12] || ciphertext || tag[16]` AES-256-GCM envelope. It has no
+Store, GCS, route, environment-flag, or authority connection. A future migration adapter
+must pin the source generation, authenticate the entire ciphertext before starting a
+temporary plaintext sink, re-read that same generation in fixed-size chunks, and commit
+only after the second pass has the same ciphertext digest and valid GCM tag. The primitive
+uses async range and sink contracts; after staging begins, a synchronous-abort guard removes
+temporary plaintext even if the migration future is cancelled at an I/O await point.
+Staging creation itself is synchronous, so it cannot leave an unguarded temporary object on
+cancellation. Any future concrete adapter must live in the isolated legacy-GCM module (or a
+child), require an exact-generation GCS `206` response with a parsed `Content-Range` total
+and observed generation on every range, and receive dedicated review for atomic commit,
+non-observability, and reconciliation if cancellation races an externally completed commit.
+It accepts only an explicit historic empty-AAD profile (SQLite/control/ACME) or the exact
+historic media-user-id AAD profile; it never probes multiple AADs and explicitly rejects a
+v2 marker. Its AES/CTR/GHASH composition is intentionally isolated because it needs a
+dedicated low-level cryptographic review, including the production range-reader and
+all-or-nothing tmpfs sink implementations, before it can be connected to any runtime path.
 ### ADR-0022 archive-v3 foundation is inactive
 
 The offline `scripts/run_archive_capacity_harness.py` creates deterministic,
