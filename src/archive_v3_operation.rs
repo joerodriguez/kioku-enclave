@@ -21,12 +21,19 @@ use zeroize::Zeroizing;
 use crate::archive_v3::{
     CiphertextEnvelope, LogicalLocation, ObjectContext, ObjectId, ObjectKey, ObjectRole,
 };
+use crate::archive_v3_legacy_extent_session::{
+    LegacyExtentAttemptId, LegacyExtentCandidate, LegacyExtentRootAdmission,
+    LegacyExtentSessionBinding, LegacyExtentSessionError, LegacyExtentSessionId,
+    LegacyExtentSessionRecord, LegacyExtentSessionState, LEGACY_EXTENT_SESSION_RECORD_BYTES,
+};
 use crate::archive_v3_shadow_session::{
     ShadowAttemptId, ShadowCandidate, ShadowSessionBinding, ShadowSessionError, ShadowSessionId,
     ShadowSessionRecord, ShadowSessionState, SHADOW_SESSION_RECORD_BYTES,
 };
 
 const FINGERPRINT_DOMAIN: &[u8] = b"kioku:archive:v3:operation-request\0";
+const LEGACY_EXTENT_CURSOR_DOMAIN: &[u8] = b"kioku:archive:v3:legacy-extent-cursor\0";
+const LEGACY_EXTENT_INVENTORY_DOMAIN: &[u8] = b"kioku:archive:v3:legacy-extent-inventory\0";
 const INLINE_RESULT_DOMAIN: &[u8] = b"kioku:archive:v3:operation-inline-result\0";
 const ENTITY_RESULT_DOMAIN: &[u8] = b"kioku:archive:v3:operation-entity-result\0";
 const LEDGER_SCHEMA_VERSION: u8 = 1;
@@ -41,6 +48,13 @@ pub const MAX_SHADOW_SESSION_ATTEMPTS: i64 = 16;
 pub const MAX_SHADOW_OBJECTS_PER_ATTEMPT: usize = 32_768 + 129 + 1;
 pub const MAX_SHADOW_OBJECTS_PAGE: usize = 256;
 const MAX_SHADOW_OBJECT_CONTEXT_BYTES: usize = 512;
+pub(crate) const MAX_LEGACY_EXTENT_SESSION_ATTEMPTS: i64 = 16;
+pub(crate) const MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT: usize = 32_898;
+pub(crate) const MAX_LEGACY_EXTENT_OBJECTS_PAGE: usize = 256;
+const LEGACY_EXTENT_SCHEMA_TABLE_SQL: &str = "CREATE TABLE archive_v3_legacy_extent_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL CHECK(version = 2)) STRICT";
+const LEGACY_EXTENT_SESSIONS_TABLE_SQL: &str = "CREATE TABLE archive_v3_legacy_extent_sessions (session_id BLOB NOT NULL CHECK(length(session_id) = 16), attempt_id BLOB UNIQUE NOT NULL CHECK(length(attempt_id) = 16), archive_id BLOB NOT NULL CHECK(length(archive_id) = 16), database_epoch BLOB NOT NULL CHECK(length(database_epoch) = 16), operation_id BLOB NOT NULL CHECK(length(operation_id) = 16), request_fingerprint BLOB NOT NULL CHECK(length(request_fingerprint) = 32), state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 3), record BLOB NOT NULL CHECK(length(record) = 436), PRIMARY KEY(session_id, attempt_id)) STRICT";
+const LEGACY_EXTENT_OBJECTS_TABLE_SQL: &str = "CREATE TABLE archive_v3_legacy_extent_objects (session_id BLOB NOT NULL CHECK(length(session_id) = 16), attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16), ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 32898), object_id BLOB NOT NULL CHECK(length(object_id) = 16), object_role INTEGER NOT NULL CHECK(object_role IN (3, 4, 5)), root_seq INTEGER, context_aad BLOB NOT NULL CHECK(length(context_aad) > 0 AND length(context_aad) <= 512), object_key TEXT NOT NULL CHECK(length(object_key) > 0 AND length(object_key) <= 512), ciphertext_hash BLOB NOT NULL CHECK(length(ciphertext_hash) = 32), state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 3), PRIMARY KEY(session_id, attempt_id, ordinal), UNIQUE(session_id, attempt_id, object_id), CHECK(root_seq IS NULL OR root_seq > 0), CHECK((object_role = 5 AND root_seq IS NOT NULL) OR (object_role != 5 AND root_seq IS NULL))) STRICT";
+const LEGACY_EXTENT_OBJECTS_INDEX_SQL: &str = "CREATE INDEX archive_v3_legacy_extent_objects_exact_attempt ON archive_v3_legacy_extent_objects(session_id, attempt_id, state, ordinal)";
 const SHADOW_OBJECT_SCHEMA_TABLE_SQL: &str = "CREATE TABLE archive_v3_shadow_object_schema (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL CHECK(version BETWEEN 1 AND 2)) STRICT";
 const SHADOW_OBJECT_INDEX_SQL: &str = "CREATE INDEX archive_v3_shadow_objects_exact_attempt ON archive_v3_shadow_objects(session_id, attempt_id, state)";
 const SHADOW_OBJECT_TABLE_V1_SQL: &str = "CREATE TABLE archive_v3_shadow_objects (session_id BLOB NOT NULL CHECK(length(session_id) = 16), attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16), object_id BLOB NOT NULL CHECK(length(object_id) = 16), object_role INTEGER NOT NULL CHECK(object_role BETWEEN 1 AND 8), root_seq INTEGER, context_aad BLOB NOT NULL CHECK(length(context_aad) > 0 AND length(context_aad) <= 512), ciphertext_hash BLOB NOT NULL CHECK(length(ciphertext_hash) = 32), state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 4), PRIMARY KEY(session_id, attempt_id, object_id), CHECK(root_seq IS NULL OR root_seq > 0), CHECK((object_role = 5 AND root_seq IS NOT NULL) OR (object_role != 5 AND root_seq IS NULL))) STRICT";
@@ -60,6 +74,8 @@ pub enum OperationLedgerError {
     Corrupt,
     #[error(transparent)]
     ShadowSession(#[from] ShadowSessionError),
+    #[error(transparent)]
+    LegacyExtentSession(#[from] LegacyExtentSessionError),
     #[error("archive-v3 operation ledger SQLite operation failed")]
     Sqlite(#[source] rusqlite::Error),
 }
@@ -767,6 +783,223 @@ impl fmt::Debug for ShadowObjectFacts {
     }
 }
 
+/// Exact object lifecycle for an inactive legacy-to-extent conversion attempt.
+/// `CandidateReady` is deliberately not a retained-by-witness state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum LegacyExtentObjectState {
+    Reserved = 1,
+    Materialized = 2,
+    OrphanPendingGrace = 3,
+}
+
+impl LegacyExtentObjectState {
+    fn decode(value: i64) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Reserved),
+            2 => Ok(Self::Materialized),
+            3 => Ok(Self::OrphanPendingGrace),
+            _ => Err(OperationLedgerError::Corrupt),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LegacyExtentObjectFacts {
+    ordinal: u32,
+    object_id: ObjectId,
+    object_role: ObjectRole,
+    root_seq: Option<u64>,
+    context_aad: Zeroizing<Vec<u8>>,
+    object_key: String,
+    ciphertext_hash: [u8; 32],
+}
+
+impl LegacyExtentObjectFacts {
+    pub(crate) fn from_sealed(
+        context: &ObjectContext,
+        envelope: &CiphertextEnvelope,
+        ordinal: u32,
+    ) -> Result<Self> {
+        let context_aad = context.canonical_aad();
+        let root_seq = match context.location() {
+            LogicalLocation::Root { root_seq } => Some(*root_seq),
+            _ => None,
+        };
+        let value = Self {
+            ordinal,
+            object_id: context.object_id(),
+            object_role: context.role(),
+            root_seq,
+            context_aad: Zeroizing::new(context_aad),
+            object_key: context.object_key().as_str().to_owned(),
+            ciphertext_hash: envelope.hash(),
+        };
+        value.validate_canonical()?;
+        Ok(value)
+    }
+
+    pub(crate) const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+    pub(crate) const fn object_id(&self) -> ObjectId {
+        self.object_id
+    }
+    pub(crate) const fn object_role(&self) -> ObjectRole {
+        self.object_role
+    }
+    pub(crate) const fn root_seq(&self) -> Option<u64> {
+        self.root_seq
+    }
+    pub(crate) const fn ciphertext_hash(&self) -> [u8; 32] {
+        self.ciphertext_hash
+    }
+
+    fn validate_canonical(&self) -> Result<()> {
+        if usize::try_from(self.ordinal)
+            .ok()
+            .is_none_or(|x| x >= MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT)
+            || self.context_aad.is_empty()
+            || self.context_aad.len() > MAX_SHADOW_OBJECT_CONTEXT_BYTES
+            || self.object_key.is_empty()
+            || self.object_key.len() > MAX_SHADOW_OBJECT_CONTEXT_BYTES
+            || self.ciphertext_hash.iter().all(|x| *x == 0)
+            || !matches!(
+                self.object_role,
+                ObjectRole::ExtentV3 | ObjectRole::MerkleNodeV3 | ObjectRole::RootV3
+            )
+        {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        let context = ObjectContext::decode_canonical_aad(self.context_aad.as_slice())
+            .map_err(|_| OperationLedgerError::Corrupt)?;
+        let root_seq = match context.location() {
+            LogicalLocation::Root { root_seq } => Some(*root_seq),
+            _ => None,
+        };
+        if context.object_id() != self.object_id
+            || context.role() != self.object_role
+            || root_seq != self.root_seq
+            || context.object_key().as_str() != self.object_key
+            || !valid_shadow_object_key(&self.object_key, self.object_role, self.object_id)
+        {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn matches_binding(&self, binding: LegacyExtentSessionBinding) -> bool {
+        let Ok(context) = ObjectContext::decode_canonical_aad(self.context_aad.as_slice()) else {
+            return false;
+        };
+        context.archive_id().as_bytes() == &binding.archive_id()
+            && context.database_epoch().as_bytes() == &binding.database_epoch()
+            && context.key_epoch().as_bytes() == &binding.key_epoch()
+            && match (self.object_role, context.location()) {
+                (ObjectRole::RootV3, LogicalLocation::Root { root_seq }) => {
+                    binding.base_root_seq().checked_add(1) == Some(*root_seq)
+                        && context.parent().is_some_and(|parent| {
+                            parent.object_id.as_bytes() == &binding.base_root_object_id()
+                                && parent.envelope_hash == binding.base_root_ciphertext_hash()
+                        })
+                }
+                (ObjectRole::ExtentV3 | ObjectRole::MerkleNodeV3, _) => context.parent().is_none(),
+                _ => false,
+            }
+    }
+
+    fn is_candidate_root(&self, candidate: LegacyExtentCandidate) -> bool {
+        self.object_role == ObjectRole::RootV3
+            && self.root_seq == Some(candidate.root_seq())
+            && self.object_id.as_bytes() == &candidate.object_id()
+            && self.ciphertext_hash == candidate.ciphertext_hash()
+    }
+}
+impl fmt::Debug for LegacyExtentObjectFacts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LegacyExtentObjectFacts(<opaque>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct LegacyExtentObjectInventoryEntry {
+    facts: LegacyExtentObjectFacts,
+    state: LegacyExtentObjectState,
+}
+impl LegacyExtentObjectInventoryEntry {
+    pub(crate) const fn state(&self) -> LegacyExtentObjectState {
+        self.state
+    }
+    pub(crate) fn facts(&self) -> &LegacyExtentObjectFacts {
+        &self.facts
+    }
+}
+impl fmt::Debug for LegacyExtentObjectInventoryEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LegacyExtentObjectInventoryEntry(<opaque>)")
+    }
+}
+pub(crate) struct LegacyExtentObjectInventoryPage {
+    entries: Vec<LegacyExtentObjectInventoryEntry>,
+    next_cursor: Option<LegacyExtentObjectCursor>,
+}
+impl LegacyExtentObjectInventoryPage {
+    pub(crate) fn entries(&self) -> &[LegacyExtentObjectInventoryEntry] {
+        &self.entries
+    }
+    pub(crate) const fn next_cursor(&self) -> Option<LegacyExtentObjectCursor> {
+        self.next_cursor
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyExtentObjectCursor {
+    session_id: LegacyExtentSessionId,
+    attempt_id: LegacyExtentAttemptId,
+    next_ordinal: u32,
+    integrity: [u8; 32],
+}
+impl LegacyExtentObjectCursor {
+    fn new(
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        next_ordinal: u32,
+    ) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(LEGACY_EXTENT_CURSOR_DOMAIN);
+        hash.update(session_id.as_bytes());
+        hash.update(attempt_id.as_bytes());
+        hash.update(next_ordinal.to_be_bytes());
+        Self {
+            session_id,
+            attempt_id,
+            next_ordinal,
+            integrity: hash.finalize().into(),
+        }
+    }
+    fn valid(self) -> bool {
+        self == Self::new(self.session_id, self.attempt_id, self.next_ordinal)
+    }
+}
+impl fmt::Debug for LegacyExtentObjectCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LegacyExtentObjectCursor(<opaque>)")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LegacyExtentInventoryRequirement {
+    Materialized,
+    PreOrphan,
+    Orphaned,
+}
+
+struct LegacyExtentInventoryScan {
+    count: usize,
+    root: Option<LegacyExtentObjectFacts>,
+    commitment: [u8; 32],
+}
+
 pub struct OperationLedger;
 
 impl OperationLedger {
@@ -822,6 +1055,7 @@ impl OperationLedger {
         )?;
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
         Self::initialize_shadow_object_inventory(&transaction)?;
+        Self::initialize_legacy_extent_inventory(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -2074,6 +2308,43 @@ fn decode_shadow_session_row(row: ShadowSessionRow) -> Result<ShadowSessionRecor
     Ok(record)
 }
 
+type LegacyExtentSessionRow = ShadowSessionRow;
+
+fn read_legacy_extent_session_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LegacyExtentSessionRow> {
+    read_shadow_session_row(row)
+}
+
+fn decode_legacy_extent_session_row(
+    row: LegacyExtentSessionRow,
+) -> Result<LegacyExtentSessionRecord> {
+    let (
+        session_id,
+        attempt_id,
+        archive_id,
+        database_epoch,
+        operation_id,
+        request_fingerprint,
+        state,
+        encoded,
+    ) = row;
+    let record =
+        LegacyExtentSessionRecord::decode(&encoded).map_err(|_| OperationLedgerError::Corrupt)?;
+    let binding = record.binding();
+    if session_id.as_slice() != record.session_id().as_bytes()
+        || attempt_id.as_slice() != record.attempt_id().as_bytes()
+        || archive_id.as_slice() != binding.archive_id()
+        || database_epoch.as_slice() != binding.database_epoch()
+        || operation_id.as_slice() != binding.operation_id()
+        || request_fingerprint.as_slice() != binding.request_fingerprint()
+        || state != record.state() as i64
+    {
+        return Err(OperationLedgerError::Corrupt);
+    }
+    Ok(record)
+}
+
 fn positive_u64(value: i64) -> Result<u64> {
     if value <= 0 {
         return Err(OperationLedgerError::Corrupt);
@@ -2086,6 +2357,690 @@ fn nonnegative_u64(value: i64) -> Result<u64> {
         return Err(OperationLedgerError::Corrupt);
     }
     Ok(value as u64)
+}
+
+impl OperationLedger {
+    /// Separate, exact schema for legacy conversion.  It never aliases a
+    /// shadow row: a future migration cannot forge WAL-specific facts.
+    fn initialize_legacy_extent_inventory(transaction: &Transaction<'_>) -> Result<()> {
+        let existing: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
+                'archive_v3_legacy_extent_schema',
+                'archive_v3_legacy_extent_sessions',
+                'archive_v3_legacy_extent_objects')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !matches!(existing, 0 | 3) {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        if existing == 0 {
+            transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS archive_v3_legacy_extent_schema (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                version INTEGER NOT NULL CHECK(version = 2)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS archive_v3_legacy_extent_sessions (
+                session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+                attempt_id BLOB UNIQUE NOT NULL CHECK(length(attempt_id) = 16),
+                archive_id BLOB NOT NULL CHECK(length(archive_id) = 16),
+                database_epoch BLOB NOT NULL CHECK(length(database_epoch) = 16),
+                operation_id BLOB NOT NULL CHECK(length(operation_id) = 16),
+                request_fingerprint BLOB NOT NULL CHECK(length(request_fingerprint) = 32),
+                state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 3),
+                record BLOB NOT NULL CHECK(length(record) = 436),
+                PRIMARY KEY(session_id, attempt_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS archive_v3_legacy_extent_objects (
+                session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+                attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+                ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 32898),
+                object_id BLOB NOT NULL CHECK(length(object_id) = 16),
+                object_role INTEGER NOT NULL CHECK(object_role IN (3, 4, 5)),
+                root_seq INTEGER,
+                context_aad BLOB NOT NULL CHECK(length(context_aad) > 0 AND length(context_aad) <= 512),
+                object_key TEXT NOT NULL CHECK(length(object_key) > 0 AND length(object_key) <= 512),
+                ciphertext_hash BLOB NOT NULL CHECK(length(ciphertext_hash) = 32),
+                state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 3),
+                PRIMARY KEY(session_id, attempt_id, ordinal),
+                UNIQUE(session_id, attempt_id, object_id),
+                CHECK(root_seq IS NULL OR root_seq > 0),
+                CHECK((object_role = 5 AND root_seq IS NOT NULL) OR (object_role != 5 AND root_seq IS NULL))
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS archive_v3_legacy_extent_objects_exact_attempt
+                ON archive_v3_legacy_extent_objects(session_id, attempt_id, state, ordinal);",
+            )?;
+            transaction.execute(
+                "INSERT INTO archive_v3_legacy_extent_schema(singleton, version) VALUES (1, 2)",
+                [],
+            )?;
+        }
+        for (name, expected) in [
+            (
+                "archive_v3_legacy_extent_schema",
+                LEGACY_EXTENT_SCHEMA_TABLE_SQL,
+            ),
+            (
+                "archive_v3_legacy_extent_sessions",
+                LEGACY_EXTENT_SESSIONS_TABLE_SQL,
+            ),
+            (
+                "archive_v3_legacy_extent_objects",
+                LEGACY_EXTENT_OBJECTS_TABLE_SQL,
+            ),
+        ] {
+            if !Self::has_exact_schema_descriptor(transaction, name, expected)? {
+                return Err(OperationLedgerError::Corrupt);
+            }
+        }
+        if !Self::has_exact_index_descriptor(
+            transaction,
+            "archive_v3_legacy_extent_objects_exact_attempt",
+            LEGACY_EXTENT_OBJECTS_INDEX_SQL,
+        )? {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        let triggers: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT type, tbl_name FROM sqlite_master
+                UNION ALL
+                SELECT type, tbl_name FROM sqlite_temp_master
+             ) WHERE type = 'trigger' AND tbl_name IN (
+                'archive_v3_legacy_extent_schema',
+                'archive_v3_legacy_extent_sessions',
+                'archive_v3_legacy_extent_objects')",
+            [],
+            |row| row.get(0),
+        )?;
+        if triggers != 0 {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        let rows: Vec<(i64, i64)> = transaction.prepare("SELECT singleton, version FROM archive_v3_legacy_extent_schema ORDER BY singleton LIMIT 2")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        if rows.as_slice() != [(1, 2)] {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_legacy_extent_session(
+        connection: &mut Connection,
+        record: &LegacyExtentSessionRecord,
+    ) -> Result<RecordOutcome> {
+        if record.state() != LegacyExtentSessionState::Prepared || record.candidate().is_some() {
+            return Err(OperationLedgerError::LegacyExtentSession(
+                LegacyExtentSessionError::InvalidTransition,
+            ));
+        }
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            Self::read_legacy_extent_session(&tx, record.session_id(), record.attempt_id())?
+        {
+            return if existing == *record {
+                Ok(RecordOutcome::AlreadyRecorded)
+            } else if existing.binding().request_fingerprint()
+                != record.binding().request_fingerprint()
+            {
+                Err(OperationLedgerError::FingerprintConflict)
+            } else {
+                Err(OperationLedgerError::ResultConflict)
+            };
+        }
+        let mut statement = tx.prepare("SELECT session_id,attempt_id,archive_id,database_epoch,operation_id,request_fingerprint,state,record FROM archive_v3_legacy_extent_sessions WHERE session_id = ? ORDER BY attempt_id LIMIT 17")?;
+        let family: Vec<LegacyExtentSessionRecord> = statement
+            .query_map(params![record.session_id().as_bytes().as_slice()], |row| {
+                read_legacy_extent_session_row(row)
+            })?
+            .map(|row| {
+                row.map_err(OperationLedgerError::from)
+                    .and_then(decode_legacy_extent_session_row)
+            })
+            .collect::<Result<_>>()?;
+        drop(statement);
+        for existing in &family {
+            Self::validate_legacy_extent_session_inventory(&tx, existing)?;
+        }
+        if family.len() >= usize::try_from(MAX_LEGACY_EXTENT_SESSION_ATTEMPTS).unwrap() {
+            return Err(OperationLedgerError::TooLarge(
+                "legacy extent session attempts",
+            ));
+        }
+        if let Some(first) = family.first() {
+            let a = first.binding();
+            let b = record.binding();
+            if a.archive_id() != b.archive_id()
+                || a.database_epoch() != b.database_epoch()
+                || a.operation_id() != b.operation_id()
+            {
+                return Err(OperationLedgerError::ResultConflict);
+            }
+            if a.request_fingerprint() != b.request_fingerprint() {
+                return Err(OperationLedgerError::FingerprintConflict);
+            }
+            if family.iter().any(|r| {
+                matches!(
+                    r.state(),
+                    LegacyExtentSessionState::Prepared | LegacyExtentSessionState::CandidateReady
+                )
+            }) {
+                return Err(OperationLedgerError::ResultConflict);
+            }
+        }
+        let b = record.binding();
+        let encoded = record.encode()?;
+        if tx.execute("INSERT INTO archive_v3_legacy_extent_sessions (session_id, attempt_id, archive_id, database_epoch, operation_id, request_fingerprint, state, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", params![record.session_id().as_bytes().as_slice(), record.attempt_id().as_bytes().as_slice(), b.archive_id().as_slice(), b.database_epoch().as_slice(), b.operation_id().as_slice(), b.request_fingerprint().as_slice(), record.state() as i64, encoded.as_slice()])? != 1 { return Err(OperationLedgerError::Corrupt); }
+        tx.commit()?;
+        Ok(RecordOutcome::Recorded)
+    }
+
+    pub(crate) fn load_legacy_extent_session(
+        connection: &Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+    ) -> Result<Option<LegacyExtentSessionRecord>> {
+        Self::read_legacy_extent_session(connection, session_id, attempt_id)
+    }
+
+    pub(crate) fn reserve_legacy_extent_object(
+        connection: &mut Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+        facts: &LegacyExtentObjectFacts,
+    ) -> Result<RecordOutcome> {
+        facts.validate_canonical()?;
+        if !facts.matches_binding(binding) {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = Self::read_legacy_extent_session(&tx, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        record.require_binding(binding)?;
+        if record.state() != LegacyExtentSessionState::Prepared {
+            return Err(OperationLedgerError::LegacyExtentSession(
+                LegacyExtentSessionError::InvalidTransition,
+            ));
+        }
+        if let Some(existing) =
+            Self::read_legacy_extent_object_ordinal(&tx, session_id, attempt_id, facts.ordinal)?
+        {
+            if existing == *facts {
+                tx.commit()?;
+                return Ok(RecordOutcome::AlreadyRecorded);
+            }
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        if Self::read_legacy_extent_object(&tx, session_id, attempt_id, facts.object_id)?.is_some()
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        let count:i64=tx.query_row("SELECT COUNT(*) FROM archive_v3_legacy_extent_objects WHERE session_id=? AND attempt_id=?",params![session_id.as_bytes().as_slice(),attempt_id.as_bytes().as_slice()],|r|r.get(0))?;
+        if count < 0
+            || usize::try_from(count)
+                .ok()
+                .is_none_or(|n| n >= MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT)
+        {
+            return Err(OperationLedgerError::TooLarge(
+                "legacy extent objects per attempt",
+            ));
+        }
+        if facts.ordinal != u32::try_from(count).map_err(|_| OperationLedgerError::Corrupt)? {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        let roots: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM archive_v3_legacy_extent_objects
+             WHERE session_id = ? AND attempt_id = ? AND object_role = ?",
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                ObjectRole::RootV3 as i64
+            ],
+            |row| row.get(0),
+        )?;
+        if roots != 0 {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        if tx.execute("INSERT INTO archive_v3_legacy_extent_objects (session_id,attempt_id,ordinal,object_id,object_role,root_seq,context_aad,object_key,ciphertext_hash,state) VALUES (?,?,?,?,?,?,?,?,?,?)",params![session_id.as_bytes().as_slice(),attempt_id.as_bytes().as_slice(),i64::from(facts.ordinal),facts.object_id.as_bytes().as_slice(),facts.object_role as i64,facts.root_seq.map(|x|x as i64),facts.context_aad.as_slice(),facts.object_key.as_str(),facts.ciphertext_hash.as_slice(),LegacyExtentObjectState::Reserved as i64])? !=1 {return Err(OperationLedgerError::Corrupt)}
+        tx.commit()?;
+        Ok(RecordOutcome::Recorded)
+    }
+
+    pub(crate) fn mark_legacy_extent_object_materialized(
+        connection: &mut Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+        facts: &LegacyExtentObjectFacts,
+    ) -> Result<RecordOutcome> {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = Self::read_legacy_extent_session(&tx, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        record.require_binding(binding)?;
+        if record.state() != LegacyExtentSessionState::Prepared {
+            return Err(OperationLedgerError::LegacyExtentSession(
+                LegacyExtentSessionError::InvalidTransition,
+            ));
+        }
+        if Self::read_legacy_extent_object(&tx, session_id, attempt_id, facts.object_id)?.as_ref()
+            != Some(facts)
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        match Self::read_legacy_extent_object_state(&tx, session_id, attempt_id, facts.object_id)? {
+            Some(LegacyExtentObjectState::Reserved) => {
+                if tx.execute("UPDATE archive_v3_legacy_extent_objects SET state=? WHERE session_id=? AND attempt_id=? AND object_id=? AND state=?",params![LegacyExtentObjectState::Materialized as i64,session_id.as_bytes().as_slice(),attempt_id.as_bytes().as_slice(),facts.object_id.as_bytes().as_slice(),LegacyExtentObjectState::Reserved as i64])?!=1{return Err(OperationLedgerError::Corrupt)}
+                tx.commit()?;
+                Ok(RecordOutcome::Recorded)
+            }
+            Some(LegacyExtentObjectState::Materialized) => {
+                tx.commit()?;
+                Ok(RecordOutcome::AlreadyRecorded)
+            }
+            _ => Err(OperationLedgerError::ResultConflict),
+        }
+    }
+
+    pub(crate) fn load_exact_legacy_extent_object_page(
+        connection: &Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+        cursor: Option<LegacyExtentObjectCursor>,
+    ) -> Result<LegacyExtentObjectInventoryPage> {
+        let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Deferred)?;
+        let record = Self::read_legacy_extent_session(&transaction, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        record.require_binding(binding)?;
+        let expected = match cursor {
+            None => 0,
+            Some(cursor)
+                if cursor.session_id == session_id
+                    && cursor.attempt_id == attempt_id
+                    && cursor.valid()
+                    && usize::try_from(cursor.next_ordinal)
+                        .ok()
+                        .is_some_and(|value| value < MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT) =>
+            {
+                cursor.next_ordinal
+            }
+            Some(_) => return Err(OperationLedgerError::Corrupt),
+        };
+        let prefix_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM archive_v3_legacy_extent_objects
+             WHERE session_id = ? AND attempt_id = ? AND ordinal < ?",
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                i64::from(expected)
+            ],
+            |row| row.get(0),
+        )?;
+        if prefix_count != i64::from(expected) {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        let mut st=transaction.prepare("SELECT ordinal,object_id,object_role,root_seq,context_aad,object_key,ciphertext_hash,state FROM archive_v3_legacy_extent_objects WHERE session_id=? AND attempt_id=? AND ordinal>=? ORDER BY ordinal LIMIT 257")?;
+        let rows = st.query_map(
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                i64::from(expected)
+            ],
+            |r| Ok((read_shadow_object_row(r)?, r.get::<_, i64>(7)?)),
+        )?;
+        let mut entries = Vec::new();
+        let mut next_expected = expected;
+        for row in rows {
+            let (row, state) = row?;
+            let facts = Self::legacy_facts_from_row(row)?;
+            if !facts.matches_binding(binding) || facts.ordinal != next_expected {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            next_expected = next_expected
+                .checked_add(1)
+                .ok_or(OperationLedgerError::Corrupt)?;
+            entries.push(LegacyExtentObjectInventoryEntry {
+                facts,
+                state: LegacyExtentObjectState::decode(state)?,
+            });
+        }
+        let next_cursor = if entries.len() > MAX_LEGACY_EXTENT_OBJECTS_PAGE {
+            entries.pop();
+            Some(LegacyExtentObjectCursor::new(
+                session_id,
+                attempt_id,
+                expected
+                    .checked_add(
+                        u32::try_from(entries.len()).map_err(|_| OperationLedgerError::Corrupt)?,
+                    )
+                    .ok_or(OperationLedgerError::Corrupt)?,
+            ))
+        } else {
+            if cursor.is_some() && entries.is_empty() {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            None
+        };
+        drop(st);
+        transaction.commit()?;
+        Ok(LegacyExtentObjectInventoryPage {
+            entries,
+            next_cursor,
+        })
+    }
+
+    fn scan_legacy_extent_inventory(
+        connection: &Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+        requirement: LegacyExtentInventoryRequirement,
+    ) -> Result<LegacyExtentInventoryScan> {
+        let mut statement=connection.prepare("SELECT ordinal,object_id,object_role,root_seq,context_aad,object_key,ciphertext_hash,state FROM archive_v3_legacy_extent_objects WHERE session_id=? AND attempt_id=? ORDER BY ordinal LIMIT 32899")?;
+        let rows = statement.query_map(
+            params![
+                session_id.as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice()
+            ],
+            |row| Ok((read_shadow_object_row(row)?, row.get::<_, i64>(7)?)),
+        )?;
+        let mut count = 0usize;
+        let mut root = None;
+        let mut commitment = Sha256::new();
+        commitment.update(LEGACY_EXTENT_INVENTORY_DOMAIN);
+        commitment.update(session_id.as_bytes());
+        commitment.update(attempt_id.as_bytes());
+        for row in rows {
+            let (row, encoded_state) = row?;
+            let facts = Self::legacy_facts_from_row(row)?;
+            let state = LegacyExtentObjectState::decode(encoded_state)?;
+            if count >= MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT
+                || facts.ordinal
+                    != u32::try_from(count).map_err(|_| OperationLedgerError::Corrupt)?
+                || !facts.matches_binding(binding)
+                || root.is_some()
+                || !match requirement {
+                    LegacyExtentInventoryRequirement::Materialized => {
+                        state == LegacyExtentObjectState::Materialized
+                    }
+                    LegacyExtentInventoryRequirement::PreOrphan => matches!(
+                        state,
+                        LegacyExtentObjectState::Reserved | LegacyExtentObjectState::Materialized
+                    ),
+                    LegacyExtentInventoryRequirement::Orphaned => {
+                        state == LegacyExtentObjectState::OrphanPendingGrace
+                    }
+                }
+            {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            if facts.object_role == ObjectRole::RootV3 {
+                root = Some(facts.clone());
+            }
+            commitment.update(facts.ordinal.to_be_bytes());
+            commitment.update(facts.object_id.as_bytes());
+            commitment.update([facts.object_role as u8]);
+            match facts.root_seq {
+                Some(sequence) => {
+                    commitment.update([1]);
+                    commitment.update(sequence.to_be_bytes());
+                }
+                None => commitment.update([0; 9]),
+            }
+            commitment.update(
+                u32::try_from(facts.context_aad.len())
+                    .map_err(|_| OperationLedgerError::Corrupt)?
+                    .to_be_bytes(),
+            );
+            commitment.update(facts.context_aad.as_slice());
+            commitment.update(
+                u32::try_from(facts.object_key.len())
+                    .map_err(|_| OperationLedgerError::Corrupt)?
+                    .to_be_bytes(),
+            );
+            commitment.update(facts.object_key.as_bytes());
+            commitment.update(facts.ciphertext_hash);
+            count += 1;
+        }
+        commitment.update(
+            u32::try_from(count)
+                .map_err(|_| OperationLedgerError::Corrupt)?
+                .to_be_bytes(),
+        );
+        Ok(LegacyExtentInventoryScan {
+            count,
+            root,
+            commitment: commitment.finalize().into(),
+        })
+    }
+
+    /// One IMMEDIATE transaction admits only a complete contiguous materialized graph
+    /// and its final root.  It is still not a witness retention or CAS.
+    pub(crate) fn persist_legacy_extent_candidate(
+        connection: &mut Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+        admission: LegacyExtentRootAdmission,
+        root_facts: &LegacyExtentObjectFacts,
+    ) -> Result<LegacyExtentSessionRecord> {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut record = Self::read_legacy_extent_session(&tx, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        record.require_binding(binding)?;
+        let candidate = admission.candidate();
+        if !admission.matches(binding)
+            || !admission.matches_root_aad(root_facts.context_aad.as_slice())
+            || !root_facts.is_candidate_root(candidate)
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        let scan = Self::scan_legacy_extent_inventory(
+            &tx,
+            session_id,
+            attempt_id,
+            binding,
+            LegacyExtentInventoryRequirement::Materialized,
+        )?;
+        if scan.count < 2
+            || root_facts.ordinal == 0
+            || scan.root.as_ref() != Some(root_facts)
+            || !scan
+                .root
+                .as_ref()
+                .is_some_and(|facts| facts.is_candidate_root(candidate))
+        {
+            return Err(OperationLedgerError::ResultConflict);
+        }
+        let before = record.encode()?;
+        record.persist_candidate(candidate)?;
+        Self::replace_legacy_extent_session(&tx, &before, &record)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub(crate) fn orphan_legacy_extent_attempt(
+        connection: &mut Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+        binding: LegacyExtentSessionBinding,
+    ) -> Result<LegacyExtentSessionRecord> {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut record = Self::read_legacy_extent_session(&tx, session_id, attempt_id)?
+            .ok_or(OperationLedgerError::Corrupt)?;
+        record.require_binding(binding)?;
+        if record.state() == LegacyExtentSessionState::OrphanPendingGrace {
+            let scan = Self::scan_legacy_extent_inventory(
+                &tx,
+                session_id,
+                attempt_id,
+                binding,
+                LegacyExtentInventoryRequirement::Orphaned,
+            )?;
+            let proof = record
+                .orphan_inventory_proof()
+                .ok_or(OperationLedgerError::Corrupt)?;
+            if proof
+                != (
+                    u32::try_from(scan.count).map_err(|_| OperationLedgerError::Corrupt)?,
+                    scan.commitment,
+                )
+            {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            tx.commit()?;
+            return Ok(record);
+        }
+        if record.state() != LegacyExtentSessionState::Prepared {
+            return Err(OperationLedgerError::LegacyExtentSession(
+                LegacyExtentSessionError::InvalidTransition,
+            ));
+        }
+        let scan = Self::scan_legacy_extent_inventory(
+            &tx,
+            session_id,
+            attempt_id,
+            binding,
+            LegacyExtentInventoryRequirement::PreOrphan,
+        )?;
+        let before = record.encode()?;
+        record.orphan_with_inventory(
+            u32::try_from(scan.count).map_err(|_| OperationLedgerError::Corrupt)?,
+            scan.commitment,
+        )?;
+        let changed=tx.execute("UPDATE archive_v3_legacy_extent_objects SET state=? WHERE session_id=? AND attempt_id=? AND state IN (?,?)",params![LegacyExtentObjectState::OrphanPendingGrace as i64,session_id.as_bytes().as_slice(),attempt_id.as_bytes().as_slice(),LegacyExtentObjectState::Reserved as i64,LegacyExtentObjectState::Materialized as i64])?;
+        if changed != scan.count {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        let normalized = Self::scan_legacy_extent_inventory(
+            &tx,
+            session_id,
+            attempt_id,
+            binding,
+            LegacyExtentInventoryRequirement::Orphaned,
+        )?;
+        if normalized.count != scan.count || normalized.commitment != scan.commitment {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        Self::replace_legacy_extent_session(&tx, &before, &record)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    fn read_legacy_extent_session(
+        connection: &Connection,
+        session_id: LegacyExtentSessionId,
+        attempt_id: LegacyExtentAttemptId,
+    ) -> Result<Option<LegacyExtentSessionRecord>> {
+        let row: Option<LegacyExtentSessionRow> = connection.query_row("SELECT session_id,attempt_id,archive_id,database_epoch,operation_id,request_fingerprint,state,record FROM archive_v3_legacy_extent_sessions WHERE session_id=? AND attempt_id=?",params![session_id.as_bytes().as_slice(),attempt_id.as_bytes().as_slice()],read_legacy_extent_session_row).optional()?;
+        let record = row.map(decode_legacy_extent_session_row).transpose()?;
+        if record.as_ref().is_some_and(|record| {
+            record.session_id() != session_id || record.attempt_id() != attempt_id
+        }) {
+            return Err(OperationLedgerError::Corrupt);
+        }
+        if let Some(record) = record.as_ref() {
+            Self::validate_legacy_extent_session_inventory(connection, record)?;
+        }
+        Ok(record)
+    }
+
+    fn validate_legacy_extent_session_inventory(
+        connection: &Connection,
+        record: &LegacyExtentSessionRecord,
+    ) -> Result<()> {
+        if record.state() == LegacyExtentSessionState::OrphanPendingGrace {
+            let scan = Self::scan_legacy_extent_inventory(
+                connection,
+                record.session_id(),
+                record.attempt_id(),
+                record.binding(),
+                LegacyExtentInventoryRequirement::Orphaned,
+            )?;
+            let proof = record
+                .orphan_inventory_proof()
+                .ok_or(OperationLedgerError::Corrupt)?;
+            if proof
+                != (
+                    u32::try_from(scan.count).map_err(|_| OperationLedgerError::Corrupt)?,
+                    scan.commitment,
+                )
+            {
+                return Err(OperationLedgerError::Corrupt);
+            }
+        }
+        if record.state() == LegacyExtentSessionState::CandidateReady {
+            let candidate = record.candidate().ok_or(OperationLedgerError::Corrupt)?;
+            let scan = Self::scan_legacy_extent_inventory(
+                connection,
+                record.session_id(),
+                record.attempt_id(),
+                record.binding(),
+                LegacyExtentInventoryRequirement::Materialized,
+            )?;
+            if scan.count < 2
+                || !scan
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| root.is_candidate_root(candidate))
+            {
+                return Err(OperationLedgerError::Corrupt);
+            }
+        }
+        Ok(())
+    }
+    fn replace_legacy_extent_session(
+        tx: &Transaction<'_>,
+        before: &[u8; LEGACY_EXTENT_SESSION_RECORD_BYTES],
+        after: &LegacyExtentSessionRecord,
+    ) -> Result<()> {
+        let encoded = after.encode()?;
+        if tx.execute("UPDATE archive_v3_legacy_extent_sessions SET state=?,record=? WHERE session_id=? AND attempt_id=? AND record=?",params![after.state() as i64,encoded.as_slice(),after.session_id().as_bytes().as_slice(),after.attempt_id().as_bytes().as_slice(),before.as_slice()])?!=1{return Err(OperationLedgerError::Corrupt)}
+        Ok(())
+    }
+    fn read_legacy_extent_object(
+        connection: &Connection,
+        session: LegacyExtentSessionId,
+        attempt: LegacyExtentAttemptId,
+        object: ObjectId,
+    ) -> Result<Option<LegacyExtentObjectFacts>> {
+        let row:Option<ShadowObjectRow>=connection.query_row("SELECT ordinal,object_id,object_role,root_seq,context_aad,object_key,ciphertext_hash FROM archive_v3_legacy_extent_objects WHERE session_id=? AND attempt_id=? AND object_id=?",params![session.as_bytes().as_slice(),attempt.as_bytes().as_slice(),object.as_bytes().as_slice()],read_shadow_object_row).optional()?;
+        row.map(Self::legacy_facts_from_row).transpose()
+    }
+    fn read_legacy_extent_object_ordinal(
+        connection: &Connection,
+        session: LegacyExtentSessionId,
+        attempt: LegacyExtentAttemptId,
+        ordinal: u32,
+    ) -> Result<Option<LegacyExtentObjectFacts>> {
+        let row:Option<ShadowObjectRow>=connection.query_row("SELECT ordinal,object_id,object_role,root_seq,context_aad,object_key,ciphertext_hash FROM archive_v3_legacy_extent_objects WHERE session_id=? AND attempt_id=? AND ordinal=?",params![session.as_bytes().as_slice(),attempt.as_bytes().as_slice(),i64::from(ordinal)],read_shadow_object_row).optional()?;
+        row.map(Self::legacy_facts_from_row).transpose()
+    }
+    fn read_legacy_extent_object_state(
+        connection: &Connection,
+        session: LegacyExtentSessionId,
+        attempt: LegacyExtentAttemptId,
+        object: ObjectId,
+    ) -> Result<Option<LegacyExtentObjectState>> {
+        connection.query_row("SELECT state FROM archive_v3_legacy_extent_objects WHERE session_id=? AND attempt_id=? AND object_id=?",params![session.as_bytes().as_slice(),attempt.as_bytes().as_slice(),object.as_bytes().as_slice()],|r|r.get::<_,i64>(0)).optional()?.map(LegacyExtentObjectState::decode).transpose()
+    }
+    fn legacy_facts_from_row(row: ShadowObjectRow) -> Result<LegacyExtentObjectFacts> {
+        let (ordinal, object_id, role, root_seq, aad, key, hash) = row;
+        let facts = LegacyExtentObjectFacts {
+            ordinal: u32::try_from(ordinal).map_err(|_| OperationLedgerError::Corrupt)?,
+            object_id: ObjectId::from_bytes(
+                object_id
+                    .try_into()
+                    .map_err(|_| OperationLedgerError::Corrupt)?,
+            ),
+            object_role: decode_object_role(role)?,
+            root_seq: root_seq.map(positive_u64).transpose()?,
+            context_aad: Zeroizing::new(aad),
+            object_key: key,
+            ciphertext_hash: hash.try_into().map_err(|_| OperationLedgerError::Corrupt)?,
+        };
+        facts.validate_canonical()?;
+        Ok(facts)
+    }
 }
 
 #[cfg(test)]
@@ -3695,5 +4650,855 @@ mod tests {
             base,
             RequestFingerprint::derive(OperationRoute::IngestCommit, b"canonical-2").unwrap()
         );
+    }
+
+    fn legacy_binding(id: u8) -> LegacyExtentSessionBinding {
+        LegacyExtentSessionBinding::fixture_for_test(
+            [id; 16],
+            [id.wrapping_add(1); 16],
+            [id.wrapping_add(2); 16],
+            [id.wrapping_add(7); 16],
+            [id.wrapping_add(8); 32],
+        )
+    }
+
+    fn legacy_session(id: u8) -> LegacyExtentSessionRecord {
+        let binding = legacy_binding(id);
+        LegacyExtentSessionRecord::prepared(
+            LegacyExtentSessionId::for_binding(binding).unwrap(),
+            LegacyExtentAttemptId::from_bytes_for_test([id.wrapping_add(11); 16]),
+            binding,
+        )
+        .unwrap()
+    }
+
+    fn legacy_facts(
+        session: &LegacyExtentSessionRecord,
+        ordinal: u32,
+        role: ObjectRole,
+    ) -> LegacyExtentObjectFacts {
+        let binding = session.binding();
+        let mut object_bytes = [0x31; 16];
+        object_bytes[..4].copy_from_slice(&ordinal.to_be_bytes());
+        let object = ObjectId::from_bytes(object_bytes);
+        let (location, root_seq) = match role {
+            ObjectRole::ExtentV3 => (
+                LogicalLocation::Extent {
+                    extent_no: u64::from(ordinal),
+                    byte_len: crate::archive_v3::SQLITE_PAGE_SIZE,
+                },
+                None,
+            ),
+            ObjectRole::MerkleNodeV3 => (
+                LogicalLocation::MerkleNode {
+                    level: 0,
+                    range_start: 0,
+                    range_end: 1,
+                },
+                None,
+            ),
+            ObjectRole::RootV3 => (
+                LogicalLocation::Root {
+                    root_seq: binding.base_root_seq() + 1,
+                },
+                Some(binding.base_root_seq() + 1),
+            ),
+            _ => unreachable!(),
+        };
+        let context = ObjectContext::new(
+            crate::archive_v3::ArchiveId::from_bytes(binding.archive_id()),
+            crate::archive_v3::DatabaseEpoch::from_bytes(binding.database_epoch()),
+            crate::archive_v3::KeyEpoch::from_bytes(binding.key_epoch()),
+            role,
+            location,
+            object,
+            (role == ObjectRole::RootV3).then_some(crate::archive_v3::ParentReference {
+                object_id: ObjectId::from_bytes(binding.base_root_object_id()),
+                envelope_hash: binding.base_root_ciphertext_hash(),
+            }),
+        )
+        .unwrap();
+        let mut ciphertext_hash = [0x51; 32];
+        ciphertext_hash[..4].copy_from_slice(&ordinal.to_be_bytes());
+        LegacyExtentObjectFacts {
+            ordinal,
+            object_id: object,
+            object_role: role,
+            root_seq,
+            context_aad: Zeroizing::new(context.canonical_aad()),
+            object_key: context.object_key().as_str().to_owned(),
+            ciphertext_hash,
+        }
+    }
+
+    fn legacy_root_admission(
+        session: &LegacyExtentSessionRecord,
+        facts: &LegacyExtentObjectFacts,
+    ) -> LegacyExtentRootAdmission {
+        let binding = session.binding();
+        let context = ObjectContext::decode_canonical_aad(facts.context_aad.as_slice()).unwrap();
+        let root = crate::archive_v3::ArchiveRoot {
+            root_seq: binding.base_root_seq() + 1,
+            parent: Some(crate::archive_v3::ParentReference {
+                object_id: ObjectId::from_bytes(binding.base_root_object_id()),
+                envelope_hash: binding.base_root_ciphertext_hash(),
+            }),
+            database_epoch: crate::archive_v3::DatabaseEpoch::from_bytes(binding.database_epoch()),
+            key_epoch: crate::archive_v3::KeyEpoch::from_bytes(binding.key_epoch()),
+            owner_fencing_epoch: binding.owner_fence(),
+            sqlite_page_size: crate::archive_v3::SQLITE_PAGE_SIZE,
+            logical_file_length: binding.plaintext_len(),
+            user_schema_version: 1,
+            storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
+            wal_generation: 0,
+            wal_segment_count: 0,
+            checkpoint_root: None,
+            extent_tree_root: Some(crate::archive_v3::ImmutableReference {
+                object_id: ObjectId::from_bytes([0x71; 16]),
+                envelope_hash: [0x72; 32],
+            }),
+            wal_chain_root: None,
+        };
+        LegacyExtentRootAdmission::from_validated_root_for_test(
+            &root,
+            &context,
+            facts.ciphertext_hash,
+            binding,
+        )
+        .unwrap()
+    }
+
+    fn wrong_parent_root_aad(facts: &LegacyExtentObjectFacts) -> Vec<u8> {
+        let context = ObjectContext::decode_canonical_aad(facts.context_aad.as_slice()).unwrap();
+        ObjectContext::new(
+            context.archive_id(),
+            context.database_epoch(),
+            context.key_epoch(),
+            context.role(),
+            context.location().clone(),
+            context.object_id(),
+            Some(crate::archive_v3::ParentReference {
+                object_id: ObjectId::from_bytes([0x73; 16]),
+                envelope_hash: [0x74; 32],
+            }),
+        )
+        .unwrap()
+        .canonical_aad()
+    }
+
+    fn unexpected_parent_aad(facts: &LegacyExtentObjectFacts) -> Vec<u8> {
+        let context = ObjectContext::decode_canonical_aad(facts.context_aad.as_slice()).unwrap();
+        ObjectContext::new(
+            context.archive_id(),
+            context.database_epoch(),
+            context.key_epoch(),
+            context.role(),
+            context.location().clone(),
+            context.object_id(),
+            Some(crate::archive_v3::ParentReference {
+                object_id: ObjectId::from_bytes([0x75; 16]),
+                envelope_hash: [0x76; 32],
+            }),
+        )
+        .unwrap()
+        .canonical_aad()
+    }
+
+    #[test]
+    fn legacy_extent_ledger_is_idempotent_contiguous_and_root_final() {
+        let mut connection = setup();
+        let session = legacy_session(21);
+        assert_eq!(
+            OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap(),
+            RecordOutcome::AlreadyRecorded
+        );
+        let gap = legacy_facts(&session, 1, ObjectRole::ExtentV3);
+        assert!(OperationLedger::reserve_legacy_extent_object(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            &gap
+        )
+        .is_err());
+        let extent = legacy_facts(&session, 0, ObjectRole::ExtentV3);
+        assert_eq!(
+            OperationLedger::reserve_legacy_extent_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &extent
+            )
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            OperationLedger::reserve_legacy_extent_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &extent
+            )
+            .unwrap(),
+            RecordOutcome::AlreadyRecorded
+        );
+        let root = legacy_facts(&session, 1, ObjectRole::RootV3);
+        assert_eq!(
+            OperationLedger::reserve_legacy_extent_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &root
+            )
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert!(OperationLedger::reserve_legacy_extent_object(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            &legacy_facts(&session, 2, ObjectRole::MerkleNodeV3)
+        )
+        .is_err());
+        assert_eq!(
+            OperationLedger::mark_legacy_extent_object_materialized(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &extent
+            )
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            OperationLedger::mark_legacy_extent_object_materialized(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &root
+            )
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        let candidate =
+            LegacyExtentCandidate::new(1, *root.object_id.as_bytes(), root.ciphertext_hash)
+                .unwrap();
+        let admission = legacy_root_admission(&session, &root);
+        let exact_extent_aad = extent.context_aad.clone();
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_objects SET context_aad = ?
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                params![
+                    unexpected_parent_aad(&extent),
+                    session.session_id().as_bytes().as_slice(),
+                    session.attempt_id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(OperationLedger::persist_legacy_extent_candidate(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            admission,
+            &root,
+        )
+        .is_err());
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_objects SET context_aad = ?
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                params![
+                    exact_extent_aad.as_slice(),
+                    session.session_id().as_bytes().as_slice(),
+                    session.attempt_id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        let mut substituted_root = root.clone();
+        substituted_root.context_aad = Zeroizing::new(wrong_parent_root_aad(&root));
+        assert!(OperationLedger::persist_legacy_extent_candidate(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            admission,
+            &substituted_root,
+        )
+        .is_err());
+        assert_eq!(
+            OperationLedger::persist_legacy_extent_candidate(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                admission,
+                &root
+            )
+            .unwrap()
+            .state(),
+            LegacyExtentSessionState::CandidateReady
+        );
+        assert_eq!(
+            OperationLedger::load_legacy_extent_session(
+                &connection,
+                session.session_id(),
+                session.attempt_id()
+            )
+            .unwrap()
+            .unwrap()
+            .candidate(),
+            Some(candidate)
+        );
+    }
+
+    #[test]
+    fn legacy_extent_session_identity_has_one_bounded_attempt_family() {
+        let mut connection = setup();
+        let binding = legacy_binding(31);
+        let session_id = LegacyExtentSessionId::for_binding(binding).unwrap();
+        let mut alternate = session_id.as_bytes();
+        alternate[0] ^= 1;
+        assert!(LegacyExtentSessionRecord::prepared(
+            LegacyExtentSessionId::from_bytes_for_test(alternate),
+            LegacyExtentAttemptId::from_bytes_for_test([1; 16]),
+            binding,
+        )
+        .is_err());
+
+        let first = LegacyExtentSessionRecord::prepared(
+            session_id,
+            LegacyExtentAttemptId::from_bytes_for_test([1; 16]),
+            binding,
+        )
+        .unwrap();
+        OperationLedger::prepare_legacy_extent_session(&mut connection, &first).unwrap();
+        OperationLedger::orphan_legacy_extent_attempt(
+            &mut connection,
+            first.session_id(),
+            first.attempt_id(),
+            binding,
+        )
+        .unwrap();
+
+        let conflicting_binding = LegacyExtentSessionBinding::fixture_for_test(
+            binding.archive_id(),
+            binding.database_epoch(),
+            binding.key_epoch(),
+            binding.operation_id(),
+            [0xa5; 32],
+        );
+        assert_eq!(
+            LegacyExtentSessionId::for_binding(conflicting_binding).unwrap(),
+            session_id
+        );
+        let conflicting = LegacyExtentSessionRecord::prepared(
+            session_id,
+            LegacyExtentAttemptId::from_bytes_for_test([18; 16]),
+            conflicting_binding,
+        )
+        .unwrap();
+        assert!(matches!(
+            OperationLedger::prepare_legacy_extent_session(&mut connection, &conflicting),
+            Err(OperationLedgerError::FingerprintConflict)
+        ));
+
+        for attempt in 2..=MAX_LEGACY_EXTENT_SESSION_ATTEMPTS {
+            let record = LegacyExtentSessionRecord::prepared(
+                session_id,
+                LegacyExtentAttemptId::from_bytes_for_test([u8::try_from(attempt).unwrap(); 16]),
+                binding,
+            )
+            .unwrap();
+            OperationLedger::prepare_legacy_extent_session(&mut connection, &record).unwrap();
+            OperationLedger::orphan_legacy_extent_attempt(
+                &mut connection,
+                record.session_id(),
+                record.attempt_id(),
+                binding,
+            )
+            .unwrap();
+        }
+        let overflow = LegacyExtentSessionRecord::prepared(
+            session_id,
+            LegacyExtentAttemptId::from_bytes_for_test([17; 16]),
+            binding,
+        )
+        .unwrap();
+        assert!(matches!(
+            OperationLedger::prepare_legacy_extent_session(&mut connection, &overflow),
+            Err(OperationLedgerError::TooLarge(
+                "legacy extent session attempts"
+            ))
+        ));
+        let (families, attempts): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT hex(session_id)), COUNT(*)
+                 FROM archive_v3_legacy_extent_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (families, attempts),
+            (1, MAX_LEGACY_EXTENT_SESSION_ATTEMPTS)
+        );
+    }
+
+    #[test]
+    fn legacy_extent_candidate_rejects_reserved_root_and_denormalized_tamper() {
+        let mut connection = setup();
+        let session = legacy_session(41);
+        OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap();
+        let root = legacy_facts(&session, 0, ObjectRole::RootV3);
+        OperationLedger::reserve_legacy_extent_object(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            &root,
+        )
+        .unwrap();
+        let admission = legacy_root_admission(&session, &root);
+        assert!(OperationLedger::persist_legacy_extent_candidate(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            admission,
+            &root
+        )
+        .is_err());
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_sessions SET state = 2 WHERE session_id = ?",
+                params![session.session_id().as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert!(OperationLedger::load_legacy_extent_session(
+            &connection,
+            session.session_id(),
+            session.attempt_id()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_extent_orphaning_scans_exact_rows_and_rejects_tamper() {
+        let mut connection = setup();
+        let session = legacy_session(61);
+        OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap();
+        let extent = legacy_facts(&session, 0, ObjectRole::ExtentV3);
+        OperationLedger::reserve_legacy_extent_object(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            &extent,
+        )
+        .unwrap();
+        let orphaned = OperationLedger::orphan_legacy_extent_attempt(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+        )
+        .unwrap();
+        assert_eq!(
+            orphaned.state(),
+            LegacyExtentSessionState::OrphanPendingGrace
+        );
+        OperationLedger::orphan_legacy_extent_attempt(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+        )
+        .unwrap();
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_objects SET ciphertext_hash = zeroblob(32)
+             WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                params![
+                    session.session_id().as_bytes().as_slice(),
+                    session.attempt_id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(OperationLedger::orphan_legacy_extent_attempt(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+        )
+        .is_err());
+
+        for (id, mutation) in [
+            (
+                62,
+                "UPDATE archive_v3_legacy_extent_objects SET ordinal = 1",
+            ),
+            (
+                63,
+                "UPDATE archive_v3_legacy_extent_objects SET context_aad = zeroblob(32)",
+            ),
+            (
+                64,
+                "UPDATE archive_v3_legacy_extent_objects SET object_key = 'archive/v3/bad'",
+            ),
+            (
+                65,
+                "UPDATE archive_v3_legacy_extent_objects SET ciphertext_hash = zeroblob(32)",
+            ),
+            (66, "UPDATE archive_v3_legacy_extent_objects SET state = 3"),
+        ] {
+            let mut connection = setup();
+            let session = legacy_session(id);
+            OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap();
+            let extent = legacy_facts(&session, 0, ObjectRole::ExtentV3);
+            OperationLedger::reserve_legacy_extent_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &extent,
+            )
+            .unwrap();
+            connection.execute(mutation, []).unwrap();
+            assert!(OperationLedger::orphan_legacy_extent_attempt(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+            )
+            .is_err());
+        }
+
+        let mut connection = setup();
+        let session = legacy_session(67);
+        OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap();
+        let extent = legacy_facts(&session, 0, ObjectRole::ExtentV3);
+        OperationLedger::reserve_legacy_extent_object(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            &extent,
+        )
+        .unwrap();
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_objects SET context_aad = ?",
+                params![unexpected_parent_aad(&extent)],
+            )
+            .unwrap();
+        assert!(OperationLedger::orphan_legacy_extent_attempt(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_extent_orphan_proof_rejects_deletion_and_accepts_exact_empty_retry() {
+        let mut connection = setup();
+        let empty = legacy_session(68);
+        OperationLedger::prepare_legacy_extent_session(&mut connection, &empty).unwrap();
+        OperationLedger::orphan_legacy_extent_attempt(
+            &mut connection,
+            empty.session_id(),
+            empty.attempt_id(),
+            empty.binding(),
+        )
+        .unwrap();
+        OperationLedger::orphan_legacy_extent_attempt(
+            &mut connection,
+            empty.session_id(),
+            empty.attempt_id(),
+            empty.binding(),
+        )
+        .unwrap();
+
+        for (id, object_count, deleted_ordinal) in [(69, 1, 0), (70, 2, 1)] {
+            let mut connection = setup();
+            let session = legacy_session(id);
+            OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap();
+            for ordinal in 0..object_count {
+                let facts = legacy_facts(&session, ordinal, ObjectRole::ExtentV3);
+                OperationLedger::reserve_legacy_extent_object(
+                    &mut connection,
+                    session.session_id(),
+                    session.attempt_id(),
+                    session.binding(),
+                    &facts,
+                )
+                .unwrap();
+            }
+            OperationLedger::orphan_legacy_extent_attempt(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+            )
+            .unwrap();
+            connection
+                .execute(
+                    "DELETE FROM archive_v3_legacy_extent_objects
+                     WHERE session_id = ? AND attempt_id = ? AND ordinal = ?",
+                    params![
+                        session.session_id().as_bytes().as_slice(),
+                        session.attempt_id().as_bytes().as_slice(),
+                        deleted_ordinal
+                    ],
+                )
+                .unwrap();
+            assert!(OperationLedger::load_legacy_extent_session(
+                &connection,
+                session.session_id(),
+                session.attempt_id(),
+            )
+            .is_err());
+            assert!(OperationLedger::orphan_legacy_extent_attempt(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_extent_cursor_is_bound_contiguous_and_cannot_skip() {
+        let mut connection = setup();
+        let session = legacy_session(71);
+        OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap();
+        for ordinal in 0..257 {
+            let facts = legacy_facts(&session, ordinal, ObjectRole::ExtentV3);
+            OperationLedger::reserve_legacy_extent_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                &facts,
+            )
+            .unwrap();
+        }
+        let first = OperationLedger::load_exact_legacy_extent_object_page(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.entries().len(), 256);
+        let cursor = first.next_cursor().unwrap();
+        let final_page = OperationLedger::load_exact_legacy_extent_object_page(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            Some(cursor),
+        )
+        .unwrap();
+        assert_eq!(final_page.entries().len(), 1);
+        assert_eq!(final_page.entries()[0].facts().ordinal(), 256);
+        let replay = OperationLedger::load_exact_legacy_extent_object_page(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            Some(cursor),
+        )
+        .unwrap();
+        assert_eq!(replay.entries()[0].facts().ordinal(), 256);
+        let forged = LegacyExtentObjectCursor {
+            next_ordinal: 200,
+            ..cursor
+        };
+        assert!(OperationLedger::load_exact_legacy_extent_object_page(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            Some(forged),
+        )
+        .is_err());
+        let cross = LegacyExtentObjectCursor {
+            session_id: legacy_session(72).session_id(),
+            ..cursor
+        };
+        assert!(OperationLedger::load_exact_legacy_extent_object_page(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            Some(cross),
+        )
+        .is_err());
+        let out_of_range = LegacyExtentObjectCursor {
+            next_ordinal: MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT as u32,
+            ..cursor
+        };
+        assert!(OperationLedger::load_exact_legacy_extent_object_page(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            Some(out_of_range),
+        )
+        .is_err());
+        let mut over_cap = legacy_facts(&session, 257, ObjectRole::ExtentV3);
+        over_cap.ordinal = MAX_LEGACY_EXTENT_OBJECTS_PER_ATTEMPT as u32;
+        assert!(OperationLedger::reserve_legacy_extent_object(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            &over_cap,
+        )
+        .is_err());
+        connection
+            .execute(
+                "DELETE FROM archive_v3_legacy_extent_objects
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                params![
+                    session.session_id().as_bytes().as_slice(),
+                    session.attempt_id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(OperationLedger::load_exact_legacy_extent_object_page(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            Some(cursor),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_extent_candidate_ready_restart_rescans_inventory_and_schema_tamper_fails() {
+        let mut connection = setup();
+        let session = legacy_session(81);
+        OperationLedger::prepare_legacy_extent_session(&mut connection, &session).unwrap();
+        let extent = legacy_facts(&session, 0, ObjectRole::ExtentV3);
+        let root = legacy_facts(&session, 1, ObjectRole::RootV3);
+        for facts in [&extent, &root] {
+            OperationLedger::reserve_legacy_extent_object(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                facts,
+            )
+            .unwrap();
+            OperationLedger::mark_legacy_extent_object_materialized(
+                &mut connection,
+                session.session_id(),
+                session.attempt_id(),
+                session.binding(),
+                facts,
+            )
+            .unwrap();
+        }
+        OperationLedger::persist_legacy_extent_candidate(
+            &mut connection,
+            session.session_id(),
+            session.attempt_id(),
+            session.binding(),
+            legacy_root_admission(&session, &root),
+            &root,
+        )
+        .unwrap();
+        let exact_extent_aad = extent.context_aad.clone();
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_objects SET context_aad = ?
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                params![
+                    unexpected_parent_aad(&extent),
+                    session.session_id().as_bytes().as_slice(),
+                    session.attempt_id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(OperationLedger::load_legacy_extent_session(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+        )
+        .is_err());
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_objects SET context_aad = ?
+                 WHERE session_id = ? AND attempt_id = ? AND ordinal = 0",
+                params![
+                    exact_extent_aad.as_slice(),
+                    session.session_id().as_bytes().as_slice(),
+                    session.attempt_id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        let wrong_parent_aad = wrong_parent_root_aad(&root);
+        connection
+            .execute(
+                "UPDATE archive_v3_legacy_extent_objects SET context_aad = ?
+             WHERE session_id = ? AND attempt_id = ? AND ordinal = 1",
+                params![
+                    wrong_parent_aad,
+                    session.session_id().as_bytes().as_slice(),
+                    session.attempt_id().as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(OperationLedger::load_legacy_extent_session(
+            &connection,
+            session.session_id(),
+            session.attempt_id(),
+        )
+        .is_err());
+
+        let connection = setup();
+        connection
+            .execute_batch("DROP INDEX archive_v3_legacy_extent_objects_exact_attempt;")
+            .unwrap();
+        assert!(OperationLedger::initialize(&connection).is_err());
+        let connection = setup();
+        connection
+            .execute("DELETE FROM archive_v3_legacy_extent_schema", [])
+            .unwrap();
+        assert!(OperationLedger::initialize(&connection).is_err());
+        let connection = setup();
+        connection
+            .execute_batch("DROP TABLE archive_v3_legacy_extent_objects;")
+            .unwrap();
+        assert!(OperationLedger::initialize(&connection).is_err());
+        let connection = setup();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER archive_v3_legacy_extent_objects_delete_tamper
+                 AFTER DELETE ON archive_v3_legacy_extent_objects
+                 BEGIN
+                    UPDATE archive_v3_legacy_extent_sessions SET state = state;
+                 END;",
+            )
+            .unwrap();
+        assert!(OperationLedger::initialize(&connection).is_err());
     }
 }
