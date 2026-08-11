@@ -283,6 +283,28 @@ scraping into a valid capture mechanism: Phase 1 still requires a SQLite VFS shi
 observes the exact `xSync` boundary, plus independent shadow recovery and crash
 conformance.
 
+`src/archive_v3_genesis.rs` is a separately compiled but inactive restart-safe
+bootstrap seam. Its constructor accepts only a control-plane-supplied opaque
+archive binding and a retained candidate with bounded registry/root bytes; it
+does not construct credentials or providers and cannot issue I/O. Resolution
+first authenticates an exact existing active witness, registry, and root using
+the canonical KMS AAD and archive object context. If absent, it attempts
+immutable create-if-absent for the exact registry and root candidates, then
+creates the witness only after exact read-back authentication. A collision or a
+lost response is resolved solely by a bounded exact read and byte/commitment
+equality; it is never blindly retried. Tombstoned or deleting witness states
+reject bootstrap. After authenticating root and registry, both the existing and
+create paths reread the exact witness immediately before success and require the
+entire authenticated snapshot to remain byte-for-byte equal and active; a
+concurrent tombstone is a distinct failure and any root/registry advance fails
+closed. Before any provider create, future runtime wiring must durably retain
+the opaque archive binding, all genesis IDs, and the exact registry/root
+candidate bytes, and its account-deletion inventory must cover partial objects
+created before the witness exists. This seam deliberately cannot satisfy that
+prerequisite because it owns no persistence or deletion path. It also has no
+Store, VFS, route, runtime flag, Firestore/GCS construction,
+environment/default credential path, logging, or production authority.
+
 The inactive mutation ledger records a stable opaque operation ID, a domain-separated
 canonical request fingerprint, the proposed committed root sequence, an internally
 derived exact result digest, and either a bounded inline result or an opaque
