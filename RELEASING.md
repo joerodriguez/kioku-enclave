@@ -79,6 +79,7 @@ The public build validates these non-secret GitHub Actions variables before Dock
 | Apple login (optional, all or none) | `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` |
 | Synthetic plugin reviewer | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` |
 | Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
+| Billing boundary | `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE`, `BILLING_ENFORCEMENT_MODE` (`shadow` or `enforce`) |
 | Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |
 
 Set them in GitHub Settings → Secrets and variables → Actions or with
@@ -122,6 +123,8 @@ Production requirements are fail-closed:
 - `BASE_URL` and `WEB_ORIGIN` must be HTTPS origins; legacy `ENCLAVE_AUDIENCE` must match
   the caller's ID-token `aud` exactly and should normally be the public HTTPS API URL;
 - `ALLOWED_EMAILS` must be nonempty and must not be `*`;
+- `BILLING_SERVICE_URL` and `BILLING_SERVICE_AUDIENCE` must be the same HTTPS origin,
+  and `BILLING_ENFORCEMENT_MODE` must be `shadow` or `enforce`;
 - `ENCLAVE_ACME` must be `1`; and
 - `ENCLAVE_ATTEST_STS_AUDIENCE` is an internal WIF provider resource, never the audience
   of the public `/v1/attestation` token.
@@ -264,6 +267,14 @@ After approval and rollout:
 
 Record the release URL, signed tag commit, digest-qualified image, provenance result,
 deployment run, and verification result in the operator's deployment record.
+
+For a billing-enforcement promotion, first verify the pinned billing credential, every
+catalog price, reconciliation with zero failures, the idempotent 60-second
+authorize/replay/detach canary, and the signed cloud-only client quota-denial upgrade UI.
+Then set `BILLING_ENFORCEMENT_MODE=enforce` and cut a new signed release; the mode is baked
+into the image and attested in schema-v3 metadata. To roll back enforcement, set the
+variable to `shadow`, cut another signed release, and roll its verified digest. Do not
+attempt a live launch-metadata override.
 
 ## One-time legacy-blob migration
 

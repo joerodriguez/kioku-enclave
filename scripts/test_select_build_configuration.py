@@ -113,13 +113,12 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("ENCLAVE_GCS_BUCKET=kioku-production-indexes\n", content)
         self.assertNotIn("ENCLAVE_KMS_KEY_RING=kioku-eval\n", content)
 
-    def test_production_rejects_billing_enforcement_before_native_clients_are_ready(self) -> None:
+    def test_production_accepts_reviewed_billing_enforcement(self) -> None:
         env = environment()
         env["PRODUCTION_BILLING_ENFORCEMENT_MODE"] = "enforce"
         completed, content = self.run_selector("production", env)
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(content, "")
-        self.assertIn("must remain shadow", completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("BILLING_ENFORCEMENT_MODE=enforce\n", content)
 
     def test_missing_evaluation_value_never_falls_back_to_production(self) -> None:
         env = environment()
@@ -260,6 +259,15 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("validated_real_corpus", release_script)
         self.assertIn(
             '"$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE"',
+            release_script,
+        )
+        self.assertIn("EXPECTED_BILLING_ENFORCEMENT_MODE", release_script)
+        self.assertIn(
+            '"$BILLING_ENFORCEMENT_MODE" != "$EXPECTED_BILLING_ENFORCEMENT_MODE"',
+            release_script,
+        )
+        self.assertIn(
+            "BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE",
             release_script,
         )
 

@@ -56,10 +56,11 @@ surfaces.
   service account, KMS key, buckets, hostname, and attestation binding that have no
   production data access. The operator has retired that isolated runtime; production is
   now the only active owner evaluation environment.
-- Production selection fails closed unless billing enforcement remains `shadow`. The
-  selected mode is preserved in schema-v3 release metadata and rechecked by the release
-  script, so a later configuration clear cannot hide an enforcement change before
-  native clients are ready.
+- Production selection accepts only the reviewed `shadow` and `enforce` billing modes.
+  The selected mode is preserved in schema-v3 release metadata, and a fresh release
+  rechecks that it matches the repository variable observed before tagging. A later
+  configuration change therefore cannot silently alter the signed image's enforcement
+  behavior.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL
@@ -902,8 +903,9 @@ shape; compromise of both databases could link those records.
 New capture depends on the billing service in enforce mode: a denial or inactive lease is
 HTTP 402, idempotency/early-renewal conflict is HTTP 409, and unavailable durable state is
 HTTP 503 before persistence. Screenshots and references require an active lease but do not
-consume again. Reads, search, export, and deletion remain ungated. Shadow mode is
-temporary and must not log upstream denial detail.
+consume again. Existing cloud archive reads, search, export, and deletion remain ungated;
+there is no local recording or transcription fallback. Shadow mode must not log upstream
+denial detail.
 
 ### Stable user identifiers are linkable
 

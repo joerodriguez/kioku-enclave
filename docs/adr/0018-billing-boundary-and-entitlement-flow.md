@@ -45,6 +45,16 @@ outage; it never logs an upstream reason. Enforce mode fails closed. Account del
 transactionally removes the pseudonym mapping and places only the random account ID in a
 durable detach outbox; retry completion removes that outbox row.
 
+Production promotion to `enforce` requires a healthy version-pinned billing secret,
+successful catalog reads for every offered price, a successful reconciliation run with
+zero failures, an idempotent 60-second authorize/replay/detach canary, and a published
+cloud-only native client that renders typed quota denial as an upgrade path. These gates
+were satisfied before the 2026-08-11 promotion. The release script binds schema-v3 build
+metadata to the repository mode observed before tagging.
+
+Rollback is a new signed release built after setting the repository mode to `shadow`,
+followed by the ordinary verified digest roll. Launch metadata cannot override the mode.
+
 ## Consequences
 
 - The Mac menu and website can share the same summary contract; presentation remains a
@@ -54,5 +64,6 @@ durable detach outbox; retry completion removes that outbox row.
 - A pending intent is durable before remote authorization. Only a pre-existing pending
   intent may recover an upstream duplicate; a new intent receiving `duplicate=true` is
   HTTP 409. This prevents an old pruned receipt from minting a fresh free lease.
-- The billing service is an availability dependency only for new recording; reads,
-  search, export, and deletion remain available.
+- The billing service is an availability dependency only for new recording; existing
+  cloud archive reads, search, export, and deletion remain available. None is a local
+  fallback.

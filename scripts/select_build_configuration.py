@@ -208,10 +208,6 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         raise SystemExit(
             "BILLING_ENFORCEMENT_MODE must be either shadow or enforce"
         )
-    if profile == "production" and configuration["BILLING_ENFORCEMENT_MODE"] != "shadow":
-        raise SystemExit(
-            "production BILLING_ENFORCEMENT_MODE must remain shadow until native clients are ready"
-        )
 
 
 def selected_configuration(profile: str, environment: dict[str, str]) -> dict[str, str]:
