@@ -353,6 +353,45 @@ root must still name the checkpoint-manifest base reference, preventing publicat
 unrecoverable WAL chain. Chunking/manifest construction and recovery remain inactive until
 their storage/witness fault gates pass.
 
+`src/archive_v3_export.rs` is an equally inactive, compiled export-parity seam. It accepts
+only an opaque `ArchiveId` and reads one exact active witness record through a sealed,
+cancellation/deadline-aware witness adapter. A separate sealed publication boundary then
+atomically admits that full record and holds deletion-aware authority through conditional
+commit. Every root, registry, and deletion transition must serialize with admissions;
+deletion closes new admissions and wins or drains existing admissions before tombstoning.
+The defensive final full-record reread is not the race-safety claim: only the admission's
+atomic exact-active conditional commit may publish. If deletion closure wins at commit, the
+pending artifact is aborted and remains unpublished.
+
+Tombstoned/deleting/deleted records and root or key-registry changes abort the transaction.
+The source pulls one reconstructed SQLite page into a caller-owned fixed-size buffer; fixed
+cursor storage plus cursor sequence, page number/size/count, nonzero total-page,
+snapshot-byte, nonempty output-chunk, nonzero completed output, output-write-count, and
+output-byte checks prevent provider-owned unbounded responses, empty-write amplification,
+empty publication, or a whole 32-GiB allocation.
+A cursorless page is terminal, must exactly reach the declared page count, and is never
+followed by another source call. One finite deadline-budget/cancellation control is passed
+into witness reads, source open/descriptor/pulls, the canonical adapter, transactional sink
+begin/write operations, admission, and conditional publication; it is also checked around
+each potentially blocking call. This does not claim that outer polling interrupts an
+implementation that ignores the control or blocks without its own transport deadline. A
+transaction guard aborts partial output on every pre-commit error or drop.
+The sink is a trusted boundary: it must isolate writes, discard them on abort, and atomically
+honor stop state while committing; a failed commit must remain abortable and unpublished. A
+dishonest implementation is outside this code proof.
+
+The cancellation-aware witness, authenticated source, deletion-aware publication/admission,
+and canonical export adapter are all sealed to deterministic test fakes. The current formats
+do not yet supply one complete authenticated checkpoint/WAL/extent walker, and no admitted
+adapter yet binds the live route's exact table, ordering, value encoding, JSON schema, and
+content semantics. The seam never drains a partially consumed reader after an adapter
+returns; only complete consumption inside that same sealed adapter call can reach publication.
+These are compile-time activation blockers, not claims
+that arbitrary output bytes establish parity. The module has no Store, route, startup,
+environment, credentials, logging of identifiers/content, or live I/O wiring. The active
+`/api/export` route remains the legacy Store export until both blockers and their provider
+fault/lifecycle evidence are reviewed as an explicit authority change.
+
 During the ADR-0022 legacy lifecycle transition, before the first whole-blob overwrite
 for each user and UTC day, the service creates or verifies one immutable server-side
 recovery copy under `legacy-recovery/{user_id}/YYYY-MM-DD.db.enc`. A generation-zero
