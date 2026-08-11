@@ -31,8 +31,9 @@ use crate::{
         OperationLedger, OperationLedgerError, OperationRecord, RecordOutcome, ShadowObjectFacts,
     },
     archive_v3_shadow_checkpoint::{
-        upload_checkpoint, CheckpointSource, ShadowCheckpointError, ShadowObjectInventory,
-        ShadowObjectInventoryError, ShadowObjectStaging, UploadedCheckpoint,
+        reconcile_reserved_shadow_objects, upload_checkpoint, CheckpointSource,
+        ShadowCheckpointError, ShadowObjectInventory, ShadowObjectInventoryError,
+        ShadowObjectStaging, UploadedCheckpoint,
     },
     archive_v3_shadow_session::{
         ShadowAttemptId, ShadowCandidate, ShadowReconcileDecision, ShadowSessionBinding,
@@ -126,6 +127,13 @@ pub(crate) trait ShadowSessionPersistence: ShadowObjectInventory + Send + Sync {
     ) -> std::result::Result<(), ShadowSessionPersistenceError>;
 
     async fn mark_superseded(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+    ) -> std::result::Result<(), ShadowSessionPersistenceError>;
+
+    async fn mark_aborted(
         &self,
         session_id: ShadowSessionId,
         attempt_id: ShadowAttemptId,
@@ -343,6 +351,25 @@ impl ShadowSessionPersistence for EncryptedSqliteShadowSessionPersistence {
                 attempt_id,
                 binding,
                 ShadowSessionState::Superseded,
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    async fn mark_aborted(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+    ) -> std::result::Result<(), ShadowSessionPersistenceError> {
+        self.run_blocking(move |connection| {
+            OperationLedger::transition_shadow_session(
+                connection,
+                session_id,
+                attempt_id,
+                binding,
+                ShadowSessionState::Aborted,
             )
             .map(|_| ())
         })
@@ -729,6 +756,7 @@ pub(crate) async fn reconcile_shadow_checkpoint(
 pub(crate) async fn reconcile_durable_shadow_session(
     witness: Arc<dyn ShadowCheckpointWitnessProvider>,
     sessions: Arc<dyn ShadowSessionPersistence>,
+    backend: &dyn ImmutableObjectBackend,
     session_id: ShadowSessionId,
     attempt_id: ShadowAttemptId,
     completion: OperationRecord,
@@ -755,11 +783,21 @@ pub(crate) async fn reconcile_durable_shadow_session(
             return Ok(ShadowReconcileDecision::Witnessed);
         }
         ShadowSessionState::Superseded => return Ok(ShadowReconcileDecision::Superseded),
-        ShadowSessionState::Prepared | ShadowSessionState::Aborted => {
-            return Err(ShadowCoordinatorError::StaleAuthority);
+        ShadowSessionState::Aborted => return Ok(ShadowReconcileDecision::Aborted),
+        ShadowSessionState::Prepared => {
+            let staging =
+                ShadowObjectStaging::new(sessions.as_ref(), session_id, attempt_id, binding);
+            reconcile_reserved_shadow_objects(backend, &staging).await?;
+            sessions
+                .mark_aborted(session_id, attempt_id, binding)
+                .await
+                .map_err(ShadowCoordinatorError::SessionPersistence)?;
+            return Ok(ShadowReconcileDecision::Aborted);
         }
         ShadowSessionState::CandidatePersisted | ShadowSessionState::ReconcileRequired => {}
     }
+    let staging = ShadowObjectStaging::new(sessions.as_ref(), session_id, attempt_id, binding);
+    reconcile_reserved_shadow_objects(backend, &staging).await?;
     let archive_id = ArchiveId::from_bytes(session.binding().archive_id());
     let observed = witness
         .read_current_exact(archive_id)
@@ -782,6 +820,7 @@ pub(crate) async fn reconcile_durable_shadow_session(
                 .map_err(ShadowCoordinatorError::SessionPersistence)?;
         }
         ShadowReconcileDecision::RetrySameCandidate => {}
+        ShadowReconcileDecision::Aborted => return Err(ShadowCoordinatorError::StaleAuthority),
     }
     Ok(decision)
 }
@@ -1128,6 +1167,7 @@ mod tests {
             crate::archive_v3_operation::ShadowObjectInventoryPage,
             ShadowObjectInventoryError,
         > {
+            self.events.lock().unwrap().push("load_inventory");
             Ok(crate::archive_v3_operation::ShadowObjectInventoryPage::empty())
         }
     }
@@ -1211,6 +1251,28 @@ mod tests {
             if record.state() != ShadowSessionState::Superseded {
                 record
                     .transition(ShadowSessionState::Superseded)
+                    .map_err(|_| ShadowSessionPersistenceError::Conflict)?;
+            }
+            Ok(())
+        }
+
+        async fn mark_aborted(
+            &self,
+            session_id: ShadowSessionId,
+            attempt_id: ShadowAttemptId,
+            binding: ShadowSessionBinding,
+        ) -> std::result::Result<(), ShadowSessionPersistenceError> {
+            self.events.lock().unwrap().push("persist_aborted");
+            let mut record = self.record.lock().unwrap();
+            if record.session_id() != session_id
+                || record.attempt_id() != attempt_id
+                || record.require_binding(binding).is_err()
+            {
+                return Err(ShadowSessionPersistenceError::Conflict);
+            }
+            if record.state() != ShadowSessionState::Aborted {
+                record
+                    .transition(ShadowSessionState::Aborted)
                     .map_err(|_| ShadowSessionPersistenceError::Conflict)?;
             }
             Ok(())
@@ -1729,6 +1791,7 @@ mod tests {
             reconcile_durable_shadow_session(
                 witness.clone(),
                 sessions.clone(),
+                &backend,
                 request.session_id,
                 request.attempt_id,
                 completion(),
@@ -1761,6 +1824,7 @@ mod tests {
             reconcile_durable_shadow_session(
                 witness,
                 sessions,
+                &backend,
                 request.session_id,
                 request.attempt_id,
                 completion(),
@@ -1827,6 +1891,7 @@ mod tests {
                 reconcile_durable_shadow_session(
                     witness.clone(),
                     sessions.clone(),
+                    &backend,
                     request.session_id,
                     request.attempt_id,
                     completion(),
@@ -1844,16 +1909,44 @@ mod tests {
             sessions.completion.lock().unwrap().as_ref(),
             Some(&completion())
         );
+        assert!(sessions.events.lock().unwrap().contains(&"load_inventory"));
+    }
+
+    #[tokio::test]
+    async fn prepared_restart_reconciles_only_its_exact_inventory_then_aborts_without_reupload() {
+        let (backend, _cipher, witness, sessions, request, _) = setup(Outcome::Ok).await;
+        assert_eq!(
+            reconcile_durable_shadow_session(
+                witness,
+                sessions.clone(),
+                &backend,
+                request.session_id,
+                request.attempt_id,
+                completion(),
+            )
+            .await
+            .unwrap(),
+            ShadowReconcileDecision::Aborted
+        );
+        assert_eq!(
+            sessions.record.lock().unwrap().state(),
+            ShadowSessionState::Aborted
+        );
+        let session_events = sessions.events.lock().unwrap();
+        assert!(session_events.contains(&"load_inventory"));
+        assert!(session_events.contains(&"persist_aborted"));
+        drop(session_events);
+        assert!(!backend.events.lock().unwrap().contains(&"create"));
     }
 
     #[tokio::test]
     async fn rejected_attempt_is_terminal_across_restart_before_new_attempt() {
         let (backend, cipher, witness, prepared, request, _) = setup(Outcome::Reject).await;
         let temporary = tempfile::NamedTempFile::new().unwrap();
-        let connection = Connection::open(temporary.path()).unwrap();
+        let mut connection = Connection::open(temporary.path()).unwrap();
         OperationLedger::initialize(&connection).unwrap();
         let prepared_record = prepared.record.lock().unwrap().clone();
-        OperationLedger::prepare_shadow_session(&connection, &prepared_record).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &prepared_record).unwrap();
         let sessions = Arc::new(EncryptedSqliteShadowSessionPersistence::new(Arc::new(
             Mutex::new(connection),
         )));
@@ -1891,6 +1984,7 @@ mod tests {
             reconcile_durable_shadow_session(
                 witness,
                 restarted,
+                &backend,
                 request.session_id,
                 request.attempt_id,
                 completion(),
@@ -1906,7 +2000,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            OperationLedger::prepare_shadow_session(&shared.lock().unwrap(), &next).unwrap(),
+            OperationLedger::prepare_shadow_session(&mut shared.lock().unwrap(), &next).unwrap(),
             RecordOutcome::Recorded
         );
     }
@@ -1916,10 +2010,10 @@ mod tests {
         let (backend, cipher, witness, prepared, request, _) =
             setup(Outcome::UnknownUncommitted).await;
         let temporary = tempfile::NamedTempFile::new().unwrap();
-        let connection = Connection::open(temporary.path()).unwrap();
+        let mut connection = Connection::open(temporary.path()).unwrap();
         OperationLedger::initialize(&connection).unwrap();
         let prepared_record = prepared.record.lock().unwrap().clone();
-        OperationLedger::prepare_shadow_session(&connection, &prepared_record).unwrap();
+        OperationLedger::prepare_shadow_session(&mut connection, &prepared_record).unwrap();
         let sessions = Arc::new(EncryptedSqliteShadowSessionPersistence::new(Arc::new(
             Mutex::new(connection),
         )));
@@ -1958,6 +2052,7 @@ mod tests {
             reconcile_durable_shadow_session(
                 witness,
                 restarted,
+                &backend,
                 request.session_id,
                 request.attempt_id,
                 completion(),
