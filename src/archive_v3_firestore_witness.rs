@@ -35,7 +35,7 @@ const WITNESS_COLLECTION: &str = "archive_witness_v3";
 const MAX_BEARER_TOKEN_BYTES: usize = 16_384;
 const MAX_TRANSACTION_BYTES: usize = 1_024;
 const MAX_FIRESTORE_TIMESTAMP_BYTES: usize = 30;
-const MAX_BATCH_GET_RESPONSE_BYTES: usize = 4_096;
+pub(crate) const MAX_BATCH_GET_RESPONSE_BYTES: usize = 4_096;
 const WITNESS_RECORD_BASE64_BYTES: usize = 4 * WITNESS_RECORD_BYTES.div_ceil(3);
 const ARCHIVE_WITNESS_WIF_AUDIENCE_PREFIX: &str = "//iam.googleapis.com/projects/";
 const ARCHIVE_WITNESS_WIF_AUDIENCE_SUFFIX: &str =
@@ -356,11 +356,30 @@ mod tests {
             parse_batch_get_response(&bad_create, &document),
             Err(FirestoreWitnessTransportError::Protocol)
         );
+        let no_create_time = json!({"found": {"name": document, "updateTime": TIME, "fields": {"r": {"bytesValue": STANDARD.encode([9; WITNESS_RECORD_BYTES])}}}, "readTime": TIME});
+        assert!(parse_batch_get_response(&no_create_time, &document).is_ok());
+        let unexpected_instead_of_create = json!({"found": {"name": document, "unexpected": CREATE_TIME, "updateTime": TIME, "fields": {"r": {"bytesValue": STANDARD.encode([9; WITNESS_RECORD_BYTES])}}}, "readTime": TIME});
+        assert_eq!(
+            parse_batch_get_response(&unexpected_instead_of_create, &document),
+            Err(FirestoreWitnessTransportError::Protocol)
+        );
         let wrong_length = json!({"found": {"name": document, "createTime": CREATE_TIME, "updateTime": TIME, "fields": {"r": {"bytesValue": "A".repeat(WITNESS_RECORD_BASE64_BYTES - 1)}}}, "readTime": TIME});
         assert_eq!(
             parse_batch_get_response(&wrong_length, &document),
             Err(FirestoreWitnessTransportError::Protocol)
         );
+        assert!(valid_firestore_precondition_timestamp(
+            "2026-01-02T03:04:05.123456Z"
+        ));
+        assert!(valid_firestore_precondition_timestamp(
+            "2026-01-02T03:04:05.123456000Z"
+        ));
+        assert!(!valid_firestore_precondition_timestamp(
+            "2026-01-02T03:04:05.123456789Z"
+        ));
+        assert!(!valid_firestore_precondition_timestamp(
+            "2026-01-02T03:04:05.123456+00:00"
+        ));
     }
 
     #[tokio::test]
@@ -573,7 +592,7 @@ impl FirestoreTransaction {
             len: bytes.len(),
         })
     }
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
@@ -629,6 +648,30 @@ impl FirestoreTimestamp {
         (self.trusted_tick, self.subsecond_nanos) > (other.trusted_tick, other.subsecond_nanos)
     }
 }
+
+/// Validates the bounded canonical Firestore UTC timestamp grammar shared by
+/// the provider-neutral adapter and its concrete REST transport.
+pub(crate) fn valid_firestore_timestamp(value: &str) -> bool {
+    FirestoreTimestamp::parse(value).is_ok()
+}
+
+/// Validates Firestore's update-time precondition requirement: a canonical
+/// UTC timestamp whose nanoseconds are aligned to whole microseconds.
+pub(crate) fn valid_firestore_precondition_timestamp(value: &str) -> bool {
+    FirestoreTimestamp::parse(value).is_ok_and(|timestamp| timestamp.subsecond_nanos % 1_000 == 0)
+}
+
+/// Compares two already canonical provider timestamps without exposing their
+/// contents or allowing a separate, weaker parser in the HTTP transport.
+pub(crate) fn firestore_timestamp_not_after(left: &str, right: &str) -> bool {
+    match (
+        FirestoreTimestamp::parse(left),
+        FirestoreTimestamp::parse(right),
+    ) {
+        (Ok(left), Ok(right)) => !left.is_after(&right),
+        _ => false,
+    }
+}
 impl fmt::Debug for FirestoreTimestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("FirestoreTimestamp(<redacted>)")
@@ -665,9 +708,10 @@ pub(crate) trait FirestoreWitnessBearerTokenProvider: Send + Sync {
 /// Provider-neutral Firestore REST boundary. Implementations issue only
 /// `beginTransaction(readWrite)`, exact `batchGet`, and full-document
 /// `commit`; they must never list, query, delete, or add fields to the record.
-/// For `batchGet`, they must cap a complete response frame at
+/// For `batchGet`, they must cap the complete response array at
 /// [`MAX_BATCH_GET_RESPONSE_BYTES`] before deserializing it and call
-/// [`parse_exact_batch_get_stream`] so exactly one response is accepted.
+/// [`parse_exact_batch_get_stream`] with its sole object so exactly one
+/// response is accepted.
 #[async_trait::async_trait]
 pub(crate) trait FirestoreWitnessTransport: Send + Sync {
     async fn begin_read_write(
@@ -781,6 +825,30 @@ impl FirestoreWitnessNamespace {
             self.project, self.database
         )
     }
+
+    /// The immutable Firestore database resource used by the concrete
+    /// transport. This is deliberately not a general collection or document
+    /// selector.
+    pub(crate) fn database_resource(&self) -> String {
+        format!("projects/{}/databases/{}", self.project, self.database)
+    }
+
+    /// Checks the only legal document family without exposing the project or
+    /// database components separately to a transport implementation.
+    pub(crate) fn is_canonical_document(&self, document: &str) -> bool {
+        let prefix = format!(
+            "projects/{}/databases/{}/documents/{WITNESS_COLLECTION}/",
+            self.project, self.database
+        );
+        let Some(archive_id) = document.strip_prefix(&prefix) else {
+            return false;
+        };
+        archive_id.len() == 32 && archive_id.bytes().all(is_lower_hex_byte)
+    }
+}
+
+const fn is_lower_hex_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
 }
 
 /// Firestore named databases reject UUID-shaped IDs even though their
@@ -876,7 +944,7 @@ fn decode_read(
 }
 
 /// Strictly decodes one already size-bounded JSON object from Firestore's
-/// `batchGet` stream. The expected document prevents a substituted name from
+/// `batchGet` response array. The expected document prevents a substituted name from
 /// becoming an authority record.
 fn parse_batch_get_response(
     value: &Value,
@@ -917,22 +985,28 @@ fn parse_batch_get_response(
     if found.get("name").and_then(Value::as_str) != Some(expected_document) {
         return Err(FirestoreWitnessTransportError::Protocol);
     }
-    if found.len() != 4 {
+    if !matches!(found.len(), 3 | 4) {
         return Err(FirestoreWitnessTransportError::Protocol);
     }
-    let create_time = found
-        .get("createTime")
-        .and_then(Value::as_str)
-        .ok_or(FirestoreWitnessTransportError::Protocol)?;
-    let create_time = FirestoreTimestamp::parse(create_time)
-        .map_err(|_| FirestoreWitnessTransportError::Protocol)?;
     let update_time = found
         .get("updateTime")
         .and_then(Value::as_str)
         .ok_or(FirestoreWitnessTransportError::Protocol)?;
     let update_time = FirestoreTimestamp::parse(update_time)
         .map_err(|_| FirestoreWitnessTransportError::Protocol)?;
-    if create_time.is_after(&update_time) || update_time.is_after(&read_time) {
+    let create_time = match found.get("createTime") {
+        None if found.len() == 3 => None,
+        Some(Value::String(create_time)) if found.len() == 4 => Some(
+            FirestoreTimestamp::parse(create_time)
+                .map_err(|_| FirestoreWitnessTransportError::Protocol)?,
+        ),
+        _ => return Err(FirestoreWitnessTransportError::Protocol),
+    };
+    if create_time
+        .as_ref()
+        .is_some_and(|create_time| create_time.is_after(&update_time))
+        || update_time.is_after(&read_time)
+    {
         return Err(FirestoreWitnessTransportError::Protocol);
     }
     let fields = found
@@ -967,11 +1041,11 @@ fn parse_batch_get_response(
     })
 }
 
-/// Parses exactly one size-bounded batch-get response. A concrete HTTP
-/// transport must cap each response frame before allocating or deserializing
-/// it, then pass its one complete frame here; an empty or multi-record stream
-/// is a protocol failure rather than a partial read.
-fn parse_exact_batch_get_stream<'a>(
+/// Parses exactly one size-bounded batch-get response object. A concrete HTTP
+/// transport must cap the complete JSON response array before deserializing
+/// it, require exactly one object, then pass that object here; an empty or
+/// multi-object response is a protocol failure rather than a partial read.
+pub(crate) fn parse_exact_batch_get_stream<'a>(
     responses: impl IntoIterator<Item = &'a [u8]>,
     expected_document: &str,
 ) -> std::result::Result<FirestoreWitnessRead, FirestoreWitnessTransportError> {

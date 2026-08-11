@@ -69,8 +69,10 @@ mod archive_v3_gcs;
 // Concrete but inactive REST transport. It has no environment constructor,
 // token acquisition, Store/VFS/witness connection, or production authority.
 mod archive_v3_gcs_http;
-// Inactive ADR-0022 Firestore witness transaction adapter. It has no concrete
-// HTTP client, runtime token source, Store, VFS, route, or authority wiring.
+// Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
+// REST transport. They have no runtime token source, Store, VFS, route, or
+// authority wiring.
+mod archive_v3_firestore_http;
 mod archive_v3_firestore_witness;
 mod archive_v3_journal;
 mod archive_v3_operation;
