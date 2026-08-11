@@ -80,6 +80,9 @@ impl ShadowCheckpointWitnessProvider for FirestoreShadowWitness {
                 FirestoreWitnessCommitError::Rejected(error) => {
                     ShadowWitnessCommitError::Rejected(error)
                 }
+                FirestoreWitnessCommitError::Failed(error) => {
+                    ShadowWitnessCommitError::Failed(error)
+                }
                 FirestoreWitnessCommitError::OutcomeUnknown => {
                     ShadowWitnessCommitError::OutcomeUnknown
                 }
