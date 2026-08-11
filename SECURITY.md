@@ -224,9 +224,10 @@ field `r` containing the fixed witness codec, read-write transaction begin, exac
 transactional batch read, full-record conditional commit, and an exact fresh-read check
 after an ambiguous response. It parses Firestore `readTime` as the trusted monotonic
 clock and retries only bounded `ABORTED` commits. The inactive boundary rejects `(default)`
-and accepts only the documented named-database grammar; a future token source is required
-to receive and use the one dedicated `archive-witness-attest/providers/archive-witness` WIF
-provider-resource audience on every mint. Batch-get transport is capped before JSON parsing
+and accepts only the documented named-database grammar. The separately compiled inactive
+Firestore bearer source receives and uses the one dedicated
+`archive-witness-attest/providers/archive-witness` WIF provider-resource audience on every
+mint. Batch-get transport is capped before JSON parsing
 and accepts exactly one response, while record/base64, transaction, token, `readTime`, and
 `updateTime` material are bounded and fail closed. `src/archive_v3_firestore_http.rs` is a
 compiled but equally inactive concrete transport: its production origin is fixed to
@@ -243,9 +244,10 @@ but if present it must be canonical and no later than `updateTime`. A post-send 
 transport/timeout/429/5xx or
 malformed success remains `OutcomeUnknown`; `ABORTED` and `FAILED_PRECONDITION` retain their
 typed meanings, and an HTTP 404 is only an endpoint/database failure, never a missing
-witness document. It intentionally has no token source (including no metadata-token fallback),
-IAM, queries/lists/deletes/batch-write/create-document, additional fields, Store/VFS/route
-connection, deployment flag, or production authority.
+witness document. The REST transport and the separately compiled bearer source have no runtime
+connection; neither uses metadata/default-token fallback or service-account impersonation. There
+is no Firestore IAM runtime wiring, query/list/delete/batch-write/create-document capability,
+additional field, Store/VFS/route connection, deployment flag, or production authority.
 Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
 acknowledge a write from archive-v3 until ADR-0022
@@ -402,6 +404,18 @@ Confidential Space tokens:
    retried over a fresh connection. A verifier must validate Google's signature, issuer,
    expiry, audience, nonce, relevant Confidential Space claims, and image digest rather
    than merely decoding the JWT.
+
+The compiled-but-inactive ADR-0022 Firestore witness boundary is deliberately a third,
+type-separated credential path. It derives only the exact dedicated
+`archive-witness-attest/archive-witness` provider audience, requests a no-nonce launcher
+OIDC token for that audience, and exchanges it only at fixed Google STS with the
+cloud-platform scope. It has a separate mutex-coalesced zeroizing cache refreshed 60
+seconds early; it does not share KMS credentials or cache state, use metadata/default
+credentials, impersonate a service account, expose its tokens publicly, or enable any
+runtime witness authority. The three paths share only the bounded launcher socket protocol;
+the Firestore audience type, STS client, secret-owning request/response buffers, and cache are
+separate. Its STS client is rustls-only, proxy-free, redirect-free, retry-disabled, and
+bounded; neither OIDC/STS tokens, audience, nor provider bodies are logged.
 
 TLS terminates inside the attested binary, so no external reverse proxy receives request
 plaintext. ACME generates the private key inside the TEE and persists account,

@@ -70,10 +70,13 @@ mod archive_v3_gcs;
 // token acquisition, Store/VFS/witness connection, or production authority.
 mod archive_v3_gcs_http;
 // Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
-// REST transport. They have no runtime token source, Store, VFS, route, or
+// REST transport. They have no runtime construction, Store, VFS, route, or
 // authority wiring.
 mod archive_v3_firestore_http;
 mod archive_v3_firestore_witness;
+// Inactive, Firestore-witness-only Confidential Space bearer path. It is
+// deliberately distinct from the KMS and public attestation credential paths.
+mod archive_v3_firestore_auth;
 mod archive_v3_journal;
 mod archive_v3_operation;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
