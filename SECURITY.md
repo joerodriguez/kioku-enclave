@@ -414,6 +414,18 @@ root must still name the checkpoint-manifest base reference, preventing publicat
 unrecoverable WAL chain. Chunking/manifest construction and recovery remain inactive until
 their storage/witness fault gates pass.
 
+**ADR-0022 inactive extent-tree seam:** `src/archive_v3_extent.rs` streams one
+caller-owned, page-aligned 1 MiB buffer at a time into context-bound immutable
+extent objects and persistent 256-way sparse Merkle nodes. Exact-root range
+recovery derives every node/extent key from an already authenticated root,
+never lists storage, verifies each envelope hash, AEAD context, node range and
+level, bounded traversal/object counts, and extent length before copying an
+intersection into a caller-owned buffer; missing sparse extents are zeroes.
+This is not a live recovery or authority path: it has no Store, VFS, provider,
+witness, route, flag, or credential wiring. The current codec intentionally
+has no authenticated empty-tree representation, so an all-hole file is
+rejected. These tests and format bounds do not satisfy the 32-GiB release gate.
+
 `src/archive_v3_export.rs` is an equally inactive, compiled export-parity seam. It accepts
 only an opaque `ArchiveId` and reads one exact active witness record through a sealed,
 cancellation/deadline-aware witness adapter. A separate sealed publication boundary then
