@@ -632,7 +632,8 @@ async fn delete_account(
 
     // 2. Delete content. Any incomplete outcome remains a durable 202
     // operation; every non-deletion account route stays denied.
-    if let Err(error) = s.store.delete_user(&user_id).await {
+    if let Err(error) = delete_account_content(s.control.as_ref(), s.store.as_ref(), &user_id).await
+    {
         let (reason, retry_after_seconds, hard_delete_time) = match &error {
             EnclaveError::DeletionPending(pending) => (
                 pending.reason.as_str(),
@@ -814,7 +815,7 @@ async fn reconcile_pending_account_deletions(
             continue;
         }
 
-        match store.delete_user(&user_id).await {
+        match delete_account_content(control, store, &user_id).await {
             Ok(()) => match control.finalize_user_deletion(&user_id).await {
                 Ok(_) => summary.completed += 1,
                 Err(_) => {
@@ -862,6 +863,34 @@ async fn reconcile_pending_account_deletions(
         }
     }
     Ok(summary)
+}
+
+/// Consume any durable identity-rebind authority before account content
+/// deletion. The control claim precedes provider deletion, and a provider
+/// create explicitly recorded as in-flight is retried instead of being
+/// overtaken. Once claimed, both exact namespaces are purged under one
+/// Store-owned admission/lifecycle fence and reconciled durably before final
+/// identity cleanup is allowed.
+async fn delete_account_content(
+    control: &ControlStore,
+    store: &Store,
+    user_id: &str,
+) -> EnclaveResult<()> {
+    let operation = control.identity_rebind_operation_for_user(user_id).await?;
+    let Some(operation) = operation else {
+        return store.delete_user(user_id).await;
+    };
+    if !control.claim_identity_rebind_deletion(user_id).await? {
+        return Err(EnclaveError::Conflict(
+            "identity rebind provider transition is still in progress".into(),
+        ));
+    }
+    store
+        .delete_identity_rebind_users(&operation.old_user_id, &operation.stable_user_id)
+        .await?;
+    control
+        .mark_identity_rebind_deletion_reconciled(user_id)
+        .await
 }
 
 pub fn spawn_account_deletion_reconciler(state: Arc<CpState>) {

@@ -2439,12 +2439,18 @@ async fn rest_screenshot_image_upload(
     // 3. Upload to GCS
     let put_lease = _content_write.child();
     let put_store = Arc::clone(&s.store);
+    let put_user_id = user_id.clone();
     let put_object_key = object_key.clone();
     let put_wrapped_b64 = wrapped_b64.clone();
     let put = tokio::spawn(async move {
         let _put_lease = put_lease;
         put_store
-            .put_media(&put_object_key, &encrypted_data, &put_wrapped_b64)
+            .put_user_media(
+                &put_user_id,
+                &put_object_key,
+                &encrypted_data,
+                &put_wrapped_b64,
+            )
             .await
     });
     match put.await {

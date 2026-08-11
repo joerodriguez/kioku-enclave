@@ -17,15 +17,17 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::{
+    archive_v3::ArchiveId,
     cp::isotime,
     crypto::{decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, KmsClient},
     error::{EnclaveError, Result},
-    store::GcsClient,
+    store::{validate_user_id, GcsClient, IdentityRebindSource, Store},
 };
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
@@ -33,6 +35,8 @@ const CONTROL_CONTEXT: &[u8] = b"control-db\0control/control.db.enc";
 const MAX_PENDING_RECORDING_LEASE_REQUESTS_PER_USER: i64 = 1;
 const MAX_RECORDING_LEASE_DENIALS_PER_USER: i64 = 100;
 const RECORDING_LEASE_DURATION_MS: i64 = 60_000;
+const MAX_ARCHIVE_DELETION_CURSOR_BYTES: usize = 4 * 1024;
+const MAX_ARCHIVE_ID_CANDIDATES: usize = 8;
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -195,6 +199,77 @@ CREATE TABLE IF NOT EXISTS account_deletion_operations (
     hard_delete_time    TEXT,
     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- The archive-v3 namespace is deliberately opaque to identities.  This
+-- encrypted control-store mapping is its only account-to-archive association;
+-- the future provider witness must receive only archive_id.
+CREATE TABLE IF NOT EXISTS archive_bindings (
+    user_id    TEXT PRIMARY KEY,
+    archive_id BLOB NOT NULL UNIQUE CHECK (length(archive_id) = 16 AND archive_id != zeroblob(16)),
+    state      TEXT NOT NULL CHECK (state IN ('active_legacy', 'tombstoned')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    tombstoned_at TEXT
+);
+-- This is a durable, encrypted control-plane ledger for a later exact v3
+-- deletion worker.  It intentionally has no completed states: this release
+-- has no v3 provider authority and must not claim key/object/retention
+-- completion.  Each cursor is opaque provider continuation state, never an
+-- identity, object name, or user-content field.
+CREATE TABLE IF NOT EXISTS archive_deletion_ledgers (
+    archive_id                  BLOB PRIMARY KEY CHECK (length(archive_id) = 16 AND archive_id != zeroblob(16)),
+    state                       TEXT NOT NULL CHECK (state IN ('active_legacy', 'tombstoned')),
+    deletion_fence_id           BLOB CHECK (deletion_fence_id IS NULL OR length(deletion_fence_id) = 16),
+    inventory_format_version    INTEGER NOT NULL DEFAULT 1 CHECK (inventory_format_version = 1),
+    archive_object_cursor       BLOB,
+    key_registry_cursor         BLOB,
+    legacy_generation_cursor    BLOB,
+    media_inventory_cursor      BLOB,
+    legacy_rebind_fence_object_name TEXT CHECK (
+        legacy_rebind_fence_object_name IS NULL
+        OR length(legacy_rebind_fence_object_name) > 0
+    ),
+    tombstoned_at               TEXT,
+    updated_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (
+        (state = 'active_legacy' AND deletion_fence_id IS NULL AND tombstoned_at IS NULL)
+        OR
+        (state = 'tombstoned' AND deletion_fence_id IS NOT NULL
+         AND length(deletion_fence_id) = 16 AND deletion_fence_id != zeroblob(16)
+         AND tombstoned_at IS NOT NULL)
+    )
+);
+-- Durable authority for the legacy identity -> stable-ID transition. This row
+-- is encrypted inside the control blob and precedes every provider mutation.
+-- It retains both exact namespaces through account deletion so a deletion
+-- started before reauthentication cannot strand either side of a partial move.
+CREATE TABLE IF NOT EXISTS identity_rebind_operations (
+    operation_id          TEXT PRIMARY KEY,
+    google_sub            TEXT NOT NULL UNIQUE,
+    old_user_id           TEXT NOT NULL,
+    stable_user_id        TEXT NOT NULL UNIQUE,
+    archive_id            BLOB NOT NULL CHECK (length(archive_id) = 16 AND archive_id != zeroblob(16)),
+    old_object_name       TEXT NOT NULL,
+    stable_object_name    TEXT NOT NULL,
+    source_base_generation INTEGER NOT NULL CHECK (source_base_generation >= 0),
+    source_generation     INTEGER,
+    source_commitment     BLOB NOT NULL CHECK (length(source_commitment) = 32),
+    stage                 TEXT NOT NULL CHECK (stage IN (
+        'prepared', 'source_freezing', 'source_frozen', 'stable_writing',
+        'stable_written', 'old_purging', 'old_purged', 'committed',
+        'deletion_pending', 'deletion_reconciled'
+    )),
+    created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (
+        (stage IN ('prepared', 'source_freezing', 'deletion_pending', 'deletion_reconciled')
+         AND source_generation IS NULL)
+        OR
+        (stage NOT IN ('prepared', 'source_freezing', 'deletion_pending', 'deletion_reconciled')
+         AND source_generation IS NOT NULL AND source_generation > 0)
+        OR
+        (stage IN ('deletion_pending', 'deletion_reconciled') AND source_generation > 0)
+    ),
+    CHECK (old_user_id != stable_user_id)
+);
 CREATE TABLE IF NOT EXISTS query_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     TEXT,
@@ -329,10 +404,15 @@ impl Drop for PendingTempFile {
     }
 }
 
+#[derive(Clone)]
 pub struct ControlStore {
-    inner: Mutex<Option<Handle>>,
+    inner: Arc<Mutex<Option<Handle>>>,
     kms: Arc<dyn KmsClient>,
     gcs: Arc<dyn GcsClient>,
+    /// Production authority for serializing legacy identity rebinding with
+    /// account deletion. Tests which do not exercise rebinding may omit it;
+    /// the rebind path itself always fails closed when it is absent.
+    lifecycle_store: Option<Arc<Store>>,
 }
 
 /// A user identity row (the fields callers actually need).
@@ -350,6 +430,148 @@ pub struct AccountDeletionOperation {
     pub reason: String,
     pub retry_after_seconds: Option<u64>,
     pub hard_delete_time: Option<String>,
+}
+
+/// Internal-only opaque archive binding.  It is deliberately absent from API
+/// and export models; archive IDs may leave this encrypted control store only
+/// when a later separately-authorized v3 authority path is added.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArchiveBinding {
+    archive_id: ArchiveId,
+}
+
+impl std::fmt::Debug for ArchiveBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArchiveBinding(<opaque>)")
+    }
+}
+
+impl ArchiveBinding {
+    #[allow(
+        dead_code,
+        reason = "reserved for separately-authorized v3 authority wiring"
+    )]
+    pub(crate) const fn archive_id(self) -> ArchiveId {
+        self.archive_id
+    }
+}
+
+/// The only transitions enabled in this prerequisite are
+/// `ActiveLegacy -> Tombstoned`.  Future provider-backed work may add exact
+/// inventory/erasure transitions, but this type intentionally has no state
+/// that could be mistaken for cryptographic, logical, or physical completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveDeletionState {
+    ActiveLegacy,
+    Tombstoned,
+}
+
+impl ArchiveDeletionState {
+    const fn as_db(self) -> &'static str {
+        match self {
+            Self::ActiveLegacy => "active_legacy",
+            Self::Tombstoned => "tombstoned",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "active_legacy" => Ok(Self::ActiveLegacy),
+            "tombstoned" => Ok(Self::Tombstoned),
+            _ => Err(EnclaveError::Store("invalid archive deletion state".into())),
+        }
+    }
+}
+
+/// Typed shape of the encrypted, resumable v3-deletion inventory. Cursor fields
+/// are raw opaque continuation tokens; the retained legacy marker name is a
+/// domain-separated HMAC under the KMS-protected control DEK, never an
+/// identity-derived plaintext or publicly enumerable namespace. No code treats
+/// absent cursor state as inventory completion.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveDeletionLedger {
+    pub(crate) binding: ArchiveBinding,
+    pub(crate) state: ArchiveDeletionState,
+    pub(crate) deletion_fence_id: Option<ArchiveId>,
+    pub(crate) archive_object_cursor: Option<Vec<u8>>,
+    pub(crate) key_registry_cursor: Option<Vec<u8>>,
+    pub(crate) legacy_generation_cursor: Option<Vec<u8>>,
+    pub(crate) media_inventory_cursor: Option<Vec<u8>>,
+    pub(crate) legacy_rebind_fence_object_name: Option<String>,
+}
+
+impl std::fmt::Debug for ArchiveDeletionLedger {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArchiveDeletionLedger(<opaque>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum IdentityRebindStage {
+    Prepared,
+    SourceFreezing,
+    SourceFrozen,
+    StableWriting,
+    StableWritten,
+    OldPurging,
+    OldPurged,
+    Committed,
+    DeletionPending,
+    DeletionReconciled,
+}
+
+impl IdentityRebindStage {
+    const fn as_db(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::SourceFreezing => "source_freezing",
+            Self::SourceFrozen => "source_frozen",
+            Self::StableWriting => "stable_writing",
+            Self::StableWritten => "stable_written",
+            Self::OldPurging => "old_purging",
+            Self::OldPurged => "old_purged",
+            Self::Committed => "committed",
+            Self::DeletionPending => "deletion_pending",
+            Self::DeletionReconciled => "deletion_reconciled",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "source_freezing" => Ok(Self::SourceFreezing),
+            "source_frozen" => Ok(Self::SourceFrozen),
+            "stable_writing" => Ok(Self::StableWriting),
+            "stable_written" => Ok(Self::StableWritten),
+            "old_purging" => Ok(Self::OldPurging),
+            "old_purged" => Ok(Self::OldPurged),
+            "committed" => Ok(Self::Committed),
+            "deletion_pending" => Ok(Self::DeletionPending),
+            "deletion_reconciled" => Ok(Self::DeletionReconciled),
+            _ => Err(EnclaveError::Store("invalid identity rebind stage".into())),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct IdentityRebindOperation {
+    operation_id: String,
+    google_sub: String,
+    pub(crate) old_user_id: String,
+    pub(crate) stable_user_id: String,
+    binding: ArchiveBinding,
+    old_object_name: String,
+    stable_object_name: String,
+    source_base_generation: i64,
+    source_generation: Option<i64>,
+    source_commitment: [u8; 32],
+    stage: IdentityRebindStage,
+}
+
+impl std::fmt::Debug for IdentityRebindOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IdentityRebindOperation(<opaque>)")
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -488,11 +710,761 @@ fn account_deletion_operation_conn(
     .transpose()
 }
 
+fn archive_id_from_blob(value: Vec<u8>) -> Result<ArchiveId> {
+    let bytes: [u8; 16] = value
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("invalid persisted opaque archive binding".into()))?;
+    if bytes == [0; 16] {
+        return Err(EnclaveError::Store(
+            "invalid persisted zero archive identifier".into(),
+        ));
+    }
+    Ok(ArchiveId::from_bytes(bytes))
+}
+
+fn random_nonzero_archive_id() -> Result<ArchiveId> {
+    for _ in 0..MAX_ARCHIVE_ID_CANDIDATES {
+        let value = *ArchiveId::random().as_bytes();
+        if value != [0; 16] {
+            return Ok(ArchiveId::from_bytes(value));
+        }
+    }
+    Err(EnclaveError::Store(
+        "opaque archive identifier generation exhausted".into(),
+    ))
+}
+
+fn checked_archive_deletion_cursor(value: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    if value
+        .as_ref()
+        .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_ARCHIVE_DELETION_CURSOR_BYTES)
+    {
+        return Err(EnclaveError::Store(
+            "invalid persisted archive deletion cursor".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn archive_binding_conn(conn: &Connection, user_id: &str) -> Result<Option<ArchiveBinding>> {
+    conn.query_row(
+        "SELECT archive_id FROM archive_bindings WHERE user_id = ?1",
+        [user_id],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()?
+    .map(archive_id_from_blob)
+    .transpose()
+    .map(|binding| binding.map(|archive_id| ArchiveBinding { archive_id }))
+}
+
+fn archive_deletion_ledger_conn(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<ArchiveDeletionLedger>> {
+    let row = conn
+        .query_row(
+            "SELECT b.archive_id, b.state, b.tombstoned_at,
+                    l.state, l.deletion_fence_id, l.inventory_format_version,
+                    l.tombstoned_at,
+                    l.archive_object_cursor, l.key_registry_cursor,
+                    l.legacy_generation_cursor, l.media_inventory_cursor,
+                    l.legacy_rebind_fence_object_name
+             FROM archive_bindings b
+             JOIN archive_deletion_ledgers l ON l.archive_id = b.archive_id
+             WHERE b.user_id = ?1",
+            [user_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            archive_id,
+            binding_state,
+            binding_tombstoned_at,
+            state,
+            deletion_fence_id,
+            inventory_format_version,
+            ledger_tombstoned_at,
+            archive_object_cursor,
+            key_registry_cursor,
+            legacy_generation_cursor,
+            media_inventory_cursor,
+            legacy_rebind_fence_object_name,
+        )| {
+            let binding_state = ArchiveDeletionState::from_db(&binding_state)?;
+            let state = ArchiveDeletionState::from_db(&state)?;
+            if binding_state != state {
+                return Err(EnclaveError::Store(
+                    "archive binding and deletion ledger states disagree".into(),
+                ));
+            }
+            if inventory_format_version != 1 {
+                return Err(EnclaveError::Store(
+                    "unsupported archive deletion inventory format".into(),
+                ));
+            }
+            let deletion_fence_id = deletion_fence_id.map(archive_id_from_blob).transpose()?;
+            match (state, deletion_fence_id) {
+                (ArchiveDeletionState::ActiveLegacy, None)
+                | (ArchiveDeletionState::Tombstoned, Some(_)) => {}
+                (ArchiveDeletionState::ActiveLegacy, Some(_)) => {
+                    return Err(EnclaveError::Store(
+                        "active archive ledger has a deletion fence".into(),
+                    ));
+                }
+                (ArchiveDeletionState::Tombstoned, None) => {
+                    return Err(EnclaveError::Store(
+                        "tombstoned archive ledger is missing its deletion fence".into(),
+                    ));
+                }
+            }
+            let timestamps_match_state = match state {
+                ArchiveDeletionState::ActiveLegacy => {
+                    binding_tombstoned_at.is_none() && ledger_tombstoned_at.is_none()
+                }
+                ArchiveDeletionState::Tombstoned => {
+                    binding_tombstoned_at
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                        && ledger_tombstoned_at
+                            .as_deref()
+                            .is_some_and(|value| !value.is_empty())
+                }
+            };
+            if !timestamps_match_state {
+                return Err(EnclaveError::Store(
+                    "archive tombstone timestamps disagree with state".into(),
+                ));
+            }
+            if let Some(fence_name) = legacy_rebind_fence_object_name.as_deref() {
+                if !crate::store::is_canonical_identity_rebind_fence_object_name(fence_name) {
+                    return Err(EnclaveError::Store(
+                        "invalid archived rebind fence name".into(),
+                    ));
+                }
+            }
+            Ok(ArchiveDeletionLedger {
+                binding: ArchiveBinding {
+                    archive_id: archive_id_from_blob(archive_id)?,
+                },
+                state,
+                deletion_fence_id,
+                archive_object_cursor: checked_archive_deletion_cursor(archive_object_cursor)?,
+                key_registry_cursor: checked_archive_deletion_cursor(key_registry_cursor)?,
+                legacy_generation_cursor: checked_archive_deletion_cursor(
+                    legacy_generation_cursor,
+                )?,
+                media_inventory_cursor: checked_archive_deletion_cursor(media_inventory_cursor)?,
+                legacy_rebind_fence_object_name,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn validate_active_archive_binding_conn(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<ArchiveBinding> {
+    let ledger = archive_deletion_ledger_conn(conn, user_id)?.ok_or_else(|| {
+        EnclaveError::Store("active account is missing its archive ledger".into())
+    })?;
+    if ledger.state != ArchiveDeletionState::ActiveLegacy || ledger.deletion_fence_id.is_some() {
+        return Err(EnclaveError::Auth("account archive is inactive".into()));
+    }
+    Ok(ledger.binding)
+}
+
+/// Revalidate every local precondition for a legacy-ID migration. Callers do
+/// this only after holding both Store lifecycle gates, and repeat it in the
+/// final transaction after provider work. The expected random binding makes a
+/// stale preliminary read fail closed instead of moving a different archive.
+fn validate_archive_rebind_conn(
+    conn: &Connection,
+    google_sub: &str,
+    old_user_id: &str,
+    stable_user_id: &str,
+    expected_binding: ArchiveBinding,
+) -> Result<()> {
+    if is_deleted_user_conn(conn, stable_user_id)? {
+        return Err(EnclaveError::Auth("account deleted".into()));
+    }
+    let source = conn
+        .query_row(
+            "SELECT id, status FROM users WHERE google_sub = ?1",
+            [google_sub],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match source {
+        Some((id, status)) if id == old_user_id && status == "active" => {}
+        Some((id, _)) if id != old_user_id => {
+            return Err(EnclaveError::Conflict(
+                "canonical identity migration source changed".into(),
+            ));
+        }
+        _ => return Err(EnclaveError::Auth("account inactive".into())),
+    }
+    if validate_active_archive_binding_conn(conn, old_user_id)? != expected_binding {
+        return Err(EnclaveError::Conflict(
+            "canonical identity migration archive changed".into(),
+        ));
+    }
+    if archive_binding_conn(conn, stable_user_id)?.is_some() {
+        return Err(EnclaveError::Conflict(
+            "canonical identity migration has a conflicting archive binding".into(),
+        ));
+    }
+    let target_user_exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+        [stable_user_id],
+        |row| row.get(0),
+    )?;
+    if target_user_exists != 0 {
+        return Err(EnclaveError::Conflict(
+            "canonical identity migration target account already exists".into(),
+        ));
+    }
+    Ok(())
+}
+
+type IdentityRebindRow = (
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Vec<u8>,
+    String,
+);
+
+fn identity_rebind_operation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<IdentityRebindRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn decode_identity_rebind_operation(row: IdentityRebindRow) -> Result<IdentityRebindOperation> {
+    let (
+        operation_id,
+        google_sub,
+        old_user_id,
+        stable_user_id,
+        archive_id,
+        old_object_name,
+        stable_object_name,
+        source_base_generation,
+        source_generation,
+        source_commitment,
+        stage,
+    ) = row;
+    if !operation_id.starts_with("rebind_") || operation_id.len() != 71 || google_sub.is_empty() {
+        return Err(EnclaveError::Store(
+            "invalid persisted identity rebind operation".into(),
+        ));
+    }
+    validate_user_id(&old_user_id)?;
+    validate_user_id(&stable_user_id)?;
+    if old_user_id == stable_user_id
+        || old_object_name != format!("indexes/{old_user_id}.db.enc")
+        || stable_object_name != format!("indexes/{stable_user_id}.db.enc")
+        || source_base_generation < 0
+    {
+        return Err(EnclaveError::Store(
+            "invalid persisted identity rebind namespace".into(),
+        ));
+    }
+    let source_commitment: [u8; 32] = source_commitment
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("invalid rebind source commitment".into()))?;
+    let stage = IdentityRebindStage::from_db(&stage)?;
+    if (matches!(
+        stage,
+        IdentityRebindStage::Prepared | IdentityRebindStage::SourceFreezing
+    ) && source_generation.is_some())
+        || (stage > IdentityRebindStage::Prepared
+            && !matches!(
+                stage,
+                IdentityRebindStage::SourceFreezing
+                    | IdentityRebindStage::DeletionPending
+                    | IdentityRebindStage::DeletionReconciled
+            )
+            && source_generation.is_none_or(|generation| generation <= 0))
+    {
+        return Err(EnclaveError::Store(
+            "identity rebind generation disagrees with stage".into(),
+        ));
+    }
+    Ok(IdentityRebindOperation {
+        operation_id,
+        google_sub,
+        old_user_id,
+        stable_user_id,
+        binding: ArchiveBinding {
+            archive_id: archive_id_from_blob(archive_id)?,
+        },
+        old_object_name,
+        stable_object_name,
+        source_base_generation,
+        source_generation,
+        source_commitment,
+        stage,
+    })
+}
+
+const IDENTITY_REBIND_SELECT: &str =
+    "SELECT operation_id, google_sub, old_user_id, stable_user_id, archive_id,
+            old_object_name, stable_object_name, source_base_generation,
+            source_generation, source_commitment, stage
+     FROM identity_rebind_operations";
+
+fn identity_rebind_operation_for_subject_conn(
+    conn: &Connection,
+    google_sub: &str,
+) -> Result<Option<IdentityRebindOperation>> {
+    conn.query_row(
+        &format!("{IDENTITY_REBIND_SELECT} WHERE google_sub = ?1"),
+        [google_sub],
+        identity_rebind_operation_from_row,
+    )
+    .optional()?
+    .map(decode_identity_rebind_operation)
+    .transpose()
+}
+
+fn identity_rebind_operation_for_user_conn(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<IdentityRebindOperation>> {
+    conn.query_row(
+        &format!("{IDENTITY_REBIND_SELECT} WHERE old_user_id = ?1 OR stable_user_id = ?1"),
+        [user_id],
+        identity_rebind_operation_from_row,
+    )
+    .optional()?
+    .map(decode_identity_rebind_operation)
+    .transpose()
+}
+
+fn pending_identity_rebind_operations_conn(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<IdentityRebindOperation>> {
+    let mut statement = conn.prepare(&format!(
+        "{IDENTITY_REBIND_SELECT}
+         WHERE stage NOT IN ('committed', 'deletion_pending', 'deletion_reconciled')
+           AND (
+             stage IN ('source_freezing', 'stable_writing')
+             OR EXISTS (
+               SELECT 1 FROM users
+               WHERE users.google_sub = identity_rebind_operations.google_sub
+                 AND users.id = identity_rebind_operations.old_user_id
+                 AND users.status = 'active'
+             )
+           )
+         ORDER BY updated_at, operation_id
+         LIMIT ?1"
+    ))?;
+    let rows = statement
+        .query_map([limit], identity_rebind_operation_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(decode_identity_rebind_operation)
+        .collect()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "exact durable rebind authority is intentionally passed field-by-field"
+)]
+fn prepare_identity_rebind_conn(
+    conn: &Connection,
+    operation_id: &str,
+    google_sub: &str,
+    old_user_id: &str,
+    stable_user_id: &str,
+    fence_object_name: &str,
+    binding: ArchiveBinding,
+    source: &IdentityRebindSource,
+) -> Result<IdentityRebindOperation> {
+    if !crate::store::is_canonical_identity_rebind_fence_object_name(fence_object_name) {
+        return Err(EnclaveError::Store(
+            "identity rebind fence name is not canonical".into(),
+        ));
+    }
+    validate_archive_rebind_conn(conn, google_sub, old_user_id, stable_user_id, binding)?;
+    let old_object_name = format!("indexes/{old_user_id}.db.enc");
+    let stable_object_name = format!("indexes/{stable_user_id}.db.enc");
+    conn.execute(
+        "INSERT OR IGNORE INTO identity_rebind_operations
+         (operation_id, google_sub, old_user_id, stable_user_id, archive_id,
+          old_object_name, stable_object_name, source_base_generation,
+          source_commitment, stage)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'prepared')",
+        rusqlite::params![
+            operation_id,
+            google_sub,
+            old_user_id,
+            stable_user_id,
+            binding.archive_id.as_bytes().as_slice(),
+            old_object_name,
+            stable_object_name,
+            source.base_generation,
+            source.commitment.as_slice(),
+        ],
+    )?;
+    let ledger_updated = conn.execute(
+        "UPDATE archive_deletion_ledgers
+         SET legacy_rebind_fence_object_name = ?2,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1
+           AND (legacy_rebind_fence_object_name IS NULL
+                OR legacy_rebind_fence_object_name = ?2)",
+        rusqlite::params![binding.archive_id.as_bytes().as_slice(), fence_object_name],
+    )?;
+    if ledger_updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "identity rebind archive fence inventory conflicts".into(),
+        ));
+    }
+    let operation = identity_rebind_operation_for_subject_conn(conn, google_sub)?
+        .ok_or_else(|| EnclaveError::Store("identity rebind prepare disappeared".into()))?;
+    if operation.old_user_id != old_user_id
+        || operation.stable_user_id != stable_user_id
+        || operation.binding != binding
+        || operation.source_base_generation != source.base_generation
+        || operation.source_commitment != source.commitment
+        || operation.old_object_name != old_object_name
+        || operation.stable_object_name != stable_object_name
+    {
+        return Err(EnclaveError::Conflict(
+            "conflicting durable identity rebind operation".into(),
+        ));
+    }
+    Ok(operation)
+}
+
+fn advance_identity_rebind_conn(
+    conn: &Connection,
+    operation: &IdentityRebindOperation,
+    next_stage: IdentityRebindStage,
+    source_generation: Option<i64>,
+) -> Result<IdentityRebindOperation> {
+    let current = identity_rebind_operation_for_subject_conn(conn, &operation.google_sub)?
+        .ok_or_else(|| EnclaveError::Store("identity rebind operation disappeared".into()))?;
+    if current.operation_id != operation.operation_id
+        || current.old_user_id != operation.old_user_id
+        || current.stable_user_id != operation.stable_user_id
+        || current.binding != operation.binding
+        || current.source_commitment != operation.source_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "identity rebind authority changed".into(),
+        ));
+    }
+    if current.stage >= next_stage {
+        return Ok(current);
+    }
+    if next_stage <= current.stage {
+        return Err(EnclaveError::Conflict(
+            "identity rebind stage cannot move backward".into(),
+        ));
+    }
+    let generation = source_generation.or(current.source_generation);
+    if next_stage > IdentityRebindStage::Prepared
+        && !matches!(
+            next_stage,
+            IdentityRebindStage::SourceFreezing
+                | IdentityRebindStage::DeletionPending
+                | IdentityRebindStage::DeletionReconciled
+        )
+        && generation.is_none_or(|generation| generation <= 0)
+    {
+        return Err(EnclaveError::Store(
+            "identity rebind stage requires a source generation".into(),
+        ));
+    }
+    conn.execute(
+        "UPDATE identity_rebind_operations
+         SET stage = ?2, source_generation = ?3,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id = ?1",
+        rusqlite::params![operation.operation_id, next_stage.as_db(), generation],
+    )?;
+    identity_rebind_operation_for_subject_conn(conn, &operation.google_sub)?
+        .ok_or_else(|| EnclaveError::Store("identity rebind operation disappeared".into()))
+}
+
+fn rebase_identity_rebind_source_conn(
+    conn: &Connection,
+    operation: &IdentityRebindOperation,
+    source: &IdentityRebindSource,
+) -> Result<IdentityRebindOperation> {
+    let current = identity_rebind_operation_for_subject_conn(conn, &operation.google_sub)?
+        .ok_or_else(|| EnclaveError::Store("identity rebind operation disappeared".into()))?;
+    if current.operation_id != operation.operation_id
+        || current.old_user_id != operation.old_user_id
+        || current.stable_user_id != operation.stable_user_id
+        || current.binding != operation.binding
+        || current.stage != IdentityRebindStage::SourceFreezing
+        || source.source_generation <= current.source_base_generation
+    {
+        return Err(EnclaveError::Conflict(
+            "identity rebind source cannot be rebased".into(),
+        ));
+    }
+    conn.execute(
+        "UPDATE identity_rebind_operations
+         SET source_base_generation = ?2, source_commitment = ?3,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id = ?1 AND stage = 'source_freezing'",
+        rusqlite::params![
+            operation.operation_id,
+            source.source_generation,
+            source.commitment.as_slice(),
+        ],
+    )?;
+    identity_rebind_operation_for_subject_conn(conn, &operation.google_sub)?
+        .ok_or_else(|| EnclaveError::Store("identity rebind operation disappeared".into()))
+}
+
+fn claim_identity_rebind_deletion_conn(conn: &Connection, user_id: &str) -> Result<bool> {
+    let Some(operation) = identity_rebind_operation_for_user_conn(conn, user_id)? else {
+        return Ok(true);
+    };
+    if matches!(
+        operation.stage,
+        IdentityRebindStage::SourceFreezing | IdentityRebindStage::StableWriting
+    ) {
+        return Ok(false);
+    }
+    let claimed = advance_identity_rebind_conn(
+        conn,
+        &operation,
+        IdentityRebindStage::DeletionPending,
+        operation.source_generation,
+    )?;
+    Ok(claimed.stage >= IdentityRebindStage::DeletionPending)
+}
+
+/// Insert one random binding plus its inactive deletion-ledger row in the
+/// caller's transaction. Existing same-user state is idempotently validated;
+/// a random ID owned by another user consumes one bounded retry.
+fn create_active_archive_binding_with_candidates<F>(
+    conn: &Connection,
+    user_id: &str,
+    mut next_candidate: F,
+) -> Result<ArchiveBinding>
+where
+    F: FnMut() -> [u8; 16],
+{
+    if archive_binding_conn(conn, user_id)?.is_some() {
+        return validate_active_archive_binding_conn(conn, user_id);
+    }
+    for _ in 0..MAX_ARCHIVE_ID_CANDIDATES {
+        let candidate = next_candidate();
+        if candidate == [0; 16] {
+            continue;
+        }
+        let proposed = ArchiveId::from_bytes(candidate);
+        let retained_or_live_ledger: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_deletion_ledgers WHERE archive_id = ?1)",
+            [proposed.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if retained_or_live_ledger != 0 {
+            continue;
+        }
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO archive_bindings (user_id, archive_id, state)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                user_id,
+                proposed.as_bytes().as_slice(),
+                ArchiveDeletionState::ActiveLegacy.as_db()
+            ],
+        )?;
+        if inserted == 0 {
+            if archive_binding_conn(conn, user_id)?.is_some() {
+                return validate_active_archive_binding_conn(conn, user_id);
+            }
+            let owned_elsewhere: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM archive_bindings WHERE archive_id = ?1)",
+                [proposed.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            if owned_elsewhere != 0 {
+                continue;
+            }
+            return Err(EnclaveError::Store(
+                "archive binding insertion was ignored without an owner".into(),
+            ));
+        }
+        conn.execute(
+            "INSERT INTO archive_deletion_ledgers (archive_id, state)
+             VALUES (?1, ?2)",
+            rusqlite::params![
+                proposed.as_bytes().as_slice(),
+                ArchiveDeletionState::ActiveLegacy.as_db()
+            ],
+        )?;
+        return validate_active_archive_binding_conn(conn, user_id);
+    }
+    Err(EnclaveError::Conflict(
+        "opaque archive identifier allocation exhausted".into(),
+    ))
+}
+
+fn create_active_archive_binding_conn(conn: &Connection, user_id: &str) -> Result<ArchiveBinding> {
+    create_active_archive_binding_with_candidates(conn, user_id, || *ArchiveId::random().as_bytes())
+}
+
+/// Establish the only enabled archive-v3 deletion transition.  The random
+/// fence and any future opaque cursors remain in the encrypted ledger even
+/// after the ordinary identity rows are removed.
+fn tombstone_archive_deletion_ledger_conn(
+    conn: &Connection,
+    user_id: &str,
+    fence_object_name: &str,
+) -> Result<ArchiveDeletionLedger> {
+    if !crate::store::is_canonical_identity_rebind_fence_object_name(fence_object_name) {
+        return Err(EnclaveError::Store(
+            "archive deletion fence name is not canonical".into(),
+        ));
+    }
+    let binding = archive_binding_conn(conn, user_id)?.ok_or_else(|| {
+        EnclaveError::Store("refusing identity deletion without an archive binding".into())
+    })?;
+    let state: String = conn.query_row(
+        "SELECT state FROM archive_bindings WHERE user_id = ?1",
+        [user_id],
+        |row| row.get(0),
+    )?;
+    match ArchiveDeletionState::from_db(&state)? {
+        ArchiveDeletionState::ActiveLegacy => {
+            let fence = random_nonzero_archive_id()?;
+            let updated = conn.execute(
+                "UPDATE archive_bindings
+                 SET state = 'tombstoned', tombstoned_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE user_id = ?1 AND state = 'active_legacy'",
+                [user_id],
+            )?;
+            if updated != 1 {
+                return Err(EnclaveError::Conflict(
+                    "archive deletion fence changed concurrently".into(),
+                ));
+            }
+            let updated = conn.execute(
+                "UPDATE archive_deletion_ledgers
+                 SET state = 'tombstoned', deletion_fence_id = ?2,
+                     legacy_rebind_fence_object_name = COALESCE(
+                         legacy_rebind_fence_object_name, ?3
+                     ),
+                     tombstoned_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE archive_id = ?1 AND state = 'active_legacy'
+                   AND (legacy_rebind_fence_object_name IS NULL
+                        OR legacy_rebind_fence_object_name = ?3)",
+                rusqlite::params![
+                    binding.archive_id.as_bytes().as_slice(),
+                    fence.as_bytes().as_slice(),
+                    fence_object_name,
+                ],
+            )?;
+            if updated != 1 {
+                return Err(EnclaveError::Store(
+                    "archive deletion ledger is missing or inconsistent".into(),
+                ));
+            }
+        }
+        ArchiveDeletionState::Tombstoned => {}
+    }
+    let ledger = archive_deletion_ledger_conn(conn, user_id)?
+        .ok_or_else(|| EnclaveError::Store("archive deletion ledger disappeared".into()))?;
+    if ledger.binding != binding || ledger.state != ArchiveDeletionState::Tombstoned {
+        return Err(EnclaveError::Store(
+            "archive deletion tombstone is inconsistent".into(),
+        ));
+    }
+    Ok(ledger)
+}
+
+/// Backfill legacy identities once while the encrypted control database is
+/// loaded. Archive IDs are generated independently for every canonical user;
+/// they are never derived from, logged with, or exposed alongside an identity.
+fn backfill_archive_bindings_conn(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let user_ids = {
+        let mut statement = tx.prepare(
+            "SELECT id FROM users
+             WHERE NOT EXISTS (SELECT 1 FROM archive_bindings b WHERE b.user_id = users.id)
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for user_id in &user_ids {
+        create_active_archive_binding_conn(&tx, user_id)?;
+    }
+    tx.commit()?;
+    Ok(user_ids.len())
+}
+
 /// Remove identity/accounting state and leave only a stable, non-content
 /// tombstone. Returning Google credentials can then be denied instead of
 /// recreating the just-deleted account.
-fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<AccountDeletionOperation> {
+fn delete_user_identity_conn(
+    conn: &Connection,
+    user_id: &str,
+    fence_object_name: &str,
+) -> Result<AccountDeletionOperation> {
     let tx = conn.unchecked_transaction()?;
+    let rebind_operation = identity_rebind_operation_for_user_conn(&tx, user_id)?;
+    if rebind_operation
+        .as_ref()
+        .is_some_and(|operation| operation.stage != IdentityRebindStage::DeletionReconciled)
+    {
+        tx.rollback()?;
+        return Err(EnclaveError::Conflict(
+            "identity rebind namespaces are not deletion-reconciled".into(),
+        ));
+    }
     let identity: Option<(String, String)> = tx
         .query_row(
             "SELECT google_sub, status FROM users WHERE id = ?1",
@@ -529,6 +1501,12 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<Account
         }
         let operation = account_deletion_operation_conn(&tx, user_id)?
             .ok_or_else(|| EnclaveError::Store("account deletion operation disappeared".into()))?;
+        if let Some(rebind_operation) = rebind_operation.as_ref() {
+            tx.execute(
+                "DELETE FROM identity_rebind_operations WHERE operation_id = ?1",
+                [&rebind_operation.operation_id],
+            )?;
+        }
         tx.commit()?;
         return Ok(operation);
     };
@@ -538,6 +1516,10 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<Account
             "account deletion was not initialized".into(),
         ));
     }
+    // Recheck the durable pre-v3 fence in the same transaction that removes
+    // ordinary identity data. A retry preserves the ledger state; it cannot
+    // reopen an archive after a partial finalization.
+    tombstone_archive_deletion_ledger_conn(&tx, user_id, fence_object_name)?;
 
     let stable_user_id = super::tokens::derive_stable_uuid(&google_sub);
     tx.execute(
@@ -592,6 +1574,17 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<Account
         [user_id],
     )?;
     tx.execute("DELETE FROM auth_identities WHERE user_id = ?1", [user_id])?;
+    // Keep the archive-keyed ledger but erase the identity -> archive mapping.
+    // `deleted_users`/`deleted_identities` are the no-resurrection fence after
+    // finalization; nothing can reconnect this former account to its archive.
+    let erased_binding =
+        tx.execute("DELETE FROM archive_bindings WHERE user_id = ?1", [user_id])?;
+    if erased_binding != 1 {
+        tx.rollback()?;
+        return Err(EnclaveError::Store(
+            "archive binding disappeared during identity deletion".into(),
+        ));
+    }
     let deleted = tx.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
     if deleted != 1 {
         tx.rollback()?;
@@ -615,6 +1608,18 @@ fn delete_user_identity_conn(conn: &Connection, user_id: &str) -> Result<Account
     }
     let operation = account_deletion_operation_conn(&tx, user_id)?
         .ok_or_else(|| EnclaveError::Store("account deletion operation disappeared".into()))?;
+    if let Some(rebind_operation) = rebind_operation.as_ref() {
+        let erased = tx.execute(
+            "DELETE FROM identity_rebind_operations WHERE operation_id = ?1",
+            [&rebind_operation.operation_id],
+        )?;
+        if erased != 1 {
+            tx.rollback()?;
+            return Err(EnclaveError::Conflict(
+                "identity rebind deletion authority disappeared".into(),
+            ));
+        }
+    }
     tx.commit()?;
     Ok(operation)
 }
@@ -623,6 +1628,7 @@ fn begin_user_deletion_conn(
     conn: &Connection,
     user_id: &str,
     proposed_operation_id: &str,
+    fence_object_name: &str,
 ) -> Result<Option<AccountDeletionOperation>> {
     let tx = conn.unchecked_transaction()?;
     let status: Option<String> = tx
@@ -657,6 +1663,13 @@ fn begin_user_deletion_conn(
              consented_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
             [user_id],
         )?;
+    }
+    // This precedes every legacy content attempt and, therefore, every later
+    // ordinary identity removal. The tombstone is durable even when legacy
+    // deletion needs a retry, so future v3 work cannot acquire/recreate the
+    // old archive after an account enters deletion.
+    if !tombstoned || archive_binding_conn(&tx, user_id)?.is_some() {
+        tombstone_archive_deletion_ledger_conn(&tx, user_id, fence_object_name)?;
     }
     tx.execute(
         "INSERT OR IGNORE INTO account_deletion_operations
@@ -724,12 +1737,317 @@ fn update_user_deletion_status_conn(
 }
 
 impl ControlStore {
+    /// Test-only constructor for control-plane behavior that never performs a
+    /// legacy user-ID rebind. Production has no ungated constructor.
+    #[cfg(test)]
     pub fn new(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>) -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: Arc::new(Mutex::new(None)),
             kms,
             gcs,
+            lifecycle_store: None,
         }
+    }
+
+    pub fn new_with_store(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        lifecycle_store: Arc<Store>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            kms,
+            gcs,
+            lifecycle_store: Some(lifecycle_store),
+        }
+    }
+
+    pub(crate) async fn initialize_legacy_fence_key(&self) -> Result<()> {
+        match self.lifecycle_store.as_ref() {
+            Some(store) => {
+                // Loading the exact durable control generation installs its
+                // KMS-protected DEK as the Store's HMAC key. A new database is
+                // made durable by a no-op transaction before this returns.
+                if !store.legacy_fence_key_initialized()? {
+                    self.read(|_| Ok(())).await?;
+                }
+                if !store.legacy_fence_key_initialized()? {
+                    self.write(|_| Ok(())).await?;
+                }
+                if !store.legacy_fence_key_initialized()? {
+                    return Err(EnclaveError::Store(
+                        "durable legacy fence key initialization failed".into(),
+                    ));
+                }
+                Ok(())
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    Ok(())
+                }
+                #[cfg(not(test))]
+                {
+                    Err(EnclaveError::Store(
+                        "legacy fence key lacks lifecycle authority".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn identity_rebind_fence_object_name(&self, user_id: &str) -> Result<String> {
+        self.initialize_legacy_fence_key().await?;
+        match self.lifecycle_store.as_ref() {
+            Some(store) => {
+                let retained = self
+                    .read({
+                        let user_id = user_id.to_string();
+                        move |conn| {
+                            Ok(archive_deletion_ledger_conn(conn, &user_id)?
+                                .and_then(|ledger| ledger.legacy_rebind_fence_object_name))
+                        }
+                    })
+                    .await?;
+                match retained {
+                    Some(name) => Ok(name),
+                    None => store.identity_rebind_fence_object_name(user_id),
+                }
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    Ok(crate::store::test_identity_rebind_fence_object_name(
+                        user_id,
+                    ))
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = user_id;
+                    Err(EnclaveError::Store(
+                        "legacy fence name lacks lifecycle authority".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn prepare_identity_rebind(
+        &self,
+        google_sub: &str,
+        old_user_id: &str,
+        stable_user_id: &str,
+        binding: ArchiveBinding,
+        source: &IdentityRebindSource,
+    ) -> Result<IdentityRebindOperation> {
+        let proposed_operation_id = format!("rebind_{}", super::tokens::random_token_hex());
+        let fence_object_name = self.identity_rebind_fence_object_name(old_user_id).await?;
+        let attempt = self
+            .write({
+                let proposed_operation_id = proposed_operation_id.clone();
+                let google_sub = google_sub.to_string();
+                let old_user_id = old_user_id.to_string();
+                let stable_user_id = stable_user_id.to_string();
+                let fence_object_name = fence_object_name.clone();
+                let source_base_generation = source.base_generation;
+                let source_commitment = source.commitment;
+                move |conn| {
+                    let source = IdentityRebindSource {
+                        base_generation: source_base_generation,
+                        source_generation: source_base_generation,
+                        commitment: source_commitment,
+                        plaintext: Vec::new(),
+                        wrapped_dek_b64: String::new(),
+                    };
+                    prepare_identity_rebind_conn(
+                        conn,
+                        &proposed_operation_id,
+                        &google_sub,
+                        &old_user_id,
+                        &stable_user_id,
+                        &fence_object_name,
+                        binding,
+                        &source,
+                    )
+                }
+            })
+            .await;
+        match attempt {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                // A competing control generation or a lost successful PUT is
+                // resolved only by reloading the encrypted authority and
+                // comparing every exact prepared field.
+                let observed = self
+                    .read({
+                        let google_sub = google_sub.to_string();
+                        move |conn| identity_rebind_operation_for_subject_conn(conn, &google_sub)
+                    })
+                    .await?;
+                match observed {
+                    Some(operation)
+                        if operation.old_user_id == old_user_id
+                            && operation.stable_user_id == stable_user_id
+                            && operation.binding == binding
+                            && operation.source_base_generation == source.base_generation
+                            && operation.source_commitment == source.commitment =>
+                    {
+                        Ok(operation)
+                    }
+                    _ => Err(error),
+                }
+            }
+        }
+    }
+
+    async fn advance_identity_rebind(
+        &self,
+        operation: &IdentityRebindOperation,
+        next_stage: IdentityRebindStage,
+        source_generation: Option<i64>,
+    ) -> Result<IdentityRebindOperation> {
+        let attempt = self
+            .write({
+                let operation = operation.clone();
+                move |conn| {
+                    advance_identity_rebind_conn(conn, &operation, next_stage, source_generation)
+                }
+            })
+            .await;
+        match attempt {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let observed = self
+                    .read({
+                        let google_sub = operation.google_sub.clone();
+                        move |conn| identity_rebind_operation_for_subject_conn(conn, &google_sub)
+                    })
+                    .await?;
+                match observed {
+                    Some(current)
+                        if current.operation_id == operation.operation_id
+                            && current.binding == operation.binding
+                            && current.source_commitment == operation.source_commitment
+                            && current.stage >= next_stage =>
+                    {
+                        Ok(current)
+                    }
+                    _ => Err(error),
+                }
+            }
+        }
+    }
+
+    async fn rebase_identity_rebind_source(
+        &self,
+        operation: &IdentityRebindOperation,
+        source: &IdentityRebindSource,
+    ) -> Result<IdentityRebindOperation> {
+        let attempt = self
+            .write({
+                let operation = operation.clone();
+                let source_base_generation = source.source_generation;
+                let source_commitment = source.commitment;
+                move |conn| {
+                    let source = IdentityRebindSource {
+                        base_generation: source_base_generation,
+                        source_generation: source_base_generation,
+                        commitment: source_commitment,
+                        plaintext: Vec::new(),
+                        wrapped_dek_b64: String::new(),
+                    };
+                    rebase_identity_rebind_source_conn(conn, &operation, &source)
+                }
+            })
+            .await;
+        match attempt {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let observed = self
+                    .read({
+                        let google_sub = operation.google_sub.clone();
+                        move |conn| identity_rebind_operation_for_subject_conn(conn, &google_sub)
+                    })
+                    .await?;
+                match observed {
+                    Some(current)
+                        if current.operation_id == operation.operation_id
+                            && current.stage == IdentityRebindStage::SourceFreezing
+                            && current.source_base_generation == source.source_generation
+                            && current.source_commitment == source.commitment =>
+                    {
+                        Ok(current)
+                    }
+                    _ => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Recover a bounded set of durable identity transitions before request
+    /// admission starts. Ordinary pending stages run to `committed`; if an
+    /// account entered deletion while a provider create was explicitly in
+    /// flight, recovery records that create's exact completed stage and leaves
+    /// the deletion reconciler to claim and purge both namespaces.
+    pub(crate) async fn reconcile_pending_identity_rebinds(&self) -> Result<usize> {
+        const STARTUP_REBIND_PAGE_SIZE: i64 = 64;
+        const STARTUP_REBIND_HARD_LIMIT: usize = 4096;
+        let store = self.lifecycle_store.as_ref().cloned().ok_or_else(|| {
+            EnclaveError::Store("identity rebind recovery lacks lifecycle authority".into())
+        })?;
+        let mut recovered = 0usize;
+        let mut inspected = 0usize;
+        loop {
+            let operations = self
+                .read(|conn| {
+                    pending_identity_rebind_operations_conn(conn, STARTUP_REBIND_PAGE_SIZE)
+                })
+                .await?;
+            if operations.is_empty() {
+                break;
+            }
+            if inspected.saturating_add(operations.len()) > STARTUP_REBIND_HARD_LIMIT {
+                return Err(EnclaveError::Store(
+                    "identity rebind startup backlog exceeds the hard safety limit".into(),
+                ));
+            }
+            inspected = inspected.saturating_add(operations.len());
+            for operation in operations {
+                let email = self
+                    .read({
+                        let google_sub = operation.google_sub.clone();
+                        move |conn| {
+                            conn.query_row(
+                                "SELECT email FROM users WHERE google_sub = ?1",
+                                [&google_sub],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?
+                            .ok_or_else(|| {
+                                EnclaveError::Store(
+                                    "pending identity rebind lost its account".into(),
+                                )
+                            })
+                        }
+                    })
+                    .await?;
+                let transition = store
+                    .begin_identity_rebind(&operation.old_user_id, &operation.stable_user_id)
+                    .await?;
+                match self
+                    .resume_identity_rebind(operation, transition, email)
+                    .await
+                {
+                    Ok(_) => recovered = recovered.saturating_add(1),
+                    // Deletion is the durable winner. A writing stage was
+                    // reconciled before this result; safe stages are left for
+                    // the deletion worker without provider mutation.
+                    Err(EnclaveError::Auth(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(recovered)
     }
 
     /// Run a read-only closure against the control DB (loads on first use).
@@ -799,7 +2117,7 @@ impl ControlStore {
     }
 
     async fn load(&self) -> Result<Handle> {
-        let (plaintext, meta) = match self.gcs.get_object(CONTROL_OBJECT).await {
+        let (plaintext, meta, durable_fence_key) = match self.gcs.get_object(CONTROL_OBJECT).await {
             Ok(resp) => {
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
                 let opened = decrypt_bound_blob(&dek, &resp.ciphertext, CONTROL_CONTEXT)?;
@@ -809,6 +2127,7 @@ impl ControlStore {
                         generation: resp.generation,
                         wrapped_dek_b64: resp.wrapped_dek_b64,
                     },
+                    Some(dek.0),
                 )
             }
             Err(EnclaveError::NotFound) => {
@@ -820,10 +2139,15 @@ impl ControlStore {
                         generation: 0,
                         wrapped_dek_b64: wrapped,
                     },
+                    None,
                 )
             }
             Err(e) => return Err(e),
         };
+
+        if let (Some(store), Some(key)) = (self.lifecycle_store.as_ref(), durable_fence_key) {
+            store.install_legacy_fence_key(key)?;
+        }
 
         let temp_path = std::env::temp_dir().join(format!(
             "kioku-control-{}.db",
@@ -860,6 +2184,7 @@ impl ControlStore {
                 Err(error) => return Err(error.into()),
             }
         }
+        schema_migrations += backfill_archive_bindings_conn(&conn)?;
         // Historical builds retained raw search text in the central accounting
         // DB. Remove it during load so the migration is automatic and durable.
         let redacted_queries = conn.execute(
@@ -889,7 +2214,7 @@ impl ControlStore {
         let db_bytes = tokio::fs::read(&handle.temp_path).await?;
         let dek = load_dek(self.kms.as_ref(), &handle.meta.wrapped_dek_b64).await?;
         let ciphertext = encrypt_bound_blob(&dek, &db_bytes, CONTROL_CONTEXT)?;
-        let new_gen = self
+        let put_result = self
             .gcs
             .put_object(
                 CONTROL_OBJECT,
@@ -897,14 +2222,36 @@ impl ControlStore {
                 &handle.meta.wrapped_dek_b64,
                 handle.meta.generation,
             )
-            .await?;
+            .await;
+        let new_gen = match put_result {
+            Ok(generation) => generation,
+            Err(error) => match self.gcs.get_object(CONTROL_OBJECT).await {
+                Ok(current)
+                    if current.generation > handle.meta.generation
+                        && current.wrapped_dek_b64 == handle.meta.wrapped_dek_b64
+                        && current.ciphertext == ciphertext =>
+                {
+                    // Exact reread is the only authority for a control PUT
+                    // whose response was lost. A different ciphertext is a
+                    // genuine competing control generation and remains an
+                    // error even when its decoded rows happen to look similar.
+                    current.generation
+                }
+                _ => return Err(error),
+            },
+        };
         handle.meta.generation = new_gen;
+        if let Some(store) = self.lifecycle_store.as_ref() {
+            let dek = load_dek(self.kms.as_ref(), &handle.meta.wrapped_dek_b64).await?;
+            store.install_legacy_fence_key(dek.0)?;
+        }
         Ok(())
     }
 
     /// Move a pre-stable-id user database without breaking its object-bound
     /// AEAD context. A raw GCS copy would retain the old context and become
     /// undecryptable under the stable object's name.
+    #[cfg(test)]
     async fn rebind_user_blob(&self, old_user_id: &str, new_user_id: &str) -> Result<()> {
         let old_object = format!("indexes/{old_user_id}.db.enc");
         let new_object = format!("indexes/{new_user_id}.db.enc");
@@ -1029,6 +2376,540 @@ impl ControlStore {
 
     // ── Identity ────────────────────────────────────────────────────────────────
 
+    async fn decode_rebind_source_response(
+        &self,
+        operation: &IdentityRebindOperation,
+        response: crate::store::GcsGetResponse,
+        user_id_context: &str,
+        require_source_generation: bool,
+    ) -> Result<IdentityRebindSource> {
+        let expected_generation = operation.source_generation.ok_or_else(|| {
+            EnclaveError::Store("identity rebind source generation is missing".into())
+        })?;
+        if require_source_generation && response.generation != expected_generation {
+            return Err(EnclaveError::Conflict(
+                "identity rebind source generation changed".into(),
+            ));
+        }
+        let dek = load_dek(self.kms.as_ref(), &response.wrapped_dek_b64).await?;
+        let opened = decrypt_bound_blob(
+            &dek,
+            &response.ciphertext,
+            &crate::store::user_blob_context(user_id_context),
+        )?;
+        let commitment: [u8; 32] = Sha256::digest(&opened.plaintext).into();
+        if commitment != operation.source_commitment {
+            return Err(EnclaveError::Conflict(
+                "identity rebind source commitment changed".into(),
+            ));
+        }
+        Ok(IdentityRebindSource {
+            base_generation: operation.source_base_generation,
+            source_generation: expected_generation,
+            commitment,
+            plaintext: opened.plaintext,
+            wrapped_dek_b64: response.wrapped_dek_b64,
+        })
+    }
+
+    async fn load_identity_rebind_source(
+        &self,
+        operation: &IdentityRebindOperation,
+    ) -> Result<IdentityRebindSource> {
+        let generation = operation.source_generation.ok_or_else(|| {
+            EnclaveError::Store("identity rebind source generation is missing".into())
+        })?;
+        match self
+            .gcs
+            .get_object_generation(&operation.old_object_name, generation)
+            .await
+        {
+            Ok(response) => {
+                self.decode_rebind_source_response(
+                    operation,
+                    response,
+                    &operation.old_user_id,
+                    true,
+                )
+                .await
+            }
+            Err(EnclaveError::NotFound)
+                if operation.stage >= IdentityRebindStage::StableWritten =>
+            {
+                let response = self.gcs.get_object(&operation.stable_object_name).await?;
+                self.decode_rebind_source_response(
+                    operation,
+                    response,
+                    &operation.stable_user_id,
+                    false,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn validate_stable_rebind_target(
+        &self,
+        operation: &IdentityRebindOperation,
+        source: &IdentityRebindSource,
+    ) -> Result<()> {
+        let existing = self.gcs.get_object(&operation.stable_object_name).await?;
+        if existing.wrapped_dek_b64 != source.wrapped_dek_b64 {
+            return Err(EnclaveError::Conflict(
+                "stable rebind target uses a different wrapped key".into(),
+            ));
+        }
+        let dek = load_dek(self.kms.as_ref(), &existing.wrapped_dek_b64).await?;
+        let opened = decrypt_bound_blob(
+            &dek,
+            &existing.ciphertext,
+            &crate::store::user_blob_context(&operation.stable_user_id),
+        )?;
+        let commitment: [u8; 32] = Sha256::digest(&opened.plaintext).into();
+        if commitment != operation.source_commitment || opened.plaintext != source.plaintext {
+            return Err(EnclaveError::Conflict(
+                "stable rebind target differs from its exact source".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn identity_rebind_account_is_active(
+        &self,
+        operation: &IdentityRebindOperation,
+    ) -> Result<bool> {
+        let google_sub = operation.google_sub.clone();
+        let old_user_id = operation.old_user_id.clone();
+        self.read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT status = 'active' FROM users
+                     WHERE google_sub = ?1 AND id = ?2",
+                    rusqlite::params![google_sub, old_user_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false))
+        })
+        .await
+    }
+
+    async fn ensure_identity_rebind_provider_fence(
+        &self,
+        operation: &IdentityRebindOperation,
+    ) -> Result<String> {
+        let store = self.lifecycle_store.as_ref().ok_or_else(|| {
+            EnclaveError::Store("identity rebind fence lacks lifecycle authority".into())
+        })?;
+        let authority = store
+            .fence_and_drain_legacy_writes(&operation.old_user_id, &operation.operation_id)
+            .await?;
+        if authority != operation.operation_id {
+            return Err(EnclaveError::Auth(
+                "account deletion superseded identity rebind provider authority".into(),
+            ));
+        }
+        Ok(authority)
+    }
+
+    async fn resume_identity_rebind(
+        &self,
+        mut operation: IdentityRebindOperation,
+        mut transition: crate::store::IdentityRebindTransition,
+        email: String,
+    ) -> Result<User> {
+        if operation.stage >= IdentityRebindStage::DeletionPending {
+            return Err(EnclaveError::Auth(
+                "account deletion superseded identity rebind".into(),
+            ));
+        }
+        if operation.stage >= IdentityRebindStage::Committed {
+            transition.complete().await;
+            return self
+                .identity_user("google", &operation.google_sub)
+                .await?
+                .ok_or_else(|| {
+                    EnclaveError::Store("committed identity rebind lost its user".into())
+                });
+        }
+        let mut account_active = self.identity_rebind_account_is_active(&operation).await?;
+        if !account_active
+            && !matches!(
+                operation.stage,
+                IdentityRebindStage::SourceFreezing | IdentityRebindStage::StableWriting
+            )
+        {
+            return Err(EnclaveError::Auth(
+                "account deletion superseded identity rebind".into(),
+            ));
+        }
+
+        if operation.stage == IdentityRebindStage::Prepared {
+            operation = self
+                .advance_identity_rebind(&operation, IdentityRebindStage::SourceFreezing, None)
+                .await?;
+            if operation.stage >= IdentityRebindStage::DeletionPending {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+        }
+
+        let source = if operation.stage == IdentityRebindStage::SourceFreezing {
+            let marker_authority = self
+                .ensure_identity_rebind_provider_fence(&operation)
+                .await?;
+            let first_freeze = transition
+                .freeze_source(
+                    operation.source_base_generation,
+                    &operation.source_commitment,
+                    &marker_authority,
+                )
+                .await;
+            let frozen = match first_freeze {
+                Ok(frozen) => frozen,
+                Err(error @ EnclaveError::Conflict(_)) => {
+                    let refreshed = transition.source_snapshot().await?;
+                    operation = self
+                        .rebase_identity_rebind_source(&operation, &refreshed)
+                        .await?;
+                    transition
+                        .freeze_source(
+                            operation.source_base_generation,
+                            &operation.source_commitment,
+                            &marker_authority,
+                        )
+                        .await
+                        .map_err(|retry_error| match retry_error {
+                            EnclaveError::Conflict(_) => error,
+                            other => other,
+                        })?
+                }
+                Err(error) => return Err(error),
+            };
+            operation = self
+                .advance_identity_rebind(
+                    &operation,
+                    IdentityRebindStage::SourceFrozen,
+                    Some(frozen.source_generation),
+                )
+                .await?;
+            account_active = self.identity_rebind_account_is_active(&operation).await?;
+            if operation.stage >= IdentityRebindStage::DeletionPending {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+            if !account_active {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+            frozen
+        } else {
+            self.load_identity_rebind_source(&operation).await?
+        };
+
+        if operation.stage == IdentityRebindStage::SourceFrozen {
+            match self.gcs.get_object(&operation.stable_object_name).await {
+                Err(EnclaveError::NotFound) => {}
+                Ok(_) => {
+                    return Err(EnclaveError::Conflict(
+                        "stable rebind target appeared before write intent".into(),
+                    ))
+                }
+                Err(error) => return Err(error),
+            }
+            operation = self
+                .advance_identity_rebind(
+                    &operation,
+                    IdentityRebindStage::StableWriting,
+                    operation.source_generation,
+                )
+                .await?;
+            account_active = self.identity_rebind_account_is_active(&operation).await?;
+            if operation.stage >= IdentityRebindStage::DeletionPending {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+            if !account_active {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+        }
+
+        if operation.stage == IdentityRebindStage::StableWriting {
+            let store = self.lifecycle_store.as_ref().ok_or_else(|| {
+                EnclaveError::Store("stable rebind write lacks lifecycle authority".into())
+            })?;
+            store
+                .reconcile_stable_rebind_intents(&operation.stable_user_id)
+                .await?;
+            match self
+                .validate_stable_rebind_target(&operation, &source)
+                .await
+            {
+                Ok(()) => {}
+                Err(EnclaveError::NotFound) => {
+                    let dek = load_dek(self.kms.as_ref(), &source.wrapped_dek_b64).await?;
+                    let rebound = encrypt_bound_blob(
+                        &dek,
+                        &source.plaintext,
+                        &crate::store::user_blob_context(&operation.stable_user_id),
+                    )?;
+                    match store
+                        .put_stable_rebind_index(
+                            &operation.stable_user_id,
+                            &operation.stable_object_name,
+                            &rebound,
+                            &source.wrapped_dek_b64,
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(EnclaveError::Conflict(_)) => {
+                            self.validate_stable_rebind_target(&operation, &source)
+                                .await?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            self.validate_stable_rebind_target(&operation, &source)
+                .await?;
+            operation = self
+                .advance_identity_rebind(
+                    &operation,
+                    IdentityRebindStage::StableWritten,
+                    operation.source_generation,
+                )
+                .await?;
+            account_active = self.identity_rebind_account_is_active(&operation).await?;
+            if !account_active {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+        } else if operation.stage >= IdentityRebindStage::StableWritten {
+            self.validate_stable_rebind_target(&operation, &source)
+                .await?;
+        }
+
+        if operation.stage == IdentityRebindStage::StableWritten {
+            operation = self
+                .advance_identity_rebind(
+                    &operation,
+                    IdentityRebindStage::OldPurging,
+                    operation.source_generation,
+                )
+                .await?;
+            if operation.stage >= IdentityRebindStage::DeletionPending {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+        }
+        if operation.stage == IdentityRebindStage::OldPurging {
+            crate::store::delete_all_object_generations(
+                self.gcs.as_ref(),
+                &operation.old_object_name,
+            )
+            .await?;
+            operation = self
+                .advance_identity_rebind(
+                    &operation,
+                    IdentityRebindStage::OldPurged,
+                    operation.source_generation,
+                )
+                .await?;
+            if operation.stage >= IdentityRebindStage::DeletionPending {
+                return Err(EnclaveError::Auth(
+                    "account deletion superseded identity rebind".into(),
+                ));
+            }
+        }
+        if operation.stage == IdentityRebindStage::OldPurged {
+            let user = match self.commit_identity_rebind(email, operation.clone()).await {
+                Ok(user) => user,
+                Err(error) => {
+                    let observed = self
+                        .read({
+                            let google_sub = operation.google_sub.clone();
+                            move |conn| {
+                                identity_rebind_operation_for_subject_conn(conn, &google_sub)
+                            }
+                        })
+                        .await?;
+                    match observed {
+                        Some(current)
+                            if current.operation_id == operation.operation_id
+                                && current.stage >= IdentityRebindStage::Committed
+                                && current.stage < IdentityRebindStage::DeletionPending =>
+                        {
+                            self.identity_user("google", &operation.google_sub)
+                                .await?
+                                .ok_or_else(|| {
+                                    EnclaveError::Store(
+                                        "committed identity rebind lost its user".into(),
+                                    )
+                                })?
+                        }
+                        _ => return Err(error),
+                    }
+                }
+            };
+            transition.complete().await;
+            return Ok(user);
+        }
+        if operation.stage >= IdentityRebindStage::Committed
+            && operation.stage < IdentityRebindStage::DeletionPending
+        {
+            transition.complete().await;
+            return self
+                .identity_user("google", &operation.google_sub)
+                .await?
+                .ok_or_else(|| {
+                    EnclaveError::Store("committed identity rebind lost its user".into())
+                });
+        }
+        Err(EnclaveError::Store(
+            "identity rebind stopped in an invalid stage".into(),
+        ))
+    }
+
+    async fn commit_identity_rebind(
+        &self,
+        email: String,
+        operation: IdentityRebindOperation,
+    ) -> Result<User> {
+        let google_sub = operation.google_sub.clone();
+        let stable_id = operation.stable_user_id.clone();
+        let existing = Some((
+            operation.old_user_id.clone(),
+            String::new(),
+            operation.binding,
+        ));
+        self.write(move |conn| {
+            conn.execute("BEGIN TRANSACTION", [])?;
+            let res = (|| -> Result<()> {
+                if is_deleted_user_conn(conn, &stable_id)? {
+                    return Err(EnclaveError::Auth("account deleted".into()));
+                }
+                if let Some((ref old_id, _, source_binding)) = existing {
+                    let status: Option<String> = conn
+                        .query_row(
+                            "SELECT status FROM users WHERE google_sub = ?1",
+                            [&google_sub],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if status.as_deref() != Some("active") {
+                        return Err(EnclaveError::Auth("account inactive".into()));
+                    }
+                    if old_id != &stable_id {
+                        validate_archive_rebind_conn(
+                            conn,
+                            &google_sub,
+                            old_id,
+                            &stable_id,
+                            source_binding,
+                        )?;
+                        conn.execute(
+                            "UPDATE users SET id = ?1, email = ?2 WHERE google_sub = ?3",
+                            rusqlite::params![stable_id, email, google_sub],
+                        )?;
+                        for table in [
+                            "usage_daily",
+                            "billing_accounts",
+                            "recording_leases",
+                            "recording_lease_requests",
+                            "refresh_tokens",
+                            "oauth_authorization_codes",
+                            "oauth_consents",
+                            "query_log",
+                            "vertex_coverage_anchors",
+                            "recording_lease_denials",
+                            "webhook_subscriptions",
+                            "episode_email_preferences",
+                            "auth_identities",
+                            "apple_credentials",
+                            "archive_bindings",
+                        ] {
+                            conn.execute(
+                                &format!("UPDATE {table} SET user_id = ?1 WHERE user_id = ?2"),
+                                rusqlite::params![stable_id, old_id],
+                            )?;
+                        }
+                    } else {
+                        conn.execute(
+                            "UPDATE users SET email = ?1 WHERE google_sub = ?2",
+                            rusqlite::params![email, google_sub],
+                        )?;
+                    }
+                } else {
+                    conn.execute(
+                        "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email
+                         WHERE users.id = excluded.id AND users.status = 'active'",
+                        rusqlite::params![stable_id, google_sub, email],
+                    )?;
+                    let created_status: Option<(String, String)> = conn
+                        .query_row(
+                            "SELECT id, status FROM users WHERE google_sub = ?1",
+                            [&google_sub],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    if !matches!(created_status, Some((ref id, ref status)) if id == &stable_id && status == "active") {
+                        return Err(EnclaveError::Auth("account inactive".into()));
+                    }
+                }
+                conn.execute(
+                    "INSERT INTO auth_identities (provider, subject, user_id, email) VALUES ('google', ?1, ?2, ?3) ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    rusqlite::params![google_sub, stable_id, email],
+                )?;
+                if archive_binding_conn(conn, &stable_id)?.is_some() {
+                    validate_active_archive_binding_conn(conn, &stable_id)?;
+                } else if existing.is_none() {
+                    create_active_archive_binding_conn(conn, &stable_id)?;
+                } else {
+                    return Err(EnclaveError::Store(
+                        "existing account lost its archive binding".into(),
+                    ));
+                }
+                let committed = advance_identity_rebind_conn(
+                    conn,
+                    &operation,
+                    IdentityRebindStage::Committed,
+                    operation.source_generation,
+                )?;
+                if committed.stage != IdentityRebindStage::Committed {
+                    return Err(EnclaveError::Store(
+                        "identity rebind control commit did not become durable".into(),
+                    ));
+                }
+                Ok(())
+            })();
+
+            if res.is_ok() {
+                conn.execute("COMMIT", [])?;
+            } else {
+                let _ = conn.execute("ROLLBACK", []);
+            }
+            res?;
+
+            Ok(User {
+                id: stable_id,
+                email,
+            })
+        })
+        .await
+    }
+
     /// Upsert a user by `google_sub`; returns id + email.
     pub async fn upsert_user(&self, google_sub: &str, email: &str) -> Result<User> {
         let google_sub = google_sub.to_string();
@@ -1062,7 +2943,10 @@ impl ControlStore {
                         Some((_, _, ref status)) if status != "active" => {
                             Err(EnclaveError::Auth("account inactive".into()))
                         }
-                        Some((id, current_email, _)) => Ok(Some((id, current_email))),
+                        Some((id, current_email, _)) => {
+                            let binding = validate_active_archive_binding_conn(conn, &id)?;
+                            Ok(Some((id, current_email, binding)))
+                        }
                         None => Ok(None),
                     }
                 }
@@ -1073,7 +2957,7 @@ impl ControlStore {
         // the encrypted control DB for the overwhelmingly common no-op case;
         // screenshot upload bursts otherwise exceed GCS's per-object write
         // rate and turn valid image requests into intermittent 500 responses.
-        if let Some((existing_id, existing_email)) = existing.as_ref() {
+        if let Some((existing_id, existing_email, _)) = existing.as_ref() {
             if existing_id == &stable_id && existing_email == &email {
                 return Ok(User {
                     id: stable_id,
@@ -1082,26 +2966,70 @@ impl ControlStore {
             }
         }
 
-        // 2. If it has an old ID, authenticate and re-encrypt the GCS blob under
-        // the stable object's context before updating the identity row.
-        if let Some((old_id, _)) = existing.as_ref() {
+        // 2. Legacy IDs enter an owned, durable state machine. The Store-owned
+        // transition fences both namespaces and snapshots the latest actor;
+        // the encrypted prepare record is committed before its first provider
+        // write, then remains the authority across retries and restarts.
+        if let Some((old_id, _, source_binding)) = existing.as_ref() {
             if old_id != &stable_id {
-                info!(
-                    old_id = %old_id,
-                    stable_id = %stable_id,
-                    "rebinding GCS index blob to stable ID"
-                );
-                match self.rebind_user_blob(old_id, &stable_id).await {
-                    Ok(_) => {}
-                    Err(EnclaveError::NotFound) => {
-                        info!("no existing GCS index blob found, skipping GCS rename");
-                    }
-                    Err(e) => return Err(e),
-                }
+                let owned = ControlStore::clone(self);
+                let old_id = old_id.clone();
+                let stable_id = stable_id.clone();
+                let google_sub = google_sub.clone();
+                let email = email.clone();
+                let source_binding = *source_binding;
+                let task = tokio::spawn(async move {
+                    let store = owned.lifecycle_store.as_ref().cloned().ok_or_else(|| {
+                        EnclaveError::Store(
+                            "legacy identity rebind lacks lifecycle authority".into(),
+                        )
+                    })?;
+                    let mut transition = store.begin_identity_rebind(&old_id, &stable_id).await?;
+                    let pending = owned
+                        .read({
+                            let google_sub = google_sub.clone();
+                            move |conn| {
+                                identity_rebind_operation_for_subject_conn(conn, &google_sub)
+                            }
+                        })
+                        .await?;
+                    let operation = match pending {
+                        Some(operation) => {
+                            if operation.old_user_id != old_id
+                                || operation.stable_user_id != stable_id
+                                || operation.binding != source_binding
+                            {
+                                return Err(EnclaveError::Conflict(
+                                    "durable identity rebind authority conflicts with login".into(),
+                                ));
+                            }
+                            operation
+                        }
+                        None => {
+                            let source = transition.source_snapshot().await?;
+                            owned
+                                .prepare_identity_rebind(
+                                    &google_sub,
+                                    &old_id,
+                                    &stable_id,
+                                    source_binding,
+                                    &source,
+                                )
+                                .await?
+                        }
+                    };
+                    owned
+                        .resume_identity_rebind(operation, transition, email)
+                        .await
+                });
+                return task.await.map_err(|_| {
+                    EnclaveError::Store("legacy identity rebind task failed".into())
+                })?;
             }
         }
 
-        // 3. Perform database transaction to insert or update user ID
+        // 3. Perform database transaction to insert or update user ID. The
+        // legacy-ID case returned through the durable state machine above.
         let existing_cloned = existing.clone();
         self.write(move |conn| {
             conn.execute("BEGIN TRANSACTION", [])?;
@@ -1109,7 +3037,7 @@ impl ControlStore {
                 if is_deleted_user_conn(conn, &stable_id)? {
                     return Err(EnclaveError::Auth("account deleted".into()));
                 }
-                if let Some((ref old_id, _)) = existing_cloned {
+                if let Some((ref old_id, _, source_binding)) = existing_cloned {
                     let status: Option<String> = conn
                         .query_row(
                             "SELECT status FROM users WHERE google_sub = ?1",
@@ -1121,66 +3049,16 @@ impl ControlStore {
                         return Err(EnclaveError::Auth("account inactive".into()));
                     }
                     if old_id != &stable_id {
-                        conn.execute(
-                            "UPDATE users SET id = ?1, email = ?2 WHERE google_sub = ?3",
-                            rusqlite::params![stable_id, email, google_sub],
+                        validate_archive_rebind_conn(
+                            conn,
+                            &google_sub,
+                            old_id,
+                            &stable_id,
+                            source_binding,
                         )?;
-                        conn.execute(
-                            "UPDATE usage_daily SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE billing_accounts SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE recording_leases SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE recording_lease_requests SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE refresh_tokens SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE oauth_authorization_codes SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE oauth_consents SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE query_log SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE vertex_coverage_anchors SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE recording_lease_denials SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE webhook_subscriptions SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE episode_email_preferences SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE auth_identities SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
-                        conn.execute(
-                            "UPDATE apple_credentials SET user_id = ?1 WHERE user_id = ?2",
-                            rusqlite::params![stable_id, old_id],
-                        )?;
+                        return Err(EnclaveError::Store(
+                            "legacy identity rebind bypassed its durable state machine".into(),
+                        ));
                     } else {
                         conn.execute(
                             "UPDATE users SET email = ?1 WHERE google_sub = ?2",
@@ -1189,14 +3067,35 @@ impl ControlStore {
                     }
                 } else {
                     conn.execute(
-                        "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
+                        "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email
+                         WHERE users.id = excluded.id AND users.status = 'active'",
                         rusqlite::params![stable_id, google_sub, email],
                     )?;
+                    let created_status: Option<(String, String)> = conn
+                        .query_row(
+                            "SELECT id, status FROM users WHERE google_sub = ?1",
+                            [&google_sub],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    if !matches!(created_status, Some((ref id, ref status)) if id == &stable_id && status == "active") {
+                        return Err(EnclaveError::Auth("account inactive".into()));
+                    }
                 }
                 conn.execute(
                     "INSERT INTO auth_identities (provider, subject, user_id, email) VALUES ('google', ?1, ?2, ?3) ON CONFLICT(provider, subject) DO UPDATE SET email = excluded.email, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
                     rusqlite::params![google_sub, stable_id, email],
                 )?;
+                if archive_binding_conn(conn, &stable_id)?.is_some() {
+                    validate_active_archive_binding_conn(conn, &stable_id)?;
+                } else if existing_cloned.is_none() {
+                    create_active_archive_binding_conn(conn, &stable_id)?;
+                } else {
+                    return Err(EnclaveError::Store(
+                        "existing account lost its archive binding".into(),
+                    ));
+                }
                 Ok(())
             })();
 
@@ -1221,7 +3120,7 @@ impl ControlStore {
         let provider = provider.to_string();
         let subject = subject.to_string();
         self.read(move |conn| {
-            Ok(conn
+            let user = conn
                 .query_row(
                     "SELECT u.id, u.email FROM auth_identities i JOIN users u ON u.id = i.user_id WHERE i.provider = ?1 AND i.subject = ?2 AND u.status = 'active'",
                     rusqlite::params![provider, subject],
@@ -1232,7 +3131,11 @@ impl ControlStore {
                         })
                     },
                 )
-                .optional()?)
+                .optional()?;
+            if let Some(user) = &user {
+                validate_active_archive_binding_conn(conn, &user.id)?;
+            }
+            Ok(user)
         })
         .await
     }
@@ -1266,6 +3169,7 @@ impl ControlStore {
             ).optional()?;
             let (user_id, primary_email) = match existing {
                 Some((user_id, primary_email, status)) if status == "active" => {
+                    validate_active_archive_binding_conn(&tx, &user_id)?;
                     tx.execute(
                         "UPDATE auth_identities SET email = ?1, last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE provider = ?2 AND subject = ?3",
                         rusqlite::params![email, provider, subject],
@@ -1286,11 +3190,16 @@ impl ControlStore {
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     ).optional()?;
                     match collision {
-                        None => tx.execute(
-                            "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![stable_id, compatibility_anchor, email],
-                        )?,
-                        Some((anchor, status)) if anchor == compatibility_anchor && status == "active" => 0,
+                        None => {
+                            tx.execute(
+                                "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
+                                rusqlite::params![stable_id, compatibility_anchor, email],
+                            )?;
+                            create_active_archive_binding_conn(&tx, &stable_id)?;
+                        }
+                        Some((anchor, status)) if anchor == compatibility_anchor && status == "active" => {
+                            validate_active_archive_binding_conn(&tx, &stable_id)?;
+                        }
                         Some(_) => {
                             tx.rollback()?;
                             return Err(EnclaveError::Conflict("provider identity collision".into()));
@@ -1307,6 +3216,7 @@ impl ControlStore {
                 "INSERT INTO apple_credentials (user_id, client_id, refresh_token, revoked_at) VALUES (?1, ?2, ?3, NULL) ON CONFLICT(user_id, client_id) DO UPDATE SET refresh_token = excluded.refresh_token, last_validated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), revoked_at = NULL",
                 rusqlite::params![user_id, client_id, refresh_token],
             )?;
+            validate_active_archive_binding_conn(&tx, &user_id)?;
             tx.commit()?;
             Ok(User { id: user_id, email: primary_email })
         }).await
@@ -1333,6 +3243,7 @@ impl ControlStore {
                 tx.rollback()?;
                 return Err(EnclaveError::Auth("account inactive".into()));
             }
+            validate_active_archive_binding_conn(&tx, &user_id)?;
             if is_deleted_identity_conn(&tx, "apple", &subject)? {
                 tx.rollback()?;
                 return Err(EnclaveError::Auth("identity deleted".into()));
@@ -2048,6 +3959,21 @@ impl ControlStore {
             .await
     }
 
+    /// Internal inspection seam for future v3 deletion work. It is not a
+    /// route, export field, telemetry dimension, or provider integration.
+    #[allow(
+        dead_code,
+        reason = "reserved for the separately-authorized v3 deletion worker"
+    )]
+    pub(crate) async fn archive_deletion_ledger(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<ArchiveDeletionLedger>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| archive_deletion_ledger_conn(conn, &user_id))
+            .await
+    }
+
     pub async fn account_deletion_operation(
         &self,
         user_id: &str,
@@ -2055,6 +3981,123 @@ impl ControlStore {
         let user_id = user_id.to_string();
         self.read(move |conn| account_deletion_operation_conn(conn, &user_id))
             .await
+    }
+
+    /// Return the encrypted durable two-namespace authority associated with
+    /// either side of an identity rebind. The operation is internal-only and
+    /// its debug representation is deliberately opaque.
+    pub(crate) async fn identity_rebind_operation_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<IdentityRebindOperation>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| identity_rebind_operation_for_user_conn(conn, &user_id))
+            .await
+    }
+
+    /// Claim a pending identity rebind for account deletion. If the durable
+    /// operation is at a provider-write stage, this live retry owns both Store
+    /// lifecycle gates and resumes that exact intent until it reaches a stage
+    /// deletion can monotonically claim. Provider intent leases/CAS serialize
+    /// cross-instance takeover; progress never depends on a future restart.
+    pub(crate) async fn claim_identity_rebind_deletion(&self, user_id: &str) -> Result<bool> {
+        let user_id = user_id.to_string();
+        for _ in 0..4 {
+            let claimed = self
+                .write({
+                    let user_id = user_id.clone();
+                    move |conn| claim_identity_rebind_deletion_conn(conn, &user_id)
+                })
+                .await?;
+            let operation = self
+                .read({
+                    let user_id = user_id.clone();
+                    move |conn| identity_rebind_operation_for_user_conn(conn, &user_id)
+                })
+                .await?;
+            if claimed {
+                if let Some(operation) = operation {
+                    self.ensure_identity_rebind_provider_fence(&operation)
+                        .await?;
+                }
+                return Ok(true);
+            }
+
+            let operation = operation.ok_or_else(|| {
+                EnclaveError::Store("identity rebind deletion claim disappeared".into())
+            })?;
+            if !matches!(
+                operation.stage,
+                IdentityRebindStage::SourceFreezing | IdentityRebindStage::StableWriting
+            ) {
+                continue;
+            }
+            let store = self.lifecycle_store.as_ref().cloned().ok_or_else(|| {
+                EnclaveError::Store("identity rebind deletion lacks lifecycle authority".into())
+            })?;
+            let email = self
+                .read({
+                    let google_sub = operation.google_sub.clone();
+                    move |conn| {
+                        conn.query_row(
+                            "SELECT email FROM users WHERE google_sub = ?1",
+                            [&google_sub],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .ok_or_else(|| {
+                            EnclaveError::Store("identity rebind deletion lost its account".into())
+                        })
+                    }
+                })
+                .await?;
+            let transition = store
+                .begin_identity_rebind(&operation.old_user_id, &operation.stable_user_id)
+                .await?;
+            match self
+                .resume_identity_rebind(operation, transition, email)
+                .await
+            {
+                Ok(_) | Err(EnclaveError::Auth(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(EnclaveError::Conflict(
+            "identity rebind deletion claim did not reach a safe stage".into(),
+        ))
+    }
+
+    /// Record that both exact namespaces have completed physical deletion.
+    /// Final identity cleanup refuses to erase the operation before this
+    /// durable reconciliation point.
+    pub(crate) async fn mark_identity_rebind_deletion_reconciled(
+        &self,
+        user_id: &str,
+    ) -> Result<()> {
+        let user_id = user_id.to_string();
+        self.write(move |conn| {
+            let Some(operation) = identity_rebind_operation_for_user_conn(conn, &user_id)? else {
+                return Ok(());
+            };
+            if operation.stage < IdentityRebindStage::DeletionPending {
+                return Err(EnclaveError::Conflict(
+                    "identity rebind deletion was not durably claimed".into(),
+                ));
+            }
+            let reconciled = advance_identity_rebind_conn(
+                conn,
+                &operation,
+                IdentityRebindStage::DeletionReconciled,
+                operation.source_generation,
+            )?;
+            if reconciled.stage != IdentityRebindStage::DeletionReconciled {
+                return Err(EnclaveError::Conflict(
+                    "identity rebind deletion did not reconcile".into(),
+                ));
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// All user ids (for the summarizer sweep).
@@ -2131,8 +4174,11 @@ impl ControlStore {
     ) -> Result<Option<AccountDeletionOperation>> {
         let user_id = user_id.to_string();
         let proposed_operation_id = format!("del_{}", super::tokens::random_token_hex());
-        self.write(move |conn| begin_user_deletion_conn(conn, &user_id, &proposed_operation_id))
-            .await
+        let fence_object_name = self.identity_rebind_fence_object_name(&user_id).await?;
+        self.write(move |conn| {
+            begin_user_deletion_conn(conn, &user_id, &proposed_operation_id, &fence_object_name)
+        })
+        .await
     }
 
     /// Persist content-free pending/failed-retryable state before returning
@@ -2162,11 +4208,16 @@ impl ControlStore {
 
     /// Finalize identity deletion only after the content store has completed.
     pub async fn finalize_user_deletion(&self, user_id: &str) -> Result<AccountDeletionOperation> {
+        let fence_object_name = self.identity_rebind_fence_object_name(user_id).await?;
         let mut guard = self.inner.lock().await;
         if guard.is_none() {
             *guard = Some(self.load().await?);
         }
-        let operation = match delete_user_identity_conn(&guard.as_ref().unwrap().conn, user_id) {
+        let operation = match delete_user_identity_conn(
+            &guard.as_ref().unwrap().conn,
+            user_id,
+            &fence_object_name,
+        ) {
             Ok(operation) => operation,
             Err(error) => {
                 *guard = None;
@@ -2471,6 +4522,12 @@ mod tests {
         pause_next_control_list: AtomicBool,
         list_started: Notify,
         resume_list: Notify,
+        pause_after_put_target: std::sync::Mutex<Option<String>>,
+        put_committed: Notify,
+        resume_put: Notify,
+        pause_after_get_target: std::sync::Mutex<Option<String>>,
+        get_completed: Notify,
+        resume_get: Notify,
     }
 
     impl PausingGcs {
@@ -2480,18 +4537,56 @@ mod tests {
                 pause_next_control_list: AtomicBool::new(false),
                 list_started: Notify::new(),
                 resume_list: Notify::new(),
+                pause_after_put_target: std::sync::Mutex::new(None),
+                put_committed: Notify::new(),
+                resume_put: Notify::new(),
+                pause_after_get_target: std::sync::Mutex::new(None),
+                get_completed: Notify::new(),
+                resume_get: Notify::new(),
             }
         }
 
         fn pause_next_control_list(&self) {
             self.pause_next_control_list.store(true, Ordering::SeqCst);
         }
+
+        fn pause_after_next_put(&self, object_name: &str) {
+            *self.pause_after_put_target.lock().unwrap() = Some(object_name.to_string());
+        }
+
+        fn pause_after_next_get(&self, object_name: &str) {
+            *self.pause_after_get_target.lock().unwrap() = Some(object_name.to_string());
+        }
     }
 
     #[async_trait::async_trait]
     impl GcsClient for PausingGcs {
+        async fn trusted_time_millis(
+            &self,
+            authority_object_name: &str,
+            authority_generation: i64,
+        ) -> Result<i64> {
+            self.inner
+                .trusted_time_millis(authority_object_name, authority_generation)
+                .await
+        }
+
         async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse> {
-            self.inner.get_object(object_name).await
+            let result = self.inner.get_object(object_name).await;
+            let should_pause = {
+                let mut target = self.pause_after_get_target.lock().unwrap();
+                if target.as_deref() == Some(object_name) {
+                    *target = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_pause {
+                self.get_completed.notify_one();
+                self.resume_get.notified().await;
+            }
+            result
         }
 
         async fn get_object_generation(
@@ -2511,14 +4606,29 @@ mod tests {
             wrapped_dek_b64: &str,
             if_generation_match: i64,
         ) -> Result<i64> {
-            self.inner
+            let generation = self
+                .inner
                 .put_object(
                     object_name,
                     ciphertext,
                     wrapped_dek_b64,
                     if_generation_match,
                 )
-                .await
+                .await?;
+            let should_pause = {
+                let mut target = self.pause_after_put_target.lock().unwrap();
+                if target.as_deref() == Some(object_name) {
+                    *target = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_pause {
+                self.put_committed.notify_one();
+                self.resume_put.notified().await;
+            }
+            Ok(generation)
         }
 
         async fn delete_object(&self, object_name: &str) -> Result<()> {
@@ -2575,6 +4685,39 @@ mod tests {
         }
     }
 
+    async fn seed_legacy_rebind_account(
+        control: &ControlStore,
+        content: &Store,
+        subject: &str,
+        old_user_id: &str,
+    ) {
+        content
+            .with_user(old_user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES ('legacy-rebind', 'seeded')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        content.save_user(old_user_id).await.unwrap();
+        let subject = subject.to_string();
+        let old_user_id = old_user_id.to_string();
+        control
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO users (id, google_sub, email)
+                     VALUES (?1, ?2, 'legacy@example.com')",
+                    rusqlite::params![old_user_id, subject],
+                )?;
+                create_active_archive_binding_conn(conn, &old_user_id)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     fn account_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
@@ -2623,6 +4766,7 @@ mod tests {
             [USER_ID],
         )
         .unwrap();
+        create_active_archive_binding_conn(&conn, USER_ID).unwrap();
         conn
     }
 
@@ -2631,6 +4775,200 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         assert!(!is_active_user_conn(&conn, "missing").unwrap());
+    }
+
+    #[test]
+    fn archive_id_allocation_retries_zero_and_cross_user_collision_but_is_bounded() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        let first =
+            create_active_archive_binding_with_candidates(&conn, "first", || [2; 16]).unwrap();
+        assert_eq!(first.archive_id().as_bytes(), &[2; 16]);
+
+        let mut candidates = [[0; 16], [2; 16], [3; 16]].into_iter();
+        let second = create_active_archive_binding_with_candidates(&conn, "second", || {
+            candidates.next().unwrap()
+        })
+        .unwrap();
+        assert_eq!(second.archive_id().as_bytes(), &[3; 16]);
+
+        // Finalization erases the identity mapping but retains its archive-keyed
+        // tombstone. That ID remains permanently unavailable to new accounts.
+        conn.execute(
+            "INSERT INTO archive_deletion_ledgers
+             (archive_id, state, deletion_fence_id, tombstoned_at)
+             VALUES (?1, 'tombstoned', ?2, '2026-08-11T00:00:00.000Z')",
+            rusqlite::params![[4_u8; 16].as_slice(), [5_u8; 16].as_slice()],
+        )
+        .unwrap();
+        let mut retained_collision = [[4; 16], [6; 16]].into_iter();
+        let after_retained =
+            create_active_archive_binding_with_candidates(&conn, "after-retained", || {
+                retained_collision.next().unwrap()
+            })
+            .unwrap();
+        assert_eq!(after_retained.archive_id().as_bytes(), &[6; 16]);
+
+        // Same-user creation is idempotent and never asks for another random
+        // candidate after the exact binding and ledger already exist.
+        let replay =
+            create_active_archive_binding_with_candidates(&conn, "second", || -> [u8; 16] {
+                panic!("idempotent binding replay consumed randomness")
+            })
+            .unwrap();
+        assert_eq!(replay, second);
+
+        let mut attempts = 0;
+        let exhausted = create_active_archive_binding_with_candidates(&conn, "third", || {
+            attempts += 1;
+            if attempts % 2 == 0 {
+                [2; 16]
+            } else {
+                [0; 16]
+            }
+        });
+        assert!(matches!(exhausted, Err(EnclaveError::Conflict(_))));
+        assert_eq!(attempts, MAX_ARCHIVE_ID_CANDIDATES);
+        assert_eq!(archive_binding_conn(&conn, "third").unwrap(), None);
+    }
+
+    #[test]
+    fn archive_schema_and_decoder_reject_zero_ids_and_invalid_fences() {
+        let schema_conn = Connection::open_in_memory().unwrap();
+        schema_conn.execute_batch(SCHEMA).unwrap();
+        assert!(schema_conn
+            .execute(
+                "INSERT INTO archive_bindings (user_id, archive_id, state)
+                 VALUES ('zero', zeroblob(16), 'active_legacy')",
+                [],
+            )
+            .is_err());
+        create_active_archive_binding_with_candidates(&schema_conn, "active", || [4; 16]).unwrap();
+        assert!(schema_conn
+            .execute(
+                "UPDATE archive_deletion_ledgers
+                 SET state = 'tombstoned', tombstoned_at = '2026-08-11T00:00:00.000Z'
+                 WHERE archive_id = ?1",
+                [ArchiveId::from_bytes([4; 16]).as_bytes().as_slice()],
+            )
+            .is_err());
+
+        let zero_binding = account_conn();
+        zero_binding
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        zero_binding
+            .execute(
+                "UPDATE archive_bindings SET archive_id = zeroblob(16) WHERE user_id = ?1",
+                [USER_ID],
+            )
+            .unwrap();
+        assert!(archive_binding_conn(&zero_binding, USER_ID).is_err());
+
+        let active_fence = account_conn();
+        active_fence
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        active_fence
+            .execute(
+                "UPDATE archive_deletion_ledgers SET deletion_fence_id = ?2
+                 WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                rusqlite::params![USER_ID, [5_u8; 16].as_slice()],
+            )
+            .unwrap();
+        assert!(archive_deletion_ledger_conn(&active_fence, USER_ID).is_err());
+
+        let unsupported_inventory = account_conn();
+        unsupported_inventory
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        unsupported_inventory
+            .execute(
+                "UPDATE archive_deletion_ledgers SET inventory_format_version = 2
+                 WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                [USER_ID],
+            )
+            .unwrap();
+        assert!(archive_deletion_ledger_conn(&unsupported_inventory, USER_ID).is_err());
+
+        let active_with_tombstone_time = account_conn();
+        active_with_tombstone_time
+            .execute(
+                "UPDATE archive_bindings
+                 SET tombstoned_at = '2026-08-11T00:00:00.000Z'
+                 WHERE user_id = ?1",
+                [USER_ID],
+            )
+            .unwrap();
+        assert!(archive_deletion_ledger_conn(&active_with_tombstone_time, USER_ID).is_err());
+
+        let tombstone_without_ledger_time = account_conn();
+        tombstone_without_ledger_time
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        tombstone_without_ledger_time
+            .execute(
+                "UPDATE archive_bindings
+                 SET state = 'tombstoned', tombstoned_at = '2026-08-11T00:00:00.000Z'
+                 WHERE user_id = ?1",
+                [USER_ID],
+            )
+            .unwrap();
+        tombstone_without_ledger_time
+            .execute(
+                "UPDATE archive_deletion_ledgers
+                 SET state = 'tombstoned', deletion_fence_id = ?2, tombstoned_at = NULL
+                 WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                rusqlite::params![USER_ID, [6_u8; 16].as_slice()],
+            )
+            .unwrap();
+        assert!(archive_deletion_ledger_conn(&tombstone_without_ledger_time, USER_ID).is_err());
+
+        for fence in [None, Some([0_u8; 16])] {
+            let tombstoned = account_conn();
+            tombstoned
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            tombstoned
+                .execute(
+                    "UPDATE archive_bindings
+                     SET state = 'tombstoned', tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE user_id = ?1",
+                    [USER_ID],
+                )
+                .unwrap();
+            tombstoned
+                .execute(
+                    "UPDATE archive_deletion_ledgers
+                     SET state = 'tombstoned', deletion_fence_id = ?2,
+                         tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    rusqlite::params![USER_ID, fence.map(|value| value.to_vec())],
+                )
+                .unwrap();
+            assert!(archive_deletion_ledger_conn(&tombstoned, USER_ID).is_err());
+        }
+    }
+
+    #[test]
+    fn archive_deletion_ledger_debug_redacts_nonempty_cursors() {
+        let ledger = ArchiveDeletionLedger {
+            binding: ArchiveBinding {
+                archive_id: ArchiveId::from_bytes([7; 16]),
+            },
+            state: ArchiveDeletionState::Tombstoned,
+            deletion_fence_id: Some(ArchiveId::from_bytes([8; 16])),
+            archive_object_cursor: Some(b"provider-object-cursor".to_vec()),
+            key_registry_cursor: Some(b"provider-key-cursor".to_vec()),
+            legacy_generation_cursor: Some(b"provider-legacy-cursor".to_vec()),
+            media_inventory_cursor: Some(b"provider-media-cursor".to_vec()),
+            legacy_rebind_fence_object_name: Some("opaque-fence-name".into()),
+        };
+        let rendered = format!("{ledger:?}");
+        assert_eq!(rendered, "ArchiveDeletionLedger(<opaque>)");
+        assert!(!rendered.contains("cursor"));
+        assert!(!rendered.contains('7'));
     }
 
     #[test]
@@ -2734,15 +5072,28 @@ mod tests {
             [USER_ID],
         )
         .unwrap();
-        let first = begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID)
+        let fence = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let first = begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID, &fence)
             .unwrap()
             .unwrap();
         // Initialization is idempotent so a failed content deletion can retry.
-        let retry = begin_user_deletion_conn(&conn, USER_ID, "del_different")
+        let retry = begin_user_deletion_conn(&conn, USER_ID, "del_different", &fence)
             .unwrap()
             .unwrap();
         assert_eq!(first.operation_id, OPERATION_ID);
         assert_eq!(retry.operation_id, OPERATION_ID);
+        let fenced_ledger = archive_deletion_ledger_conn(&conn, USER_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fenced_ledger.state, ArchiveDeletionState::Tombstoned);
+        assert!(fenced_ledger.archive_object_cursor.is_none());
+        assert!(fenced_ledger.key_registry_cursor.is_none());
+        assert!(fenced_ledger.legacy_generation_cursor.is_none());
+        assert!(fenced_ledger.media_inventory_cursor.is_none());
+        assert_eq!(
+            format!("{:?}", fenced_ledger.binding),
+            "ArchiveBinding(<opaque>)"
+        );
         assert_eq!(
             conn.query_row("SELECT status FROM users WHERE id = ?1", [USER_ID], |r| {
                 r.get::<_, String>(0)
@@ -2773,7 +5124,7 @@ mod tests {
             .unwrap();
         assert_eq!(webhook_enabled, 0);
 
-        let completed = delete_user_identity_conn(&conn, USER_ID).unwrap();
+        let completed = delete_user_identity_conn(&conn, USER_ID, &fence).unwrap();
         assert_eq!(completed.status, "physical_complete");
         assert_eq!(completed.reason, "content_deleted");
         assert_eq!(completed.operation_id, OPERATION_ID);
@@ -2786,6 +5137,21 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+        // The v3 ledger deliberately remains fenced after ordinary identity
+        // removal. It has no completion marker because no v3 provider was
+        // called by this legacy deletion path.
+        assert_eq!(archive_binding_conn(&conn, USER_ID).unwrap(), None);
+        let retained_state: String = conn
+            .query_row(
+                "SELECT state FROM archive_deletion_ledgers WHERE archive_id = ?1",
+                [fenced_ledger.binding.archive_id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ArchiveDeletionState::from_db(&retained_state).unwrap(),
+            ArchiveDeletionState::Tombstoned
         );
         for table in ["recording_leases", "recording_lease_requests"] {
             let count: i64 = conn
@@ -2818,10 +5184,264 @@ mod tests {
     }
 
     #[test]
+    fn deletion_consumes_every_identity_rebind_stage_and_waits_only_for_provider_creates() {
+        let stages = [
+            IdentityRebindStage::Prepared,
+            IdentityRebindStage::SourceFreezing,
+            IdentityRebindStage::SourceFrozen,
+            IdentityRebindStage::StableWriting,
+            IdentityRebindStage::StableWritten,
+            IdentityRebindStage::OldPurging,
+            IdentityRebindStage::OldPurged,
+            IdentityRebindStage::Committed,
+        ];
+        for (index, stage) in stages.into_iter().enumerate() {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            let old_id = format!("legacy-delete-stage-{index}");
+            let subject = format!("delete-stage-subject-{index}");
+            let stable_id = super::super::tokens::derive_stable_uuid(&subject);
+            conn.execute(
+                "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, 'stage@example.com')",
+                rusqlite::params![old_id, subject],
+            )
+            .unwrap();
+            let binding = create_active_archive_binding_conn(&conn, &old_id).unwrap();
+            let source = IdentityRebindSource {
+                base_generation: 1,
+                source_generation: 1,
+                commitment: [index as u8 + 1; 32],
+                plaintext: Vec::new(),
+                wrapped_dek_b64: String::new(),
+            };
+            let operation_id = format!("rebind_{:064x}", index + 1);
+            let mut operation = prepare_identity_rebind_conn(
+                &conn,
+                &operation_id,
+                &subject,
+                &old_id,
+                &stable_id,
+                &crate::store::test_identity_rebind_fence_object_name(&old_id),
+                binding,
+                &source,
+            )
+            .unwrap();
+            if stage != IdentityRebindStage::Prepared {
+                let generation = if stage == IdentityRebindStage::SourceFreezing {
+                    None
+                } else {
+                    Some(2)
+                };
+                conn.execute(
+                    "UPDATE identity_rebind_operations SET stage = ?2, source_generation = ?3
+                     WHERE operation_id = ?1",
+                    rusqlite::params![operation_id, stage.as_db(), generation],
+                )
+                .unwrap();
+                operation = identity_rebind_operation_for_subject_conn(&conn, &subject)
+                    .unwrap()
+                    .unwrap();
+            }
+            let fence = crate::store::test_identity_rebind_fence_object_name(&old_id);
+            begin_user_deletion_conn(&conn, &old_id, &format!("del_{:064x}", index + 1), &fence)
+                .unwrap()
+                .unwrap();
+
+            let writing = matches!(
+                stage,
+                IdentityRebindStage::SourceFreezing | IdentityRebindStage::StableWriting
+            );
+            assert_eq!(
+                claim_identity_rebind_deletion_conn(&conn, &old_id).unwrap(),
+                !writing,
+                "unexpected claim result at {stage:?}"
+            );
+            if writing {
+                let _completed = advance_identity_rebind_conn(
+                    &conn,
+                    &operation,
+                    match stage {
+                        IdentityRebindStage::SourceFreezing => IdentityRebindStage::SourceFrozen,
+                        IdentityRebindStage::StableWriting => IdentityRebindStage::StableWritten,
+                        _ => unreachable!(),
+                    },
+                    Some(2),
+                )
+                .unwrap();
+                assert!(claim_identity_rebind_deletion_conn(&conn, &old_id).unwrap());
+            }
+            let claimed = identity_rebind_operation_for_user_conn(&conn, &old_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.stage, IdentityRebindStage::DeletionPending);
+            assert!(matches!(
+                delete_user_identity_conn(&conn, &old_id, &fence),
+                Err(EnclaveError::Conflict(_))
+            ));
+            let reconciled = advance_identity_rebind_conn(
+                &conn,
+                &claimed,
+                IdentityRebindStage::DeletionReconciled,
+                claimed.source_generation,
+            )
+            .unwrap();
+            assert_eq!(reconciled.stage, IdentityRebindStage::DeletionReconciled);
+            assert_eq!(
+                delete_user_identity_conn(&conn, &old_id, &fence)
+                    .unwrap()
+                    .status,
+                "physical_complete"
+            );
+            assert!(identity_rebind_operation_for_user_conn(&conn, &old_id)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_deletion_retry_resumes_source_freezing_without_restart() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let content = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let control = ControlStore::new_with_store(kms, gcs, content.clone());
+        let old_user_id = "live-delete-source-freezing";
+        let subject = "live-delete-source-freezing-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+
+        let mut transition = content
+            .begin_identity_rebind(old_user_id, &stable_user_id)
+            .await
+            .unwrap();
+        let source = transition.source_snapshot().await.unwrap();
+        let binding = control
+            .archive_deletion_ledger(old_user_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .binding;
+        let operation = control
+            .prepare_identity_rebind(subject, old_user_id, &stable_user_id, binding, &source)
+            .await
+            .unwrap();
+        let operation = control
+            .advance_identity_rebind(&operation, IdentityRebindStage::SourceFreezing, None)
+            .await
+            .unwrap();
+        assert_eq!(operation.stage, IdentityRebindStage::SourceFreezing);
+        drop(transition);
+
+        control
+            .begin_user_deletion(old_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(control
+            .claim_identity_rebind_deletion(old_user_id)
+            .await
+            .unwrap());
+        let claimed = control
+            .identity_rebind_operation_for_user(old_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.stage, IdentityRebindStage::DeletionPending);
+        assert!(claimed
+            .source_generation
+            .is_some_and(|generation| generation > 0));
+    }
+
+    #[tokio::test]
+    async fn live_deletion_retry_resumes_stable_writing_without_restart() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let content = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let control = ControlStore::new_with_store(kms, gcs.clone(), content.clone());
+        let old_user_id = "live-delete-stable-writing";
+        let subject = "live-delete-stable-writing-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+
+        let mut transition = content
+            .begin_identity_rebind(old_user_id, &stable_user_id)
+            .await
+            .unwrap();
+        let source = transition.source_snapshot().await.unwrap();
+        let binding = control
+            .archive_deletion_ledger(old_user_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .binding;
+        let mut operation = control
+            .prepare_identity_rebind(subject, old_user_id, &stable_user_id, binding, &source)
+            .await
+            .unwrap();
+        operation = control
+            .advance_identity_rebind(&operation, IdentityRebindStage::SourceFreezing, None)
+            .await
+            .unwrap();
+        let authority = control
+            .ensure_identity_rebind_provider_fence(&operation)
+            .await
+            .unwrap();
+        let frozen = transition
+            .freeze_source(
+                operation.source_base_generation,
+                &operation.source_commitment,
+                &authority,
+            )
+            .await
+            .unwrap();
+        operation = control
+            .advance_identity_rebind(
+                &operation,
+                IdentityRebindStage::SourceFrozen,
+                Some(frozen.source_generation),
+            )
+            .await
+            .unwrap();
+        control
+            .advance_identity_rebind(
+                &operation,
+                IdentityRebindStage::StableWriting,
+                operation.source_generation,
+            )
+            .await
+            .unwrap();
+        drop(transition);
+
+        control
+            .begin_user_deletion(old_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(control
+            .claim_identity_rebind_deletion(old_user_id)
+            .await
+            .unwrap());
+        let claimed = control
+            .identity_rebind_operation_for_user(old_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.stage, IdentityRebindStage::DeletionPending);
+        assert_eq!(
+            gcs.exact_generation_count(&format!("indexes/{stable_user_id}.db.enc")),
+            1
+        );
+    }
+
+    #[test]
     fn finalization_requires_the_deleting_state() {
         let conn = account_conn();
+        let fence = crate::store::test_identity_rebind_fence_object_name(USER_ID);
         assert!(matches!(
-            delete_user_identity_conn(&conn, USER_ID),
+            delete_user_identity_conn(&conn, USER_ID, &fence),
             Err(EnclaveError::Conflict(_))
         ));
         assert!(is_active_user_conn(&conn, USER_ID).unwrap());
@@ -2837,11 +5457,17 @@ mod tests {
             rusqlite::params![stable_id, GOOGLE_SUB],
         )
         .unwrap();
-        assert!(begin_user_deletion_conn(&conn, &stable_id, OPERATION_ID)
-            .unwrap()
-            .is_some());
+        create_active_archive_binding_conn(&conn, &stable_id).unwrap();
+        let fence = crate::store::test_identity_rebind_fence_object_name(&stable_id);
+        assert!(
+            begin_user_deletion_conn(&conn, &stable_id, OPERATION_ID, &fence)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
-            delete_user_identity_conn(&conn, &stable_id).unwrap().status,
+            delete_user_identity_conn(&conn, &stable_id, &fence)
+                .unwrap()
+                .status,
             "physical_complete"
         );
 
@@ -2852,13 +5478,15 @@ mod tests {
             user_status_conn(&conn, &stable_id).unwrap().as_deref(),
             Some("deleted")
         );
-        let retry = begin_user_deletion_conn(&conn, &stable_id, "del_different")
+        let retry = begin_user_deletion_conn(&conn, &stable_id, "del_different", &fence)
             .unwrap()
             .unwrap();
         assert_eq!(retry.operation_id, OPERATION_ID);
         assert_eq!(retry.status, "physical_complete");
         assert_eq!(
-            delete_user_identity_conn(&conn, &stable_id).unwrap().status,
+            delete_user_identity_conn(&conn, &stable_id, &fence)
+                .unwrap()
+                .status,
             "physical_complete"
         );
     }
@@ -2866,7 +5494,8 @@ mod tests {
     #[test]
     fn deletion_status_metadata_is_current_and_queryable() {
         let conn = account_conn();
-        begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID)
+        let fence = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID, &fence)
             .unwrap()
             .unwrap();
         let pending = update_user_deletion_status_conn(
@@ -2932,6 +5561,1296 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(first_generation, second_generation);
+    }
+
+    #[tokio::test]
+    async fn lost_successful_control_put_is_accepted_only_by_exact_ciphertext_reread() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(Arc::new(FakeKms), gcs.clone());
+        gcs.fail_next_put_after_commit(EnclaveError::Gcs(
+            "simulated lost successful response".into(),
+        ));
+        let user = control
+            .upsert_user("lost-control-put-subject", "lost@example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            control.user_status(&user.id).await.unwrap().as_deref(),
+            Some("active")
+        );
+        assert!(gcs.get_object(CONTROL_OBJECT).await.unwrap().generation > 0);
+    }
+
+    #[tokio::test]
+    async fn unchanged_google_reauthentication_fails_closed_on_archive_state() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let missing = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let missing_user = missing
+            .upsert_user("missing-ledger-subject", "missing@example.com")
+            .await
+            .unwrap();
+        let missing_id = missing_user.id.clone();
+        missing
+            .write(move |conn| {
+                conn.execute(
+                    "DELETE FROM archive_deletion_ledgers
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    [&missing_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            missing
+                .upsert_user("missing-ledger-subject", "missing@example.com")
+                .await,
+            Err(EnclaveError::Store(_))
+        ));
+
+        let tombstoned = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let tombstoned_user = tombstoned
+            .upsert_user("tombstoned-ledger-subject", "tombstoned@example.com")
+            .await
+            .unwrap();
+        let tombstoned_id = tombstoned_user.id.clone();
+        tombstoned
+            .write(move |conn| {
+                conn.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+                conn.execute(
+                    "UPDATE archive_bindings
+                     SET state = 'tombstoned', tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE user_id = ?1",
+                    [&tombstoned_id],
+                )?;
+                conn.execute(
+                    "UPDATE archive_deletion_ledgers
+                     SET state = 'tombstoned', deletion_fence_id = ?2,
+                         tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    rusqlite::params![tombstoned_id, [6_u8; 16].as_slice()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tombstoned
+                .upsert_user("tombstoned-ledger-subject", "tombstoned@example.com")
+                .await,
+            Err(EnclaveError::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn apple_existing_and_link_paths_require_an_exact_active_archive_ledger() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let existing = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let apple_user = existing
+            .upsert_apple_user(
+                "apple-existing-subject",
+                "apple@example.com",
+                "com.kioku.ios",
+                "refresh-one",
+            )
+            .await
+            .unwrap();
+        let apple_id = apple_user.id.clone();
+        existing
+            .write(move |conn| {
+                conn.execute(
+                    "DELETE FROM archive_deletion_ledgers
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    [&apple_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            existing
+                .upsert_apple_user(
+                    "apple-existing-subject",
+                    "apple@example.com",
+                    "com.kioku.ios",
+                    "refresh-two",
+                )
+                .await,
+            Err(EnclaveError::Store(_))
+        ));
+        assert!(matches!(
+            existing
+                .identity_user("apple", "apple-existing-subject")
+                .await,
+            Err(EnclaveError::Store(_))
+        ));
+
+        let malformed = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let malformed_user = malformed
+            .upsert_apple_user(
+                "apple-malformed-subject",
+                "malformed@example.com",
+                "com.kioku.ios",
+                "refresh-one",
+            )
+            .await
+            .unwrap();
+        let malformed_id = malformed_user.id.clone();
+        malformed
+            .write(move |conn| {
+                conn.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+                conn.execute(
+                    "UPDATE archive_deletion_ledgers SET deletion_fence_id = ?2
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    rusqlite::params![malformed_id, [8_u8; 16].as_slice()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            malformed
+                .upsert_apple_user(
+                    "apple-malformed-subject",
+                    "malformed@example.com",
+                    "com.kioku.ios",
+                    "refresh-two",
+                )
+                .await,
+            Err(EnclaveError::Store(_))
+        ));
+
+        let tombstoned = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let tombstoned_user = tombstoned
+            .upsert_apple_user(
+                "apple-tombstoned-subject",
+                "tombstoned@example.com",
+                "com.kioku.ios",
+                "refresh-one",
+            )
+            .await
+            .unwrap();
+        let tombstoned_id = tombstoned_user.id.clone();
+        tombstoned
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE archive_bindings
+                     SET state = 'tombstoned', tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE user_id = ?1",
+                    [&tombstoned_id],
+                )?;
+                conn.execute(
+                    "UPDATE archive_deletion_ledgers
+                     SET state = 'tombstoned', deletion_fence_id = ?2,
+                         tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    rusqlite::params![tombstoned_id, [9_u8; 16].as_slice()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tombstoned
+                .upsert_apple_user(
+                    "apple-tombstoned-subject",
+                    "tombstoned@example.com",
+                    "com.kioku.ios",
+                    "refresh-two",
+                )
+                .await,
+            Err(EnclaveError::Auth(_))
+        ));
+
+        let linking = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let google = linking
+            .upsert_user("apple-link-owner", "owner@example.com")
+            .await
+            .unwrap();
+        let google_id = google.id.clone();
+        linking
+            .write(move |conn| {
+                conn.execute(
+                    "DELETE FROM archive_deletion_ledgers
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    [&google_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            linking
+                .link_apple_identity(
+                    &google.id,
+                    "new-apple-link",
+                    "owner@example.com",
+                    "com.kioku.ios",
+                    "refresh-link",
+                )
+                .await,
+            Err(EnclaveError::Store(_))
+        ));
+
+        let malformed_link = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let malformed_owner = malformed_link
+            .upsert_user("malformed-link-owner", "malformed-link@example.com")
+            .await
+            .unwrap();
+        let malformed_owner_id = malformed_owner.id.clone();
+        malformed_link
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE archive_deletion_ledgers
+                     SET state = 'tombstoned', deletion_fence_id = ?2,
+                         tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    rusqlite::params![malformed_owner_id, [10_u8; 16].as_slice()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            malformed_link
+                .link_apple_identity(
+                    &malformed_owner.id,
+                    "malformed-apple-link",
+                    "malformed-link@example.com",
+                    "com.kioku.ios",
+                    "refresh-link",
+                )
+                .await,
+            Err(EnclaveError::Store(_))
+        ));
+
+        let tombstoned_link = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let tombstoned_owner = tombstoned_link
+            .upsert_user("tombstoned-link-owner", "tombstoned-link@example.com")
+            .await
+            .unwrap();
+        let tombstoned_owner_id = tombstoned_owner.id.clone();
+        tombstoned_link
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE archive_bindings
+                     SET state = 'tombstoned', tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE user_id = ?1",
+                    [&tombstoned_owner_id],
+                )?;
+                conn.execute(
+                    "UPDATE archive_deletion_ledgers
+                     SET state = 'tombstoned', deletion_fence_id = ?2,
+                         tombstoned_at = '2026-08-11T00:00:00.000Z'
+                     WHERE archive_id = (SELECT archive_id FROM archive_bindings WHERE user_id = ?1)",
+                    rusqlite::params![tombstoned_owner_id, [11_u8; 16].as_slice()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tombstoned_link
+                .link_apple_identity(
+                    &tombstoned_owner.id,
+                    "tombstoned-apple-link",
+                    "tombstoned-link@example.com",
+                    "com.kioku.ios",
+                    "refresh-link",
+                )
+                .await,
+            Err(EnclaveError::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn archive_binding_is_random_restart_stable_and_never_in_public_models() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let user = control
+            .upsert_user("archive-binding-subject", "archive@example.com")
+            .await
+            .unwrap();
+        let first = control
+            .archive_deletion_ledger(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.state, ArchiveDeletionState::ActiveLegacy);
+        assert_eq!(format!("{:?}", first.binding), "ArchiveBinding(<opaque>)");
+        let first_id = *first.binding.archive_id().as_bytes();
+
+        drop(control);
+        let restarted = ControlStore::new(kms, gcs);
+        let same = restarted
+            .upsert_user("archive-binding-subject", "archive@example.com")
+            .await
+            .unwrap();
+        let reloaded = restarted
+            .archive_deletion_ledger(&same.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*reloaded.binding.archive_id().as_bytes(), first_id);
+        assert_eq!(format!("{:?}", reloaded), format!("{:?}", first));
+
+        // The same canonical subject in an independently initialized control
+        // store receives a different random archive ID, proving the binding is
+        // persisted state rather than a stable/user-derived hash.
+        let independent = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let independent_user = independent
+            .upsert_user("archive-binding-subject", "archive@example.com")
+            .await
+            .unwrap();
+        let independent_id = *independent
+            .archive_deletion_ledger(&independent_user.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .binding
+            .archive_id()
+            .as_bytes();
+        assert_ne!(independent_id, first_id);
+
+        // The public deletion response has no archive identifier or ledger
+        // fields, and no route/export model received one in this change.
+        let public = serde_json::to_string(&AccountDeletionOperation {
+            operation_id: "del_public".into(),
+            status: "pending".into(),
+            reason: "content_deletion_in_progress".into(),
+            retry_after_seconds: Some(30),
+            hard_delete_time: None,
+        })
+        .unwrap();
+        assert!(!public.contains("archive"));
+        assert!(!public.contains("cursor"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_creation_keeps_one_binding_and_deletion_prevents_resurrection() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = Arc::new(ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(12));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let control = Arc::clone(&control);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                control
+                    .upsert_user("concurrent-archive-subject", "concurrent@example.com")
+                    .await
+            }));
+        }
+        let mut users = Vec::new();
+        for task in tasks {
+            users.push(task.await.unwrap().unwrap());
+        }
+        assert!(users.iter().all(|user| user.id == users[0].id));
+        let user_id = users[0].id.clone();
+        let bindings: i64 = control
+            .read({
+                let user_id = user_id.clone();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT count(*) FROM archive_bindings WHERE user_id = ?1",
+                        [&user_id],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(bindings, 1);
+
+        let before = control
+            .archive_deletion_ledger(&user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        control
+            .begin_user_deletion(&user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = control
+            .begin_user_deletion(&user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.status, "pending");
+        let tombstoned = control
+            .archive_deletion_ledger(&user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.binding, tombstoned.binding);
+        assert_eq!(tombstoned.state, ArchiveDeletionState::Tombstoned);
+
+        // Simulate legacy deletion's completed identity transaction. The
+        // remaining encrypted archive tombstone blocks a later login from
+        // creating or reconnecting any archive.
+        control.finalize_user_deletion(&user_id).await.unwrap();
+        assert!(matches!(
+            control
+                .upsert_user("concurrent-archive-subject", "concurrent@example.com")
+                .await,
+            Err(EnclaveError::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deletion_wins_legacy_rebind_without_moving_stable_content() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        let gcs_client: Arc<dyn GcsClient> = gcs;
+        let content = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let control = Arc::new(ControlStore::new_with_store(
+            kms,
+            gcs_client,
+            content.clone(),
+        ));
+        let old_user_id = "legacy-delete-wins";
+        let subject = "legacy-delete-wins-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+
+        let deletion_guard = content.lock_user_lifecycle(old_user_id).await.unwrap();
+        control
+            .begin_user_deletion(old_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let rebind_control = control.clone();
+        let rebind = tokio::spawn(async move {
+            rebind_control
+                .upsert_user(subject, "legacy@example.com")
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            inner.exact_generation_count(&format!("indexes/{stable_user_id}.db.enc")),
+            0
+        );
+        drop(deletion_guard);
+
+        assert!(matches!(rebind.await.unwrap(), Err(EnclaveError::Auth(_))));
+        content.delete_user(old_user_id).await.unwrap();
+        control.finalize_user_deletion(old_user_id).await.unwrap();
+        assert_eq!(
+            inner.exact_generation_count(&format!("indexes/{stable_user_id}.db.enc")),
+            0
+        );
+        assert_eq!(
+            control
+                .user_status(&stable_user_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("deleted")
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_wins_and_queued_deletion_cannot_orphan_stable_content() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+        use tokio::sync::oneshot;
+
+        let kms = Arc::new(FakeKms);
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        let gcs_client: Arc<dyn GcsClient> = gcs.clone();
+        let content = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let control = Arc::new(ControlStore::new_with_store(
+            kms,
+            gcs_client,
+            content.clone(),
+        ));
+        let old_user_id = "legacy-rebind-wins";
+        let subject = "legacy-rebind-wins-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        let old_object = format!("indexes/{old_user_id}.db.enc");
+        let stable_object = format!("indexes/{stable_user_id}.db.enc");
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+
+        gcs.pause_after_next_put(&stable_object);
+        let rebind_control = control.clone();
+        let mut rebind = tokio::spawn(async move {
+            rebind_control
+                .upsert_user(subject, "legacy@example.com")
+                .await
+        });
+        tokio::select! {
+            () = gcs.put_committed.notified() => {}
+            outcome = &mut rebind => match outcome {
+                Ok(Err(error)) => panic!("rebind failed before stable PUT: {error}"),
+                Ok(Ok(_)) => panic!("rebind completed without pausing after stable PUT"),
+                Err(error) => panic!("rebind task failed before stable PUT: {error}"),
+            },
+        }
+        assert_eq!(inner.exact_generation_count(&stable_object), 1);
+
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+        let deletion_content = content.clone();
+        let deletion_control = control.clone();
+        let deletion = tokio::spawn(async move {
+            attempted_tx.send(()).unwrap();
+            let _guard = deletion_content
+                .lock_user_lifecycle(old_user_id)
+                .await
+                .unwrap();
+            deletion_control.begin_user_deletion(old_user_id).await
+        });
+        attempted_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!deletion.is_finished());
+
+        gcs.resume_put.notify_one();
+        let rebound = rebind.await.unwrap().unwrap();
+        assert_eq!(rebound.id, stable_user_id);
+        assert_eq!(deletion.await.unwrap().unwrap(), None);
+        assert_eq!(inner.exact_generation_count(&old_object), 0);
+        assert_eq!(inner.exact_generation_count(&stable_object), 1);
+        assert_eq!(
+            control
+                .user_status(&stable_user_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("active")
+        );
+        let ledger = control
+            .archive_deletion_ledger(&stable_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.state, ArchiveDeletionState::ActiveLegacy);
+    }
+
+    #[tokio::test]
+    async fn two_store_writer_wins_prefence_cas_then_rebind_rebases_exact_source() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        let gcs_client: Arc<dyn GcsClient> = gcs.clone();
+        let rebind_store = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let writer_store = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let control = Arc::new(ControlStore::new_with_store(
+            kms,
+            gcs_client,
+            rebind_store.clone(),
+        ));
+        let old_user_id = "legacy-two-store-writer-wins";
+        let subject = "legacy-two-store-writer-wins-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        seed_legacy_rebind_account(&control, &rebind_store, subject, old_user_id).await;
+        let fence = crate::store::test_identity_rebind_fence_object_name(old_user_id);
+
+        writer_store
+            .with_user(old_user_id, |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_metadata (key, value)
+                     VALUES ('remote-writer', 'durable')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let old_object = format!("indexes/{old_user_id}.db.enc");
+        gcs.pause_after_next_put(&old_object);
+        let writer = {
+            let writer_store = writer_store.clone();
+            tokio::spawn(async move { writer_store.save_user(old_user_id).await })
+        };
+        gcs.put_committed.notified().await;
+
+        // The writer owns a durable Requesting intent and its generation CAS
+        // has committed, but the response/terminal tombstone is paused. The
+        // first rebind attempt creates the marker and must remain retryable
+        // instead of fencing or overtaking that active request.
+        assert!(matches!(
+            control.upsert_user(subject, "legacy@example.com").await,
+            Err(EnclaveError::DeletionPending(
+                crate::error::DeletionPending {
+                    reason: crate::error::DeletionPendingReason::LegacyWriteIntentUnsettled,
+                    ..
+                }
+            ))
+        ));
+        gcs.resume_put.notify_one();
+        writer.await.unwrap().unwrap();
+
+        // A live retry drains the now-terminal intent, durably rebases the
+        // exact source generation/commitment, and forces a second CAS bump
+        // before copying the stable object.
+        let user = control
+            .upsert_user(subject, "legacy@example.com")
+            .await
+            .unwrap();
+        assert_eq!(user.id, stable_user_id);
+
+        let stable_store = Store::new(Arc::new(FakeKms), inner.clone());
+        let copied: String = stable_store
+            .read_user(&stable_user_id, |conn| {
+                Ok(conn.query_row(
+                    "SELECT value FROM app_metadata WHERE key = 'remote-writer'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(copied, "durable");
+        let operation = control
+            .identity_rebind_operation_for_user(&stable_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.stage, IdentityRebindStage::Committed);
+        assert!(operation.source_base_generation >= 2);
+        assert_eq!(
+            control
+                .archive_deletion_ledger(&stable_user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .legacy_rebind_fence_object_name
+                .as_deref(),
+            Some(fence.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn two_store_rebind_wins_cas_and_stale_writer_cannot_resurrect_old_namespace() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        let gcs_client: Arc<dyn GcsClient> = gcs.clone();
+        let rebind_store = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let writer_store = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let control = Arc::new(ControlStore::new_with_store(
+            kms,
+            gcs_client,
+            rebind_store.clone(),
+        ));
+        let old_user_id = "legacy-two-store-rebind-wins";
+        let subject = "legacy-two-store-rebind-wins-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        let old_object = format!("indexes/{old_user_id}.db.enc");
+        seed_legacy_rebind_account(&control, &rebind_store, subject, old_user_id).await;
+        writer_store
+            .with_user(old_user_id, |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_metadata (key, value)
+                     VALUES ('stale-writer', 'must-not-commit')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let fence = crate::store::test_identity_rebind_fence_object_name(old_user_id);
+        gcs.pause_after_next_get(&fence);
+        let writer = {
+            let writer_store = writer_store.clone();
+            tokio::spawn(async move { writer_store.save_user(old_user_id).await })
+        };
+        gcs.get_completed.notified().await;
+        let rebound = control
+            .upsert_user(subject, "legacy@example.com")
+            .await
+            .unwrap();
+        assert_eq!(rebound.id, stable_user_id);
+        gcs.resume_get.notify_one();
+        assert!(writer.await.unwrap().is_err());
+        assert_eq!(inner.exact_generation_count(&old_object), 0);
+
+        // Even after account finalization, the content-free provider marker is
+        // retained as the ledger-known no-resurrection tombstone. A stale
+        // Store image cannot create an old raw object or flush its old actor.
+        control
+            .begin_user_deletion(&stable_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(control
+            .claim_identity_rebind_deletion(&stable_user_id)
+            .await
+            .unwrap());
+        rebind_store
+            .delete_identity_rebind_users(old_user_id, &stable_user_id)
+            .await
+            .unwrap();
+        control
+            .mark_identity_rebind_deletion_reconciled(&stable_user_id)
+            .await
+            .unwrap();
+        control
+            .finalize_user_deletion(&stable_user_id)
+            .await
+            .unwrap();
+        assert!(inner.get_object(&fence).await.is_ok());
+        assert!(writer_store
+            .put_user_media(
+                old_user_id,
+                &format!("raw/{old_user_id}/late.enc"),
+                b"late",
+                "wrapped",
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            inner.exact_generation_count(&format!("raw/{old_user_id}/late.enc")),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn prefence_raw_intent_is_fenced_before_data_io_and_old_inventory_is_retained() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        let gcs_client: Arc<dyn GcsClient> = gcs.clone();
+        let rebind_store = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let raw_store = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let control = Arc::new(ControlStore::new_with_store(
+            kms,
+            gcs_client,
+            rebind_store.clone(),
+        ));
+        let old_user_id = "legacy-late-raw-put";
+        let subject = "legacy-late-raw-put-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        let raw_name = format!("raw/{old_user_id}/late.enc");
+        seed_legacy_rebind_account(&control, &rebind_store, subject, old_user_id).await;
+
+        let fence = crate::store::test_identity_rebind_fence_object_name(old_user_id);
+        gcs.pause_after_next_get(&fence);
+        let raw_put = {
+            let raw_store = raw_store.clone();
+            let raw_name = raw_name.clone();
+            tokio::spawn(async move {
+                raw_store
+                    .put_user_media(old_user_id, &raw_name, b"late", "wrapped")
+                    .await
+            })
+        };
+        gcs.get_completed.notified().await;
+        control
+            .upsert_user(subject, "legacy@example.com")
+            .await
+            .unwrap();
+        gcs.resume_get.notify_one();
+        assert!(raw_put.await.unwrap().is_err());
+        assert_eq!(inner.exact_generation_count(&raw_name), 0);
+
+        // The durable pre-marker intent was visible to rebind and terminalized
+        // before any raw data I/O. The committed operation and retained archive
+        // ledger still preserve the exact old prefix and marker through final
+        // deletion.
+        raw_store
+            .with_user(old_user_id, |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_metadata (key, value)
+                     VALUES ('late-raw-link', 'pending')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(raw_store.save_user(old_user_id).await.is_err());
+        let operation = control
+            .identity_rebind_operation_for_user(&stable_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.old_user_id, old_user_id);
+        assert_eq!(operation.stage, IdentityRebindStage::Committed);
+        assert_eq!(
+            control
+                .archive_deletion_ledger(&stable_user_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .legacy_rebind_fence_object_name
+                .as_deref(),
+            Some(fence.as_str())
+        );
+
+        control
+            .begin_user_deletion(&stable_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(control
+            .claim_identity_rebind_deletion(&stable_user_id)
+            .await
+            .unwrap());
+        rebind_store
+            .delete_identity_rebind_users(old_user_id, &stable_user_id)
+            .await
+            .unwrap();
+        assert_eq!(inner.exact_generation_count(&raw_name), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_rebind_caller_keeps_lifecycle_gates_until_owned_commit() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+        use tokio::sync::oneshot;
+
+        let kms = Arc::new(FakeKms);
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        let gcs_client: Arc<dyn GcsClient> = gcs.clone();
+        let content = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let control = Arc::new(ControlStore::new_with_store(
+            kms,
+            gcs_client,
+            content.clone(),
+        ));
+        let old_user_id = "legacy-cancelled-rebind";
+        let subject = "legacy-cancelled-rebind-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        let old_object = format!("indexes/{old_user_id}.db.enc");
+        let stable_object = format!("indexes/{stable_user_id}.db.enc");
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+
+        gcs.pause_after_next_put(&stable_object);
+        let cancelled_control = control.clone();
+        let mut cancelled = tokio::spawn(async move {
+            cancelled_control
+                .upsert_user(subject, "legacy@example.com")
+                .await
+        });
+        tokio::select! {
+            () = gcs.put_committed.notified() => {}
+            outcome = &mut cancelled => match outcome {
+                Ok(Err(error)) => panic!("rebind failed before stable PUT: {error}"),
+                Ok(Ok(_)) => panic!("rebind completed without pausing after stable PUT"),
+                Err(error) => panic!("rebind task failed before stable PUT: {error}"),
+            },
+        }
+        cancelled.abort();
+        assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
+        assert_eq!(inner.exact_generation_count(&old_object), 2);
+        assert_eq!(inner.exact_generation_count(&stable_object), 1);
+        assert_eq!(
+            control.user_status(old_user_id).await.unwrap().as_deref(),
+            Some("active")
+        );
+
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+        let deletion_content = content.clone();
+        let deletion_control = control.clone();
+        let deletion = tokio::spawn(async move {
+            attempted_tx.send(()).unwrap();
+            let _guard = deletion_content
+                .lock_user_lifecycle(old_user_id)
+                .await
+                .unwrap();
+            deletion_control.begin_user_deletion(old_user_id).await
+        });
+        attempted_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!deletion.is_finished());
+
+        gcs.resume_put.notify_one();
+        assert_eq!(deletion.await.unwrap().unwrap(), None);
+        assert_eq!(inner.exact_generation_count(&old_object), 0);
+        assert_eq!(inner.exact_generation_count(&stable_object), 1);
+        assert_eq!(
+            control
+                .user_status(&stable_user_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("active")
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_repairs_a_stable_put_committed_before_control_rebind() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner.clone()));
+        let gcs_client: Arc<dyn GcsClient> = gcs.clone();
+        let content = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let control = Arc::new(ControlStore::new_with_store(
+            kms.clone(),
+            gcs_client.clone(),
+            content.clone(),
+        ));
+        let old_user_id = "legacy-restart-rebind";
+        let subject = "legacy-restart-rebind-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        let old_object = format!("indexes/{old_user_id}.db.enc");
+        let stable_object = format!("indexes/{stable_user_id}.db.enc");
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+
+        // Model process interruption after the durable provider-write intent
+        // and create-only stable PUT commit, but before its completed stage.
+        let mut transition = content
+            .begin_identity_rebind(old_user_id, &stable_user_id)
+            .await
+            .unwrap();
+        let initial = transition.source_snapshot().await.unwrap();
+        let binding = control
+            .archive_deletion_ledger(old_user_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .binding;
+        let mut operation = control
+            .prepare_identity_rebind(subject, old_user_id, &stable_user_id, binding, &initial)
+            .await
+            .unwrap();
+        operation = control
+            .advance_identity_rebind(&operation, IdentityRebindStage::SourceFreezing, None)
+            .await
+            .unwrap();
+        let marker_authority = control
+            .ensure_identity_rebind_provider_fence(&operation)
+            .await
+            .unwrap();
+        let frozen = transition
+            .freeze_source(
+                operation.source_base_generation,
+                &operation.source_commitment,
+                &marker_authority,
+            )
+            .await
+            .unwrap();
+        operation = control
+            .advance_identity_rebind(
+                &operation,
+                IdentityRebindStage::SourceFrozen,
+                Some(frozen.source_generation),
+            )
+            .await
+            .unwrap();
+        operation = control
+            .advance_identity_rebind(
+                &operation,
+                IdentityRebindStage::StableWriting,
+                operation.source_generation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(operation.stage, IdentityRebindStage::StableWriting);
+        let dek = load_dek(control.kms.as_ref(), &frozen.wrapped_dek_b64)
+            .await
+            .unwrap();
+        let stable_ciphertext = encrypt_bound_blob(
+            &dek,
+            &frozen.plaintext,
+            &crate::store::user_blob_context(&stable_user_id),
+        )
+        .unwrap();
+        gcs.pause_after_next_put(&stable_object);
+        let interrupted_write = {
+            let content = content.clone();
+            let stable_user_id = stable_user_id.clone();
+            let stable_object = stable_object.clone();
+            let wrapped_dek_b64 = frozen.wrapped_dek_b64.clone();
+            tokio::spawn(async move {
+                content
+                    .put_stable_rebind_index(
+                        &stable_user_id,
+                        &stable_object,
+                        &stable_ciphertext,
+                        &wrapped_dek_b64,
+                    )
+                    .await
+            })
+        };
+        gcs.put_committed.notified().await;
+        interrupted_write.abort();
+        assert!(matches!(
+            interrupted_write.await,
+            Err(error) if error.is_cancelled()
+        ));
+        // The durable intent remains Requesting. A restarted instance may
+        // take it over only after provider time has passed its ownership
+        // lease, then exact-reread the already-created stable destination.
+        inner.set_provider_clock_millis(1_900_000_000_000);
+        drop(transition);
+        assert_eq!(inner.exact_generation_count(&old_object), 2);
+        assert_eq!(inner.exact_generation_count(&stable_object), 1);
+        assert_eq!(
+            control.user_status(old_user_id).await.unwrap().as_deref(),
+            Some("active")
+        );
+
+        drop(control);
+        drop(content);
+        let restarted_content = Arc::new(Store::new(kms.clone(), gcs_client.clone()));
+        let restarted = ControlStore::new_with_store(kms, gcs_client, restarted_content);
+        assert_eq!(
+            restarted
+                .reconcile_pending_identity_rebinds()
+                .await
+                .unwrap(),
+            1
+        );
+        let repaired = restarted.identity_user("google", subject).await.unwrap();
+        assert_eq!(repaired.unwrap().id, stable_user_id);
+        assert_eq!(inner.exact_generation_count(&old_object), 0);
+        assert_eq!(inner.exact_generation_count(&stable_object), 1);
+        assert_eq!(
+            restarted
+                .user_status(&stable_user_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("active")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rebind_recovery_drains_more_than_one_bounded_page() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        const OPERATION_COUNT: usize = 65;
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let template_store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let mut template_transition = template_store
+            .begin_identity_rebind("template-old", "template-stable")
+            .await
+            .unwrap();
+        let template = template_transition.source_snapshot().await.unwrap();
+        drop(template_transition);
+        let dek = load_dek(kms.as_ref(), &template.wrapped_dek_b64)
+            .await
+            .unwrap();
+
+        for index in 0..OPERATION_COUNT {
+            let old_id = format!("startup-page-old-{index}");
+            let ciphertext = encrypt_bound_blob(
+                &dek,
+                &template.plaintext,
+                &crate::store::user_blob_context(&old_id),
+            )
+            .unwrap();
+            gcs.put_object(
+                &format!("indexes/{old_id}.db.enc"),
+                &ciphertext,
+                &template.wrapped_dek_b64,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+
+        let recovery_store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let control = ControlStore::new_with_store(kms, gcs, recovery_store);
+        let commitment = template.commitment;
+        control
+            .write(move |conn| {
+                for index in 0..OPERATION_COUNT {
+                    let old_id = format!("startup-page-old-{index}");
+                    let subject = format!("startup-page-subject-{index}");
+                    let stable_id = super::super::tokens::derive_stable_uuid(&subject);
+                    conn.execute(
+                        "INSERT INTO users (id, google_sub, email)
+                         VALUES (?1, ?2, 'startup@example.com')",
+                        rusqlite::params![old_id, subject],
+                    )?;
+                    let binding = create_active_archive_binding_conn(conn, &old_id)?;
+                    let source = IdentityRebindSource {
+                        base_generation: 1,
+                        source_generation: 1,
+                        commitment,
+                        plaintext: Vec::new(),
+                        wrapped_dek_b64: String::new(),
+                    };
+                    prepare_identity_rebind_conn(
+                        conn,
+                        &format!("rebind_{:064x}", index + 1),
+                        &subject,
+                        &old_id,
+                        &stable_id,
+                        &crate::store::test_identity_rebind_fence_object_name(&old_id),
+                        binding,
+                        &source,
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            control.reconcile_pending_identity_rebinds().await.unwrap(),
+            OPERATION_COUNT
+        );
+        assert!(control
+            .read(|conn| pending_identity_rebind_operations_conn(conn, 1))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_partial_old_generation_purge_without_reauthentication() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let content = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let control = ControlStore::new_with_store(kms.clone(), gcs.clone(), content.clone());
+        let old_user_id = "legacy-partial-old-purge";
+        let subject = "legacy-partial-old-purge-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        let old_object = format!("indexes/{old_user_id}.db.enc");
+        let stable_object = format!("indexes/{stable_user_id}.db.enc");
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+        content
+            .with_user(old_user_id, |conn| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO app_metadata (key, value)
+                     VALUES ('second-generation', 'present')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        content.save_user(old_user_id).await.unwrap();
+        assert_eq!(gcs.exact_generation_count(&old_object), 2);
+        gcs.fail_next_generation_delete(&old_object, 1);
+
+        assert!(control
+            .upsert_user(subject, "legacy@example.com")
+            .await
+            .is_err());
+        let pending = control
+            .identity_rebind_operation_for_user(old_user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.stage, IdentityRebindStage::OldPurging);
+        assert_eq!(gcs.exact_generation_count(&stable_object), 1);
+
+        drop(control);
+        drop(content);
+        let restarted_store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let restarted = ControlStore::new_with_store(kms, gcs.clone(), restarted_store);
+        assert_eq!(
+            restarted
+                .reconcile_pending_identity_rebinds()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(gcs.exact_generation_count(&old_object), 0);
+        assert_eq!(gcs.exact_generation_count(&stable_object), 1);
+        assert_eq!(
+            restarted
+                .user_status(&stable_user_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("active")
+        );
+    }
+
+    #[tokio::test]
+    async fn ungated_test_control_store_refuses_legacy_rebind_before_provider_io() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let content = Store::new(kms.clone(), gcs.clone());
+        let control = ControlStore::new(kms, gcs.clone());
+        let old_user_id = "legacy-ungated-rebind";
+        let subject = "legacy-ungated-rebind-subject";
+        let stable_user_id = super::super::tokens::derive_stable_uuid(subject);
+        seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
+
+        assert!(matches!(
+            control.upsert_user(subject, "legacy@example.com").await,
+            Err(EnclaveError::Store(_))
+        ));
+        assert_eq!(
+            gcs.exact_generation_count(&format!("indexes/{stable_user_id}.db.enc")),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_id_rebind_refuses_a_conflicting_target_binding_before_blob_migration() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let lifecycle_store = Arc::new(Store::new(kms.clone(), gcs.clone()));
+        let control = ControlStore::new_with_store(kms, gcs, lifecycle_store);
+        let old_id = "legacy-identity-id".to_string();
+        let subject = "legacy-archive-binding-subject".to_string();
+        let stable_id = super::super::tokens::derive_stable_uuid(&subject);
+        control
+            .write({
+                let old_id = old_id.clone();
+                let subject = subject.clone();
+                let stable_id = stable_id.clone();
+                move |conn| {
+                    conn.execute(
+                        "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, 'legacy@example.com')",
+                        rusqlite::params![old_id, subject],
+                    )?;
+                    create_active_archive_binding_conn(conn, &old_id)?;
+                    // This can only be a prior incomplete/corrupt migration;
+                    // reject it deterministically rather than silently choosing
+                    // one random archive ID or tripping a late UNIQUE error.
+                    create_active_archive_binding_conn(conn, &stable_id)?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            control.upsert_user(&subject, "legacy@example.com").await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        let retained_id: String = control
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM users WHERE google_sub = ?1",
+                    [&subject],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(retained_id, old_id);
     }
 
     #[tokio::test]

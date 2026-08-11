@@ -551,7 +551,6 @@ async fn main() {
         media_gcs,
     ));
     Store::spawn_metrics_reporter(Arc::clone(&store));
-    Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
 
     // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
     // control store consumes the originals.
@@ -559,7 +558,26 @@ async fn main() {
     let acme_gcs = Arc::clone(&gcs);
 
     // ── In-enclave control plane (ADR-0001): OAuth, sync, account, MCP. ─────────
-    let control_store = Arc::new(cp::control_store::ControlStore::new(kms, gcs));
+    let control_store = Arc::new(cp::control_store::ControlStore::new_with_store(
+        kms,
+        gcs,
+        Arc::clone(&store),
+    ));
+    control_store
+        .initialize_legacy_fence_key()
+        .await
+        .unwrap_or_else(|error| panic!("Failed to initialize legacy fence key: {error}"));
+    Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
+    let recovered_rebinds = control_store
+        .reconcile_pending_identity_rebinds()
+        .await
+        .unwrap_or_else(|error| panic!("Failed to reconcile identity rebinds: {error}"));
+    if recovered_rebinds > 0 {
+        info!(
+            recovered = recovered_rebinds,
+            "reconciled pending identity rebinds before request admission"
+        );
+    }
 
     let (jwt_secrets, google_web_client_secret) = if test_mode_enabled() {
         let jwt_secret =
