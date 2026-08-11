@@ -218,8 +218,20 @@ registry generation authenticated inside the KMS plaintext prevents key rollback
 Fenced compare-and-advance, direct
 large-archive extent shadowing, migration/deletion, database-epoch rollback, and
 key-rotation transitions are linearizable only in the test model.
-It has no GCS/Firestore
-client, Store/VFS/route connection, or production authority. Recovery must fetch only the
+`src/archive_v3_firestore_witness.rs` adds an equally inactive provider-neutral Firestore
+metadata boundary: exactly one canonical document per opaque archive, exactly one bytes
+field `r` containing the fixed witness codec, read-write transaction begin, exact
+transactional batch read, full-record conditional commit, and an exact fresh-read check
+after an ambiguous response. It parses Firestore `readTime` as the trusted monotonic
+clock and retries only bounded `ABORTED` commits. The inactive boundary rejects `(default)`
+and accepts only the documented named-database grammar; a future token source is required
+to receive and use the one dedicated `archive-witness-attest/providers/archive-witness` WIF
+provider-resource audience on every mint. Batch-get transport is capped before JSON parsing
+and accepts exactly one response, while record/base64, transaction, token, `readTime`, and
+`updateTime` material are bounded and fail closed. It intentionally has no concrete HTTP
+transport, token source (including no metadata-token fallback), IAM, queries/lists/deletes,
+additional fields, Store/VFS/route connection, deployment flag, or production authority.
+Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
 acknowledge a write from archive-v3 until ADR-0022
 Phase 1 shadow recovery, VFS crash/conformance, witness, fault, lifecycle, and capacity
