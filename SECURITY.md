@@ -200,6 +200,16 @@ generation on every range, and receive dedicated review for atomic commit, non-o
 and reconciliation if cancellation races an externally completed commit. The in-memory
 receipt checks reject inconsistencies but cannot prove that a malicious concrete adapter
 reported provider metadata honestly.
+The private `legacy_gcm/extent_candidate.rs` child is an inactive, provisional-only SQLite
+extent source: it accepts only nonzero, page-aligned authenticated lengths within the fixed
+32-GiB cap; validates the required first 100-byte SQLite header fields and their bounded
+header-only relations before it returns an extent; and emits every dense sequential
+1-MiB-or-final-page-aligned extent, including all-zero content. It does
+not authenticate B-tree, FTS, or vector contents, finish or verify the second pass, stage an
+object, construct a root candidate, or connect to a provider, Store, runtime, route, flag,
+witness, CAS, or cutover authority. A later reviewed coordinator must own the parent source,
+scope and drop this adapter, finish and consume its binding, re-read the witness, then perform
+any staging or publication.
 It accepts only an explicit historic empty-AAD profile (SQLite/control/ACME) or the exact
 historic media-user-id AAD profile; it never probes multiple AADs and explicitly rejects a
 v2 marker. Its AES/CTR/GHASH composition is intentionally isolated because it needs a
@@ -227,6 +237,19 @@ content and first refuse filesystems without observable sparse allocation; they 
 materialize, download, upload, or encrypt a 32-GiB snapshot. Its report
 is permanently marked local non-authority/non-release evidence; it cannot change runtime
 authority or satisfy the image/backend/VFS/witness/fault/lifecycle/cache/concurrency gates.
+
+The inactive Phase-1 signed capacity-evidence contract adds no authority. Its offline
+verifier accepts a restricted ASCII/JCS profile only; enforces exact workload geometry,
+the workload-by-case/metric/result cross-product, policy-pinned environment, context-bound
+ADR metrics and transport components, strict bounds, paired live-size write traces with
+recomputed summaries and amplification growth,
+root/witness caps, ANN completeness, and conditional deletion semantics; and DER-validates
+a pinned P-256 SPKI. Request, time,
+replay-ledger, provenance, SBOM, and environment files are hash-bound wrappers, not trusted
+facts. The `preauthorization_only` receipt lists rollback-protected challenge issuance,
+transactional replay consumption, authenticated time, cryptographic provenance/environment
+verification, and independent measurement authenticity as unsatisfied activation blockers.
+It always carries `authority: false` and cannot authorize an archive-v3 transition.
 
 `src/archive_v3.rs`, `src/archive_v3_journal.rs`, `src/archive_v3_shadow.rs`, and `src/archive_v3_sqlite_vfs.rs` define only audited, unit-tested
 format primitives for the future

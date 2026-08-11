@@ -44,6 +44,11 @@ const MAX_AAD_BYTES: u64 = 1 << 36;
 const MAX_LOGICAL_DATABASE_BYTES: u64 = crate::archive_v3::MAX_DATABASE_BYTES;
 const V2_MAGIC: &[u8] = b"KIOKU-BLOB\x02";
 
+// This child is the only inactive consumer allowed to turn provisional legacy
+// plaintext into dense archive extents. It deliberately has neither a
+// completion path nor a root-candidate path.
+mod extent_candidate;
+
 mod sealed {
     pub trait RangeReader {}
     pub trait Sink {}
