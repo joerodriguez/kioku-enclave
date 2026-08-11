@@ -73,6 +73,9 @@ mod archive_v3_gcs_http;
 // has its own audience type, launcher boundary, STS client, cache, and no
 // Store/VFS/route/transport/authority connection.
 mod archive_v3_gcs_auth;
+// Inactive ADR-0022 restart-safe genesis coordinator. It has no provider
+// construction or authority wiring; only deterministic fake-tested contracts.
+mod archive_v3_genesis;
 // Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
 // REST transport. They have no runtime construction, Store, VFS, route, or
 // authority wiring.

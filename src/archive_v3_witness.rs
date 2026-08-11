@@ -599,6 +599,18 @@ impl WitnessRecord {
         forged.archive_id = archive_id;
         forged
     }
+    #[cfg(test)]
+    pub(crate) fn tombstoned_for_test(&self) -> Self {
+        let mut forged = self.clone();
+        forged.deletion = DeletionState::Tombstoned;
+        forged
+    }
+    #[cfg(test)]
+    pub(crate) fn with_root_for_test(&self, root: RootCommitment) -> Self {
+        let mut forged = self.clone();
+        forged.root = root;
+        forged
+    }
     pub fn migration(&self) -> MigrationState {
         self.migration
     }
