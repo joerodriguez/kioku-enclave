@@ -111,6 +111,12 @@ PROJECT_ID="$(gh variable get GCP_PROJECT_ID --repo "$REPOSITORY")"
 REGION="$(gh variable get GCP_REGION --repo "$REPOSITORY")"
 AR_REPOSITORY="$(gh variable get AR_REPOSITORY --repo "$REPOSITORY")"
 IMAGE_NAME="$(gh variable get IMAGE_NAME --repo "$REPOSITORY")"
+EXPECTED_GCS_BUCKET="$(gh variable get ENCLAVE_GCS_BUCKET --repo "$REPOSITORY")"
+EXPECTED_GCS_MEDIA_BUCKET="$(gh variable get ENCLAVE_GCS_MEDIA_BUCKET --repo "$REPOSITORY")"
+if [[ -z "$EXPECTED_GCS_BUCKET" || -z "$EXPECTED_GCS_MEDIA_BUCKET" || "$EXPECTED_GCS_MEDIA_BUCKET" != "$EXPECTED_GCS_BUCKET" ]]; then
+  echo "Error: ENCLAVE_GCS_MEDIA_BUCKET must be configured and exactly match ENCLAVE_GCS_BUCKET for the Phase-0 transitional release." >&2
+  exit 1
+fi
 REGISTRY_HOST="${REGION}-docker.pkg.dev"
 
 CURRENT_BRANCH="$(git branch --show-current)"
@@ -245,6 +251,7 @@ fi
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 METADATA_FILE="$WORK_DIR/enclave-release.json"
+METADATA_PROVENANCE_FILE="$WORK_DIR/enclave-release-metadata-provenance.jsonl"
 PROVENANCE_FILE="$WORK_DIR/enclave-provenance.jsonl"
 SBOM_FILE="$WORK_DIR/enclave-sbom.spdx.json"
 SBOM_ATTESTATION_FILE="$WORK_DIR/enclave-sbom-attestation.jsonl"
@@ -312,41 +319,30 @@ else
   echo "Using durable metadata from the existing public release."
 fi
 
-if [[ ! -s "$METADATA_FILE" ]]; then
-  echo "Error: build did not produce enclave-release.json" >&2
+if [[ ! -s "$METADATA_FILE" || ! -s "$METADATA_PROVENANCE_FILE" ]]; then
+  echo "Error: build did not produce the signed enclave release metadata manifest and provenance bundle" >&2
   exit 1
 fi
 
-RELEASE_METADATA="$(python3 - "$METADATA_FILE" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    data = json.load(handle)
-keys = ("schema_version", "source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest", "build_url", "build_profile")
-data["voice_quality_gate"] = data.get("voice_quality_gate", "legacy_unclassified")
-data["billing_enforcement_mode"] = data.get("billing_enforcement_mode", "legacy_unclassified")
-keys += ("voice_quality_gate", "billing_enforcement_mode")
-print("\t".join(str(data[key]) for key in keys))
-PY
-)"
-IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE <<< "$RELEASE_METADATA"
+echo "Verifying signed release metadata manifest..."
+gh attestation verify "$METADATA_FILE" \
+  --repo "$REPOSITORY" \
+  --bundle "$METADATA_PROVENANCE_FILE" \
+  --deny-self-hosted-runners \
+  --signer-workflow "${REPOSITORY}/.github/workflows/build.yml" \
+  --source-digest "$REMOTE_TAG_COMMIT" \
+  --source-ref "refs/tags/${RELEASE_TAG}" >/dev/null
 
-if [[ "$SOURCE_REPOSITORY" != "https://github.com/${REPOSITORY}" || "$BUILD_PROFILE" != "production" ]]; then
-  echo "Error: build metadata has an unexpected schema, source repository, or non-production profile." >&2
-  exit 1
-fi
-if [[ "$SCHEMA_VERSION" == "3" ]]; then
-  if [[ "$VOICE_QUALITY_GATE" != "owner_only_unvalidated" && "$VOICE_QUALITY_GATE" != "validated_real_corpus" ]]; then
-    echo "Error: schema-v3 build metadata has an invalid voice-quality gate classification." >&2
-    exit 1
-  fi
-  if [[ "$BILLING_ENFORCEMENT_MODE" != "shadow" && "$BILLING_ENFORCEMENT_MODE" != "enforce" ]]; then
-    echo "Error: schema-v3 build metadata has an invalid billing-enforcement mode." >&2
-    exit 1
-  fi
-elif [[ "$SCHEMA_VERSION" != "1" && "$SCHEMA_VERSION" != "2" ]] || [[ "$BILLING_ENFORCEMENT_MODE" != "legacy_unclassified" || "$ROLLBACK_EXISTING" != "true" ]]; then
-  echo "Error: legacy unclassified metadata is accepted only for an immutable rollback." >&2
-  exit 1
-fi
+RELEASE_METADATA="$(python3 scripts/verify_release_metadata.py \
+  "$METADATA_FILE" \
+  --repository "$REPOSITORY" \
+  --tag "$RELEASE_TAG" \
+  --commit "$REMOTE_TAG_COMMIT" \
+  --image-repository "${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}" \
+  --expected-gcs-bucket "$EXPECTED_GCS_BUCKET" \
+  --expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET")"
+IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE GCS_BUCKET GCS_MEDIA_BUCKET <<< "$RELEASE_METADATA"
+
 if [[ -n "$EXPECTED_VOICE_QUALITY_GATE" && "$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE" ]]; then
   echo "Error: build metadata voice-quality classification does not match the checked source." >&2
   exit 1
@@ -355,28 +351,7 @@ if [[ -n "$EXPECTED_BILLING_ENFORCEMENT_MODE" && "$BILLING_ENFORCEMENT_MODE" != 
   echo "Error: build metadata billing-enforcement mode does not match the checked repository configuration." >&2
   exit 1
 fi
-if [[ "$BUILT_REF" != "$RELEASE_TAG" || "$BUILT_COMMIT" != "$REMOTE_TAG_COMMIT" ]]; then
-  echo "Error: build metadata does not match the requested source tag and commit." >&2
-  exit 1
-fi
-if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "Error: build returned an invalid image digest: $DIGEST" >&2
-  exit 1
-fi
-
 EXPECTED_IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
-if [[ "$IMAGE_URI" != "${EXPECTED_IMAGE_REPOSITORY}:"* ]]; then
-  echo "Error: image URI is outside the configured Artifact Registry repository." >&2
-  exit 1
-fi
-if [[ "$DIGEST_URI" != "${EXPECTED_IMAGE_REPOSITORY}@${DIGEST}" ]]; then
-  echo "Error: digest-qualified image URI does not match the configured repository and digest." >&2
-  exit 1
-fi
-if [[ "$BUILD_URL" != "https://github.com/${REPOSITORY}/actions/runs/"* ]]; then
-  echo "Error: build URL is outside this source repository." >&2
-  exit 1
-fi
 REGISTRY_DIGEST="$(gcloud artifacts docker images describe "$DIGEST_URI" \
   --project "$PROJECT_ID" \
   --format='value(image_summary.digest)')"
@@ -463,6 +438,7 @@ printf '%s\n' \
   "| Image digest | \`${DIGEST}\` |" \
   "| Build | [GitHub Actions run](${BUILD_URL}) |" \
   "| Voice quality gate | \`${VOICE_QUALITY_GATE}\` |" \
+  "| Phase-0 GCS media bucket | \`${GCS_MEDIA_BUCKET}\` (must equal \`${GCS_BUCKET}\`) |" \
   "" \
   "The digest is the attestation anchor used by the deployment's KMS policy." \
   "See README.md for the trust boundary and current reproducibility caveats." \
@@ -470,6 +446,7 @@ printf '%s\n' \
 
 RELEASE_ASSETS=(
   "$METADATA_FILE"
+  "$METADATA_PROVENANCE_FILE"
   "$PROVENANCE_FILE"
   "$SBOM_FILE"
   "$SBOM_ATTESTATION_FILE"
@@ -477,6 +454,7 @@ RELEASE_ASSETS=(
 EXPECTED_ASSET_NAMES="$(printf '%s\n' \
   enclave-provenance.jsonl \
   enclave-release.json \
+  enclave-release-metadata-provenance.jsonl \
   enclave-sbom-attestation.jsonl \
   enclave-sbom.spdx.json | sort)"
 EXPECTED_ASSETS_CSV="$(tr '\n' ',' <<< "$EXPECTED_ASSET_NAMES" | sed 's/,$//')"
@@ -487,10 +465,10 @@ if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   PRERELEASE_ARGS=(--prerelease)
 fi
 
-# A tagged workflow may publish an immutable release while this script is
-# waiting for and verifying its build evidence. Refresh immediately before the
-# first release mutation so a stale "missing" observation cannot lead to an
-# unsafe create attempt. Existing immutable assets are never modified.
+# Another fingerprint-authorized operator invocation may publish while this
+# script is waiting for and verifying build evidence. Refresh immediately
+# before the first release mutation so a stale "missing" observation cannot
+# lead to an unsafe create attempt. Existing immutable assets are never modified.
 refresh_release_state_before_mutation() {
   local release_json release_state
   RELEASE_EXISTS=false
@@ -574,12 +552,12 @@ create_release_or_reverify_publication_race() {
     return 0
   fi
 
-  # Close the remaining check/create race as well as the longer build-time
-  # race above. A failed create may mean the tagged workflow published first
-  # (or that the create response was lost). Only an exact immutable release is
-  # accepted; an absent or draft release remains an incomplete operation for a
-  # later explicit resume.
-  echo "Release create did not complete; checking for concurrent workflow publication..."
+  # Close the remaining check/create race as well as the longer evidence-wait
+  # race above. A failed create may mean another authorized invocation
+  # published first (or that the create response was lost). Only an exact
+  # immutable release is accepted; an absent or draft release remains an
+  # incomplete operation for a later explicit resume.
+  echo "Release create did not complete; checking for concurrent authorized publication..."
   refresh_release_state_before_mutation
   if [[ "$RELEASE_EXISTS" == "true" && "$RELEASE_IS_DRAFT" == "false" ]]; then
     reverify_published_immutable_release

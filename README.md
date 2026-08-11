@@ -401,7 +401,7 @@ docker build --platform linux/amd64 \
   --build-arg KMS_KEY_RING=my-keyring \
   --build-arg KMS_KEY=my-kek \
   --build-arg GCS_BUCKET=my-enclave-indexes \
-  --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
+  --build-arg GCS_MEDIA_BUCKET=my-enclave-indexes \
   --build-arg RUN_SA_EMAIL=legacy-caller@my-project.iam.gserviceaccount.com \
   --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
   --build-arg ATTEST_STS_AUDIENCE='//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/confidential-space' \
@@ -437,7 +437,7 @@ binding.
 |---|---|
 | `KMS_PROJECT`, `KMS_LOCATION`, `KMS_KEY_RING`, `KMS_KEY` | KMS KEK coordinates |
 | `GCS_BUCKET` | Encrypted database bucket |
-| `GCS_MEDIA_BUCKET` | Encrypted bounded-retention raw-media bucket |
+| `GCS_MEDIA_BUCKET` | Encrypted bounded-retention raw-media bucket; must exactly equal `GCS_BUCKET` for the Phase-0 transitional release |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
@@ -483,8 +483,15 @@ operation. For `main` and tags the workflow then:
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>`;
 5. generates an SPDX JSON SBOM and scans it for fixed high-severity vulnerabilities;
 6. creates GitHub-signed image provenance and a signed SBOM attestation; and
-7. uploads schema-v3 release metadata (including the attested billing enforcement mode),
+7. uploads a schema-v4 release manifest (including the attested billing mode and exact
+   Phase-0 media-bucket claim), that manifest's GitHub-signed provenance bundle, image
    provenance, SBOM, and attestation bundles.
+
+The build workflow has read-only repository-content permission and never publishes a
+GitHub Release. `scripts/release.sh`, after enforcing the separately authenticated
+`RELEASE_SIGNER_FINGERPRINT`, is the sole publisher. A tag that GitHub generically marks
+verified can produce CI artifacts, but those artifacts cannot qualify or publish a release
+when the signer fingerprint is wrong.
 
 Production is the sole active owner evaluation environment. Signed releases either carry
 the exact `eval/voice/owner-only-production.json` declaration and record
@@ -547,7 +554,10 @@ published trusted fingerprint; a valid signature from an unknown key is not suff
 The release contains:
 
 - `enclave-release.json` — production build profile, source ref/commit, image URI/digest,
-  build URL, and explicit voice-quality gate classification;
+  build URL, explicit voice-quality gate classification, and equal Phase-0 index/media
+  bucket claims;
+- `enclave-release-metadata-provenance.jsonl` — GitHub-signed provenance for the exact
+  release-manifest bytes; the JSON manifest is not evidence on its own;
 - `enclave-provenance.jsonl` — GitHub-signed image provenance;
 - `enclave-sbom.spdx.json` — SPDX SBOM; and
 - `enclave-sbom-attestation.jsonl` — signed SBOM attestation.

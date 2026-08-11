@@ -11,9 +11,11 @@ None of these scripts runs in the enclave or in a Kioku client.
 | `fetch_voice_eval_assets.sh` | Downloads licensed evaluation inputs and records hashes outside Git. |
 | `check_voice_release_gate.py` | Classifies a release as exact owner-only/no-claim or invokes the Rust checker for a complete real-corpus trio. |
 | `test_check_voice_release_gate.py` | Fail-closed contract tests for owner-only and validated-real-corpus classifications. |
-| `release.sh` | Verifies the selected voice-quality classification and repository-bound billing mode, creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
-| `test_release.py` | Static fail-closed contracts for release-state refresh, immutable-publication races, and malformed release metadata. |
-| `test_release_race.sh` | Mocked execution test of release-state refresh: raced immutable releases are reverified without mutation, while mismatched assets fail closed. |
+| `release.sh` | Verifies the selected voice-quality classification, repository-bound billing mode, and GitHub-signed schema-v4 Phase-0 media-bucket manifest; creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
+| `verify_release_metadata.py` | Strict schema-v4 validator for the GitHub-signed release-manifest subject: binds source/tag/image digest and requires the transitional media-bucket claim to equal the index bucket. |
+| `test_release.py` | Static fail-closed contracts for release-state refresh, immutable-publication races, signed release-manifest handling, and the workflow's lack of publication authority. |
+| `test_verify_release_metadata.py` | Adversarial contract tests for missing/different media claims and substituted source/image-digest manifest fields. |
+| `test_release_race.sh` | Mocked execution test of the exact signer anchor and release-state refresh: a valid wrong-key signature fails, raced immutable releases are reverified without mutation, and mismatched assets fail closed. |
 | `select_build_configuration.py` | Atomically selects and validates one complete production or evaluation image profile, including the reviewed `shadow|enforce` billing mode, without cross-profile fallback. |
 | `test_select_build_configuration.py` | Contract tests for profile isolation and the public build workflow. |
 | `generate_capacity_fixture.py` | Validates ADR-0022's versioned v1/v2 capacity manifests and streams content-free synthetic distributions into ignored/out-of-tree output; an explicit option can create the declared 32-GiB logical sparse shape without writing 32 GiB of blocks. |

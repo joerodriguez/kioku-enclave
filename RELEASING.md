@@ -2,8 +2,8 @@
 
 A production image must be traceable to signed public source and a content-addressable
 image digest. A release therefore includes a signed Git tag, immutable GitHub Release,
-validated image metadata, GitHub-signed build provenance, an SPDX SBOM, and a signed SBOM
-attestation. The image digest is the value authorized by the deployment's KMS
+validated image metadata with its own GitHub-signed provenance bundle, GitHub-signed image
+provenance, an SPDX SBOM, and a signed SBOM attestation. The image digest is the value authorized by the deployment's KMS
 attestation condition.
 
 ## Signed release workflow
@@ -30,8 +30,10 @@ To cut a new release:
    verifies the signed tag, and pushes it.
 5. The tag workflow independently requires GitHub to verify the tag signature,
    checks the selected classification, builds the image, generates provenance/SBOM attestations,
-   and publishes the immutable release. The local script then verifies that
-   evidence and may request a separately approved production roll.
+   and uploads workflow artifacts with read-only repository-content permission. It cannot
+   publish a GitHub Release. The local script rechecks the tag against the trusted
+   `RELEASE_SIGNER_FINGERPRINT`, verifies the evidence, and is the sole release publisher;
+   it may then request a separately approved production roll.
 
 ## Prerequisites
 
@@ -81,6 +83,13 @@ The public build validates these non-secret GitHub Actions variables before Dock
 | Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
 | Billing boundary | `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE`, `BILLING_ENFORCEMENT_MODE` (`shadow` or `enforce`) |
 | Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |
+
+For this ADR-0022 Phase-0 transitional release, `ENCLAVE_GCS_MEDIA_BUCKET` is required
+and must be exactly equal to `ENCLAVE_GCS_BUCKET`. CI rejects a missing or different
+value before Docker runs, bakes both `ENV` values into the image, and records the exact
+non-secret value in a schema-v4 release manifest. This is a build/release binding only:
+it does not create a media bucket, change Store/archive-v3 behavior, delete objects, or
+deploy a VM. A later split-bucket migration requires separate review and release evidence.
 
 Set them in GitHub Settings → Secrets and variables → Actions or with
 `gh variable set`. The workflow maps the `ENCLAVE_*` repository-variable names to the
@@ -191,19 +200,33 @@ The script and workflow then:
 6. push the image to the configured
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>` destination;
 7. generate an SPDX SBOM, fail on fixed high-severity image findings, and create
-   GitHub-signed image-provenance and SBOM attestations;
-8. validate the source repository/ref/commit, build URL, configured image repository,
-   digest, provenance signer workflow, and exact equality between the standalone SBOM
+   GitHub-signed image-provenance, SBOM, and schema-v4 release-manifest attestations;
+8. verify the signed release-manifest subject before parsing it, then validate its exact
+   source repository/ref/commit, image digest, configured Artifact Registry repository,
+   and Phase-0 claim that the exact media bucket equals the exact index bucket; verify
+   the image provenance signer workflow and exact equality between the standalone SBOM
    and the verified SBOM-attestation predicate; and
-9. create a draft, attach `enclave-release.json`,
-   `enclave-provenance.jsonl`, `enclave-sbom.spdx.json`, and
-   `enclave-sbom-attestation.jsonl`, publish it, and verify GitHub's immutable-release
-   attestation.
+9. return publication control to the fingerprint-enforcing local script, which alone
+   creates a draft and attaches `enclave-release.json`,
+   `enclave-release-metadata-provenance.jsonl`, `enclave-provenance.jsonl`,
+   `enclave-sbom.spdx.json`, and `enclave-sbom-attestation.jsonl`, publishes it, and
+   verifies GitHub's immutable-release attestation.
 
-If a prior invocation left a draft, the script repairs only the four expected assets and
+If a prior invocation left a draft, the script repairs only the five expected assets and
 rejects unexpected ones before publication. If a public release already exists, the
 script requires GitHub to report it as immutable and does not edit or clobber it.
 Investigate a mismatch; do not delete and recreate provenance to make verification pass.
+
+The build workflow has `contents: read` and no release-creation step. GitHub's generic
+`verification.verified` tag result is sufficient only to spend CI resources producing
+quarantined workflow artifacts; it never grants publication eligibility. A tag signed by
+any key other than the out-of-band `RELEASE_SIGNER_FINGERPRINT` is rejected by the sole
+publisher even when GitHub reports that signature as verified.
+
+Images whose immutable release lacks the signed schema-v4 media-bucket manifest and its
+matching provenance bundle are ineligible for promotion, including an attempted rollback.
+An old release, a mutable tag, a manually copied manifest, or a runtime fallback is not
+evidence that a digest was built for the transitional index bucket.
 
 Publishing creates a verified public release; it does not change production. An operator
 may then use `--roll` with an explicitly configured `DEPLOYMENT_REPO` to request that
@@ -226,8 +249,11 @@ gh release download vX.Y.Z \
 Check that:
 
 - `enclave-release.json` names the `production` build profile, this repository, tag,
-  signed-tag commit, build URL, and the expected digest-qualified Artifact Registry
-  repository;
+  signed-tag commit, build URL, the expected digest-qualified Artifact Registry
+  repository, and equal exact `gcs_bucket` / `gcs_media_bucket` claims;
+- `enclave-release-metadata-provenance.jsonl` verifies `enclave-release.json` itself as
+  a GitHub-signed subject from this workflow, tag, and commit—do not treat the JSON file
+  alone as evidence;
 - `gh attestation verify` accepts the image provenance for this repository's
   `.github/workflows/build.yml`, tag, and commit;
 - the SPDX SBOM is present and its signed attestation verifies for the same image digest;
@@ -252,7 +278,8 @@ approval-gated `enclave.yml` workflow with the digest-qualified image URI and di
 deployment workflow must verify the same release evidence, update the KMS image-digest
 condition, replace the Confidential Space VM, and record the successful pin. Do not
 bypass it with direct metadata edits, mutable image tags, or a digest from an unverified
-build.
+build. Merging this code or publishing a release does not deploy it; the separate
+deployment workflow remains the only rollout authority.
 
 After approval and rollout:
 
@@ -272,7 +299,7 @@ For a billing-enforcement promotion, first verify the pinned billing credential,
 catalog price, reconciliation with zero failures, the idempotent 60-second
 authorize/replay/detach canary, and the signed cloud-only client quota-denial upgrade UI.
 Then set `BILLING_ENFORCEMENT_MODE=enforce` and cut a new signed release; the mode is baked
-into the image and attested in schema-v3 metadata. To roll back enforcement, set the
+into the image and attested in schema-v4 metadata. To roll back enforcement, set the
 variable to `shadow`, cut another signed release, and roll its verified digest. Do not
 attempt a live launch-metadata override.
 

@@ -40,7 +40,8 @@ name: Build & push enclave image
 #   ENCLAVE_KMS_KEY_RING      KMS key ring name
 #   ENCLAVE_KMS_KEY           KMS crypto key name
 #   ENCLAVE_GCS_BUCKET        GCS bucket for encrypted index blobs
-#   ENCLAVE_GCS_MEDIA_BUCKET  GCS bucket for encrypted, bounded-retention media
+#   ENCLAVE_GCS_MEDIA_BUCKET  Required Phase-0 alias of ENCLAVE_GCS_BUCKET for
+#                             encrypted, bounded-retention media
 #   ENCLAVE_RUN_SA_EMAIL      Control-plane service account email
 #   ENCLAVE_AUDIENCE          Enclave's own URL (for ID-token aud validation)
 #   ENCLAVE_ATTEST_STS_AUDIENCE  WIF provider resource name for attestation STS
@@ -152,6 +153,7 @@ jobs:
         run: |
           python3 scripts/test_select_build_configuration.py
           python3 scripts/test_release.py
+          python3 scripts/test_verify_release_metadata.py
           scripts/test_release_race.sh
 
       - name: ADR-0022 capacity tooling contract tests
@@ -200,12 +202,14 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       attestations: write
-      contents: write
+      contents: read
       id-token: write
     outputs:
       image_tag: ${{ steps.build.outputs.image_tag }}
       image_uri: ${{ steps.build.outputs.image_uri }}
       image_repository: ${{ steps.build.outputs.image_repository }}
+      gcs_bucket: ${{ steps.build.outputs.gcs_bucket }}
+      gcs_media_bucket: ${{ steps.build.outputs.gcs_media_bucket }}
       digest:    ${{ steps.digest.outputs.digest }}
 
     steps:
@@ -364,6 +368,8 @@ jobs:
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "image_repository=${IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "gcs_bucket=${ENCLAVE_GCS_BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "gcs_media_bucket=${ENCLAVE_GCS_MEDIA_BUCKET}" >> "$GITHUB_OUTPUT"
           echo "billing_enforcement_mode=${BILLING_ENFORCEMENT_MODE}" >> "$GITHUB_OUTPUT"
 
       # The selector must use GITHUB_ENV so the trusted Docker build can receive
@@ -526,10 +532,7 @@ jobs:
       # summary. scripts/release.sh publishes this file on the public GitHub
       # Release, giving auditors a stable source commit -> image digest record.
       - name: Write release metadata
-        id: metadata
         run: |
-          VERSION="$(grep '^version =' Cargo.toml | head -1 | cut -d '"' -f 2)"
-          TAG_NAME="v${VERSION}"
           SOURCE_REF="${GITHUB_REF}"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             SOURCE_REF="${GITHUB_REF_NAME}"
@@ -547,13 +550,15 @@ jobs:
             "${KIOKU_BUILD_PROFILE}" \
             "${VOICE_QUALITY_GATE}" \
             "${{ steps.build.outputs.billing_enforcement_mode }}" \
+            "${{ steps.build.outputs.gcs_bucket }}" \
+            "${{ steps.build.outputs.gcs_media_bucket }}" \
             > enclave-release.json <<'PY'
           import json
           import sys
 
-          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode = sys.argv[1:]
+          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode, gcs_bucket, gcs_media_bucket = sys.argv[1:]
           print(json.dumps({
-              "schema_version": 3,
+              "schema_version": 4,
               "source_repository": "https://github.com/${{ github.repository }}",
               "source_ref": source_ref,
               "source_commit": commit,
@@ -564,9 +569,23 @@ jobs:
               "build_profile": build_profile,
               "voice_quality_gate": voice_quality_gate,
               "billing_enforcement_mode": billing_enforcement_mode,
+              "gcs_bucket": gcs_bucket,
+              "gcs_media_bucket": gcs_media_bucket,
           }, indent=2))
           PY
-          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      # The exact manifest bytes—including the non-secret Phase-0 bucket
+      # claim—are a signed provenance subject.  This is deliberately not an
+      # unsigned release-note assertion: release.sh verifies this bundle and
+      # separately verifies the image provenance before it can promote a tag.
+      - name: Attest release metadata manifest
+        id: attest_metadata
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: enclave-release.json
+
+      - name: Preserve release metadata provenance bundle
+        run: cp "${{ steps.attest_metadata.outputs.bundle-path }}" enclave-release-metadata-provenance.jsonl
 
       - name: Upload release metadata
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -574,37 +593,8 @@ jobs:
           name: enclave-release-metadata-${{ github.run_id }}
           path: |
             enclave-release.json
+            enclave-release-metadata-provenance.jsonl
             enclave-provenance.jsonl
             enclave-sbom.spdx.json
             enclave-sbom-attestation.jsonl
           retention-days: 90
-
-      - name: Automatically publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.metadata.outputs.tag_name }}
-        run: |
-          if [[ "${GITHUB_REF_NAME}" != "${TAG_NAME}" ]]; then
-            echo "::error::Cargo version ${TAG_NAME} does not match pushed tag ${GITHUB_REF_NAME}."
-            exit 1
-          fi
-          if [[ "$(git cat-file -t "${TAG_NAME}")" != "tag" ]]; then
-            echo "::error::Release source must be an annotated tag created and verified by scripts/release.sh."
-            exit 1
-          fi
-
-          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release ${TAG_NAME} already exists. Skipping release publication."
-            exit 0
-          fi
-
-          echo "Publishing GitHub Release for the verified signed tag ${TAG_NAME}..."
-          gh release create "${TAG_NAME}" \
-            enclave-release.json \
-            enclave-provenance.jsonl \
-            enclave-sbom.spdx.json \
-            enclave-sbom-attestation.jsonl \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "Kioku enclave ${TAG_NAME}" \
-            --notes "Automated open-source Kioku enclave release **${TAG_NAME}**."

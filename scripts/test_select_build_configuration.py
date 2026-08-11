@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
 RELEASE_SCRIPT = ROOT / "scripts" / "release.sh"
+METADATA_VERIFIER = ROOT / "scripts" / "verify_release_metadata.py"
 
 CONFIGURATION = {
     "ENCLAVE_KMS_PROJECT": "kioku-joerodriguez",
@@ -21,7 +22,7 @@ CONFIGURATION = {
     "ENCLAVE_KMS_KEY_RING": "kioku-eval",
     "ENCLAVE_KMS_KEY": "eval-kek",
     "ENCLAVE_GCS_BUCKET": "kioku-eval-indexes",
-    "ENCLAVE_GCS_MEDIA_BUCKET": "kioku-eval-media",
+    "ENCLAVE_GCS_MEDIA_BUCKET": "kioku-eval-indexes",
     "ENCLAVE_RUN_SA_EMAIL": "kioku-eval@kioku-joerodriguez.iam.gserviceaccount.com",
     "ENCLAVE_AUDIENCE": "https://eval-api.kiokuu.com",
     "ENCLAVE_ATTEST_STS_AUDIENCE": "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/enclave-attest/providers/attest",
@@ -70,6 +71,7 @@ def environment() -> dict[str, str]:
             result[f"{prefix}_{key}"] = value
     result["PRODUCTION_ENCLAVE_KMS_KEY_RING"] = "kioku-production"
     result["PRODUCTION_ENCLAVE_GCS_BUCKET"] = "kioku-production-indexes"
+    result["PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET"] = "kioku-production-indexes"
     return result
 
 
@@ -128,6 +130,14 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(content, "")
         self.assertIn("EVALUATION_ENCLAVE_GCS_BUCKET", completed.stderr)
         self.assertNotIn("kioku-production-indexes", completed.stderr)
+
+    def test_phase0_media_bucket_is_required_to_match_the_index_bucket(self) -> None:
+        env = environment()
+        env["EVALUATION_ENCLAVE_GCS_MEDIA_BUCKET"] = "kioku-eval-other"
+        completed, content = self.run_selector("evaluation", env)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("must exactly match ENCLAVE_GCS_BUCKET", completed.stderr)
 
     def test_apple_configuration_is_optional_but_atomic(self) -> None:
         env = environment()
@@ -242,21 +252,25 @@ class SelectorTests(unittest.TestCase):
             workflow.count("python3 scripts/check_voice_release_gate.py"), 2
         )
         self.assertNotIn("test -s eval/voice/release-manifest.json", workflow)
-        self.assertIn('"schema_version": 3', workflow)
+        self.assertIn('"schema_version": 4', workflow)
         self.assertIn('"voice_quality_gate": voice_quality_gate', workflow)
         self.assertIn('"billing_enforcement_mode": billing_enforcement_mode', workflow)
+        self.assertIn('"gcs_media_bucket": gcs_media_bucket', workflow)
+        self.assertIn("Attest release metadata manifest", workflow)
+        self.assertIn("subject-path: enclave-release.json", workflow)
 
     def test_operator_release_uses_shared_voice_gate_and_verifies_metadata(self) -> None:
         release_script = RELEASE_SCRIPT.read_text()
+        metadata_verifier = METADATA_VERIFIER.read_text()
         self.assertIn(
             'VOICE_QUALITY_GATE="$(python3 scripts/check_voice_release_gate.py)"',
             release_script,
         )
-        self.assertIn('"voice_quality_gate"', release_script)
-        self.assertIn('"3"', release_script)
-        self.assertIn('"billing_enforcement_mode"', release_script)
-        self.assertIn("owner_only_unvalidated", release_script)
-        self.assertIn("validated_real_corpus", release_script)
+        self.assertIn('"voice_quality_gate"', metadata_verifier)
+        self.assertIn("schema_version must be 4", metadata_verifier)
+        self.assertIn('"billing_enforcement_mode"', metadata_verifier)
+        self.assertIn("owner_only_unvalidated", metadata_verifier)
+        self.assertIn("validated_real_corpus", metadata_verifier)
         self.assertIn(
             '"$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE"',
             release_script,
@@ -270,6 +284,9 @@ class SelectorTests(unittest.TestCase):
             "BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE",
             release_script,
         )
+        self.assertIn("ENCLAVE_GCS_MEDIA_BUCKET must be configured and exactly match", release_script)
+        self.assertIn("Verifying signed release metadata manifest", release_script)
+        self.assertIn("enclave-release-metadata-provenance.jsonl", release_script)
 
 
 if __name__ == "__main__":

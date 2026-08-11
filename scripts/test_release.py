@@ -9,12 +9,24 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE = ROOT / "scripts" / "release.sh"
+WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
 
 
 class ReleasePublicationRaceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = RELEASE.read_text(encoding="utf-8")
+        cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    def test_ci_cannot_publish_a_release_for_a_generic_verified_signer(self) -> None:
+        self.assertNotIn("contents: write", self.workflow)
+        self.assertNotIn("Automatically publish GitHub Release", self.workflow)
+        self.assertNotIn("gh release create", self.workflow)
+        signer_check = self.source.index('grep -qxF "$RELEASE_SIGNER_FINGERPRINT"')
+        signer_call = self.source.index("\n  verify_tag_signer\n")
+        release_create = self.source.index('if gh release create "$RELEASE_TAG"')
+        self.assertLess(signer_check, signer_call)
+        self.assertLess(signer_call, release_create)
 
     def test_refreshes_state_after_build_evidence_and_before_mutation(self) -> None:
         evidence = self.source.index("Verifying signed GitHub build provenance")
@@ -66,6 +78,16 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertLess(edit, reverified)
         self.assertLess(upload, reverified)
         self.assertLess(immutable, edit)
+
+    def test_release_requires_signed_schema_v4_media_manifest_before_promotion(self) -> None:
+        manifest_verification = self.source.index("Verifying signed release metadata manifest")
+        parser = self.source.index("scripts/verify_release_metadata.py")
+        image_provenance = self.source.index("Verifying signed GitHub build provenance")
+        self.assertLess(manifest_verification, parser)
+        self.assertLess(parser, image_provenance)
+        self.assertIn('METADATA_PROVENANCE_FILE="$WORK_DIR/enclave-release-metadata-provenance.jsonl"', self.source)
+        self.assertIn('--expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET"', self.source)
+        self.assertIn("enclave-release-metadata-provenance.jsonl", self.source)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Execute the release-state helpers with a mocked GitHub CLI. This covers the
-# race where a workflow publishes after the script's earlier missing-release
-# check but before its first release mutation.
+# Execute release trust and state helpers with mocked Git/GitHub CLIs. This
+# covers concurrent operator publication races and the exact signer anchor.
 
 set -euo pipefail
 
@@ -21,8 +20,56 @@ print(source[start:end])
 PY
 }
 
+extract_signer_verifier() {
+  python3 - "$RELEASE_SCRIPT" <<'PY'
+import sys
+
+source = open(sys.argv[1], encoding="utf-8").read()
+start = source.index("verify_tag_signer() {")
+end = source.index('if [[ -z "$REMOTE_TAG_COMMIT" ]]', start)
+print(source[start:end])
+PY
+}
+
 HELPERS="$TEMP_DIR/helpers.sh"
 extract_helpers > "$HELPERS"
+SIGNER_VERIFIER="$TEMP_DIR/signer-verifier.sh"
+extract_signer_verifier > "$SIGNER_VERIFIER"
+
+run_signer_case() {
+  local case_name="$1"
+  local actual_fingerprint="$2"
+  local expect_success="$3"
+  local case_dir="$TEMP_DIR/$case_name"
+  mkdir -p "$case_dir"
+
+  set +e
+  ACTUAL_FINGERPRINT="$actual_fingerprint" SIGNER_VERIFIER="$SIGNER_VERIFIER" bash -s >"$case_dir/stdout" 2>"$case_dir/stderr" <<'SH'
+set -euo pipefail
+RELEASE_TAG="v1.2.3"
+RELEASE_SIGNER_FINGERPRINT="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+git() {
+  if [[ "$1" == "verify-tag" && "$2" == "--raw" && "$3" == "$RELEASE_TAG" ]]; then
+    printf '[GNUPG:] VALIDSIG %s\n' "$ACTUAL_FINGERPRINT" >&2
+    return 0
+  fi
+  return 92
+}
+
+source "$SIGNER_VERIFIER"
+verify_tag_signer
+SH
+  status=$?
+  set -e
+
+  if [[ "$expect_success" == "true" ]]; then
+    [[ "$status" -eq 0 ]] || { cat "$case_dir/stderr" >&2; echo "$case_name unexpectedly failed" >&2; return 1; }
+  else
+    [[ "$status" -ne 0 ]] || { echo "$case_name unexpectedly passed" >&2; return 1; }
+    grep -q "was not signed by RELEASE_SIGNER_FINGERPRINT" "$case_dir/stderr"
+  fi
+}
 
 run_race_case() {
   local case_name="$1"
@@ -32,7 +79,7 @@ run_race_case() {
   local case_dir="$TEMP_DIR/$case_name"
   local expected_names
   mkdir -p "$case_dir/work" "$case_dir/remote"
-  expected_names=$'enclave-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
+  expected_names=$'enclave-provenance.jsonl\nenclave-release-metadata-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
   while IFS= read -r name; do
     printf 'verified-%s\n' "$name" > "$case_dir/work/$name"
     printf '%s-%s\n' "$remote_suffix" "$name" > "$case_dir/remote/$name"
@@ -47,7 +94,7 @@ set -euo pipefail
 RELEASE_TAG="v1.2.3"
 REPOSITORY="owner/repository"
 WORK_DIR="$CASE_DIR/work"
-EXPECTED_ASSET_NAMES=$'enclave-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
+EXPECTED_ASSET_NAMES=$'enclave-provenance.jsonl\nenclave-release-metadata-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
 EXPECTED_ASSETS_CSV="$(tr '\n' ',' <<< "$EXPECTED_ASSET_NAMES" | sed 's/,$//')"
 EXPECTED_PRERELEASE=false
 
@@ -107,7 +154,7 @@ run_post_check_create_race_case() {
   local case_dir="$TEMP_DIR/$case_name"
   local expected_names
   mkdir -p "$case_dir/work" "$case_dir/remote"
-  expected_names=$'enclave-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
+  expected_names=$'enclave-provenance.jsonl\nenclave-release-metadata-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
   while IFS= read -r name; do
     printf 'verified-%s\n' "$name" > "$case_dir/work/$name"
   done <<< "$expected_names"
@@ -122,7 +169,7 @@ WORK_DIR="$CASE_DIR/work"
 NOTES_FILE="$CASE_DIR/notes.md"
 RELEASE_ASSETS=("$WORK_DIR/enclave-release.json")
 PRERELEASE_ARGS=(--prerelease=false)
-EXPECTED_ASSET_NAMES=$'enclave-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
+EXPECTED_ASSET_NAMES=$'enclave-provenance.jsonl\nenclave-release-metadata-provenance.jsonl\nenclave-release.json\nenclave-sbom-attestation.jsonl\nenclave-sbom.spdx.json'
 EXPECTED_ASSETS_CSV="$(tr '\n' ',' <<< "$EXPECTED_ASSET_NAMES" | sed 's/,$//')"
 EXPECTED_PRERELEASE=false
 
@@ -176,7 +223,12 @@ SH
   fi
 }
 
-published_release_json='{"isDraft":false,"isImmutable":true,"isPrerelease":false,"publishedAt":"2026-08-10T00:00:00Z","assets":[{"name":"enclave-provenance.jsonl"},{"name":"enclave-release.json"},{"name":"enclave-sbom-attestation.jsonl"},{"name":"enclave-sbom.spdx.json"}]}'
+published_release_json='{"isDraft":false,"isImmutable":true,"isPrerelease":false,"publishedAt":"2026-08-10T00:00:00Z","assets":[{"name":"enclave-provenance.jsonl"},{"name":"enclave-release-metadata-provenance.jsonl"},{"name":"enclave-release.json"},{"name":"enclave-sbom-attestation.jsonl"},{"name":"enclave-sbom.spdx.json"}]}'
+
+# A cryptographically valid tag from another signer is not enough. The sole
+# publisher requires the exact out-of-band fingerprint before any mutation.
+run_signer_case trusted_signer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA true
+run_signer_case generic_verified_wrong_signer BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB false
 
 # A raced immutable release with identical expected assets is reverified and
 # takes no create/edit/upload path.
