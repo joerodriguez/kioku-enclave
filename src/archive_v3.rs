@@ -64,7 +64,7 @@ pub const SQLITE_PAGE_SIZE: u32 = 4096;
 /// and WAL commit must remain within this many SQLite pages.
 pub const MAX_DATABASE_PAGES: u32 = 8_388_608;
 /// Byte form of [`MAX_DATABASE_PAGES`] for length-bearing archive formats.
-pub const MAX_DATABASE_BYTES: u64 = u64::from(MAX_DATABASE_PAGES) * u64::from(SQLITE_PAGE_SIZE);
+pub const MAX_DATABASE_BYTES: u64 = (MAX_DATABASE_PAGES as u64) * (SQLITE_PAGE_SIZE as u64);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ArchiveV3Error {

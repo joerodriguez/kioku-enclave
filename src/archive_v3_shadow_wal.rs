@@ -803,7 +803,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(uploaded.segment_count(), 2);
-        assert_eq!(uploaded.effective_logical_file_length(), SQLITE_PAGE_SIZE as u64);
+        assert_eq!(
+            uploaded.effective_logical_file_length(),
+            SQLITE_PAGE_SIZE as u64
+        );
 
         let checkpoint = ImmutableReference {
             object_id: ObjectId::from_bytes([4; 16]),

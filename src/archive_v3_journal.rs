@@ -1057,7 +1057,7 @@ mod tests {
         );
         assert_ne!(
             Sha256::digest(segment.encode().unwrap()),
-            Sha256::digest(tampered.frames)
+            Sha256::digest(&tampered.frames)
         );
 
         let mut over_cap_page = fixture_wal_segment();
