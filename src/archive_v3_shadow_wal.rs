@@ -716,8 +716,7 @@ mod tests {
         let backend = InMemoryImmutableBackend::new();
         let mut sink = RecordingSink::new();
         assert!(matches!(
-            recover_witness_nominated_wal(&recovery, &backend, &cipher, archive, &mut sink)
-                .await,
+            recover_witness_nominated_wal(&recovery, &backend, &cipher, archive, &mut sink).await,
             Err(ShadowWalError::Archive(ArchiveV3Error::Authentication))
         ));
         assert!(sink.aborted);
@@ -740,8 +739,7 @@ mod tests {
         let backend = InMemoryImmutableBackend::new();
         let mut sink = RecordingSink::new();
         assert!(matches!(
-            recover_witness_nominated_wal(&recovery, &backend, &cipher, archive, &mut sink)
-                .await,
+            recover_witness_nominated_wal(&recovery, &backend, &cipher, archive, &mut sink).await,
             Err(ShadowWalError::MissingObject)
         ));
         assert!(sink.aborted);
