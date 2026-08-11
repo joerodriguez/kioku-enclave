@@ -118,7 +118,7 @@ impl CapturedWalCommit {
     /// fixed frame boundary used by the future immutable uploader. The dummy
     /// predecessor is only a presence marker for payload validation; the real
     /// uploader replaces it with each previously sealed segment's exact hash.
-    fn validate_segments(&self, root_seq: u64) -> Result<()> {
+    pub(crate) fn validate_segments(&self, root_seq: u64) -> Result<()> {
         const WORST_CASE_HEADER_BYTES: usize = 138;
         let frames_per_segment =
             (MAX_WAL_SEGMENT_BYTES - WORST_CASE_HEADER_BYTES) / SQLITE_WAL_FRAME_BYTES;
@@ -163,6 +163,14 @@ impl CapturedWalCommit {
             .validate()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn replay_header(&self) -> &[u8; SQLITE_WAL_HEADER_BYTES] {
+        &self.wal_header
+    }
+
+    pub(crate) fn replay_frames(&self) -> &[u8] {
+        &self.frames
     }
 }
 
