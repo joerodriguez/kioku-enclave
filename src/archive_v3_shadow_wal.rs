@@ -306,8 +306,17 @@ async fn recover_witness_nominated_wal_inner(
         return Err(ArchiveV3Error::InvalidContext.into());
     }
     let commitment = recovery.root();
-    if cipher.key_epoch() != commitment.key_epoch() {
-        return Err(ArchiveV3Error::InvalidContext.into());
+    let registry = recovery.registry();
+    // The witness root names both a root commitment and the exact wrapped
+    // registry that authorized its DEK. A key-epoch match alone would permit
+    // a different same-epoch registry object to be substituted at this seam.
+    if cipher.key_epoch() != commitment.key_epoch()
+        || registry.key_epoch() != commitment.key_epoch()
+        || registry.rotation_generation() != cipher.registry_rotation_generation()
+        || registry.object_id() != cipher.registry_object_id()
+        || registry.ciphertext_hash() != cipher.registry_ciphertext_hash()
+    {
+        return Err(ArchiveV3Error::Authentication.into());
     }
     let root = load_witness_root(
         backend,
@@ -492,16 +501,57 @@ mod tests {
     use super::*;
     use crate::{
         archive_v3::{
-            resolve_archive_cipher, ArchiveDek, ExactKeyRegistryProvider, InMemoryImmutableBackend,
-            KeyEpoch, KeyKind, KeyRegistryContext, KeyRegistryPlaintext,
+            resolve_archive_cipher, ArchiveDek, ArchivePrefix, CreateIfAbsent, EnumerationCursor,
+            EnumerationLimit, EnumerationPage, ExactKeyRegistryProvider, InMemoryImmutableBackend,
+            KeyEpoch, KeyKind, KeyRegistryContext, KeyRegistryPlaintext, ObjectKey,
         },
         archive_v3_shadow::{ShadowSyncOutcome, WalCaptureState},
+        archive_v3_witness::{
+            InMemoryWitness, KeyRegistryReference, RootCommitment, Witness, WitnessBootstrap,
+        },
     };
 
     const WRAPPED: &[u8] = b"shadow-wal-test-registry";
 
     struct RegistryProvider {
         plaintext: Vec<u8>,
+    }
+
+    /// A provider fault after an accepted immutable create. Publication must
+    /// fail before a caller receives a root-composable reference.
+    struct MissingReadbackBackend {
+        inner: InMemoryImmutableBackend,
+    }
+
+    #[async_trait]
+    impl ImmutableObjectBackend for MissingReadbackBackend {
+        async fn create_if_absent(
+            &self,
+            key: ObjectKey,
+            value: crate::archive_v3::CiphertextEnvelope,
+        ) -> crate::archive_v3::Result<CreateIfAbsent> {
+            self.inner.create_if_absent(key, value).await
+        }
+
+        async fn get(
+            &self,
+            _key: &ObjectKey,
+        ) -> crate::archive_v3::Result<Option<crate::archive_v3::CiphertextEnvelope>> {
+            Ok(None)
+        }
+
+        async fn enumerate(
+            &self,
+            prefix: &ArchivePrefix,
+            cursor: Option<&EnumerationCursor>,
+            limit: EnumerationLimit,
+        ) -> crate::archive_v3::Result<EnumerationPage> {
+            self.inner.enumerate(prefix, cursor, limit).await
+        }
+
+        async fn delete_exact(&self, key: &ObjectKey) -> crate::archive_v3::Result<bool> {
+            self.inner.delete_exact(key).await
+        }
     }
 
     #[async_trait]
@@ -626,6 +676,99 @@ mod tests {
         fn abort(&mut self) {
             self.aborted = true;
         }
+    }
+
+    fn bootstrap_recovery(
+        archive: ArchiveId,
+        database: DatabaseEpoch,
+        key: KeyEpoch,
+        registry: KeyRegistryReference,
+    ) -> crate::archive_v3_witness::RecoveryRoot {
+        let witness = InMemoryWitness::new();
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive,
+                database,
+                RootCommitment::genesis(
+                    database,
+                    key,
+                    RootReference::new(0, ObjectId::from_bytes([31; 16]), [32; 32]),
+                ),
+                registry,
+            ))
+            .unwrap();
+        witness.recovery_root(archive).unwrap()
+    }
+
+    #[tokio::test]
+    async fn public_recovery_binds_the_exact_registry_and_aborts_its_sink() {
+        let archive = ArchiveId::from_bytes([21; 16]);
+        let database = DatabaseEpoch::from_bytes([22; 16]);
+        let key = KeyEpoch::from_bytes([23; 16]);
+        let cipher = test_cipher(archive, key).await;
+        let wrong_registry = KeyRegistryReference::new(
+            key,
+            cipher.registry_rotation_generation().saturating_add(1),
+            ObjectId::from_bytes([24; 16]),
+            [25; 32],
+        );
+        let recovery = bootstrap_recovery(archive, database, key, wrong_registry);
+        let backend = InMemoryImmutableBackend::new();
+        let mut sink = RecordingSink::new();
+        assert!(matches!(
+            recover_witness_nominated_wal(&recovery, &backend, &cipher, archive, &mut sink)
+                .await,
+            Err(ShadowWalError::Archive(ArchiveV3Error::Authentication))
+        ));
+        assert!(sink.aborted);
+        assert!(sink.header.is_none() && sink.frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_recovery_aborts_on_a_missing_witness_nominated_root() {
+        let archive = ArchiveId::from_bytes([26; 16]);
+        let database = DatabaseEpoch::from_bytes([27; 16]);
+        let key = KeyEpoch::from_bytes([28; 16]);
+        let cipher = test_cipher(archive, key).await;
+        let registry = KeyRegistryReference::new(
+            key,
+            cipher.registry_rotation_generation(),
+            cipher.registry_object_id(),
+            cipher.registry_ciphertext_hash(),
+        );
+        let recovery = bootstrap_recovery(archive, database, key, registry);
+        let backend = InMemoryImmutableBackend::new();
+        let mut sink = RecordingSink::new();
+        assert!(matches!(
+            recover_witness_nominated_wal(&recovery, &backend, &cipher, archive, &mut sink)
+                .await,
+            Err(ShadowWalError::MissingObject)
+        ));
+        assert!(sink.aborted);
+        assert!(sink.header.is_none() && sink.frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_requires_exact_readback_before_returning_a_reference() {
+        let archive = ArchiveId::from_bytes([41; 16]);
+        let database = DatabaseEpoch::from_bytes([42; 16]);
+        let key = KeyEpoch::from_bytes([43; 16]);
+        let cipher = test_cipher(archive, key).await;
+        let backend = MissingReadbackBackend {
+            inner: InMemoryImmutableBackend::new(),
+        };
+        assert!(matches!(
+            upload_captured_wal_commit(
+                &backend,
+                &cipher,
+                archive,
+                database,
+                1,
+                &captured_commit(1),
+            )
+            .await,
+            Err(ShadowWalError::MissingObject)
+        ));
     }
 
     #[tokio::test]

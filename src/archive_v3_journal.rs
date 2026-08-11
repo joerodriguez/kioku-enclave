@@ -14,6 +14,7 @@ use crate::archive_v3::{
     LogicalLocation, ObjectContext, ObjectId, ObjectRole, Result, ARCHIVE_FORMAT_VERSION,
     SQLITE_PAGE_SIZE,
 };
+use zeroize::Zeroizing;
 
 const CHECKPOINT_MANIFEST_MAGIC: &[u8; 8] = b"KACMv3\0\0";
 const WAL_SEGMENT_MAGIC: &[u8; 8] = b"KAWLv3\0\0";
@@ -532,8 +533,11 @@ pub fn resolve_wal_segment(
     {
         return Err(ArchiveV3Error::Authentication);
     }
-    let plaintext = cipher.open(&context, &envelope)?;
-    let segment = WalSegment::decode(&plaintext)?;
+    // `WalSegment::decode` copies the authenticated frame bytes into its
+    // bounded owned representation. Keep the transient AEAD plaintext
+    // zeroized even when decoding or context validation rejects it.
+    let plaintext = Zeroizing::new(cipher.open(&context, &envelope)?);
+    let segment = WalSegment::decode(plaintext.as_slice())?;
     segment.validate_for_context(&context)?;
     Ok(ResolvedWalSegment {
         reference: expected_reference,
@@ -555,8 +559,10 @@ pub fn resolve_verified_wal_segment(
     {
         return Err(ArchiveV3Error::Authentication);
     }
-    let plaintext = cipher.open(&context, &envelope)?;
-    let segment = WalSegment::decode(&plaintext)?;
+    // See `resolve_wal_segment`: the raw AEAD plaintext has no reason to
+    // survive after the validated segment owns its bounded frame copy.
+    let plaintext = Zeroizing::new(cipher.open(&context, &envelope)?);
+    let segment = WalSegment::decode(plaintext.as_slice())?;
     segment.validate_for_context(&context)?;
     Ok(ResolvedWalSegment {
         reference: expected_reference,

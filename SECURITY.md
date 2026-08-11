@@ -727,8 +727,9 @@ predecessor-linked immutable WAL segments. Every create is followed by an exact 
 envelope-hash, AEAD-context, and format check before its reference can appear in a candidate root.
 That root retains the exact checkpoint base and final WAL reference; composition rejects a prior
 WAL chain or extent base so it cannot discard history. Recovery begins only with one
-witness-nominated root, authenticates that root plus every reverse predecessor link before a
-staging sink receives a byte, and never enumerates storage. This is still not an authority or
+witness-nominated root, requires its exact registry epoch/rotation/object/hash to match the
+already resolved verified cipher, authenticates that root plus every reverse predecessor link
+before a staging sink receives a byte, and never enumerates storage. This is still not an authority or
 restore path: no VFS capture is drained, no `Store`/provider/flag/route/startup path calls it,
 no local WAL is truncated, and no composite staging adapter yet atomically joins checkpoint and
 WAL recovery before exposing a database.
