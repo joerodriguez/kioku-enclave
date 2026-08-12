@@ -54,6 +54,13 @@ PROFILE_KEYS = (
     "ENCLAVE_ACME_CONTACT",
 )
 
+PROBE_KEYS = (
+    "ARCHIVE_WITNESS_SHADOW_MODE",
+    "ARCHIVE_WITNESS_PROJECT_ID",
+    "ARCHIVE_WITNESS_PROJECT_NUMBER",
+    "ARCHIVE_WITNESS_DATABASE_ID",
+)
+
 OPTIONAL_PROFILE_GROUPS = (
     (
         "APPLE_TEAM_ID",
@@ -230,6 +237,28 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         raise SystemExit(
             "BILLING_ENFORCEMENT_MODE must be either shadow or enforce"
         )
+    probe_mode = configuration["ARCHIVE_WITNESS_SHADOW_MODE"]
+    probe_namespace = tuple(configuration[name] for name in PROBE_KEYS[1:])
+    if probe_mode == "off":
+        if any(probe_namespace):
+            raise SystemExit("archive witness namespace must be empty while shadow mode is off")
+    elif probe_mode == "probe-v1":
+        if not all(probe_namespace):
+            raise SystemExit("archive witness namespace must be complete for probe-v1")
+        require_pattern(configuration, "ARCHIVE_WITNESS_PROJECT_ID", PROJECT_PATTERN)
+        require_pattern(configuration, "ARCHIVE_WITNESS_PROJECT_NUMBER", r"[1-9][0-9]{0,19}")
+        require_pattern(
+            configuration,
+            "ARCHIVE_WITNESS_DATABASE_ID",
+            r"[a-z][a-z0-9-]{2,61}[a-z0-9]",
+        )
+        if re.fullmatch(
+            r"[0-9A-Za-z]{8}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{4}-[0-9A-Za-z]{12}",
+            configuration["ARCHIVE_WITNESS_DATABASE_ID"],
+        ):
+            raise SystemExit("archive witness database ID must not be UUID-shaped")
+    else:
+        raise SystemExit("ARCHIVE_WITNESS_SHADOW_MODE must be off or probe-v1")
 
 
 def selected_configuration(profile: str, environment: dict[str, str]) -> dict[str, str]:
@@ -240,6 +269,11 @@ def selected_configuration(profile: str, environment: dict[str, str]) -> dict[st
     for name in PROFILE_KEYS:
         source_name = f"{prefix}_{name}"
         configuration[name] = require_value(environment, source_name)
+    configuration["ARCHIVE_WITNESS_SHADOW_MODE"] = require_value(
+        environment, f"{prefix}_ARCHIVE_WITNESS_SHADOW_MODE"
+    )
+    for name in PROBE_KEYS[1:]:
+        configuration[name] = environment.get(f"{prefix}_{name}", "")
     for group in OPTIONAL_PROFILE_GROUPS:
         values = {
             name: environment.get(f"{prefix}_{name}", "") for name in group

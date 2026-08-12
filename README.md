@@ -403,6 +403,10 @@ docker build --platform linux/amd64 \
   --build-arg GCS_BUCKET=my-enclave-indexes \
   --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
   --build-arg GCS_LEGACY_MEDIA_BUCKET=my-enclave-indexes \
+  --build-arg ARCHIVE_WITNESS_SHADOW_MODE=off \
+  --build-arg ARCHIVE_WITNESS_PROJECT_ID= \
+  --build-arg ARCHIVE_WITNESS_PROJECT_NUMBER= \
+  --build-arg ARCHIVE_WITNESS_DATABASE_ID= \
   --build-arg RUN_SA_EMAIL=legacy-caller@my-project.iam.gserviceaccount.com \
   --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
   --build-arg ATTEST_STS_AUDIENCE='//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/confidential-space' \
@@ -440,6 +444,7 @@ binding.
 | `GCS_BUCKET` | Encrypted database bucket |
 | `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
 | `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
+| `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe. Checked-in builds use `off` and three empty namespace fields; `probe-v1` requires all three exact named-database fields and grants no archive authority |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
@@ -488,7 +493,7 @@ operation. For `main` and tags the workflow then:
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>`;
 5. generates an SPDX JSON SBOM and scans it for fixed high-severity vulnerabilities;
 6. creates GitHub-signed image provenance and a signed SBOM attestation; and
-7. uploads a schema-v5 release manifest (including the attested billing mode, index,
+7. uploads a schema-v6 release manifest (including the attested billing mode, index,
    current-media, and legacy-media bucket claims), that manifest's GitHub-signed provenance bundle, image
    provenance, SBOM, and attestation bundles.
 

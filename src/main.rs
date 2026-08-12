@@ -95,6 +95,10 @@ mod archive_v3_firestore_witness;
 // Inactive, Firestore-witness-only Confidential Space bearer path. It is
 // deliberately distinct from the KMS and public attestation credential paths.
 mod archive_v3_firestore_auth;
+// Inert, non-authoritative singleton transaction probe for the dedicated
+// named Firestore witness database. It has no Store, route, root, or rollout
+// wiring while its image-baked mode remains off.
+mod archive_v3_firestore_probe;
 // Inactive, no-I/O composition of the exact Firestore namespace, dedicated
 // bearer, fixed REST transport, and shadow-coordinator transaction boundary.
 mod archive_v3_firestore_shadow;
@@ -630,6 +634,15 @@ async fn main() {
         version = env!("CARGO_PKG_VERSION"),
         "kioku-enclave starting"
     );
+
+    // Non-authoritative ADR-0022 transport probe. Off is the baked default;
+    // probe-v1 owns one isolated bounded task and one fixed singleton document.
+    // Keep the guard in this stack frame across the complete server lifetime.
+    let _firestore_probe_guard = archive_v3_firestore_probe::FirestoreProbeTaskGuard::start(
+        archive_v3_firestore_probe::FirestoreProbeStartupConfig::from_env()
+            .expect("valid image-baked archive witness probe configuration"),
+    )
+    .expect("construct archive witness transport probe");
 
     // ── Auth config ───────────────────────────────────────────────────────────
     //

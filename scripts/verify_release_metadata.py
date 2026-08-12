@@ -30,7 +30,17 @@ FIELDS = (
     "gcs_bucket",
     "gcs_media_bucket",
     "gcs_legacy_media_bucket",
+    "archive_witness_shadow_mode",
+    "archive_witness_project_id",
+    "archive_witness_project_number",
+    "archive_witness_database_id",
 )
+
+EMPTY_ALLOWED_FIELDS = {
+    "archive_witness_project_id",
+    "archive_witness_project_number",
+    "archive_witness_database_id",
+}
 
 
 def reject(message: str) -> None:
@@ -59,8 +69,14 @@ def parse_metadata(path: Path) -> dict[str, object]:
     if type(data["schema_version"]) is not int:
         reject("schema_version must be an integer")
     for key in FIELDS:
-        if key != "schema_version":
+        if key != "schema_version" and key not in EMPTY_ALLOWED_FIELDS:
             required_string(data, key)
+        elif key in EMPTY_ALLOWED_FIELDS:
+            value = data[key]
+            if not isinstance(value, str) or any(
+                ord(character) < 32 or ord(character) == 127 for character in value
+            ):
+                reject(f"{key} must be a control-free string")
     return data
 
 
@@ -73,8 +89,8 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         reject("expected legacy media GCS bucket has an invalid format")
     if arguments.expected_gcs_bucket != arguments.expected_gcs_legacy_media_bucket:
         reject("expected legacy media GCS bucket must equal the expected GCS bucket for Phase-0")
-    if data["schema_version"] != 5:
-        reject("schema_version must be 5; older manifests are ineligible for promotion")
+    if data["schema_version"] != 6:
+        reject("schema_version must be 6; older manifests are ineligible for promotion")
 
     expected_repository = f"https://github.com/{arguments.repository}"
     if data["source_repository"] != expected_repository:
@@ -125,6 +141,34 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
     if legacy_media_bucket != bucket:
         reject("gcs_legacy_media_bucket must equal gcs_bucket for the Phase-0 dual-media migration")
 
+    probe_claim = (
+        data["archive_witness_shadow_mode"],
+        data["archive_witness_project_id"],
+        data["archive_witness_project_number"],
+        data["archive_witness_database_id"],
+    )
+    expected_probe_claim = (
+        arguments.expected_archive_witness_shadow_mode,
+        arguments.expected_archive_witness_project_id,
+        arguments.expected_archive_witness_project_number,
+        arguments.expected_archive_witness_database_id,
+    )
+    if probe_claim != expected_probe_claim:
+        reject("archive witness probe claim does not match the release configuration")
+    mode, project_id, project_number, database_id = probe_claim
+    if mode == "off":
+        if any((project_id, project_number, database_id)):
+            reject("archive witness namespace must be empty while mode is off")
+    elif mode == "probe-v1":
+        if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project_id):
+            reject("archive witness project ID is invalid")
+        if not re.fullmatch(r"[1-9][0-9]{0,19}", project_number):
+            reject("archive witness project number is invalid")
+        if not re.fullmatch(r"[a-z][a-z0-9-]{2,61}[a-z0-9]", database_id):
+            reject("archive witness database ID is invalid")
+    else:
+        reject("archive witness shadow mode is invalid")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -136,6 +180,10 @@ def main() -> None:
     parser.add_argument("--expected-gcs-bucket", required=True)
     parser.add_argument("--expected-gcs-media-bucket", required=True)
     parser.add_argument("--expected-gcs-legacy-media-bucket", required=True)
+    parser.add_argument("--expected-archive-witness-shadow-mode", default="off")
+    parser.add_argument("--expected-archive-witness-project-id", default="")
+    parser.add_argument("--expected-archive-witness-project-number", default="")
+    parser.add_argument("--expected-archive-witness-database-id", default="")
     arguments = parser.parse_args()
     data = parse_metadata(arguments.metadata)
     validate(arguments, data)

@@ -11,11 +11,12 @@
 //! against one named database: `beginTransaction`, one-document `batchGet`,
 //! and one-document `commit`.
 
+use crate::archive_v3_firestore_probe::{FirestoreProbeRecord, PROBE_RECORD_BYTES};
 use crate::archive_v3_firestore_witness::{
     firestore_timestamp_not_after, parse_exact_batch_get_stream,
-    valid_firestore_precondition_timestamp, FirestoreTransaction, FirestoreWitnessNamespace,
-    FirestoreWitnessRead, FirestoreWitnessTransport, FirestoreWitnessTransportError,
-    MAX_BATCH_GET_RESPONSE_BYTES,
+    parse_exact_probe_batch_get_stream, valid_firestore_precondition_timestamp, FirestoreProbeRead,
+    FirestoreProbeTransport, FirestoreTransaction, FirestoreWitnessNamespace, FirestoreWitnessRead,
+    FirestoreWitnessTransport, FirestoreWitnessTransportError, MAX_BATCH_GET_RESPONSE_BYTES,
 };
 use crate::archive_v3_witness::WITNESS_RECORD_BYTES;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -207,6 +208,102 @@ impl FirestoreWitnessRestTransport {
         }
     }
 
+    fn validate_probe_batch_get_request(
+        &self,
+        request: &Value,
+        transaction: Option<&FirestoreTransaction>,
+    ) -> bool {
+        let Some(object) = request.as_object() else {
+            return false;
+        };
+        if object.len() != usize::from(transaction.is_some()) + 1 {
+            return false;
+        }
+        let exact_document = object
+            .get("documents")
+            .and_then(Value::as_array)
+            .filter(|documents| documents.len() == 1)
+            .and_then(|documents| documents[0].as_str())
+            .is_some_and(|document| self.namespace.is_probe_document(document));
+        exact_document
+            && match (transaction, object.get("transaction")) {
+                (None, None) => true,
+                (Some(transaction), Some(Value::String(encoded))) => {
+                    canonical_base64_decodes_to(encoded, transaction.bytes())
+                }
+                _ => false,
+            }
+    }
+
+    fn validate_probe_commit_request(
+        &self,
+        request: &Value,
+        transaction: &FirestoreTransaction,
+    ) -> bool {
+        let Some(object) = request.as_object() else {
+            return false;
+        };
+        if object.len() != 2
+            || !object
+                .get("transaction")
+                .and_then(Value::as_str)
+                .is_some_and(|value| canonical_base64_decodes_to(value, transaction.bytes()))
+        {
+            return false;
+        }
+        let Some(write) = object
+            .get("writes")
+            .and_then(Value::as_array)
+            .filter(|writes| writes.len() == 1)
+            .and_then(|writes| writes[0].as_object())
+            .filter(|write| write.len() == 2)
+        else {
+            return false;
+        };
+        let Some(update) = write
+            .get("update")
+            .and_then(Value::as_object)
+            .filter(|update| update.len() == 2)
+        else {
+            return false;
+        };
+        if !update
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| self.namespace.is_probe_document(name))
+        {
+            return false;
+        }
+        let valid_record = update
+            .get("fields")
+            .and_then(Value::as_object)
+            .filter(|fields| fields.len() == 1)
+            .and_then(|fields| fields.get("r"))
+            .and_then(Value::as_object)
+            .filter(|field| field.len() == 1)
+            .and_then(|field| field.get("bytesValue"))
+            .and_then(Value::as_str)
+            .is_some_and(canonical_probe_record_base64);
+        if !valid_record {
+            return false;
+        }
+        let Some(precondition) = write.get("currentDocument").and_then(Value::as_object) else {
+            return false;
+        };
+        matches!(
+            (
+                precondition.get("exists"),
+                precondition.get("updateTime"),
+                precondition.len()
+            ),
+            (Some(Value::Bool(false)), None, 1)
+        ) || matches!(
+            (precondition.get("exists"), precondition.get("updateTime"), precondition.len()),
+            (None, Some(Value::String(timestamp)), 1)
+                if valid_firestore_precondition_timestamp(timestamp)
+        )
+    }
+
     async fn post_json(
         &self,
         rpc: &str,
@@ -357,6 +454,81 @@ impl FirestoreWitnessTransport for FirestoreWitnessRestTransport {
     }
 }
 
+#[async_trait::async_trait]
+impl FirestoreProbeTransport for FirestoreWitnessRestTransport {
+    async fn begin_probe_transaction(
+        &self,
+        bearer_token: &str,
+        request_json: Value,
+    ) -> std::result::Result<FirestoreTransaction, FirestoreWitnessTransportError> {
+        self.begin_read_write(bearer_token, request_json).await
+    }
+
+    async fn batch_get_probe(
+        &self,
+        bearer_token: &str,
+        transaction: &FirestoreTransaction,
+        request_json: Value,
+    ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+        if !self.validate_probe_batch_get_request(&request_json, Some(transaction)) {
+            return Err(FirestoreWitnessTransportError::Protocol);
+        }
+        let document = request_json["documents"][0]
+            .as_str()
+            .expect("validated request")
+            .to_owned();
+        let response = self
+            .post_json("batchGet", bearer_token, request_json)
+            .await?;
+        if !response.status().is_success() {
+            return Err(read_error_response(response).await?);
+        }
+        let body = bounded_body(response, MAX_BATCH_GET_RESPONSE_BYTES).await?;
+        parse_probe_batch_get_response_array(&body, &document)
+    }
+
+    async fn read_probe(
+        &self,
+        bearer_token: &str,
+        request_json: Value,
+    ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+        if !self.validate_probe_batch_get_request(&request_json, None) {
+            return Err(FirestoreWitnessTransportError::Protocol);
+        }
+        let document = request_json["documents"][0]
+            .as_str()
+            .expect("validated request")
+            .to_owned();
+        let response = self
+            .post_json("batchGet", bearer_token, request_json)
+            .await?;
+        if !response.status().is_success() {
+            return Err(read_error_response(response).await?);
+        }
+        let body = bounded_body(response, MAX_BATCH_GET_RESPONSE_BYTES).await?;
+        parse_probe_batch_get_response_array(&body, &document)
+    }
+
+    async fn commit_probe_record(
+        &self,
+        bearer_token: &str,
+        transaction: &FirestoreTransaction,
+        request_json: Value,
+    ) -> std::result::Result<(), FirestoreWitnessTransportError> {
+        if !self.validate_probe_commit_request(&request_json, transaction) {
+            return Err(FirestoreWitnessTransportError::Protocol);
+        }
+        let response = self.post_commit_json(bearer_token, request_json).await?;
+        if !response.status().is_success() {
+            return commit_error_response(response).await;
+        }
+        let body = bounded_body(response, MAX_COMMIT_RESPONSE_BYTES)
+            .await
+            .map_err(|_| FirestoreWitnessTransportError::OutcomeUnknown)?;
+        parse_commit_response(&body).map_err(|_| FirestoreWitnessTransportError::OutcomeUnknown)
+    }
+}
+
 fn valid_production_origin(origin: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else {
         return false;
@@ -409,6 +581,15 @@ fn canonical_fixed_record_base64(encoded: &str) -> bool {
         return false;
     };
     decoded.len() == MAX_WITNESS_RECORD_BYTES && STANDARD.encode(decoded) == encoded
+}
+
+fn canonical_probe_record_base64(encoded: &str) -> bool {
+    let Ok(decoded) = STANDARD.decode(encoded) else {
+        return false;
+    };
+    decoded.len() == PROBE_RECORD_BYTES
+        && STANDARD.encode(&decoded) == encoded
+        && FirestoreProbeRecord::decode(&decoded).is_some()
 }
 
 async fn bounded_body(
@@ -465,6 +646,21 @@ fn parse_batch_get_response_array(
     let response =
         serde_json::to_vec(&responses[0]).map_err(|_| FirestoreWitnessTransportError::Protocol)?;
     parse_exact_batch_get_stream([response.as_slice()], expected_document)
+}
+
+fn parse_probe_batch_get_response_array(
+    body: &[u8],
+    expected_document: &str,
+) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| FirestoreWitnessTransportError::Protocol)?;
+    let responses = value
+        .as_array()
+        .filter(|responses| responses.len() == 1 && responses[0].is_object())
+        .ok_or(FirestoreWitnessTransportError::Protocol)?;
+    let response =
+        serde_json::to_vec(&responses[0]).map_err(|_| FirestoreWitnessTransportError::Protocol)?;
+    parse_exact_probe_batch_get_stream([response.as_slice()], expected_document)
 }
 
 fn parse_begin_response(
@@ -822,6 +1018,22 @@ mod tests {
     fn commit_request() -> Value {
         json!({"transaction": STANDARD.encode(transaction().bytes()), "writes": [{"update": {"name": document(), "fields": {"r": {"bytesValue": STANDARD.encode(record())}}}, "currentDocument": {"updateTime": TIME}}]})
     }
+    fn probe_document() -> String {
+        format!(
+            "projects/{PROJECT}/databases/{DATABASE}/documents/archive_witness_transport_probe_v1/singleton"
+        )
+    }
+    fn probe_record() -> [u8; PROBE_RECORD_BYTES] {
+        let mut bytes = [0; PROBE_RECORD_BYTES];
+        bytes[..16].copy_from_slice(b"KIOKU-WIT-PROBE\0");
+        bytes[16..20].copy_from_slice(&1u32.to_be_bytes());
+        bytes[24..32].copy_from_slice(&1u64.to_be_bytes());
+        bytes[32..].fill(7);
+        bytes
+    }
+    fn probe_commit_request() -> Value {
+        json!({"transaction": STANDARD.encode(transaction().bytes()), "writes": [{"update": {"name": probe_document(), "fields": {"r": {"bytesValue": STANDARD.encode(probe_record())}}}, "currentDocument": {"exists": false}}]})
+    }
     fn batch_body() -> String {
         format!(r#"{{"missing":"{}","readTime":"{}"}}"#, document(), TIME)
     }
@@ -1082,5 +1294,18 @@ mod tests {
         aligned["writes"][0]["currentDocument"]["updateTime"] =
             json!("2026-01-02T03:04:05.123456000Z");
         assert!(transport.validate_commit_request(&aligned, &transaction()));
+
+        assert!(transport
+            .validate_probe_batch_get_request(&json!({"documents": [probe_document()]}), None));
+        assert!(transport.validate_probe_commit_request(&probe_commit_request(), &transaction()));
+        let mut arbitrary = probe_commit_request();
+        arbitrary["writes"][0]["update"]["name"] = json!(format!(
+            "projects/{PROJECT}/databases/{DATABASE}/documents/archive_witness_transport_probe_v1/other"
+        ));
+        assert!(!transport.validate_probe_commit_request(&arbitrary, &transaction()));
+        let mut malformed = probe_commit_request();
+        malformed["writes"][0]["update"]["fields"]["r"]["bytesValue"] =
+            json!(STANDARD.encode([0; PROBE_RECORD_BYTES]));
+        assert!(!transport.validate_probe_commit_request(&malformed, &transaction()));
     }
 }

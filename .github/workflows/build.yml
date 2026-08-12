@@ -212,6 +212,10 @@ jobs:
       gcs_bucket: ${{ steps.build.outputs.gcs_bucket }}
       gcs_media_bucket: ${{ steps.build.outputs.gcs_media_bucket }}
       gcs_legacy_media_bucket: ${{ steps.build.outputs.gcs_legacy_media_bucket }}
+      archive_witness_shadow_mode: ${{ steps.build.outputs.archive_witness_shadow_mode }}
+      archive_witness_project_id: ${{ steps.build.outputs.archive_witness_project_id }}
+      archive_witness_project_number: ${{ steps.build.outputs.archive_witness_project_number }}
+      archive_witness_database_id: ${{ steps.build.outputs.archive_witness_database_id }}
       digest:    ${{ steps.digest.outputs.digest }}
 
     steps:
@@ -241,6 +245,10 @@ jobs:
           PRODUCTION_ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
           PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
           PRODUCTION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_LEGACY_MEDIA_BUCKET }}
+          PRODUCTION_ARCHIVE_WITNESS_SHADOW_MODE: off
+          PRODUCTION_ARCHIVE_WITNESS_PROJECT_ID: ""
+          PRODUCTION_ARCHIVE_WITNESS_PROJECT_NUMBER: ""
+          PRODUCTION_ARCHIVE_WITNESS_DATABASE_ID: ""
           PRODUCTION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
           PRODUCTION_ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
           PRODUCTION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
@@ -278,6 +286,10 @@ jobs:
           EVALUATION_ENCLAVE_GCS_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_BUCKET }}
           EVALUATION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_MEDIA_BUCKET }}
           EVALUATION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET }}
+          EVALUATION_ARCHIVE_WITNESS_SHADOW_MODE: off
+          EVALUATION_ARCHIVE_WITNESS_PROJECT_ID: ""
+          EVALUATION_ARCHIVE_WITNESS_PROJECT_NUMBER: ""
+          EVALUATION_ARCHIVE_WITNESS_DATABASE_ID: ""
           EVALUATION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.EVAL_ENCLAVE_RUN_SA_EMAIL }}
           EVALUATION_ENCLAVE_AUDIENCE: ${{ vars.EVAL_ENCLAVE_AUDIENCE }}
           EVALUATION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.EVAL_ENCLAVE_ATTEST_STS_AUDIENCE }}
@@ -348,6 +360,10 @@ jobs:
             --build-arg GCS_BUCKET="${ENCLAVE_GCS_BUCKET}" \
             --build-arg GCS_MEDIA_BUCKET="${ENCLAVE_GCS_MEDIA_BUCKET}" \
             --build-arg GCS_LEGACY_MEDIA_BUCKET="${ENCLAVE_GCS_LEGACY_MEDIA_BUCKET}" \
+            --build-arg ARCHIVE_WITNESS_SHADOW_MODE="${ARCHIVE_WITNESS_SHADOW_MODE}" \
+            --build-arg ARCHIVE_WITNESS_PROJECT_ID="${ARCHIVE_WITNESS_PROJECT_ID}" \
+            --build-arg ARCHIVE_WITNESS_PROJECT_NUMBER="${ARCHIVE_WITNESS_PROJECT_NUMBER}" \
+            --build-arg ARCHIVE_WITNESS_DATABASE_ID="${ARCHIVE_WITNESS_DATABASE_ID}" \
             --build-arg RUN_SA_EMAIL="${ENCLAVE_RUN_SA_EMAIL}" \
             --build-arg ENCLAVE_AUDIENCE="${ENCLAVE_AUDIENCE}" \
             --build-arg ATTEST_STS_AUDIENCE="${ENCLAVE_ATTEST_STS_AUDIENCE}" \
@@ -386,6 +402,10 @@ jobs:
           echo "gcs_bucket=${ENCLAVE_GCS_BUCKET}" >> "$GITHUB_OUTPUT"
           echo "gcs_media_bucket=${ENCLAVE_GCS_MEDIA_BUCKET}" >> "$GITHUB_OUTPUT"
           echo "gcs_legacy_media_bucket=${ENCLAVE_GCS_LEGACY_MEDIA_BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "archive_witness_shadow_mode=${ARCHIVE_WITNESS_SHADOW_MODE}" >> "$GITHUB_OUTPUT"
+          echo "archive_witness_project_id=${ARCHIVE_WITNESS_PROJECT_ID}" >> "$GITHUB_OUTPUT"
+          echo "archive_witness_project_number=${ARCHIVE_WITNESS_PROJECT_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "archive_witness_database_id=${ARCHIVE_WITNESS_DATABASE_ID}" >> "$GITHUB_OUTPUT"
           echo "billing_enforcement_mode=${BILLING_ENFORCEMENT_MODE}" >> "$GITHUB_OUTPUT"
           echo "build_profile=${KIOKU_BUILD_PROFILE}" >> "$GITHUB_OUTPUT"
 
@@ -397,6 +417,7 @@ jobs:
           for name in \
             ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING \
             ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_GCS_LEGACY_MEDIA_BUCKET \
+            ARCHIVE_WITNESS_SHADOW_MODE ARCHIVE_WITNESS_PROJECT_ID ARCHIVE_WITNESS_PROJECT_NUMBER ARCHIVE_WITNESS_DATABASE_ID \
             ENCLAVE_RUN_SA_EMAIL ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE \
             GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID \
             APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID \
@@ -547,7 +568,7 @@ jobs:
       - name: Preserve SBOM attestation bundle
         run: cp "${{ steps.attest_sbom.outputs.bundle-path }}" enclave-sbom-attestation.jsonl
 
-      # Keep release metadata machine-readable as well as visible in the job
+      # Keep schema-v6 release metadata machine-readable as well as visible in the job
       # summary. scripts/release.sh publishes this file on the public GitHub
       # Release, giving auditors a stable source commit -> image digest record.
       - name: Write release metadata
@@ -574,13 +595,17 @@ jobs:
             "${{ steps.build.outputs.gcs_bucket }}" \
             "${{ steps.build.outputs.gcs_media_bucket }}" \
             "${{ steps.build.outputs.gcs_legacy_media_bucket }}" \
+            "${{ steps.build.outputs.archive_witness_shadow_mode }}" \
+            "${{ steps.build.outputs.archive_witness_project_id }}" \
+            "${{ steps.build.outputs.archive_witness_project_number }}" \
+            "${{ steps.build.outputs.archive_witness_database_id }}" \
             > enclave-release.json <<'PY'
           import json
           import sys
 
-          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode, gcs_bucket, gcs_media_bucket, gcs_legacy_media_bucket = sys.argv[1:]
+          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode, gcs_bucket, gcs_media_bucket, gcs_legacy_media_bucket, archive_witness_shadow_mode, archive_witness_project_id, archive_witness_project_number, archive_witness_database_id = sys.argv[1:]
           print(json.dumps({
-              "schema_version": 5,
+              "schema_version": 6,
               "source_repository": "https://github.com/${{ github.repository }}",
               "source_ref": source_ref,
               "source_commit": commit,
@@ -594,6 +619,10 @@ jobs:
               "gcs_bucket": gcs_bucket,
               "gcs_media_bucket": gcs_media_bucket,
               "gcs_legacy_media_bucket": gcs_legacy_media_bucket,
+              "archive_witness_shadow_mode": archive_witness_shadow_mode,
+              "archive_witness_project_id": archive_witness_project_id,
+              "archive_witness_project_number": archive_witness_project_number,
+              "archive_witness_database_id": archive_witness_database_id,
           }, indent=2))
           PY
 

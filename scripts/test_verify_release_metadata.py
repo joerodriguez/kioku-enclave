@@ -21,7 +21,7 @@ MEDIA_BUCKET = "kioku-production-media"
 
 def manifest() -> dict[str, object]:
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "source_repository": "https://github.com/owner/repository",
         "source_ref": "v1.2.3",
         "source_commit": COMMIT,
@@ -35,6 +35,10 @@ def manifest() -> dict[str, object]:
         "gcs_bucket": BUCKET,
         "gcs_media_bucket": MEDIA_BUCKET,
         "gcs_legacy_media_bucket": BUCKET,
+        "archive_witness_shadow_mode": "off",
+        "archive_witness_project_id": "",
+        "archive_witness_project_number": "",
+        "archive_witness_database_id": "",
     }
 
 
@@ -42,6 +46,13 @@ def schema_v4_manifest() -> dict[str, object]:
     data = manifest()
     data["schema_version"] = 4
     del data["gcs_legacy_media_bucket"]
+    for key in (
+        "archive_witness_shadow_mode",
+        "archive_witness_project_id",
+        "archive_witness_project_number",
+        "archive_witness_database_id",
+    ):
+        del data[key]
     return data
 
 
@@ -79,7 +90,7 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_valid_current_manifest_is_eligible(self) -> None:
         completed = self.verify(manifest())
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(f"\t{BUCKET}\t{MEDIA_BUCKET}\t{BUCKET}\n", completed.stdout)
+        self.assertIn(f"\t{BUCKET}\t{MEDIA_BUCKET}\t{BUCKET}\toff", completed.stdout)
 
     def test_missing_build_profile_is_ineligible(self) -> None:
         data = manifest()
@@ -150,6 +161,24 @@ class ReleaseMetadataTests(unittest.TestCase):
         completed = self.verify(data)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("missing or unexpected fields", completed.stderr)
+
+    def test_mode_namespace_claim_is_exact_and_all_or_nothing(self) -> None:
+        data = manifest()
+        data["archive_witness_project_id"] = "project-1"
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("does not match", completed.stderr)
+
+        data = manifest()
+        data.update({
+            "archive_witness_shadow_mode": "probe-v1",
+            "archive_witness_project_id": "project-1",
+            "archive_witness_project_number": "123456789",
+            "archive_witness_database_id": "witness-db",
+        })
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("does not match", completed.stderr)
 
 
 if __name__ == "__main__":
