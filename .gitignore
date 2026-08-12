@@ -1,5 +1,7 @@
 /target
 Cargo.lock.bak
+__pycache__/
+*.py[cod]
 
 # Claude Code local settings (IDE tooling, not project source)
 .claude/

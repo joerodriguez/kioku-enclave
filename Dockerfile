@@ -20,8 +20,8 @@
 # compiles natively with:
 #   rustup target add x86_64-unknown-linux-musl
 #   cargo build --release --locked --target x86_64-unknown-linux-musl
-# The local `cargo build` (darwin) is for development only; the Dockerfile
-# assumes it runs on a Linux x86-64 builder (GitHub Actions Ubuntu 24.04).
+# The Dockerfile assumes a Linux x86-64 builder (GitHub Actions Ubuntu 24.04);
+# ordinary macOS development uses the repository's lightweight verifier.
 #
 # Operator build instructions
 # ---------------------------

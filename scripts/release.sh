@@ -242,11 +242,86 @@ if [[ "$RELEASE_TAG" != "v${PACKAGE_VERSION}" ]]; then
   exit 1
 fi
 
+verify_required_ci_success() {
+  local commit="$1"
+  local run_json run_id jobs_json
+
+  if ! run_json="$(gh run list \
+    --repo "$REPOSITORY" \
+    --workflow build.yml \
+    --commit "$commit" \
+    --event push \
+    --limit 100 \
+    --json databaseId,headBranch,headSha,status,conclusion)"; then
+    echo "Error: could not query required CI for exact commit ${commit}." >&2
+    return 1
+  fi
+  run_id="$(printf '%s' "$run_json" | python3 -c '
+import json
+import sys
+
+expected_commit = sys.argv[1]
+runs = json.load(sys.stdin)
+matching = [
+    run
+    for run in runs
+    if type(run) is dict
+    and type(run.get("databaseId")) is int
+    and run.get("headBranch") == "main"
+    and run.get("headSha") == expected_commit
+    and run.get("status") == "completed"
+    and run.get("conclusion") == "success"
+]
+if not matching:
+    raise SystemExit(
+        "no successful completed push workflow run for the exact main commit"
+    )
+print(max(run["databaseId"] for run in matching))
+' "$commit")" || {
+    echo "Error: required CI has not succeeded for exact commit ${commit}." >&2
+    echo "       Wait for the main push workflow to complete successfully, then retry." >&2
+    return 1
+  }
+
+  if ! jobs_json="$(gh run view "$run_id" --repo "$REPOSITORY" --json jobs)"; then
+    echo "Error: could not inspect required CI run ${run_id}." >&2
+    return 1
+  fi
+  if ! printf '%s' "$jobs_json" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+jobs = data.get("jobs") if type(data) is dict else None
+ci_jobs = [
+    job
+    for job in jobs or []
+    if type(job) is dict and job.get("name") == "CI"
+]
+if len(ci_jobs) != 1:
+    raise SystemExit("the exact workflow run did not contain exactly one CI job")
+job = ci_jobs[0]
+if job.get("status") != "completed" or job.get("conclusion") != "success":
+    raise SystemExit("the required CI job did not complete successfully")
+'; then
+    echo "Error: required CI job did not succeed for exact commit ${commit}." >&2
+    return 1
+  fi
+
+  echo "Verified required CI run ${run_id} for exact commit ${commit}."
+}
+
+if [[ "$ROLLBACK_EXISTING" == "false" ]]; then
+  REQUIRED_CI_COMMIT="$COMMIT"
+  if [[ "$RESUME_EXISTING" == "true" ]]; then
+    REQUIRED_CI_COMMIT="$REMOTE_TAG_COMMIT"
+  fi
+  echo "Verifying required CI..."
+  verify_required_ci_success "$REQUIRED_CI_COMMIT"
+fi
+
 if [[ "$ROLLBACK_EXISTING" == "false" && "$RESUME_EXISTING" == "false" ]]; then
-  echo "Running release checks..."
-  cargo fmt --all -- --check
-  cargo test --locked
-  cargo clippy --locked --all-targets -- -D warnings
+  echo "Checking release-only metadata..."
   VOICE_QUALITY_GATE="$(python3 scripts/check_voice_release_gate.py)"
   EXPECTED_VOICE_QUALITY_GATE="$VOICE_QUALITY_GATE"
   EXPECTED_BILLING_ENFORCEMENT_MODE="$(gh variable get BILLING_ENFORCEMENT_MODE --repo "$REPOSITORY")"

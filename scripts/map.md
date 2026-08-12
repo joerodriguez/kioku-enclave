@@ -7,11 +7,17 @@ None of these scripts runs in the enclave or in a Kioku client.
 
 | Path | Responsibility |
 |---|---|
-| `bump_version.sh` | Refuses main/detached HEAD, updates the Cargo version, and stages the complete release change without committing or pushing. |
+| `agent-verify.sh` | Space-guarded local verification with quick, focused, and full modes; uses locked Cargo commands and an optional bounded local `sccache`. |
+| `check_build_disk_space.py` | Refuses heavyweight local verification when the selected filesystem is below a configurable free-space floor (15 GiB by default). |
+| `rust_build_lock.py` | Crash-safe, per-worktree kernel lock shared by local verification and artifact retirement so wrapper-controlled builds cannot overlap retirement. |
+| `retire_rust_worktree_artifacts.py` | Dry-run-first retirement of only the exact `target/` directory in a clean, linked worktree whose exact GitHub PR head is merged; coordinates with the wrapper lock plus defensive process/Cargo-profile checks and quarantines the exact directory before deletion. Raw Cargo must not race it. |
+| `test_agent_verify.py` | Fast mocked command contracts for verification modes, argument forwarding, the shared disk guard, and bounded optional `sccache`. |
+| `test_rust_build_lifecycle.py` | Isolated temporary-repository contracts for disk checks and fail-closed worktree artifact retirement. |
+| `bump_version.sh` | Refuses main/detached HEAD, updates the Cargo manifest and exact root lockfile package entry without compiling, validates them with locked metadata, and stages the complete release change without committing or pushing. |
 | `fetch_voice_eval_assets.sh` | Downloads licensed evaluation inputs and records hashes outside Git. |
 | `check_voice_release_gate.py` | Classifies a release as exact owner-only/no-claim or invokes the Rust checker for a complete real-corpus trio. |
 | `test_check_voice_release_gate.py` | Fail-closed contract tests for owner-only and validated-real-corpus classifications. |
-| `release.sh` | Verifies the selected voice-quality classification, repository-bound billing mode, GitHub-signed schema-v6 Phase-0/probe-mode manifest, and—before a roll—enabled APNs key-version metadata plus the exact runtime secret-accessor IAM binding without reading keys or impersonating the runtime identity; creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
+| `release.sh` | Requires successful required CI for the exact public main commit, verifies the selected voice-quality classification, repository-bound billing mode, GitHub-signed schema-v6 Phase-0/probe-mode manifest, and—before a roll—enabled APNs key-version metadata plus the exact runtime secret-accessor IAM binding without reading keys or impersonating the runtime identity; creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
 | `verify_release_metadata.py` | Strict schema-v6 validator for the GitHub-signed release-manifest subject: binds source/tag/image digest, bucket topology, and the exact complete-or-empty Firestore probe mode/namespace claim. |
 | `test_release.py` | Static fail-closed contracts for release-state refresh, immutable-publication races, signed release-manifest handling, APNs metadata/IAM-only roll preflight, and the workflow's lack of publication authority. |
 | `test_verify_release_metadata.py` | Adversarial contract tests for missing/different media claims and substituted source/image-digest manifest fields. |
