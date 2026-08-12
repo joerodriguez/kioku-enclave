@@ -571,6 +571,12 @@ Verify the provenance against the digest-qualified image, source repository, wor
 tag, and commit. `scripts/release.sh` performs these checks with `gh attestation verify`
 before it publishes a new release or requests a roll.
 
+The workflow records the selected build profile as an output of the trusted image-build
+step before clearing the sensitive build environment. The schema-v5 manifest and job
+summary must consume that output, and the release wrapper requires its attested value to
+be exactly `production`. A missing or cleared profile makes the image non-deployable even
+when its image scan and provenance attestations succeeded.
+
 ### 3. Match all anchors
 
 The verified chain is:

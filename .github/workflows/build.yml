@@ -387,6 +387,7 @@ jobs:
           echo "gcs_media_bucket=${ENCLAVE_GCS_MEDIA_BUCKET}" >> "$GITHUB_OUTPUT"
           echo "gcs_legacy_media_bucket=${ENCLAVE_GCS_LEGACY_MEDIA_BUCKET}" >> "$GITHUB_OUTPUT"
           echo "billing_enforcement_mode=${BILLING_ENFORCEMENT_MODE}" >> "$GITHUB_OUTPUT"
+          echo "build_profile=${KIOKU_BUILD_PROFILE}" >> "$GITHUB_OUTPUT"
 
       # The selector must use GITHUB_ENV so the trusted Docker build can receive
       # one dynamically chosen profile. Remove those values before any
@@ -489,6 +490,7 @@ jobs:
         env:
           EXPECTED_DIGEST: ${{ steps.push.outputs.digest }}
           IMAGE_TAGGED_URI: ${{ steps.build.outputs.image_uri }}
+          BUILD_PROFILE: ${{ steps.build.outputs.build_profile }}
         run: |
           REGISTRY_DIGEST="$(gcloud artifacts docker images describe "${IMAGE_TAGGED_URI}" \
             --format='value(image_summary.digest)' 2>/dev/null || echo 'unknown')"
@@ -502,14 +504,14 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Build profile | \`${KIOKU_BUILD_PROFILE}\` |"
+            echo "| Build profile | \`${BUILD_PROFILE}\` |"
             echo "| Image tag | \`${{ steps.build.outputs.image_tag }}\` |"
             echo "| Image URI | \`${IMAGE_TAGGED_URI}\` |"
             echo "| **Image digest** | \`${EXPECTED_DIGEST}\` |"
             echo "| Commit | \`${GITHUB_SHA}\` |"
             echo "| Built at | $(date -u '+%Y-%m-%dT%H:%M:%SZ') |"
             echo ""
-            if [[ "${KIOKU_BUILD_PROFILE}" == "evaluation" ]]; then
+            if [[ "${BUILD_PROFILE}" == "evaluation" ]]; then
               echo "### Evaluation image only"
               echo ""
               echo "This is not a production release or deployment input. Pin it only in"
@@ -549,6 +551,8 @@ jobs:
       # summary. scripts/release.sh publishes this file on the public GitHub
       # Release, giving auditors a stable source commit -> image digest record.
       - name: Write release metadata
+        env:
+          BUILD_PROFILE: ${{ steps.build.outputs.build_profile }}
         run: |
           SOURCE_REF="${GITHUB_REF}"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
@@ -564,7 +568,7 @@ jobs:
             "${IMAGE_REPOSITORY}@${DIGEST}" \
             "${DIGEST}" \
             "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
-            "${KIOKU_BUILD_PROFILE}" \
+            "${BUILD_PROFILE}" \
             "${VOICE_QUALITY_GATE}" \
             "${{ steps.build.outputs.billing_enforcement_mode }}" \
             "${{ steps.build.outputs.gcs_bucket }}" \
