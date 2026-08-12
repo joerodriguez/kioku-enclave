@@ -318,6 +318,15 @@ intervals, including a turn that crosses an event boundary. Gemini offsets are
 validated against the assembled window; source timestamps, URLs, and literal
 device context always remain authoritative.
 
+Gemini `speaker_local_id` values are request-local turn-grouping hints, not
+durable speaker identities. The archive therefore never exposes an unmatched
+local ID such as `speaker_0`: it uses `Unidentified voice` instead. Within one
+work unit, unresolved sibling turns may inherit a name or independent voice
+profile label only when the same local ID has exactly one nonconflicting
+resolution. The enclave abstains when different resolutions conflict, and it
+never carries a Gemini local ID across work-unit boundaries. Schema migration
+applies the same rule to historical exact local-ID fallbacks.
+
 Storyboard inputs use each event ID as an opaque `frame_id`. A response is
 rejected atomically if any expected ID is missing, duplicated, or replaced by
 an unknown ID. Per-frame results are projected only to that exact source frame;
@@ -425,7 +434,9 @@ the bounded server-side reconciler.
   seconds of clean speech is required for enrollment, and profiles use a
   versioned medoid/trimmed centroid with outlier rejection. Independent
   WeSpeaker embeddings then match later turns; Gemini never receives
-  voiceprints or acts as a biometric identifier.
+  voiceprints or acts as a biometric identifier. Gemini request-local speaker
+  IDs may group turns only inside their source work unit; unmatched IDs are
+  displayed as `Unidentified voice`, not persisted as apparent people.
 - Profile reconciliation retains append-only revisions and sample-assignment
   history. A merge proposal is accepted only across the same embedding space,
   scorer, acoustic domain, and nonconflicting identity; a split is anonymous

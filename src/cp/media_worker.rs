@@ -28,7 +28,7 @@ const MAX_JOBS_PER_USER_PER_SWEEP: usize = 2;
 const MAX_CONCURRENT_USER_SWEEPS: usize = 4;
 const MAX_ATTEMPTS: i64 = 3;
 const PROCESSOR_VERSION: i64 = 1;
-const PROMPT_VERSION: i64 = 1;
+const PROMPT_VERSION: i64 = 2;
 
 #[derive(Debug, Clone)]
 struct MediaJob {
@@ -1026,7 +1026,7 @@ fn persist_audio_window_result(
         let speaker_label = confident_name
             .map(ToOwned::to_owned)
             .or(voice_label)
-            .unwrap_or_else(|| turn.speaker_local_id.clone());
+            .unwrap_or_else(|| super::media::UNIDENTIFIED_SPEAKER_LABEL.to_string());
         let source_key = format!("cloud-v2:{}:{}", anchor_job.event_id, turn.turn_id);
         tx.execute(
             "INSERT INTO utterances \
@@ -1105,6 +1105,7 @@ fn persist_audio_window_result(
             }
         }
     }
+    super::media::reconcile_request_local_speaker_labels(&tx, Some(work_unit_id))?;
     for job in jobs {
         mark_succeeded(&tx, job)?;
     }
@@ -1597,7 +1598,8 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
         reserve_media_output(state, user_id, work).await?;
         let candidate_names = candidate_name_vocabulary(state, user_id).await?;
         let prompt = format!(
-            "Transcribe this audio exactly. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this asset. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
+            "Transcribe this audio exactly. The source kind is {}. Return chronological speaker turns with millisecond offsets from the beginning. Keep stable speaker_local_id values within this entire asset. Prefer an existing local id whenever the voice remains acoustically consistent. Do not invent a new speaker solely because of a one-word interjection, a short phrase, a pause, changed volume or prosody, device movement, or background noise; create a new local id only when sustained acoustic evidence supports a different human voice. Mark overlap. Only populate speaker_name, speaker_name_confidence, and speaker_name_evidence when the audio itself explicitly supports the person's full or partial name; never guess from voice alone. For every turn, include only durable person_facts explicitly supported by that turn, with literal evidence; never infer sensitive traits or unstated facts. The following bounded names are spelling vocabulary only, not proof that anyone is present, speaking, or has any identity: {}",
+            work.jobs[0].stream_kind,
             serde_json::to_string(&candidate_names)?
         );
         let generation = vertex::generate_media_custom(
@@ -2039,6 +2041,42 @@ mod tests {
         }
     }
 
+    fn persist_single_audio_work(
+        conn: &Connection,
+        turns: &[AudioTurn],
+        voiceprints: &[super::super::voice_memory::EmbeddedTurn],
+    ) {
+        record_source_event(
+            conn,
+            "account-1",
+            &manifest(),
+            &"b".repeat(64),
+            "raw/object",
+        )
+        .unwrap();
+        let work = lease_work_unit(conn, "2026-07-31T18:01:00.000Z", WorkClass::Audio)
+            .unwrap()
+            .unwrap();
+        persist_audio_window_result(
+            conn,
+            &work.id,
+            &work.jobs,
+            &[SourceInterval::new("event-1", 0, 5_000)],
+            turns,
+            voiceprints,
+        )
+        .unwrap();
+    }
+
+    fn persisted_speaker_labels(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT speaker_label FROM utterances ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     fn active_speaker_screen() -> ScreenResult {
         ScreenResult {
             literal_description: "John Garcia is visibly marked as speaking".into(),
@@ -2226,6 +2264,128 @@ mod tests {
             vec![
                 ("event-0".into(), 4_500, 5_000, 4_500, 5_000),
                 ("event-1".into(), 5_000, 5_500, 0, 500),
+            ]
+        );
+    }
+
+    #[test]
+    fn unmatched_request_local_speaker_id_is_not_persisted_as_identity() {
+        let conn = job_fixture_db();
+        persist_single_audio_work(&conn, &[unnamed_turn()], &[]);
+        assert_eq!(
+            persisted_speaker_labels(&conn),
+            vec![super::super::media::UNIDENTIFIED_SPEAKER_LABEL]
+        );
+    }
+
+    #[test]
+    fn unique_voice_resolution_labels_same_local_id_siblings_within_work_unit() {
+        let conn = job_fixture_db();
+        let mut unresolved = unnamed_turn();
+        unresolved.end_ms = 500;
+        unresolved.text = "What?".into();
+        let mut resolved = unnamed_turn();
+        resolved.turn_id = "turn-2".into();
+        resolved.start_ms = 500;
+        resolved.text = "The rest of the launch plan is ready".into();
+        persist_single_audio_work(
+            &conn,
+            &[unresolved, resolved],
+            &[enrolled_voiceprint_for("turn-2", vec![0.0625; 256])],
+        );
+        assert_eq!(persisted_speaker_labels(&conn), vec!["Voice 1", "Voice 1"]);
+    }
+
+    #[test]
+    fn schema_migration_repairs_historical_request_local_labels() {
+        let conn = job_fixture_db();
+        let mut unresolved = unnamed_turn();
+        unresolved.end_ms = 500;
+        unresolved.text = "What?".into();
+        let mut resolved = unnamed_turn();
+        resolved.turn_id = "turn-2".into();
+        resolved.start_ms = 500;
+        persist_single_audio_work(
+            &conn,
+            &[unresolved, resolved],
+            &[enrolled_voiceprint_for("turn-2", vec![0.0625; 256])],
+        );
+        conn.execute(
+            "UPDATE utterances SET speaker_label='speaker-1' WHERE id=(SELECT MIN(id) FROM utterances)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key='request-local-speaker-labels-v1'",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        assert_eq!(persisted_speaker_labels(&conn), vec!["Voice 1", "Voice 1"]);
+        let completed: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key='request-local-speaker-labels-v1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(completed);
+    }
+
+    #[test]
+    fn voice_resolution_does_not_cross_request_local_speaker_ids() {
+        let conn = job_fixture_db();
+        let mut unresolved = unnamed_turn();
+        unresolved.end_ms = 500;
+        unresolved.text = "What?".into();
+        let mut resolved = unnamed_turn();
+        resolved.turn_id = "turn-2".into();
+        resolved.start_ms = 500;
+        resolved.speaker_local_id = "speaker-2".into();
+        resolved.text = "A different voice continues the launch plan".into();
+        persist_single_audio_work(
+            &conn,
+            &[unresolved, resolved],
+            &[enrolled_voiceprint_for("turn-2", vec![0.0625; 256])],
+        );
+        assert_eq!(
+            persisted_speaker_labels(&conn),
+            vec![super::super::media::UNIDENTIFIED_SPEAKER_LABEL, "Voice 1"]
+        );
+    }
+
+    #[test]
+    fn conflicting_voice_resolutions_do_not_claim_an_unresolved_sibling() {
+        let conn = job_fixture_db();
+        let mut unresolved = unnamed_turn();
+        unresolved.end_ms = 500;
+        unresolved.text = "What?".into();
+        let mut first_voice = unnamed_turn();
+        first_voice.turn_id = "turn-2".into();
+        first_voice.start_ms = 500;
+        first_voice.end_ms = 2_500;
+        let mut second_voice = unnamed_turn();
+        second_voice.turn_id = "turn-3".into();
+        second_voice.start_ms = 2_500;
+        second_voice.text = "Another voice has a different embedding".into();
+        let mut orthogonal = vec![0.0; 256];
+        orthogonal[0] = 1.0;
+        persist_single_audio_work(
+            &conn,
+            &[unresolved, first_voice, second_voice],
+            &[
+                enrolled_voiceprint_for("turn-2", vec![0.0625; 256]),
+                enrolled_voiceprint_for("turn-3", orthogonal),
+            ],
+        );
+        assert_eq!(
+            persisted_speaker_labels(&conn),
+            vec![
+                super::super::media::UNIDENTIFIED_SPEAKER_LABEL,
+                "Voice 1",
+                "Voice 2"
             ]
         );
     }
