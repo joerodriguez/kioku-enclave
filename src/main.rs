@@ -44,11 +44,11 @@
 //! | GET    | /health                    | Liveness probe; returns `{"ok":true}`        |
 //! | ANY    | /v1/* data routes          | Authenticated `410 Gone`; permanently retired|
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{any, get},
@@ -264,6 +264,81 @@ async fn legacy_data_plane_retired() -> Response {
         })),
     )
         .into_response()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BillingRequestObservation {
+    route: &'static str,
+    status: u16,
+    status_class: &'static str,
+    duration_ms: u64,
+}
+
+fn billing_request_observation(
+    method: &Method,
+    path: &str,
+    status: StatusCode,
+    duration_ms: u64,
+) -> Option<BillingRequestObservation> {
+    let route = match (method, path) {
+        (method, "/api/billing") if method == Method::GET => "billing_summary",
+        (method, "/api/billing/recording-lease") if method == Method::POST => "recording_lease",
+        _ => return None,
+    };
+    let status_class = match status.as_u16() {
+        200..=299 => "2xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    };
+    Some(BillingRequestObservation {
+        route,
+        status: status.as_u16(),
+        status_class,
+        duration_ms,
+    })
+}
+
+/// Emits one content-free event only for the two launch-critical billing
+/// method-and-route pairs. Raw paths, queries, account IDs, tokens, headers,
+/// and bodies never enter the event, so its fields remain safe for
+/// low-cardinality log metrics.
+async fn observe_billing_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    if let Some(observation) =
+        billing_request_observation(&method, &path, response.status(), duration_ms)
+    {
+        let route = observation.route;
+        let status = observation.status;
+        let status_class = observation.status_class;
+        let duration_ms = observation.duration_ms;
+        if status_class == "5xx" {
+            warn!(
+                target: "kioku::billing_request",
+                metric_schema = "billing_request_v1",
+                route,
+                status,
+                status_class,
+                duration_ms,
+                "billing request completed"
+            );
+        } else {
+            info!(
+                target: "kioku::billing_request",
+                metric_schema = "billing_request_v1",
+                route,
+                status,
+                status_class,
+                duration_ms,
+                "billing request completed"
+            );
+        }
+    }
+    response
 }
 
 fn legacy_data_plane_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
@@ -831,6 +906,7 @@ async fn main() {
         .route("/v1/attestation", get(handle_attestation))
         .merge(authenticated)
         .merge(control_plane)
+        .layer(middleware::from_fn(observe_billing_request))
         .layer(middleware::from_fn(security_headers))
         .with_state(Arc::clone(&state));
 
@@ -1021,6 +1097,58 @@ mod email_startup_tests {
             .unwrap()
             .keys()
             .all(|key| !key.contains("user")));
+    }
+}
+
+#[cfg(test)]
+mod billing_request_observability_tests {
+    use super::*;
+
+    #[test]
+    fn only_fixed_billing_routes_produce_content_free_observations() {
+        assert_eq!(
+            billing_request_observation(&Method::GET, "/api/billing", StatusCode::OK, 61),
+            Some(BillingRequestObservation {
+                route: "billing_summary",
+                status: 200,
+                status_class: "2xx",
+                duration_ms: 61,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(
+                &Method::POST,
+                "/api/billing/recording-lease",
+                StatusCode::SERVICE_UNAVAILABLE,
+                2_001,
+            ),
+            Some(BillingRequestObservation {
+                route: "recording_lease",
+                status: 503,
+                status_class: "5xx",
+                duration_ms: 2_001,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(&Method::GET, "/api/accounts/private", StatusCode::OK, 1),
+            None
+        );
+        assert_eq!(
+            billing_request_observation(&Method::GET, "/api/billing/private", StatusCode::OK, 1),
+            None
+        );
+        for (method, path) in [
+            (Method::OPTIONS, "/api/billing"),
+            (Method::OPTIONS, "/api/billing/recording-lease"),
+            (Method::POST, "/api/billing"),
+            (Method::GET, "/api/billing/recording-lease"),
+        ] {
+            assert_eq!(
+                billing_request_observation(&method, path, StatusCode::METHOD_NOT_ALLOWED, 1),
+                None,
+                "observed wrong method {method} for {path}"
+            );
+        }
     }
 }
 

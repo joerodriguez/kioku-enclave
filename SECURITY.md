@@ -819,7 +819,11 @@ normal sign-ins cannot exhaust bounded third-party registration. The directly di
 Mac app uses a separate fixed public native client whose browser return must be exact
 HTTP `127.0.0.1`, include an explicit ephemeral port, use only `/oauth/callback`, and have
 no query before the server appends the single-use code and state; lookalike hosts and
-paths are rejected. Apple refresh
+paths are rejected. That public native client ID and caller-selected loopback port do not
+independently prove that the receiving local process is the official Kioku binary. Its
+consent page therefore retains the requesting-app, redirect-destination, and full-archive
+access disclosure; only the fixed web client returning to Kioku's exact owned origin uses
+official first-party sign-in copy. Apple refresh
 authorization is held per issuing iPhone/Mac/web client only in the encrypted control
 store and every retained grant is revoked before identity deletion. Legacy routes accept only
 Google-signed ID tokens with the baked audience and
@@ -992,6 +996,19 @@ HTTP 503 before persistence. Screenshots and references require an active lease 
 consume again. Existing cloud archive reads, search, export, and deletion remain ungated;
 there is no local recording or transcription fallback. Shadow mode must not log upstream
 denial detail.
+
+### Billing request telemetry reveals route timing and outcome
+
+The service emits one structured event after each `GET` billing-summary or `POST`
+recording-lease request. It ignores preflight and wrong-method requests. Each event
+contains only a fixed schema name, one of two fixed route labels, the numeric HTTP status
+and its fixed class, and elapsed milliseconds. It deliberately omits the request method,
+path and query, account and provider identifiers, tokens, headers, bodies, lease/request
+IDs, exception text, and captured content. This is request-level operational telemetry—not
+an anonymous aggregate—so privileged log readers can observe billing request cadence and
+may correlate timing with other infrastructure events. Keep the method/route set fixed
+and low-cardinality, retain privileged log access, and do not join these events to
+user-level logs.
 
 ### Stable user identifiers are linkable
 

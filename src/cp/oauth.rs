@@ -1224,13 +1224,61 @@ fn native_loopback_redirect_matches(redirect_uri: &str) -> bool {
         && uri.query().is_none()
 }
 
-fn consent_page(client_name: Option<&str>, origin: &str, consent_token: &str) -> Response {
+fn uses_owned_web_sign_in_copy(client_id: &str) -> bool {
+    client_id == FIRST_PARTY_WEB_CLIENT_ID
+}
+
+fn consent_page(
+    owned_web_sign_in: bool,
+    client_name: Option<&str>,
+    origin: &str,
+    consent_token: &str,
+) -> Response {
     let display_name = client_name
         .map(|name| name.chars().take(MAX_CLIENT_NAME_BYTES).collect::<String>())
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "Unnamed OAuth client".to_string());
-    let content = format!(
-        r#"<section class="card" aria-labelledby="page-title">
+    let content = if owned_web_sign_in {
+        format!(
+            r#"<section class="card" aria-labelledby="page-title">
+      <p class="eyebrow">Kioku sign-in</p>
+      <h1 id="page-title">Finish signing in to Kioku</h1>
+      <p class="lede">Your identity is verified. Continue to return securely to the Kioku app.</p>
+      <div class="context">
+        <div class="context-row">
+          <span class="context-label">Official app</span>
+          <span class="context-value">Kioku</span>
+        </div>
+        <div class="context-row">
+          <span class="context-label">Returns to</span>
+          <code>{}</code>
+        </div>
+      </div>
+      <div class="permission">
+        <span class="permission-icon" aria-hidden="true">→</span>
+        <div>
+          <strong>Your Kioku account</strong>
+          <p>Continue to use your private archive in the official Kioku app.</p>
+        </div>
+      </div>
+      <p class="trust-note">
+        <span class="trust-note-symbol" aria-hidden="true">◆</span>
+        <span>This sign-in returns only to the verified Kioku destination shown above.</span>
+      </p>
+      <form method="post" action="/oauth/consent">
+        <input type="hidden" name="consent_token" value="{}">
+        <div class="actions">
+          <button class="primary" type="submit" name="decision" value="approve">Continue to Kioku</button>
+          <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
+        </div>
+      </form>
+    </section>"#,
+            html_escape(origin),
+            html_escape(consent_token),
+        )
+    } else {
+        format!(
+            r#"<section class="card" aria-labelledby="page-title">
       <p class="eyebrow">MCP connection request</p>
       <h1 id="page-title">Connect this app to your memory?</h1>
       <p class="lede">Review the app and destination before giving it access to your Kioku archive.</p>
@@ -1263,11 +1311,19 @@ fn consent_page(client_name: Option<&str>, origin: &str, consent_token: &str) ->
         </div>
       </form>
     </section>"#,
-        html_escape(&display_name),
-        html_escape(origin),
-        html_escape(consent_token),
+            html_escape(&display_name),
+            html_escape(origin),
+            html_escape(consent_token),
+        )
+    };
+    let body = oauth_page(
+        if owned_web_sign_in {
+            "Sign in to Kioku"
+        } else {
+            "Connect to Kioku"
+        },
+        &content,
     );
-    let body = oauth_page("Connect to Kioku", &content);
     // Browsers enforce `form-action` across redirects from a submitted form.
     // Allow the already-validated registered client origin so the consent POST's
     // 302 can complete without permitting arbitrary form destinations.
@@ -1525,6 +1581,11 @@ pub(super) async fn begin_authorization_consent(
     user_id: &str,
 ) -> Response {
     let (client_id, redirect_uri) = (state.client_id.clone(), state.redirect_uri.clone());
+    // Only the fixed web client returns to Kioku's exact owned origin. The
+    // native client ID is public and accepts a caller-chosen loopback port, so
+    // another local app can reuse it with its own PKCE verifier. Keep the
+    // archive-access disclosure for that path rather than calling it official.
+    let owned_web_sign_in = uses_owned_web_sign_in_copy(&client_id);
     let registered = s
         .control
         .read({
@@ -1594,7 +1655,7 @@ pub(super) async fn begin_authorization_consent(
             "The authorization could not be completed.",
         );
     }
-    consent_page(name.as_deref(), &origin, &consent_token)
+    consent_page(owned_web_sign_in, name.as_deref(), &origin, &consent_token)
 }
 
 #[derive(Deserialize)]
@@ -2440,6 +2501,7 @@ mod tests {
     #[tokio::test]
     async fn consent_page_escapes_client_metadata_and_is_not_cacheable() {
         let response = consent_page(
+            false,
             Some("<script>alert(1)</script>"),
             "https://client.example",
             "token\" autofocus onfocus=alert(1)",
@@ -2464,6 +2526,56 @@ mod tests {
         assert!(body.contains("Protected by Kioku’s confidential cloud"));
         assert!(body.contains("name=\"decision\" value=\"approve\""));
         assert!(body.contains("name=\"decision\" value=\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn owned_web_consent_page_uses_sign_in_copy_without_mcp_warning() {
+        let response = consent_page(
+            true,
+            Some("Kioku Web"),
+            "https://kiokuu.com",
+            "first-party-token",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["Cache-Control"], "no-store");
+        assert!(response.headers()["Content-Security-Policy"]
+            .to_str()
+            .unwrap()
+            .contains("form-action 'self' https://kiokuu.com;"));
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<title>Sign in to Kioku · Kioku</title>"));
+        assert!(body.contains("Kioku sign-in"));
+        assert!(body.contains("Finish signing in to Kioku"));
+        assert!(body.contains("Continue to Kioku"));
+        assert!(body.contains("Protected by Kioku’s confidential cloud"));
+        assert!(!body.contains("MCP connection request"));
+        assert!(!body.contains("Full archive access"));
+        assert!(!body.contains("trust the redirect destination"));
+        assert!(body.contains("name=\"decision\" value=\"approve\""));
+        assert!(body.contains("name=\"decision\" value=\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn public_native_client_keeps_archive_access_disclosure() {
+        assert!(uses_owned_web_sign_in_copy(FIRST_PARTY_WEB_CLIENT_ID));
+        assert!(!uses_owned_web_sign_in_copy(FIRST_PARTY_NATIVE_CLIENT_ID));
+        assert!(!uses_owned_web_sign_in_copy("third-party-client"));
+
+        let response = consent_page(
+            uses_owned_web_sign_in_copy(FIRST_PARTY_NATIVE_CLIENT_ID),
+            Some("Kioku Native Apps"),
+            "http://127.0.0.1:49152",
+            "native-client-token",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("MCP connection request"));
+        assert!(body.contains("Full archive access"));
+        assert!(body.contains("trust the redirect destination"));
+        assert!(!body.contains("Official app"));
+        assert!(!body.contains("verified Kioku destination"));
     }
 
     #[tokio::test]
