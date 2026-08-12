@@ -148,6 +148,7 @@ jobs:
           trap 'find "${SCCACHE_DOWNLOAD_DIR}" -type f -delete; rmdir "${SCCACHE_DOWNLOAD_DIR}"' EXIT
           mkdir -p "${SCCACHE_INSTALL_DIR}"
           curl --fail --location --proto '=https' --tlsv1.2 \
+            --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 90 \
             --output "${SCCACHE_DOWNLOAD_DIR}/sccache.tar.gz" \
             "${SCCACHE_ARCHIVE_URL}"
           printf '%s  %s\n' \

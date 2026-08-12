@@ -159,6 +159,7 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertIn(f"SCCACHE_ARCHIVE_SHA256: {expected_digest}", install)
         self.assertNotIn(".sha256", install)
         self.assertNotIn("mozilla-actions/sccache-action", self.workflow)
+        self.assertIn("--retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 90", install)
         self.assertIn("sha256sum --check --strict", install)
         self.assertLess(install.index("sha256sum --check --strict"), install.index("tar --extract"))
         self.assertIn("--strip-components=1", install)
