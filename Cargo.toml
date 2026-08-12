@@ -94,7 +94,7 @@ httpdate = "1.0.3"
 async-trait = "0.1.88"
 
 # Base64 encoding/decoding for KMS payloads and DEK storage
-base64 = "0.22.1"
+base64 = "0.23.1"
 
 # URL-encoding for GCS object names
 urlencoding = "2.1.3"
