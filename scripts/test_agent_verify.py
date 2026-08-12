@@ -79,6 +79,10 @@ class AgentVerifyTests(unittest.TestCase):
                 executable.chmod(0o755)
 
             environment = os.environ.copy()
+            # Keep fixtures hermetic when this suite itself runs inside the CI
+            # job, which configures sccache for the surrounding Rust checks.
+            for inherited in ("RUSTC_WRAPPER", "SCCACHE_CACHE_SIZE", "SCCACHE_BASEDIRS"):
+                environment.pop(inherited, None)
             environment.update(
                 {
                     "PATH": f"{bin_dir}:/bin:/usr/bin",
