@@ -30,6 +30,12 @@ const MAX_ID_TOKEN_BYTES: usize = 32 * 1024;
 const ID_TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 const RECORDING_LEASE_SECONDS: i64 = 60;
 const RECORDING_LEASE_RENEWAL_HEADROOM_MS: i64 = 20_000;
+// Clients schedule renewal from the server-authored absolute expiry using their
+// local wall clock. Permit a small positive client/server skew without turning
+// the already-paid recording off at the exact 20-second boundary. A successful
+// renewal still reserves exactly one minute and extends from the prior expiry,
+// so this tolerance cannot create overlapping or unmetered recording time.
+const RECORDING_LEASE_RENEWAL_CLOCK_SKEW_MS: i64 = 5_000;
 
 pub struct RecordingLeaseGates {
     by_user: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -595,11 +601,12 @@ fn duplicate_is_conflict(existing_pending: bool, upstream_duplicate: bool) -> bo
 }
 
 fn renewal_too_early(now_ms: i64, expires_ms: i64) -> bool {
-    expires_ms.saturating_sub(now_ms) > RECORDING_LEASE_RENEWAL_HEADROOM_MS
+    expires_ms.saturating_sub(now_ms)
+        > RECORDING_LEASE_RENEWAL_HEADROOM_MS + RECORDING_LEASE_RENEWAL_CLOCK_SKEW_MS
 }
 
 fn can_reattach_paid_lease(now_ms: i64, expires_ms: i64) -> bool {
-    expires_ms > now_ms && renewal_too_early(now_ms, expires_ms)
+    expires_ms.saturating_sub(now_ms) > RECORDING_LEASE_RENEWAL_HEADROOM_MS
 }
 
 fn lease_authorized_summary(mut summary: Value) -> Value {
@@ -1960,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn request_id_payload_conflicts_and_early_renewal_are_rejected() {
+    fn request_id_payload_conflicts_and_unsafe_early_renewals_are_rejected() {
         let row = super::super::control_store::RecordingLeaseRequestRow {
             requested_lease_id: None,
             issued_lease_id:
@@ -1984,8 +1991,12 @@ mod tests {
                 lease_id: Some(row.issued_lease_id.clone()),
             }
         ));
-        assert!(renewal_too_early(1_000, 21_001));
-        assert!(!renewal_too_early(1_000, 21_000));
+        assert!(renewal_too_early(1_000, 26_001));
+        assert!(!renewal_too_early(1_000, 26_000));
+        assert!(!renewal_too_early(1_000, 21_001));
+        // Clock-skew tolerance applies only to a renewal that presents the
+        // active lease id. It must not move the fresh-null reattach/charge
+        // boundary from the public 20-second contract.
         assert!(can_reattach_paid_lease(1_000, 21_001));
         assert!(!can_reattach_paid_lease(1_000, 21_000));
         assert!(!can_reattach_paid_lease(21_001, 21_000));
