@@ -81,6 +81,27 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(f"\t{BUCKET}\t{MEDIA_BUCKET}\t{BUCKET}\n", completed.stdout)
 
+    def test_missing_build_profile_is_ineligible(self) -> None:
+        data = manifest()
+        del data["build_profile"]
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("missing or unexpected fields", completed.stderr)
+
+    def test_cleared_build_profile_is_ineligible(self) -> None:
+        data = manifest()
+        data["build_profile"] = ""
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("build_profile must be a non-empty string", completed.stderr)
+
+    def test_non_production_build_profile_is_ineligible(self) -> None:
+        data = manifest()
+        data["build_profile"] = "evaluation"
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("build_profile is not production", completed.stderr)
+
     def test_missing_media_claim_is_ineligible(self) -> None:
         data = manifest()
         del data["gcs_media_bucket"]

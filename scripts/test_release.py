@@ -10,6 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE = ROOT / "scripts" / "release.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
+METADATA_VERIFIER = ROOT / "scripts" / "verify_release_metadata.py"
 
 
 class ReleasePublicationRaceTests(unittest.TestCase):
@@ -17,6 +18,7 @@ class ReleasePublicationRaceTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = RELEASE.read_text(encoding="utf-8")
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+        cls.metadata_verifier = METADATA_VERIFIER.read_text(encoding="utf-8")
 
     def test_ci_cannot_publish_a_release_for_a_generic_verified_signer(self) -> None:
         self.assertNotIn("contents: write", self.workflow)
@@ -92,6 +94,10 @@ class ReleasePublicationRaceTests(unittest.TestCase):
             self.source,
         )
         self.assertIn("enclave-release-metadata-provenance.jsonl", self.source)
+        self.assertIn(
+            'if data["build_profile"] != "production":',
+            self.metadata_verifier,
+        )
 
     def test_apns_roll_preflight_reads_only_metadata_and_exact_iam(self) -> None:
         self.assertIn("gcloud secrets versions describe latest", self.source)

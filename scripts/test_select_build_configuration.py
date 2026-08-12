@@ -278,6 +278,21 @@ class SelectorTests(unittest.TestCase):
             '--build-arg KIOKU_BUILD_PROFILE="${KIOKU_BUILD_PROFILE}"',
             workflow,
         )
+        self.assertIn(
+            'echo "build_profile=${KIOKU_BUILD_PROFILE}" >> "$GITHUB_OUTPUT"',
+            workflow,
+        )
+        self.assertIn(
+            "BUILD_PROFILE: ${{ steps.build.outputs.build_profile }}",
+            workflow,
+        )
+        metadata_start = workflow.index("- name: Write release metadata")
+        metadata_end = workflow.index(
+            "- name: Attest release metadata manifest", metadata_start
+        )
+        metadata_step = workflow[metadata_start:metadata_end]
+        self.assertIn('"${BUILD_PROFILE}"', metadata_step)
+        self.assertNotIn('"${KIOKU_BUILD_PROFILE}"', metadata_step)
         self.assertIn('"build_profile": build_profile', workflow)
         for key in CONFIGURATION:
             self.assertIn(f"EVALUATION_{key}:", workflow)
