@@ -165,6 +165,8 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertIn("--strip-components=1", install)
         self.assertIn('sccache" --version)" = "sccache 0.17.0"', install)
         self.assertIn("SCCACHE_GHA_VERSION: kioku-enclave-ci-v2", self.workflow)
+        self.assertIn('test "$(cargo-audit --version)" = "cargo-audit 0.22.2"', self.workflow)
+        self.assertNotIn('test "$(cargo audit --version)"', self.workflow)
 
         build_push = self.workflow[self.workflow.index("  build-push:"):]
         self.assertNotIn("RUSTC_WRAPPER", build_push)

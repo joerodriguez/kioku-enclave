@@ -248,7 +248,7 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Verify pinned dependency auditor
-        run: test "$(cargo audit --version)" = "cargo-audit 0.22.2"
+        run: test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
 
       - name: Dependency vulnerability audit
         run: cargo audit --ignore RUSTSEC-2023-0071
