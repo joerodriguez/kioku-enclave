@@ -37,11 +37,25 @@ impl LegacyExtentSessionId {
         if !binding.valid() {
             return Err(LegacyExtentSessionError::Malformed("binding"));
         }
+        Self::for_stable_identity(
+            binding.archive_id,
+            binding.database_epoch,
+            binding.operation_id,
+        )
+    }
+    pub(crate) fn for_stable_identity(
+        archive_id: [u8; 16],
+        database_epoch: [u8; 16],
+        operation_id: [u8; 16],
+    ) -> Result<Self> {
+        if !nonzero(&archive_id) || !nonzero(&database_epoch) || !nonzero(&operation_id) {
+            return Err(LegacyExtentSessionError::Malformed("session identity"));
+        }
         let mut hash = Sha256::new();
         hash.update(SESSION_DOMAIN);
-        hash.update(binding.archive_id);
-        hash.update(binding.database_epoch);
-        hash.update(binding.operation_id);
+        hash.update(archive_id);
+        hash.update(database_epoch);
+        hash.update(operation_id);
         let digest: [u8; 32] = hash.finalize().into();
         let mut value = [0; 16];
         value.copy_from_slice(&digest[..16]);
@@ -390,6 +404,9 @@ impl LegacyExtentSessionBinding {
     }
     pub(crate) const fn request_fingerprint(self) -> [u8; 32] {
         self.request_fingerprint
+    }
+    pub(crate) const fn legacy_source_binding(self) -> [u8; 32] {
+        self.legacy_source_binding
     }
     #[cfg(test)]
     pub(crate) fn fixture_for_test(

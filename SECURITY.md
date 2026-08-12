@@ -227,6 +227,24 @@ all-or-nothing encrypted staging implementation, before it can be connected to a
 path.
 ### ADR-0022 archive-v3 foundation is inactive
 
+The inactive legacy SQLite extent-candidate coordinator is private to
+`legacy_gcm/extent_candidate/`. It can persist only a content-free
+`CandidateReady` ledger record after asynchronous exact witness reads, a
+pinned full legacy-GCM authentication/decryption pass, an exact hash-bound
+AEAD-open/decode/context validation of the witness-nominated base root, sealed
+immutable-object readback, and production root-admission validation. Before
+the first durable row or provider write it also completes a bounded,
+zeroizing-buffer SQLite-header preflight through exact EOF and one-shot source
+completion, rejecting malformed headers and schema rollback. Its
+caller-retained attempt handle keeps durable IDs/binding and blocking ledger
+tasks across cancellation; exact reconciliation observes CandidateReady or
+orphans only Prepared attempts through bounded exact ledger pages. Restart
+discovery is derived solely from archive/database/operation identity and fully
+validated persisted rows; it deliberately takes no live witness/lease/root/
+registry/source input and requires exclusive future caller ownership. It has no
+witness CAS/publication, provider construction, Store/VFS/route/flag wiring,
+deletion, or GC. Provider-scale cleanup is intentionally deferred.
+
 The offline `scripts/run_archive_capacity_harness.py` creates deterministic,
 content-free SQLite smoke databases only outside the checkout or under ignored `target/`.
 Its exclusive run receipt rejects foreign/symlinked output and incompatible resume state.

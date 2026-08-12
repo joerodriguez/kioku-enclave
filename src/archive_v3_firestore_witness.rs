@@ -21,6 +21,7 @@ use crate::{
         Witness, WitnessBootstrap, WitnessError, WitnessLease, WitnessReceipt, WitnessRecord,
         WITNESS_RECORD_BYTES,
     },
+    legacy_gcm::ExactLegacyWitness,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
@@ -631,6 +632,18 @@ mod tests {
         let audiences = tokens.0.lock().unwrap();
         assert!(audiences.len() >= 2);
         assert!(audiences.iter().all(|audience| audience == WIF_AUDIENCE));
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_read_uses_async_firestore_transport_under_tokio() {
+        let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
+        let adapter = witness(transport);
+        let record = adapter.bootstrap_async(bootstrap()).await.unwrap();
+        let observed =
+            crate::legacy_gcm::ExactLegacyWitness::read_exact_legacy(&adapter, record.archive_id())
+                .await
+                .unwrap();
+        assert_eq!(observed, record);
     }
 }
 
@@ -1703,6 +1716,18 @@ impl Drop for FirestoreWitness {
 impl fmt::Debug for FirestoreWitness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("FirestoreWitness(<inactive>)")
+    }
+}
+
+#[async_trait::async_trait]
+impl ExactLegacyWitness for FirestoreWitness {
+    async fn read_exact_legacy(
+        &self,
+        archive_id: ArchiveId,
+    ) -> std::result::Result<WitnessRecord, WitnessError> {
+        self.read_current_async(archive_id)
+            .await?
+            .ok_or(WitnessError::MissingArchive)
     }
 }
 

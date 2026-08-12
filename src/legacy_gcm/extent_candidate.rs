@@ -17,6 +17,11 @@ use zeroize::Zeroize;
 
 use super::{AuthenticatedLegacySource, LegacySourceState, PinnedLegacyRangeReader};
 
+// This composition remains a child of `legacy_gcm`: it alone may consume the
+// parent source's provisional pull and one-shot completion without broadening
+// either capability to archive-v3 callers.
+mod coordinator;
+
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 

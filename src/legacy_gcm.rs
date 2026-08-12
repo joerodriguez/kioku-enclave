@@ -26,6 +26,8 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    archive_v3::ArchiveId,
+    archive_v3_witness::{WitnessError, WitnessRecord},
     crypto::Dek,
     error::{EnclaveError, Result},
 };
@@ -48,6 +50,17 @@ const V2_MAGIC: &[u8] = b"KIOKU-BLOB\x02";
 // plaintext into dense archive extents. It deliberately has neither a
 // completion path nor a root-candidate path.
 mod extent_candidate;
+
+/// Read-only asynchronous witness seam for the private legacy extent
+/// candidate coordinator.  It has no compare-and-advance operation, so this
+/// migration-only composition cannot receive publication authority.
+#[async_trait]
+pub(crate) trait ExactLegacyWitness: Send + Sync {
+    async fn read_exact_legacy(
+        &self,
+        archive_id: ArchiveId,
+    ) -> std::result::Result<WitnessRecord, WitnessError>;
+}
 
 mod sealed {
     pub trait RangeReader {}
@@ -227,12 +240,14 @@ pub(crate) trait PinnedLegacyRangeReader: sealed::RangeReader + Send {
 }
 
 /// Explicit historic AAD profiles. No arbitrary AAD, fallback, or probe exists.
+#[derive(Clone, Copy)]
 pub(crate) enum LegacyGcmAad<'a> {
     Empty(LegacyEmptyAad),
     MediaUserId(&'a [u8]),
 }
 
 /// Empty AAD was used by the historic SQLite, control, and ACME envelopes.
+#[derive(Clone, Copy)]
 pub(crate) enum LegacyEmptyAad {
     Sqlite,
     Control,
