@@ -6,9 +6,12 @@
 - [x] Resolve notification handoffs only for the authenticated owner and canonical browser memory route.
 - [x] Treat APNs delivery as non-blocking to finalization while failing production startup/release closed on missing provider configuration.
 - [x] Verify the complete Rust suite, lint, formatting, release-selection, and release-preflight contracts.
-- [ ] Publish signed production release v0.8.14. The signed v0.8.13 image is
-  non-deployable: its attested manifest omitted the selected production profile,
-  and the release wrapper correctly rejected it before rollout.
+- [x] Publish signed production release v0.8.14 from source commit
+  `181d1131211ee986d8c6897339ebaff62ee8f532` and roll the attested image
+  `sha256:f64359c5370e79c3d15b1a1d2dd76e793bd0fbed12906e82e40f5b3f7f891ee7`
+  to production. The signed v0.8.13 image remains non-deployable and untouched:
+  its attested manifest omitted the selected production profile, and the release
+  wrapper correctly rejected it before rollout.
 
 # ADR-0022 task evidence
 
