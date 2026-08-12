@@ -28,6 +28,8 @@ const MAX_TURNS: usize = 10_000;
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_MULTIPART_BYTES: usize = MAX_AUDIO_BYTES as usize + MAX_MANIFEST_BYTES + 64 * 1024;
 const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
+const REQUEST_LOCAL_LABEL_MIGRATION_KEY: &str = "request-local-speaker-labels-v1";
+pub(crate) const UNIDENTIFIED_SPEAKER_LABEL: &str = "Unidentified voice";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1999,6 +2001,130 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         add_column_if_missing(conn, "person_facts", column, alteration)?;
     }
     super::voice_lineage::backfill_profile_lineage(conn)?;
+    migrate_request_local_speaker_labels(conn)?;
+    Ok(())
+}
+
+/// Gemini speaker ids are stable only within one media request. They are useful
+/// for joining turns inside that request, but they are not a durable identity
+/// and must never leak into the archive as if `speaker_0` were a person.
+///
+/// First replace exact request-local fallbacks with an explicitly unresolved
+/// label. Then, within one work unit only, let a unique independently resolved
+/// voice/name for the same local id label its sibling turns. Conflicting
+/// resolutions abstain. This preserves the independent voice/evidence graph as
+/// the only cross-request identity authority.
+pub(crate) fn reconcile_request_local_speaker_labels(
+    conn: &Connection,
+    work_unit_id: Option<&str>,
+) -> Result<usize> {
+    let required_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
+         ('utterances','speaker_observations','media_work_members')",
+        [],
+        |row| row.get(0),
+    )?;
+    if required_tables != 3 {
+        return Ok(0);
+    }
+
+    let mut updated = match work_unit_id {
+        Some(work_unit_id) => conn.execute(
+            "UPDATE utterances AS u SET speaker_label=?1 WHERE EXISTS ( \
+               SELECT 1 FROM speaker_observations s \
+               JOIN media_work_members m ON m.event_id=s.event_id \
+               WHERE m.work_unit_id=?2 \
+                 AND u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
+                 AND u.speaker_label=s.speaker_local_id)",
+            params![UNIDENTIFIED_SPEAKER_LABEL, work_unit_id],
+        )?,
+        None => conn.execute(
+            "UPDATE utterances AS u SET speaker_label=?1 WHERE EXISTS ( \
+               SELECT 1 FROM speaker_observations s \
+               WHERE u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
+                 AND u.speaker_label=s.speaker_local_id)",
+            [UNIDENTIFIED_SPEAKER_LABEL],
+        )?,
+    };
+
+    let reconcile_all = "WITH unique_labels AS ( \
+           SELECT m.work_unit_id,s.speaker_local_id,MIN(u.speaker_label) AS speaker_label \
+           FROM speaker_observations s \
+           JOIN utterances u \
+             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
+           JOIN media_work_members m ON m.event_id=s.event_id \
+           WHERE u.speaker_label<>?1 \
+           GROUP BY m.work_unit_id,s.speaker_local_id \
+           HAVING COUNT(DISTINCT u.speaker_label)=1 \
+         ), targets AS ( \
+           SELECT DISTINCT u.id AS utterance_id,l.speaker_label \
+           FROM speaker_observations s \
+           JOIN utterances u \
+             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
+           JOIN media_work_members m ON m.event_id=s.event_id \
+           JOIN unique_labels l ON l.work_unit_id=m.work_unit_id \
+             AND l.speaker_local_id=s.speaker_local_id \
+           WHERE u.speaker_label=?1 \
+         ) \
+         UPDATE utterances SET speaker_label=( \
+           SELECT speaker_label FROM targets WHERE utterance_id=utterances.id \
+         ) WHERE id IN (SELECT utterance_id FROM targets)";
+    let reconcile_one = "WITH unique_labels AS ( \
+           SELECT m.work_unit_id,s.speaker_local_id,MIN(u.speaker_label) AS speaker_label \
+           FROM speaker_observations s \
+           JOIN utterances u \
+             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
+           JOIN media_work_members m ON m.event_id=s.event_id \
+           WHERE u.speaker_label<>?1 AND m.work_unit_id=?2 \
+           GROUP BY m.work_unit_id,s.speaker_local_id \
+           HAVING COUNT(DISTINCT u.speaker_label)=1 \
+         ), targets AS ( \
+           SELECT DISTINCT u.id AS utterance_id,l.speaker_label \
+           FROM speaker_observations s \
+           JOIN utterances u \
+             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
+           JOIN media_work_members m ON m.event_id=s.event_id \
+           JOIN unique_labels l ON l.work_unit_id=m.work_unit_id \
+             AND l.speaker_local_id=s.speaker_local_id \
+           WHERE u.speaker_label=?1 AND m.work_unit_id=?2 \
+         ) \
+         UPDATE utterances SET speaker_label=( \
+           SELECT speaker_label FROM targets WHERE utterance_id=utterances.id \
+         ) WHERE id IN (SELECT utterance_id FROM targets)";
+    updated += match work_unit_id {
+        Some(work_unit_id) => conn.execute(
+            reconcile_one,
+            params![UNIDENTIFIED_SPEAKER_LABEL, work_unit_id],
+        )?,
+        None => conn.execute(reconcile_all, [UNIDENTIFIED_SPEAKER_LABEL])?,
+    };
+    Ok(updated)
+}
+
+fn migrate_request_local_speaker_labels(conn: &Connection) -> Result<()> {
+    let has_metadata: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_metadata'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_metadata == 0 {
+        return Ok(());
+    }
+    let complete: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key=?1)",
+        [REQUEST_LOCAL_LABEL_MIGRATION_KEY],
+        |row| row.get(0),
+    )?;
+    if complete {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    reconcile_request_local_speaker_labels(&tx, None)?;
+    tx.execute(
+        "INSERT INTO app_metadata(key,value) VALUES (?1,'complete')",
+        [REQUEST_LOCAL_LABEL_MIGRATION_KEY],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
