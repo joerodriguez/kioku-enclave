@@ -135,12 +135,13 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy && rustup default 1.96.0
 
-      # The artifact URL and its independently reviewed digest are fixed in
-      # this workflow. Do not replace the literal with the co-hosted .sha256:
+      # The immutable release-asset API ID and its independently reviewed digest
+      # are fixed in this workflow. Do not replace the digest literal with the co-hosted .sha256:
       # compromising a release upload must not also redefine the trust anchor.
       - name: Install digest-pinned sccache
         env:
-          SCCACHE_ARCHIVE_URL: https://github.com/mozilla/sccache/releases/download/v0.17.0/sccache-v0.17.0-x86_64-unknown-linux-musl.tar.gz
+          GH_TOKEN: ${{ github.token }}
+          SCCACHE_ARCHIVE_URL: https://api.github.com/repos/mozilla/sccache/releases/assets/493679099
           SCCACHE_ARCHIVE_SHA256: 67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006
         run: |
           SCCACHE_DOWNLOAD_DIR="$(mktemp -d)"
@@ -149,6 +150,9 @@ jobs:
           mkdir -p "${SCCACHE_INSTALL_DIR}"
           curl --fail --location --proto '=https' --tlsv1.2 \
             --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 90 \
+            --header 'Accept: application/octet-stream' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
             --output "${SCCACHE_DOWNLOAD_DIR}/sccache.tar.gz" \
             "${SCCACHE_ARCHIVE_URL}"
           printf '%s  %s\n' \

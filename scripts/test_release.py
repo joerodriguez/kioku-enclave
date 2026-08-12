@@ -146,10 +146,7 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertNotIn("cargo build", bump_script)
 
     def test_sccache_archive_has_an_independent_fixed_digest(self) -> None:
-        expected_url = (
-            "https://github.com/mozilla/sccache/releases/download/v0.17.0/"
-            "sccache-v0.17.0-x86_64-unknown-linux-musl.tar.gz"
-        )
+        expected_url = "https://api.github.com/repos/mozilla/sccache/releases/assets/493679099"
         expected_digest = "67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006"
         install = self.workflow[
             self.workflow.index("- name: Install digest-pinned sccache"):
@@ -160,6 +157,8 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertNotIn(".sha256", install)
         self.assertNotIn("mozilla-actions/sccache-action", self.workflow)
         self.assertIn("--retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 90", install)
+        self.assertIn("Accept: application/octet-stream", install)
+        self.assertIn('Authorization: Bearer ${GH_TOKEN}', install)
         self.assertIn("sha256sum --check --strict", install)
         self.assertLess(install.index("sha256sum --check --strict"), install.index("tar --extract"))
         self.assertIn("--strip-components=1", install)
