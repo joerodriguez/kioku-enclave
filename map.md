@@ -53,13 +53,25 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, fail-closed inactive archive-v3 signed-capacity-evidence verification, versioning, build-profile, and signed-release operator tools |
 | [TASKS.md](TASKS.md) | Scoped ADR-0022 implementation evidence and intentionally remaining authority gates |
 | `SECURITY.md` | **Threat model + residual risks — read before touching crypto/auth/attestation** |
-| `CONTRIBUTING.md` | PR rules; the three pre-commit checks |
+| `CONTRIBUTING.md` | PR rules, lightweight local verification, and required GitHub CI gate |
 | `rust-toolchain.toml` | Pinned toolchain |
 
 ## Working here
 
-- Pre-commit, all must pass: `cargo test --locked`,
-  `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`.
+- Required GitHub CI is the exhaustive merge gate. For normal local feedback,
+  run `./scripts/agent-verify.sh quick` plus a focused test with
+  `./scripts/agent-verify.sh focused -- <test-filter>`; use
+  `./scripts/agent-verify.sh full` for broad/security-sensitive changes or CI
+  diagnosis. The helper uses locked Cargo compilation/test commands and no
+  separate local build is required.
+- Retire a finished linked worktree's Rust artifacts with
+  `./scripts/retire_rust_worktree_artifacts.py --worktree <absolute-path>`;
+  it is dry-run-only unless `--apply` is supplied and fails closed unless the
+  worktree is clean and its exact GitHub PR head is merged. Verification and
+  retirement share the same crash-safe per-worktree lock, with process and Cargo
+  profile-lock checks as additional defenses. Do not race retirement with raw
+  Cargo commands outside `agent-verify.sh`. The tool removes generated artifacts,
+  never sources or the worktree itself.
 - Treat every change as security-sensitive; explain threat-model impact for auth/crypto/
   attestation changes.
 - The `/api/v2/capture/*`, `/api/v2/people*`, and `/v1/*` APIs are public compatibility boundaries; keep handler behavior and public

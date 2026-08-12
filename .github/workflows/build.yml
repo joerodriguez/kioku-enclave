@@ -117,6 +117,15 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    # Keep the reusable compiler cache remote and bounded by GitHub's cache
+    # quota. Do not cache target/: it is large, worktree-specific, and can
+    # contain stale incremental state.
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_VERSION: kioku-enclave-ci-v2
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,6 +134,45 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy && rustup default 1.96.0
+
+      # The artifact URL and its independently reviewed digest are fixed in
+      # this workflow. Do not replace the literal with the co-hosted .sha256:
+      # compromising a release upload must not also redefine the trust anchor.
+      - name: Install digest-pinned sccache
+        env:
+          SCCACHE_ARCHIVE_URL: https://github.com/mozilla/sccache/releases/download/v0.17.0/sccache-v0.17.0-x86_64-unknown-linux-musl.tar.gz
+          SCCACHE_ARCHIVE_SHA256: 67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006
+        run: |
+          SCCACHE_DOWNLOAD_DIR="$(mktemp -d)"
+          SCCACHE_INSTALL_DIR="${RUNNER_TEMP}/sccache-v0.17.0"
+          trap 'find "${SCCACHE_DOWNLOAD_DIR}" -type f -delete; rmdir "${SCCACHE_DOWNLOAD_DIR}"' EXIT
+          mkdir -p "${SCCACHE_INSTALL_DIR}"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "${SCCACHE_DOWNLOAD_DIR}/sccache.tar.gz" \
+            "${SCCACHE_ARCHIVE_URL}"
+          printf '%s  %s\n' \
+            "${SCCACHE_ARCHIVE_SHA256}" \
+            "${SCCACHE_DOWNLOAD_DIR}/sccache.tar.gz" \
+            | sha256sum --check --strict -
+          tar --extract --gzip \
+            --file "${SCCACHE_DOWNLOAD_DIR}/sccache.tar.gz" \
+            --directory "${SCCACHE_INSTALL_DIR}" \
+            --strip-components=1 \
+            --no-same-owner \
+            sccache-v0.17.0-x86_64-unknown-linux-musl/sccache
+          test "$("${SCCACHE_INSTALL_DIR}/sccache" --version)" = "sccache 0.17.0"
+          echo "${SCCACHE_INSTALL_DIR}" >> "${GITHUB_PATH}"
+
+      # sccache's GHA backend needs the per-run cache service endpoints. This
+      # official, commit-pinned action only exports runner-provided values; it
+      # neither downloads a compiler nor restores a target directory.
+      - name: Configure GitHub Actions compiler-cache backend
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', 'on');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Verify release tag identity and signature
         if: startsWith(github.ref, 'refs/tags/v')
@@ -152,6 +200,8 @@ jobs:
 
       - name: Release tooling contract tests
         run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_agent_verify.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_rust_build_lifecycle.py
           python3 scripts/test_select_build_configuration.py
           python3 scripts/test_release.py
           python3 scripts/test_verify_release_metadata.py
@@ -180,10 +230,24 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: python3 scripts/check_voice_release_gate.py
 
+      # Cache only the fixed-version auditor executable, never Cargo target/.
+      # This unprivileged CI job has no cloud credentials; build-push deliberately
+      # does not restore compiler or tool caches.
+      - name: Restore pinned dependency auditor
+        id: cargo_audit_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-v0.22.2-${{ runner.os }}-${{ runner.arch }}
+
       # RUSTSEC-2023-0071 affects RSA private-key operations. This service only
       # verifies third-party RS256 signatures and holds no RSA private key.
-      - name: Install pinned dependency auditor
+      - name: Install pinned dependency auditor on cache miss
+        if: steps.cargo_audit_cache.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Verify pinned dependency auditor
+        run: test "$(cargo audit --version)" = "cargo-audit 0.22.2"
 
       - name: Dependency vulnerability audit
         run: cargo audit --ignore RUSTSEC-2023-0071

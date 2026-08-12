@@ -265,11 +265,22 @@ explicit remediation rather than being declared complete from a later empty list
 Prerequisites are Rust 1.96+, the pinned toolchain in `rust-toolchain.toml`, and Cargo.
 
 ```sh
-cargo build
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo fmt --all -- --check
+# Default local feedback: formatting plus a locked type-check.
+./scripts/agent-verify.sh quick
+
+# Add the smallest relevant test selection while developing.
+./scripts/agent-verify.sh focused -- module::tests::affected_case
+
+# Required GitHub CI is the exhaustive merge gate. This is available locally
+# for broad or security-sensitive changes and CI diagnosis.
+./scripts/agent-verify.sh full
 ```
+
+The helper checks free disk space before compiling and uses `sccache` only when
+it is already installed, with a bounded cache and a 15-GiB default free-space
+floor. It also holds a crash-safe per-worktree artifact lock while its locked Cargo
+compilation/test commands run; a separate local `cargo build` is unnecessary.
+Do not race worktree artifact retirement with raw Cargo outside this helper.
 
 ## Archive capacity fixtures and observability
 

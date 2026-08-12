@@ -4,6 +4,30 @@
 
 set -euo pipefail
 
+sync_root_lockfile_version() {
+  local new_version="$1"
+
+  python3 - "$new_version" <<'PY'
+import re
+import sys
+
+new_ver = sys.argv[1]
+path = "Cargo.lock"
+with open(path, encoding="utf-8") as handle:
+    content = handle.read()
+
+pattern = re.compile(
+    r'(?ms)(^\[\[package\]\]\nname = "kioku-enclave"\nversion\s*=\s*")[^"]+(".*?)(?=^\[\[package\]\]|\Z)'
+)
+updated, count = pattern.subn(rf'\g<1>{new_ver}\g<2>', content)
+if count != 1:
+    raise SystemExit(f"expected exactly one kioku-enclave package entry in {path}, found {count}")
+
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(updated)
+PY
+}
+
 if [[ $# -ne 1 ]]; then
   echo "Usage: $0 <MAJOR.MINOR.PATCH>" >&2
   echo "Example: $0 0.6.15" >&2
@@ -48,7 +72,11 @@ with open("Cargo.toml", "w") as f:
 PY
 
 echo "Syncing Cargo.lock..."
-cargo check >/dev/null
+# A version bump changes only this workspace package's lockfile entry. Update
+# that exact entry instead of resolving the dependency graph (or compiling it),
+# then have Cargo validate the resulting manifest/lockfile pair without builds.
+sync_root_lockfile_version "$NEW_VERSION"
+cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
 git add -A
 echo "Release candidate v${NEW_VERSION} is staged on ${CURRENT_BRANCH}."
