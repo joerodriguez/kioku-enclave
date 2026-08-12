@@ -31,6 +31,7 @@ pub mod media_planner;
 pub mod media_worker;
 pub mod model_usage;
 pub mod oauth;
+pub mod push;
 pub mod query;
 pub mod reviewer;
 // Retained for legacy-index migrations and focused regression tests after
@@ -462,6 +463,7 @@ pub struct CpState {
     pub oauth_limiter: limits::RateLimiter,
     pub test_email_limiter: limits::RateLimiter,
     pub email_transport: Option<Arc<dyn email_worker::EmailTransport>>,
+    pub push_transport: Option<Arc<dyn push::PushTransport>>,
     /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
     /// (model not baked/downloaded, or failed to load — never fatal).
     pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,

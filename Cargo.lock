@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "kioku-enclave"
-version = "0.8.12"
+version = "0.8.13"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2794,6 +2794,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

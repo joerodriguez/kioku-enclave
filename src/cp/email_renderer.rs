@@ -47,7 +47,7 @@ pub fn render_email_body(
     app_base_url: &str,
 ) -> (String, String) {
     let app_url = format!(
-        "{}/app#episodes/{}",
+        "{}/app#memory/{}",
         app_base_url.trim_end_matches('/'),
         episode.episode_id
     );
@@ -342,7 +342,7 @@ mod tests {
         assert!(!html.contains("Project Alpha"));
         assert!(!html.contains("Alice"));
         assert!(!html.contains("Discussed launch timelines"));
-        assert!(html.contains("https://api.kiokuu.com/app#episodes/101"));
+        assert!(html.contains("https://api.kiokuu.com/app#memory/101"));
     }
 
     #[test]

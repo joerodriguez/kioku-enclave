@@ -309,7 +309,7 @@ async fn load_event(
     let mut data = json!({
         "episode_id": outbox.episode_id,
         "finalized_at": details.finalized_at,
-        "kioku_url": format!("{}/app#episodes/{}", state.config.web_origin, outbox.episode_id),
+        "kioku_url": format!("{}/app#memory/{}", state.config.web_origin, outbox.episode_id),
         "content_included": include_content,
     });
     if include_content {

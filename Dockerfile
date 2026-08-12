@@ -52,6 +52,10 @@
 #   APPLE_MACOS_CLIENT_ID / APPLE_WEB_CLIENT_ID
 #                        Optional Sign in with Apple identifiers; set all five
 #                        or none. The private key is fetched from Secret Manager.
+#   APNS_TEAM_ID / APNS_PRODUCTION_KEY_ID / APNS_SANDBOX_KEY_ID
+#                        Required together for production memory-ready alerts.
+#                        Environment-separated private keys are fetched from
+#                        Secret Manager and never enter the image.
 #   ALLOWED_EMAILS       Comma-separated account allow-list
 #   ADMIN_USER_IDS       Comma-separated stable owner IDs (separate from email access)
 #   BASE_URL / WEB_ORIGIN  Public API issuer and browser application origin
@@ -104,6 +108,7 @@
 FROM rust:1.97.1-slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder
 
 ARG SOURCE_DATE_EPOCH
+ARG KIOKU_BUILD_PROFILE
 WORKDIR /build
 
 # Declare and validate production configuration in a runnable stage. A bare
@@ -126,6 +131,9 @@ ARG APPLE_KEY_ID
 ARG APPLE_IOS_CLIENT_ID
 ARG APPLE_MACOS_CLIENT_ID
 ARG APPLE_WEB_CLIENT_ID
+ARG APNS_TEAM_ID
+ARG APNS_PRODUCTION_KEY_ID
+ARG APNS_SANDBOX_KEY_ID
 ARG ALLOWED_EMAILS
 ARG ADMIN_USER_IDS
 ARG BASE_URL
@@ -149,6 +157,7 @@ ARG ENCLAVE_ACME_CONTACT
 # media bucket.
 RUN set -eu \
     && case "${SOURCE_DATE_EPOCH}" in ''|*[!0-9]*) false;; *) true;; esac \
+    && case "${KIOKU_BUILD_PROFILE}" in production|evaluation) true;; *) false;; esac \
     && for value in \
         "${KMS_PROJECT}" "${KMS_LOCATION}" "${KMS_KEY_RING}" "${KMS_KEY}" \
         "${GCS_BUCKET}" "${GCS_MEDIA_BUCKET}" "${GCS_LEGACY_MEDIA_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
@@ -184,6 +193,19 @@ RUN set -eu \
          && [ "${APPLE_MACOS_CLIENT_ID}" = "com.kiokuu.app" ] \
          && [ "${APPLE_WEB_CLIENT_ID}" = "com.kiokuu.web" ]; \
        fi
+RUN set -eu \
+    && case "${KIOKU_BUILD_PROFILE}" in \
+         production) \
+           [ -n "${APNS_TEAM_ID}" ] \
+           && [ -n "${APNS_PRODUCTION_KEY_ID}" ] \
+           && [ -n "${APNS_SANDBOX_KEY_ID}" ] ;; \
+         evaluation) \
+           if [ -n "${APNS_TEAM_ID}${APNS_PRODUCTION_KEY_ID}${APNS_SANDBOX_KEY_ID}" ]; then \
+             [ -n "${APNS_TEAM_ID}" ] \
+             && [ -n "${APNS_PRODUCTION_KEY_ID}" ] \
+             && [ -n "${APNS_SANDBOX_KEY_ID}" ]; \
+           fi ;; \
+       esac
 
 # Install musl toolchain (+ curl for the embedding-model download below)
 RUN rustup target add x86_64-unknown-linux-musl \
@@ -343,6 +365,7 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
 # the old baked ENCLAVE_TLS_*_PEM_B64 args leaked the key to operator-visible
 # logs. Those env vars remain honored at runtime only as a bootstrap fallback
 # and for local testing; do not reintroduce them as build args.
+ARG KIOKU_BUILD_PROFILE
 ARG GOOGLE_DESKTOP_CLIENT_ID
 ARG GOOGLE_IOS_CLIENT_ID
 ARG GOOGLE_WEB_CLIENT_ID
@@ -351,6 +374,9 @@ ARG APPLE_KEY_ID
 ARG APPLE_IOS_CLIENT_ID
 ARG APPLE_MACOS_CLIENT_ID
 ARG APPLE_WEB_CLIENT_ID
+ARG APNS_TEAM_ID
+ARG APNS_PRODUCTION_KEY_ID
+ARG APNS_SANDBOX_KEY_ID
 ARG ALLOWED_EMAILS
 ARG ADMIN_USER_IDS
 ARG BASE_URL
@@ -367,7 +393,8 @@ ARG VERTEX_MODEL
 ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
-ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
+ENV KIOKU_BUILD_PROFILE=${KIOKU_BUILD_PROFILE} \
+    GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     GOOGLE_IOS_CLIENT_ID=${GOOGLE_IOS_CLIENT_ID} \
     GOOGLE_WEB_CLIENT_ID=${GOOGLE_WEB_CLIENT_ID} \
     APPLE_TEAM_ID=${APPLE_TEAM_ID} \
@@ -375,6 +402,9 @@ ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
     APPLE_IOS_CLIENT_ID=${APPLE_IOS_CLIENT_ID} \
     APPLE_MACOS_CLIENT_ID=${APPLE_MACOS_CLIENT_ID} \
     APPLE_WEB_CLIENT_ID=${APPLE_WEB_CLIENT_ID} \
+    APNS_TEAM_ID=${APNS_TEAM_ID} \
+    APNS_PRODUCTION_KEY_ID=${APNS_PRODUCTION_KEY_ID} \
+    APNS_SANDBOX_KEY_ID=${APNS_SANDBOX_KEY_ID} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
     ADMIN_USER_IDS=${ADMIN_USER_IDS} \
     BASE_URL=${BASE_URL} \

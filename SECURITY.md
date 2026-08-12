@@ -41,6 +41,11 @@ surfaces.
   user adds an HTTPS destination. Events are content-free by default; full brief content
   is a separate opt-in and is then processed by that destination outside Kioku's trust
   boundary.
+- **Apple Push Notification service.** An opted-in installation sends Apple a device
+  token, exact app topic, generic `Your memory is ready.` alert, and delivery timing.
+  Every installation receives a different opaque handoff handle. APNs payloads contain
+  no memory/episode ID, title, people, transcript, summary, action items, account
+  identity, timestamp, arbitrary URL, or credential.
 
 ## Security invariants
 
@@ -969,7 +974,7 @@ Release notes must say “publicly auditable with signed build provenance,” no
 snapshot-pinned OS packages, deterministic build inputs/timestamps, network-disabled
 compilation, and independent rebuild comparison.
 
-### Vertex and user-configured webhooks cross the TEE boundary
+### Vertex, user-configured webhooks, and APNs cross the TEE boundary
 
 Audio transcription/diarization, screenshot understanding, identity/fact evidence extraction,
 episode summarisation, and evidence verification send bounded content to Google Vertex
@@ -980,6 +985,15 @@ default and carry final-brief content only when that destination's explicit opti
 enabled. The sender revalidates public DNS addresses on every attempt, pins the validated
 address, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
 signatures, or response bodies.
+
+APNs ready alerts are a separate, explicitly enabled metadata-only boundary. Environment-
+separated provider keys come from dedicated Secret Manager containers available only to
+the enclave runtime identity; production startup fails closed if either key is missing.
+The worker uses a generic alert and a distinct per-installation opaque handoff, rechecks
+registration before send, generation-fences terminal-token responses, and never logs
+tokens, handles, payloads, provider paths, or response bodies. Apple may correlate the
+device token, topic, generic alert, and delivery timing; Focus/device settings determine
+display and an already accepted generic alert cannot be recalled after offline sign-out.
 
 ### Pseudonymous entitlement and usage events cross the TEE boundary
 

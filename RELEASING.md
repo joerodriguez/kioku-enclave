@@ -60,8 +60,10 @@ To cut a new release:
 - Authenticate `gcloud` with read-only access to the configured Artifact Registry
   repository. OCI attestation verification resolves the image manifest even when the
   signed bundle is local; the script configures the standard Docker credential helper
-  and fails before tagging if the repository is not readable. Writer, deploy, IAM,
-  Secret Manager, and KMS permissions are unnecessary.
+  and fails before tagging if the repository is not readable. For `--roll`, the operator
+  also needs Secret Manager metadata/IAM-policy read access for the two APNs key
+  containers, but never secret payload access or runtime-service-account impersonation.
+  Writer, deploy, service-account Token Creator, and KMS permissions are unnecessary.
 - When using `--roll`, set `DEPLOYMENT_REPO=owner/repository`.
 - Enable GitHub immutable releases. The release script requires the setting, uploads all
   assets while a release is still a draft, and confirms GitHub made the published release
@@ -78,6 +80,7 @@ The public build validates these non-secret GitHub Actions variables before Dock
 | KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_GCS_MEDIA_BUCKET`, `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
 | Internal KMS attestation exchange | `ENCLAVE_ATTEST_STS_AUDIENCE` |
 | OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
+| APNs ready alerts | `APNS_TEAM_ID`, `APNS_PRODUCTION_KEY_ID`, `APNS_SANDBOX_KEY_ID` |
 | Apple login (optional, all or none) | `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` |
 | Synthetic plugin reviewer | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` |
 | Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
@@ -107,6 +110,15 @@ When native Apple login is enabled, put the `.p8` contents in the runtime projec
 Secret Manager secret `kioku-apple-sign-in-private-key`; never place that key in an
 Actions variable, Docker build argument, image layer, or launch metadata. The three
 non-secret Apple identifiers are image-baked and must be supplied together.
+
+Ready alerts require externally populated Secret Manager versions in
+`kioku-apns-production-private-key` and `kioku-apns-sandbox-private-key`. The deployment
+repository's Terraform owns those containers and grants secret-level accessor to the
+actual `kioku-enclave@<project>.iam.gserviceaccount.com` runtime identity; it never owns
+the Apple-issued bytes. Before a `--roll`, `scripts/release.sh` verifies that each
+`latest` version is `ENABLED` and that the exact runtime accessor binding exists by
+reading metadata and IAM policy only. It deliberately never reads a key, impersonates
+the runtime identity, or requires `roles/iam.serviceAccountTokenCreator`.
 
 ### Retired isolated evaluation profile
 

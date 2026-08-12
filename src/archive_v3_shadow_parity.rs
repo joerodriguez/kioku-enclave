@@ -95,6 +95,7 @@ const COUNTED_TABLES: &[&str] = &[
     "vertex_usage_coverage",
     "webhook_deliveries",
     "email_deliveries",
+    "push_deliveries",
     "device_watermarks",
     "vec_utterances",
     "vec_screenshots",

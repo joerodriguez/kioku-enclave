@@ -1,3 +1,13 @@
+# ADR-0029 ready-notification delivery
+
+- [x] Persist authenticated, per-installation APNs registrations with account-switch and token-generation fencing.
+- [x] Commit first-finalization push deliveries atomically with the final memory result; regeneration does not replay them.
+- [x] Send privacy-safe per-device handoff handles through separate production and sandbox APNs transports.
+- [x] Resolve notification handoffs only for the authenticated owner and canonical browser memory route.
+- [x] Treat APNs delivery as non-blocking to finalization while failing production startup/release closed on missing provider configuration.
+- [x] Verify the complete Rust suite, lint, formatting, release-selection, and release-preflight contracts.
+- [ ] Merge the protected pull request and publish the signed production release.
+
 # ADR-0022 task evidence
 
 ## Capacity fixture and local gate

@@ -1,7 +1,7 @@
 # map.md — src/ (enclave service)
 
 The entire attested Kioku backend: it terminates TLS and serves OAuth, sync, MCP/REST,
-account, quotas, and the summarizer—see [`cp/`](cp/map.md)—alongside authenticated
+account, quotas, capture-session feedback, APNs ready receipts, and the summarizer—see [`cp/`](cp/map.md)—alongside authenticated
 `410 Gone` tombstones for the retired `/v1/*` query/storage API. Plaintext databases exist only here and in SEV tmpfs, never on
 persistent disk; bounded audio, screenshot pixels, transcript/screen text, and metadata
 leave the TEE through the documented Vertex inference boundary, while explicitly
@@ -9,10 +9,10 @@ configured webhook events use the separate webhook boundary.
 
 | File | Role |
 |---|---|
-| `main.rs` | Entry point; wires public OAuth, auth-gated control-plane routes (including Cloud Capture v2), legacy `/v1/*`, public health/attestation, and offline ADR-0016 derivation/similarity/evidence/scoring commands; emits content-free fixed-route/status-class/duration observations only for GET billing-summary and POST recording-lease requests; drains durable identity-rebind operations in bounded pages before request admission, then starts media, summarization, and bounded account-deletion reconciliation workers; production serves only through `serve_tls`, while plaintext application HTTP requires a debug build plus `ENCLAVE_TEST_MODE=1`; spawns the isolated ACME :80 listener and renewal loop |
+| `main.rs` | Entry point; wires public OAuth, auth-gated Cloud Capture/session/push/query routes, environment-separated Secret-Manager APNs credentials, legacy `/v1/*`, public health/attestation, and offline ADR-0016 commands; starts media, summarization, finalization, push, and deletion workers; production fails closed without APNs configuration and serves only through `serve_tls` |
 | `tls.rs` | In-enclave rustls termination with a swappable certificate resolver and SHA-256 leaf fingerprint. Production uses ACME; static/generated certificate paths are custom/debug fallback mechanisms, not production launch overrides |
 | `acme.rs` | Required production ACME lifecycle: answers HTTP-01 on :80, generates the TLS key in the TEE, persists account/cert/key as context-bound KMS-wrapped state (`acme/tls.json.enc`), blocks boot until a usable cert exists, and hot-swaps renewals |
-| [`cp/`](cp/map.md) | **Control plane:** OAuth/DCR, sync, account, MCP + REST, quotas, summarizer, and the encrypted identity control store, including internal-only random archive bindings and pre-v3 deletion fences |
+| [`cp/`](cp/map.md) | **Control plane:** OAuth/DCR, sync, account, MCP + REST, quotas, capture-session feedback, ready-push installation/outbox/handoff, summarizer, and the encrypted identity control store |
 | `attestation.rs` | Shared bounded/zeroizing Confidential Space launcher socket protocol plus two active separated token paths: internal WIF-audience STS exchange/cache for KMS credentials, and public HTTPS-verifier-audience OIDC tokens that can never use the WIF audience; exposes only a sealed typed no-nonce launcher seam to the exact inactive Firestore and archive-GCS identity types, not credentials, cache, or authority |
 | `archive_v3_firestore_auth.rs` | **Inactive ADR-0022 only:** a third, type-separated Confidential Space bearer path for the dedicated named-Firestore witness WIF audience; uses the typed no-nonce launcher seam plus fixed retry-disabled Google STS exchange, zeroizing request/response ownership and a 60-second-early cache, with no KMS/public-attestation credential/cache or runtime wiring |
 | `archive_v3_firestore_shadow.rs` | **Inactive ADR-0022 composition only:** derives one exact named-database namespace and dedicated witness audience from the same typed config, constructs the fixed bearer/REST adapter without I/O, and preserves ambiguous commit outcomes for the shadow coordinator's exact reconciliation handle; it has no Store/startup/env/route/bootstrap/authority wiring |

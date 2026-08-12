@@ -3027,6 +3027,7 @@ mod tests {
             oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             embedding: None,
             voice: None,
         })
@@ -4199,6 +4200,7 @@ mod tests {
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             config: Arc::new(
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
@@ -4280,6 +4282,7 @@ mod tests {
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             config: Arc::new(
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
@@ -4335,6 +4338,7 @@ mod tests {
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: Some(Arc::new(crate::cp::email_worker::FakeEmailTransport::new())),
+            push_transport: None,
             embedding: None,
             voice: None,
         });

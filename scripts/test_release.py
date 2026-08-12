@@ -93,6 +93,15 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         )
         self.assertIn("enclave-release-metadata-provenance.jsonl", self.source)
 
+    def test_apns_roll_preflight_reads_only_metadata_and_exact_iam(self) -> None:
+        self.assertIn("gcloud secrets versions describe latest", self.source)
+        self.assertIn("gcloud secrets get-iam-policy", self.source)
+        self.assertIn('apns_latest_state" != "ENABLED"', self.source)
+        self.assertIn("roles/secretmanager.secretAccessor", self.source)
+        self.assertIn('serviceAccount:${ENCLAVE_RUN_SA_EMAIL}', self.source)
+        self.assertNotIn("gcloud secrets versions access", self.source)
+        self.assertNotIn("--impersonate-service-account", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

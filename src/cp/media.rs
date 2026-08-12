@@ -162,6 +162,8 @@ pub struct CaptureEventManifest {
     pub source_monotonic_ns: u64,
     pub started_at: String,
     pub ended_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_finished: Option<bool>,
     pub timezone_id: String,
     pub utc_offset_minutes: i32,
     pub clock_uncertainty_ms: u32,
@@ -218,6 +220,11 @@ impl CaptureEventManifest {
         if duration_ms > 8 * 60 * 60 * 1000 {
             return Err(EnclaveError::InvalidRequest(
                 "capture event duration exceeds eight hours".into(),
+            ));
+        }
+        if self.session_finished == Some(true) && !self.stream_kind.is_audio() {
+            return Err(EnclaveError::InvalidRequest(
+                "session_finished is permitted only on a final audio event".into(),
             ));
         }
         if self.timezone_id.is_empty() || self.timezone_id.len() > 128 {
@@ -561,6 +568,49 @@ struct CaptureStatus {
     attempt_count: i64,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CaptureSessionStage {
+    Received,
+    Processing,
+    Organizing,
+    PreparingRecap,
+    Ready,
+    NeedsAttention,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureSessionProcessing {
+    queued: i64,
+    processing: i64,
+    retry_wait: i64,
+    ready: i64,
+    failed: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureSessionMemory {
+    id: i64,
+    title: Option<String>,
+    started_at: String,
+    ended_at: String,
+    finalization_status: String,
+    finalized_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureSessionStatus {
+    capture_session_id: String,
+    device_id: String,
+    started_at: String,
+    last_event_at: String,
+    ended_at: Option<String>,
+    event_count: i64,
+    stage: CaptureSessionStage,
+    processing: CaptureSessionProcessing,
+    memories: Vec<CaptureSessionMemory>,
+}
+
 #[derive(Debug, Serialize)]
 struct PersonSummary {
     id: i64,
@@ -684,6 +734,10 @@ pub fn router() -> Router<Arc<CpState>> {
     Router::new()
         .route("/api/v2/capture/events", post(upload_capture_event))
         .route("/api/v2/capture/events/{event_id}", get(capture_status))
+        .route(
+            "/api/v2/capture/sessions/{capture_session_id}",
+            get(capture_session_status).post(finish_capture_session),
+        )
         .route("/api/v2/capture/streams/{stream_id}/ack", get(stream_ack))
         .route("/api/v2/people", get(list_people))
         .route("/api/v2/people/{person_id}", get(person_profile))
@@ -996,6 +1050,59 @@ async fn capture_status(
     }
 }
 
+async fn capture_session_status(
+    State(state): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(capture_session_id): Path<String>,
+) -> Response {
+    if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
+        return error.into_response();
+    }
+    match state
+        .store
+        .with_user(&user.0, |conn| {
+            load_capture_session_status(conn, &capture_session_id)
+        })
+        .await
+    {
+        Ok(Some(status)) => Json(status).into_response(),
+        Ok(None) => EnclaveError::NotFound.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn finish_capture_session(
+    State(state): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(capture_session_id): Path<String>,
+) -> Response {
+    if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
+        return error.into_response();
+    }
+    match state
+        .store
+        .with_user(&user.0, |conn| {
+            let updated = conn.execute(
+                "UPDATE capture_sessions SET ended_at=COALESCE(ended_at, \
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?1",
+                [&capture_session_id],
+            )?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            load_capture_session_status(conn, &capture_session_id)
+        })
+        .await
+    {
+        Ok(Some(status)) => match state.store.save_user(&user.0).await {
+            Ok(()) => Json(status).into_response(),
+            Err(error) => error.into_response(),
+        },
+        Ok(None) => EnclaveError::NotFound.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<CaptureStatus>> {
     conn.query_row(
         "SELECT e.event_id,COALESCE(m.processing_state,'ready'),j.error_code,\
@@ -1014,6 +1121,111 @@ fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<Captu
     )
     .optional()
     .map_err(Into::into)
+}
+
+fn load_capture_session_status(
+    conn: &Connection,
+    capture_session_id: &str,
+) -> Result<Option<CaptureSessionStatus>> {
+    let session = conn
+        .query_row(
+            "SELECT id,device_id,started_at,last_event_at,ended_at FROM capture_sessions WHERE id=?1",
+            [capture_session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((capture_session_id, device_id, started_at, last_event_at, ended_at)) = session else {
+        return Ok(None);
+    };
+
+    let (event_count, queued, processing, retry_wait, ready, failed) = conn.query_row(
+        "SELECT COUNT(*), \
+          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='queued' THEN 1 ELSE 0 END), \
+          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='processing' THEN 1 ELSE 0 END), \
+          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='retry_wait' THEN 1 ELSE 0 END), \
+          SUM(CASE WHEN COALESCE(m.processing_state,'ready') IN ('ready','pruned') THEN 1 ELSE 0 END), \
+          SUM(CASE WHEN COALESCE(m.processing_state,'ready')='failed' THEN 1 ELSE 0 END) \
+         FROM capture_events e LEFT JOIN media_objects m USING(event_id) \
+         WHERE e.capture_session_id=?1",
+        [&capture_session_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            ))
+        },
+    )?;
+
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT e.id,e.title,e.started_at,e.ended_at,e.finalization_status,e.finalized_at \
+         FROM episodes e JOIN episode_members m ON m.episode_id=e.id \
+         LEFT JOIN utterances u ON m.record_type='utterance' AND m.record_id=u.id \
+         LEFT JOIN speaker_observations so \
+           ON u.source_key=('cloud-v2:'||so.event_id||':'||so.turn_id) \
+         LEFT JOIN screenshots s ON m.record_type='screenshot' AND m.record_id=s.id \
+         LEFT JOIN capture_events ce ON ce.capture_session_id=?1 AND ( \
+           ce.event_id=so.event_id OR s.source_key=('cloud-v2:'||ce.event_id)) \
+         WHERE ce.event_id IS NOT NULL ORDER BY e.started_at DESC,e.id DESC",
+    )?;
+    let memories = statement
+        .query_map([&capture_session_id], |row| {
+            Ok(CaptureSessionMemory {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                started_at: row.get(2)?,
+                ended_at: row.get(3)?,
+                finalization_status: row.get(4)?,
+                finalized_at: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let has_ready_memory = memories
+        .iter()
+        .any(|memory| memory.finalization_status == "complete" && memory.finalized_at.is_some());
+    let stage = if failed > 0 {
+        CaptureSessionStage::NeedsAttention
+    } else if queued + processing + retry_wait > 0 {
+        CaptureSessionStage::Processing
+    } else if has_ready_memory {
+        CaptureSessionStage::Ready
+    } else if !memories.is_empty() {
+        CaptureSessionStage::PreparingRecap
+    } else if ended_at.is_some() {
+        CaptureSessionStage::Organizing
+    } else {
+        CaptureSessionStage::Received
+    };
+
+    Ok(Some(CaptureSessionStatus {
+        capture_session_id,
+        device_id,
+        started_at,
+        last_event_at,
+        ended_at,
+        event_count,
+        stage,
+        processing: CaptureSessionProcessing {
+            queued,
+            processing,
+            retry_wait,
+            ready,
+            failed,
+        },
+        memories,
+    }))
 }
 
 async fn list_people(
@@ -1474,6 +1686,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             install_id TEXT NOT NULL,
             started_at TEXT NOT NULL,
             last_event_at TEXT NOT NULL,
+            ended_at TEXT,
             schema_version INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
@@ -1799,6 +2012,12 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         "#,
+    )?;
+    add_column_if_missing(
+        conn,
+        "capture_sessions",
+        "ended_at",
+        "ALTER TABLE capture_sessions ADD COLUMN ended_at TEXT",
     )?;
     add_column_if_missing(
         conn,
@@ -2223,15 +2442,19 @@ pub fn record_source_event_with_generation(
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO capture_sessions \
-         (id, device_id, install_id, started_at, last_event_at, schema_version) \
-         VALUES (?1,?2,?3,?4,?5,2) \
-         ON CONFLICT(id) DO UPDATE SET last_event_at=MAX(last_event_at, excluded.last_event_at)",
+         (id, device_id, install_id, started_at, last_event_at, schema_version, ended_at) \
+         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END) \
+         ON CONFLICT(id) DO UPDATE SET \
+           last_event_at=MAX(last_event_at, excluded.last_event_at), \
+           ended_at=CASE WHEN ?6 THEN COALESCE(capture_sessions.ended_at, excluded.ended_at) \
+                         ELSE capture_sessions.ended_at END",
         params![
             manifest.capture_session_id,
             manifest.device_id,
             manifest.install_id,
             manifest.started_at,
-            manifest.ended_at
+            manifest.ended_at,
+            manifest.session_finished.unwrap_or(false)
         ],
     )?;
     tx.execute(
@@ -2461,15 +2684,19 @@ fn record_reference_event(
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO capture_sessions \
-         (id,device_id,install_id,started_at,last_event_at,schema_version) \
-         VALUES (?1,?2,?3,?4,?5,2) \
-         ON CONFLICT(id) DO UPDATE SET last_event_at=MAX(last_event_at,excluded.last_event_at)",
+         (id,device_id,install_id,started_at,last_event_at,schema_version,ended_at) \
+         VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END) \
+         ON CONFLICT(id) DO UPDATE SET \
+           last_event_at=MAX(last_event_at,excluded.last_event_at), \
+           ended_at=CASE WHEN ?6 THEN COALESCE(capture_sessions.ended_at,excluded.ended_at) \
+                         ELSE capture_sessions.ended_at END",
         params![
             manifest.capture_session_id,
             manifest.device_id,
             manifest.install_id,
             manifest.started_at,
-            manifest.ended_at
+            manifest.ended_at,
+            manifest.session_finished.unwrap_or(false)
         ],
     )?;
     tx.execute(
@@ -3218,6 +3445,121 @@ mod tests {
         assert_eq!(status.processing_state, "queued");
         assert_eq!(status.attempt_count, 0);
         assert!(status.error_code.is_none());
+    }
+
+    #[test]
+    fn capture_session_status_tracks_processing_recap_and_ready_without_guessing() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE episodes (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                finalization_status TEXT NOT NULL,
+                finalized_at TEXT
+             );
+             CREATE TABLE utterances (id INTEGER PRIMARY KEY, source_key TEXT);
+             CREATE TABLE screenshots (id INTEGER PRIMARY KEY, source_key TEXT);
+             CREATE TABLE episode_members (
+                episode_id INTEGER NOT NULL,
+                record_type TEXT NOT NULL,
+                record_id INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+
+        let manifest = valid_manifest();
+        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
+        let session = load_capture_session_status(&conn, &manifest.capture_session_id)
+            .unwrap()
+            .expect("session exists after its first accepted event");
+        assert_eq!(session.stage, CaptureSessionStage::Processing);
+        assert_eq!(session.event_count, 1);
+        assert!(session.memories.is_empty());
+
+        conn.execute(
+            "UPDATE media_objects SET processing_state='ready' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE capture_sessions SET ended_at='2026-08-01T18:01:00.000Z' WHERE id=?1",
+            [&manifest.capture_session_id],
+        )
+        .unwrap();
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id)
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::Organizing
+        );
+
+        conn.execute(
+            "INSERT INTO screenshots(id,source_key) VALUES (1,?1)",
+            [format!("cloud-v2:{}", manifest.event_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episodes(id,title,started_at,ended_at,finalization_status) \
+             VALUES (7,'First memory',?1,?2,'pending_horizon')",
+            [&manifest.started_at, &manifest.ended_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episode_members(episode_id,record_type,record_id) \
+             VALUES (7,'screenshot',1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id)
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::PreparingRecap
+        );
+
+        conn.execute(
+            "UPDATE episodes SET finalization_status='complete', \
+             finalized_at='2026-08-01T22:01:00.000Z' WHERE id=7",
+            [],
+        )
+        .unwrap();
+        let ready = load_capture_session_status(&conn, &manifest.capture_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.stage, CaptureSessionStage::Ready);
+        assert_eq!(ready.memories.len(), 1);
+        assert_eq!(ready.memories[0].id, 7);
+    }
+
+    #[test]
+    fn accepted_final_capture_event_durably_closes_the_exact_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let mut manifest = valid_manifest();
+        manifest.session_finished = Some(true);
+        let digest = manifest_digest(&manifest).unwrap();
+
+        assert_eq!(
+            record_source_event(&conn, "account-1", &manifest, &digest, "object-1").unwrap(),
+            RecordOutcome::Created
+        );
+        assert_eq!(
+            record_source_event(&conn, "account-1", &manifest, &digest, "object-1").unwrap(),
+            RecordOutcome::Duplicate
+        );
+        let ended_at: Option<String> = conn
+            .query_row(
+                "SELECT ended_at FROM capture_sessions WHERE id=?1",
+                [&manifest.capture_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended_at.as_deref(), Some(manifest.ended_at.as_str()));
     }
 
     #[test]
