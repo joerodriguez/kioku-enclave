@@ -196,6 +196,42 @@ fn validate_resend_api_key(api_key: String) -> Result<String, String> {
     Ok(api_key.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApnsIdentifiers {
+    team_id: String,
+    production_key_id: String,
+    sandbox_key_id: String,
+}
+
+fn resolve_apns_identifiers(
+    profile: &str,
+    team_id: Option<String>,
+    production_key_id: Option<String>,
+    sandbox_key_id: Option<String>,
+) -> Result<Option<ApnsIdentifiers>, String> {
+    let supplied = [
+        team_id.as_ref(),
+        production_key_id.as_ref(),
+        sandbox_key_id.as_ref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some_and(|value| !value.trim().is_empty()))
+    .count();
+    if supplied == 0 && profile == "evaluation" {
+        return Ok(None);
+    }
+    if supplied != 3 {
+        return Err(format!(
+            "{profile} startup requires a complete APNs team, production key, and sandbox key configuration"
+        ));
+    }
+    Ok(Some(ApnsIdentifiers {
+        team_id: team_id.unwrap().trim().to_string(),
+        production_key_id: production_key_id.unwrap().trim().to_string(),
+        sandbox_key_id: sandbox_key_id.unwrap().trim().to_string(),
+    }))
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct AppState {
@@ -835,6 +871,71 @@ async fn main() {
             )) as Arc<dyn cp::email_worker::EmailTransport>
         });
 
+    let build_profile = std::env::var("KIOKU_BUILD_PROFILE").unwrap_or_else(|_| {
+        if test_mode_enabled() {
+            "evaluation"
+        } else {
+            "production"
+        }
+        .into()
+    });
+    let apns_identifiers = resolve_apns_identifiers(
+        &build_profile,
+        std::env::var("APNS_TEAM_ID").ok(),
+        std::env::var("APNS_PRODUCTION_KEY_ID").ok(),
+        std::env::var("APNS_SANDBOX_KEY_ID").ok(),
+    )
+    .unwrap_or_else(|error| panic!("Failed to configure APNs: {error}"));
+    let push_transport: Option<Arc<dyn cp::push::PushTransport>> =
+        if let Some(identifiers) = apns_identifiers {
+            let production_key = if test_mode_enabled() {
+                std::env::var("APNS_PRODUCTION_PRIVATE_KEY_PEM").ok()
+            } else {
+                Some(
+                    cp::fetch_secret_from_manager("kioku-apns-production-private-key", "latest")
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to configure production APNs credential: {error}")
+                        }),
+                )
+            };
+            let sandbox_key = if test_mode_enabled() {
+                std::env::var("APNS_SANDBOX_PRIVATE_KEY_PEM").ok()
+            } else {
+                Some(
+                    cp::fetch_secret_from_manager("kioku-apns-sandbox-private-key", "latest")
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to configure sandbox APNs credential: {error}")
+                        }),
+                )
+            };
+            match (production_key, sandbox_key) {
+                (Some(production_key), Some(sandbox_key)) => {
+                    let production = cp::push::ApnsCredential::new(
+                        identifiers.team_id.clone(),
+                        identifiers.production_key_id,
+                        &production_key,
+                    )
+                    .expect("valid production APNs credential");
+                    let sandbox = cp::push::ApnsCredential::new(
+                        identifiers.team_id,
+                        identifiers.sandbox_key_id,
+                        &sandbox_key,
+                    )
+                    .expect("valid sandbox APNs credential");
+                    Some(
+                        Arc::new(cp::push::ApnsTransport::new(production, Some(sandbox)))
+                            as Arc<dyn cp::push::PushTransport>,
+                    )
+                }
+                _ if build_profile == "evaluation" => None,
+                _ => panic!("production startup requires both APNs private-key secrets"),
+            }
+        } else {
+            None
+        };
+
     let billing_gateway: Arc<dyn cp::billing::BillingGateway> = Arc::new(
         cp::billing::HttpBillingGateway::from_env()
             .unwrap_or_else(|error| panic!("Invalid billing service configuration: {error}")),
@@ -858,6 +959,7 @@ async fn main() {
         oauth_limiter: cp::limits::RateLimiter::new(120.0, 2.0),
         test_email_limiter: cp::limits::RateLimiter::new(3.0, 0.05),
         email_transport,
+        push_transport,
         config: cp_config,
         embedding: embedding_engine,
         voice: voice_engine,
@@ -876,6 +978,7 @@ async fn main() {
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
     let cp_authed = cp::sync::router()
         .merge(cp::media::router())
+        .merge(cp::push::router())
         .merge(cp::query::router())
         .merge(cp::billing::router())
         .merge(cp::apple::authenticated_router())
@@ -1012,12 +1115,36 @@ async fn serve_tls(
 
 #[cfg(test)]
 mod email_startup_tests {
-    use super::{health_json, resolve_resend_api_key};
+    use super::{health_json, resolve_apns_identifiers, resolve_resend_api_key};
     use crate::store::LegacyCheckpointReconciliation;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    #[test]
+    fn production_startup_requires_complete_apns_identifiers() {
+        assert!(resolve_apns_identifiers("production", None, None, None).is_err());
+        assert!(resolve_apns_identifiers(
+            "production",
+            Some("ABCDE12345".into()),
+            Some("PRODKEY123".into()),
+            None,
+        )
+        .is_err());
+        assert!(resolve_apns_identifiers(
+            "production",
+            Some("ABCDE12345".into()),
+            Some("PRODKEY123".into()),
+            Some("SBOXKEY123".into()),
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(
+            resolve_apns_identifiers("evaluation", None, None, None).unwrap(),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn local_test_mode_can_omit_email_without_fetching_a_secret() {

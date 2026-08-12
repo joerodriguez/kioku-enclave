@@ -1,6 +1,6 @@
 [package]
 name = "kioku-enclave"
-version = "0.8.12"
+version = "0.8.13"
 edition = "2021"
 rust-version = "1.96"
 description = "Attested Kioku backend for encrypted personal-memory storage and retrieval"
@@ -85,7 +85,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 # HTTP client for KMS / GCS REST — rustls only, NO openssl.
 # webpki-roots bundles Mozilla's CA roots into the binary so the FROM-scratch
 # container image needs no /etc/ssl/certs on the filesystem.
-reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls-webpki-roots", "json", "http2"] }
 # Strict parsing of the authenticated GCS response Date used for durable
 # legacy-write intent leases. Already present transitively through hyper.
 httpdate = "1.0.3"

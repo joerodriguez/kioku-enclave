@@ -1582,6 +1582,11 @@ pub async fn summarize_all(state: &CpState) {
                 warn!(user_id = %id, error = %e, "deliver_user_emails failed");
             }
         }
+        if let Some(ref transport) = state.push_transport {
+            if let Err(e) = super::push::deliver_user_pushes(state, transport.as_ref(), &id).await {
+                warn!(user_id = %id, error = %e, "deliver_user_pushes failed");
+            }
+        }
     }
 }
 

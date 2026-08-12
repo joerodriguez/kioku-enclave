@@ -304,6 +304,22 @@ CREATE TABLE IF NOT EXISTS episode_email_preferences (
     consented_at     TEXT,
     updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+CREATE TABLE IF NOT EXISTS push_installations (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL REFERENCES users(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    platform         TEXT NOT NULL CHECK (platform IN ('ios','macos')),
+    topic            TEXT NOT NULL,
+    environment      TEXT NOT NULL CHECK (environment IN ('sandbox','production')),
+    device_token     TEXT NOT NULL,
+    token_generation INTEGER NOT NULL DEFAULT 1,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    last_seen_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (topic, environment, device_token)
+);
+CREATE INDEX IF NOT EXISTS push_installations_user_idx
+    ON push_installations(user_id, enabled, last_seen_at);
 -- ADR-0012 removes Gmail delivery and its stored OAuth credentials.
 DROP TABLE IF EXISTS user_gmail_configs;
 "#;
@@ -593,6 +609,60 @@ pub struct EpisodeEmailPreference {
     pub recipient_email: String,
     pub consented_at: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PushInstallation {
+    pub id: String,
+    pub user_id: String,
+    pub platform: String,
+    pub topic: String,
+    pub environment: String,
+    pub device_token: String,
+    pub token_generation: i64,
+    pub enabled: bool,
+}
+
+impl std::fmt::Debug for PushInstallation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PushInstallation")
+            .field("id", &"<opaque>")
+            .field("platform", &self.platform)
+            .field("topic", &self.topic)
+            .field("environment", &self.environment)
+            .field("token_generation", &self.token_generation)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+fn push_installation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PushInstallation> {
+    Ok(PushInstallation {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        platform: row.get(2)?,
+        topic: row.get(3)?,
+        environment: row.get(4)?,
+        device_token: row.get(5)?,
+        token_generation: row.get(6)?,
+        enabled: row.get::<_, i64>(7)? != 0,
+    })
+}
+
+fn load_push_installation_conn(
+    conn: &Connection,
+    user_id: &str,
+    installation_id: &str,
+) -> Result<Option<PushInstallation>> {
+    Ok(conn
+        .query_row(
+            "SELECT id,user_id,platform,topic,environment,device_token,token_generation,enabled \
+             FROM push_installations WHERE user_id=?1 AND id=?2",
+            rusqlite::params![user_id, installation_id],
+            push_installation_from_row,
+        )
+        .optional()?)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1570,6 +1640,10 @@ fn delete_user_identity_conn(
         [user_id],
     )?;
     tx.execute(
+        "DELETE FROM push_installations WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
         "DELETE FROM apple_credentials WHERE user_id = ?1",
         [user_id],
     )?;
@@ -1661,6 +1735,11 @@ fn begin_user_deletion_conn(
         tx.execute(
             "UPDATE episode_email_preferences SET enabled = 0, include_content = 0, \
              consented_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
+            [user_id],
+        )?;
+        tx.execute(
+            "UPDATE push_installations SET enabled = 0, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE user_id = ?1",
             [user_id],
         )?;
     }
@@ -2835,6 +2914,7 @@ impl ControlStore {
                             "recording_lease_denials",
                             "webhook_subscriptions",
                             "episode_email_preferences",
+                            "push_installations",
                             "auth_identities",
                             "apple_credentials",
                             "archive_bindings",
@@ -4464,6 +4544,132 @@ impl ControlStore {
         .await
     }
 
+    pub async fn upsert_push_installation(
+        &self,
+        installation: PushInstallation,
+    ) -> Result<PushInstallation> {
+        self.write(move |conn| {
+            if !is_active_user_conn(conn, &installation.user_id)? {
+                return Err(EnclaveError::Auth("account inactive or deleting".into()));
+            }
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM push_installations WHERE topic=?1 AND environment=?2 \
+                 AND device_token=?3 AND id<>?4",
+                rusqlite::params![
+                    installation.topic,
+                    installation.environment,
+                    installation.device_token,
+                    installation.id
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO push_installations \
+                   (id,user_id,platform,topic,environment,device_token,token_generation,enabled) \
+                 VALUES (?1,?2,?3,?4,?5,?6,1,1) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   user_id=excluded.user_id,platform=excluded.platform,topic=excluded.topic, \
+                   environment=excluded.environment, \
+                   token_generation=CASE WHEN device_token=excluded.device_token \
+                     AND topic=excluded.topic AND environment=excluded.environment \
+                     THEN token_generation ELSE token_generation+1 END, \
+                   device_token=excluded.device_token,enabled=1, \
+                   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+                   last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                rusqlite::params![
+                    installation.id,
+                    installation.user_id,
+                    installation.platform,
+                    installation.topic,
+                    installation.environment,
+                    installation.device_token,
+                ],
+            )?;
+            let excess: i64 = tx.query_row(
+                "SELECT MAX(0,COUNT(*)-10) FROM push_installations \
+                 WHERE user_id=?1 AND enabled=1",
+                [&installation.user_id],
+                |row| row.get(0),
+            )?;
+            if excess > 0 {
+                tx.execute(
+                    "DELETE FROM push_installations WHERE id IN ( \
+                       SELECT id FROM push_installations WHERE user_id=?1 AND enabled=1 AND id<>?2 \
+                       ORDER BY last_seen_at ASC,id ASC LIMIT ?3)",
+                    rusqlite::params![installation.user_id, installation.id, excess],
+                )?;
+            }
+            let installed =
+                load_push_installation_conn(&tx, &installation.user_id, &installation.id)?
+                    .ok_or_else(|| {
+                        EnclaveError::Store("push installation upsert disappeared".into())
+                    })?;
+            tx.commit()?;
+            Ok(installed)
+        })
+        .await
+    }
+
+    pub async fn list_push_installations(&self, user_id: &str) -> Result<Vec<PushInstallation>> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT id,user_id,platform,topic,environment,device_token,token_generation,enabled \
+                 FROM push_installations WHERE user_id=?1 AND enabled=1 ORDER BY id",
+            )?;
+            let rows = statement.query_map([user_id], push_installation_from_row)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+    }
+
+    pub async fn get_push_installation(
+        &self,
+        user_id: &str,
+        installation_id: &str,
+    ) -> Result<Option<PushInstallation>> {
+        let user_id = user_id.to_string();
+        let installation_id = installation_id.to_string();
+        self.read(move |conn| load_push_installation_conn(conn, &user_id, &installation_id))
+            .await
+    }
+
+    pub async fn delete_push_installation(
+        &self,
+        user_id: &str,
+        installation_id: &str,
+    ) -> Result<bool> {
+        let user_id = user_id.to_string();
+        let installation_id = installation_id.to_string();
+        self.write(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM push_installations WHERE user_id=?1 AND id=?2",
+                rusqlite::params![user_id, installation_id],
+            )? == 1)
+        })
+        .await
+    }
+
+    pub async fn disable_push_installation_generation(
+        &self,
+        user_id: &str,
+        installation_id: &str,
+        token_generation: i64,
+    ) -> Result<bool> {
+        let user_id = user_id.to_string();
+        let installation_id = installation_id.to_string();
+        self.write(move |conn| {
+            Ok(conn.execute(
+                "UPDATE push_installations SET enabled=0, \
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                 WHERE user_id=?1 AND id=?2 AND token_generation=?3",
+                rusqlite::params![user_id, installation_id, token_generation],
+            )? == 1)
+        })
+        .await
+    }
+
     pub async fn set_email_preference(
         &self,
         user_id: &str,
@@ -4803,6 +5009,14 @@ mod tests {
             "INSERT INTO webhook_subscriptions
              (id, user_id, name, endpoint_url, signing_secret, include_content)
              VALUES ('hook-1', ?1, 'Automation', 'https://example.com/hook', 'whsec_test', 1)",
+            [USER_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO push_installations
+             (id,user_id,platform,topic,environment,device_token)
+             VALUES ('22222222-2222-4222-8222-222222222222',?1,'ios','com.kioku.ios',
+                     'production','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
             [USER_ID],
         )
         .unwrap();
@@ -5163,6 +5377,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(webhook_enabled, 0);
+        let push_enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM push_installations WHERE user_id = ?1",
+                [USER_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(push_enabled, 0);
 
         let completed = delete_user_identity_conn(&conn, USER_ID, &fence).unwrap();
         assert_eq!(completed.status, "physical_complete");
@@ -5174,6 +5396,15 @@ mod tests {
                 "SELECT count(*) FROM query_log WHERE user_id = ?1",
                 [USER_ID],
                 |r| { r.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM push_installations WHERE user_id = ?1",
+                [USER_ID],
+                |r| r.get::<_, i64>(0)
             )
             .unwrap(),
             0

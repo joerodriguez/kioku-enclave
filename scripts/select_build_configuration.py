@@ -62,6 +62,11 @@ OPTIONAL_PROFILE_GROUPS = (
         "APPLE_MACOS_CLIENT_ID",
         "APPLE_WEB_CLIENT_ID",
     ),
+    (
+        "APNS_TEAM_ID",
+        "APNS_PRODUCTION_KEY_ID",
+        "APNS_SANDBOX_KEY_ID",
+    ),
 )
 
 PROJECT_PATTERN = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
@@ -159,6 +164,10 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         require_pattern(configuration, "APPLE_IOS_CLIENT_ID", r"com\.kioku\.ios")
         require_pattern(configuration, "APPLE_MACOS_CLIENT_ID", r"com\.kiokuu\.app")
         require_pattern(configuration, "APPLE_WEB_CLIENT_ID", r"com\.kiokuu\.web")
+    if configuration.get("APNS_TEAM_ID"):
+        require_pattern(configuration, "APNS_TEAM_ID", r"[A-Za-z0-9]{10}")
+        require_pattern(configuration, "APNS_PRODUCTION_KEY_ID", r"[A-Za-z0-9]{10}")
+        require_pattern(configuration, "APNS_SANDBOX_KEY_ID", r"[A-Za-z0-9]{10}")
     require_pattern(configuration, "REVIEWER_AUTH_API_KEY", r"[A-Za-z0-9_-]{20,256}")
     require_pattern(configuration, "REVIEWER_AUTH_UID", r"[A-Za-z0-9_-]{1,128}")
     require_pattern(configuration, "REVIEWER_AUTH_EMAIL", EMAIL_PATTERN)
@@ -243,6 +252,12 @@ def selected_configuration(profile: str, environment: dict[str, str]) -> dict[st
                 "incomplete optional repository configuration group; missing: " + missing
             )
         configuration.update(values)
+    if profile == "production" and not configuration.get("APNS_TEAM_ID"):
+        raise SystemExit(
+            "missing required production repository configuration: "
+            "PRODUCTION_APNS_TEAM_ID, PRODUCTION_APNS_PRODUCTION_KEY_ID, "
+            "PRODUCTION_APNS_SANDBOX_KEY_ID"
+        )
     validate(configuration, profile)
     return configuration
 

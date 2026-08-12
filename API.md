@@ -76,6 +76,7 @@ screenshot.
   "device_id": "019fbab2-8413-7053-9117-eb249b72b15d",
   "install_id": "019fbab2-8413-7053-9117-eb249b72b15e",
   "capture_session_id": "019fbab2-8413-7053-9117-eb249b72b15f",
+  "session_finished": false,
   "stream_id": "019fbab2-8413-7053-9117-eb249b72b160",
   "stream_kind": "system_audio",
   "sequence": 42,
@@ -138,6 +139,11 @@ screenshot.
   }
 }
 ```
+
+`session_finished` is optional (false by default) and valid only on audio. A client sets
+it on its final durable, gracefully completed audio event. Acceptance atomically records
+the exact capture session as ended; byte-identical replay remains idempotent. A separate
+session-finish request may accelerate that fact but is not the durable boundary.
 
 `media_disposition` is `canonical` or `reference`; omission means `canonical`
 for compatibility. Canonical events require `media`, forbid `reference`, and
@@ -345,6 +351,34 @@ States are `queued`, `processing`, `retry_wait`, `ready`, `failed`, or
 `pruned`. `pruned` means the bounded raw-media retention window elapsed; the
 derived searchable records and timestamped evidence remain. A well-formed event ID
 that does not belong to the authenticated account returns HTTP `404`.
+
+## Check or finish one capture session
+
+`GET /api/v2/capture/sessions/{capture_session_id}` returns only work and memories linked
+to that exact authenticated session. Its stage is one of `received`, `processing`,
+`organizing`, `preparing_recap`, `ready`, or `needs_attention`; the body also contains
+the accepted event count, optional end time, and zero or more linked memory summaries.
+
+`POST /api/v2/capture/sessions/{capture_session_id}` is an idempotent completion
+acceleration. Native clients retry it only after all durable events for that session are
+accepted. Correctness and later finalization do not depend on this request because the
+final accepted audio manifest carries `session_finished=true`.
+
+## Apple ready-notification installation
+
+Authenticated native clients opt in one device with
+`PUT /api/push/installations/{installation_uuid}` and disable it with `DELETE` on the
+same path. Registration accepts only the exact iOS/macOS app topic and matching
+sandbox/production environment. A first successful initial memory finalization creates
+one logical delivery for every installation active at that moment; recap regeneration
+does not replay it.
+
+The APNs alert is always `Kioku` / `Your memory is ready.` Its payload contains only a
+schema version and a distinct 43-character URL-safe handoff handle. It contains no
+memory ID, title, people, transcript, summary, action items, timestamps, account identity,
+URL, or credential. `POST /api/push/handoffs/resolve` authenticates the handle owner and
+returns the corresponding memory ID; missing, expired/deleted, and wrong-owner handles
+are indistinguishable.
 
 ## People learned automatically
 

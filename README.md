@@ -446,6 +446,7 @@ binding.
 | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
 | `APPLE_TEAM_ID`, `APPLE_KEY_ID` | Optional Apple developer team/key identifiers; atomic with every Apple client ID |
 | `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` | Exact Apple audiences `com.kioku.ios`, `com.kiokuu.app`, and `com.kiokuu.web`; all five Apple values are set together or Apple auth stays off |
+| `APNS_TEAM_ID`, `APNS_PRODUCTION_KEY_ID`, `APNS_SANDBOX_KEY_ID` | Required production ready-alert provider identifiers; production and sandbox keys remain separated and are fetched from Secret Manager |
 | `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
 | `ADMIN_USER_IDS` | Nonempty comma-separated stable owner UUIDs for margin reporting; separate from the email allow-list |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
@@ -460,8 +461,10 @@ binding.
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
 
-The Google web OAuth secret and optional Apple `.p8` key are fetched at runtime from
-Secret Manager. Apple refresh authorization is stored per issuing Apple client in the
+The Google web OAuth secret, optional Apple login `.p8` key, and environment-separated
+APNs provider `.p8` keys are fetched at runtime from Secret Manager. Production startup
+fails closed if the APNs identifiers or either provider key are unavailable; evaluation
+may explicitly omit the complete APNs group. Apple refresh authorization is stored per issuing Apple client in the
 encrypted control database so deletion can revoke every retained platform grant. The reviewer
 password remains only in Google Identity Platform, the review portal, and the operator's
 versioned `kioku-openai-reviewer-password` secret in project `kioku-joerodriguez`. JWT

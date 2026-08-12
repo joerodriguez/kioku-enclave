@@ -23,6 +23,7 @@ OAuth clients and legacy service-identity integrations
         ├── context-bound AES-256-GCM blobs ──► GCS (ciphertext only)
         ├── attestation-derived credentials ─► Cloud KMS
         ├── documented plaintext egress ─────► Vertex / Resend transactional email / user-configured webhooks
+        ├── generic metadata-only egress ────► Apple Push Notification service
         └── content-free pseudonymous egress ► monorepo billing service
 ```
 
@@ -35,7 +36,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 
 | Path | What it is |
 |---|---|
-| [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, separate KMS/public/Firestore-witness/archive-GCS attestation boundaries, per-user synchronized encrypted storage, search, episodes |
+| [src/](src/map.md) | The Rust backend: TLS, OAuth/API, crypto, capture-session feedback, APNs ready receipts, separate KMS/public/Firestore-witness/archive-GCS attestation boundaries, per-user synchronized encrypted storage, search, episodes |
 | `src/archive_v3.rs` / `src/archive_v3_extent.rs` / `src/archive_v3_journal.rs` / `src/archive_v3_operation.rs` / `src/archive_v3_shadow.rs` / `src/archive_v3_shadow_checkpoint.rs` / `src/archive_v3_shadow_wal.rs` / `src/archive_v3_shadow_coordinator.rs` / `src/archive_v3_sqlite_vfs.rs` / `src/archive_v3_export.rs` | Inactive ADR-0022 immutable archive foundation, bounded sparse extent-tree and checkpoint/WAL formats, transactional idempotency ledger, synchronized WAL capture, checkpoint upload/recovery, sealed WAL upload/readback and exact-root chain recovery, fail-closed shadow-publication coordination, an opt-in transparent SQLite VFS wrapper, and a transactional export seam whose cancellation-aware witness, authenticated walker, deletion-safe publication admission, canonical product-semantic adapter, and guarded nonempty output are sealed compile-time blockers; compiled/tested only, with no startup VFS registration or live persistence authority until shadow gates pass |
 | `src/archive_v3_witness.rs` | Inactive ADR-0022 content-free witness/recovery contract with an in-memory linearizable model; it is compiled/tested only and has no concrete provider or live-authority wiring |
 | `src/archive_v3_deletion.rs` | Inactive ADR-0022 deletion driver: freshly witness-reauthenticated worker/operation/fence orchestration over a sealed, bounded canonical metadata inventory; only inventory-minted per-entry capabilities reach the concrete GCS adapter, which validates full execution binding and exact membership before I/O. It removes exact content generations and derived permanent claims, reconciles uncertain mutations only by exact absence checks, and binds physical-completion witness evidence to the exact inventory plus a fresh provider drain. It has no route, Store, runtime/provider/credential construction, or authority wiring. Full metadata traversal is a compile-time activation blocker: current immutable references omit descendant locations, the inventory API is module-private, and no non-test full-reachability seal exists. |
@@ -47,7 +48,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image; Phase-0 bakes distinct current-media and legacy-media buckets, with legacy equal to the index bucket, with remaining rebuild limits documented in `SECURITY.md` |
 | `Cargo.toml` / `Cargo.lock` | Crate manifest |
 | `README.md` | What the enclave does + the attestation/privacy claim |
-| `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, retry semantics, browser metadata, processing status, and learned people profiles |
+| `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, durable session finish, exact-session status, privacy-safe push registration/handoff, retry semantics, browser metadata, processing status, and learned people profiles |
 | [eval/](eval/map.md) | Public, content-free voice/identity quality scoring plus archive-capacity contracts, synthetic regression inputs, and real-corpus methodology |
 | [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, fail-closed inactive archive-v3 signed-capacity-evidence verification, versioning, build-profile, and signed-release operator tools |
 | [TASKS.md](TASKS.md) | Scoped ADR-0022 implementation evidence and intentionally remaining authority gates |

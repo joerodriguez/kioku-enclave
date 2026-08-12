@@ -116,6 +116,7 @@ mod tests {
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             embedding: None,
             voice: None,
         });

@@ -1986,6 +1986,26 @@ async fn finalize_user_episodes_scoped(
             .ok()
             .filter(|pref| pref.enabled);
 
+        // Snapshot active installations before the user-content transaction.
+        // The worker re-resolves each installation before sending, so a later
+        // opt-out cancels its opaque row while a later opt-in receives no
+        // historical notification.
+        let push_destinations: Vec<(String, String, String, String)> = state
+            .control
+            .list_push_installations(user_id)
+            .await?
+            .into_iter()
+            .map(|installation| {
+                let random = super::tokens::random_token_hex();
+                (
+                    installation.id,
+                    super::tokens::new_uuid(),
+                    super::tokens::pkce_s256(&random),
+                    super::tokens::new_uuid(),
+                )
+            })
+            .collect();
+
         // 8. Optimistic commit transaction
         let user_cloned4 = user.clone();
         let ep_id = ep.id;
@@ -2131,8 +2151,11 @@ async fn finalize_user_episodes_scoped(
             // Only a first finalization may enqueue outbound events. Versioned
             // repairs update the canonical web/export brief without replaying
             // the same historical episode to external automations.
-            let deliveries_enqueued =
-                mode.should_enqueue_delivery(!webhook_destinations.is_empty() || email_preference.is_some());
+            let deliveries_enqueued = mode.should_enqueue_delivery(
+                !webhook_destinations.is_empty()
+                    || email_preference.is_some()
+                    || !push_destinations.is_empty(),
+            );
             if deliveries_enqueued {
                 for (subscription_id, event_id) in &webhook_destinations {
                     transaction.execute(
@@ -2156,7 +2179,7 @@ async fn finalize_user_episodes_scoped(
                             .unwrap_or_default()
                             .as_millis() as i64,
                     );
-                    conn.execute(
+                    transaction.execute(
                         "INSERT OR IGNORE INTO email_deliveries
                             (episode_id, delivery_version, delivery_id, include_content, state, attempt_count, next_attempt_at, created_at, updated_at)
                          VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5, ?5)",
@@ -2165,6 +2188,32 @@ async fn finalize_user_episodes_scoped(
                             FINALIZATION_VERSION,
                             delivery_id,
                             if pref.include_content { 1 } else { 0 },
+                            now,
+                        ],
+                    )?;
+                }
+                for (installation_id, delivery_id, handoff_handle, collapse_id) in
+                    &push_destinations
+                {
+                    let now = isotime::format_epoch_millis(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                    );
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO push_deliveries \
+                           (episode_id,installation_id,delivery_version,delivery_id, \
+                            handoff_handle,collapse_id,state,attempt_count,next_attempt_at, \
+                            created_at,updated_at) \
+                         VALUES (?1,?2,?3,?4,?5,?6,'pending',0,?7,?7,?7)",
+                        rusqlite::params![
+                            ep_id,
+                            installation_id,
+                            FINALIZATION_VERSION,
+                            delivery_id,
+                            handoff_handle,
+                            collapse_id,
                             now,
                         ],
                     )?;
@@ -2194,7 +2243,7 @@ async fn finalize_user_episodes_scoped(
 
             transaction.commit()?;
             Ok(if deliveries_enqueued {
-                webhook_destinations.len()
+                webhook_destinations.len() + push_destinations.len()
             } else {
                 0
             })

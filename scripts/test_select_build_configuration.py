@@ -57,6 +57,12 @@ APPLE_CONFIGURATION = {
     "APPLE_WEB_CLIENT_ID": "com.kiokuu.web",
 }
 
+APNS_CONFIGURATION = {
+    "APNS_TEAM_ID": "ABCDE12345",
+    "APNS_PRODUCTION_KEY_ID": "PUSHPRD123",
+    "APNS_SANDBOX_KEY_ID": "PUSHSBX123",
+}
+
 
 def environment() -> dict[str, str]:
     result = {
@@ -75,6 +81,8 @@ def environment() -> dict[str, str]:
     result["PRODUCTION_ENCLAVE_GCS_BUCKET"] = "kioku-production-indexes"
     result["PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET"] = "kioku-production-media"
     result["PRODUCTION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET"] = "kioku-production-indexes"
+    for key, value in APNS_CONFIGURATION.items():
+        result[f"PRODUCTION_{key}"] = value
     return result
 
 
@@ -169,6 +177,40 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(content, "")
         self.assertIn("PRODUCTION_APPLE_KEY_ID", completed.stderr)
 
+    def test_production_apns_configuration_is_required_and_atomic(self) -> None:
+        env = environment()
+        for key in APNS_CONFIGURATION:
+            del env[f"PRODUCTION_{key}"]
+        completed, content = self.run_selector("production", env)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("required production repository configuration", completed.stderr)
+
+        for key, value in APNS_CONFIGURATION.items():
+            env[f"PRODUCTION_{key}"] = value
+        completed, content = self.run_selector("production", env)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("APNS_PRODUCTION_KEY_ID=PUSHPRD123\n", content)
+        self.assertIn("APNS_SANDBOX_KEY_ID=PUSHSBX123\n", content)
+
+        del env["PRODUCTION_APNS_SANDBOX_KEY_ID"]
+        completed, content = self.run_selector("production", env)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(content, "")
+        self.assertIn("PRODUCTION_APNS_SANDBOX_KEY_ID", completed.stderr)
+
+    def test_evaluation_apns_configuration_remains_optional_but_atomic(self) -> None:
+        env = environment()
+        completed, content = self.run_selector("evaluation", env)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("APNS_TEAM_ID=\n", content)
+
+        for key, value in APNS_CONFIGURATION.items():
+            env[f"EVALUATION_{key}"] = value
+        completed, content = self.run_selector("evaluation", env)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("APNS_PRODUCTION_KEY_ID=PUSHPRD123\n", content)
+
     def test_every_evaluation_value_is_required(self) -> None:
         for key in CONFIGURATION:
             source_name = f"EVALUATION_{key}"
@@ -232,6 +274,10 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("scripts/select_build_configuration.py", workflow)
         self.assertIn("EVALUATION_ENCLAVE_KMS_PROJECT", workflow)
         self.assertIn('KIOKU_BUILD_PROFILE == "evaluation"', workflow)
+        self.assertIn(
+            '--build-arg KIOKU_BUILD_PROFILE="${KIOKU_BUILD_PROFILE}"',
+            workflow,
+        )
         self.assertIn('"build_profile": build_profile', workflow)
         for key in CONFIGURATION:
             self.assertIn(f"EVALUATION_{key}:", workflow)
@@ -242,6 +288,17 @@ class SelectorTests(unittest.TestCase):
         clear = workflow.index("Clear selected build configuration")
         third_party = workflow.index("anchore/sbom-action")
         self.assertLess(clear, third_party)
+
+    def test_selected_profile_is_validated_and_baked_into_the_runtime_image(self) -> None:
+        dockerfile = DOCKERFILE.read_text()
+        self.assertGreaterEqual(dockerfile.count("ARG KIOKU_BUILD_PROFILE"), 2)
+        self.assertIn(
+            'case "${KIOKU_BUILD_PROFILE}" in production|evaluation)',
+            dockerfile,
+        )
+        self.assertIn("production)", dockerfile)
+        self.assertIn('[ -n "${APNS_TEAM_ID}" ]', dockerfile)
+        self.assertIn("ENV KIOKU_BUILD_PROFILE=${KIOKU_BUILD_PROFILE}", dockerfile)
 
     def test_evaluation_reviewer_key_is_read_from_an_encrypted_secret(self) -> None:
         workflow = WORKFLOW.read_text()

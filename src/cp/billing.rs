@@ -1823,6 +1823,7 @@ mod tests {
             oauth_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
             test_email_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
             email_transport: None,
+            push_transport: None,
             embedding: None,
             voice: None,
         })

@@ -85,6 +85,7 @@ REQUIRED_REPO_VARIABLES=(
   ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_GCS_LEGACY_MEDIA_BUCKET ENCLAVE_RUN_SA_EMAIL
   ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
   GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID BASE_URL WEB_ORIGIN
+  APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID
   REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL
   VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
   BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE
@@ -114,6 +115,7 @@ IMAGE_NAME="$(gh variable get IMAGE_NAME --repo "$REPOSITORY")"
 EXPECTED_GCS_BUCKET="$(gh variable get ENCLAVE_GCS_BUCKET --repo "$REPOSITORY")"
 EXPECTED_GCS_MEDIA_BUCKET="$(gh variable get ENCLAVE_GCS_MEDIA_BUCKET --repo "$REPOSITORY")"
 EXPECTED_GCS_LEGACY_MEDIA_BUCKET="$(gh variable get ENCLAVE_GCS_LEGACY_MEDIA_BUCKET --repo "$REPOSITORY")"
+ENCLAVE_RUN_SA_EMAIL="$(gh variable get ENCLAVE_RUN_SA_EMAIL --repo "$REPOSITORY")"
 if [[ -z "$EXPECTED_GCS_BUCKET" || -z "$EXPECTED_GCS_MEDIA_BUCKET" || -z "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" || "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" != "$EXPECTED_GCS_BUCKET" ]]; then
   echo "Error: ENCLAVE_GCS_LEGACY_MEDIA_BUCKET must be configured and exactly match ENCLAVE_GCS_BUCKET for the Phase-0 dual-media migration." >&2
   exit 1
@@ -146,6 +148,46 @@ gcloud artifacts repositories describe "$AR_REPOSITORY" \
   --project "$PROJECT_ID" \
   --location "$REGION" >/dev/null
 gcloud auth configure-docker "$REGISTRY_HOST" --quiet >/dev/null
+if [[ "$ROLL" == "true" ]]; then
+  apns_runtime_member="serviceAccount:${ENCLAVE_RUN_SA_EMAIL}"
+  for apns_secret in kioku-apns-production-private-key kioku-apns-sandbox-private-key; do
+    apns_latest_state="$(gcloud secrets versions describe latest \
+      --secret "$apns_secret" \
+      --project "$PROJECT_ID" \
+      --format='value(state)' 2>/dev/null || true)"
+    if [[ "$apns_latest_state" != "ENABLED" ]]; then
+      echo "Error: required APNs secret has no enabled latest version: $apns_secret" >&2
+      echo "       Refusing traffic promotion without reading or exposing the credential." >&2
+      exit 1
+    fi
+
+    apns_policy="$(gcloud secrets get-iam-policy "$apns_secret" \
+      --project "$PROJECT_ID" \
+      --format=json 2>/dev/null || true)"
+    if ! python3 -c '
+import json
+import sys
+
+expected_member = sys.argv[1]
+try:
+    policy = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+
+matches = [
+    binding
+    for binding in policy.get("bindings", [])
+    if binding.get("role") == "roles/secretmanager.secretAccessor"
+    and expected_member in binding.get("members", [])
+]
+raise SystemExit(0 if matches else 1)
+' "$apns_runtime_member" <<< "$apns_policy"; then
+      echo "Error: APNs secret lacks exact enclave runtime accessor binding: $apns_secret" >&2
+      echo "       Expected roles/secretmanager.secretAccessor for $apns_runtime_member." >&2
+      exit 1
+    fi
+  done
+fi
 
 REMOTE_TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG" 2>/dev/null || true)"
 RELEASE_EXISTS=false
