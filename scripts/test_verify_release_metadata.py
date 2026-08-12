@@ -16,11 +16,12 @@ COMMIT = "a" * 40
 DIGEST = "sha256:" + "b" * 64
 IMAGE_REPOSITORY = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
 BUCKET = "kioku-production-indexes"
+MEDIA_BUCKET = "kioku-production-media"
 
 
 def manifest() -> dict[str, object]:
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "source_repository": "https://github.com/owner/repository",
         "source_ref": "v1.2.3",
         "source_commit": COMMIT,
@@ -32,8 +33,16 @@ def manifest() -> dict[str, object]:
         "voice_quality_gate": "owner_only_unvalidated",
         "billing_enforcement_mode": "shadow",
         "gcs_bucket": BUCKET,
-        "gcs_media_bucket": BUCKET,
+        "gcs_media_bucket": MEDIA_BUCKET,
+        "gcs_legacy_media_bucket": BUCKET,
     }
+
+
+def schema_v4_manifest() -> dict[str, object]:
+    data = manifest()
+    data["schema_version"] = 4
+    del data["gcs_legacy_media_bucket"]
+    return data
 
 
 class ReleaseMetadataTests(unittest.TestCase):
@@ -57,6 +66,8 @@ class ReleaseMetadataTests(unittest.TestCase):
                     "--expected-gcs-bucket",
                     BUCKET,
                     "--expected-gcs-media-bucket",
+                    MEDIA_BUCKET,
+                    "--expected-gcs-legacy-media-bucket",
                     BUCKET,
                 ],
                 cwd=ROOT,
@@ -68,7 +79,7 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_valid_current_manifest_is_eligible(self) -> None:
         completed = self.verify(manifest())
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(f"\t{BUCKET}\t{BUCKET}\n", completed.stdout)
+        self.assertIn(f"\t{BUCKET}\t{MEDIA_BUCKET}\t{BUCKET}\n", completed.stdout)
 
     def test_missing_media_claim_is_ineligible(self) -> None:
         data = manifest()
@@ -77,9 +88,23 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("missing or unexpected fields", completed.stderr)
 
-    def test_different_media_bucket_is_ineligible(self) -> None:
+    def test_missing_legacy_media_claim_is_ineligible(self) -> None:
         data = manifest()
-        data["gcs_media_bucket"] = "kioku-production-media"
+        del data["gcs_legacy_media_bucket"]
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("missing or unexpected fields", completed.stderr)
+
+    def test_different_current_media_bucket_is_ineligible(self) -> None:
+        data = manifest()
+        data["gcs_media_bucket"] = BUCKET
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("does not match the release configuration", completed.stderr)
+
+    def test_different_legacy_media_bucket_is_ineligible(self) -> None:
+        data = manifest()
+        data["gcs_legacy_media_bucket"] = MEDIA_BUCKET
         completed = self.verify(data)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("does not match the release configuration", completed.stderr)
@@ -98,11 +123,9 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("source_commit does not match", completed.stderr)
 
-    def test_old_manifest_without_claim_is_ineligible_for_promotion(self) -> None:
-        data = manifest()
-        data["schema_version"] = 3
-        del data["gcs_bucket"]
-        del data["gcs_media_bucket"]
+    def test_exact_schema_v4_manifest_is_ineligible_for_promotion(self) -> None:
+        data = schema_v4_manifest()
+        self.assertEqual(len(data), 13)  # schema plus the exact 12 schema-v4 claims
         completed = self.verify(data)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("missing or unexpected fields", completed.stderr)

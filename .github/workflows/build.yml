@@ -40,8 +40,9 @@ name: Build & push enclave image
 #   ENCLAVE_KMS_KEY_RING      KMS key ring name
 #   ENCLAVE_KMS_KEY           KMS crypto key name
 #   ENCLAVE_GCS_BUCKET        GCS bucket for encrypted index blobs
-#   ENCLAVE_GCS_MEDIA_BUCKET  Required Phase-0 alias of ENCLAVE_GCS_BUCKET for
-#                             encrypted, bounded-retention media
+#   ENCLAVE_GCS_MEDIA_BUCKET  Current encrypted, bounded-retention media bucket
+#   ENCLAVE_GCS_LEGACY_MEDIA_BUCKET  Migration-only legacy media bucket; must
+#                             equal ENCLAVE_GCS_BUCKET for Phase-0 cleanup
 #   ENCLAVE_RUN_SA_EMAIL      Control-plane service account email
 #   ENCLAVE_AUDIENCE          Enclave's own URL (for ID-token aud validation)
 #   ENCLAVE_ATTEST_STS_AUDIENCE  WIF provider resource name for attestation STS
@@ -210,6 +211,7 @@ jobs:
       image_repository: ${{ steps.build.outputs.image_repository }}
       gcs_bucket: ${{ steps.build.outputs.gcs_bucket }}
       gcs_media_bucket: ${{ steps.build.outputs.gcs_media_bucket }}
+      gcs_legacy_media_bucket: ${{ steps.build.outputs.gcs_legacy_media_bucket }}
       digest:    ${{ steps.digest.outputs.digest }}
 
     steps:
@@ -238,6 +240,7 @@ jobs:
           PRODUCTION_ENCLAVE_KMS_KEY: ${{ vars.ENCLAVE_KMS_KEY }}
           PRODUCTION_ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
           PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
+          PRODUCTION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_LEGACY_MEDIA_BUCKET }}
           PRODUCTION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
           PRODUCTION_ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
           PRODUCTION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
@@ -271,6 +274,7 @@ jobs:
           EVALUATION_ENCLAVE_KMS_KEY: ${{ vars.EVAL_ENCLAVE_KMS_KEY }}
           EVALUATION_ENCLAVE_GCS_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_BUCKET }}
           EVALUATION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_MEDIA_BUCKET }}
+          EVALUATION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET }}
           EVALUATION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.EVAL_ENCLAVE_RUN_SA_EMAIL }}
           EVALUATION_ENCLAVE_AUDIENCE: ${{ vars.EVAL_ENCLAVE_AUDIENCE }}
           EVALUATION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.EVAL_ENCLAVE_ATTEST_STS_AUDIENCE }}
@@ -336,6 +340,7 @@ jobs:
             --build-arg KMS_KEY="${ENCLAVE_KMS_KEY}" \
             --build-arg GCS_BUCKET="${ENCLAVE_GCS_BUCKET}" \
             --build-arg GCS_MEDIA_BUCKET="${ENCLAVE_GCS_MEDIA_BUCKET}" \
+            --build-arg GCS_LEGACY_MEDIA_BUCKET="${ENCLAVE_GCS_LEGACY_MEDIA_BUCKET}" \
             --build-arg RUN_SA_EMAIL="${ENCLAVE_RUN_SA_EMAIL}" \
             --build-arg ENCLAVE_AUDIENCE="${ENCLAVE_AUDIENCE}" \
             --build-arg ATTEST_STS_AUDIENCE="${ENCLAVE_ATTEST_STS_AUDIENCE}" \
@@ -370,6 +375,7 @@ jobs:
           echo "image_repository=${IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
           echo "gcs_bucket=${ENCLAVE_GCS_BUCKET}" >> "$GITHUB_OUTPUT"
           echo "gcs_media_bucket=${ENCLAVE_GCS_MEDIA_BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "gcs_legacy_media_bucket=${ENCLAVE_GCS_LEGACY_MEDIA_BUCKET}" >> "$GITHUB_OUTPUT"
           echo "billing_enforcement_mode=${BILLING_ENFORCEMENT_MODE}" >> "$GITHUB_OUTPUT"
 
       # The selector must use GITHUB_ENV so the trusted Docker build can receive
@@ -379,7 +385,7 @@ jobs:
         run: |
           for name in \
             ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING \
-            ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET \
+            ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_GCS_LEGACY_MEDIA_BUCKET \
             ENCLAVE_RUN_SA_EMAIL ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE \
             GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID \
             APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID \
@@ -552,13 +558,14 @@ jobs:
             "${{ steps.build.outputs.billing_enforcement_mode }}" \
             "${{ steps.build.outputs.gcs_bucket }}" \
             "${{ steps.build.outputs.gcs_media_bucket }}" \
+            "${{ steps.build.outputs.gcs_legacy_media_bucket }}" \
             > enclave-release.json <<'PY'
           import json
           import sys
 
-          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode, gcs_bucket, gcs_media_bucket = sys.argv[1:]
+          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode, gcs_bucket, gcs_media_bucket, gcs_legacy_media_bucket = sys.argv[1:]
           print(json.dumps({
-              "schema_version": 4,
+              "schema_version": 5,
               "source_repository": "https://github.com/${{ github.repository }}",
               "source_ref": source_ref,
               "source_commit": commit,
@@ -571,6 +578,7 @@ jobs:
               "billing_enforcement_mode": billing_enforcement_mode,
               "gcs_bucket": gcs_bucket,
               "gcs_media_bucket": gcs_media_bucket,
+              "gcs_legacy_media_bucket": gcs_legacy_media_bucket,
           }, indent=2))
           PY
 

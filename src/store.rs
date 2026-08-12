@@ -199,7 +199,13 @@ pub struct Store {
     content_write_barrier: Arc<ContentWriteBarrier>,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
+    /// Current media write/read bucket. New capture objects are written here.
     pub media_gcs: Arc<dyn GcsClient>,
+    /// Migration-only source for media that predates the current media bucket.
+    /// Reads fall back here only after the current bucket returns NotFound;
+    /// cleanup scans both providers because bucket identity is not inferable
+    /// from a historical database key.
+    pub legacy_media_gcs: Arc<dyn GcsClient>,
     max_open: usize,
     checkpoint_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     storage_metrics: StorageMetrics,
@@ -953,7 +959,7 @@ pub struct EmailDeliveryRow {
 impl Store {
     pub fn new(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>) -> Self {
         let media_gcs = Arc::clone(&gcs);
-        Self::new_internal(kms, gcs, media_gcs)
+        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs)
     }
 
     pub fn new_with_media(
@@ -961,26 +967,40 @@ impl Store {
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
     ) -> Self {
-        Self::new_internal(kms, gcs, media_gcs)
+        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs)
+    }
+
+    /// Construct the Phase-0 split-media topology. The legacy client is
+    /// deliberately explicit: production startup must not silently point it
+    /// at another bucket when the baked migration evidence is absent.
+    pub fn new_with_media_and_legacy(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
+    ) -> Self {
+        Self::new_internal(kms, gcs, media_gcs, legacy_media_gcs)
     }
 
     fn new_internal(
         kms: Arc<dyn KmsClient>,
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
     ) -> Self {
         let max_open = std::env::var("STORE_MAX_OPEN")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(16usize)
             .max(1);
-        Self::new_internal_with_max_open(kms, gcs, media_gcs, max_open)
+        Self::new_internal_with_max_open(kms, gcs, media_gcs, legacy_media_gcs, max_open)
     }
 
     fn new_internal_with_max_open(
         kms: Arc<dyn KmsClient>,
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
     ) -> Self {
         Store {
@@ -997,6 +1017,7 @@ impl Store {
             kms,
             gcs,
             media_gcs,
+            legacy_media_gcs,
             max_open: max_open.max(1),
             checkpoint_clock: Arc::new(SystemTime::now),
             storage_metrics: StorageMetrics::default(),
@@ -1982,17 +2003,213 @@ impl Store {
     }
 
     pub async fn get_media(&self, name: &str) -> Result<crate::store::GcsGetResponse> {
-        self.media_gcs.get_object(name).await
+        match self.media_gcs.get_object(name).await {
+            Ok(object) => Ok(object),
+            Err(EnclaveError::NotFound) => self.legacy_media_gcs.get_object(name).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    fn unique_media_providers(&self) -> impl Iterator<Item = &Arc<dyn GcsClient>> {
+        std::iter::once(&self.media_gcs).chain(
+            (!Arc::ptr_eq(&self.media_gcs, &self.legacy_media_gcs))
+                .then_some(&self.legacy_media_gcs),
+        )
     }
 
     pub async fn delete_media(&self, name: &str) -> Result<()> {
-        self.media_gcs.delete_object(name).await
+        self.delete_media_on_both(name, None).await
     }
 
-    pub async fn delete_media_generation(&self, name: &str, generation: i64) -> Result<()> {
-        self.media_gcs
-            .delete_object_generation(name, generation)
-            .await
+    /// Delete one retained logical media object without assuming provider
+    /// generations are comparable. New rows name the current backend and use
+    /// their exact recorded generation there. Legacy migration shadows (and
+    /// pre-provenance rows) are deleted only after their independently returned
+    /// generation decrypts under the exact owner/key context and matches the
+    /// row's persisted plaintext SHA-256.
+    pub async fn delete_retained_media(
+        &self,
+        user_id: &str,
+        name: &str,
+        generation: Option<i64>,
+        object_backend: Option<&str>,
+        expected_sha256: &str,
+    ) -> Result<()> {
+        validate_user_id(user_id)?;
+        if generation.is_some_and(|value| value <= 0)
+            || expected_sha256.len() != 64
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || (object_backend == Some("current") && generation.is_none())
+        {
+            return Err(EnclaveError::Store(
+                "invalid retained media deletion identity".into(),
+            ));
+        }
+        if !matches!(object_backend, None | Some("current")) {
+            return Err(EnclaveError::Store(
+                "invalid retained media backend provenance".into(),
+            ));
+        }
+
+        let current_exact = if let Some(generation) = generation {
+            match self.media_gcs.get_object_generation(name, generation).await {
+                Ok(object) => Some(object),
+                Err(EnclaveError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let legacy_exact = if let (None, Some(generation)) = (object_backend, generation) {
+            match self
+                .legacy_media_gcs
+                .get_object_generation(name, generation)
+                .await
+            {
+                Ok(object) => Some(object),
+                Err(EnclaveError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let current_live = if object_backend.is_none() {
+            match self.media_gcs.get_object(name).await {
+                Ok(object) => Some(object),
+                Err(EnclaveError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let legacy_live = match self.legacy_media_gcs.get_object(name).await {
+            Ok(object) => Some(object),
+            Err(EnclaveError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+
+        let mut current_generations = HashSet::new();
+        let mut legacy_generations = HashSet::new();
+        if let Some(object) = current_exact {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                current_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "current media candidate does not match its retained identity".into(),
+                ));
+            }
+        }
+        if let Some(object) = current_live {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                current_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "current media key has an unverified live generation".into(),
+                ));
+            }
+        }
+        if let Some(object) = legacy_exact {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                legacy_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "legacy media candidate does not match its retained identity".into(),
+                ));
+            }
+        }
+        if let Some(object) = legacy_live {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                legacy_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "legacy media key has an unverified live generation".into(),
+                ));
+            }
+        }
+
+        // Delete migration shadows first. If that provider fails, the exact
+        // current generation remains available as authenticated retry evidence.
+        for candidate_generation in legacy_generations {
+            match self
+                .legacy_media_gcs
+                .delete_object_generation(name, candidate_generation)
+                .await
+            {
+                Ok(()) | Err(EnclaveError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for candidate_generation in current_generations {
+            match self
+                .media_gcs
+                .delete_object_generation(name, candidate_generation)
+                .await
+            {
+                Ok(()) | Err(EnclaveError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn retained_media_identity_matches(
+        &self,
+        user_id: &str,
+        name: &str,
+        object: &GcsGetResponse,
+        expected_sha256: &str,
+    ) -> Result<bool> {
+        let dek = load_dek(self.kms.as_ref(), &object.wrapped_dek_b64).await?;
+        let opened =
+            decrypt_bound_blob(&dek, &object.ciphertext, &media_blob_context(user_id, name))?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(&opened.plaintext));
+        Ok(actual_sha256.eq_ignore_ascii_case(expected_sha256))
+    }
+
+    /// Remove a media object from both migration providers. A missing object
+    /// on one provider is expected when the key belongs to the other bucket;
+    /// any other error is retained so callers cannot mark physical cleanup
+    /// complete after a partial provider failure.
+    async fn delete_media_on_both(&self, name: &str, generation: Option<i64>) -> Result<()> {
+        let current = match generation {
+            Some(generation) => {
+                self.media_gcs
+                    .delete_object_generation(name, generation)
+                    .await
+            }
+            None => self.media_gcs.delete_object(name).await,
+        };
+        let legacy = match generation {
+            Some(generation) => {
+                self.legacy_media_gcs
+                    .delete_object_generation(name, generation)
+                    .await
+            }
+            None => self.legacy_media_gcs.delete_object(name).await,
+        };
+        match (current, legacy) {
+            (Ok(()), Ok(()))
+            | (Ok(()), Err(EnclaveError::NotFound))
+            | (Err(EnclaveError::NotFound), Ok(())) => Ok(()),
+            (Err(EnclaveError::NotFound), Err(EnclaveError::NotFound)) => {
+                Err(EnclaveError::NotFound)
+            }
+            (Err(error), Ok(())) | (Err(error), Err(EnclaveError::NotFound)) => Err(error),
+            (Ok(()), Err(error)) | (Err(EnclaveError::NotFound), Err(error)) => Err(error),
+            (Err(error), Err(_)) => Err(error),
+        }
     }
 
     /// Serialize one account's cloud-write lifecycle with deletion. The gate
@@ -2336,13 +2553,16 @@ impl Store {
         // longer represented by the current SQLite blob. The prefix includes
         // its trailing slash, so another user's similarly named prefix cannot
         // be selected.
-        self.delete_all_versions_under(&self.media_gcs, &media_prefix(user_id))
-            .await?;
-        self.delete_all_versions_under(&self.media_gcs, &legacy_media_prefix(user_id))
-            .await?;
-        for key in keys_to_delete.iter() {
-            self.delete_all_versions_for_name(&self.media_gcs, key)
+        for media_gcs in self.unique_media_providers() {
+            self.delete_all_versions_under(media_gcs, &media_prefix(user_id))
                 .await?;
+            self.delete_all_versions_under(media_gcs, &legacy_media_prefix(user_id))
+                .await?;
+        }
+        for key in keys_to_delete.iter() {
+            for media_gcs in self.unique_media_providers() {
+                self.delete_all_versions_for_name(media_gcs, key).await?;
+            }
         }
 
         // Every retained legacy DB/checkpoint generation can name unscoped
@@ -2387,19 +2607,25 @@ impl Store {
         referenced_media_keys: &[String],
     ) -> Result<SoftDeletedInventory> {
         let mut inventory = SoftDeletedInventory::default();
-        let namespaces = [
+        for (gcs, selector, exact_name) in [
             (&self.gcs, gcs_object_name(user_id), true),
             (&self.gcs, legacy_recovery_prefix(user_id), false),
-            (&self.media_gcs, media_prefix(user_id), false),
-            (&self.media_gcs, legacy_media_prefix(user_id), false),
-        ];
-        for (gcs, selector, exact_name) in namespaces {
+        ] {
             inventory
                 .merge(matching_soft_deleted_inventory(gcs.as_ref(), &selector, exact_name).await?);
         }
+        for media_gcs in self.unique_media_providers() {
+            for selector in [media_prefix(user_id), legacy_media_prefix(user_id)] {
+                inventory.merge(
+                    matching_soft_deleted_inventory(media_gcs.as_ref(), &selector, false).await?,
+                );
+            }
+        }
         for name in referenced_media_keys {
-            inventory
-                .merge(matching_soft_deleted_inventory(self.media_gcs.as_ref(), name, true).await?);
+            for media_gcs in self.unique_media_providers() {
+                inventory
+                    .merge(matching_soft_deleted_inventory(media_gcs.as_ref(), name, true).await?);
+            }
         }
         Ok(inventory)
     }
@@ -2459,12 +2685,13 @@ impl Store {
                     };
                     let mut blocked_media = SoftDeletedInventory::default();
                     for key in keys {
-                        self.delete_all_versions_for_name(&self.media_gcs, &key)
-                            .await?;
-                        blocked_media.merge(
-                            matching_soft_deleted_inventory(self.media_gcs.as_ref(), &key, true)
-                                .await?,
-                        );
+                        for media_gcs in self.unique_media_providers() {
+                            self.delete_all_versions_for_name(media_gcs, &key).await?;
+                            blocked_media.merge(
+                                matching_soft_deleted_inventory(media_gcs.as_ref(), &key, true)
+                                    .await?,
+                            );
+                        }
                     }
                     if blocked_media.found {
                         soft_deleted.merge(blocked_media);
@@ -6325,6 +6552,7 @@ pub(crate) mod tests {
         objects: StdMutex<HashMap<String, Vec<FakeObject>>>,
         fail_copy: StdMutex<VecDeque<EnclaveError>>,
         fail_copy_after_create: StdMutex<Option<EnclaveError>>,
+        fail_get: StdMutex<Option<EnclaveError>>,
         fail_put: StdMutex<Option<EnclaveError>>,
         fail_put_after_commit: StdMutex<Option<EnclaveError>>,
         corrupt_wrapped_dek_after_commit_failure: StdMutex<Option<String>>,
@@ -6349,6 +6577,7 @@ pub(crate) mod tests {
                 objects: StdMutex::new(HashMap::new()),
                 fail_copy: StdMutex::new(VecDeque::new()),
                 fail_copy_after_create: StdMutex::new(None),
+                fail_get: StdMutex::new(None),
                 fail_put: StdMutex::new(None),
                 fail_put_after_commit: StdMutex::new(None),
                 corrupt_wrapped_dek_after_commit_failure: StdMutex::new(None),
@@ -6429,7 +6658,7 @@ pub(crate) mod tests {
             self.live_gets.lock().unwrap().len()
         }
 
-        fn version_count(&self, prefix: &str) -> usize {
+        pub(crate) fn version_count(&self, prefix: &str) -> usize {
             self.objects
                 .lock()
                 .unwrap()
@@ -6498,6 +6727,10 @@ pub(crate) mod tests {
             *self.fail_put_after_commit.lock().unwrap() = Some(error);
         }
 
+        fn fail_next_get(&self, error: EnclaveError) {
+            *self.fail_get.lock().unwrap() = Some(error);
+        }
+
         pub(crate) fn fail_next_generation_delete(&self, object_name: &str, generation: i64) {
             *self.fail_generation_delete.lock().unwrap() = Some((object_name.into(), generation));
         }
@@ -6546,6 +6779,9 @@ pub(crate) mod tests {
 
         async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
             self.live_gets.lock().unwrap().push(object_name.into());
+            if let Some(error) = self.fail_get.lock().unwrap().take() {
+                return Err(error);
+            }
             let store = self.objects.lock().unwrap();
             store
                 .get(object_name)
@@ -9061,7 +9297,7 @@ pub(crate) mod tests {
         media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
     ) -> Store {
-        Store::new_internal_with_max_open(kms, gcs, media_gcs, max_open)
+        Store::new_internal_with_max_open(kms, gcs, Arc::clone(&media_gcs), media_gcs, max_open)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9299,20 +9535,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_content_put_child_lease_keeps_deletion_behind_provider_settlement() {
+    async fn split_media_cancelled_put_keeps_both_deletion_scans_behind_provider_settlement() {
         let database_gcs = Arc::new(FakeGcs::new());
-        let media_inner = Arc::new(FakeGcs::new());
+        let current_inner = Arc::new(FakeGcs::new());
+        let legacy_media = Arc::new(FakeGcs::new());
         let media_name = "raw/content-lease-user/late.enc";
         let blocked_media = Arc::new(BlockingPutGcs::new(
-            Arc::clone(&media_inner),
+            Arc::clone(&current_inner),
             media_name.to_string(),
         ));
-        let store = Arc::new(make_store_with_limit(
+        let store = Arc::new(Store::new_with_media_and_legacy(
             Arc::new(FakeKms),
             database_gcs,
             blocked_media.clone(),
-            1,
+            legacy_media.clone(),
         ));
+        let legacy_name = "raw/content-lease-user/legacy.enc";
+        legacy_media
+            .put_object(legacy_name, b"legacy", "wrapped", 0)
+            .await
+            .unwrap();
+        current_inner.reset_operation_counts();
+        legacy_media.reset_operation_counts();
 
         let request_lease = store
             .acquire_content_write("content-lease-user")
@@ -9339,6 +9583,9 @@ pub(crate) mod tests {
                 .is_err(),
             "deletion must wait for an admitted provider PUT"
         );
+        assert_eq!(current_inner.operation_counts().0, 0);
+        assert_eq!(legacy_media.operation_counts().0, 0);
+        assert!(legacy_media.get_object(legacy_name).await.is_ok());
 
         blocked_media.release();
         put.await
@@ -9349,9 +9596,15 @@ pub(crate) mod tests {
             .expect("deletion task panicked")
             .expect("deletion failed after provider settlement");
         assert!(matches!(
-            media_inner.get_object(media_name).await,
+            current_inner.get_object(media_name).await,
             Err(EnclaveError::NotFound)
         ));
+        assert!(matches!(
+            legacy_media.get_object(legacy_name).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(current_inner.operation_counts().0 > 0);
+        assert!(legacy_media.operation_counts().0 > 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10229,6 +10482,77 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn account_deletion_scans_both_media_buckets_without_cross_user_deletion() {
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            indexes,
+            current.clone(),
+            legacy.clone(),
+        );
+        write_and_save(&store, "alice", "init").await.unwrap();
+        for (gcs, name) in [
+            (&current, "raw/alice/current.enc"),
+            (&current, "media/alice/current-legacy-name.enc"),
+            (&legacy, "raw/alice/legacy-name.enc"),
+            (&legacy, "media/alice/legacy.enc"),
+        ] {
+            gcs.put_object(name, b"ciphertext", "wrapped", 0)
+                .await
+                .unwrap();
+        }
+        legacy
+            .put_object("raw/bob/keep.enc", b"other-user", "wrapped", 0)
+            .await
+            .unwrap();
+        current
+            .put_object("raw/bob/current-keep.enc", b"other-user", "wrapped", 0)
+            .await
+            .unwrap();
+
+        store.delete_user("alice").await.unwrap();
+        for (gcs, prefix) in [
+            (&current, "raw/alice/"),
+            (&current, "media/alice/"),
+            (&legacy, "raw/alice/"),
+            (&legacy, "media/alice/"),
+        ] {
+            assert!(list_all_object_versions(gcs.as_ref(), prefix)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert!(legacy.get_object("raw/bob/keep.enc").await.is_ok());
+        assert!(current.get_object("raw/bob/current-keep.enc").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_media_soft_delete_blocks_physical_account_completion() {
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store =
+            Store::new_with_media_and_legacy(Arc::new(FakeKms), indexes, current, legacy.clone());
+        write_and_save(&store, "alice", "init").await.unwrap();
+        legacy
+            .put_object("raw/alice/retained.enc", b"ciphertext", "wrapped", 0)
+            .await
+            .unwrap();
+        legacy.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                ..
+            }))
+        ));
+        assert!(legacy.soft_deleted_count("raw/alice/") > 0);
+    }
+
+    #[tokio::test]
     async fn deletion_cost_tracks_live_generations_not_pruned_media_ledger_rows() {
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
@@ -10483,6 +10807,73 @@ pub(crate) mod tests {
         store.delete_user("alice").await.unwrap();
         assert_eq!(gcs.version_count(media), 0);
         assert_eq!(gcs.version_count(&gcs_object_name("alice")), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_unscoped_inventory_tracks_soft_delete_retention_in_both_media_buckets() {
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            indexes.clone(),
+            current.clone(),
+            legacy.clone(),
+        );
+        let current_key = "unscoped/current-evidence.enc";
+        let legacy_key = "unscoped/legacy-evidence.enc";
+        store
+            .with_user("alice", |conn| {
+                insert_screenshot_evidence(conn, current_key)?;
+                conn.execute(
+                    "INSERT INTO screenshots(id,captured_at) VALUES (2,'2026-01-01T00:00:01Z')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO screenshot_images \
+                     (id,screenshot_id,episode_id,source_key,captured_at,object_key,mime_type,width,height,byte_length,sha256) \
+                     VALUES ('image-2',2,1,'source-2','2026-01-01T00:00:01Z',?1,'image/jpeg',1,1,1,?2)",
+                    rusqlite::params![legacy_key, "b".repeat(64)],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        store
+            .with_user("alice", |conn| {
+                conn.execute("DELETE FROM screenshot_images", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        current
+            .put_object(current_key, b"current", "wrapped", 0)
+            .await
+            .unwrap();
+        legacy
+            .put_object(legacy_key, b"legacy", "wrapped", 0)
+            .await
+            .unwrap();
+        current.set_soft_delete_enabled(true);
+        legacy.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                ..
+            }))
+        ));
+        assert_eq!(current.soft_deleted_count(current_key), 1);
+        assert_eq!(legacy.soft_deleted_count(legacy_key), 1);
+        assert!(indexes.version_count(&legacy_recovery_prefix("alice")) > 0);
+
+        current.expire_soft_deleted(current_key);
+        legacy.expire_soft_deleted(legacy_key);
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(indexes.version_count(&gcs_object_name("alice")), 0);
     }
 
     #[tokio::test]
@@ -11092,6 +11483,227 @@ pub(crate) mod tests {
             store.get_media(&object_key).await,
             Err(EnclaveError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn split_media_uses_current_writes_then_exact_legacy_read_and_dual_delete() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let key = "raw/split-media-owner/asset.enc";
+
+        legacy
+            .put_object(key, b"legacy", "legacy-wrapped", 0)
+            .await
+            .unwrap();
+        let fallback = store.get_media(key).await.unwrap();
+        assert_eq!(fallback.ciphertext, b"legacy");
+
+        store
+            .put_media(key, b"current", "current-wrapped")
+            .await
+            .unwrap();
+        let preferred = store.get_media(key).await.unwrap();
+        assert_eq!(preferred.ciphertext, b"current");
+        assert_eq!(
+            current.get_object(key).await.unwrap().ciphertext,
+            b"current"
+        );
+        assert_eq!(legacy.get_object(key).await.unwrap().ciphertext, b"legacy");
+
+        store.delete_media(key).await.unwrap();
+        assert!(matches!(
+            current.get_object(key).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(matches!(
+            legacy.get_object(key).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_media_does_not_fallback_after_current_provider_error() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let key = "raw/split-media-owner/provider-error.enc";
+        legacy
+            .put_object(key, b"legacy", "legacy-wrapped", 0)
+            .await
+            .unwrap();
+        current.fail_next_get(EnclaveError::Gcs("current media unavailable".into()));
+
+        assert!(matches!(
+            store.get_media(key).await,
+            Err(EnclaveError::Gcs(message)) if message == "current media unavailable"
+        ));
+        assert_eq!(
+            legacy.live_get_count(),
+            0,
+            "legacy must not mask current errors"
+        );
+    }
+
+    async fn retained_media_ciphertext(
+        store: &Store,
+        user_id: &str,
+        object_key: &str,
+        plaintext: &[u8],
+    ) -> (Vec<u8>, String, String) {
+        let (dek, wrapped_dek) = generate_and_wrap_dek(store.kms.as_ref()).await.unwrap();
+        let ciphertext =
+            encrypt_bound_blob(&dek, plaintext, &media_blob_context(user_id, object_key)).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(plaintext));
+        (ciphertext, wrapped_dek, sha256)
+    }
+
+    #[tokio::test]
+    async fn retained_media_deletes_each_providers_own_unequal_generation() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let user_id = "retention-legacy-higher";
+        let key = format!("raw/{user_id}/asset.enc");
+        let (ciphertext, wrapped_dek, sha256) =
+            retained_media_ciphertext(&store, user_id, &key, b"same logical media").await;
+        let current_generation = current
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let legacy_seed = legacy
+            .put_object(&key, b"older unrelated", "wrapped", 0)
+            .await
+            .unwrap();
+        let legacy_generation = legacy
+            .put_object(&key, &ciphertext, &wrapped_dek, legacy_seed)
+            .await
+            .unwrap();
+        assert!(legacy_generation > current_generation);
+
+        store
+            .delete_retained_media(
+                user_id,
+                &key,
+                Some(current_generation),
+                Some("current"),
+                &sha256,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(current.version_count(&key), 0);
+        assert_eq!(
+            legacy.version_count(&key),
+            1,
+            "unrelated legacy history remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrated_retention_row_without_provenance_authenticates_each_live_generation() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let user_id = "retention-migrated-row";
+        let key = format!("raw/{user_id}/asset.enc");
+        let (ciphertext, wrapped_dek, sha256) =
+            retained_media_ciphertext(&store, user_id, &key, b"migrated logical media").await;
+        let seed_generation = current
+            .put_object(&key, b"older unrelated", "wrapped", 0)
+            .await
+            .unwrap();
+        let current_generation = current
+            .put_object(&key, &ciphertext, &wrapped_dek, seed_generation)
+            .await
+            .unwrap();
+        let legacy_generation = legacy
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        assert_ne!(current_generation, legacy_generation);
+
+        store
+            .delete_retained_media(user_id, &key, None, None, &sha256)
+            .await
+            .unwrap();
+
+        assert_eq!(current.version_count(&key), 1);
+        assert_eq!(legacy.version_count(&key), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_media_never_deletes_newer_unverified_legacy_generation() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let user_id = "retention-newer-legacy";
+        let key = format!("raw/{user_id}/asset.enc");
+        let (ciphertext, wrapped_dek, sha256) =
+            retained_media_ciphertext(&store, user_id, &key, b"retained logical media").await;
+        let current_generation = current
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let legacy_generation = legacy
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let (newer_ciphertext, newer_wrapped_dek, _) =
+            retained_media_ciphertext(&store, user_id, &key, b"newer independent media").await;
+        let newer_generation = legacy
+            .put_object(
+                &key,
+                &newer_ciphertext,
+                &newer_wrapped_dek,
+                legacy_generation,
+            )
+            .await
+            .unwrap();
+
+        assert!(store
+            .delete_retained_media(
+                user_id,
+                &key,
+                Some(current_generation),
+                Some("current"),
+                &sha256,
+            )
+            .await
+            .is_err());
+        assert_eq!(current.version_count(&key), 1);
+        assert_eq!(legacy.version_count(&key), 2);
+        assert_eq!(legacy.generation(&key), Some(newer_generation));
     }
 
     #[test]

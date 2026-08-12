@@ -29,6 +29,7 @@ FIELDS = (
     "billing_enforcement_mode",
     "gcs_bucket",
     "gcs_media_bucket",
+    "gcs_legacy_media_bucket",
 )
 
 
@@ -68,10 +69,12 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         reject("expected GCS bucket has an invalid format")
     if not BUCKET_PATTERN.fullmatch(arguments.expected_gcs_media_bucket):
         reject("expected media GCS bucket has an invalid format")
-    if arguments.expected_gcs_bucket != arguments.expected_gcs_media_bucket:
-        reject("expected media GCS bucket must equal the expected GCS bucket for Phase-0")
-    if data["schema_version"] != 4:
-        reject("schema_version must be 4; older manifests are ineligible for promotion")
+    if not BUCKET_PATTERN.fullmatch(arguments.expected_gcs_legacy_media_bucket):
+        reject("expected legacy media GCS bucket has an invalid format")
+    if arguments.expected_gcs_bucket != arguments.expected_gcs_legacy_media_bucket:
+        reject("expected legacy media GCS bucket must equal the expected GCS bucket for Phase-0")
+    if data["schema_version"] != 5:
+        reject("schema_version must be 5; older manifests are ineligible for promotion")
 
     expected_repository = f"https://github.com/{arguments.repository}"
     if data["source_repository"] != expected_repository:
@@ -107,14 +110,20 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
 
     bucket = required_string(data, "gcs_bucket")
     media_bucket = required_string(data, "gcs_media_bucket")
-    if not BUCKET_PATTERN.fullmatch(bucket) or not BUCKET_PATTERN.fullmatch(media_bucket):
+    legacy_media_bucket = required_string(data, "gcs_legacy_media_bucket")
+    if not all(
+        BUCKET_PATTERN.fullmatch(value)
+        for value in (bucket, media_bucket, legacy_media_bucket)
+    ):
         reject("GCS bucket claim has an invalid format")
     if bucket != arguments.expected_gcs_bucket:
         reject("gcs_bucket does not match the release configuration")
     if media_bucket != arguments.expected_gcs_media_bucket:
         reject("gcs_media_bucket does not match the release configuration")
-    if media_bucket != bucket:
-        reject("gcs_media_bucket must equal gcs_bucket for the Phase-0 transitional release")
+    if legacy_media_bucket != arguments.expected_gcs_legacy_media_bucket:
+        reject("gcs_legacy_media_bucket does not match the release configuration")
+    if legacy_media_bucket != bucket:
+        reject("gcs_legacy_media_bucket must equal gcs_bucket for the Phase-0 dual-media migration")
 
 
 def main() -> None:
@@ -126,6 +135,7 @@ def main() -> None:
     parser.add_argument("--image-repository", required=True)
     parser.add_argument("--expected-gcs-bucket", required=True)
     parser.add_argument("--expected-gcs-media-bucket", required=True)
+    parser.add_argument("--expected-gcs-legacy-media-bucket", required=True)
     arguments = parser.parse_args()
     data = parse_metadata(arguments.metadata)
     validate(arguments, data)

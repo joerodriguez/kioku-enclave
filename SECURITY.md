@@ -58,18 +58,18 @@ surfaces.
   production data access. The operator has retired that isolated runtime; production is
   now the only active owner evaluation environment.
 - Production selection accepts only the reviewed `shadow` and `enforce` billing modes.
-  The selected mode is preserved in schema-v4 release metadata, and a fresh release
+  The selected mode is preserved in schema-v5 release metadata, and a fresh release
   rechecks that it matches the repository variable observed before tagging. A later
   configuration change therefore cannot silently alter the signed image's enforcement
   behavior.
-- ADR-0022 Phase-0 requires the non-secret `ENCLAVE_GCS_MEDIA_BUCKET` repository variable
-  to be present and exactly equal to `ENCLAVE_GCS_BUCKET`. Both values are baked into the
-  image; the exact equality claim is carried in a schema-v4 release manifest that is
-  itself a GitHub-signed provenance subject, and release tooling verifies that subject,
-  the tagged source, and the image provenance before promotion. A missing claim, a
-  different bucket, an unsigned/copied manifest, or an older release manifest is not
-  promotion evidence. This is not runtime Store/archive-v3 wiring, a deletion action, or
-  deployment authority.
+- ADR-0022 Phase-0 requires three baked non-secret repository variables:
+  `ENCLAVE_GCS_BUCKET` for indexes, `ENCLAVE_GCS_MEDIA_BUCKET` for current-media
+  writes, and `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` for migration-only media reads and
+  deletes. The current media bucket may differ from the index bucket; legacy media must
+  exactly equal it. The exact three-value claim is carried in a schema-v5 release
+  manifest that is itself a GitHub-signed provenance subject. Runtime has no missing
+  legacy-bucket fallback; an unsigned/copied or older manifest is not promotion evidence.
+  This is not archive-v3 wiring, a deletion action, or deployment authority.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL
@@ -942,7 +942,7 @@ Rust crates visible in that image SBOM, and CI fails if representative core/nati
 packages are absent. The credentialed build job accepts only main or `v*` tag refs; the
 GCP OIDC provider must additionally constrain immutable repository/owner IDs and the
 expected workflow identity. A tagged build produces GitHub-signed image provenance, an
-SPDX SBOM, a signed SBOM attestation, and a signed schema-v4 media-bucket-manifest subject,
+SPDX SBOM, a signed SBOM attestation, and a signed schema-v5 dual-media-bucket-manifest subject,
 but has read-only repository-content permission and no GitHub Release publication step.
 The sole publisher is `scripts/release.sh`: before any release mutation it requires the
 exact tag-signing fingerprint from a separately published trusted anchor, then verifies
