@@ -82,7 +82,7 @@ REQUIRED_REPO_VARIABLES=(
   GCP_WIF_PROVIDER GCP_SERVICE_ACCOUNT
   GCP_PROJECT_ID GCP_REGION AR_REPOSITORY IMAGE_NAME
   ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING
-  ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_RUN_SA_EMAIL
+  ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_GCS_LEGACY_MEDIA_BUCKET ENCLAVE_RUN_SA_EMAIL
   ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
   GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID BASE_URL WEB_ORIGIN
   REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL
@@ -113,8 +113,9 @@ AR_REPOSITORY="$(gh variable get AR_REPOSITORY --repo "$REPOSITORY")"
 IMAGE_NAME="$(gh variable get IMAGE_NAME --repo "$REPOSITORY")"
 EXPECTED_GCS_BUCKET="$(gh variable get ENCLAVE_GCS_BUCKET --repo "$REPOSITORY")"
 EXPECTED_GCS_MEDIA_BUCKET="$(gh variable get ENCLAVE_GCS_MEDIA_BUCKET --repo "$REPOSITORY")"
-if [[ -z "$EXPECTED_GCS_BUCKET" || -z "$EXPECTED_GCS_MEDIA_BUCKET" || "$EXPECTED_GCS_MEDIA_BUCKET" != "$EXPECTED_GCS_BUCKET" ]]; then
-  echo "Error: ENCLAVE_GCS_MEDIA_BUCKET must be configured and exactly match ENCLAVE_GCS_BUCKET for the Phase-0 transitional release." >&2
+EXPECTED_GCS_LEGACY_MEDIA_BUCKET="$(gh variable get ENCLAVE_GCS_LEGACY_MEDIA_BUCKET --repo "$REPOSITORY")"
+if [[ -z "$EXPECTED_GCS_BUCKET" || -z "$EXPECTED_GCS_MEDIA_BUCKET" || -z "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" || "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" != "$EXPECTED_GCS_BUCKET" ]]; then
+  echo "Error: ENCLAVE_GCS_LEGACY_MEDIA_BUCKET must be configured and exactly match ENCLAVE_GCS_BUCKET for the Phase-0 dual-media migration." >&2
   exit 1
 fi
 REGISTRY_HOST="${REGION}-docker.pkg.dev"
@@ -340,8 +341,9 @@ RELEASE_METADATA="$(python3 scripts/verify_release_metadata.py \
   --commit "$REMOTE_TAG_COMMIT" \
   --image-repository "${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}" \
   --expected-gcs-bucket "$EXPECTED_GCS_BUCKET" \
-  --expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET")"
-IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE GCS_BUCKET GCS_MEDIA_BUCKET <<< "$RELEASE_METADATA"
+  --expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET" \
+  --expected-gcs-legacy-media-bucket "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET")"
+IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE GCS_BUCKET GCS_MEDIA_BUCKET GCS_LEGACY_MEDIA_BUCKET <<< "$RELEASE_METADATA"
 
 if [[ -n "$EXPECTED_VOICE_QUALITY_GATE" && "$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE" ]]; then
   echo "Error: build metadata voice-quality classification does not match the checked source." >&2
@@ -438,7 +440,8 @@ printf '%s\n' \
   "| Image digest | \`${DIGEST}\` |" \
   "| Build | [GitHub Actions run](${BUILD_URL}) |" \
   "| Voice quality gate | \`${VOICE_QUALITY_GATE}\` |" \
-  "| Phase-0 GCS media bucket | \`${GCS_MEDIA_BUCKET}\` (must equal \`${GCS_BUCKET}\`) |" \
+  "| Phase-0 current media bucket | \`${GCS_MEDIA_BUCKET}\` |" \
+  "| Phase-0 legacy media bucket | \`${GCS_LEGACY_MEDIA_BUCKET}\` (must equal index \`${GCS_BUCKET}\`) |" \
   "" \
   "The digest is the attestation anchor used by the deployment's KMS policy." \
   "See README.md for the trust boundary and current reproducibility caveats." \

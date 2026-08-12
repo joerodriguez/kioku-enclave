@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use tracing::warn;
 
 use crate::error::{EnclaveError, Result};
+use crate::store::Store;
 
 use super::media::{parse_audio_result, AudioTurn};
 use super::media_planner::{self, PlanningEvent, SourceInterval, WorkClass};
@@ -1797,12 +1798,15 @@ async fn process_user(state: &CpState, user_id: &str) {
 }
 
 async fn prune_user_media(state: &CpState, user_id: &str) {
+    prune_user_media_store(state.store.as_ref(), user_id).await;
+}
+
+async fn prune_user_media_store(store: &Store, user_id: &str) {
     let now = now_iso();
-    let due = state
-        .store
+    let due = store
         .with_user(user_id, |conn| {
             let mut statement = conn.prepare(
-                "SELECT event_id,object_key,object_generation FROM media_objects \
+                "SELECT event_id,object_key,object_generation,object_backend,sha256 FROM media_objects \
                  WHERE deleted_at IS NULL AND retain_until<=?1 \
                  AND processing_state IN ('ready','failed') ORDER BY retain_until LIMIT 100",
             )?;
@@ -1812,6 +1816,8 @@ async fn prune_user_media(state: &CpState, user_id: &str) {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1826,26 +1832,22 @@ async fn prune_user_media(state: &CpState, user_id: &str) {
         }
     };
     let mut changed = false;
-    for (event_id, object_key, object_generation) in due {
-        let delete_result = match object_generation {
-            Some(generation) => {
-                state
-                    .store
-                    .delete_media_generation(&object_key, generation)
-                    .await
-            }
-            // Rows accepted before generation capture retain the legacy
-            // name-delete fallback; account deletion still reconciles every
-            // generation under the exact user prefix.
-            None => state.store.delete_media(&object_key).await,
-        };
+    for (event_id, object_key, object_generation, object_backend, sha256) in due {
+        let delete_result = store
+            .delete_retained_media(
+                user_id,
+                &object_key,
+                object_generation,
+                object_backend.as_deref(),
+                &sha256,
+            )
+            .await;
         if let Err(error) = delete_result {
             warn!(error = %error, "raw media retention delete failed");
             continue;
         }
         let deleted_at = now_iso();
-        if let Err(error) = state
-            .store
+        if let Err(error) = store
             .with_user(user_id, |conn| {
                 conn.execute(
                     "UPDATE media_objects SET processing_state='pruned',deleted_at=?1 \
@@ -1862,7 +1864,7 @@ async fn prune_user_media(state: &CpState, user_id: &str) {
         changed = true;
     }
     if changed {
-        let _ = state.store.save_user(user_id).await;
+        let _ = store.save_user(user_id).await;
     }
 }
 
@@ -1907,7 +1909,12 @@ pub fn spawn_scheduler(state: Arc<CpState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cp::media::{init_schema, record_source_event, CaptureEventManifest, StreamKind};
+    use crate::cp::media::{
+        init_schema, record_source_event, record_source_event_with_generation,
+        CaptureEventManifest, StreamKind,
+    };
+    use crate::store::tests::{FakeGcs, FakeKms};
+    use crate::store::GcsClient;
 
     fn job_fixture_db() -> Connection {
         crate::store::init_vec_extension();
@@ -2690,5 +2697,97 @@ mod tests {
             persist_screen_result(&conn, &screen_job, &active_speaker_screen()).unwrap();
         }
         assert_john_bound(&conn);
+    }
+
+    #[tokio::test]
+    async fn retention_exact_generation_waits_for_both_media_providers_before_pruning_row() {
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            indexes,
+            current.clone(),
+            legacy.clone(),
+        );
+        let user_id = "retention-split-owner";
+        let object_key = format!("raw/{user_id}/asset.enc");
+        let plaintext = b"retained logical media";
+        let sha256 = format!("{:x}", Sha256::digest(plaintext));
+        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(store.kms.as_ref())
+            .await
+            .unwrap();
+        let ciphertext = crate::crypto::encrypt_bound_blob(
+            &dek,
+            plaintext,
+            &crate::store::media_blob_context(user_id, &object_key),
+        )
+        .unwrap();
+        let seed_generation = current
+            .put_object(&object_key, b"older-unrelated-generation", "wrapped", 0)
+            .await
+            .unwrap();
+        let retained_generation = current
+            .put_object(&object_key, &ciphertext, &wrapped_dek, seed_generation)
+            .await
+            .unwrap();
+        let legacy_generation = legacy
+            .put_object(&object_key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        assert_ne!(legacy_generation, retained_generation);
+        let mut capture = manifest();
+        capture.media.as_mut().unwrap().sha256 = sha256;
+        store
+            .with_user(user_id, |conn| {
+                record_source_event_with_generation(
+                    conn,
+                    user_id,
+                    &capture,
+                    &"d".repeat(64),
+                    &object_key,
+                    Some(retained_generation),
+                )?;
+                conn.execute(
+                    "UPDATE media_objects SET processing_state='ready',retain_until='2000-01-01T00:00:00.000Z' \
+                     WHERE event_id=?1",
+                    [&capture.event_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        legacy.fail_next_generation_delete(&object_key, legacy_generation);
+
+        prune_user_media_store(&store, user_id).await;
+        let after_failure: (String, Option<String>) = store
+            .with_user_read(user_id, |conn| {
+                Ok(conn.query_row(
+                    "SELECT processing_state,deleted_at FROM media_objects WHERE event_id=?1",
+                    [&capture.event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_failure, ("ready".into(), None));
+        assert_eq!(current.version_count(&object_key), 2);
+        assert_eq!(legacy.version_count(&object_key), 1);
+
+        prune_user_media_store(&store, user_id).await;
+        let after_retry: (String, Option<String>) = store
+            .with_user_read(user_id, |conn| {
+                Ok(conn.query_row(
+                    "SELECT processing_state,deleted_at FROM media_objects WHERE event_id=?1",
+                    [&capture.event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_retry.0, "pruned");
+        assert!(after_retry.1.is_some());
+        assert_eq!(current.version_count(&object_key), 1);
+        assert_eq!(legacy.version_count(&object_key), 0);
     }
 }

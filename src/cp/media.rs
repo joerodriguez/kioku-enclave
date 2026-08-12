@@ -1524,6 +1524,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             event_id TEXT NOT NULL UNIQUE REFERENCES capture_events(event_id) ON DELETE CASCADE,
             object_key TEXT NOT NULL UNIQUE,
             object_generation INTEGER,
+            object_backend TEXT CHECK (object_backend IN ('current')),
             mime_type TEXT NOT NULL,
             codec TEXT NOT NULL,
             byte_length INTEGER NOT NULL,
@@ -1804,6 +1805,12 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         "media_objects",
         "object_generation",
         "ALTER TABLE media_objects ADD COLUMN object_generation INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "media_objects",
+        "object_backend",
+        "ALTER TABLE media_objects ADD COLUMN object_backend TEXT CHECK (object_backend IN ('current'))",
     )?;
     let has_normalized_name: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('people') WHERE name='normalized_name'",
@@ -2279,9 +2286,9 @@ pub fn record_source_event_with_generation(
     }
     tx.execute(
         "INSERT INTO media_objects \
-         (asset_id,event_id,object_key,object_generation,mime_type,codec,byte_length,sha256,sample_rate,channels, \
+         (asset_id,event_id,object_key,object_generation,object_backend,mime_type,codec,byte_length,sha256,sample_rate,channels, \
           frame_count,width,height,scale,orientation,retain_until) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+         VALUES (?1,?2,?3,?4,CASE WHEN ?4 IS NULL THEN NULL ELSE 'current' END,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             media.asset_id,
             manifest.event_id,
@@ -3054,6 +3061,15 @@ mod tests {
             )
             .unwrap(),
             42
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT object_backend FROM media_objects WHERE object_key='object-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "current"
         );
 
         let duplicate =

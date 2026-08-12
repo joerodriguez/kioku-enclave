@@ -556,17 +556,25 @@ async fn main() {
     let gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_env().expect("GCS_BUCKET must be set"));
 
+    let media_bucket =
+        std::env::var("GCS_MEDIA_BUCKET").expect("GCS_MEDIA_BUCKET must be baked into the image");
+    let legacy_media_bucket = std::env::var("GCS_LEGACY_MEDIA_BUCKET")
+        .expect("GCS_LEGACY_MEDIA_BUCKET must be baked into the image");
+    let index_bucket =
+        std::env::var("GCS_BUCKET").expect("GCS_BUCKET must be baked into the image");
+    if legacy_media_bucket != index_bucket {
+        panic!("GCS_LEGACY_MEDIA_BUCKET must exactly match GCS_BUCKET for the Phase-0 dual-media migration");
+    }
     let media_gcs: Arc<dyn crate::store::GcsClient> =
-        if let Ok(bucket) = std::env::var("GCS_MEDIA_BUCKET") {
-            Arc::new(GcpGcsClient::from_bucket(bucket))
-        } else {
-            Arc::clone(&gcs)
-        };
+        Arc::new(GcpGcsClient::from_bucket(media_bucket));
+    let legacy_media_gcs: Arc<dyn crate::store::GcsClient> =
+        Arc::new(GcpGcsClient::from_bucket(legacy_media_bucket));
 
-    let store = Arc::new(Store::new_with_media(
+    let store = Arc::new(Store::new_with_media_and_legacy(
         Arc::clone(&kms),
         Arc::clone(&gcs),
         media_gcs,
+        legacy_media_gcs,
     ));
     Store::spawn_metrics_reporter(Arc::clone(&store));
 

@@ -79,7 +79,7 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertLess(upload, reverified)
         self.assertLess(immutable, edit)
 
-    def test_release_requires_signed_schema_v4_media_manifest_before_promotion(self) -> None:
+    def test_release_requires_signed_schema_v5_dual_media_manifest_before_promotion(self) -> None:
         manifest_verification = self.source.index("Verifying signed release metadata manifest")
         parser = self.source.index("scripts/verify_release_metadata.py")
         image_provenance = self.source.index("Verifying signed GitHub build provenance")
@@ -87,6 +87,10 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertLess(parser, image_provenance)
         self.assertIn('METADATA_PROVENANCE_FILE="$WORK_DIR/enclave-release-metadata-provenance.jsonl"', self.source)
         self.assertIn('--expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET"', self.source)
+        self.assertIn(
+            '--expected-gcs-legacy-media-bucket "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET"',
+            self.source,
+        )
         self.assertIn("enclave-release-metadata-provenance.jsonl", self.source)
 
 

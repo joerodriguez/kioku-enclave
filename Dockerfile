@@ -35,8 +35,9 @@
 #   KMS_KEY_RING         KMS key ring name
 #   KMS_KEY              KMS crypto key name
 #   GCS_BUCKET           GCS bucket holding encrypted index blobs
-#   GCS_MEDIA_BUCKET     Required Phase-0 alias of GCS_BUCKET for encrypted
-#                        bounded-retention media
+#   GCS_MEDIA_BUCKET     Current encrypted bounded-retention media bucket
+#   GCS_LEGACY_MEDIA_BUCKET  Migration-only legacy media bucket; must equal
+#                        GCS_BUCKET during Phase-0 cleanup
 #   RUN_SA_EMAIL         Service account email the control plane presents in its
 #                        Google ID token (format: name@project.iam.gserviceaccount.com)
 #   ENCLAVE_AUDIENCE     The enclave's own URL, used to validate the 'aud' claim
@@ -71,7 +72,8 @@
 #     --build-arg KMS_KEY_RING=my-keyring \
 #     --build-arg KMS_KEY=my-kek \
 #     --build-arg GCS_BUCKET=my-enclave-indexes \
-#     --build-arg GCS_MEDIA_BUCKET=my-enclave-indexes \
+#     --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
+#     --build-arg GCS_LEGACY_MEDIA_BUCKET=my-enclave-indexes \
 #     --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
 #     --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
 #     --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/123.../... \
@@ -112,6 +114,7 @@ ARG KMS_KEY_RING
 ARG KMS_KEY
 ARG GCS_BUCKET
 ARG GCS_MEDIA_BUCKET
+ARG GCS_LEGACY_MEDIA_BUCKET
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -140,21 +143,22 @@ ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
 
-# Phase-0 keeps bounded-retention media in the existing encrypted index bucket.
-# A split bucket is a future, separately reviewed migration; do not emit a
-# digest that could be mistaken for the transitional binding.
+# Phase-0 writes bounded-retention media to GCS_MEDIA_BUCKET and retains the
+# previous index bucket as the exact legacy-media read/delete source. The
+# equality check binds that migration source without constraining the current
+# media bucket.
 RUN set -eu \
     && case "${SOURCE_DATE_EPOCH}" in ''|*[!0-9]*) false;; *) true;; esac \
     && for value in \
         "${KMS_PROJECT}" "${KMS_LOCATION}" "${KMS_KEY_RING}" "${KMS_KEY}" \
-        "${GCS_BUCKET}" "${GCS_MEDIA_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
+        "${GCS_BUCKET}" "${GCS_MEDIA_BUCKET}" "${GCS_LEGACY_MEDIA_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
         "${ATTEST_STS_AUDIENCE}" "${GOOGLE_DESKTOP_CLIENT_ID}" "${GOOGLE_IOS_CLIENT_ID}" \
         "${GOOGLE_WEB_CLIENT_ID}" "${ALLOWED_EMAILS}" "${ADMIN_USER_IDS}" "${BASE_URL}" "${WEB_ORIGIN}" \
         "${BILLING_SERVICE_URL}" "${BILLING_SERVICE_AUDIENCE}" "${BILLING_ENFORCEMENT_MODE}" \
         "${VERTEX_PROJECT}" "${VERTEX_LOCATION}" "${VERTEX_MODEL}" \
         "${ENCLAVE_ACME_DIRECTORY}" "${ENCLAVE_ACME_CONTACT}"; \
        do [ -n "${value}" ]; done \
-    && [ "${GCS_MEDIA_BUCKET}" = "${GCS_BUCKET}" ] \
+    && [ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ] \
     && [ "${ENCLAVE_ACME}" = "1" ] \
     && [ "${ALLOWED_EMAILS}" != "*" ] \
     && case "${ADMIN_USER_IDS}" in *[!0-9A-Fa-f,-]*) false;; *) true;; esac \
@@ -300,6 +304,7 @@ ARG KMS_KEY_RING
 ARG KMS_KEY
 ARG GCS_BUCKET
 ARG GCS_MEDIA_BUCKET
+ARG GCS_LEGACY_MEDIA_BUCKET
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -316,6 +321,7 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
     KMS_KEY=${KMS_KEY} \
     GCS_BUCKET=${GCS_BUCKET} \
     GCS_MEDIA_BUCKET=${GCS_MEDIA_BUCKET} \
+    GCS_LEGACY_MEDIA_BUCKET=${GCS_LEGACY_MEDIA_BUCKET} \
     RUN_SA_EMAIL=${RUN_SA_EMAIL} \
     ENCLAVE_AUDIENCE=${ENCLAVE_AUDIENCE} \
     ATTEST_STS_AUDIENCE=${ATTEST_STS_AUDIENCE}

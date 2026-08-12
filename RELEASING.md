@@ -75,7 +75,7 @@ The public build validates these non-secret GitHub Actions variables before Dock
 |---|---|
 | Keyless image push | `GCP_WIF_PROVIDER`, `GCP_SERVICE_ACCOUNT` |
 | Artifact Registry destination | `GCP_PROJECT_ID`, `GCP_REGION`, `AR_REPOSITORY`, `IMAGE_NAME` |
-| KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_GCS_MEDIA_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
+| KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_GCS_MEDIA_BUCKET`, `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
 | Internal KMS attestation exchange | `ENCLAVE_ATTEST_STS_AUDIENCE` |
 | OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
 | Apple login (optional, all or none) | `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` |
@@ -84,12 +84,14 @@ The public build validates these non-secret GitHub Actions variables before Dock
 | Billing boundary | `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE`, `BILLING_ENFORCEMENT_MODE` (`shadow` or `enforce`) |
 | Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |
 
-For this ADR-0022 Phase-0 transitional release, `ENCLAVE_GCS_MEDIA_BUCKET` is required
-and must be exactly equal to `ENCLAVE_GCS_BUCKET`. CI rejects a missing or different
-value before Docker runs, bakes both `ENV` values into the image, and records the exact
-non-secret value in a schema-v4 release manifest. This is a build/release binding only:
-it does not create a media bucket, change Store/archive-v3 behavior, delete objects, or
-deploy a VM. A later split-bucket migration requires separate review and release evidence.
+For this ADR-0022 Phase-0 dual-media migration, `ENCLAVE_GCS_MEDIA_BUCKET` is required
+as the current write bucket and may differ from `ENCLAVE_GCS_BUCKET`.
+`ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` is required and must exactly equal
+`ENCLAVE_GCS_BUCKET`. CI rejects a missing or mismatched value before Docker runs, bakes
+all three `ENV` values into the image, and records them in a schema-v5 release manifest.
+The selected values are a build/release binding and the runtime Store uses them for the
+dual-media migration; this workflow does not create either bucket, delete objects, wire
+archive-v3 authority, or deploy a VM.
 
 Set them in GitHub Settings → Secrets and variables → Actions or with
 `gh variable set`. The workflow maps the `ENCLAVE_*` repository-variable names to the
@@ -200,10 +202,11 @@ The script and workflow then:
 6. push the image to the configured
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>` destination;
 7. generate an SPDX SBOM, fail on fixed high-severity image findings, and create
-   GitHub-signed image-provenance, SBOM, and schema-v4 release-manifest attestations;
+   GitHub-signed image-provenance, SBOM, and schema-v5 release-manifest attestations;
 8. verify the signed release-manifest subject before parsing it, then validate its exact
    source repository/ref/commit, image digest, configured Artifact Registry repository,
-   and Phase-0 claim that the exact media bucket equals the exact index bucket; verify
+   and Phase-0 claims for the exact current-media bucket and legacy-media bucket equal
+   to the exact index bucket; verify
    the image provenance signer workflow and exact equality between the standalone SBOM
    and the verified SBOM-attestation predicate; and
 9. return publication control to the fingerprint-enforcing local script, which alone
@@ -223,10 +226,10 @@ quarantined workflow artifacts; it never grants publication eligibility. A tag s
 any key other than the out-of-band `RELEASE_SIGNER_FINGERPRINT` is rejected by the sole
 publisher even when GitHub reports that signature as verified.
 
-Images whose immutable release lacks the signed schema-v4 media-bucket manifest and its
+Images whose immutable release lacks the signed schema-v5 dual-media-bucket manifest and its
 matching provenance bundle are ineligible for promotion, including an attempted rollback.
 An old release, a mutable tag, a manually copied manifest, or a runtime fallback is not
-evidence that a digest was built for the transitional index bucket.
+evidence that a digest was built for the dual-media migration.
 
 Publishing creates a verified public release; it does not change production. An operator
 may then use `--roll` with an explicitly configured `DEPLOYMENT_REPO` to request that
@@ -250,7 +253,8 @@ Check that:
 
 - `enclave-release.json` names the `production` build profile, this repository, tag,
   signed-tag commit, build URL, the expected digest-qualified Artifact Registry
-  repository, and equal exact `gcs_bucket` / `gcs_media_bucket` claims;
+  repository, plus exact `gcs_bucket`, current `gcs_media_bucket`, and
+  `gcs_legacy_media_bucket == gcs_bucket` claims;
 - `enclave-release-metadata-provenance.jsonl` verifies `enclave-release.json` itself as
   a GitHub-signed subject from this workflow, tag, and commit—do not treat the JSON file
   alone as evidence;
@@ -299,7 +303,7 @@ For a billing-enforcement promotion, first verify the pinned billing credential,
 catalog price, reconciliation with zero failures, the idempotent 60-second
 authorize/replay/detach canary, and the signed cloud-only client quota-denial upgrade UI.
 Then set `BILLING_ENFORCEMENT_MODE=enforce` and cut a new signed release; the mode is baked
-into the image and attested in schema-v4 metadata. To roll back enforcement, set the
+into the image and attested in schema-v5 metadata. To roll back enforcement, set the
 variable to `shadow`, cut another signed release, and roll its verified digest. Do not
 attempt a live launch-metadata override.
 
