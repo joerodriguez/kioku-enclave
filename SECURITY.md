@@ -63,7 +63,7 @@ surfaces.
   production data access. The operator has retired that isolated runtime; production is
   now the only active owner evaluation environment.
 - Production selection accepts only the reviewed `shadow` and `enforce` billing modes.
-  The selected mode is preserved in schema-v5 release metadata, and a fresh release
+  The selected mode is preserved in schema-v6 release metadata, and a fresh release
   rechecks that it matches the repository variable observed before tagging. A later
   configuration change therefore cannot silently alter the signed image's enforcement
   behavior.
@@ -71,10 +71,21 @@ surfaces.
   `ENCLAVE_GCS_BUCKET` for indexes, `ENCLAVE_GCS_MEDIA_BUCKET` for current-media
   writes, and `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` for migration-only media reads and
   deletes. The current media bucket may differ from the index bucket; legacy media must
-  exactly equal it. The exact three-value claim is carried in a schema-v5 release
+  exactly equal it. The exact three-value claim is carried in a schema-v6 release
   manifest that is itself a GitHub-signed provenance subject. Runtime has no missing
   legacy-bucket fallback; an unsigned/copied or older manifest is not promotion evidence.
   This is not archive-v3 wiring, a deletion action, or deployment authority.
+- The ADR-0022 Firestore transport probe is non-authoritative and defaults to
+  `ARCHIVE_WITNESS_SHADOW_MODE=off` in both checked-in image profiles. Off requires
+  empty project/number/database fields. `probe-v1`, if separately reviewed and baked,
+  can touch only `archive_witness_transport_probe_v1/singleton`, whose sole `r` field
+  is a strict fixed-size magic/version, monotonic generation, and random opaque attempt
+  ID. It runs as at most one retained startup task, has no Store/AppState/CpState/route/
+  health/admission/deletion/acknowledgement connection, and never constructs a witness
+  bootstrap or changes canonical archive-witness state. Commit ambiguity is never
+  blindly retried and is confirmed only by rereading the exact attempt. Schema-v6
+  signed release metadata binds the mode and complete-or-empty namespace but grants no
+  Firestore, rollout, or archive authority.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL
@@ -951,7 +962,7 @@ Rust crates visible in that image SBOM, and CI fails if representative core/nati
 packages are absent. The credentialed build job accepts only main or `v*` tag refs; the
 GCP OIDC provider must additionally constrain immutable repository/owner IDs and the
 expected workflow identity. A tagged build produces GitHub-signed image provenance, an
-SPDX SBOM, a signed SBOM attestation, and a signed schema-v5 dual-media-bucket-manifest subject,
+SPDX SBOM, a signed SBOM attestation, and a signed schema-v6 release-manifest subject,
 but has read-only repository-content permission and no GitHub Release publication step.
 The sole publisher is `scripts/release.sh`: before any release mutation it requires the
 exact tag-signing fingerprint from a separately published trusted anchor, then verifies

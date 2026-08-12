@@ -38,6 +38,9 @@
 #   GCS_MEDIA_BUCKET     Current encrypted bounded-retention media bucket
 #   GCS_LEGACY_MEDIA_BUCKET  Migration-only legacy media bucket; must equal
 #                        GCS_BUCKET during Phase-0 cleanup
+#   ARCHIVE_WITNESS_SHADOW_MODE  off or probe-v1; checked-in profiles use off
+#   ARCHIVE_WITNESS_PROJECT_ID / ARCHIVE_WITNESS_PROJECT_NUMBER /
+#   ARCHIVE_WITNESS_DATABASE_ID  empty when off, complete named DB when probe-v1
 #   RUN_SA_EMAIL         Service account email the control plane presents in its
 #                        Google ID token (format: name@project.iam.gserviceaccount.com)
 #   ENCLAVE_AUDIENCE     The enclave's own URL, used to validate the 'aud' claim
@@ -78,6 +81,10 @@
 #     --build-arg GCS_BUCKET=my-enclave-indexes \
 #     --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
 #     --build-arg GCS_LEGACY_MEDIA_BUCKET=my-enclave-indexes \
+#     --build-arg ARCHIVE_WITNESS_SHADOW_MODE=off \
+#     --build-arg ARCHIVE_WITNESS_PROJECT_ID= \
+#     --build-arg ARCHIVE_WITNESS_PROJECT_NUMBER= \
+#     --build-arg ARCHIVE_WITNESS_DATABASE_ID= \
 #     --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
 #     --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
 #     --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/123.../... \
@@ -120,6 +127,10 @@ ARG KMS_KEY
 ARG GCS_BUCKET
 ARG GCS_MEDIA_BUCKET
 ARG GCS_LEGACY_MEDIA_BUCKET
+ARG ARCHIVE_WITNESS_SHADOW_MODE
+ARG ARCHIVE_WITNESS_PROJECT_ID
+ARG ARCHIVE_WITNESS_PROJECT_NUMBER
+ARG ARCHIVE_WITNESS_DATABASE_ID
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -168,6 +179,14 @@ RUN set -eu \
         "${ENCLAVE_ACME_DIRECTORY}" "${ENCLAVE_ACME_CONTACT}"; \
        do [ -n "${value}" ]; done \
     && [ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ] \
+    && case "${ARCHIVE_WITNESS_SHADOW_MODE}" in \
+         off) [ -z "${ARCHIVE_WITNESS_PROJECT_ID}${ARCHIVE_WITNESS_PROJECT_NUMBER}${ARCHIVE_WITNESS_DATABASE_ID}" ];; \
+         probe-v1) \
+           printf '%s\n' "${ARCHIVE_WITNESS_PROJECT_ID}" | grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' \
+           && printf '%s\n' "${ARCHIVE_WITNESS_PROJECT_NUMBER}" | grep -Eq '^[1-9][0-9]{0,19}$' \
+           && printf '%s\n' "${ARCHIVE_WITNESS_DATABASE_ID}" | grep -Eq '^[a-z][a-z0-9-]{2,61}[a-z0-9]$';; \
+         *) false;; \
+       esac \
     && [ "${ENCLAVE_ACME}" = "1" ] \
     && [ "${ALLOWED_EMAILS}" != "*" ] \
     && case "${ADMIN_USER_IDS}" in *[!0-9A-Fa-f,-]*) false;; *) true;; esac \
@@ -327,6 +346,10 @@ ARG KMS_KEY
 ARG GCS_BUCKET
 ARG GCS_MEDIA_BUCKET
 ARG GCS_LEGACY_MEDIA_BUCKET
+ARG ARCHIVE_WITNESS_SHADOW_MODE
+ARG ARCHIVE_WITNESS_PROJECT_ID
+ARG ARCHIVE_WITNESS_PROJECT_NUMBER
+ARG ARCHIVE_WITNESS_DATABASE_ID
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -344,6 +367,10 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
     GCS_BUCKET=${GCS_BUCKET} \
     GCS_MEDIA_BUCKET=${GCS_MEDIA_BUCKET} \
     GCS_LEGACY_MEDIA_BUCKET=${GCS_LEGACY_MEDIA_BUCKET} \
+    ARCHIVE_WITNESS_SHADOW_MODE=${ARCHIVE_WITNESS_SHADOW_MODE} \
+    ARCHIVE_WITNESS_PROJECT_ID=${ARCHIVE_WITNESS_PROJECT_ID} \
+    ARCHIVE_WITNESS_PROJECT_NUMBER=${ARCHIVE_WITNESS_PROJECT_NUMBER} \
+    ARCHIVE_WITNESS_DATABASE_ID=${ARCHIVE_WITNESS_DATABASE_ID} \
     RUN_SA_EMAIL=${RUN_SA_EMAIL} \
     ENCLAVE_AUDIENCE=${ENCLAVE_AUDIENCE} \
     ATTEST_STS_AUDIENCE=${ATTEST_STS_AUDIENCE}

@@ -38,6 +38,10 @@ CONFIGURATION = {
     "BILLING_SERVICE_URL": "https://billing.kiokuu.com",
     "BILLING_SERVICE_AUDIENCE": "https://billing.kiokuu.com",
     "BILLING_ENFORCEMENT_MODE": "shadow",
+    "ARCHIVE_WITNESS_SHADOW_MODE": "off",
+    "ARCHIVE_WITNESS_PROJECT_ID": "",
+    "ARCHIVE_WITNESS_PROJECT_NUMBER": "",
+    "ARCHIVE_WITNESS_DATABASE_ID": "",
     "REVIEWER_AUTH_API_KEY": "abcdefghijklmnopqrstuvwxyz123456",
     "REVIEWER_AUTH_UID": "reviewer-uid",
     "REVIEWER_AUTH_EMAIL": "reviewer@example.com",
@@ -213,6 +217,8 @@ class SelectorTests(unittest.TestCase):
 
     def test_every_evaluation_value_is_required(self) -> None:
         for key in CONFIGURATION:
+            if key.startswith("ARCHIVE_WITNESS_") and key != "ARCHIVE_WITNESS_SHADOW_MODE":
+                continue
             source_name = f"EVALUATION_{key}"
             with self.subTest(source_name=source_name):
                 env = environment()
@@ -296,7 +302,8 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('"build_profile": build_profile', workflow)
         for key in CONFIGURATION:
             self.assertIn(f"EVALUATION_{key}:", workflow)
-            self.assertIn(f"EVAL_{key}", workflow)
+            if not key.startswith("ARCHIVE_WITNESS_"):
+                self.assertIn(f"EVAL_{key}", workflow)
         for key in APPLE_CONFIGURATION:
             self.assertIn(f"EVALUATION_{key}:", workflow)
             self.assertIn(f"EVAL_{key}", workflow)
@@ -334,7 +341,7 @@ class SelectorTests(unittest.TestCase):
             workflow.count("python3 scripts/check_voice_release_gate.py"), 2
         )
         self.assertNotIn("test -s eval/voice/release-manifest.json", workflow)
-        self.assertIn('"schema_version": 5', workflow)
+        self.assertIn('"schema_version": 6', workflow)
         self.assertIn('"voice_quality_gate": voice_quality_gate', workflow)
         self.assertIn('"billing_enforcement_mode": billing_enforcement_mode', workflow)
         self.assertIn('"gcs_media_bucket": gcs_media_bucket', workflow)
@@ -370,8 +377,8 @@ class SelectorTests(unittest.TestCase):
             self.assertIn(f'"{manifest_field}"', verifier)
         self.assertIn('[ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
         self.assertNotIn('[ "${GCS_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
-        self.assertIn('"schema_version": 5', workflow)
-        self.assertIn("schema_version must be 5", verifier)
+        self.assertIn('"schema_version": 6', workflow)
+        self.assertIn("schema_version must be 6", verifier)
 
     def test_operator_release_uses_shared_voice_gate_and_verifies_metadata(self) -> None:
         release_script = RELEASE_SCRIPT.read_text()
@@ -381,7 +388,7 @@ class SelectorTests(unittest.TestCase):
             release_script,
         )
         self.assertIn('"voice_quality_gate"', metadata_verifier)
-        self.assertIn("schema_version must be 5", metadata_verifier)
+        self.assertIn("schema_version must be 6", metadata_verifier)
         self.assertIn('"billing_enforcement_mode"', metadata_verifier)
         self.assertIn("owner_only_unvalidated", metadata_verifier)
         self.assertIn("validated_real_corpus", metadata_verifier)
@@ -401,6 +408,20 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("ENCLAVE_GCS_LEGACY_MEDIA_BUCKET must be configured and exactly match", release_script)
         self.assertIn("Verifying signed release metadata manifest", release_script)
         self.assertIn("enclave-release-metadata-provenance.jsonl", release_script)
+
+    def test_probe_mode_defaults_off_with_empty_baked_namespace(self) -> None:
+        completed, selected = self.run_selector("production", environment())
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=off\n", selected)
+        self.assertIn("ARCHIVE_WITNESS_PROJECT_ID=\n", selected)
+        self.assertIn("ARCHIVE_WITNESS_PROJECT_NUMBER=\n", selected)
+        self.assertIn("ARCHIVE_WITNESS_DATABASE_ID=\n", selected)
+
+        partial = environment()
+        partial["PRODUCTION_ARCHIVE_WITNESS_PROJECT_ID"] = "project-1"
+        completed, _ = self.run_selector("production", partial)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("namespace must be empty", completed.stderr)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,10 @@
 
 use crate::{
     archive_v3::{ArchiveId, DatabaseEpoch, KeyEpoch, ObjectId},
+    archive_v3_firestore_probe::{
+        singleton_document_suffix, FirestoreProbeAttemptId, FirestoreProbeOutcome,
+        FirestoreProbeRecord, PROBE_RECORD_BYTES,
+    },
     archive_v3_witness::{
         DeletionAdvance, DeletionRecovery, DeletionStageProof, DeletionState,
         DeletionWorkerCredential, InMemoryWitness, RecoveryRoot, RootAdvance, TombstoneReceipt,
@@ -645,6 +649,333 @@ mod tests {
                 .unwrap();
         assert_eq!(observed, record);
     }
+
+    struct FakeProbeState {
+        record: Option<[u8; PROBE_RECORD_BYTES]>,
+        update_time: Option<String>,
+        commits: usize,
+        outcomes: VecDeque<FirestoreWitnessTransportError>,
+        preconditions: Vec<Value>,
+        apply_unknown: bool,
+    }
+
+    struct FakeProbeTransport(Mutex<FakeProbeState>);
+
+    impl FakeProbeTransport {
+        fn new(outcomes: impl IntoIterator<Item = FirestoreWitnessTransportError>) -> Self {
+            Self(Mutex::new(FakeProbeState {
+                record: None,
+                update_time: None,
+                commits: 0,
+                outcomes: outcomes.into_iter().collect(),
+                preconditions: Vec::new(),
+                apply_unknown: false,
+            }))
+        }
+
+        fn read(state: &FakeProbeState) -> FirestoreProbeRead {
+            FirestoreProbeRead {
+                record: state.record,
+                update_time: state
+                    .update_time
+                    .as_deref()
+                    .map(|value| FirestoreTimestamp::parse(value).unwrap()),
+                read_time: FirestoreTimestamp::parse(TIME).unwrap(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FirestoreProbeTransport for FakeProbeTransport {
+        async fn begin_probe_transaction(
+            &self,
+            _bearer_token: &str,
+            request_json: Value,
+        ) -> std::result::Result<FirestoreTransaction, FirestoreWitnessTransportError> {
+            assert_eq!(request_json, begin_request_json());
+            FirestoreTransaction::new(b"probe-tx")
+        }
+
+        async fn batch_get_probe(
+            &self,
+            _bearer_token: &str,
+            _transaction: &FirestoreTransaction,
+            _request_json: Value,
+        ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+            Ok(Self::read(&self.0.lock().unwrap()))
+        }
+
+        async fn read_probe(
+            &self,
+            _bearer_token: &str,
+            _request_json: Value,
+        ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+            Ok(Self::read(&self.0.lock().unwrap()))
+        }
+
+        async fn commit_probe_record(
+            &self,
+            _bearer_token: &str,
+            _transaction: &FirestoreTransaction,
+            request_json: Value,
+        ) -> std::result::Result<(), FirestoreWitnessTransportError> {
+            let mut state = self.0.lock().unwrap();
+            state.commits += 1;
+            state
+                .preconditions
+                .push(request_json["writes"][0]["currentDocument"].clone());
+            let encoded = request_json["writes"][0]["update"]["fields"]["r"]["bytesValue"]
+                .as_str()
+                .unwrap();
+            let decoded = STANDARD.decode(encoded).unwrap();
+            let mut record = [0; PROBE_RECORD_BYTES];
+            record.copy_from_slice(&decoded);
+            let outcome = state.outcomes.pop_front();
+            if outcome.is_none()
+                || outcome == Some(FirestoreWitnessTransportError::OutcomeUnknown)
+                    && state.apply_unknown
+            {
+                state.record = Some(record);
+                state.update_time = Some(TIME.to_owned());
+            }
+            match outcome {
+                None => Ok(()),
+                Some(error) => Err(error),
+            }
+        }
+    }
+
+    fn probe(transport: Arc<FakeProbeTransport>) -> FirestoreTransportProbe {
+        FirestoreTransportProbe::new(
+            FirestoreWitnessConfig::new("project-1", "123456789", "witness-db").unwrap(),
+            Arc::new(StaticToken(Mutex::new(Vec::new()))),
+            transport,
+        )
+    }
+
+    #[tokio::test]
+    async fn probe_create_then_exact_update_use_provider_preconditions() {
+        let transport = Arc::new(FakeProbeTransport::new([]));
+        assert_eq!(
+            probe(transport.clone()).run_once().await,
+            FirestoreProbeOutcome::Confirmed
+        );
+        assert_eq!(
+            probe(transport.clone()).run_once().await,
+            FirestoreProbeOutcome::Confirmed
+        );
+        let state = transport.0.lock().unwrap();
+        assert_eq!(state.preconditions[0], json!({"exists": false}));
+        assert_eq!(state.preconditions[1], json!({"updateTime": TIME}));
+        assert_eq!(
+            FirestoreProbeRecord::decode(&state.record.unwrap())
+                .unwrap()
+                .generation(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_aborted_retries_are_bounded_and_stale_is_definitive() {
+        let transport = Arc::new(FakeProbeTransport::new([
+            FirestoreWitnessTransportError::Aborted,
+            FirestoreWitnessTransportError::Aborted,
+            FirestoreWitnessTransportError::Aborted,
+        ]));
+        assert_eq!(
+            probe(transport.clone()).run_once().await,
+            FirestoreProbeOutcome::Failed
+        );
+        assert_eq!(transport.0.lock().unwrap().commits, MAX_ABORTED_ATTEMPTS);
+
+        let transport = Arc::new(FakeProbeTransport::new([
+            FirestoreWitnessTransportError::PreconditionFailed,
+        ]));
+        assert_eq!(
+            probe(transport).run_once().await,
+            FirestoreProbeOutcome::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_ambiguity_confirms_only_the_exact_attempt_and_generation() {
+        let transport = Arc::new(FakeProbeTransport::new([
+            FirestoreWitnessTransportError::OutcomeUnknown,
+        ]));
+        transport.0.lock().unwrap().apply_unknown = true;
+        assert_eq!(
+            probe(transport).run_once().await,
+            FirestoreProbeOutcome::Confirmed
+        );
+
+        let transport = Arc::new(FakeProbeTransport::new([
+            FirestoreWitnessTransportError::OutcomeUnknown,
+        ]));
+        assert_eq!(
+            probe(transport).run_once().await,
+            FirestoreProbeOutcome::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn probe_batch_get_rejects_malformed_oversized_and_multiple_results() {
+        let namespace = FirestoreWitnessNamespace::new("project-1", "witness-db").unwrap();
+        let document = namespace.probe_document();
+        let record = FirestoreProbeRecord::first(FirestoreProbeAttemptId::from_test_bytes([3; 32]));
+        let valid = serde_json::to_vec(&json!({
+            "found": {"name": document, "updateTime": TIME, "fields": {"r": {"bytesValue": STANDARD.encode(record.encode())}}},
+            "readTime": TIME
+        }))
+        .unwrap();
+        assert!(parse_exact_probe_batch_get_stream([valid.as_slice()], &document).is_ok());
+        assert_eq!(
+            parse_exact_probe_batch_get_stream([valid.as_slice(), valid.as_slice()], &document)
+                .map(|_| ()),
+            Err(FirestoreWitnessTransportError::Protocol)
+        );
+        assert_eq!(
+            parse_exact_probe_batch_get_stream(
+                [vec![b'x'; MAX_BATCH_GET_RESPONSE_BYTES + 1].as_slice()],
+                &document
+            )
+            .map(|_| ()),
+            Err(FirestoreWitnessTransportError::TooLarge)
+        );
+        let mut malformed: Value = serde_json::from_slice(&valid).unwrap();
+        malformed["found"]["fields"]["extra"] = json!({"integerValue": "1"});
+        let malformed = serde_json::to_vec(&malformed).unwrap();
+        assert_eq!(
+            parse_exact_probe_batch_get_stream([malformed.as_slice()], &document).map(|_| ()),
+            Err(FirestoreWitnessTransportError::Protocol)
+        );
+    }
+
+    struct PendingToken {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl FirestoreWitnessBearerTokenProvider for PendingToken {
+        async fn bearer_token(
+            &self,
+            _expected_audience: &str,
+        ) -> std::result::Result<FirestoreWitnessBearerToken, FirestoreWitnessTransportError>
+        {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum PendingProbeStage {
+        Read,
+        Commit,
+    }
+
+    struct PendingProbeTransport {
+        stage: PendingProbeStage,
+        entered: Arc<tokio::sync::Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FirestoreProbeTransport for PendingProbeTransport {
+        async fn begin_probe_transaction(
+            &self,
+            _bearer_token: &str,
+            _request_json: Value,
+        ) -> std::result::Result<FirestoreTransaction, FirestoreWitnessTransportError> {
+            FirestoreTransaction::new(b"pending-tx")
+        }
+
+        async fn batch_get_probe(
+            &self,
+            _bearer_token: &str,
+            _transaction: &FirestoreTransaction,
+            _request_json: Value,
+        ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if matches!(self.stage, PendingProbeStage::Read) {
+                self.entered.notify_one();
+                return std::future::pending().await;
+            }
+            Ok(FirestoreProbeRead {
+                record: None,
+                update_time: None,
+                read_time: FirestoreTimestamp::parse(TIME).unwrap(),
+            })
+        }
+
+        async fn read_probe(
+            &self,
+            _bearer_token: &str,
+            _request_json: Value,
+        ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+            unreachable!("ambiguity reconciliation is not used")
+        }
+
+        async fn commit_probe_record(
+            &self,
+            _bearer_token: &str,
+            _transaction: &FirestoreTransaction,
+            _request_json: Value,
+        ) -> std::result::Result<(), FirestoreWitnessTransportError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_auth_read_or_commit_has_no_detached_retry() {
+        let config =
+            || FirestoreWitnessConfig::new("project-1", "123456789", "witness-db").unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(FakeProbeTransport::new([]));
+        let probe = Arc::new(FirestoreTransportProbe::new(
+            config(),
+            Arc::new(PendingToken {
+                entered: Arc::clone(&entered),
+            }),
+            transport.clone(),
+        ));
+        let task = tokio::spawn({
+            let probe = Arc::clone(&probe);
+            async move { probe.run_once().await }
+        });
+        entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(transport.0.lock().unwrap().commits, 0);
+
+        for stage in [PendingProbeStage::Read, PendingProbeStage::Commit] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let transport = Arc::new(PendingProbeTransport {
+                stage,
+                entered: Arc::clone(&entered),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let probe = Arc::new(FirestoreTransportProbe::new(
+                config(),
+                Arc::new(StaticToken(Mutex::new(Vec::new()))),
+                transport.clone(),
+            ));
+            let task = tokio::spawn({
+                let probe = Arc::clone(&probe);
+                async move { probe.run_once().await }
+            });
+            entered.notified().await;
+            let calls = transport.calls.load(std::sync::atomic::Ordering::SeqCst);
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            tokio::task::yield_now().await;
+            assert_eq!(
+                transport.calls.load(std::sync::atomic::Ordering::SeqCst),
+                calls
+            );
+        }
+    }
 }
 
 /// Exact, dedicated WIF provider resource accepted by this inactive adapter.
@@ -882,6 +1213,49 @@ pub(crate) trait FirestoreWitnessTransport: Send + Sync {
     ) -> std::result::Result<(), FirestoreWitnessTransportError>;
 }
 
+/// Probe-only REST boundary. It is deliberately separate from canonical
+/// archive witness semantics and accepts only the fixed singleton request
+/// shapes constructed below.
+#[async_trait::async_trait]
+pub(crate) trait FirestoreProbeTransport: Send + Sync {
+    async fn begin_probe_transaction(
+        &self,
+        bearer_token: &str,
+        request_json: Value,
+    ) -> std::result::Result<FirestoreTransaction, FirestoreWitnessTransportError>;
+    async fn batch_get_probe(
+        &self,
+        bearer_token: &str,
+        transaction: &FirestoreTransaction,
+        request_json: Value,
+    ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError>;
+    async fn read_probe(
+        &self,
+        bearer_token: &str,
+        request_json: Value,
+    ) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError>;
+    async fn commit_probe_record(
+        &self,
+        bearer_token: &str,
+        transaction: &FirestoreTransaction,
+        request_json: Value,
+    ) -> std::result::Result<(), FirestoreWitnessTransportError>;
+}
+
+/// Exact singleton read result. All fields remain private; the concrete HTTP
+/// transport can construct it only through the strict parser in this module.
+pub(crate) struct FirestoreProbeRead {
+    record: Option<[u8; PROBE_RECORD_BYTES]>,
+    update_time: Option<FirestoreTimestamp>,
+    read_time: FirestoreTimestamp,
+}
+
+impl fmt::Debug for FirestoreProbeRead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FirestoreProbeRead(<redacted>)")
+    }
+}
+
 /// One construction boundary collects the Firestore namespace and numeric WIF
 /// provider project and derives the exact audience rather than accepting it as
 /// independent runtime configuration. A future concrete runtime must source
@@ -988,6 +1362,21 @@ impl FirestoreWitnessNamespace {
     /// selector.
     pub(crate) fn database_resource(&self) -> String {
         format!("projects/{}/databases/{}", self.project, self.database)
+    }
+
+    /// The sole non-authoritative probe document. There is no caller-selected
+    /// collection or document component.
+    pub(crate) fn probe_document(&self) -> String {
+        format!(
+            "projects/{}/databases/{}/documents/{}",
+            self.project,
+            self.database,
+            singleton_document_suffix()
+        )
+    }
+
+    pub(crate) fn is_probe_document(&self, document: &str) -> bool {
+        document == self.probe_document()
     }
 
     /// Checks the only legal document family without exposing the project or
@@ -1220,6 +1609,271 @@ pub(crate) fn parse_exact_batch_get_stream<'a>(
         return Err(FirestoreWitnessTransportError::Protocol);
     }
     Ok(parsed)
+}
+
+fn probe_batch_get_request_json(
+    document: &str,
+    transaction: Option<&FirestoreTransaction>,
+) -> Value {
+    batch_get_request_json(document, transaction)
+}
+
+fn probe_commit_request_json(
+    document: &str,
+    transaction: &FirestoreTransaction,
+    encoded: &[u8; PROBE_RECORD_BYTES],
+    update_time: Option<&str>,
+) -> Value {
+    let precondition = match update_time {
+        Some(update_time) => json!({"updateTime": update_time}),
+        None => json!({"exists": false}),
+    };
+    json!({
+        "transaction": STANDARD.encode(transaction.bytes()),
+        "writes": [{
+            "update": {"name": document, "fields": {"r": {"bytesValue": STANDARD.encode(encoded)}}},
+            "currentDocument": precondition
+        }]
+    })
+}
+
+/// Parse exactly one bounded Firestore `batchGet` object for the singleton
+/// probe. This codec is independent of and cannot decode a canonical witness.
+pub(crate) fn parse_exact_probe_batch_get_stream<'a>(
+    responses: impl IntoIterator<Item = &'a [u8]>,
+    expected_document: &str,
+) -> std::result::Result<FirestoreProbeRead, FirestoreWitnessTransportError> {
+    let mut responses = responses.into_iter();
+    let bytes = responses
+        .next()
+        .ok_or(FirestoreWitnessTransportError::Protocol)?;
+    if bytes.len() > MAX_BATCH_GET_RESPONSE_BYTES {
+        return Err(FirestoreWitnessTransportError::TooLarge);
+    }
+    if responses.next().is_some() {
+        return Err(FirestoreWitnessTransportError::Protocol);
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| FirestoreWitnessTransportError::Protocol)?;
+    let object = value
+        .as_object()
+        .ok_or(FirestoreWitnessTransportError::Protocol)?;
+    if object.len() != 2 {
+        return Err(FirestoreWitnessTransportError::Protocol);
+    }
+    let read_time = object
+        .get("readTime")
+        .and_then(Value::as_str)
+        .ok_or(FirestoreWitnessTransportError::Protocol)
+        .and_then(|value| {
+            FirestoreTimestamp::parse(value).map_err(|_| FirestoreWitnessTransportError::Protocol)
+        })?;
+    match (object.get("found"), object.get("missing")) {
+        (None, Some(Value::String(missing))) if missing == expected_document => {
+            Ok(FirestoreProbeRead {
+                record: None,
+                update_time: None,
+                read_time,
+            })
+        }
+        (Some(Value::Object(found)), None) => {
+            if !matches!(found.len(), 3 | 4)
+                || found.get("name").and_then(Value::as_str) != Some(expected_document)
+            {
+                return Err(FirestoreWitnessTransportError::Protocol);
+            }
+            let update_time = found
+                .get("updateTime")
+                .and_then(Value::as_str)
+                .ok_or(FirestoreWitnessTransportError::Protocol)
+                .and_then(|value| {
+                    FirestoreTimestamp::parse(value)
+                        .map_err(|_| FirestoreWitnessTransportError::Protocol)
+                })?;
+            let create_time = match found.get("createTime") {
+                None if found.len() == 3 => None,
+                Some(Value::String(value)) if found.len() == 4 => Some(
+                    FirestoreTimestamp::parse(value)
+                        .map_err(|_| FirestoreWitnessTransportError::Protocol)?,
+                ),
+                _ => return Err(FirestoreWitnessTransportError::Protocol),
+            };
+            if update_time.is_after(&read_time)
+                || create_time
+                    .as_ref()
+                    .is_some_and(|value| value.is_after(&update_time))
+            {
+                return Err(FirestoreWitnessTransportError::Protocol);
+            }
+            let fields = found
+                .get("fields")
+                .and_then(Value::as_object)
+                .filter(|fields| fields.len() == 1)
+                .ok_or(FirestoreWitnessTransportError::Protocol)?;
+            let encoded = fields
+                .get("r")
+                .and_then(Value::as_object)
+                .filter(|field| field.len() == 1)
+                .and_then(|field| field.get("bytesValue"))
+                .and_then(Value::as_str)
+                .ok_or(FirestoreWitnessTransportError::Protocol)?;
+            let decoded = STANDARD
+                .decode(encoded)
+                .map_err(|_| FirestoreWitnessTransportError::Protocol)?;
+            if decoded.len() != PROBE_RECORD_BYTES || STANDARD.encode(&decoded) != encoded {
+                return Err(FirestoreWitnessTransportError::Protocol);
+            }
+            let mut record = [0; PROBE_RECORD_BYTES];
+            record.copy_from_slice(&decoded);
+            FirestoreProbeRecord::decode(&record)
+                .ok_or(FirestoreWitnessTransportError::Protocol)?;
+            Ok(FirestoreProbeRead {
+                record: Some(record),
+                update_time: Some(update_time),
+                read_time,
+            })
+        }
+        _ => Err(FirestoreWitnessTransportError::Protocol),
+    }
+}
+
+/// One-shot, non-authoritative probe over the process's Tokio runtime. It owns
+/// no runtime and launches no tasks; cancellation drops the in-flight future,
+/// so no detached retry can survive any auth/read/commit await point.
+pub(crate) struct FirestoreTransportProbe {
+    namespace: FirestoreWitnessNamespace,
+    provider_audience: FirestoreWitnessAudience,
+    tokens: Arc<dyn FirestoreWitnessBearerTokenProvider>,
+    transport: Arc<dyn FirestoreProbeTransport>,
+}
+
+impl FirestoreTransportProbe {
+    pub(crate) fn new(
+        config: FirestoreWitnessConfig,
+        tokens: Arc<dyn FirestoreWitnessBearerTokenProvider>,
+        transport: Arc<dyn FirestoreProbeTransport>,
+    ) -> Self {
+        Self {
+            namespace: config.namespace,
+            provider_audience: config.provider_audience,
+            tokens,
+            transport,
+        }
+    }
+
+    async fn token(
+        &self,
+    ) -> std::result::Result<FirestoreWitnessBearerToken, FirestoreWitnessTransportError> {
+        self.tokens
+            .bearer_token(self.provider_audience.as_str())
+            .await
+    }
+
+    pub(crate) async fn run_once(&self) -> FirestoreProbeOutcome {
+        let attempt_id = FirestoreProbeAttemptId::random();
+        let document = self.namespace.probe_document();
+        for retry in 0..MAX_ABORTED_ATTEMPTS {
+            let token = match self.token().await {
+                Ok(token) => token,
+                Err(_) => return FirestoreProbeOutcome::Failed,
+            };
+            let transaction = match self
+                .transport
+                .begin_probe_transaction(token.as_str(), begin_request_json())
+                .await
+            {
+                Ok(transaction) => transaction,
+                Err(_) => return FirestoreProbeOutcome::Failed,
+            };
+            let read = match self
+                .transport
+                .batch_get_probe(
+                    token.as_str(),
+                    &transaction,
+                    probe_batch_get_request_json(&document, Some(&transaction)),
+                )
+                .await
+            {
+                Ok(read) => read,
+                Err(_) => return FirestoreProbeOutcome::Failed,
+            };
+            let current = match read.record {
+                None if read.update_time.is_none() => None,
+                Some(bytes) if read.update_time.is_some() => {
+                    match FirestoreProbeRecord::decode(&bytes) {
+                        Some(record) => Some(record),
+                        None => return FirestoreProbeOutcome::Failed,
+                    }
+                }
+                _ => return FirestoreProbeOutcome::Failed,
+            };
+            let candidate = match current {
+                Some(record) => match record.next(attempt_id) {
+                    Some(next) => next,
+                    None => return FirestoreProbeOutcome::Failed,
+                },
+                None => FirestoreProbeRecord::first(attempt_id),
+            };
+            let commit = self
+                .transport
+                .commit_probe_record(
+                    token.as_str(),
+                    &transaction,
+                    probe_commit_request_json(
+                        &document,
+                        &transaction,
+                        &candidate.encode(),
+                        read.update_time.as_ref().map(FirestoreTimestamp::as_str),
+                    ),
+                )
+                .await;
+            match commit {
+                Ok(()) => return FirestoreProbeOutcome::Confirmed,
+                Err(FirestoreWitnessTransportError::Aborted)
+                    if retry + 1 < MAX_ABORTED_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(FirestoreWitnessTransportError::PreconditionFailed) => {
+                    return FirestoreProbeOutcome::Stale;
+                }
+                Err(FirestoreWitnessTransportError::OutcomeUnknown) => {
+                    let token = match self.token().await {
+                        Ok(token) => token,
+                        Err(_) => return FirestoreProbeOutcome::OutcomeUnknown,
+                    };
+                    let observed = self
+                        .transport
+                        .read_probe(
+                            token.as_str(),
+                            probe_batch_get_request_json(&document, None),
+                        )
+                        .await;
+                    return match observed
+                        .ok()
+                        .and_then(|read| read.record)
+                        .and_then(|bytes| FirestoreProbeRecord::decode(&bytes))
+                    {
+                        Some(record)
+                            if record.attempt_id() == attempt_id
+                                && record.generation() == candidate.generation() =>
+                        {
+                            FirestoreProbeOutcome::Confirmed
+                        }
+                        _ => FirestoreProbeOutcome::OutcomeUnknown,
+                    };
+                }
+                Err(_) => return FirestoreProbeOutcome::Failed,
+            }
+        }
+        FirestoreProbeOutcome::Failed
+    }
+}
+
+impl fmt::Debug for FirestoreTransportProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FirestoreTransportProbe(<redacted>)")
+    }
 }
 
 /// Parses canonical UTC Firestore timestamps to whole seconds. A provider
