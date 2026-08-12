@@ -2543,6 +2543,58 @@ impl OperationLedger {
         Self::read_legacy_extent_session(connection, session_id, attempt_id)
     }
 
+    /// Discover the complete bounded durable attempt family from only its
+    /// stable content-free identity. Every row is fully decoded, checked
+    /// against its denormalized columns, and inventory-validated. A 17th row
+    /// fails closed rather than returning a truncated restart view.
+    pub(crate) fn discover_legacy_extent_session_family(
+        connection: &Connection,
+        archive_id: [u8; 16],
+        database_epoch: [u8; 16],
+        operation_id: [u8; 16],
+    ) -> Result<Vec<LegacyExtentSessionRecord>> {
+        let session_id =
+            LegacyExtentSessionId::for_stable_identity(archive_id, database_epoch, operation_id)?;
+        let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Deferred)?;
+        let mut statement = transaction.prepare(
+            "SELECT session_id,attempt_id,archive_id,database_epoch,operation_id,request_fingerprint,state,record
+             FROM archive_v3_legacy_extent_sessions
+             WHERE session_id = ? ORDER BY attempt_id LIMIT 17",
+        )?;
+        let family: Vec<LegacyExtentSessionRecord> = statement
+            .query_map(params![session_id.as_bytes().as_slice()], |row| {
+                read_legacy_extent_session_row(row)
+            })?
+            .map(|row| {
+                row.map_err(OperationLedgerError::from)
+                    .and_then(decode_legacy_extent_session_row)
+            })
+            .collect::<Result<_>>()?;
+        drop(statement);
+        if family.len() > usize::try_from(MAX_LEGACY_EXTENT_SESSION_ATTEMPTS).unwrap() {
+            return Err(OperationLedgerError::TooLarge(
+                "legacy extent session attempts",
+            ));
+        }
+        let fingerprint = family
+            .first()
+            .map(|record| record.binding().request_fingerprint());
+        for record in &family {
+            let binding = record.binding();
+            if record.session_id() != session_id
+                || binding.archive_id() != archive_id
+                || binding.database_epoch() != database_epoch
+                || binding.operation_id() != operation_id
+                || Some(binding.request_fingerprint()) != fingerprint
+            {
+                return Err(OperationLedgerError::Corrupt);
+            }
+            Self::validate_legacy_extent_session_inventory(&transaction, record)?;
+        }
+        transaction.commit()?;
+        Ok(family)
+    }
+
     pub(crate) fn reserve_legacy_extent_object(
         connection: &mut Connection,
         session_id: LegacyExtentSessionId,
