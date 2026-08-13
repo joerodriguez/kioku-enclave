@@ -39,6 +39,13 @@ if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; the
   exit 2
 fi
 
+PROBE_RELEASE=false
+PACKAGE_RELEASE_TAG="$RELEASE_TAG"
+if [[ "$RELEASE_TAG" =~ ^(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))-witness-probe\.([1-9][0-9]*)$ ]]; then
+  PROBE_RELEASE=true
+  PACKAGE_RELEASE_TAG="${BASH_REMATCH[1]}"
+fi
+
 if [[ "$ROLL" == "true" && ! "$DEPLOYMENT_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "Error: --roll requires DEPLOYMENT_REPO=owner/repository." >&2
   exit 2
@@ -63,6 +70,31 @@ done
 
 cd "$REPO_ROOT"
 gh auth status >/dev/null
+
+# The same checked-in parser used by the build and metadata verifier decides
+# whether this exact tag may carry probe-v1. This runs before any tag/release
+# mutation. The probe can never enter the production roll path.
+SELECTED_ARCHIVE_WITNESS_MODE="$(python3 - "$RELEASE_TAG" <<'PY'
+import sys
+from pathlib import Path
+from scripts.archive_witness_probe_config import load_probe_config, select_probe_config
+
+selected = select_probe_config(
+    load_probe_config(Path("config/archive-witness-probe.json")),
+    profile="production",
+    source_ref=sys.argv[1],
+)
+print(selected.mode)
+PY
+)"
+if [[ "$SELECTED_ARCHIVE_WITNESS_MODE" == "probe-v1" && "$PROBE_RELEASE" != "true" ]]; then
+  echo "Error: probe-v1 requires an exact vX.Y.Z-witness-probe.N prerelease tag." >&2
+  exit 1
+fi
+if [[ "$SELECTED_ARCHIVE_WITNESS_MODE" == "probe-v1" && "$ROLL" == "true" ]]; then
+  echo "Error: refusing to roll an archive witness probe release to production." >&2
+  exit 1
+fi
 
 REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 VISIBILITY="$(gh repo view --json visibility --jq .visibility)"
@@ -237,8 +269,8 @@ print(match.group(1))
 else
   PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 fi
-if [[ "$RELEASE_TAG" != "v${PACKAGE_VERSION}" ]]; then
-  echo "Error: Cargo package version ${PACKAGE_VERSION} does not match ${RELEASE_TAG}." >&2
+if [[ "$PACKAGE_RELEASE_TAG" != "v${PACKAGE_VERSION}" ]]; then
+  echo "Error: Cargo package version ${PACKAGE_VERSION} does not match ${PACKAGE_RELEASE_TAG}." >&2
   exit 1
 fi
 

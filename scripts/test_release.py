@@ -104,6 +104,24 @@ class ReleasePublicationRaceTests(unittest.TestCase):
             self.metadata_verifier,
         )
 
+    def test_probe_release_is_exact_prerelease_and_cannot_roll(self) -> None:
+        parser = self.source.index("scripts.archive_witness_probe_config")
+        reject_roll = self.source.index(
+            "refusing to roll an archive witness probe release to production"
+        )
+        tag_create = self.source.index('git tag -s "$RELEASE_TAG"')
+        dispatch = self.source.index("gh workflow run enclave.yml")
+        self.assertLess(parser, reject_roll)
+        self.assertLess(reject_roll, tag_create)
+        self.assertLess(reject_roll, dispatch)
+        self.assertIn("-witness-probe\\.([1-9][0-9]*)", self.source)
+        self.assertIn('PACKAGE_RELEASE_TAG="${BASH_REMATCH[1]}"', self.source)
+        self.assertIn(
+            'if [[ "$PACKAGE_RELEASE_TAG" != "v${PACKAGE_VERSION}" ]]', self.source
+        )
+        self.assertIn("from archive_witness_probe_config import", self.metadata_verifier)
+        self.assertNotIn("--expected-archive-witness-shadow-mode", self.metadata_verifier)
+
     def test_apns_roll_preflight_reads_only_metadata_and_exact_iam(self) -> None:
         self.assertIn("gcloud secrets versions describe latest", self.source)
         self.assertIn("gcloud secrets get-iam-policy", self.source)
