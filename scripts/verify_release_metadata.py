@@ -23,7 +23,7 @@ from archive_v3_shadow_runtime_config import (
 BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]\Z")
 DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
-BUILD_URL_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+\Z")
+RELEASE_URL_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/tag/v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?\Z")
 
 FIELDS = (
     "schema_version",
@@ -33,7 +33,7 @@ FIELDS = (
     "image_uri",
     "image_digest_uri",
     "image_digest",
-    "build_url",
+    "release_url",
     "build_profile",
     "voice_quality_gate",
     "billing_enforcement_mode",
@@ -112,8 +112,8 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         reject("expected legacy media GCS bucket has an invalid format")
     if arguments.expected_gcs_bucket != arguments.expected_gcs_legacy_media_bucket:
         reject("expected legacy media GCS bucket must equal the expected GCS bucket for Phase-0")
-    if data["schema_version"] != 7:
-        reject("schema_version must be 7; older manifests are ineligible for promotion")
+    if data["schema_version"] != 8:
+        reject("schema_version must be 8; older manifests are ineligible for promotion")
 
     expected_repository = f"https://github.com/{arguments.repository}"
     if data["source_repository"] != expected_repository:
@@ -131,12 +131,11 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         reject("image_uri is outside the expected Artifact Registry repository")
     if data["image_digest_uri"] != f"{arguments.image_repository}@{digest}":
         reject("image_digest_uri does not bind the expected image repository and digest")
-    if not BUILD_URL_PATTERN.fullmatch(required_string(data, "build_url")):
-        reject("build_url is not a GitHub Actions run URL")
-    if not required_string(data, "build_url").startswith(
-        f"https://github.com/{arguments.repository}/actions/runs/"
-    ):
-        reject("build_url is outside the expected repository")
+    expected_release_url = f"https://github.com/{arguments.repository}/releases/tag/{arguments.tag}"
+    if not RELEASE_URL_PATTERN.fullmatch(required_string(data, "release_url")):
+        reject("release_url is not an immutable GitHub release URL")
+    if data["release_url"] != expected_release_url:
+        reject("release_url does not exactly bind the expected repository and tag")
     if data["build_profile"] != "production":
         reject("build_profile is not production")
     if data["voice_quality_gate"] not in (

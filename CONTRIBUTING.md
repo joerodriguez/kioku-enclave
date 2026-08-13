@@ -24,9 +24,9 @@ Open a GitHub issue. Include:
 
 1. Fork the repository and create a branch for your change.
 2. Run the quick local verification and focused tests for the code changed.
-   Run the full local suite when the change is broad, security-sensitive, or
-   you need to reproduce CI. Required GitHub CI is the exhaustive,
-   authoritative merge gate; it must pass before merge.
+   Run the full local suite when the change is broad or security-sensitive.
+   GitHub Actions is disabled; the reviewed local verification record is the
+   exhaustive merge gate and must pass before merge.
 3. Include a clear description of what the change does and why.
 4. Security-sensitive changes (auth, crypto, attestation) require extra
    scrutiny. Explain the threat model impact of your change.

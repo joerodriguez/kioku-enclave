@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Verify a complete signed local enclave evidence bundle before a rollout.
+
+This executable is deliberately suitable for ``KIOKU_ENCLAVE_EVIDENCE_VERIFY``:
+it uses an externally pinned Ed25519 key, checks the exact bytes named by the
+signed manifest, validates schema-8 release metadata, and emits the verified
+source and digest bindings as JSON.  It never reads cloud credentials or
+changes local or remote state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+import local_build_evidence  # noqa: E402
+import verify_release_metadata  # noqa: E402
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(f"local evidence bundle: {message}")
+
+
+def sha256(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError as error:
+        fail(f"cannot hash {path.name}: {error}")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot parse {path.name}: {error}")
+    if not isinstance(value, dict):
+        fail(f"{path.name} must be a JSON object")
+    return value
+
+
+def verify_signature(arguments: argparse.Namespace, manifest: Path, signature: Path) -> dict[str, Any]:
+    # Reuse the canonical, pinned-key verifier directly rather than accepting a
+    # caller-provided shell command.  It validates the manifest before OpenSSL.
+    manifest_bytes = local_build_evidence.read_regular_bytes(manifest, "manifest")
+    data = local_build_evidence.read_manifest_bytes(manifest_bytes)
+    signature_bytes = local_build_evidence.read_regular_bytes(signature, "signature")
+    public_key_bytes = local_build_evidence.read_regular_bytes(arguments.public_key, "public key")
+    expected = arguments.expected_public_key_sha256.lower()
+    if not local_build_evidence.SHA256.fullmatch(expected):
+        fail("expected public-key fingerprint must be a lowercase sha256")
+    actual = local_build_evidence.public_fingerprint_bytes(public_key_bytes)
+    if actual != expected:
+        fail("public key does not match the external trust anchor")
+    local_build_evidence.verify_detached_bytes(
+        manifest_bytes, signature_bytes, public_key_bytes
+    )
+    return data
+
+
+def metadata_arguments(arguments: argparse.Namespace, metadata: Path) -> argparse.Namespace:
+    repository = arguments.repository
+    if repository.startswith("https://github.com/"):
+        repository = repository.removeprefix("https://github.com/")
+    image_repository = arguments.image_repository
+    if not image_repository:
+        try:
+            image_repository = read_json(metadata)["image_digest_uri"].split("@", 1)[0]
+        except (KeyError, AttributeError):
+            fail("release metadata does not contain an image digest URI")
+    return argparse.Namespace(
+        repository=repository,
+        tag=arguments.tag,
+        commit=arguments.commit,
+        image_repository=image_repository,
+        expected_gcs_bucket=arguments.expected_gcs_bucket,
+        expected_gcs_media_bucket=arguments.expected_gcs_media_bucket,
+        expected_gcs_legacy_media_bucket=arguments.expected_gcs_legacy_media_bucket,
+        archive_witness_probe_config=arguments.archive_witness_probe_config,
+        archive_v3_shadow_runtime_config=arguments.archive_v3_shadow_runtime_config,
+        metadata=metadata,
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--evidence-dir", type=Path, required=True)
+    parser.add_argument("--public-key", type=Path, default=os.environ.get("LOCAL_BUILD_EVIDENCE_PUBLIC_KEY"))
+    parser.add_argument("--expected-public-key-sha256", default=os.environ.get("LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256"))
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--release-tag", "--tag", dest="tag", required=True)
+    parser.add_argument("--source-commit", "--commit", dest="commit", required=True)
+    parser.add_argument("--image-digest-uri")
+    parser.add_argument("--image-digest")
+    parser.add_argument("--image-repository")
+    parser.add_argument("--expected-gcs-bucket", default="kioku-production-indexes")
+    parser.add_argument("--expected-gcs-media-bucket", default="kioku-production-media")
+    parser.add_argument("--expected-gcs-legacy-media-bucket", default="kioku-production-indexes")
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--archive-witness-probe-config", type=Path, default=ROOT / "config/archive-witness-probe.json")
+    parser.add_argument("--archive-v3-shadow-runtime-config", type=Path, default=ROOT / "config/archive-v3-shadow-runtime.json")
+    arguments = parser.parse_args()
+    if arguments.public_key is None or not arguments.expected_public_key_sha256:
+        fail("public key and fingerprint must be supplied by flags or LOCAL_BUILD_EVIDENCE_* environment")
+    if arguments.repository.startswith("https://github.com/"):
+        arguments.repository = arguments.repository.removeprefix("https://github.com/")
+    if not local_build_evidence.text(arguments.repository, "repository") or "/" not in arguments.repository:
+        fail("repository must be an OWNER/REPO name or GitHub HTTPS URL")
+    if bool(arguments.image_digest_uri) != bool(arguments.image_digest):
+        fail("image digest URI and image digest must be supplied together")
+
+    directory = arguments.evidence_dir.resolve()
+    manifest = directory / "enclave-local-build-evidence.json"
+    signature = directory / "enclave-local-build-evidence.sig"
+    metadata_path = directory / "enclave-release.json"
+    sbom = directory / "enclave-sbom.spdx.json"
+    scan = directory / "enclave-scan.json"
+    if not directory.is_dir() or any(not path.is_file() for path in (manifest, signature, metadata_path, sbom, scan)):
+        fail("evidence directory must contain manifest, signature, metadata, SBOM, and scan")
+    evidence = verify_signature(arguments, manifest, signature)
+    metadata_bytes = local_build_evidence.read_regular_bytes(metadata_path, "release metadata")
+    sbom_bytes = local_build_evidence.read_regular_bytes(sbom, "SBOM")
+    scan_bytes = local_build_evidence.read_regular_bytes(scan, "scan")
+    for path, value, field in (
+        (metadata_path, metadata_bytes, "release_metadata_sha256"),
+        (sbom, sbom_bytes, "sbom_sha256"),
+        (scan, scan_bytes, "scan_sha256"),
+    ):
+        if sha256_bytes(value) != evidence[field]:
+            fail(f"signed evidence does not bind exact {path.name} bytes")
+    for path, field in ((ROOT / "Dockerfile", "dockerfile_sha256"), (ROOT / "Cargo.lock", "cargo_lock_sha256")):
+        if sha256_bytes(local_build_evidence.read_regular_bytes(path, path.name)) != evidence[field]:
+            fail(f"signed evidence {field} differs from checked source")
+    if arguments.config is not None and sha256_bytes(local_build_evidence.read_regular_bytes(arguments.config, "configuration")) != evidence["config_sha256"]:
+        fail("signed evidence config hash differs from the selected local configuration")
+
+    try:
+        metadata = json.loads(metadata_bytes)
+        sbom_document = json.loads(sbom_bytes)
+        json.loads(scan_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"evidence asset is not valid JSON: {error}")
+    if not isinstance(metadata, dict) or not isinstance(sbom_document, dict):
+        fail("metadata and SBOM must be JSON objects")
+    sbom_version = sbom_document.get("spdxVersion")
+    if not isinstance(sbom_version, str) or not sbom_version.startswith("SPDX-"):
+        fail("SBOM does not declare an SPDX version")
+    if not arguments.image_repository:
+        image_digest_uri = metadata.get("image_digest_uri")
+        if not isinstance(image_digest_uri, str) or "@" not in image_digest_uri:
+            fail("release metadata does not contain an image digest URI")
+        arguments.image_repository = image_digest_uri.split("@", 1)[0]
+    # Existing verifier has the security-critical checked-config claim logic.
+    verify_release_metadata.validate(metadata_arguments(arguments, metadata_path), metadata)
+    bindings = ("source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest")
+    for field in bindings:
+        if metadata.get(field) != evidence.get(field):
+            fail(f"release metadata {field} does not match signed evidence")
+    if evidence["source_repository"] != f"https://github.com/{arguments.repository}":
+        fail("signed evidence source repository does not match expected repository")
+    if evidence["source_ref"] != arguments.tag or evidence["source_commit"] != arguments.commit:
+        fail("signed evidence source does not match expected tag and commit")
+    if not evidence["image_uri"].startswith(arguments.image_repository + ":"):
+        fail("signed evidence image URI is outside the expected image repository")
+    if evidence["image_digest_uri"] != f"{arguments.image_repository}@{evidence['image_digest']}":
+        fail("signed evidence image digest URI is outside the expected image repository")
+    if arguments.image_digest_uri and evidence["image_digest_uri"] != arguments.image_digest_uri:
+        fail("signed evidence image digest URI does not match the rollout request")
+    if arguments.image_digest and evidence["image_digest"] != arguments.image_digest:
+        fail("signed evidence image digest does not match the rollout request")
+    print(json.dumps({"evidence": evidence, "metadata": metadata, "sbom_version": sbom_version}, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,6 @@
 # `scripts/` map
 
-Operator and CI entrypoints for versioning, signed release publication, licensed
+Operator and local-verification entrypoints for versioning, signed release publication, licensed
 voice-evaluation asset acquisition, deterministic capacity-fixture generation, and
 fail-closed image configuration selection.
 None of these scripts runs in the enclave or in a Kioku client.
@@ -8,6 +8,14 @@ None of these scripts runs in the enclave or in a Kioku client.
 | Path | Responsibility |
 |---|---|
 | `agent-verify.sh` | Space-guarded local verification with quick, focused, and full modes; uses locked Cargo commands and an optional bounded local `sccache`. |
+| `disable_github_actions.py` | One-time, typed-confirmation cutover that audits by default and can disable hosted Actions in both Kioku repositories while removing branch status gates that would wait forever for deleted workflows. GitHub PRs, signed tags, and release hosting remain available. |
+| `test_disable_github_actions.py` | Hermetic contracts proving the default cutover mode is read-only and mutation requires the exact typed confirmation. |
+| `local_image_pipeline.py` | Fail-closed staged local replacement for the hosted enclave verification/image job. It parses an external user-owned, non-symlinked mode-0600 allowlisted `KEY=VALUE` configuration without shell evaluation, runs the full CI gate, builds `linux/amd64` with the reviewed Docker arguments, generates and scans an SBOM before impersonated Artifact Registry authentication, and for a pushed release tag writes and locally validates schema-8 release metadata before creating unsigned canonical evidence. `preflight` is non-mutating; every other stage requires `--apply`. |
+| `test_local_image_pipeline.py` | Hermetic fake-tool contracts for local-pipeline configuration permissions/parsing, explicit mutation acknowledgement, Linux image arguments, scan-before-auth ordering, dedicated service-account impersonation, and unsigned evidence output. |
+| `local_build_evidence.py` | Canonical local release-evidence creator, Ed25519 detached signer, and verifier. It records only hashes of private configuration/build inputs, including exact schema-8 release metadata bytes, and requires a current-user-owned, non-symlinked exact-mode-0600 private key plus an external pinned public-key SHA-256 trust anchor. |
+| `bootstrap_local_operator_config.py` | One-time, value-redacted cutover helper that reads the immutable deployed production image through a private temporary registry credential, maps and validates its embedded reviewed configuration, and creates a new external mode-0600 local operator file without printing values. |
+| `verify_local_evidence_bundle.py` | Executable `KIOKU_ENCLAVE_EVIDENCE_VERIFY`-suitable verifier for a complete local evidence directory. It verifies the pinned Ed25519 signature and exact metadata/SBOM/scan/config/source/digest bindings before emitting the validated JSON bundle; it has no cloud side effects. |
+| `test_local_build_evidence.py` | Isolated OpenSSL contracts for canonical evidence and private-key permissions, plus a fake GitHub/GCP apply-shaped release-publication test with no network access. |
 | `check_build_disk_space.py` | Refuses heavyweight local verification when the selected filesystem is below a configurable free-space floor (15 GiB by default). |
 | `rust_build_lock.py` | Crash-safe, per-worktree kernel lock shared by local verification and artifact retirement so wrapper-controlled builds cannot overlap retirement. |
 | `retire_rust_worktree_artifacts.py` | Dry-run-first retirement of only the exact `target/` directory in a clean, linked worktree whose exact GitHub PR head is merged; coordinates with the wrapper lock plus defensive process/Cargo-profile checks and quarantines the exact directory before deletion. Raw Cargo must not race it. |
@@ -17,17 +25,17 @@ None of these scripts runs in the enclave or in a Kioku client.
 | `fetch_voice_eval_assets.sh` | Downloads licensed evaluation inputs and records hashes outside Git. |
 | `check_voice_release_gate.py` | Classifies a release as exact owner-only/no-claim or invokes the Rust checker for a complete real-corpus trio. |
 | `test_check_voice_release_gate.py` | Fail-closed contract tests for owner-only and validated-real-corpus classifications. |
-| `release.sh` | Requires successful required CI for the exact public main commit, verifies the selected voice-quality classification, repository-bound billing mode, GitHub-signed schema-v7 Phase-0/probe/exact-off-shadow-runtime manifest, and—before a roll—enabled APNs key-version metadata plus the exact runtime secret-accessor IAM binding without reading keys or impersonating the runtime identity; creates a signed tag, verifies build evidence, publishes an immutable release, and optionally requests an operator roll. |
+| `release.sh` | Verifies a pre-existing trusted signed tag and externally pinned Ed25519 local evidence bound to its exact source/config/schema-8 release metadata/image digest/SBOM/scan inputs; dry-runs by default, and with `--apply` validates the registry digest, pushes the tag, publishes an immutable GitHub Release with the metadata as a fifth asset, and can invoke `scripts/local-operations.sh enclave-roll` with the exact digest confirmation. |
 | `archive_witness_probe_config.py` | Sole strict parser for checked-in `config/archive-witness-probe.json`; forces evaluation/main probe state off and permits `probe-v1` only for exact `vX.Y.Z-witness-probe.N` prerelease tags. |
 | `test_archive_witness_probe_config.py` | Adversarial exact-schema, namespace, evaluation, main, and tag-eligibility contracts for the shared probe parser. |
 | `archive_v3_shadow_runtime_config.py` | Sole strict parser for checked-in `config/archive-v3-shadow-runtime.json`; accepts only exact `off` with all provider fragments empty and exposes no active mode or tag exception. |
 | `test_archive_v3_shadow_runtime_config.py` | Adversarial ordered-schema, duplicate/type/control/size, exact-off, and empty-fragment contracts for the shared shadow-runtime parser. |
-| `verify_release_metadata.py` | Strict schema-v7 validator for the GitHub-signed release-manifest subject: binds source/tag/image digest, bucket topology, the exact probe claim, and the exact-off shadow-runtime claim through their shared checked-in parsers. |
-| `test_release.py` | Static fail-closed contracts for release-state refresh, immutable-publication races, signed release-manifest handling, APNs metadata/IAM-only roll preflight, and the workflow's lack of publication authority. |
+| `verify_release_metadata.py` | Strict schema-8 validator for locally signed release metadata: binds the exact immutable GitHub release URL, source/tag/image digest, bucket topology, the shared voice-gate result, the exact probe claim, and the exact-off shadow-runtime claim through their shared checked-in parsers. |
+| `test_release.py` | Static local-release contracts for the absence of hosted workflow dependencies and ordering of evidence/tag/digest/SBOM checks before `--apply` publication. |
 | `test_verify_release_metadata.py` | Adversarial contract tests for missing/different media claims and substituted source/image-digest manifest fields. |
-| `test_release_race.sh` | Mocked execution test of the exact signer anchor and release-state refresh: a valid wrong-key signature fails, raced immutable releases are reverified without mutation, and mismatched assets fail closed. |
+| `test_release_race.sh` | Compatibility executable entrypoint for the isolated local evidence/fake GitHub release-publication contracts. |
 | `select_build_configuration.py` | Atomically selects and validates one complete production or evaluation image profile, including reviewed `shadow|enforce` billing and the shared checked-in probe profile without repository-variable/dispatch witness inputs or cross-profile fallback. |
-| `test_select_build_configuration.py` | Contract tests for profile isolation and the public build workflow. |
+| `test_select_build_configuration.py` | Contract tests for profile isolation, the local pipeline's reviewed Docker arguments, and schema-8 release metadata claim wiring. |
 | `generate_capacity_fixture.py` | Validates ADR-0022's versioned v1/v2 capacity manifests and streams content-free synthetic distributions into ignored/out-of-tree output; an explicit option can create the declared 32-GiB logical sparse shape without writing 32 GiB of blocks. |
 | `test_generate_capacity_fixture.py` | Validates v1 480/960/1,200-hour and v2 12-month 40/80/100-hour distributions plus bounded deterministic generation without creating the 32-GiB shape. |
 | `run_archive_capacity_harness.py` | Offline ADR-0022 content-free SQLite smoke harness. It binds resumable output to an exclusive receipt, verifies exact counts/integrity/export digest, and permanently refuses full/release-evidence claims. |

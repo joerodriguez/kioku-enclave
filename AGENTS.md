@@ -37,9 +37,10 @@ get a `map.md` linked from their parent. Treat a stale `map.md` like stale docs.
 
 ## Verification
 
-GitHub's required CI is the exhaustive, authoritative merge gate. It runs the
-locked full test suite, all-target Clippy with warnings denied, formatting, and
-the repository's other required checks. Do not merge around it.
+The local verification pipeline is the exhaustive, authoritative merge gate.
+GitHub Actions is disabled for this repository. Before requesting merge, run the
+reviewed local verification stage and attach its non-secret evidence summary to
+the PR; a remote status check is no longer expected.
 
 For normal local work, start with the quick verification and run a focused test
 for the code you changed:
@@ -82,8 +83,8 @@ rollout remain traceable.
 Match git history: short scoped subjects like `feat(episodes): …`, `ci: …`, `Docs: …`.
 Per CONTRIBUTING.md: include a clear description of what changed and why, and for
 security-sensitive changes (auth, crypto, attestation) explain the **threat-model
-impact**. Run the appropriate local verification above before opening a PR; required
-GitHub CI remains the exhaustive merge gate.
+impact**. Run the appropriate local verification above before opening a PR; the
+local signed evidence is the exhaustive merge/release gate.
 
 Only commit/push when the user asks. Default branch is `main`.
 
@@ -95,11 +96,11 @@ Only commit/push when the user asks. Default branch is `main`.
   git commit -m "feat(scope): detailed description"
   git push -u origin HEAD
   gh pr create --fill --base main
-  gh pr merge --auto --rebase
+  gh pr merge --rebase
   ```
-  `gh pr merge --auto --rebase` queues the PR for automatic rebase-merge as soon as all GitHub Actions CI checks pass green.
-
-  **STRICT CI MANDATE: NEVER USE `--admin` TO BYPASS RUNNING CI CHECKS OR FORCE-MERGE PREMATURELY**. Always allow GitHub Actions to run and auto-merge cleanly when green.
+  Do not merge until a reviewer has checked the local verification evidence.
+  Continue to avoid `--admin`; disabling hosted checks does not authorize bypassing
+  branch, review, or signed-commit protections.
 
 ## Release & GCP Deployment Checklist
 
@@ -110,12 +111,12 @@ When releasing a new version or deploying changes to production, follow these st
    - `./scripts/bump_version.sh` executes `git add -A` to ensure all source code changes, migrations, tests, and documentation are committed together with `Cargo.toml` and `Cargo.lock`. Never commit version files in isolation while source modifications remain unstaged.
 
 2. **GCP Confidential Space Live VM Roll**:
-   - Pushing a release tag `vX.Y.Z` triggers the enclave image build on GitHub Actions.
-   - The monorepo deployment watcher (`deploy.yml` in `joerodriguez/kioku`) updates `infra/terraform.tfvars` with the new pinned digest.
-   - **CRITICAL**: GCP Confidential Space TEE VMs do **not** automatically reload container images in-place. After Terraform updates the instance metadata, force the VM to boot the new image digest by running:
-     ```bash
-     gcloud compute instances reset kioku-enclave --project=kioku-joerodriguez --zone=us-central1-b
-     ```
+   - A tag does not trigger a hosted build. Run `scripts/local_image_pipeline.py`
+     on the reviewed Linux/amd64 builder, then sign and verify its evidence locally.
+   - Roll only through the monorepo's explicit local deployment command. It
+     binds KMS to the confirmed digest, applies an exact saved VM-replacement
+     plan, and performs the required health check; do not substitute an
+     in-place metadata edit or an ad hoc VM reset.
    - Verify boot and version startup by inspecting serial console logs:
      ```bash
      gcloud compute instances get-serial-port-output kioku-enclave --project=kioku-joerodriguez --zone=us-central1-b | tail -n 30

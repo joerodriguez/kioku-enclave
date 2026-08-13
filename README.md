@@ -25,12 +25,13 @@ Kioku's privacy claim is:
 > export and deletion. The server code handling that plaintext is open source.
 
 The exact deployed image digest is public. A Confidential Space attestation token reports
-the running container digest; a signed GitHub build attestation connects that digest to a
-tagged source commit and workflow. This makes the deployment publicly auditable.
+the running container digest; a detached Ed25519 signature from the separately pinned
+local build key connects that digest to a tagged source commit, SBOM, and scan. This makes
+the deployment publicly auditable against the designated builder's evidence.
 
 It does **not** yet make the image independently or bit-for-bit reproducible. Rust crate
 sources are not vendored, apt packages come from mutable repositories, and an independent
-rebuild comparison is not part of CI. The precise remaining trust is documented below and
+rebuild comparison is not part of the local release gate. The precise remaining trust is documented below and
 in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independently-reproducible).
 
 ## What the service does
@@ -49,7 +50,7 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   active assignments and profile revisions so calibrated merge/split proposals can be
   applied and reversed without deleting source observations or prior derivations.
 - Publishes the ADR-0016 voice evaluation reducer, objective production-model
-  similarity measurement, and schemas. Release CI recomputes
+  similarity measurement, and schemas. The local release gate recomputes
   overlap-aware diarization and identity/fact/export/delete metrics from hash-bound,
   content-free schema-v3 evidence bound to a schema-v2 multi-artifact source and
   authorized physical-route manifest. Identity decisions include denominator-visible
@@ -277,8 +278,8 @@ Prerequisites are Rust 1.96+, the pinned toolchain in `rust-toolchain.toml`, and
 # Add the smallest relevant test selection while developing.
 ./scripts/agent-verify.sh focused -- module::tests::affected_case
 
-# Required GitHub CI is the exhaustive merge gate. This is available locally
-# for broad or security-sensitive changes and CI diagnosis.
+# The exhaustive local merge gate is used for broad or security-sensitive
+# changes and for diagnosing verification failures.
 ./scripts/agent-verify.sh full
 ```
 
@@ -336,7 +337,7 @@ python3 scripts/generate_capacity_fixture.py check
 ```
 
 `scripts/run_archive_capacity_harness.py` is an offline, deterministic SQLite **smoke**
-harness. CI smoke runs create a small real SQLite database, verify exact fixture counts,
+harness. Local smoke runs create a small real SQLite database, verify exact fixture counts,
 SQLite/FTS integrity, and a deterministic logical-export digest. Its report permanently
 sets both `release_evidence` and `sqlite_local_evidence` to `false`; full mode fails
 closed. The harness cannot bind its execution to a release image/VM or exercise the v3
@@ -410,8 +411,8 @@ deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` 
 `WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the
 build.
 
-The four `ARCHIVE_WITNESS_*` Docker arguments below are low-level image inputs. Public
-CI never accepts them from repository variables or manual dispatch: both build selection
+The four `ARCHIVE_WITNESS_*` Docker arguments below are low-level image inputs. The local
+pipeline never accepts them from operator configuration or command-line overrides: both build selection
 and release verification derive them through one strict parser from the reviewed
 [`config/archive-witness-probe.json`](config/archive-witness-probe.json). The checked-in
 file is exact `off` with an empty namespace.
@@ -419,7 +420,7 @@ file is exact `off` with an empty namespace.
 The seven `ARCHIVE_V3_*` shadow-runtime arguments are likewise derived only from
 [`config/archive-v3-shadow-runtime.json`](config/archive-v3-shadow-runtime.json). This
 slice accepts exactly `off` with all six provider fragments empty. It has no active/tag
-variant, repository-variable or dispatch override, startup constructor, or provider I/O.
+variant, operator-configuration or command-line override, startup constructor, or provider I/O.
 
 ```sh
 docker build --platform linux/amd64 \
@@ -479,7 +480,7 @@ binding.
 | `GCS_BUCKET` | Encrypted database bucket |
 | `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
 | `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
-| `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, repository variables/dispatch cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
+| `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, operator configuration/commands cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
 | `ARCHIVE_V3_SHADOW_RUNTIME_MODE`, `ARCHIVE_V3_ARCHIVE_BUCKET`, `ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER`, `ARCHIVE_V3_REGISTRY_KMS_VERSION`, `ARCHIVE_V3_WITNESS_PROJECT_ID`, `ARCHIVE_V3_WITNESS_PROJECT_NUMBER`, `ARCHIVE_V3_WITNESS_DATABASE_ID` | Construction-only ADR-0022 provider bundle claim derived only from checked-in `config/archive-v3-shadow-runtime.json`. The only accepted profile is exact `off` with every provider fragment empty; no startup code constructs the bundle and no provider, Store, route, health, deletion, or archive authority is activated |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
@@ -514,30 +515,23 @@ password nor signing secret is a Docker build argument or launch metadata value.
 `ENCLAVE_TLS*` variables exist for debug/custom bootstrap paths but are neither accepted
 production build arguments nor launch-policy overrides.
 
-## CI and release evidence
+## Local verification and release evidence
 
-`.github/workflows/build.yml` runs formatting, locked tests, clippy, and RustSec audit on
-pull requests and pushes. The audit has a documented `RUSTSEC-2023-0071` exception because
-this service verifies third-party RS256 signatures but performs no RSA private-key
-operation. For `main` and tags the workflow then:
+GitHub Actions is disabled. `scripts/local_image_pipeline.py` reuses the reviewed hosted
+job's formatting, locked tests, all-target Clippy, RustSec audit, Docker arguments, SBOM,
+and fixed-high vulnerability scan locally. It accepts only a non-repository, regular
+mode-0600 configuration file without shell evaluation, builds `linux/amd64`, and performs
+all untrusted compilation and scanning before it requests short-lived impersonated
+credentials for the push-only Artifact Registry identity. The audit retains the documented
+`RUSTSEC-2023-0071` exception because this service verifies RS256 signatures but performs
+no RSA private-key operation.
 
-1. authenticates to GCP through keyless WIF using a push-only Artifact Registry identity;
-2. validates every required repository and build variable;
-3. builds with a digest-pinned Rust builder, a commit-derived `SOURCE_DATE_EPOCH`,
-   cargo-auditable dependency metadata, and a revision- and hash-pinned embedding model;
-4. pushes to the operator-configured registry
-   `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>`;
-5. generates an SPDX JSON SBOM and scans it for fixed high-severity vulnerabilities;
-6. creates GitHub-signed image provenance and a signed SBOM attestation; and
-7. uploads a schema-v7 release manifest (including the attested billing mode, index,
-   current-media, and legacy-media bucket claims), that manifest's GitHub-signed provenance bundle, image
-   provenance, SBOM, and attestation bundles.
-
-The build workflow has read-only repository-content permission and never publishes a
-GitHub Release. `scripts/release.sh`, after enforcing the separately authenticated
-`RELEASE_SIGNER_FINGERPRINT`, is the sole publisher. A tag that GitHub generically marks
-verified can produce CI artifacts, but those artifacts cannot qualify or publish a release
-when the signer fingerprint is wrong.
+The pushed digest, tagged source commit, configuration hash, Dockerfile/Cargo.lock/SBOM/
+scan hashes, tool versions, and timestamps form canonical local evidence. A separate
+mode-0600 Ed25519 private key signs those exact bytes; verification requires an externally
+pinned public-key fingerprint. `scripts/release.sh` is the sole publisher and fails before
+mutation unless both the signed source tag and local evidence verify. GitHub is used for
+immutable public release hosting, not execution or build identity.
 
 Production is the sole active owner evaluation environment. Signed releases either carry
 the exact `eval/voice/owner-only-production.json` declaration and record
@@ -546,17 +540,19 @@ and record `validated_real_corpus`. The owner-only declaration permits neither e
 users nor a voice-quality claim. The former manual `evaluation` build profile remains
 available only to reproduce and audit historical isolated images; its runtime is retired,
 it cannot become a GitHub Release or production rollout, and it must not be deployed.
-Ordinary `main` and signed `v*` tag pushes always select the production profile.
+Ordinary `main` work and signed `v*` release tags always select the production profile.
 
-All third-party Actions are pinned to reviewed commit SHAs. A separate security workflow
-runs CodeQL on pull requests, `main`, and a weekly schedule, plus dependency review on
-pull requests. Dependabot checks Cargo, GitHub Actions, and Docker weekly.
+There is no hosted CodeQL or dependency-review service after this cost cutover. The local
+gate retains RustSec audit, locked dependency resolution, Clippy, the full test suite, and
+the image scan; Dependabot continues to propose Cargo and Docker updates without an Actions
+ecosystem job. This is an explicit reduction in centralized security reporting, recorded in
+`SECURITY.md`, rather than an equivalence claim.
 
 The image-push identity is deliberately not a deployment, IAM, Secret Manager, or KMS
-identity. Rolling a VM remains a separate approval-gated operator action using the
-digest-qualified image URI. Its GCP WIF provider must constrain immutable GitHub
-repository/owner IDs, the `build.yml` workflow identity, and main or protected release-tag
-refs; the credentialed job also refuses manual runs from other branches.
+identity. Rolling a VM remains a separate operator action using the digest-qualified image
+URI and exact confirmation. The named operator impersonates stage-specific service
+accounts with short-lived credentials; no service-account key or repository runner holds
+deployment authority.
 
 ## Verify a running deployment
 
@@ -597,26 +593,11 @@ git tag -v <release-tag>
 Authenticate the displayed key fingerprint against the release operator's separately
 published trusted fingerprint; a valid signature from an unknown key is not sufficient.
 
-The release contains:
-
-- `enclave-release.json` — production build profile, source ref/commit, image URI/digest,
-  build URL, explicit voice-quality gate classification, and exact Phase-0 index/current/
-  legacy media bucket claims (legacy equals index; current may differ);
-- `enclave-release-metadata-provenance.jsonl` — GitHub-signed provenance for the exact
-  release-manifest bytes; the JSON manifest is not evidence on its own;
-- `enclave-provenance.jsonl` — GitHub-signed image provenance;
-- `enclave-sbom.spdx.json` — SPDX SBOM; and
-- `enclave-sbom-attestation.jsonl` — signed SBOM attestation.
-
-Verify the provenance against the digest-qualified image, source repository, workflow,
-tag, and commit. `scripts/release.sh` performs these checks with `gh attestation verify`
-before it publishes a new release or requests a roll.
-
-The workflow records the selected build profile as an output of the trusted image-build
-step before clearing the sensitive build environment. The schema-v7 manifest and job
-summary must consume that output, and the release wrapper requires its attested value to
-be exactly `production`. A missing or cleared profile makes the image non-deployable even
-when its image scan and provenance attestations succeeded.
+The release contains `enclave-local-build-evidence.json`, its detached `.sig`, the SPDX
+SBOM, and the vulnerability scan. Verify the canonical evidence with the separately pinned
+public key and fingerprint, then require the exact repository, tag, commit, production
+profile, digest-qualified image, file hashes, and successful scan. `scripts/release.sh`
+performs those checks before publication or rollout.
 
 ### 3. Match all anchors
 
@@ -625,23 +606,23 @@ The verified chain is:
 ```text
 Google-signed public attestation token image digest
     == release image digest
-    == subject of GitHub-signed build provenance
+    == subject of locally signed canonical build evidence
     == digest authorized by the deployment's KMS condition
 ```
 
 The release script pins the expected tag-signing fingerprint, compares the standalone
-SBOM with its verified signed predicate, and refuses to edit or clobber an existing
-immutable public release. GitHub release immutability, tag rules, and the operator's
-deployment controls remain part of the operational boundary.
+SBOM hash with its signed evidence, and refuses to edit or clobber an existing immutable
+public release. GitHub release immutability, tag rules, the pinned build-key fingerprint,
+and the operator's deployment controls remain part of the operational boundary.
 
 ## Honest limitations
 
 ### Build provenance is signed; independent reproducibility is not complete
 
-The Rust builder image is digest-pinned, the embedding model is revision- and hash-pinned,
-and third-party Actions use full commit SHAs. However, Cargo still downloads unvendored
-crate sources, apt installs unversioned packages from mutable repositories, and CI does
-not perform an independent bit-for-bit rebuild. Trust in GitHub Actions and dependency
+The Rust builder image is digest-pinned and the embedding model is revision- and hash-pinned.
+However, Cargo still downloads unvendored crate sources, apt installs unversioned packages
+from mutable repositories, and the local workflow does not perform an independent
+bit-for-bit rebuild. Trust in the designated local builder, its signing key, and dependency
 delivery therefore remains. Do not describe releases as independently reproducible.
 
 ### Vertex and user-configured webhooks leave Confidential Space

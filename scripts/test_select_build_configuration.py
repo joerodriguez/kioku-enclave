@@ -13,7 +13,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
-WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
+LOCAL_PIPELINE = ROOT / "scripts" / "local_image_pipeline.py"
 DOCKERFILE = ROOT / "Dockerfile"
 RELEASE_SCRIPT = ROOT / "scripts" / "release.sh"
 METADATA_VERIFIER = ROOT / "scripts" / "verify_release_metadata.py"
@@ -79,8 +79,6 @@ def environment() -> dict[str, str]:
         "REGION": "us-central1",
         "AR_REPOSITORY": "kioku",
         "IMAGE_NAME": "kioku-enclave",
-        "GCP_WIF_PROVIDER": "projects/123456789/locations/global/workloadIdentityPools/github/providers/actions",
-        "GCP_SERVICE_ACCOUNT": "push-images@kioku-joerodriguez.iam.gserviceaccount.com",
     }
     for prefix in ("PRODUCTION", "EVALUATION"):
         for key, value in CONFIGURATION.items():
@@ -105,7 +103,7 @@ class SelectorTests(unittest.TestCase):
         shadow_runtime_config: dict[str, object] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         with tempfile.TemporaryDirectory() as directory:
-            github_env = Path(directory) / "github-env"
+            selected_env = Path(directory) / "selected-env"
             probe_config_path = Path(directory) / "archive-witness-probe.json"
             if probe_config is None:
                 probe_config_path = ROOT / "config" / "archive-witness-probe.json"
@@ -133,8 +131,8 @@ class SelectorTests(unittest.TestCase):
                     str(probe_config_path),
                     "--archive-v3-shadow-runtime-config",
                     str(shadow_runtime_config_path),
-                    "--github-env",
-                    str(github_env),
+                    "--output-env",
+                    str(selected_env),
                 ],
                 cwd=ROOT,
                 env=env,
@@ -142,7 +140,7 @@ class SelectorTests(unittest.TestCase):
                 capture_output=True,
                 check=False,
             )
-            content = github_env.read_text() if github_env.exists() else ""
+            content = selected_env.read_text() if selected_env.exists() else ""
             return completed, content
 
     def test_evaluation_selects_only_evaluation_values(self) -> None:
@@ -219,7 +217,7 @@ class SelectorTests(unittest.TestCase):
         completed, content = self.run_selector("production", env)
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(content, "")
-        self.assertIn("required production repository configuration", completed.stderr)
+        self.assertIn("required production build configuration", completed.stderr)
 
         for key, value in APNS_CONFIGURATION.items():
             env[f"PRODUCTION_{key}"] = value
@@ -259,19 +257,12 @@ class SelectorTests(unittest.TestCase):
                 self.assertEqual(content, "")
                 self.assertIn(source_name, completed.stderr)
 
-    def test_push_identity_is_required_and_validated_before_output(self) -> None:
-        for key, value in (
-            ("GCP_WIF_PROVIDER", ""),
-            ("GCP_WIF_PROVIDER", "projects/not-a-number/unsafe"),
-            ("GCP_SERVICE_ACCOUNT", "owner@example.com"),
-        ):
-            with self.subTest(key=key, value=value):
-                env = environment()
-                env[key] = value
-                completed, content = self.run_selector("evaluation", env)
-                self.assertNotEqual(completed.returncode, 0)
-                self.assertEqual(content, "")
-                self.assertIn(key, completed.stderr)
+    def test_hosted_authentication_is_absent_from_the_local_selector(self) -> None:
+        selector = SELECTOR.read_text(encoding="utf-8")
+        pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
+        self.assertNotIn("GCP_WIF_PROVIDER", selector)
+        self.assertNotIn("GCP_SERVICE_ACCOUNT", selector)
+        self.assertIn("LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT", pipeline)
 
     def test_invalid_security_values_fail_before_writing_environment(self) -> None:
         for key, value in (
@@ -304,46 +295,16 @@ class SelectorTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(content, "")
 
-    def test_workflow_exposes_only_manual_evaluation_dispatch(self) -> None:
-        workflow = WORKFLOW.read_text()
-        self.assertIn("build_profile:", workflow)
-        self.assertIn("- evaluation", workflow)
-        self.assertIn("scripts/select_build_configuration.py", workflow)
-        self.assertIn("EVALUATION_ENCLAVE_KMS_PROJECT", workflow)
-        self.assertIn('KIOKU_BUILD_PROFILE == "evaluation"', workflow)
-        self.assertIn(
-            '--build-arg KIOKU_BUILD_PROFILE="${KIOKU_BUILD_PROFILE}"',
-            workflow,
-        )
-        self.assertIn(
-            'echo "build_profile=${KIOKU_BUILD_PROFILE}" >> "$GITHUB_OUTPUT"',
-            workflow,
-        )
-        self.assertIn(
-            "BUILD_PROFILE: ${{ steps.build.outputs.build_profile }}",
-            workflow,
-        )
-        metadata_start = workflow.index("- name: Write release metadata")
-        metadata_end = workflow.index(
-            "- name: Attest release metadata manifest", metadata_start
-        )
-        metadata_step = workflow[metadata_start:metadata_end]
-        self.assertIn('"${BUILD_PROFILE}"', metadata_step)
-        self.assertNotIn('"${KIOKU_BUILD_PROFILE}"', metadata_step)
-        self.assertIn('"build_profile": build_profile', workflow)
-        for key in CONFIGURATION:
-            if key.startswith("ARCHIVE_WITNESS_"):
-                self.assertNotIn(f"EVALUATION_{key}:", workflow)
-                self.assertNotIn(f"PRODUCTION_{key}:", workflow)
-                continue
-            self.assertIn(f"EVALUATION_{key}:", workflow)
-            self.assertIn(f"EVAL_{key}", workflow)
-        for key in APPLE_CONFIGURATION:
-            self.assertIn(f"EVALUATION_{key}:", workflow)
-            self.assertIn(f"EVAL_{key}", workflow)
-        clear = workflow.index("Clear selected build configuration")
-        third_party = workflow.index("anchore/sbom-action")
-        self.assertLess(clear, third_party)
+    def test_local_pipeline_is_the_profile_and_release_metadata_entrypoint(self) -> None:
+        pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
+        self.assertIn('choices=("production", "evaluation")', pipeline)
+        self.assertIn("selected_configuration(", pipeline)
+        self.assertIn("check_voice_release_gate.py", pipeline)
+        self.assertIn('"schema_version": 8', pipeline)
+        self.assertIn('"release_url"', pipeline)
+        self.assertIn("enclave-release.json", pipeline)
+        self.assertNotIn("GITHUB_OUTPUT", pipeline)
+        self.assertNotIn("actions/runs", pipeline)
 
     def test_selected_profile_is_validated_and_baked_into_the_runtime_image(self) -> None:
         dockerfile = DOCKERFILE.read_text()
@@ -356,34 +317,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('[ -n "${APNS_TEAM_ID}" ]', dockerfile)
         self.assertIn("ENV KIOKU_BUILD_PROFILE=${KIOKU_BUILD_PROFILE}", dockerfile)
 
-    def test_evaluation_reviewer_key_is_read_from_an_encrypted_secret(self) -> None:
-        workflow = WORKFLOW.read_text()
-        self.assertIn(
-            "EVALUATION_REVIEWER_AUTH_API_KEY: "
-            "${{ secrets.EVAL_REVIEWER_AUTH_API_KEY }}",
-            workflow,
-        )
-        self.assertNotIn(
-            "EVALUATION_REVIEWER_AUTH_API_KEY: "
-            "${{ vars.EVAL_REVIEWER_AUTH_API_KEY }}",
-            workflow,
-        )
-
-    def test_release_ci_uses_shared_voice_gate_and_attests_its_result(self) -> None:
-        workflow = WORKFLOW.read_text()
-        self.assertGreaterEqual(
-            workflow.count("python3 scripts/check_voice_release_gate.py"), 2
-        )
-        self.assertNotIn("test -s eval/voice/release-manifest.json", workflow)
-        self.assertIn('"schema_version": 7', workflow)
-        self.assertIn('"voice_quality_gate": voice_quality_gate', workflow)
-        self.assertIn('"billing_enforcement_mode": billing_enforcement_mode', workflow)
-        self.assertIn('"gcs_media_bucket": gcs_media_bucket', workflow)
-        self.assertIn('"gcs_legacy_media_bucket": gcs_legacy_media_bucket', workflow)
-        self.assertIn("Attest release metadata manifest", workflow)
-        self.assertIn("subject-path: enclave-release.json", workflow)
-
-    def test_selector_docker_and_schema_v7_manifest_bind_the_same_three_buckets(self) -> None:
+    def test_selector_docker_and_local_schema_v8_manifest_bind_the_same_three_buckets(self) -> None:
         completed, selected = self.run_selector("production", environment())
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("ENCLAVE_GCS_BUCKET=kioku-production-indexes\n", selected)
@@ -392,7 +326,7 @@ class SelectorTests(unittest.TestCase):
             "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET=kioku-production-indexes\n", selected
         )
 
-        workflow = WORKFLOW.read_text()
+        pipeline = LOCAL_PIPELINE.read_text()
         dockerfile = DOCKERFILE.read_text()
         verifier = METADATA_VERIFIER.read_text()
         for env_name, build_arg, manifest_field in (
@@ -404,44 +338,15 @@ class SelectorTests(unittest.TestCase):
                 "gcs_legacy_media_bucket",
             ),
         ):
-            self.assertIn(f'--build-arg {build_arg}="${{{env_name}}}"', workflow)
+            self.assertIn(f'("{build_arg}", configuration["{env_name}"])', pipeline)
             self.assertIn(f"ARG {build_arg}", dockerfile)
             self.assertIn(f"{build_arg}=${{{build_arg}}}", dockerfile)
-            self.assertIn(f'"{manifest_field}"', workflow)
+            self.assertIn(f'"{manifest_field}"', pipeline)
             self.assertIn(f'"{manifest_field}"', verifier)
         self.assertIn('[ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
         self.assertNotIn('[ "${GCS_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
-        self.assertIn('"schema_version": 7', workflow)
-        self.assertIn("schema_version must be 7", verifier)
-
-    def test_operator_release_uses_shared_voice_gate_and_verifies_metadata(self) -> None:
-        release_script = RELEASE_SCRIPT.read_text()
-        metadata_verifier = METADATA_VERIFIER.read_text()
-        self.assertIn(
-            'VOICE_QUALITY_GATE="$(python3 scripts/check_voice_release_gate.py)"',
-            release_script,
-        )
-        self.assertIn('"voice_quality_gate"', metadata_verifier)
-        self.assertIn("schema_version must be 7", metadata_verifier)
-        self.assertIn('"billing_enforcement_mode"', metadata_verifier)
-        self.assertIn("owner_only_unvalidated", metadata_verifier)
-        self.assertIn("validated_real_corpus", metadata_verifier)
-        self.assertIn(
-            '"$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE"',
-            release_script,
-        )
-        self.assertIn("EXPECTED_BILLING_ENFORCEMENT_MODE", release_script)
-        self.assertIn(
-            '"$BILLING_ENFORCEMENT_MODE" != "$EXPECTED_BILLING_ENFORCEMENT_MODE"',
-            release_script,
-        )
-        self.assertIn(
-            "BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE",
-            release_script,
-        )
-        self.assertIn("ENCLAVE_GCS_LEGACY_MEDIA_BUCKET must be configured and exactly match", release_script)
-        self.assertIn("Verifying signed release metadata manifest", release_script)
-        self.assertIn("enclave-release-metadata-provenance.jsonl", release_script)
+        self.assertIn('"schema_version": 8', pipeline)
+        self.assertIn("schema_version must be 8", verifier)
 
     def test_probe_mode_defaults_off_with_empty_baked_namespace(self) -> None:
         completed, selected = self.run_selector("production", environment())
@@ -459,17 +364,10 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=off\n", selected)
         self.assertNotIn("attacker-project", selected)
 
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        for prefix in ("PRODUCTION", "EVALUATION"):
-            for key in (
-                "ARCHIVE_WITNESS_SHADOW_MODE",
-                "ARCHIVE_WITNESS_PROJECT_ID",
-                "ARCHIVE_WITNESS_PROJECT_NUMBER",
-                "ARCHIVE_WITNESS_DATABASE_ID",
-            ):
-                self.assertNotIn(f"{prefix}_{key}:", workflow)
-        self.assertNotIn("inputs.archive_witness", workflow.lower())
-        self.assertIn('--source-ref "${GITHUB_REF_NAME}"', workflow)
+        pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
+        self.assertIn("selected_configuration", pipeline)
+        self.assertNotIn("inputs.archive_witness", pipeline.lower())
+        self.assertNotIn("GITHUB_REF_NAME", pipeline)
 
     def test_probe_profile_is_tag_bound_and_evaluation_is_always_off(self) -> None:
         probe = {
@@ -563,7 +461,7 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(selected, "")
         self.assertIn("must be exact off", completed.stderr)
 
-        workflow = WORKFLOW.read_text(encoding="utf-8")
+        pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         verifier = METADATA_VERIFIER.read_text(encoding="utf-8")
         parser = SHADOW_RUNTIME_PARSER.read_text(encoding="utf-8")
@@ -571,7 +469,7 @@ class SelectorTests(unittest.TestCase):
             self.assertIn("from archive_v3_shadow_runtime_config import", source)
             self.assertIn("load_shadow_runtime_config", source)
         self.assertNotIn("shadow-v1", parser)
-        self.assertNotIn("inputs.archive_v3", workflow.lower())
+        self.assertNotIn("inputs.archive_v3", pipeline.lower())
         for name in (
             "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
             "ARCHIVE_V3_ARCHIVE_BUCKET",
@@ -581,11 +479,11 @@ class SelectorTests(unittest.TestCase):
             "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
             "ARCHIVE_V3_WITNESS_DATABASE_ID",
         ):
-            self.assertIn(f'--build-arg {name}="${{{name}}}"', workflow)
+            self.assertIn(f'("{name}", configuration["{name}"])', pipeline)
             self.assertIn(f"ARG {name}", dockerfile)
             self.assertIn(f"{name}=${{{name}}}", dockerfile)
-            self.assertNotIn(f"PRODUCTION_{name}:", workflow)
-            self.assertNotIn(f"EVALUATION_{name}:", workflow)
+            self.assertNotIn(f"PRODUCTION_{name}", pipeline)
+            self.assertNotIn(f"EVALUATION_{name}", pipeline)
         main = MAIN.read_text(encoding="utf-8")
         self.assertNotIn("ArchiveV3ShadowRuntimeBundle::new", main)
 

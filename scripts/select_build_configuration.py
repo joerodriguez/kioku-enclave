@@ -27,11 +27,6 @@ SHARED_KEYS = (
     "IMAGE_NAME",
 )
 
-AUTHENTICATION_KEYS = (
-    "GCP_WIF_PROVIDER",
-    "GCP_SERVICE_ACCOUNT",
-)
-
 PROFILE_KEYS = (
     "ENCLAVE_KMS_PROJECT",
     "ENCLAVE_KMS_LOCATION",
@@ -91,19 +86,19 @@ EMAIL_PATTERN = r"[^@,\s]+@[^@,\s]+"
 def require_value(environment: dict[str, str], name: str) -> str:
     value = environment.get(name, "")
     if not value:
-        raise SystemExit(f"missing required repository configuration: {name}")
+        raise SystemExit(f"missing required build configuration: {name}")
     return value
 
 
 def reject_control_characters(configuration: dict[str, str]) -> None:
     for name, value in configuration.items():
         if any(ord(character) < 32 or ord(character) == 127 for character in value):
-            raise SystemExit(f"control character in repository configuration: {name}")
+            raise SystemExit(f"control character in build configuration: {name}")
 
 
 def require_pattern(configuration: dict[str, str], name: str, pattern: str) -> None:
     if not re.fullmatch(pattern, configuration[name]):
-        raise SystemExit(f"invalid format for repository configuration: {name}")
+        raise SystemExit(f"invalid format for build configuration: {name}")
 
 
 def require_https_origin(configuration: dict[str, str], name: str) -> None:
@@ -113,7 +108,7 @@ def require_https_origin(configuration: dict[str, str], name: str) -> None:
         parsed.port
     except ValueError as error:
         raise SystemExit(
-            f"invalid HTTPS origin in repository configuration: {name}"
+            f"invalid HTTPS origin in build configuration: {name}"
         ) from error
     if (
         parsed.scheme != "https"
@@ -124,7 +119,7 @@ def require_https_origin(configuration: dict[str, str], name: str) -> None:
         or parsed.query
         or parsed.path not in ("", "/")
     ):
-        raise SystemExit(f"invalid HTTPS origin in repository configuration: {name}")
+        raise SystemExit(f"invalid HTTPS origin in build configuration: {name}")
 
 
 def require_https_url(configuration: dict[str, str], name: str) -> None:
@@ -134,7 +129,7 @@ def require_https_url(configuration: dict[str, str], name: str) -> None:
         parsed.port
     except ValueError as error:
         raise SystemExit(
-            f"invalid HTTPS URL in repository configuration: {name}"
+            f"invalid HTTPS URL in build configuration: {name}"
         ) from error
     if (
         parsed.scheme != "https"
@@ -143,7 +138,7 @@ def require_https_url(configuration: dict[str, str], name: str) -> None:
         or parsed.password
         or parsed.fragment
     ):
-        raise SystemExit(f"invalid HTTPS URL in repository configuration: {name}")
+        raise SystemExit(f"invalid HTTPS URL in build configuration: {name}")
 
 
 def validate(configuration: dict[str, str], profile: str) -> None:
@@ -214,7 +209,7 @@ def validate(configuration: dict[str, str], profile: str) -> None:
     if configuration["ENCLAVE_ACME"] != "1":
         raise SystemExit("ENCLAVE_ACME must be 1 for an enclave image")
     if not re.fullmatch(rf"mailto:{EMAIL_PATTERN}", configuration["ENCLAVE_ACME_CONTACT"]):
-        raise SystemExit("invalid format for repository configuration: ENCLAVE_ACME_CONTACT")
+        raise SystemExit("invalid format for build configuration: ENCLAVE_ACME_CONTACT")
 
     emails = [email.strip() for email in configuration["ALLOWED_EMAILS"].split(",")]
     if (
@@ -222,13 +217,13 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         or any(email == "*" for email in emails)
         or any(not re.fullmatch(EMAIL_PATTERN, email) for email in emails)
     ):
-        raise SystemExit("invalid format for repository configuration: ALLOWED_EMAILS")
+        raise SystemExit("invalid format for build configuration: ALLOWED_EMAILS")
 
     admin_ids = [value.strip() for value in configuration["ADMIN_USER_IDS"].split(",")]
     if not admin_ids or any(
         not re.fullmatch(r"[0-9A-Fa-f-]{36}", value) for value in admin_ids
     ):
-        raise SystemExit("invalid format for repository configuration: ADMIN_USER_IDS")
+        raise SystemExit("invalid format for build configuration: ADMIN_USER_IDS")
 
     if configuration["BILLING_SERVICE_AUDIENCE"].rstrip("/") != configuration[
         "BILLING_SERVICE_URL"
@@ -278,12 +273,12 @@ def selected_configuration(
                 f"{prefix}_{name}" for name, value in values.items() if not value
             )
             raise SystemExit(
-                "incomplete optional repository configuration group; missing: " + missing
+                "incomplete optional build configuration group; missing: " + missing
             )
         configuration.update(values)
     if profile == "production" and not configuration.get("APNS_TEAM_ID"):
         raise SystemExit(
-            "missing required production repository configuration: "
+            "missing required production build configuration: "
             "PRODUCTION_APNS_TEAM_ID, PRODUCTION_APNS_PRODUCTION_KEY_ID, "
             "PRODUCTION_APNS_SANDBOX_KEY_ID"
         )
@@ -291,30 +286,15 @@ def selected_configuration(
     return configuration
 
 
-def validate_authentication(environment: dict[str, str]) -> None:
-    authentication = {
-        name: require_value(environment, name) for name in AUTHENTICATION_KEYS
-    }
-    reject_control_characters(authentication)
-    require_pattern(
-        authentication,
-        "GCP_WIF_PROVIDER",
-        r"projects/[0-9]+/locations/global/workloadIdentityPools/"
-        r"[A-Za-z0-9._-]+/providers/[A-Za-z0-9._-]+",
-    )
-    require_pattern(
-        authentication, "GCP_SERVICE_ACCOUNT", SERVICE_ACCOUNT_PATTERN
-    )
-
-
-def write_github_environment(
+def write_private_environment(
     path: Path, profile: str, configuration: dict[str, str]
 ) -> None:
-    # Validation rejects line breaks and other controls before this append. That
-    # keeps every selected value confined to its own GITHUB_ENV assignment.
     lines = [f"KIOKU_BUILD_PROFILE={profile}\n"]
     lines.extend(f"{name}={value}\n" for name, value in configuration.items())
-    with path.open("a", encoding="utf-8") as handle:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.writelines(lines)
 
 
@@ -332,7 +312,11 @@ def main() -> None:
         type=Path,
         default=Path("config/archive-v3-shadow-runtime.json"),
     )
-    parser.add_argument("--github-env", type=Path, required=True)
+    parser.add_argument(
+        "--output-env",
+        type=Path,
+        help="create a mode-0600 diagnostic environment file; omit to validate only",
+    )
     arguments = parser.parse_args()
 
     environment = dict(os.environ)
@@ -343,8 +327,8 @@ def main() -> None:
         probe_config_path=arguments.archive_witness_probe_config,
         shadow_runtime_config_path=arguments.archive_v3_shadow_runtime_config,
     )
-    validate_authentication(environment)
-    write_github_environment(arguments.github_env, arguments.profile, configuration)
+    if arguments.output_env is not None:
+        write_private_environment(arguments.output_env, arguments.profile, configuration)
 
 
 if __name__ == "__main__":

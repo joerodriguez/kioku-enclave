@@ -19,8 +19,8 @@ surfaces.
 - The KMS/DEK hierarchy and encrypted GCS objects.
 - Confidential Space attestation, image-digest authorization, and the public release
   evidence used to audit a running image.
-- The repository's CI, dependency scanning, image scanning, provenance, and release
-  process.
+- The repository's local verification, dependency audit, image scanning, signed local
+  build evidence, and release process.
 
 ### Out of scope or accepted external trust
 
@@ -56,29 +56,30 @@ surfaces.
 - The Confidential Space launch policy permits only `PORT` to be changed at launch.
   KMS, GCS, caller identity, OAuth, TLS, attestation, and migration settings are baked
   into the image and therefore covered by its digest.
-- CI selects exactly one complete image configuration before Docker runs. Manual
+- The local image pipeline selects exactly one complete image configuration before Docker
+  runs. Manual
   evaluation builds never inherit production values, are marked with an `eval-` tag and
   metadata profile, cannot become signed releases, and may run only with an isolated
   service account, KMS key, buckets, hostname, and attestation binding that have no
   production data access. The operator has retired that isolated runtime; production is
   now the only active owner evaluation environment.
 - Production selection accepts only the reviewed `shadow` and `enforce` billing modes.
-  The selected mode is preserved in schema-v7 release metadata, and a fresh release
-  rechecks that it matches the repository variable observed before tagging. A later
+  The selected mode is preserved in schema-8 release metadata, and a fresh release
+  rechecks that it matches the external operator configuration used for the image. A later
   configuration change therefore cannot silently alter the signed image's enforcement
   behavior.
-- ADR-0022 Phase-0 requires three baked non-secret repository variables:
+- ADR-0022 Phase-0 requires three baked non-secret operator configuration values:
   `ENCLAVE_GCS_BUCKET` for indexes, `ENCLAVE_GCS_MEDIA_BUCKET` for current-media
   writes, and `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` for migration-only media reads and
   deletes. The current media bucket may differ from the index bucket; legacy media must
-  exactly equal it. The exact three-value claim is carried in a schema-v7 release
-  manifest that is itself a GitHub-signed provenance subject. Runtime has no missing
+  exactly equal it. The exact three-value claim is carried in a schema-8 release
+  manifest whose exact bytes are bound by separately signed local build evidence. Runtime has no missing
   legacy-bucket fallback; an unsigned/copied or older manifest is not promotion evidence.
   This is not archive-v3 wiring, a deletion action, or deployment authority.
 - The ADR-0022 Firestore transport probe is non-authoritative and the exact checked-in
   `config/archive-witness-probe.json` defaults to `off` with empty project/number/database
   fields. Build selection and signed-metadata verification use one strict parser; no
-  repository variable or manual-dispatch witness input can override it, evaluation and
+  operator configuration or command-line witness input can override it, evaluation and
   main builds force it off, and `probe-v1` is eligible only for an exact
   `vX.Y.Z-witness-probe.N` prerelease that `release.sh --roll` rejects. Off constructs no
   Firestore credentials or transport and performs zero I/O. A probe prerelease awaits one
@@ -88,14 +89,14 @@ surfaces.
   magic/version, monotonic generation, and random opaque attempt ID. It has no AppState/
   CpState/route/health/admission/deletion/acknowledgement connection, never constructs a
   witness bootstrap, and cannot change canonical archive-witness state. Commit ambiguity is
-  never blindly retried and is confirmed only by rereading the exact attempt. Schema-v7
+  never blindly retried and is confirmed only by rereading the exact attempt. Schema-8
   signed release metadata binds the mode and complete-or-empty namespace but grants no
   Firestore, rollout, health, or archive authority.
 - The ADR-0022 construction-only shadow runtime is separately fixed to exact `off` by
   checked-in `config/archive-v3-shadow-runtime.json`. Its sole shared parser rejects every
   nonempty archive bucket, archive-GCS project number, registry KMS version, witness
-  project/number/database, and every mode other than `off`; no repository variable,
-  dispatch input, tag form, or process environment can override that selection. Schema-v7
+  project/number/database, and every mode other than `off`; no operator configuration,
+  command-line input, tag form, or process environment can override that selection. Schema-8
   signed release metadata binds all seven exact values. The compiled bundle can only
   synchronously construct fixed-origin clients behind private fields, exposes no operation
   or runtime handle, and has an always-deny hard-delete gate. Startup does not construct
@@ -1008,7 +1009,7 @@ longer require them, and protect that service account accordingly.
 **Threat:** A malformed request exploits a bug in the exact approved binary.
 
 **Mitigation:** Authentication middleware, bounded request bodies, input validation,
-rate limits, quotas, memory-safe Rust, tests, clippy, CodeQL, dependency review, and
+rate limits, quotas, memory-safe Rust, local tests, Clippy, dependency audit, and image
 vulnerability scans reduce this risk. Attestation proves which code is running; it does
 not prove that code is bug-free. Report suspected vulnerabilities privately as described
 below.
@@ -1117,26 +1118,27 @@ AMD SEV.
 
 ### T6 — Source, dependency, or build-pipeline tampering
 
-**Threat:** An attacker modifies source, dependencies, Actions, or build inputs so the
+**Threat:** An attacker modifies source, dependencies, the local builder, or build inputs so the
 published image differs from the reviewed release.
 
 **Mitigation:** Release tags are signed and verified; the release script refuses to
-overwrite an existing public release. Third-party Actions and the Rust builder image are
-pinned by full digest/SHA. The embedding model is pinned to a repository revision and
-verified by SHA-256. CI runs formatting, locked tests, clippy, RustSec audit (with a
-documented RSA-verification-only exception for `RUSTSEC-2023-0071`), CodeQL, dependency
-review, and an SBOM-based image scan. Cargo-auditable metadata makes statically linked
-Rust crates visible in that image SBOM, and CI fails if representative core/native
-packages are absent. The credentialed build job accepts only main or `v*` tag refs; the
-GCP OIDC provider must additionally constrain immutable repository/owner IDs and the
-expected workflow identity. A tagged build produces GitHub-signed image provenance, an
-SPDX SBOM, a signed SBOM attestation, and a signed schema-v7 release-manifest subject,
-but has read-only repository-content permission and no GitHub Release publication step.
-The sole publisher is `scripts/release.sh`: before any release mutation it requires the
-exact tag-signing fingerprint from a separately published trusted anchor, then verifies
-the expected repository, workflow, source ref, commit, image repository, digest, manifest
-claim, and attestations. GitHub's generic verified-signature result and CI artifacts from
-a differently signed tag do not grant release or rollout eligibility.
+overwrite an existing public release. The Rust builder image is pinned by full digest and
+the embedding model is revision- and SHA-256-pinned. The local gate runs formatting,
+locked tests, all-target Clippy, RustSec audit (with the documented RS256-verification-only
+exception), and an SBOM-based fixed-high image scan. Cargo-auditable metadata exposes
+statically linked Rust crates and the gate rejects an SBOM missing representative native
+packages. All compilation and scanning occurs before the named operator requests
+short-lived push-only credentials. Canonical evidence binds the exact tag/commit, image
+digest, configuration and input/output hashes, tools, and time; it is signed with a
+separate mode-0600 Ed25519 key and verified against an externally pinned public-key
+fingerprint. The sole publisher, `scripts/release.sh`, verifies both the tag-signing key and
+that evidence before any release or rollout mutation.
+
+GitHub Actions, hosted CodeQL, and dependency review are disabled. This removes a hosted
+runner and its recurring cost, but also removes centralized CodeQL alerts and an
+independent execution environment. RustSec, Clippy, locked tests, dependency-update PRs,
+and image scanning remain; reviewers must treat local evidence as a designated-builder
+claim, not a third-party build guarantee.
 
 ## Residual risks and limitations
 
@@ -1144,9 +1146,9 @@ a differently signed tag do not grant release or rollout eligibility.
 
 The builder image and model are pinned, but Cargo sources are fetched from crates.io
 rather than vendored, Debian packages are installed from mutable apt repositories without
-snapshot/version pins, and the workflow does not yet demonstrate a bit-for-bit rebuild.
-GitHub-signed provenance proves which GitHub workflow claims to have produced an image;
-it does not eliminate trust in GitHub Actions or mutable dependency delivery.
+snapshot/version pins, and the local workflow does not demonstrate a bit-for-bit rebuild.
+The detached evidence signature proves what the designated key holder claims to have
+built; it does not eliminate trust in that builder or mutable dependency delivery.
 
 Release notes must say “publicly auditable with signed build provenance,” not
 “independently reproducible.” Closing this limitation requires vendored Rust sources,

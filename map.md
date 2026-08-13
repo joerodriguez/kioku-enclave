@@ -50,7 +50,6 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | `src/archive_v3_gcs_auth.rs` | **Inactive ADR-0022 archive-GCS identity boundary:** an independently typed `archive-gcs-attest/archive-gcs` WIF audience, no-nonce launcher token, fixed retry-disabled Google STS exchange for only `devstorage.read_write`, zeroizing request/response/cache ownership, and no metadata/default credentials, service-account impersonation, GCS-transport connection, or runtime authority wiring |
 | `src/archive_v3_registry_kms.rs` | **Inactive ADR-0022 archive-registry KMS adapter:** derives one numeric version only below the exact legacy production KMS key, verifies the exact enabled symmetric-software version and encrypt response coordinate, binds both wrap and unwrap to one zeroizing canonical registry-plus-version AAD, clears caller destinations before work, and strictly bounds/validates its stored wrapper and Cloud KMS integrity fields. It reuses only the existing attestation-derived KMS bearer source; it has no environment/startup/Store/provider/route/flag/authority wiring and does not change live `KmsClient` behavior or endpoints. |
 | `src/archive_v3_shadow_runtime.rs` | **Construction-only ADR-0022 provider bundle:** derives fixed archive-GCS, exact registry-KMS-version, and named-Firestore providers from typed deployment fragments without I/O. All provider fields are private, the bundle is non-cloneable and has no getter/task/worker/operation, and its hard-delete drain gate always denies. Startup never constructs it and it has no Store/VFS/lifecycle/route/health/admission/deletion or authority connection. |
-| `.github/workflows/` | CI, CodeQL/dependency checks, image build/scan, provenance/SBOM attestations, and the signed schema-v7 Phase-0/probe/exact-off-shadow-runtime release-manifest subject |
 | `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image; Phase-0 bakes distinct current-media and legacy-media buckets, with legacy equal to the index bucket, with remaining rebuild limits documented in `SECURITY.md` |
 | `Cargo.toml` / `Cargo.lock` | Crate manifest |
 | `README.md` | What the enclave does + the attestation/privacy claim |
@@ -59,12 +58,13 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, fail-closed inactive archive-v3 signed-capacity-evidence verification, versioning, build-profile, and signed-release operator tools |
 | [TASKS.md](TASKS.md) | Scoped ADR-0022 implementation evidence and intentionally remaining authority gates |
 | `SECURITY.md` | **Threat model + residual risks — read before touching crypto/auth/attestation** |
-| `CONTRIBUTING.md` | PR rules, lightweight local verification, and required GitHub CI gate |
+| `CONTRIBUTING.md` | PR rules and lightweight/exhaustive local verification gates |
 | `rust-toolchain.toml` | Pinned toolchain |
 
 ## Working here
 
-- Required GitHub CI is the exhaustive merge gate. For normal local feedback,
+- The reviewed local verification pipeline is the exhaustive merge gate; hosted
+  GitHub Actions is disabled. For normal local feedback,
   run `./scripts/agent-verify.sh quick` plus a focused test with
   `./scripts/agent-verify.sh focused -- <test-filter>`; use
   `./scripts/agent-verify.sh full` for broad/security-sensitive changes or CI
