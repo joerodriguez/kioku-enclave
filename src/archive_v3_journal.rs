@@ -10,14 +10,18 @@
 //! their fail-closed validation independently testable before shadow wiring.
 
 use crate::archive_v3::{
-    ArchiveCipher, ArchiveRoot, ArchiveV3Error, CiphertextEnvelope, ImmutableReference,
-    LogicalLocation, ObjectContext, ObjectId, ObjectRole, Result, ARCHIVE_FORMAT_VERSION,
-    MAX_DATABASE_BYTES, MAX_DATABASE_PAGES, SQLITE_PAGE_SIZE,
+    ArchiveCipher, ArchiveV3Error, CiphertextEnvelope, ImmutableReference, LogicalLocation,
+    ObjectContext, ObjectId, ObjectRole, ParentReference, Result, ARCHIVE_FORMAT_VERSION,
+    MAX_DATABASE_BYTES, MAX_DATABASE_PAGES, MAX_WAL_COMMITS_PER_ROOT, MAX_WAL_SEGMENTS_PER_ROOT,
+    MAX_WAL_TAIL_BYTES, SQLITE_PAGE_SIZE,
 };
+use sha2::Digest;
+use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-const CHECKPOINT_MANIFEST_MAGIC: &[u8; 8] = b"KACMv3\0\0";
-const WAL_SEGMENT_MAGIC: &[u8; 8] = b"KAWLv3\0\0";
+const CHECKPOINT_MANIFEST_MAGIC: &[u8; 8] = b"KACMv4\0\0";
+const WAL_SEGMENT_MAGIC: &[u8; 8] = b"KAWLv4\0\0";
+const WAL_COMMIT_DESCRIPTOR_MAGIC: &[u8; 8] = b"KAWCDv4\0";
 const SQLITE_WAL_MAGIC_LE_CHECKSUM: u32 = 0x377f_0682;
 const SQLITE_WAL_MAGIC_BE_CHECKSUM: u32 = 0x377f_0683;
 const SQLITE_WAL_FORMAT_VERSION: u32 = 3_007_000;
@@ -34,6 +38,8 @@ pub const MAX_CHECKPOINT_MANIFEST_BYTES: usize = 32 * 1024;
 /// The encoded WAL segment must fit the generic archive-v3 envelope after
 /// framing. At 4-KiB pages this permits 254 frames per immutable segment.
 pub const MAX_WAL_SEGMENT_BYTES: usize = 1_048_576;
+pub const MAX_WAL_COMMIT_DESCRIPTOR_BYTES: usize = 512;
+pub const MAX_WAL_SEGMENTS_PER_COMMIT: u32 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointChunkEntry {
@@ -527,12 +533,223 @@ impl WalSegment {
         Ok(segment)
     }
 
-    fn terminal_checksum(&self) -> Result<[u32; 2]> {
+    pub(crate) fn terminal_checksum(&self) -> Result<[u32; 2]> {
         let frame_bytes = SQLITE_WAL_FRAME_HEADER_BYTES + SQLITE_PAGE_SIZE as usize;
         let frame_count = self.frame_count()? as usize;
         let last = &self.frames[(frame_count - 1) * frame_bytes..frame_count * frame_bytes];
         Ok([read_be_u32(&last[16..20])?, read_be_u32(&last[20..24])?])
     }
+}
+
+/// One bounded authenticated link in the post-checkpoint WAL lineage. The
+/// root names only the exact tail descriptor; each descriptor names its exact
+/// predecessor and the exact root parent, so recovery can validate the whole
+/// root/commit chain without listing storage.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WalCommitDescriptor {
+    pub root_seq: u64,
+    pub owner_fencing_epoch: u64,
+    pub operation_id: [u8; 16],
+    pub request_fingerprint: [u8; 32],
+    pub checkpoint_root: ImmutableReference,
+    pub parent_root: ParentReference,
+    pub parent_root_parent: Option<ParentReference>,
+    pub previous_commit: Option<ImmutableReference>,
+    pub checkpoint_logical_file_length: u64,
+    pub before_logical_file_length: u64,
+    pub after_logical_file_length: u64,
+    pub wal_generation: u64,
+    pub first_frame_no: u64,
+    pub wal_header_hash: [u8; 32],
+    pub checksum_before: [u32; 2],
+    pub checksum_after: [u32; 2],
+    pub frame_count: u32,
+    pub commit_segment_count: u32,
+    pub cumulative_commit_count: u32,
+    pub cumulative_segment_count: u32,
+    pub commit_wal_bytes: u64,
+    pub cumulative_wal_bytes: u64,
+    pub final_segment: ImmutableReference,
+}
+
+impl fmt::Debug for WalCommitDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WalCommitDescriptor(<opaque>)")
+    }
+}
+
+impl WalCommitDescriptor {
+    pub fn validate(&self) -> Result<()> {
+        let page = u64::from(SQLITE_PAGE_SIZE);
+        if self.root_seq == 0
+            || self.owner_fencing_epoch == 0
+            || self.operation_id.iter().all(|byte| *byte == 0)
+            || self.request_fingerprint.iter().all(|byte| *byte == 0)
+            || invalid_reference(&self.checkpoint_root)
+            || invalid_parent(&self.parent_root)
+            || self.parent_root_parent.as_ref().is_some_and(invalid_parent)
+            || self.previous_commit.as_ref().is_some_and(invalid_reference)
+            || invalid_reference(&self.final_segment)
+            || self.checkpoint_logical_file_length == 0
+            || self.checkpoint_logical_file_length > MAX_DATABASE_BYTES
+            || !self.checkpoint_logical_file_length.is_multiple_of(page)
+            || self.before_logical_file_length == 0
+            || self.before_logical_file_length > MAX_DATABASE_BYTES
+            || !self.before_logical_file_length.is_multiple_of(page)
+            || self.after_logical_file_length == 0
+            || self.after_logical_file_length > MAX_DATABASE_BYTES
+            || !self.after_logical_file_length.is_multiple_of(page)
+            || self.wal_generation == 0
+            || self.first_frame_no == 0
+            || self.wal_header_hash.iter().all(|byte| *byte == 0)
+            || self.frame_count == 0
+            || self.commit_segment_count == 0
+            || self.commit_segment_count > MAX_WAL_SEGMENTS_PER_COMMIT
+            || self.cumulative_commit_count == 0
+            || self.cumulative_commit_count > MAX_WAL_COMMITS_PER_ROOT
+            || u64::from(self.cumulative_commit_count) > self.root_seq
+            || self.cumulative_segment_count < self.cumulative_commit_count
+            || self.cumulative_segment_count > MAX_WAL_SEGMENTS_PER_ROOT
+            || self.cumulative_segment_count < self.commit_segment_count
+            || self.commit_wal_bytes == 0
+            || self.cumulative_wal_bytes < self.commit_wal_bytes
+            || self.cumulative_wal_bytes > MAX_WAL_TAIL_BYTES
+            || (self.previous_commit.is_some() != (self.cumulative_commit_count > 1))
+        {
+            return Err(ArchiveV3Error::Malformed("WAL commit descriptor"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_context(&self, context: &ObjectContext) -> Result<()> {
+        self.validate()?;
+        if context.role() != ObjectRole::WalCommitDescriptorV3
+            || context.parent().is_some()
+            || !matches!(
+                context.location(),
+                LogicalLocation::WalCommitDescriptor { root_seq }
+                    if *root_seq == self.root_seq
+            )
+        {
+            return Err(ArchiveV3Error::InvalidContext);
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut out = Vec::with_capacity(MAX_WAL_COMMIT_DESCRIPTOR_BYTES);
+        out.extend_from_slice(WAL_COMMIT_DESCRIPTOR_MAGIC);
+        out.push(ARCHIVE_FORMAT_VERSION);
+        push_u64(&mut out, self.root_seq);
+        push_u64(&mut out, self.owner_fencing_epoch);
+        out.extend_from_slice(&self.operation_id);
+        out.extend_from_slice(&self.request_fingerprint);
+        encode_reference(&mut out, &self.checkpoint_root);
+        encode_parent(&mut out, &self.parent_root);
+        encode_optional_parent(&mut out, &self.parent_root_parent);
+        encode_optional_reference(&mut out, &self.previous_commit);
+        push_u64(&mut out, self.checkpoint_logical_file_length);
+        push_u64(&mut out, self.before_logical_file_length);
+        push_u64(&mut out, self.after_logical_file_length);
+        push_u64(&mut out, self.wal_generation);
+        push_u64(&mut out, self.first_frame_no);
+        out.extend_from_slice(&self.wal_header_hash);
+        push_u32(&mut out, self.checksum_before[0]);
+        push_u32(&mut out, self.checksum_before[1]);
+        push_u32(&mut out, self.checksum_after[0]);
+        push_u32(&mut out, self.checksum_after[1]);
+        push_u32(&mut out, self.frame_count);
+        push_u32(&mut out, self.commit_segment_count);
+        push_u32(&mut out, self.cumulative_commit_count);
+        push_u32(&mut out, self.cumulative_segment_count);
+        push_u64(&mut out, self.commit_wal_bytes);
+        push_u64(&mut out, self.cumulative_wal_bytes);
+        encode_reference(&mut out, &self.final_segment);
+        if out.len() > MAX_WAL_COMMIT_DESCRIPTOR_BYTES {
+            return Err(ArchiveV3Error::TooLarge("WAL commit descriptor"));
+        }
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        if input.len() > MAX_WAL_COMMIT_DESCRIPTOR_BYTES {
+            return Err(ArchiveV3Error::TooLarge("WAL commit descriptor"));
+        }
+        if input.len() < 9
+            || &input[..8] != WAL_COMMIT_DESCRIPTOR_MAGIC
+            || input[8] != ARCHIVE_FORMAT_VERSION
+        {
+            return Err(ArchiveV3Error::Malformed("WAL commit descriptor header"));
+        }
+        let mut offset = 9;
+        let value = Self {
+            root_seq: take_u64(input, &mut offset)?,
+            owner_fencing_epoch: take_u64(input, &mut offset)?,
+            operation_id: take_array(take(input, &mut offset, 16)?)?,
+            request_fingerprint: take_array(take(input, &mut offset, 32)?)?,
+            checkpoint_root: decode_reference(input, &mut offset)?,
+            parent_root: decode_parent(input, &mut offset)?,
+            parent_root_parent: decode_optional_parent(input, &mut offset)?,
+            previous_commit: decode_optional_reference(input, &mut offset)?,
+            checkpoint_logical_file_length: take_u64(input, &mut offset)?,
+            before_logical_file_length: take_u64(input, &mut offset)?,
+            after_logical_file_length: take_u64(input, &mut offset)?,
+            wal_generation: take_u64(input, &mut offset)?,
+            first_frame_no: take_u64(input, &mut offset)?,
+            wal_header_hash: take_array(take(input, &mut offset, 32)?)?,
+            checksum_before: [take_u32(input, &mut offset)?, take_u32(input, &mut offset)?],
+            checksum_after: [take_u32(input, &mut offset)?, take_u32(input, &mut offset)?],
+            frame_count: take_u32(input, &mut offset)?,
+            commit_segment_count: take_u32(input, &mut offset)?,
+            cumulative_commit_count: take_u32(input, &mut offset)?,
+            cumulative_segment_count: take_u32(input, &mut offset)?,
+            commit_wal_bytes: take_u64(input, &mut offset)?,
+            cumulative_wal_bytes: take_u64(input, &mut offset)?,
+            final_segment: decode_reference(input, &mut offset)?,
+        };
+        if offset != input.len() {
+            return Err(ArchiveV3Error::Malformed("WAL commit descriptor length"));
+        }
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone)]
+pub struct ResolvedWalCommitDescriptor {
+    reference: ImmutableReference,
+    descriptor: WalCommitDescriptor,
+}
+
+impl ResolvedWalCommitDescriptor {
+    pub(crate) fn reference(&self) -> &ImmutableReference {
+        &self.reference
+    }
+
+    pub(crate) fn descriptor(&self) -> &WalCommitDescriptor {
+        &self.descriptor
+    }
+}
+
+pub fn resolve_verified_wal_commit_descriptor(
+    cipher: &crate::archive_v3::VerifiedArchiveCipher,
+    context: ObjectContext,
+    expected_reference: ImmutableReference,
+    envelope: CiphertextEnvelope,
+) -> Result<ResolvedWalCommitDescriptor> {
+    if context.object_id() != expected_reference.object_id
+        || envelope.hash() != expected_reference.envelope_hash
+    {
+        return Err(ArchiveV3Error::Authentication);
+    }
+    let plaintext = Zeroizing::new(cipher.open(&context, &envelope)?);
+    let descriptor = WalCommitDescriptor::decode(plaintext.as_slice())?;
+    descriptor.validate_for_context(&context)?;
+    Ok(ResolvedWalCommitDescriptor {
+        reference: expected_reference,
+        descriptor,
+    })
 }
 
 /// A segment that has been resolved from the expected object ID and actual
@@ -604,17 +821,17 @@ pub fn resolve_verified_wal_segment(
     })
 }
 
-/// Verify one complete SQLite commit against the exact root that nominates it.
+/// Verify one complete SQLite commit against its authenticated descriptor.
 /// This is deliberately independent of prefix enumeration and accepts no
 /// locally valid orphan candidate.
-pub fn validate_wal_commit_chain(root: &ArchiveRoot, entries: &[ResolvedWalSegment]) -> Result<()> {
-    root.validate()?;
-    let final_reference = root
-        .wal_chain_root
-        .as_ref()
-        .ok_or(ArchiveV3Error::Malformed("root has no WAL chain"))?;
+pub fn validate_wal_commit_chain(
+    descriptor: &WalCommitDescriptor,
+    entries: &[ResolvedWalSegment],
+) -> Result<()> {
+    descriptor.validate()?;
+    let final_reference = &descriptor.final_segment;
     if entries.is_empty()
-        || entries.len() != root.wal_segment_count as usize
+        || entries.len() != descriptor.commit_segment_count as usize
         || entries.last().map(|entry| &entry.reference) != Some(final_reference)
     {
         return Err(ArchiveV3Error::Malformed("WAL root chain"));
@@ -628,9 +845,9 @@ pub fn validate_wal_commit_chain(root: &ArchiveRoot, entries: &[ResolvedWalSegme
     for (index, entry) in entries.iter().enumerate() {
         let segment = &entry.segment;
         segment.validate()?;
-        if segment.root_seq != root.root_seq
-            || segment.wal_generation != root.wal_generation
-            || segment.segment_count != root.wal_segment_count
+        if segment.root_seq != descriptor.root_seq
+            || segment.wal_generation != descriptor.wal_generation
+            || segment.segment_count != descriptor.commit_segment_count
             || segment.segment_index as usize != index
             || segment.first_frame_no != expected_frame
             || segment.checksum_before != expected_checksum
@@ -654,7 +871,29 @@ pub fn validate_wal_commit_chain(root: &ArchiveRoot, entries: &[ResolvedWalSegme
     )
     .checked_mul(u64::from(SQLITE_PAGE_SIZE))
     .ok_or(ArchiveV3Error::TooLarge("SQLite database"))?;
-    if effective_length != root.logical_file_length {
+    let frame_count = entries.iter().try_fold(0u32, |count, entry| {
+        count
+            .checked_add(entry.segment.frame_count()?)
+            .ok_or(ArchiveV3Error::TooLarge("WAL frame count"))
+    })?;
+    let wal_bytes = u64::from(SQLITE_WAL_HEADER_BYTES as u32)
+        .checked_add(
+            u64::from(frame_count)
+                .checked_mul(u64::from(
+                    SQLITE_WAL_FRAME_HEADER_BYTES as u32 + SQLITE_PAGE_SIZE,
+                ))
+                .ok_or(ArchiveV3Error::TooLarge("WAL commit bytes"))?,
+        )
+        .ok_or(ArchiveV3Error::TooLarge("WAL commit bytes"))?;
+    if effective_length != descriptor.after_logical_file_length
+        || frame_count != descriptor.frame_count
+        || wal_bytes != descriptor.commit_wal_bytes
+        || entries[0].segment.first_frame_no != descriptor.first_frame_no
+        || <[u8; 32]>::from(sha2::Sha256::digest(entries[0].segment.wal_header))
+            != descriptor.wal_header_hash
+        || entries[0].segment.checksum_before != descriptor.checksum_before
+        || expected_checksum != descriptor.checksum_after
+    {
         return Err(ArchiveV3Error::Malformed("WAL effective length"));
     }
     Ok(())
@@ -690,6 +929,31 @@ fn encode_reference(out: &mut Vec<u8>, reference: &ImmutableReference) {
     out.extend_from_slice(&reference.envelope_hash);
 }
 
+fn invalid_reference(reference: &ImmutableReference) -> bool {
+    reference.object_id.as_bytes().iter().all(|byte| *byte == 0)
+        || reference.envelope_hash.iter().all(|byte| *byte == 0)
+}
+
+fn invalid_parent(reference: &ParentReference) -> bool {
+    reference.object_id.as_bytes().iter().all(|byte| *byte == 0)
+        || reference.envelope_hash.iter().all(|byte| *byte == 0)
+}
+
+fn encode_parent(out: &mut Vec<u8>, reference: &ParentReference) {
+    out.extend_from_slice(reference.object_id.as_bytes());
+    out.extend_from_slice(&reference.envelope_hash);
+}
+
+fn encode_optional_parent(out: &mut Vec<u8>, reference: &Option<ParentReference>) {
+    match reference {
+        Some(reference) => {
+            out.push(1);
+            encode_parent(out, reference);
+        }
+        None => out.push(0),
+    }
+}
+
 fn encode_optional_reference(out: &mut Vec<u8>, reference: &Option<ImmutableReference>) {
     match reference {
         Some(reference) => {
@@ -705,6 +969,21 @@ fn decode_reference(input: &[u8], offset: &mut usize) -> Result<ImmutableReferen
         object_id: ObjectId::from_bytes(take_array(take(input, offset, 16)?)?),
         envelope_hash: take_array(take(input, offset, 32)?)?,
     })
+}
+
+fn decode_parent(input: &[u8], offset: &mut usize) -> Result<ParentReference> {
+    Ok(ParentReference {
+        object_id: ObjectId::from_bytes(take_array(take(input, offset, 16)?)?),
+        envelope_hash: take_array(take(input, offset, 32)?)?,
+    })
+}
+
+fn decode_optional_parent(input: &[u8], offset: &mut usize) -> Result<Option<ParentReference>> {
+    match take(input, offset, 1)?[0] {
+        0 => Ok(None),
+        1 => Ok(Some(decode_parent(input, offset)?)),
+        _ => Err(ArchiveV3Error::Malformed("WAL parent flag")),
+    }
 }
 
 fn decode_optional_reference(
@@ -847,6 +1126,16 @@ mod tests {
         assert_eq!(
             node.validate_for_context(&wrong),
             Err(ArchiveV3Error::InvalidContext)
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_obsolete_format_three_wire() {
+        let mut wire = leaf().encode().unwrap();
+        wire[8] = 3;
+        assert_eq!(
+            CheckpointManifestNode::decode(&wire),
+            Err(ArchiveV3Error::Malformed("checkpoint manifest header"))
         );
     }
 
@@ -1021,6 +1310,16 @@ mod tests {
     }
 
     #[test]
+    fn wal_segment_rejects_obsolete_format_three_wire() {
+        let mut wire = fixture_wal_segment().encode().unwrap();
+        wire[8] = 3;
+        assert_eq!(
+            WalSegment::decode(&wire),
+            Err(ArchiveV3Error::Malformed("WAL segment header"))
+        );
+    }
+
+    #[test]
     fn wal_segment_rejects_tamper_truncation_wrong_salt_and_noncommit_tail() {
         let segment = fixture_wal_segment();
         let mut tampered = segment.clone();
@@ -1150,24 +1449,36 @@ mod tests {
         };
         assert!(first.encode().unwrap().len() <= MAX_WAL_SEGMENT_BYTES);
         assert!(second.encode().unwrap().len() <= MAX_WAL_SEGMENT_BYTES);
-        let root = ArchiveRoot {
+        let descriptor = WalCommitDescriptor {
             root_seq: 7,
-            parent: Some(ParentReference {
+            owner_fencing_epoch: 11,
+            operation_id: [3; 16],
+            request_fingerprint: [4; 32],
+            checkpoint_root: reference(40),
+            parent_root: ParentReference {
                 object_id: ObjectId::from_bytes([9; 16]),
                 envelope_hash: [9; 32],
+            },
+            parent_root_parent: Some(ParentReference {
+                object_id: ObjectId::from_bytes([8; 16]),
+                envelope_hash: [8; 32],
             }),
-            database_epoch: DatabaseEpoch::from_bytes([2; 16]),
-            key_epoch: KeyEpoch::from_bytes([3; 16]),
-            owner_fencing_epoch: 11,
-            sqlite_page_size: SQLITE_PAGE_SIZE,
-            logical_file_length: 255 * u64::from(SQLITE_PAGE_SIZE),
-            user_schema_version: 4,
-            storage_format_version: ARCHIVE_FORMAT_VERSION,
+            previous_commit: None,
+            checkpoint_logical_file_length: 255 * u64::from(SQLITE_PAGE_SIZE),
+            before_logical_file_length: 255 * u64::from(SQLITE_PAGE_SIZE),
+            after_logical_file_length: 255 * u64::from(SQLITE_PAGE_SIZE),
             wal_generation: 3,
-            wal_segment_count: 2,
-            checkpoint_root: Some(reference(40)),
-            extent_tree_root: None,
-            wal_chain_root: Some(final_reference.clone()),
+            first_frame_no: 1,
+            wal_header_hash: Sha256::digest(wal_header).into(),
+            checksum_before: header_checksum,
+            checksum_after: second.terminal_checksum().unwrap(),
+            frame_count: 255,
+            commit_segment_count: 2,
+            cumulative_commit_count: 1,
+            cumulative_segment_count: 2,
+            commit_wal_bytes: (SQLITE_WAL_HEADER_BYTES + 255 * frame_bytes) as u64,
+            cumulative_wal_bytes: (SQLITE_WAL_HEADER_BYTES + 255 * frame_bytes) as u64,
+            final_segment: final_reference.clone(),
         };
         let resolved_first = resolve_wal_segment(
             &cipher,
@@ -1184,14 +1495,46 @@ mod tests {
         )
         .unwrap();
         let entries = [resolved_first.clone(), resolved_second.clone()];
-        assert_eq!(validate_wal_commit_chain(&root, &entries), Ok(()));
+        assert_eq!(validate_wal_commit_chain(&descriptor, &entries), Ok(()));
+        assert_eq!(
+            WalCommitDescriptor::decode(&descriptor.encode().unwrap()).unwrap(),
+            descriptor
+        );
+        let mut obsolete_descriptor = descriptor.encode().unwrap();
+        obsolete_descriptor[8] = 3;
+        assert_eq!(
+            WalCommitDescriptor::decode(&obsolete_descriptor),
+            Err(ArchiveV3Error::Malformed("WAL commit descriptor header"))
+        );
+        let bounded_descriptor = WalCommitDescriptor {
+            root_seq: u64::from(MAX_WAL_COMMITS_PER_ROOT),
+            previous_commit: Some(reference(44)),
+            cumulative_commit_count: MAX_WAL_COMMITS_PER_ROOT,
+            cumulative_segment_count: MAX_WAL_SEGMENTS_PER_ROOT,
+            cumulative_wal_bytes: MAX_WAL_TAIL_BYTES,
+            ..descriptor.clone()
+        };
+        assert_eq!(bounded_descriptor.validate(), Ok(()));
+        assert!(WalCommitDescriptor {
+            root_seq: u64::from(MAX_WAL_COMMITS_PER_ROOT) + 1,
+            cumulative_commit_count: MAX_WAL_COMMITS_PER_ROOT + 1,
+            ..bounded_descriptor.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(WalCommitDescriptor {
+            cumulative_wal_bytes: MAX_WAL_TAIL_BYTES + 1,
+            ..bounded_descriptor
+        }
+        .validate()
+        .is_err());
 
-        let inconsistent_length_root = ArchiveRoot {
-            logical_file_length: u64::from(SQLITE_PAGE_SIZE),
-            ..root.clone()
+        let inconsistent_length_descriptor = WalCommitDescriptor {
+            after_logical_file_length: u64::from(SQLITE_PAGE_SIZE),
+            ..descriptor.clone()
         };
         assert_eq!(
-            validate_wal_commit_chain(&inconsistent_length_root, &entries),
+            validate_wal_commit_chain(&inconsistent_length_descriptor, &entries),
             Err(ArchiveV3Error::Malformed("WAL effective length"))
         );
 
@@ -1212,15 +1555,15 @@ mod tests {
             },
         ];
         assert_eq!(
-            validate_wal_commit_chain(&root, &wrong_entries),
+            validate_wal_commit_chain(&descriptor, &wrong_entries),
             Err(ArchiveV3Error::Malformed("WAL chain continuity"))
         );
-        let wrong_root = ArchiveRoot {
-            wal_chain_root: Some(reference(99)),
-            ..root
+        let wrong_descriptor = WalCommitDescriptor {
+            final_segment: reference(99),
+            ..descriptor
         };
         assert_eq!(
-            validate_wal_commit_chain(&wrong_root, &entries),
+            validate_wal_commit_chain(&wrong_descriptor, &entries),
             Err(ArchiveV3Error::Malformed("WAL root chain"))
         );
     }

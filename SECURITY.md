@@ -493,13 +493,13 @@ and a persistent fixed-fanout encrypted manifest tree; neither the manifest root
 node grows with database size. Immutable WAL segments repeat the exact SQLite WAL header,
 carry the prior rolling-checksum state, and verify every frame salt and checksum. A large
 SQLite commit may span many bounded predecessor-linked segments; only the final segment
-may contain its commit frame, and the root fixes the exact final reference, WAL generation,
-and segment count. Chain validation rejects frame gaps, checksum discontinuity, wrong
-predecessors, root-sequence substitution, locally valid orphan candidates, and a commit
-marker anywhere but the final frame. These checks do not turn post-commit WAL-file
-scraping into a valid capture mechanism: Phase 1 still requires a SQLite VFS shim that
-observes the exact `xSync` boundary, plus independent shadow recovery and crash
-conformance.
+may contain its commit frame. Its format-v4 descriptor fixes the exact final reference and
+per-commit topology; the root fixes the exact descriptor tail, WAL generation, and cumulative
+counts. Chain validation rejects frame gaps, checksum discontinuity, wrong predecessors,
+root-sequence substitution, locally valid orphan candidates, and a commit marker anywhere but
+the final frame. These checks do not turn post-commit WAL-file scraping into a valid capture
+mechanism. The compiled inactive SQLite VFS shim observes the exact `xSync` boundary, but Phase 1
+authority still requires reviewed runtime integration plus independent crash and conformance gates.
 
 `src/archive_v3_genesis.rs` is a separately compiled but inactive restart-safe
 bootstrap seam. Its constructor accepts only a control-plane-supplied opaque
@@ -946,20 +946,35 @@ authority wires it.
 capture can now be split only at bounded SQLite frame boundaries into independently encrypted,
 predecessor-linked immutable WAL segments. Every create is followed by an exact readback,
 envelope-hash, AEAD-context, and format check before its reference can appear in a candidate root.
-That root retains the exact checkpoint base and final WAL reference; composition rejects a prior
-WAL chain or extent base so it cannot discard history. WAL page numbers and the final commit's
-page-count-derived length are bounded by the fixed 8,388,608-page/32-GiB ceiling; because the
-current root format has one logical length also used to derive checkpoint-manifest contexts, this
-slice rejects WAL growth and shrink unless that effective length exactly equals its checkpoint
-base. A future root-format revision must bind distinct checkpoint and post-WAL lengths before
-enabling growth or shrink. Capture frames, decoded segment frames, and transient encoded plaintext
-are zeroized when their owners drop. Recovery begins only with one
-witness-nominated root, requires its exact registry epoch/rotation/object/hash to match the
-already resolved verified cipher, authenticates that root plus every reverse predecessor link
-before a staging sink receives a byte, and never enumerates storage. This is still not an authority or
-restore path: no VFS capture is drained, no `Store`/provider/flag/route/startup path calls it,
-no local WAL is truncated, and no composite staging adapter yet atomically joins checkpoint and
-WAL recovery before exposing a database.
+The format-v4 root separately binds the checkpoint length, current logical length, exact checkpoint
+reference, exact commit-descriptor tail, and cumulative commit/segment/byte counts. Each bounded
+descriptor binds the exact checkpoint, authenticated parent and grandparent root commitments,
+previous descriptor, operation/fingerprint/fence, generation/header/checksum continuity, before
+and after lengths, frame and segment topology, cumulative counters, and final segment. Publication
+accepts an existing WAL lineage only after exact descriptor continuity validation, allowing
+authenticated multi-commit and generation-rollover histories without discarding their predecessor.
+It rejects an extent base. Before any lineage readback or immutable create, it derives the new
+commit's exact segment and byte totals with checked arithmetic and enforces at most 1,024 commits,
+16,384 segments, and 1 GiB of WAL tail per root (plus the independent 16-segment per-commit cap).
+WAL page numbers and each final commit's page-count-derived length remain bounded by the fixed
+8,388,608-page/32-GiB ceiling; distinct checkpoint and current lengths permit authenticated database
+growth and shrink without changing checkpoint-manifest contexts. Capture frames, decoded segment
+frames, and transient encoded plaintext are zeroized when their owners drop.
+
+Recovery begins only with one witness-nominated root, requires its exact registry
+epoch/rotation/object/hash to match the already resolved verified cipher, follows the exact reverse
+descriptor and segment chains without storage listing, and validates the complete bounded topology
+of all descriptors before a staging sink receives a byte. Each commit's complete segment chain is
+then validated before that commit is delivered, and any later failure aborts the sink. Generation
+boundaries are explicit. Composite recovery uses that same authenticated recovery root for both
+checkpoint and WAL, creates only a fresh random owner-private `/tmp` database, and checkpoints each
+recovered WAL generation on a blocking lane.
+It requires both SQLite sidecars to be absent before an unforgeable module-private proof can transfer
+the staged database to parity checking. The operation remains owned after caller cancellation; on
+failure or eventual task completion its owner removes the database, WAL, and shared-memory sidecar,
+and the returned staged capability also owns family cleanup. This is still not an authority or
+restore path: no VFS capture is drained, no `Store`/provider/flag/route/startup path calls it, and no
+local production WAL is truncated or mutated.
 
 ### T5 — Hypervisor or memory inspection
 

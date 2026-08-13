@@ -28,18 +28,21 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// Archive-v3 format version.  Decoders reject every other version.
-pub const ARCHIVE_FORMAT_VERSION: u8 = 3;
-const AAD_DOMAIN: &[u8] = b"kioku:archive:v3:aad\0";
+/// Archive-v3 format version. Decoders reject every other version. Version 4
+/// adds an authenticated bounded WAL-commit lineage and separates the base
+/// checkpoint length from the current SQLite length. No earlier archive-v3
+/// wire version was activated in production.
+pub const ARCHIVE_FORMAT_VERSION: u8 = 4;
+const AAD_DOMAIN: &[u8] = b"kioku:archive:v4:aad\0";
 // Domain/version/three opaque IDs/role, longest (checkpoint-chunk) tagged
 // location, object ID, parent tag, and full optional parent reference.
 const MAX_CANONICAL_AAD_BYTES: usize = AAD_DOMAIN.len() + 1 + (16 * 3) + 1 + 33 + 16 + 1 + 48;
-const HKDF_SALT: &[u8] = b"kioku:archive:v3:hkdf-sha256\0";
-const ENVELOPE_MAGIC: &[u8; 8] = b"KARCv3\0\0";
-const NODE_MAGIC: &[u8; 8] = b"KARNv3\0\0";
-const ROOT_MAGIC: &[u8; 8] = b"KARRv3\0\0";
-const KEY_REGISTRY_MAGIC: &[u8; 16] = b"KIOKU-KEYREG-v3\0";
-const KEY_REGISTRY_DOMAIN: &[u8] = b"kioku:archive:v3:kms-wrap\0";
+const HKDF_SALT: &[u8] = b"kioku:archive:v4:hkdf-sha256\0";
+const ENVELOPE_MAGIC: &[u8; 8] = b"KARCv4\0\0";
+const NODE_MAGIC: &[u8; 8] = b"KARNv4\0\0";
+const ROOT_MAGIC: &[u8; 8] = b"KARRv4\0\0";
+const KEY_REGISTRY_MAGIC: &[u8; 16] = b"KIOKU-KEYREG-v4\0";
+const KEY_REGISTRY_DOMAIN: &[u8] = b"kioku:archive:v4:kms-wrap\0";
 pub(crate) const KEY_REGISTRY_PLAINTEXT_BYTES: usize =
     KEY_REGISTRY_MAGIC.len() + 1 + 2 + KEY_REGISTRY_DOMAIN.len() + 16 + 1 + 16 + 8 + 32;
 pub const MAX_WRAPPED_KEY_REGISTRY_BYTES: usize = 16 * 1024;
@@ -70,6 +73,16 @@ pub const MAX_DATABASE_PAGES: u32 = 8_388_608;
 pub const MAX_DATABASE_BYTES: u64 = (MAX_DATABASE_PAGES as u64) * (SQLITE_PAGE_SIZE as u64);
 /// Exact count of 1 MiB extent slots inside the database ceiling.
 pub const MAX_DATABASE_EXTENT_SLOTS: u64 = MAX_DATABASE_BYTES / 1_048_576;
+/// A witnessed root may retain at most this many commits after its base
+/// checkpoint. The cap is format-authenticated and independent of runtime
+/// configuration.
+pub const MAX_WAL_COMMITS_PER_ROOT: u32 = 1_024;
+/// Each captured commit currently permits at most sixteen immutable segments.
+/// Keep the cumulative bound explicit in the root decoder as defense in depth.
+pub const MAX_WAL_SEGMENTS_PER_ROOT: u32 = MAX_WAL_COMMITS_PER_ROOT * 16;
+/// A new verified checkpoint is required before an authenticated WAL tail can
+/// exceed one GiB of conservative plaintext framing.
+pub const MAX_WAL_TAIL_BYTES: u64 = 1_073_741_824;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ArchiveV3Error {
@@ -162,6 +175,7 @@ pub enum ObjectRole {
     KeyRegistryV3 = 6,
     StagingV3 = 7,
     CheckpointManifestV3 = 8,
+    WalCommitDescriptorV3 = 9,
 }
 
 /// Key-registry namespaces are disjoint because archive and media DEKs may
@@ -220,6 +234,9 @@ pub enum LogicalLocation {
         range_start: u32,
         range_end: u32,
     },
+    WalCommitDescriptor {
+        root_seq: u64,
+    },
 }
 
 impl LogicalLocation {
@@ -241,7 +258,10 @@ impl LogicalLocation {
             (ObjectRole::WalSegmentV3, Self::Wal { .. })
             | (ObjectRole::RootV3, Self::Root { .. })
             | (ObjectRole::KeyRegistryV3, Self::KeyRegistry { .. })
-            | (ObjectRole::StagingV3, Self::Staging { .. }) => true,
+            | (ObjectRole::StagingV3, Self::Staging { .. })
+            | (ObjectRole::WalCommitDescriptorV3, Self::WalCommitDescriptor { root_seq: 1.. }) => {
+                true
+            }
             (
                 ObjectRole::CheckpointManifestV3,
                 Self::CheckpointManifest {
@@ -338,6 +358,10 @@ impl LogicalLocation {
                 out.push(*level);
                 push_u32(out, *range_start);
                 push_u32(out, *range_end);
+            }
+            Self::WalCommitDescriptor { root_seq } => {
+                out.push(9);
+                push_u64(out, *root_seq);
             }
         }
     }
@@ -455,6 +479,7 @@ impl ObjectContext {
             6 => ObjectRole::KeyRegistryV3,
             7 => ObjectRole::StagingV3,
             8 => ObjectRole::CheckpointManifestV3,
+            9 => ObjectRole::WalCommitDescriptorV3,
             _ => return Err(ArchiveV3Error::Malformed("object context role")),
         };
         let location = match take(input, &mut offset, 1)?[0] {
@@ -496,6 +521,9 @@ impl ObjectContext {
                 level: take(input, &mut offset, 1)?[0],
                 range_start: take_u32(input, &mut offset)?,
                 range_end: take_u32(input, &mut offset)?,
+            },
+            9 => LogicalLocation::WalCommitDescriptor {
+                root_seq: take_u64(input, &mut offset)?,
             },
             _ => return Err(ArchiveV3Error::Malformed("object context location")),
         };
@@ -581,6 +609,9 @@ impl ObjectContext {
                     "archive/v3/{archive}/checkpoints/{database_epoch}/{checkpoint}/manifest/{level}-{range_start}-{range_end}-{object}.cmfx"
                 )
             }
+            LogicalLocation::WalCommitDescriptor { root_seq } => format!(
+                "archive/v3/{archive}/wal-commits/{database_epoch}/{root_seq}-{object}.wcdx"
+            ),
         };
         ObjectKey {
             canonical: name,
@@ -1416,19 +1447,27 @@ pub struct ArchiveRoot {
     pub key_epoch: KeyEpoch,
     pub owner_fencing_epoch: u64,
     pub sqlite_page_size: u32,
+    /// Exact length authenticated by the base checkpoint manifest. This stays
+    /// fixed while WAL commits grow or shrink the current database.
+    pub checkpoint_logical_file_length: u64,
+    /// SQLite length after the final authenticated WAL commit, or the base
+    /// checkpoint length when no WAL lineage is present.
     pub logical_file_length: u64,
     pub user_schema_version: u32,
     pub storage_format_version: u8,
-    /// Zero when no WAL chain is present. A non-zero generation and segment
-    /// count let recovery construct the exact final-segment context without
-    /// listing immutable storage.
+    /// Zero when no WAL lineage is present. Non-zero cumulative counters are
+    /// authenticated in both this root and every commit descriptor.
     pub wal_generation: u64,
+    pub wal_commit_count: u32,
     pub wal_segment_count: u32,
+    pub wal_tail_bytes: u64,
     /// Reference to a future bounded/streaming checkpoint-manifest object.
     /// This foundation intentionally cannot create a monolithic checkpoint.
     pub checkpoint_root: Option<ImmutableReference>,
     pub extent_tree_root: Option<ImmutableReference>,
-    pub wal_chain_root: Option<ImmutableReference>,
+    /// Exact tail commit descriptor. Recovery walks only its authenticated
+    /// predecessors and never selects a WAL object by enumeration.
+    pub wal_commit_tail: Option<ImmutableReference>,
 }
 
 impl ArchiveRoot {
@@ -1437,12 +1476,17 @@ impl ArchiveRoot {
             return Err(ArchiveV3Error::Malformed("SQLite page size"));
         }
         if !self
-            .logical_file_length
+            .checkpoint_logical_file_length
             .is_multiple_of(u64::from(self.sqlite_page_size))
+            || !self
+                .logical_file_length
+                .is_multiple_of(u64::from(self.sqlite_page_size))
         {
             return Err(ArchiveV3Error::Malformed("logical file length"));
         }
-        if self.logical_file_length > MAX_DATABASE_BYTES {
+        if self.checkpoint_logical_file_length > MAX_DATABASE_BYTES
+            || self.logical_file_length > MAX_DATABASE_BYTES
+        {
             return Err(ArchiveV3Error::TooLarge("SQLite database"));
         }
         if self.storage_format_version != ARCHIVE_FORMAT_VERSION {
@@ -1454,18 +1498,39 @@ impl ArchiveRoot {
         if self.root_seq > 0 && self.parent.is_none() {
             return Err(ArchiveV3Error::Malformed("root parent"));
         }
-        if self.wal_chain_root.is_some() && self.checkpoint_root.is_none() {
+        if self.wal_commit_tail.is_some() && self.checkpoint_root.is_none() {
             return Err(ArchiveV3Error::Malformed("WAL root without checkpoint"));
         }
         if !matches!(
             (
-                self.wal_chain_root.is_some(),
+                self.wal_commit_tail.is_some(),
                 self.wal_generation,
+                self.wal_commit_count,
                 self.wal_segment_count,
+                self.wal_tail_bytes,
             ),
-            (false, 0, 0) | (true, 1.., 1..)
+            (false, 0, 0, 0, 0) | (true, 1.., 1.., 1.., 1..)
         ) {
             return Err(ArchiveV3Error::Malformed("WAL root descriptor"));
+        }
+        if self.wal_commit_tail.is_some()
+            && (self.checkpoint_logical_file_length == 0
+                || self.logical_file_length == 0
+                || u64::from(self.wal_commit_count) > self.root_seq
+                || self.extent_tree_root.is_some()
+                || self.wal_commit_count > MAX_WAL_COMMITS_PER_ROOT
+                || self.wal_segment_count > MAX_WAL_SEGMENTS_PER_ROOT
+                || self.wal_segment_count < self.wal_commit_count
+                || self.wal_tail_bytes > MAX_WAL_TAIL_BYTES)
+        {
+            return Err(ArchiveV3Error::TooLarge("WAL lineage"));
+        }
+        if self.wal_commit_tail.is_none()
+            && ((self.checkpoint_root.is_some()
+                && self.checkpoint_logical_file_length != self.logical_file_length)
+                || (self.checkpoint_root.is_none() && self.checkpoint_logical_file_length != 0))
+        {
+            return Err(ArchiveV3Error::Malformed("checkpoint file length"));
         }
         if self.logical_file_length > 0
             && self.checkpoint_root.is_none()
@@ -1501,15 +1566,18 @@ impl ArchiveRoot {
         out.extend_from_slice(self.key_epoch.as_bytes());
         push_u64(&mut out, self.owner_fencing_epoch);
         push_u32(&mut out, self.sqlite_page_size);
+        push_u64(&mut out, self.checkpoint_logical_file_length);
         push_u64(&mut out, self.logical_file_length);
         push_u32(&mut out, self.user_schema_version);
         out.push(self.storage_format_version);
         push_u64(&mut out, self.wal_generation);
+        push_u32(&mut out, self.wal_commit_count);
         push_u32(&mut out, self.wal_segment_count);
+        push_u64(&mut out, self.wal_tail_bytes);
         encode_optional_parent(&mut out, &self.parent);
         encode_optional_reference(&mut out, &self.checkpoint_root);
         encode_optional_reference(&mut out, &self.extent_tree_root);
-        encode_optional_reference(&mut out, &self.wal_chain_root);
+        encode_optional_reference(&mut out, &self.wal_commit_tail);
         if out.len() > MAX_ROOT_BYTES {
             return Err(ArchiveV3Error::TooLarge("root"));
         }
@@ -1520,7 +1588,7 @@ impl ArchiveRoot {
         if input.len() > MAX_ROOT_BYTES {
             return Err(ArchiveV3Error::TooLarge("root"));
         }
-        if input.len() < 90 || &input[..8] != ROOT_MAGIC || input[8] != ARCHIVE_FORMAT_VERSION {
+        if input.len() < 110 || &input[..8] != ROOT_MAGIC || input[8] != ARCHIVE_FORMAT_VERSION {
             return Err(ArchiveV3Error::Malformed("root header"));
         }
         let mut offset = 9;
@@ -1529,17 +1597,20 @@ impl ArchiveRoot {
         let key_epoch = object_id_from_slice(take(input, &mut offset, 16)?)?;
         let owner_fencing_epoch = take_u64(input, &mut offset)?;
         let sqlite_page_size = take_u32(input, &mut offset)?;
+        let checkpoint_logical_file_length = take_u64(input, &mut offset)?;
         let logical_file_length = take_u64(input, &mut offset)?;
         let user_schema_version = take_u32(input, &mut offset)?;
         let storage_format_version = *take(input, &mut offset, 1)?
             .first()
             .ok_or(ArchiveV3Error::Malformed("root format"))?;
         let wal_generation = take_u64(input, &mut offset)?;
+        let wal_commit_count = take_u32(input, &mut offset)?;
         let wal_segment_count = take_u32(input, &mut offset)?;
+        let wal_tail_bytes = take_u64(input, &mut offset)?;
         let parent = decode_optional_parent(input, &mut offset)?;
         let checkpoint_root = decode_optional_reference(input, &mut offset)?;
         let extent_tree_root = decode_optional_reference(input, &mut offset)?;
-        let wal_chain_root = decode_optional_reference(input, &mut offset)?;
+        let wal_commit_tail = decode_optional_reference(input, &mut offset)?;
         if offset != input.len() {
             return Err(ArchiveV3Error::Malformed("root trailing bytes"));
         }
@@ -1550,14 +1621,17 @@ impl ArchiveRoot {
             key_epoch: KeyEpoch::from_bytes(*key_epoch.as_bytes()),
             owner_fencing_epoch,
             sqlite_page_size,
+            checkpoint_logical_file_length,
             logical_file_length,
             user_schema_version,
             storage_format_version,
             wal_generation,
+            wal_commit_count,
             wal_segment_count,
+            wal_tail_bytes,
             checkpoint_root,
             extent_tree_root,
-            wal_chain_root,
+            wal_commit_tail,
         };
         root.validate()?;
         Ok(root)
@@ -1922,6 +1996,17 @@ mod tests {
         trailing.push(0);
         assert!(ObjectContext::decode_canonical_aad(&trailing).is_err());
     }
+
+    #[test]
+    fn object_context_rejects_obsolete_format_three_aad() {
+        let mut aad = extent_context(4).canonical_aad();
+        aad[AAD_DOMAIN.len()] = 3;
+        assert_eq!(
+            ObjectContext::decode_canonical_aad(&aad),
+            Err(ArchiveV3Error::Malformed("object context version"))
+        );
+    }
+
     fn cipher() -> ArchiveCipher {
         ArchiveCipher::new(ArchiveDek::from_bytes([9; 32]))
     }
@@ -2017,6 +2102,20 @@ mod tests {
         let decoded = CiphertextEnvelope::decode(&wire).unwrap();
         assert_eq!(cipher.open(&context, &decoded).unwrap(), plaintext);
         assert_eq!(context.object_key().as_str(), "archive/v3/01010101010101010101010101010101/extents/02020202020202020202020202020202/9/04040404040404040404040404040404.extx");
+    }
+
+    #[test]
+    fn ciphertext_envelope_rejects_obsolete_format_three_wire() {
+        let context = extent_context(4);
+        let mut wire = cipher()
+            .seal(&context, &extent_payload(42))
+            .unwrap()
+            .encode();
+        wire[8] = 3;
+        assert_eq!(
+            CiphertextEnvelope::decode(&wire),
+            Err(ArchiveV3Error::Malformed("envelope version"))
+        );
     }
 
     #[test]
@@ -2358,6 +2457,44 @@ mod tests {
     }
 
     #[test]
+    fn key_registry_plaintext_rejects_obsolete_format_three_wire() {
+        let (archive, _, key_epoch) = ids();
+        let registry = KeyRegistryContext::new(archive, KeyKind::Archive, key_epoch);
+        let mut plaintext =
+            KeyRegistryPlaintext::encode_archive(&registry, &ArchiveDek::from_bytes([9; 32]))
+                .unwrap();
+        plaintext[KEY_REGISTRY_MAGIC.len()] = 3;
+        assert!(matches!(
+            KeyRegistryPlaintext::decode_verified(plaintext, &registry),
+            Err(ArchiveV3Error::Malformed("key registry version"))
+        ));
+    }
+
+    #[test]
+    fn merkle_node_rejects_obsolete_format_three_wire() {
+        let leaf = MerkleNode {
+            level: 0,
+            range_start: 0,
+            range_end: 8,
+            entries: MerkleEntries::Leaf(vec![ExtentReference {
+                extent_no: 3,
+                logical_byte_len: SQLITE_PAGE_SIZE,
+                revision: 7,
+                reference: ImmutableReference {
+                    object_id: ObjectId::from_bytes([4; 16]),
+                    envelope_hash: [5; 32],
+                },
+            }]),
+        };
+        let mut wire = leaf.encode().unwrap();
+        wire[8] = 3;
+        assert_eq!(
+            MerkleNode::decode(&wire),
+            Err(ArchiveV3Error::Malformed("node header"))
+        );
+    }
+
+    #[test]
     fn nodes_and_roots_reject_malformed_oversized_and_inconsistent_shapes() {
         let leaf = MerkleNode {
             level: 0,
@@ -2471,19 +2608,55 @@ mod tests {
             key_epoch: KeyEpoch::from_bytes([3; 16]),
             owner_fencing_epoch: 9,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 8192,
             logical_file_length: 8192,
             user_schema_version: 4,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: Some(ImmutableReference {
                 object_id: ObjectId::from_bytes([6; 16]),
                 envelope_hash: [6; 32],
             }),
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         assert_eq!(ArchiveRoot::decode(&root.encode().unwrap()).unwrap(), root);
+        let mut obsolete_wire = root.encode().unwrap();
+        obsolete_wire[8] = 3;
+        assert_eq!(
+            ArchiveRoot::decode(&obsolete_wire),
+            Err(ArchiveV3Error::Malformed("root header"))
+        );
+        let bounded_wal_root = ArchiveRoot {
+            root_seq: u64::from(MAX_WAL_COMMITS_PER_ROOT),
+            wal_generation: 1,
+            wal_commit_count: MAX_WAL_COMMITS_PER_ROOT,
+            wal_segment_count: MAX_WAL_COMMITS_PER_ROOT,
+            wal_tail_bytes: MAX_WAL_TAIL_BYTES,
+            wal_commit_tail: Some(ImmutableReference {
+                object_id: ObjectId::from_bytes([7; 16]),
+                envelope_hash: [7; 32],
+            }),
+            ..root.clone()
+        };
+        assert_eq!(bounded_wal_root.validate(), Ok(()));
+        assert!(ArchiveRoot {
+            wal_commit_count: MAX_WAL_COMMITS_PER_ROOT + 1,
+            wal_segment_count: MAX_WAL_COMMITS_PER_ROOT + 1,
+            root_seq: u64::from(MAX_WAL_COMMITS_PER_ROOT) + 1,
+            ..bounded_wal_root.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ArchiveRoot {
+            wal_tail_bytes: MAX_WAL_TAIL_BYTES + 1,
+            ..bounded_wal_root
+        }
+        .validate()
+        .is_err());
         let over_cap_root = ArchiveRoot {
             logical_file_length: MAX_DATABASE_BYTES + u64::from(SQLITE_PAGE_SIZE),
             ..root.clone()
@@ -2545,7 +2718,7 @@ mod tests {
         );
         let wal_without_checkpoint = ArchiveRoot {
             checkpoint_root: None,
-            wal_chain_root: Some(ImmutableReference {
+            wal_commit_tail: Some(ImmutableReference {
                 object_id: ObjectId::from_bytes([7; 16]),
                 envelope_hash: [7; 32],
             }),

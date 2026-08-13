@@ -4862,17 +4862,20 @@ mod tests {
             key_epoch: crate::archive_v3::KeyEpoch::from_bytes(binding.key_epoch()),
             owner_fencing_epoch: binding.owner_fence(),
             sqlite_page_size: crate::archive_v3::SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: binding.plaintext_len(),
             user_schema_version: 1,
             storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: Some(crate::archive_v3::ImmutableReference {
                 object_id: ObjectId::from_bytes([0x71; 16]),
                 envelope_hash: [0x72; 32],
             }),
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         LegacyExtentRootAdmission::from_validated_root_for_test(
             &root,

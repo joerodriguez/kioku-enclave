@@ -352,14 +352,17 @@ impl<'a, R: PinnedLegacyRangeReader> LegacyExtentCandidateCoordinator<'a, R> {
             key_epoch: crate::archive_v3::KeyEpoch::from_bytes(attempt.binding.key_epoch()),
             owner_fencing_epoch: attempt.binding.owner_fence(),
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: plaintext_len,
             user_schema_version,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: Some(tree.root().clone()),
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let context = ObjectContext::new(
             before.archive_id(),
@@ -1000,14 +1003,17 @@ mod tests {
             key_epoch,
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: 0,
             user_schema_version: 70,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let base_envelope = cipher
             .seal(&base_context, &base_root.encode().unwrap())
@@ -1110,14 +1116,17 @@ mod tests {
             key_epoch,
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: 0,
             user_schema_version: base_schema,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let envelope = cipher.seal(&context, &root.encode().unwrap()).unwrap();
         if !matches!(base_fault, BaseFault::Missing) {
@@ -1372,14 +1381,17 @@ mod tests {
             key_epoch,
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: 0,
             user_schema_version: 70,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let base_envelope = cipher
             .seal(&base_context, &base_root.encode().unwrap())
@@ -1636,14 +1648,17 @@ mod tests {
             key_epoch,
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: 0,
             user_schema_version: 70,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let base_envelope = cipher
             .seal(&base_context, &base_root.encode().unwrap())
@@ -1752,7 +1767,7 @@ mod tests {
         assert_eq!(root.storage_format_version, ARCHIVE_FORMAT_VERSION);
         assert_eq!((root.wal_generation, root.wal_segment_count), (0, 0));
         assert!(root.checkpoint_root.is_none());
-        assert!(root.wal_chain_root.is_none());
+        assert!(root.wal_commit_tail.is_none());
         assert!(root.extent_tree_root.is_some());
     }
 

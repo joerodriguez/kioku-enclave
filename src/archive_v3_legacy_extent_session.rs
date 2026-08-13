@@ -236,9 +236,11 @@ impl LegacyExtentRootAdmission {
             || root.storage_format_version != binding.archive_format_version
             || root.extent_tree_root.is_none()
             || root.checkpoint_root.is_some()
-            || root.wal_chain_root.is_some()
+            || root.wal_commit_tail.is_some()
             || root.wal_generation != 0
+            || root.wal_commit_count != 0
             || root.wal_segment_count != 0
+            || root.wal_tail_bytes != 0
             || !nonzero(&ciphertext_hash)
         {
             return Err(LegacyExtentSessionError::BindingConflict);
@@ -907,17 +909,20 @@ mod tests {
             key_epoch: crate::archive_v3::KeyEpoch::from_bytes(binding.key_epoch()),
             owner_fencing_epoch: binding.owner_fence(),
             sqlite_page_size: crate::archive_v3::SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: binding.plaintext_len(),
             user_schema_version: 1,
             storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: Some(crate::archive_v3::ImmutableReference {
                 object_id: crate::archive_v3::ObjectId::from_bytes([14; 16]),
                 envelope_hash: [15; 32],
             }),
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         (root, context)
     }
@@ -1009,14 +1014,21 @@ mod tests {
         .is_err());
 
         let mut wal = root;
-        let reference = crate::archive_v3::ImmutableReference {
+        wal.extent_tree_root = None;
+        wal.checkpoint_logical_file_length = binding.plaintext_len();
+        wal.checkpoint_root = Some(crate::archive_v3::ImmutableReference {
             object_id: crate::archive_v3::ObjectId::from_bytes([20; 16]),
             envelope_hash: [21; 32],
-        };
-        wal.checkpoint_root = Some(reference.clone());
-        wal.wal_chain_root = Some(reference);
+        });
+        wal.wal_commit_tail = Some(crate::archive_v3::ImmutableReference {
+            object_id: crate::archive_v3::ObjectId::from_bytes([22; 16]),
+            envelope_hash: [23; 32],
+        });
         wal.wal_generation = 1;
+        wal.wal_commit_count = 1;
         wal.wal_segment_count = 1;
+        wal.wal_tail_bytes = u64::from(32 + 24 + crate::archive_v3::SQLITE_PAGE_SIZE);
+        assert!(wal.validate_for_context(&context).is_ok());
         assert!(LegacyExtentRootAdmission::from_validated_root_for_test(
             &wal, &context, [16; 32], binding
         )

@@ -2807,14 +2807,17 @@ mod tests {
             key_epoch: r.registry.key_epoch,
             owner_fencing_epoch: lease.fencing_epoch,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: 0,
             user_schema_version: 1,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let envelope = cipher.seal(&context, &root.encode().unwrap()).unwrap();
         let missing_provider = FakeRootProvider {
@@ -2911,14 +2914,17 @@ mod tests {
             key_epoch,
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: 0,
             user_schema_version: 1,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let registry = KeyRegistryReference::new(
             key_epoch,

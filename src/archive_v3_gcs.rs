@@ -674,6 +674,12 @@ pub(super) fn canonical_object_id(key: &str) -> Option<ObjectId> {
                 .then(|| hyphenated_terminal_id(terminal, ".walx"))
                 .flatten()
         }
+        "wal-commits" => {
+            let (epoch, terminal) = (components.next()?, components.next()?);
+            (is_lower_hex_len(epoch, 32) && components.next().is_none())
+                .then(|| hyphenated_terminal_id(terminal, ".wcdx"))
+                .flatten()
+        }
         "nodes" => {
             let (epoch, level, terminal) =
                 (components.next()?, components.next()?, components.next()?);
@@ -1090,6 +1096,31 @@ mod tests {
         ArchiveCipher::new(ArchiveDek::from_bytes([9; 32]))
             .seal(context, &vec![byte; 4096])
             .unwrap()
+    }
+
+    #[test]
+    fn wal_commit_descriptor_keys_are_exact_and_noncanonical_forms_fail_closed() {
+        let object_id = ObjectId::from_bytes([0x0a; 16]);
+        let context = ObjectContext::new(
+            ArchiveId::from_bytes([1; 16]),
+            DatabaseEpoch::from_bytes([2; 16]),
+            KeyEpoch::from_bytes([3; 16]),
+            ObjectRole::WalCommitDescriptorV3,
+            LogicalLocation::WalCommitDescriptor { root_seq: 17 },
+            object_id,
+            None,
+        )
+        .unwrap();
+        let key = context.object_key();
+        assert_eq!(canonical_object_id(key.as_str()), Some(object_id));
+        assert_eq!(
+            canonical_object_id(&key.as_str().replace("/17-", "/017-")),
+            None
+        );
+        assert_eq!(
+            canonical_object_id(&key.as_str().replace("0a0a", "0A0A")),
+            None
+        );
     }
 
     #[tokio::test]
