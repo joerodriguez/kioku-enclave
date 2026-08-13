@@ -526,6 +526,7 @@ impl InventoryPage {
     ) -> Result<Self, LifecycleError> {
         if entries.is_empty()
             || entries.len() > MAX_LIFECYCLE_PAGE_ENTRIES
+            || usize::try_from(page_ordinal).map_or(true, |ordinal| ordinal >= MAX_LIFECYCLE_PAGES)
             || (page_ordinal == 0) != (previous_hash == ZERO_HASH)
         {
             return Err(LifecycleError::Malformed);
@@ -563,6 +564,7 @@ impl InventoryPage {
         if archive_id != expected_archive
             || entry_count == 0
             || entry_count > MAX_LIFECYCLE_PAGE_ENTRIES
+            || usize::try_from(page_ordinal).map_or(true, |ordinal| ordinal >= MAX_LIFECYCLE_PAGES)
             || (page_ordinal == 0) != (previous_hash == ZERO_HASH)
         {
             return Err(LifecycleError::Corrupt);
@@ -665,6 +667,22 @@ pub(crate) struct DurableInventoryPage {
 }
 
 impl DurableInventoryPage {
+    /// Minted only by the encrypted external page producer after the exact
+    /// object has been read back, authenticated, decoded, and matched to its
+    /// complete control-anchor reference.
+    pub(crate) fn from_authenticated_external_readback(
+        _producer: &crate::archive_v3_lifecycle_page_store::AuthenticatedPageReadback,
+        reference: InventoryPageReference,
+        page: InventoryPage,
+    ) -> Result<Self, LifecycleError> {
+        if page.reference() != reference
+            || InventoryPage::decode(reference.archive_id(), page.encoded())? != page
+        {
+            return Err(LifecycleError::ChainMismatch);
+        }
+        Ok(Self { page })
+    }
+
     #[cfg(test)]
     pub(crate) fn from_exact_readback(
         page: InventoryPage,
@@ -716,6 +734,7 @@ impl InventoryPageReference {
         if !nonzero(page_id.as_bytes())
             || !nonzero(&page_hash)
             || encoded_len == 0
+            || usize::try_from(page_ordinal).map_or(true, |ordinal| ordinal >= MAX_LIFECYCLE_PAGES)
             || usize::try_from(encoded_len).map_or(true, |len| len > MAX_LIFECYCLE_PAGE_BYTES)
             || (page_ordinal == 0) != (previous_hash == ZERO_HASH)
             || page_id != object_id_from_hash(page_hash)?
@@ -763,6 +782,7 @@ impl InventoryPageReference {
         if !nonzero(page_id.as_bytes())
             || !nonzero(&page_hash)
             || encoded_len == 0
+            || usize::try_from(page_ordinal).map_or(true, |ordinal| ordinal >= MAX_LIFECYCLE_PAGES)
             || usize::try_from(encoded_len).map_or(true, |len| len > MAX_LIFECYCLE_PAGE_BYTES)
             || (page_ordinal == 0) != (previous_hash == ZERO_HASH)
             || page_id != object_id_from_hash(page_hash)?
@@ -1193,30 +1213,31 @@ pub(crate) struct ErasedInventoryPages {
 }
 
 impl ErasedInventoryPages {
+    /// Minted only by the external lifecycle-page store after it has verified
+    /// all live, noncurrent, and soft-deleted generations absent for every
+    /// exact page name authorized by the durable control completion.
+    pub(crate) fn from_authenticated_external_absence(
+        _producer: &crate::archive_v3_lifecycle_page_store::AuthenticatedPageAbsence,
+        completion: &DurablePhysicalCompletion,
+        references: &[InventoryPageReference],
+    ) -> Result<Self, LifecycleError> {
+        Self::validated(completion, references)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_exact_absence(
         completion: &DurablePhysicalCompletion,
         references: &[InventoryPageReference],
     ) -> Result<Self, LifecycleError> {
+        Self::validated(completion, references)
+    }
+
+    fn validated(
+        completion: &DurablePhysicalCompletion,
+        references: &[InventoryPageReference],
+    ) -> Result<Self, LifecycleError> {
+        validate_cleanup_page_chain(completion, references)?;
         let seal = completion.physical_receipt().seal();
-        if references.is_empty()
-            || usize::try_from(seal.page_count()).ok() != Some(references.len())
-        {
-            return Err(LifecycleError::ChainMismatch);
-        }
-        let mut previous = ZERO_HASH;
-        for (index, reference) in references.iter().enumerate() {
-            if reference.archive_id() != seal.archive_id()
-                || usize::try_from(reference.page_ordinal()).ok() != Some(index)
-                || reference.previous_hash() != previous
-            {
-                return Err(LifecycleError::ChainMismatch);
-            }
-            previous = reference.page_hash();
-        }
-        if previous != seal.terminal_page_hash() {
-            return Err(LifecycleError::ChainMismatch);
-        }
         Ok(Self {
             archive_id: seal.archive_id(),
             deletion_fence: seal.deletion_fence(),
@@ -1234,6 +1255,32 @@ impl ErasedInventoryPages {
             && self.page_count == seal.page_count()
             && self.terminal_page_hash == seal.terminal_page_hash()
     }
+}
+
+/// Validate the complete sealed chain before the page-store implementation
+/// performs its first destructive request. This grants no deletion receipt.
+pub(crate) fn validate_cleanup_page_chain(
+    completion: &DurablePhysicalCompletion,
+    references: &[InventoryPageReference],
+) -> Result<(), LifecycleError> {
+    let seal = completion.physical_receipt().seal();
+    if references.is_empty() || usize::try_from(seal.page_count()).ok() != Some(references.len()) {
+        return Err(LifecycleError::ChainMismatch);
+    }
+    let mut previous = ZERO_HASH;
+    for (index, reference) in references.iter().enumerate() {
+        if reference.archive_id() != seal.archive_id()
+            || usize::try_from(reference.page_ordinal()).ok() != Some(index)
+            || reference.previous_hash() != previous
+        {
+            return Err(LifecycleError::ChainMismatch);
+        }
+        previous = reference.page_hash();
+    }
+    if previous != seal.terminal_page_hash() {
+        return Err(LifecycleError::ChainMismatch);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for ErasedInventoryPages {
@@ -1323,6 +1370,25 @@ pub(crate) trait ArchiveLifecycleLedger: Send + Sync {
         expected_revision: u64,
         deletion_fence: ObjectId,
     ) -> Result<u64, LifecycleError>;
+
+    /// Atomically prove every create-ahead/witness admission is settled and
+    /// bind that immutable snapshot before any external inventory-page create.
+    /// Once this succeeds, artifact reconciliation must remain closed.
+    async fn freeze_inventory_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        deletion_fence: ObjectId,
+    ) -> Result<u64, LifecycleError>;
+
+    /// Recover the exact settled create-ahead portion of the frozen snapshot
+    /// after cancellation/restart. These values carry no provider authority;
+    /// page creation still requires a fresh durable page admission.
+    async fn load_inventory_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<(u64, Vec<PlannedArtifact>), LifecycleError>;
 
     async fn seal_inventory(
         &self,
@@ -1732,6 +1798,59 @@ mod tests {
         assert_eq!(seal.page_count(), 2);
         assert_eq!(seal.artifact_count(), 2);
         assert_ne!(seal.inventory_commitment(), ZERO_HASH);
+    }
+
+    #[test]
+    fn page_ordinal_cap_is_enforced_by_build_decode_and_persisted_reference() {
+        let archive = ArchiveId::from_bytes([16; 16]);
+        let previous = [0x55; 32];
+        let max_ordinal = u32::try_from(MAX_LIFECYCLE_PAGES - 1).unwrap();
+        let accepted = InventoryPage::build(
+            archive,
+            max_ordinal,
+            previous,
+            vec![artifact(
+                archive,
+                attempt(12),
+                max_ordinal,
+                15,
+                ArtifactCreateState::Created,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            InventoryPage::decode(archive, accepted.encoded()).unwrap(),
+            accepted
+        );
+        let rejected_ordinal = u32::try_from(MAX_LIFECYCLE_PAGES).unwrap();
+        assert!(InventoryPage::build(
+            archive,
+            rejected_ordinal,
+            previous,
+            vec![artifact(
+                archive,
+                attempt(12),
+                rejected_ordinal,
+                16,
+                ArtifactCreateState::Created,
+            )],
+        )
+        .is_err());
+        assert!(InventoryPageReference::for_test(
+            archive,
+            rejected_ordinal,
+            accepted.page_id(),
+            previous,
+            accepted.page_hash(),
+            accepted.encoded().len() as u32,
+        )
+        .is_err());
+
+        let mut tampered = accepted.encoded().to_vec();
+        let ordinal_offset = 4 + 2 + 16;
+        tampered[ordinal_offset..ordinal_offset + 4]
+            .copy_from_slice(&rejected_ordinal.to_be_bytes());
+        assert!(InventoryPage::decode(archive, &tampered).is_err());
     }
 
     #[test]

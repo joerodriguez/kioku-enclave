@@ -347,12 +347,45 @@ confirmed-absent rows remain deletion work. Canonical object-name parsing also b
 stored role, including the v3 WAL segment and WAL commit-descriptor roles, so relabeling an
 object cannot bypass registry-first erasure. Page reordering, truncation, cross-archive use,
 commitment rollback, or conflicting reuse of an object ID fails closed before destructive
-I/O. Existing account-deletion transactions atomically freeze an anchor if this inactive
-schema has one, but do not construct an archive provider or invoke archive-v3 I/O. No startup,
-Store, route, provider construction, or deployment configuration activates the lifecycle.
+I/O. The inactive external page-store seam derives an independent AES-256-GCM key for each
+complete page reference and deletion fence from a producer-sealed control DEK. Its strict
+versioned envelope authenticates the deterministic full-hash exact object name, archive,
+fence, ordinal, page ID, predecessor, hash, and encoded length. Conditional-create success,
+precondition failure, and ambiguous response can mint a durable receipt only after a bounded
+exact read decrypts and decodes to that same canonical page. The narrow transport has no list
+or overwrite operation. Cleanup first validates the complete sealed reference chain carried
+by a durable-control physical-completion receipt, then deletes every generation of each exact
+name and separately verifies live, noncurrent, and soft-deleted state absent before its private
+producer token can mint page absence. Cancellation leaves at most an immutable exact-name
+ciphertext that the same readback path reconciles. Exact retries reproduce the same ciphertext:
+the per-page HKDF key and separately domain-derived nonce both bind the complete immutable
+context, and that context's page hash fixes the plaintext, so a derived AES-GCM key is never
+used for a different context or plaintext. Before the first page admission, encrypted control
+requires every artifact and witness create admission/outcome-unknown state to be settled, advances
+the monotonic revision, and durably commits the exact canonical create-ahead/witness snapshot.
+That immutable boundary rejects later artifact reconciliation; page retries after cancellation or
+restart therefore rebuild the same plaintext/hash/ciphertext. Before any page request, encrypted
+control then durably records its exact reference as outcome-unknown; only authenticated exact
+readback advances that row to created. Because callers may otherwise choose a different page split
+after cancellation, encrypted control permits only one unresolved page per archive and temporarily
+retains that page's exact canonical bytes (at most 64 KiB). Restart recovers a producer-private
+ordered plan of created exact references plus those one unresolved bytes; alternate ordinal/hash/
+partition admission fails closed. Exact readback clears the temporary bytes immediately, so the
+control blob never accumulates the external inventory. Every page admission and the final seal
+reauthenticate the snapshot commitment. Sealing requires the complete exact Created set, and the same durable-control
+physical-completion snapshot freezes it. Cleanup additionally requires a provider-backed drain
+proving no already-submitted create for those exact names can still settle. This closes delayed
+create versus absence-proof resurrection across cancellation and process restart. Page ordinals
+are rejected at the 4,096-page cap by canonical construction/decoding, persisted-reference
+validation, encrypted-control constraints, and admission before remote I/O. Existing
+account-deletion transactions atomically freeze an anchor if this inactive schema has one, but
+do not construct an archive provider or invoke archive-v3 I/O. No startup, Store, route, provider
+construction, or deployment configuration activates the lifecycle.
 Producer-authorized recovery reads need only the opaque archive authority: after close/reopen
 they reconstruct the original reservation or exact prepared bytes from the anchor, never from
-caller-retained random IDs or ciphertext.
+caller-retained random IDs or ciphertext. The page seam likewise has no provider implementation,
+credential/config source, runtime construction, reachability walker, pre-witness coordinator,
+or production authority.
 Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
 rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
 source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the

@@ -15,6 +15,30 @@
 
 # ADR-0022 task evidence
 
+## Encrypted lifecycle page-store seam
+
+- [x] Added a strict versioned AES-256-GCM envelope with a control-DEK-derived
+  independent key, separately domain-derived retry-stable nonce, and AAD
+  covering the full exact page name, archive, deletion fence, ordinal, page
+  ID, predecessor, hash, and encoded length.
+- [x] Added deterministic exact-name immutable create plus authenticated exact
+  readback reconciliation; encrypted control durably admits every create as
+  outcome-unknown first, and sealing requires the complete exact Created set.
+- [x] Added a durable pre-page snapshot commitment that requires every artifact
+  and witness create to be settled, advances the exact revision, and rejects
+  later artifact reconciliation so cancellation/restart cannot change page bytes.
+- [x] Persisted the sole unresolved page's exact bounded bytes and ordered split
+  until authenticated readback; restart recovers that exact typed plan and
+  conflicting partitions fail before remote I/O.
+- [x] Bound exact all-generation and soft-delete absence cleanup to durable
+  control physical completion, a frozen/drained prior-create proof, and
+  producer-private durable/absence receipts.
+- [x] Kept the seam construction-only: no concrete provider, credential,
+  runtime/startup/Store/route wiring, reachability walker, pre-witness
+  coordinator, cloud mutation, or deployment authority was added.
+
+This compiled seam does not authorize archive-v3 persistence or deletion.
+
 ## Firestore transport-probe release boundary
 
 - [x] Made one exact checked-in, non-secret probe profile the sole input to both build
