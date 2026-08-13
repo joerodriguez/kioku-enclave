@@ -46,11 +46,30 @@ const CONTROL_CONTEXT: &[u8] = b"control-db\0control/control.db.enc";
 const MAX_PENDING_RECORDING_LEASE_REQUESTS_PER_USER: i64 = 1;
 const MAX_RECORDING_LEASE_DENIALS_PER_USER: i64 = 100;
 const RECORDING_LEASE_DURATION_MS: i64 = 60_000;
+const RECORDING_DELIVERY_EVENTS_PER_MINUTE: i64 = 120;
+const RECORDING_DELIVERY_BYTES_PER_MINUTE: i64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_DELETION_CURSOR_BYTES: usize = 4 * 1024;
 const MAX_ARCHIVE_ID_CANDIDATES: usize = 8;
 const LIFECYCLE_REGISTRY_ORDINAL: u32 = 0;
 const LIFECYCLE_ROOT_ORDINAL: u32 = 1;
 const LIFECYCLE_WITNESS_ORDINAL: u32 = 2;
+
+fn grant_recording_delivery_minute(tx: &rusqlite::Transaction<'_>, user_id: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO recording_delivery_balances (user_id,event_credits,byte_credits)
+         VALUES (?1,?2,?3)
+         ON CONFLICT(user_id) DO UPDATE SET
+           event_credits=event_credits+excluded.event_credits,
+           byte_credits=byte_credits+excluded.byte_credits,
+           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        rusqlite::params![
+            user_id,
+            RECORDING_DELIVERY_EVENTS_PER_MINUTE,
+            RECORDING_DELIVERY_BYTES_PER_MINUTE
+        ],
+    )?;
+    Ok(())
+}
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -151,6 +170,28 @@ CREATE TABLE IF NOT EXISTS recording_lease_denials (
     expires_at   TEXT NOT NULL,
     denial_code  TEXT NOT NULL,
     summary_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (user_id, request_id)
+);
+-- A paid live lease or reconciled offline minute grants a bounded amount of
+-- delayed Mac-outbox delivery. This separates capture metering from network
+-- transfer time without allowing an unbounded inactive-lease upload path.
+CREATE TABLE IF NOT EXISTS recording_delivery_balances (
+    user_id       TEXT PRIMARY KEY,
+    event_credits INTEGER NOT NULL CHECK (event_credits >= 0),
+    byte_credits  INTEGER NOT NULL CHECK (byte_credits >= 0),
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS recording_delivery_reservations (
+    user_id        TEXT NOT NULL,
+    event_id       TEXT NOT NULL,
+    reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (user_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS offline_recording_usage_receipts (
+    user_id      TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (user_id, request_id)
 );
@@ -3235,6 +3276,18 @@ fn delete_user_identity_conn(
         "DELETE FROM recording_lease_denials WHERE user_id = ?1",
         [user_id],
     )?;
+    tx.execute(
+        "DELETE FROM recording_delivery_balances WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM recording_delivery_reservations WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM offline_recording_usage_receipts WHERE user_id = ?1",
+        [user_id],
+    )?;
     tx.execute("DELETE FROM query_log WHERE user_id = ?1", [user_id])?;
     tx.execute(
         "DELETE FROM webhook_subscriptions WHERE user_id = ?1",
@@ -4522,6 +4575,9 @@ impl ControlStore {
                             "query_log",
                             "vertex_coverage_anchors",
                             "recording_lease_denials",
+                            "recording_delivery_balances",
+                            "recording_delivery_reservations",
+                            "offline_recording_usage_receipts",
                             "webhook_subscriptions",
                             "episode_email_preferences",
                             "push_installations",
@@ -5343,6 +5399,130 @@ impl ControlStore {
         .await
     }
 
+    pub async fn offline_recording_usage_receipt(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<bool> {
+        let user_id = user_id.to_string();
+        let request_id = request_id.to_string();
+        self.read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM offline_recording_usage_receipts
+                     WHERE user_id=?1 AND request_id=?2",
+                    rusqlite::params![user_id, request_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+        .await
+    }
+
+    /// Records one billing-acknowledged offline minute and grants its bounded
+    /// delivery budget exactly once. A deterministic upstream duplicate after
+    /// response loss can safely call this method again.
+    pub async fn complete_offline_recording_usage(
+        &self,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<bool> {
+        let user_id = user_id.to_string();
+        let request_id = request_id.to_string();
+        self.write_if_changed(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO offline_recording_usage_receipts
+                 (user_id,request_id) VALUES (?1,?2)",
+                rusqlite::params![user_id, request_id],
+            )? != 0;
+            if inserted {
+                grant_recording_delivery_minute(&tx, &user_id)?;
+            }
+            tx.commit()?;
+            Ok((inserted, inserted))
+        })
+        .await
+    }
+
+    /// Reserves one bounded delayed-delivery slot for an encrypted Mac outbox
+    /// event. Repeating the same event is idempotent; a reference-to-canonical
+    /// rebase spends only the newly required byte delta.
+    pub async fn reserve_recording_delivery(
+        &self,
+        user_id: &str,
+        event_id: &str,
+        media_bytes: i64,
+    ) -> Result<bool> {
+        let user_id = user_id.to_string();
+        let event_id = event_id.to_string();
+        let media_bytes = media_bytes.max(0);
+        self.write_if_changed(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT reserved_bytes FROM recording_delivery_reservations
+                     WHERE user_id=?1 AND event_id=?2",
+                    rusqlite::params![user_id, event_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let (event_cost, byte_cost) = match existing {
+                Some(reserved) => (0, media_bytes.saturating_sub(reserved)),
+                None => (1, media_bytes),
+            };
+            let available: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT event_credits,byte_credits FROM recording_delivery_balances
+                     WHERE user_id=?1",
+                    [&user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((events, bytes)) = available else {
+                tx.rollback()?;
+                return Ok((false, false));
+            };
+            if events < event_cost || bytes < byte_cost {
+                tx.rollback()?;
+                return Ok((false, false));
+            }
+            if event_cost != 0 || byte_cost != 0 {
+                tx.execute(
+                    "UPDATE recording_delivery_balances
+                     SET event_credits=event_credits-?2,byte_credits=byte_credits-?3,
+                         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE user_id=?1",
+                    rusqlite::params![user_id, event_cost, byte_cost],
+                )?;
+                tx.execute(
+                    "INSERT INTO recording_delivery_reservations
+                     (user_id,event_id,reserved_bytes) VALUES (?1,?2,?3)
+                     ON CONFLICT(user_id,event_id) DO UPDATE
+                     SET reserved_bytes=MAX(reserved_bytes,excluded.reserved_bytes)",
+                    rusqlite::params![user_id, event_id, media_bytes],
+                )?;
+            }
+            tx.commit()?;
+            Ok((true, event_cost != 0 || byte_cost != 0))
+        })
+        .await
+    }
+
+    pub async fn complete_recording_delivery(&self, user_id: &str, event_id: &str) -> Result<()> {
+        let user_id = user_id.to_string();
+        let event_id = event_id.to_string();
+        self.write_if_changed(move |conn| {
+            let changed = conn.execute(
+                "DELETE FROM recording_delivery_reservations WHERE user_id=?1 AND event_id=?2",
+                rusqlite::params![user_id, event_id],
+            )? != 0;
+            Ok(((), changed))
+        })
+        .await
+    }
+
     pub async fn recording_lease_receipt(
         &self,
         user_id: &str,
@@ -5653,6 +5833,7 @@ impl ControlStore {
                  WHERE user_id=?1 AND request_id=?2 AND state='pending'",
                 rusqlite::params![user_id, request_id, summary],
             )?;
+            grant_recording_delivery_minute(&tx, &user_id)?;
             tx.execute(
                 "DELETE FROM recording_lease_requests
                  WHERE state!='pending'
@@ -7697,7 +7878,14 @@ mod tests {
             ArchiveDeletionState::from_db(&retained_state).unwrap(),
             ArchiveDeletionState::Tombstoned
         );
-        for table in ["recording_leases", "recording_lease_requests"] {
+        for table in [
+            "recording_leases",
+            "recording_lease_requests",
+            "recording_lease_denials",
+            "recording_delivery_balances",
+            "recording_delivery_reservations",
+            "offline_recording_usage_receipts",
+        ] {
             let count: i64 = conn
                 .query_row(
                     &format!("SELECT count(*) FROM {table} WHERE user_id=?1"),
@@ -9721,6 +9909,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denial_count, MAX_RECORDING_LEASE_DENIALS_PER_USER);
+    }
+
+    #[tokio::test]
+    async fn offline_minute_grants_one_idempotent_bounded_delivery_budget() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = control
+            .upsert_user("offline-delivery-subject", "offline@example.com")
+            .await
+            .unwrap();
+        assert!(!control
+            .reserve_recording_delivery(&user.id, "event-before-credit", 1)
+            .await
+            .unwrap());
+
+        assert!(control
+            .complete_offline_recording_usage(&user.id, "offline-request")
+            .await
+            .unwrap());
+        assert!(!control
+            .complete_offline_recording_usage(&user.id, "offline-request")
+            .await
+            .unwrap());
+        assert!(control
+            .offline_recording_usage_receipt(&user.id, "offline-request")
+            .await
+            .unwrap());
+
+        assert!(control
+            .reserve_recording_delivery(&user.id, "event-one", 100)
+            .await
+            .unwrap());
+        // A canonical rebase for the same event spends only its byte delta and
+        // never a second event credit.
+        assert!(control
+            .reserve_recording_delivery(&user.id, "event-one", 250)
+            .await
+            .unwrap());
+        let user_id = user.id.clone();
+        let balance: (i64, i64) = control
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT event_credits,byte_credits FROM recording_delivery_balances
+                     WHERE user_id=?1",
+                    [&user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(balance.0, RECORDING_DELIVERY_EVENTS_PER_MINUTE - 1);
+        assert_eq!(balance.1, RECORDING_DELIVERY_BYTES_PER_MINUTE - 250);
+        control
+            .complete_recording_delivery(&user.id, "event-one")
+            .await
+            .unwrap();
+        let user_id = user.id.clone();
+        assert_eq!(
+            control
+                .read(move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT count(*) FROM recording_delivery_reservations
+                         WHERE user_id=?1",
+                        [&user_id],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                })
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

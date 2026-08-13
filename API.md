@@ -11,6 +11,14 @@ Kioku feature flag. Apple recording, Screen Recording, and Automation
 permissions still apply, and clients must present the platform recording
 indicators and the product's cloud-processing disclosure.
 
+The Mac may continue capture during an ordinary network outage in an
+account-scoped AES-256-GCM local outbox. It deletes an outbox item only after
+the enclave acknowledges it. The outbox is a delivery buffer, not a local
+transcription or memory archive; all understanding remains in the cloud. Before
+releasing queued media after reconnection, the client settles each rounded-up
+offline minute through the content-free route below and obtains a new live
+recording lease.
+
 ## Authentication and transport
 
 - Production requests use HTTPS terminated inside the attested enclave.
@@ -285,6 +293,40 @@ exponential backoff plus jitter. Respect HTTP `429` and its `retry_after`
 seconds. Do not retry malformed requests (HTTP 400) without correcting them;
 the one defined exception is `screen_reference_rebase_required`, which is
 corrected by a single canonical retry at the same stream sequence.
+
+The Mac's encrypted outbox adds the fixed header
+`Kioku-Delivery-Mode: encrypted-outbox-v1`. Each newly billed live minute and
+each acknowledged offline tick grants a bounded delayed-delivery budget of 120
+events and 256 MiB. Before persistence, the enclave atomically reserves one
+event credit and the canonical media bytes by authenticated account/event ID.
+Same-event retry spends nothing twice; a reference-to-canonical recovery spends
+only its additional bytes. This delivery path remains usable after the original
+live lease expires, so a stopped Mac can drain on reconnect without metering
+network-transfer time. Requests without that header still require a current live
+recording lease. Missing delivery credit returns the same retryable
+`recording_lease_inactive` response and never persists the item.
+
+## Reconcile offline recording time
+
+`POST /api/billing/offline-recording-usage`
+
+```json
+{"request_id":"019fbab2-8413-45aa-8d2e-eb249b72b15b"}
+```
+
+Each request represents exactly one rounded-up 60-second offline recording
+tick. `request_id` is UUIDv4 and is the sole accepted field. The enclave derives
+the authenticated account and a domain-separated pseudonymous billing event;
+no capture, device, stream, media, or timestamp identifier crosses the billing
+boundary. An identical retry returns the admitted tick with `"duplicate":
+true`. Success returns `200` with `duplicate` and the current provider-neutral
+`billing` snapshot. Definite entitlement denial returns `402` with the same
+bounded denial shape as recording-lease admission; dependency unavailability
+returns `503`. Clients retain the usage request and queued media until the
+request is acknowledged and settle ticks oldest-first. A running client then
+acquires/reattaches a live lease for new online capture; a stopped client may
+launch its signed helper in drain-only mode using the credits already granted
+by the paid live/offline minutes.
 
 ## Resume a stream
 

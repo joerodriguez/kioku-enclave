@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
@@ -760,10 +760,15 @@ pub fn router() -> Router<Arc<CpState>> {
 async fn upload_capture_event(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
     let started_at = Instant::now();
     let user_id = user.0;
+    let encrypted_outbox_delivery = headers
+        .get("kioku-delivery-mode")
+        .and_then(|value| value.to_str().ok())
+        == Some("encrypted-outbox-v1");
     match limits::account_active(&state.control, &user_id).await {
         Ok(true) => {}
         Ok(false) => {
@@ -978,6 +983,10 @@ async fn upload_capture_event(
         Ok(PreflightOutcome::Duplicate {
             committed_through_sequence,
         }) => {
+            if encrypted_outbox_delivery {
+                super::billing::complete_recording_delivery(&state, &user_id, &manifest.event_id)
+                    .await;
+            }
             return (
                 StatusCode::OK,
                 Json(CaptureAccepted {
@@ -992,7 +1001,7 @@ async fn upload_capture_event(
                     committed_through_sequence,
                 }),
             )
-                .into_response()
+                .into_response();
         }
         Ok(PreflightOutcome::New) => {}
         Err(error) => return capture_error_response(started_at, Some(&manifest), error),
@@ -1001,7 +1010,18 @@ async fn upload_capture_event(
     // Wall-clock allowance is consumed by short idempotent recording leases,
     // not by VAD-triggered media duration, which can overlap across streams.
     if capture_requires_recording_lease(manifest.stream_kind) {
-        if let Err(response) = super::billing::check_recording_entitlement(&state, &user_id).await {
+        let entitlement = if encrypted_outbox_delivery {
+            super::billing::reserve_recording_delivery(
+                &state,
+                &user_id,
+                &manifest.event_id,
+                media_bytes.as_ref().map_or(0, |bytes| bytes.len() as i64),
+            )
+            .await
+        } else {
+            super::billing::check_recording_entitlement(&state, &user_id).await
+        };
+        if let Err(response) = entitlement {
             let reason = recording_entitlement_failure_reason(response.status());
             return capture_failure_response(started_at, Some(&manifest), reason, response);
         }
@@ -1127,6 +1147,9 @@ async fn upload_capture_event(
             CaptureIngestFailureReason::PersistenceUnavailable,
             (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
         );
+    }
+    if encrypted_outbox_delivery {
+        super::billing::complete_recording_delivery(&state, &user_id, &manifest.event_id).await;
     }
     (
         StatusCode::CREATED,
