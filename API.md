@@ -471,6 +471,82 @@ Large histories are available without growing the profile response:
 positive `next_cursor` as the next `before_id`. A missing, unnamed, or tentative
 person returns `404`. Unknown query fields return `400`.
 
+## Owner metrics facade
+
+The owner economics routes require an ordinary authenticated account whose stable enclave
+UUID is present in the image-baked `ADMIN_USER_IDS`. This authorization check happens
+before identity enumeration or any request to the isolated billing service. Non-owners
+receive `403`; successful and error responses use `Cache-Control: no-store`.
+
+`GET /api/admin/capabilities` is the navigation/capability probe. A successful response is:
+
+```json
+{
+  "owner": true,
+  "admin": true,
+  "margin_report": true,
+  "margin_kind": "estimated_contribution_margin",
+  "storage_bytes": "current_logical_bytes"
+}
+```
+
+`owner` is the canonical capability. `admin` remains a compatibility alias for older web
+clients and has the same owner-only meaning; it does not grant a general administrator
+role.
+
+`GET /api/admin/margin?limit=50&after=<cursor>` returns the current UTC month's estimated
+owner-economics page. `limit` is 1–100; `after` is the preceding opaque cursor. The facade
+maps each billing row's random account pseudonym to `accounts[].email` inside the enclave,
+removes the pseudonym, and adds enclave-local storage, email-delivery, and inference-
+coverage drivers. The browser must follow `next_cursor` to completion before presenting
+cross-account totals.
+
+Each account row's `direct_vertex.by_operation.audio_understanding` object is:
+
+```json
+{
+  "event_count": 18,
+  "incomplete_event_count": 0,
+  "estimated_known_uncached_input_audio_usd_micros": 12345,
+  "uncached_input_audio_usd_micros": 12345,
+  "complete": true
+}
+```
+
+The known estimate is the sum of priceable observed components. The headline uncached
+audio-input value is `null` unless bounded-recent producer coverage passes, the event page
+is not truncated, and every audio component can be priced; `incomplete_event_count`
+reports events whose audio component could not be priced. Unknown cost is never returned
+as zero.
+
+Every page includes a freshly read, page-independent population aggregate:
+
+```json
+{
+  "account_metrics": {
+    "retained_active_accounts": 42,
+    "new_retained_active_accounts_mtd": 3,
+    "period": "2026-08",
+    "as_of": "2026-08-13T18:30:00.000Z"
+  }
+}
+```
+
+`retained_active_accounts` counts identities whose current status is active; “active” does
+not mean recent recording, login, or payment activity. `new_retained_active_accounts_mtd`
+counts only those active identities created during `period`. Beginning account deletion
+removes an identity from both counts immediately, before its encrypted row is physically
+purged, so the latter is not a durable signup/acquisition cohort. Counts are recomputed for
+each page and can change between cursor requests; `as_of` is the local read time, and the
+browser uses the final fetched page's aggregate. These aggregates never expose stable
+enclave user IDs or account-level creation timestamps.
+
+The owner dashboard may derive revenue and counterfactual cost cards from all completed
+pages. It does not receive content, silence boundaries, VAD results, or timestamps through
+these routes. Silence-removal percentages shown by the dashboard are planning scenarios
+over complete rate-card-modeled uncached audio-input cost, not measured silence or realized
+savings.
+
 ## Account-deletion status (ADR-0022 Phase 0 bridge)
 
 `DELETE /api/account` begins or retries account deletion. It returns `202` until
