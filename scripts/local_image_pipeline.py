@@ -74,11 +74,21 @@ class PipelineError(RuntimeError):
     """A fail-closed operator error that should not expose configuration values."""
 
 
-def run(command: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def run(
+    command: list[str],
+    *,
+    capture: bool = False,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run a fixed argv command without a shell or inherited configuration output."""
+    child_environment = None
+    if environment is not None:
+        child_environment = os.environ.copy()
+        child_environment.update(environment)
     completed = subprocess.run(
         command,
         cwd=ROOT,
+        env=child_environment,
         text=True,
         capture_output=capture,
         check=False,
@@ -388,9 +398,29 @@ def source_repository() -> str:
     return value
 
 
+def active_docker_host() -> str:
+    """Return the endpoint for the same Docker context used by buildx."""
+    host = run(
+        [
+            "docker",
+            "context",
+            "inspect",
+            "--format",
+            '{{ (index .Endpoints "docker").Host }}',
+        ],
+        capture=True,
+    ).stdout.strip()
+    if not re.fullmatch(r"(?:unix|tcp|ssh)://[^\s\x00-\x1f\x7f]+", host):
+        raise PipelineError("active Docker context returned an invalid endpoint")
+    return host
+
+
 def sbom_and_scan(image_uri: str, output_dir: Path) -> None:
     sbom_path = output_dir / "enclave-sbom.spdx.json"
-    run(["syft", image_uri, "-o", f"spdx-json={sbom_path}"])
+    run(
+        ["syft", f"docker:{image_uri}", "-o", f"spdx-json={sbom_path}"],
+        environment={"DOCKER_HOST": active_docker_host()},
+    )
     try:
         sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
