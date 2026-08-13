@@ -95,11 +95,32 @@ This compiled coordinator does not activate archive-v3 persistence or deletion.
 - [x] Seal the Genesis witness-create surface to the commit-start-aware
   Firestore creator and recover a crash-after-commit only through the retained
   exact send-start adoption CAS.
-- [x] Keep this capability disconnected from inventory/deletion-driver
-  invocation, Store/startup/runtime/config/routes, provider construction,
-  credentials, cloud mutation, deployment, and user-visible behavior.
+- [x] Keep this capability disconnected from deletion-driver invocation,
+  Store/startup/runtime/config/routes, provider construction, credentials,
+  cloud mutation, deployment, and user-visible behavior.
 
-This compiled capability is not yet accepted by deletion and does not activate
+## Type-separated pre-witness inventory capability
+
+- [x] Consume the fresh absence proof exactly once into a separate versioned
+  encrypted-control snapshot binding the complete absence/protocol/bootstrap/
+  fence/revision tuple and every settled create-ahead fact.
+- [x] Enforce exactly one normal-tombstone or pre-witness inventory branch;
+  dual rows, stale revisions, unknown versions, unresolved creates, or tuple
+  corruption fail closed before page I/O.
+- [x] Reuse only the exact-name page producer under one deterministic plan,
+  with fresh durable revalidation before page I/O and seal, exact restart of a
+  created prefix/sole unresolved next page, rejection of every zero-plan or
+  alternate page before durable admission, and no reachability or metadata GET.
+- [x] Represent a reserved zero-object archive as zero pages/artifacts and a
+  zero terminal hash under a nonzero, domain-separated branch commitment;
+  never create an empty KILP page.
+- [x] Load the sealed chain into a separate opaque non-authorizing complete
+  inventory with no conversion, entry, provider, or deletion-driver surface.
+- [x] Keep startup/Store/runtime/config/routes, provider construction,
+  destructive invocation, cloud mutation, deployment, and user-visible
+  behavior disconnected.
+
+This compiled capability is not accepted by deletion and does not activate
 archive-v3 persistence or deletion.
 
 ## Firestore transport-probe release boundary

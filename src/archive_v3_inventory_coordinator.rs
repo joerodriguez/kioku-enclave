@@ -7,25 +7,29 @@
 //!
 //! This module joins three already separate authorities without constructing
 //! any of them: exact-current deletion witness recovery, the encrypted control
-//! lifecycle snapshot, and the exact-name encrypted page store. It walks only
-//! witness-selected current/predecessor roots, unions every settled
-//! create-ahead object, persists one deterministic bounded page chain, and
-//! returns only the control-minted [`DeletionInventorySeal`]. It has no Store,
-//! startup, environment/config, route, provider construction, list operation,
-//! deletion-driver invocation, or cloud/deployment wiring.
+//! lifecycle snapshot, and the exact-name encrypted page store. The normal
+//! branch walks only witness-selected current/predecessor roots, unions every
+//! settled create-ahead object, and returns only the control-minted
+//! [`DeletionInventorySeal`]. A type-separated pre-witness branch consumes a
+//! fresh exact-absence receipt into a create-ahead-only page seal and returns
+//! no deletion authority. It has no Store, startup, environment/config, route,
+//! provider construction, list operation, deletion-driver invocation, or
+//! cloud/deployment wiring.
 
 use crate::{
     archive_v3::{ArchiveId, ObjectId, VerifiedArchiveCipher},
     archive_v3_deletion::{
         ArchiveDeletionError, AuthenticatedDeletionContext, CompleteDeletionInventory,
-        SealedArchiveInventoryLedger,
+        CompletePreWitnessDeletionInventory, SealedArchiveInventoryLedger,
     },
     archive_v3_firestore_witness::FirestoreWitness,
     archive_v3_lifecycle::{
-        validate_sealed_page_references, ArchiveLifecyclePageStore, DeletionInventorySeal,
-        DurableInventoryPage, FrozenInventorySnapshot, InventoryPage, InventoryPageReference,
-        LifecycleError, LifecycleInventoryObject, MAX_LIFECYCLE_ARTIFACTS,
-        MAX_LIFECYCLE_OBJECT_KEY_BYTES, MAX_LIFECYCLE_PAGES,
+        validate_pre_witness_sealed_page_references, validate_sealed_page_references,
+        ArchiveLifecyclePageStore, DeletionInventorySeal, DurableInventoryPage,
+        FrozenInventorySnapshot, FrozenPreWitnessInventorySnapshot, InventoryPage,
+        InventoryPageReference, LifecycleError, LifecycleInventoryObject,
+        PreWitnessDeletionInventorySeal, MAX_LIFECYCLE_ARTIFACTS, MAX_LIFECYCLE_OBJECT_KEY_BYTES,
+        MAX_LIFECYCLE_PAGES,
     },
     archive_v3_lifecycle_page_store::RecoveredPageCreatePlan,
     archive_v3_reachability::{
@@ -34,6 +38,7 @@ use crate::{
     archive_v3_witness::{
         DeletionRecovery, DeletionWorkerCredential, InMemoryWitness, Witness, WitnessError,
     },
+    archive_v3_witness_disposition::AuthenticatedPreWitnessAbsence,
 };
 use async_trait::async_trait;
 use std::{collections::BTreeMap, fmt, sync::Arc};
@@ -213,6 +218,136 @@ impl fmt::Debug for AuthenticatedInventoryPlan {
 pub(crate) struct AuthenticatedInventoryLoad(());
 
 impl AuthenticatedInventoryLoad {
+    fn validated() -> Self {
+        Self(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(())
+    }
+}
+
+/// Restart state for the distinct pre-witness inventory branch. Encrypted
+/// control returns a frozen snapshot until the atomic seal CAS succeeds, then
+/// only the type-separated durable seal.
+pub(crate) enum RecoveredPreWitnessInventory {
+    Frozen(FrozenPreWitnessInventorySnapshot),
+    Sealed(PreWitnessDeletionInventorySeal),
+}
+
+impl fmt::Debug for RecoveredPreWitnessInventory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Frozen(_) => formatter.write_str("Frozen(<opaque>)"),
+            Self::Sealed(_) => formatter.write_str("Sealed(<opaque>)"),
+        }
+    }
+}
+
+/// Encrypted control authority for the pre-witness branch. The initial freeze
+/// consumes the fresh exact-absence proof. Restart loads only durable state by
+/// opaque archive/fence; it never remints absence or rereads Firestore.
+#[async_trait]
+pub(crate) trait PreWitnessInventoryControl: Send + Sync {
+    async fn freeze_pre_witness_snapshot(
+        &self,
+        absence: AuthenticatedPreWitnessAbsence,
+    ) -> Result<FrozenPreWitnessInventorySnapshot, LifecycleError>;
+
+    async fn recover_pre_witness_inventory(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<RecoveredPreWitnessInventory, LifecycleError>;
+
+    async fn recover_pre_witness_page_plan(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<RecoveredPageCreatePlan, LifecycleError>;
+
+    async fn seal_authenticated_pre_witness_pages(
+        &self,
+        plan: AuthenticatedPreWitnessInventoryPlan,
+    ) -> Result<PreWitnessDeletionInventorySeal, LifecycleError>;
+
+    async fn load_pre_witness_sealed_references(
+        &self,
+        seal: &PreWitnessDeletionInventorySeal,
+    ) -> Result<Vec<InventoryPageReference>, LifecycleError>;
+}
+
+/// Coordinator-only one-shot proof that the deterministic create-ahead page
+/// plan and every external readback are exact. The frozen snapshot is consumed
+/// into this value and cannot be reused for a competing seal.
+pub(crate) struct AuthenticatedPreWitnessInventoryPlan {
+    snapshot: FrozenPreWitnessInventorySnapshot,
+    planned_pages: Vec<InventoryPage>,
+    references: Vec<InventoryPageReference>,
+    durable_pages: Vec<DurableInventoryPage>,
+}
+
+impl AuthenticatedPreWitnessInventoryPlan {
+    fn from_exact_readbacks(
+        snapshot: FrozenPreWitnessInventorySnapshot,
+        planned_pages: Vec<InventoryPage>,
+        durable_pages: Vec<DurableInventoryPage>,
+    ) -> Result<Self, InventoryCoordinatorError> {
+        if planned_pages.len() != durable_pages.len()
+            || planned_pages
+                .iter()
+                .zip(&durable_pages)
+                .any(|(expected, durable)| expected != durable.page())
+        {
+            return Err(InventoryCoordinatorError::Lifecycle);
+        }
+        let references = planned_pages.iter().map(InventoryPage::reference).collect();
+        Ok(Self {
+            snapshot,
+            planned_pages,
+            references,
+            durable_pages,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        snapshot: FrozenPreWitnessInventorySnapshot,
+        planned_pages: Vec<InventoryPage>,
+        durable_pages: Vec<DurableInventoryPage>,
+    ) -> Result<Self, InventoryCoordinatorError> {
+        Self::from_exact_readbacks(snapshot, planned_pages, durable_pages)
+    }
+
+    pub(crate) const fn snapshot(&self) -> &FrozenPreWitnessInventorySnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn planned_pages(&self) -> &[InventoryPage] {
+        &self.planned_pages
+    }
+
+    pub(crate) fn references(&self) -> &[InventoryPageReference] {
+        &self.references
+    }
+
+    pub(crate) fn durable_pages(&self) -> &[DurableInventoryPage] {
+        &self.durable_pages
+    }
+}
+
+impl fmt::Debug for AuthenticatedPreWitnessInventoryPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedPreWitnessInventoryPlan(<opaque>)")
+    }
+}
+
+/// Producer token accepted only by the non-authorizing pre-witness complete
+/// inventory constructor after the entire sealed page chain is authenticated.
+pub(crate) struct AuthenticatedPreWitnessInventoryLoad(());
+
+impl AuthenticatedPreWitnessInventoryLoad {
     fn validated() -> Self {
         Self(())
     }
@@ -555,6 +690,194 @@ fn validate_recovered_plan(
     Ok(())
 }
 
+/// Consume one freshly authenticated exact-absence receipt, durably freeze
+/// the create-ahead-only branch, and seal its deterministic page plan. This
+/// path performs no reachability or archive metadata read.
+pub(crate) async fn seal_pre_witness_deletion_inventory(
+    absence: AuthenticatedPreWitnessAbsence,
+    control: &dyn PreWitnessInventoryControl,
+    page_store: &dyn ArchiveLifecyclePageStore,
+) -> Result<PreWitnessDeletionInventorySeal, InventoryCoordinatorError> {
+    let snapshot = control.freeze_pre_witness_snapshot(absence).await?;
+    persist_and_seal_pre_witness_snapshot(snapshot, control, page_store).await
+}
+
+/// Resume only after encrypted control already durably owns the pre-witness
+/// snapshot. No witness reader or absence-remint boundary is accepted here.
+pub(crate) async fn resume_pre_witness_deletion_inventory(
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    control: &dyn PreWitnessInventoryControl,
+    page_store: &dyn ArchiveLifecyclePageStore,
+) -> Result<PreWitnessDeletionInventorySeal, InventoryCoordinatorError> {
+    match control
+        .recover_pre_witness_inventory(archive_id, deletion_fence)
+        .await?
+    {
+        RecoveredPreWitnessInventory::Frozen(snapshot) => {
+            persist_and_seal_pre_witness_snapshot(snapshot, control, page_store).await
+        }
+        RecoveredPreWitnessInventory::Sealed(seal) => Ok(seal),
+    }
+}
+
+async fn persist_and_seal_pre_witness_snapshot(
+    snapshot: FrozenPreWitnessInventorySnapshot,
+    control: &dyn PreWitnessInventoryControl,
+    page_store: &dyn ArchiveLifecyclePageStore,
+) -> Result<PreWitnessDeletionInventorySeal, InventoryCoordinatorError> {
+    let pages = pre_witness_page_plan_for_snapshot(&snapshot)?;
+    revalidate_pre_witness_snapshot(&snapshot, control).await?;
+    let recovered = control
+        .recover_pre_witness_page_plan(snapshot.archive_id(), snapshot.deletion_fence())
+        .await?;
+    validate_recovered_plan(&pages, &recovered)?;
+
+    let mut durable = Vec::with_capacity(pages.len());
+    for reference in recovered.created() {
+        durable.push(
+            page_store
+                .read_exact_page(snapshot.deletion_fence(), *reference)
+                .await?,
+        );
+    }
+    let mut next = recovered.created().len();
+    if recovered.outcome_unknown().is_some() {
+        durable.push(
+            page_store
+                .create_exact_page(snapshot.deletion_fence(), &pages[next])
+                .await?,
+        );
+        next += 1;
+    }
+    for page in &pages[next..] {
+        durable.push(
+            page_store
+                .create_exact_page(snapshot.deletion_fence(), page)
+                .await?,
+        );
+    }
+
+    revalidate_pre_witness_snapshot(&snapshot, control).await?;
+    let proof =
+        AuthenticatedPreWitnessInventoryPlan::from_exact_readbacks(snapshot, pages, durable)?;
+    control
+        .seal_authenticated_pre_witness_pages(proof)
+        .await
+        .map_err(Into::into)
+}
+
+async fn revalidate_pre_witness_snapshot(
+    expected: &FrozenPreWitnessInventorySnapshot,
+    control: &dyn PreWitnessInventoryControl,
+) -> Result<(), InventoryCoordinatorError> {
+    match control
+        .recover_pre_witness_inventory(expected.archive_id(), expected.deletion_fence())
+        .await?
+    {
+        RecoveredPreWitnessInventory::Frozen(current) if &current == expected => Ok(()),
+        RecoveredPreWitnessInventory::Frozen(_) | RecoveredPreWitnessInventory::Sealed(_) => {
+            Err(InventoryCoordinatorError::Freshness)
+        }
+    }
+}
+
+pub(crate) fn pre_witness_page_plan_for_snapshot(
+    snapshot: &FrozenPreWitnessInventorySnapshot,
+) -> Result<Vec<InventoryPage>, InventoryCoordinatorError> {
+    let mut by_id = BTreeMap::<ObjectId, LifecycleInventoryObject>::new();
+    for artifact in snapshot.create_ahead() {
+        insert_object(&mut by_id, artifact.inventory_object()?)?;
+    }
+    let mut objects = by_id.into_values().collect::<Vec<_>>();
+    objects.sort();
+    let key_bytes = objects.iter().try_fold(0usize, |total, object| {
+        total
+            .checked_add(object.key().as_str().len())
+            .ok_or(InventoryCoordinatorError::Limit)
+    })?;
+    pre_witness_bounds(objects.len(), key_bytes)?;
+    if objects
+        .iter()
+        .any(|object| object.key().as_str().len() > MAX_LIFECYCLE_OBJECT_KEY_BYTES)
+    {
+        return Err(InventoryCoordinatorError::Limit);
+    }
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    canonical_page_plan(snapshot.archive_id(), objects)
+}
+
+fn pre_witness_bounds(
+    object_count: usize,
+    key_bytes: usize,
+) -> Result<(), InventoryCoordinatorError> {
+    if object_count > MAX_LIFECYCLE_ARTIFACTS || key_bytes > MAX_INVENTORY_KEY_BYTES {
+        return Err(InventoryCoordinatorError::Limit);
+    }
+    Ok(())
+}
+
+/// Load and authenticate the complete type-separated pre-witness inventory.
+/// The zero-object representation performs no page-store read. The returned
+/// value deliberately has no deletion-driver/provider authorization surface.
+pub(crate) async fn load_complete_pre_witness_deletion_inventory(
+    control: &dyn PreWitnessInventoryControl,
+    page_store: &dyn ArchiveLifecyclePageStore,
+    seal: &PreWitnessDeletionInventorySeal,
+) -> Result<CompletePreWitnessDeletionInventory, InventoryCoordinatorError> {
+    let references = control.load_pre_witness_sealed_references(seal).await?;
+    validate_pre_witness_sealed_page_references(seal, &references)?;
+
+    let mut objects = Vec::with_capacity(
+        usize::try_from(seal.artifact_count()).map_err(|_| InventoryCoordinatorError::Limit)?,
+    );
+    let mut key_bytes = 0usize;
+    let mut previous_object: Option<LifecycleInventoryObject> = None;
+    let mut seen = BTreeMap::<ObjectId, LifecycleInventoryObject>::new();
+    for reference in &references {
+        let durable = page_store
+            .read_exact_page(seal.deletion_fence(), *reference)
+            .await?;
+        let page = durable.page();
+        if page.reference() != *reference {
+            return Err(InventoryCoordinatorError::Lifecycle);
+        }
+        for object in page.entries() {
+            if previous_object
+                .as_ref()
+                .is_some_and(|previous| previous >= object)
+                || seen
+                    .insert(object.key().object_id(), object.clone())
+                    .is_some()
+            {
+                return Err(InventoryCoordinatorError::DuplicateConflict);
+            }
+            key_bytes = key_bytes
+                .checked_add(object.key().as_str().len())
+                .ok_or(InventoryCoordinatorError::Limit)?;
+            if objects.len() >= MAX_LIFECYCLE_ARTIFACTS || key_bytes > MAX_INVENTORY_KEY_BYTES {
+                return Err(InventoryCoordinatorError::Limit);
+            }
+            previous_object = Some(object.clone());
+            objects.push(object.clone());
+        }
+    }
+    if objects.len() != usize::try_from(seal.artifact_count()).unwrap_or(usize::MAX)
+        || (objects.is_empty() != references.is_empty())
+    {
+        return Err(InventoryCoordinatorError::Lifecycle);
+    }
+    CompletePreWitnessDeletionInventory::from_authenticated_lifecycle_pages(
+        &AuthenticatedPreWitnessInventoryLoad::validated(),
+        seal,
+        objects,
+        key_bytes,
+    )
+    .map_err(|_| InventoryCoordinatorError::Lifecycle)
+}
+
 /// Load and authenticate the complete v2 chain after restart. All control
 /// references are validated before the first external GET, and the result's
 /// only commitment is the exact lifecycle seal commitment.
@@ -663,10 +986,11 @@ mod tests {
     use crate::{
         archive_v3::{DatabaseEpoch, KeyEpoch, LogicalLocation, ObjectContext, ObjectRole},
         archive_v3_lifecycle::{
-            ArtifactCreateState, BootstrapAttemptId, DurablePhysicalCompletion,
-            ErasedInventoryPages,
+            ArtifactCreateState, BootstrapAttemptId, BootstrapPlan, DurablePhysicalCompletion,
+            ErasedInventoryPages, WITNESS_CREATE_PROTOCOL_V1,
         },
         archive_v3_witness::{active_deletion_test_fixture, deletion_driver_test_fixture, Witness},
+        archive_v3_witness_disposition::{ClosedWitnessPhase, ClosedWitnessProtocol},
     };
     use std::{
         collections::VecDeque,
@@ -756,6 +1080,50 @@ mod tests {
             .unwrap()
     }
 
+    fn pre_witness_snapshot(
+        revision: u64,
+        create_ahead: Vec<crate::archive_v3_lifecycle::PlannedArtifact>,
+    ) -> FrozenPreWitnessInventorySnapshot {
+        let plan = BootstrapPlan::new(
+            archive(),
+            BootstrapAttemptId::from_bytes([9; 16]).unwrap(),
+            DatabaseEpoch::from_bytes([3; 16]),
+            KeyEpoch::from_bytes([4; 16]),
+            ObjectId::from_bytes([5; 16]),
+            ObjectId::from_bytes([6; 16]),
+        )
+        .unwrap();
+        FrozenPreWitnessInventorySnapshot::for_test(
+            plan,
+            fence(),
+            revision.checked_sub(1).unwrap(),
+            revision,
+            None,
+            None,
+            [0x77; 32],
+            create_ahead,
+        )
+        .unwrap()
+    }
+
+    fn pre_witness_absence() -> AuthenticatedPreWitnessAbsence {
+        let closed = ClosedWitnessProtocol::for_test(
+            archive(),
+            BootstrapAttemptId::from_bytes([9; 16]).unwrap(),
+            fence(),
+            10,
+            None,
+            None,
+            None,
+            None,
+            WITNESS_CREATE_PROTOCOL_V1,
+            [0x66; 32],
+            ClosedWitnessPhase::AbsenceConfirmed,
+        )
+        .unwrap();
+        AuthenticatedPreWitnessAbsence::for_test(&closed, [0x77; 32]).unwrap()
+    }
+
     fn durable(page: InventoryPage) -> DurableInventoryPage {
         let encoded = page.encoded().to_vec();
         DurableInventoryPage::from_exact_readback(page, &encoded).unwrap()
@@ -768,6 +1136,100 @@ mod tests {
         created: Mutex<Vec<InventoryPageReference>>,
         unresolved: Mutex<Option<InventoryPage>>,
         references: Mutex<Vec<InventoryPageReference>>,
+    }
+
+    struct FakePreControl {
+        create_ahead: Vec<crate::archive_v3_lifecycle::PlannedArtifact>,
+        recovery_revisions: Mutex<VecDeque<u64>>,
+        freeze_calls: Mutex<usize>,
+        created: Mutex<Vec<InventoryPageReference>>,
+        unresolved: Mutex<Option<InventoryPage>>,
+        references: Mutex<Vec<InventoryPageReference>>,
+        sealed: Mutex<Option<PreWitnessDeletionInventorySeal>>,
+    }
+
+    impl FakePreControl {
+        fn new(create_ahead: Vec<crate::archive_v3_lifecycle::PlannedArtifact>) -> Self {
+            Self {
+                create_ahead,
+                recovery_revisions: Mutex::new(VecDeque::new()),
+                freeze_calls: Mutex::new(0),
+                created: Mutex::new(Vec::new()),
+                unresolved: Mutex::new(None),
+                references: Mutex::new(Vec::new()),
+                sealed: Mutex::new(None),
+            }
+        }
+
+        fn snapshot(&self, revision: u64) -> FrozenPreWitnessInventorySnapshot {
+            pre_witness_snapshot(revision, self.create_ahead.clone())
+        }
+    }
+
+    #[async_trait]
+    impl PreWitnessInventoryControl for FakePreControl {
+        async fn freeze_pre_witness_snapshot(
+            &self,
+            _absence: AuthenticatedPreWitnessAbsence,
+        ) -> Result<FrozenPreWitnessInventorySnapshot, LifecycleError> {
+            *self.freeze_calls.lock().unwrap() += 1;
+            Ok(self.snapshot(12))
+        }
+
+        async fn recover_pre_witness_inventory(
+            &self,
+            archive_id: ArchiveId,
+            deletion_fence: ObjectId,
+        ) -> Result<RecoveredPreWitnessInventory, LifecycleError> {
+            if archive_id != archive() || deletion_fence != fence() {
+                return Err(LifecycleError::StaleRevision);
+            }
+            if let Some(seal) = *self.sealed.lock().unwrap() {
+                return Ok(RecoveredPreWitnessInventory::Sealed(seal));
+            }
+            let revision = self
+                .recovery_revisions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(12);
+            Ok(RecoveredPreWitnessInventory::Frozen(
+                self.snapshot(revision),
+            ))
+        }
+
+        async fn recover_pre_witness_page_plan(
+            &self,
+            archive_id: ArchiveId,
+            _deletion_fence: ObjectId,
+        ) -> Result<RecoveredPageCreatePlan, LifecycleError> {
+            RecoveredPageCreatePlan::for_test(
+                archive_id,
+                self.created.lock().unwrap().clone(),
+                self.unresolved.lock().unwrap().clone(),
+            )
+        }
+
+        async fn seal_authenticated_pre_witness_pages(
+            &self,
+            plan: AuthenticatedPreWitnessInventoryPlan,
+        ) -> Result<PreWitnessDeletionInventorySeal, LifecycleError> {
+            let seal =
+                PreWitnessDeletionInventorySeal::for_test(plan.snapshot(), plan.durable_pages())?;
+            *self.references.lock().unwrap() = plan.references().to_vec();
+            *self.sealed.lock().unwrap() = Some(seal);
+            Ok(seal)
+        }
+
+        async fn load_pre_witness_sealed_references(
+            &self,
+            seal: &PreWitnessDeletionInventorySeal,
+        ) -> Result<Vec<InventoryPageReference>, LifecycleError> {
+            if self.sealed.lock().unwrap().as_ref() != Some(seal) {
+                return Err(LifecycleError::StaleRevision);
+            }
+            Ok(self.references.lock().unwrap().clone())
+        }
     }
 
     impl FakeControl {
@@ -996,6 +1458,15 @@ mod tests {
         );
         assert_eq!(
             validate_combined_bounds(MAX_LIFECYCLE_ARTIFACTS, MAX_INVENTORY_KEY_BYTES + 1),
+            Err(InventoryCoordinatorError::Limit)
+        );
+        assert!(pre_witness_bounds(MAX_LIFECYCLE_ARTIFACTS, MAX_INVENTORY_KEY_BYTES).is_ok());
+        assert_eq!(
+            pre_witness_bounds(MAX_LIFECYCLE_ARTIFACTS + 1, MAX_INVENTORY_KEY_BYTES),
+            Err(InventoryCoordinatorError::Limit)
+        );
+        assert_eq!(
+            pre_witness_bounds(MAX_LIFECYCLE_ARTIFACTS, MAX_INVENTORY_KEY_BYTES + 1),
             Err(InventoryCoordinatorError::Limit)
         );
     }
@@ -1317,6 +1788,197 @@ mod tests {
         assert!(before_seal.references.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn pre_witness_zero_object_branch_seals_restarts_and_loads_without_page_io() {
+        let control = FakePreControl::new(vec![]);
+        let page_store = FakePages::default();
+        let seal =
+            seal_pre_witness_deletion_inventory(pre_witness_absence(), &control, &page_store)
+                .await
+                .unwrap();
+        assert_eq!(seal.page_count(), 0);
+        assert_eq!(seal.artifact_count(), 0);
+        assert_ne!(seal.inventory_commitment(), [0; 32]);
+        assert_eq!(*control.freeze_calls.lock().unwrap(), 1);
+        assert_eq!(*page_store.create_calls.lock().unwrap(), 0);
+        assert_eq!(*page_store.read_calls.lock().unwrap(), 0);
+
+        let recovered =
+            resume_pre_witness_deletion_inventory(archive(), fence(), &control, &page_store)
+                .await
+                .unwrap();
+        assert_eq!(recovered, seal);
+        let complete =
+            load_complete_pre_witness_deletion_inventory(&control, &page_store, &recovered)
+                .await
+                .unwrap();
+        assert!(complete.objects_for_test().is_empty());
+        assert_eq!(complete.commitment_for_test(), seal.inventory_commitment());
+        assert_eq!(complete.dimensions_for_test(), (0, 0));
+        assert_eq!(*page_store.create_calls.lock().unwrap(), 0);
+        assert_eq!(*page_store.read_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn pre_witness_multipage_cancel_restart_recovers_exact_partition_and_commitment() {
+        let create_ahead = (0..600)
+            .map(|index| planned(index, ArtifactCreateState::ConfirmedAbsent))
+            .collect::<Vec<_>>();
+        let expected =
+            pre_witness_page_plan_for_snapshot(&pre_witness_snapshot(12, create_ahead.clone()))
+                .unwrap();
+        assert!(expected.len() >= 3);
+        let control = FakePreControl::new(create_ahead);
+        *control.created.lock().unwrap() = vec![expected[0].reference()];
+        *control.unresolved.lock().unwrap() = Some(expected[1].clone());
+        let page_store = FakePages::default();
+        page_store
+            .pages
+            .lock()
+            .unwrap()
+            .insert(0, expected[0].clone());
+
+        let seal = resume_pre_witness_deletion_inventory(archive(), fence(), &control, &page_store)
+            .await
+            .unwrap();
+        assert_eq!(usize::try_from(seal.page_count()).unwrap(), expected.len());
+        assert_eq!(seal.artifact_count(), 600);
+        assert_eq!(page_store.pages.lock().unwrap().len(), expected.len());
+        for expected_page in &expected {
+            assert_eq!(
+                page_store
+                    .pages
+                    .lock()
+                    .unwrap()
+                    .get(&expected_page.page_ordinal())
+                    .unwrap()
+                    .encoded(),
+                expected_page.encoded()
+            );
+        }
+        let complete = load_complete_pre_witness_deletion_inventory(&control, &page_store, &seal)
+            .await
+            .unwrap();
+        assert_eq!(complete.objects_for_test().len(), 600);
+        assert_eq!(complete.commitment_for_test(), seal.inventory_commitment());
+    }
+
+    #[test]
+    fn pre_witness_union_deduplicates_exact_and_rejects_conflicts_before_io() {
+        let exact = planned(0, ArtifactCreateState::Created);
+        let duplicate = crate::archive_v3_lifecycle::PlannedArtifact::new(
+            archive(),
+            exact.attempt_id(),
+            1,
+            exact.key().clone(),
+            exact.role(),
+            exact.ciphertext_hash(),
+            exact.encoded_len() as usize,
+            ArtifactCreateState::ConfirmedAbsent,
+        )
+        .unwrap();
+        let mut exact_rows = vec![exact, duplicate];
+        exact_rows.sort_by(|left, right| {
+            (left.attempt_id(), left.ordinal(), left.key().as_str()).cmp(&(
+                right.attempt_id(),
+                right.ordinal(),
+                right.key().as_str(),
+            ))
+        });
+        let pages =
+            pre_witness_page_plan_for_snapshot(&pre_witness_snapshot(12, exact_rows)).unwrap();
+        assert_eq!(
+            pages.iter().map(|page| page.entries().len()).sum::<usize>(),
+            1
+        );
+
+        let first = planned(2, ArtifactCreateState::Created);
+        let conflict = crate::archive_v3_lifecycle::PlannedArtifact::new(
+            archive(),
+            first.attempt_id(),
+            3,
+            first.key().clone(),
+            first.role(),
+            [0xee; 32],
+            first.encoded_len() as usize,
+            ArtifactCreateState::ConfirmedAbsent,
+        )
+        .unwrap();
+        let mut conflict_rows = vec![first, conflict];
+        conflict_rows.sort_by(|left, right| {
+            (left.attempt_id(), left.ordinal(), left.key().as_str()).cmp(&(
+                right.attempt_id(),
+                right.ordinal(),
+                right.key().as_str(),
+            ))
+        });
+        assert_eq!(
+            pre_witness_page_plan_for_snapshot(&pre_witness_snapshot(12, conflict_rows)),
+            Err(InventoryCoordinatorError::DuplicateConflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_witness_freshness_races_stop_before_page_io_and_before_seal() {
+        let create_ahead = vec![planned(0, ArtifactCreateState::Created)];
+        let before_page = FakePreControl::new(create_ahead.clone());
+        before_page
+            .recovery_revisions
+            .lock()
+            .unwrap()
+            .extend([12, 13]);
+        let page_store = FakePages::default();
+        assert!(matches!(
+            resume_pre_witness_deletion_inventory(archive(), fence(), &before_page, &page_store,)
+                .await,
+            Err(InventoryCoordinatorError::Freshness)
+        ));
+        assert_eq!(*page_store.create_calls.lock().unwrap(), 0);
+        assert_eq!(*page_store.read_calls.lock().unwrap(), 0);
+
+        let before_seal = FakePreControl::new(create_ahead);
+        before_seal
+            .recovery_revisions
+            .lock()
+            .unwrap()
+            .extend([12, 12, 13]);
+        let page_store = FakePages::default();
+        assert!(matches!(
+            resume_pre_witness_deletion_inventory(archive(), fence(), &before_seal, &page_store,)
+                .await,
+            Err(InventoryCoordinatorError::Freshness)
+        ));
+        assert_eq!(*page_store.create_calls.lock().unwrap(), 1);
+        assert!(before_seal.sealed.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_witness_bad_later_reference_causes_zero_page_reads() {
+        let create_ahead = (0..300)
+            .map(|index| planned(index, ArtifactCreateState::Created))
+            .collect::<Vec<_>>();
+        let snapshot = pre_witness_snapshot(12, create_ahead.clone());
+        let pages = pre_witness_page_plan_for_snapshot(&snapshot).unwrap();
+        let durable_pages = pages.iter().cloned().map(durable).collect::<Vec<_>>();
+        let seal = PreWitnessDeletionInventorySeal::for_test(&snapshot, &durable_pages).unwrap();
+        let control = FakePreControl::new(create_ahead);
+        *control.sealed.lock().unwrap() = Some(seal);
+        let mut references = pages
+            .iter()
+            .map(InventoryPage::reference)
+            .collect::<Vec<_>>();
+        let bad = InventoryPage::build(archive(), 1, [0x99; 32], vec![object(900)]).unwrap();
+        references[1] = bad.reference();
+        *control.references.lock().unwrap() = references;
+        let page_store = FakePages::default();
+        assert!(
+            load_complete_pre_witness_deletion_inventory(&control, &page_store, &seal,)
+                .await
+                .is_err()
+        );
+        assert_eq!(*page_store.read_calls.lock().unwrap(), 0);
+    }
+
     #[test]
     fn source_has_no_runtime_or_destructive_wiring() {
         let source = include_str!("archive_v3_inventory_coordinator.rs");
@@ -1338,5 +2000,10 @@ mod tests {
         assert!(!lifecycle.contains("async fn seal_inventory("));
         assert!(!control.contains("pub(crate) async fn seal_archive_inventory("));
         assert!(control.contains("seal_archive_inventory_conn(conn, &plan)"));
+        let absence_reachability = concat!("visit_witness_", "reachability(&absence");
+        assert!(!source.contains(absence_reachability));
+        let deletion = include_str!("archive_v3_deletion.rs");
+        assert!(!deletion.contains("impl From<CompletePreWitnessDeletionInventory"));
+        assert!(!deletion.contains("CompletePreWitnessDeletionInventory::authorize"));
     }
 }

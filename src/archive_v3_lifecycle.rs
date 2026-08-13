@@ -35,9 +35,12 @@ pub(crate) const MAX_LIFECYCLE_PAGES: usize = 4_096;
 pub(crate) const MAX_LIFECYCLE_PAGE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_LIFECYCLE_OBJECT_KEY_BYTES: usize = 1_024;
 pub(crate) const WITNESS_CREATE_PROTOCOL_V1: u16 = 1;
+pub(crate) const PRE_WITNESS_INVENTORY_FORMAT_V1: u16 = 1;
 
 const PAGE_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-page/v2\0";
 const INVENTORY_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-inventory/v2\0";
+const PRE_WITNESS_SNAPSHOT_DOMAIN: &[u8] = b"kioku/archive-v3/pre-witness-inventory-snapshot/v1\0";
+const PRE_WITNESS_INVENTORY_DOMAIN: &[u8] = b"kioku/archive-v3/pre-witness-deletion-inventory/v1\0";
 const ZERO_HASH: [u8; 32] = [0; 32];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -511,6 +514,221 @@ impl FrozenInventorySnapshot {
 impl fmt::Debug for FrozenInventorySnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FrozenInventorySnapshot(<opaque>)")
+    }
+}
+
+/// Durable, type-separated inventory boundary for a deletion that proved the
+/// initial witness send never started. It is intentionally non-cloneable: the
+/// first coordinator consumes either the fresh absence receipt into this
+/// snapshot or recovers this exact snapshot from encrypted control after a
+/// restart. It is not a tombstoned-witness reachability snapshot.
+#[derive(PartialEq, Eq)]
+pub(crate) struct FrozenPreWitnessInventorySnapshot {
+    plan: BootstrapPlan,
+    deletion_fence: ObjectId,
+    absence_revision: u64,
+    revision: u64,
+    protocol_version: u16,
+    expected_witness_hash: Option<[u8; 32]>,
+    expected_witness_len: Option<u32>,
+    protocol_commitment: [u8; 32],
+    snapshot_commitment: [u8; 32],
+    create_ahead: Vec<PlannedArtifact>,
+}
+
+impl FrozenPreWitnessInventorySnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_persisted(
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+        plan: BootstrapPlan,
+        deletion_fence: ObjectId,
+        absence_revision: u64,
+        revision: u64,
+        protocol_version: u16,
+        expected_witness_hash: Option<[u8; 32]>,
+        expected_witness_len: Option<u32>,
+        protocol_commitment: [u8; 32],
+        snapshot_commitment: [u8; 32],
+        create_ahead: Vec<PlannedArtifact>,
+    ) -> Result<Self, LifecycleError> {
+        Self::validated(
+            plan,
+            deletion_fence,
+            absence_revision,
+            revision,
+            protocol_version,
+            expected_witness_hash,
+            expected_witness_len,
+            protocol_commitment,
+            snapshot_commitment,
+            create_ahead,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        plan: BootstrapPlan,
+        deletion_fence: ObjectId,
+        absence_revision: u64,
+        revision: u64,
+        expected_witness_hash: Option<[u8; 32]>,
+        expected_witness_len: Option<u32>,
+        protocol_commitment: [u8; 32],
+        create_ahead: Vec<PlannedArtifact>,
+    ) -> Result<Self, LifecycleError> {
+        let snapshot_commitment = pre_witness_snapshot_commitment(
+            plan,
+            deletion_fence,
+            absence_revision,
+            revision,
+            WITNESS_CREATE_PROTOCOL_V1,
+            expected_witness_hash,
+            expected_witness_len,
+            protocol_commitment,
+            &create_ahead,
+        )?;
+        Self::validated(
+            plan,
+            deletion_fence,
+            absence_revision,
+            revision,
+            WITNESS_CREATE_PROTOCOL_V1,
+            expected_witness_hash,
+            expected_witness_len,
+            protocol_commitment,
+            snapshot_commitment,
+            create_ahead,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validated(
+        plan: BootstrapPlan,
+        deletion_fence: ObjectId,
+        absence_revision: u64,
+        revision: u64,
+        protocol_version: u16,
+        expected_witness_hash: Option<[u8; 32]>,
+        expected_witness_len: Option<u32>,
+        protocol_commitment: [u8; 32],
+        snapshot_commitment: [u8; 32],
+        create_ahead: Vec<PlannedArtifact>,
+    ) -> Result<Self, LifecycleError> {
+        if !nonzero(deletion_fence.as_bytes())
+            || absence_revision == 0
+            || absence_revision.checked_add(1) != Some(revision)
+            || protocol_version != WITNESS_CREATE_PROTOCOL_V1
+            || !nonzero(&protocol_commitment)
+            || !matches!(
+                (expected_witness_hash, expected_witness_len),
+                (None, None) | (Some(_), Some(_))
+            )
+            || expected_witness_hash.is_some_and(|hash| !nonzero(&hash))
+            || expected_witness_len == Some(0)
+            || create_ahead.len() > MAX_LIFECYCLE_ARTIFACTS
+        {
+            return Err(LifecycleError::Corrupt);
+        }
+        let mut previous = None;
+        for artifact in &create_ahead {
+            let current = (artifact.attempt_id, artifact.ordinal, artifact.key.as_str());
+            if artifact.attempt_id != plan.attempt_id()
+                || artifact.create_state == ArtifactCreateState::OutcomeUnknown
+                || !artifact
+                    .key
+                    .as_str()
+                    .starts_with(ArchivePrefix::for_archive(plan.archive_id()).as_str())
+                || previous.is_some_and(|value| value >= current)
+            {
+                return Err(LifecycleError::Corrupt);
+            }
+            previous = Some(current);
+        }
+        let expected = pre_witness_snapshot_commitment(
+            plan,
+            deletion_fence,
+            absence_revision,
+            revision,
+            protocol_version,
+            expected_witness_hash,
+            expected_witness_len,
+            protocol_commitment,
+            &create_ahead,
+        )?;
+        if snapshot_commitment != expected || !nonzero(&snapshot_commitment) {
+            return Err(LifecycleError::Corrupt);
+        }
+        Ok(Self {
+            plan,
+            deletion_fence,
+            absence_revision,
+            revision,
+            protocol_version,
+            expected_witness_hash,
+            expected_witness_len,
+            protocol_commitment,
+            snapshot_commitment,
+            create_ahead,
+        })
+    }
+
+    pub(crate) const fn plan(&self) -> BootstrapPlan {
+        self.plan
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.plan.archive_id()
+    }
+
+    pub(crate) const fn deletion_fence(&self) -> ObjectId {
+        self.deletion_fence
+    }
+
+    pub(crate) const fn absence_revision(&self) -> u64 {
+        self.absence_revision
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) const fn protocol_version(&self) -> u16 {
+        self.protocol_version
+    }
+
+    pub(crate) const fn expected_witness_hash(&self) -> Option<[u8; 32]> {
+        self.expected_witness_hash
+    }
+
+    pub(crate) const fn expected_witness_len(&self) -> Option<u32> {
+        self.expected_witness_len
+    }
+
+    pub(crate) const fn protocol_commitment(&self) -> [u8; 32] {
+        self.protocol_commitment
+    }
+
+    pub(crate) const fn snapshot_commitment_for_control(
+        &self,
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+    ) -> [u8; 32] {
+        self.snapshot_commitment
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn snapshot_commitment_for_test(&self) -> [u8; 32] {
+        self.snapshot_commitment
+    }
+
+    pub(crate) fn create_ahead(&self) -> &[PlannedArtifact] {
+        &self.create_ahead
+    }
+}
+
+impl fmt::Debug for FrozenPreWitnessInventorySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FrozenPreWitnessInventorySnapshot(<opaque>)")
     }
 }
 
@@ -1286,6 +1504,209 @@ impl fmt::Debug for DeletionInventorySeal {
     }
 }
 
+/// Type-separated durable seal for the branch that proved the initial witness
+/// send never started. It cannot be converted into the tombstoned-witness
+/// deletion seal and therefore grants no deletion-driver or provider entry
+/// capability. The exact reserved-state representation is zero pages, zero
+/// artifacts, and a zero terminal hash under a nonzero branch commitment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreWitnessDeletionInventorySeal {
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    snapshot_revision: u64,
+    revision: u64,
+    snapshot_commitment: [u8; 32],
+    page_count: u32,
+    artifact_count: u32,
+    terminal_page_hash: [u8; 32],
+    inventory_commitment: [u8; 32],
+}
+
+impl PreWitnessDeletionInventorySeal {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_authenticated_pages(
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+        snapshot: &FrozenPreWitnessInventorySnapshot,
+        revision: u64,
+        pages: &[DurableInventoryPage],
+        references: &[InventoryPageReference],
+    ) -> Result<Self, LifecycleError> {
+        let (page_count, artifact_count, terminal_page_hash) =
+            validate_pre_witness_pages(snapshot.archive_id(), pages, references)?;
+        Self::validated(
+            snapshot.archive_id(),
+            snapshot.deletion_fence(),
+            snapshot.revision(),
+            revision,
+            snapshot.snapshot_commitment,
+            page_count,
+            artifact_count,
+            terminal_page_hash,
+            references,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_persisted(
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+        snapshot_revision: u64,
+        revision: u64,
+        snapshot_commitment: [u8; 32],
+        page_count: u32,
+        artifact_count: u32,
+        terminal_page_hash: [u8; 32],
+        inventory_commitment: [u8; 32],
+        references: &[InventoryPageReference],
+    ) -> Result<Self, LifecycleError> {
+        Self::validated(
+            archive_id,
+            deletion_fence,
+            snapshot_revision,
+            revision,
+            snapshot_commitment,
+            page_count,
+            artifact_count,
+            terminal_page_hash,
+            references,
+            Some(inventory_commitment),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        snapshot: &FrozenPreWitnessInventorySnapshot,
+        pages: &[DurableInventoryPage],
+    ) -> Result<Self, LifecycleError> {
+        let references = pages
+            .iter()
+            .map(|page| page.page().reference())
+            .collect::<Vec<_>>();
+        let revision = snapshot
+            .revision()
+            .checked_add(1)
+            .ok_or(LifecycleError::Limit)?;
+        let (page_count, artifact_count, terminal_page_hash) =
+            validate_pre_witness_pages(snapshot.archive_id(), pages, &references)?;
+        Self::validated(
+            snapshot.archive_id(),
+            snapshot.deletion_fence(),
+            snapshot.revision(),
+            revision,
+            snapshot.snapshot_commitment,
+            page_count,
+            artifact_count,
+            terminal_page_hash,
+            &references,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validated(
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+        snapshot_revision: u64,
+        revision: u64,
+        snapshot_commitment: [u8; 32],
+        page_count: u32,
+        artifact_count: u32,
+        terminal_page_hash: [u8; 32],
+        references: &[InventoryPageReference],
+        expected_commitment: Option<[u8; 32]>,
+    ) -> Result<Self, LifecycleError> {
+        if !nonzero(archive_id.as_bytes())
+            || !nonzero(deletion_fence.as_bytes())
+            || snapshot_revision == 0
+            || snapshot_revision.checked_add(1) != Some(revision)
+            || !nonzero(&snapshot_commitment)
+            || usize::try_from(page_count).ok() != Some(references.len())
+            || usize::try_from(page_count).map_or(true, |count| count > MAX_LIFECYCLE_PAGES)
+            || usize::try_from(artifact_count).map_or(true, |count| count > MAX_LIFECYCLE_ARTIFACTS)
+            || ((page_count == 0 || artifact_count == 0)
+                && !(page_count == 0
+                    && artifact_count == 0
+                    && terminal_page_hash == ZERO_HASH
+                    && references.is_empty()))
+            || (page_count != 0 && !nonzero(&terminal_page_hash))
+        {
+            return Err(LifecycleError::Corrupt);
+        }
+        validate_pre_witness_references(archive_id, page_count, terminal_page_hash, references)?;
+        let inventory_commitment = pre_witness_inventory_commitment(
+            archive_id,
+            deletion_fence,
+            snapshot_revision,
+            revision,
+            snapshot_commitment,
+            page_count,
+            artifact_count,
+            terminal_page_hash,
+            references,
+        );
+        if !nonzero(&inventory_commitment)
+            || expected_commitment.is_some_and(|expected| expected != inventory_commitment)
+        {
+            return Err(LifecycleError::Corrupt);
+        }
+        Ok(Self {
+            archive_id,
+            deletion_fence,
+            snapshot_revision,
+            revision,
+            snapshot_commitment,
+            page_count,
+            artifact_count,
+            terminal_page_hash,
+            inventory_commitment,
+        })
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn deletion_fence(&self) -> ObjectId {
+        self.deletion_fence
+    }
+
+    pub(crate) const fn snapshot_revision(&self) -> u64 {
+        self.snapshot_revision
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    const fn snapshot_commitment(&self) -> [u8; 32] {
+        self.snapshot_commitment
+    }
+
+    pub(crate) const fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
+    pub(crate) const fn artifact_count(&self) -> u32 {
+        self.artifact_count
+    }
+
+    pub(crate) const fn terminal_page_hash(&self) -> [u8; 32] {
+        self.terminal_page_hash
+    }
+
+    pub(crate) const fn inventory_commitment(&self) -> [u8; 32] {
+        self.inventory_commitment
+    }
+}
+
+impl fmt::Debug for PreWitnessDeletionInventorySeal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreWitnessDeletionInventorySeal(<opaque>)")
+    }
+}
+
 /// Same-commitment completion returned only after the deletion driver has
 /// observed the durable witness `PhysicalComplete` transition. This receipt
 /// authorizes lifecycle-page erasure, but it does not by itself authorize the
@@ -1750,6 +2171,241 @@ fn encode_page(
     Ok(encoded)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pre_witness_snapshot_commitment(
+    plan: BootstrapPlan,
+    deletion_fence: ObjectId,
+    absence_revision: u64,
+    snapshot_revision: u64,
+    protocol_version: u16,
+    expected_witness_hash: Option<[u8; 32]>,
+    expected_witness_len: Option<u32>,
+    protocol_commitment: [u8; 32],
+    create_ahead: &[PlannedArtifact],
+) -> Result<[u8; 32], LifecycleError> {
+    if absence_revision == 0
+        || absence_revision.checked_add(1) != Some(snapshot_revision)
+        || protocol_version != WITNESS_CREATE_PROTOCOL_V1
+        || !nonzero(deletion_fence.as_bytes())
+        || !nonzero(&protocol_commitment)
+        || !matches!(
+            (expected_witness_hash, expected_witness_len),
+            (None, None) | (Some(_), Some(_))
+        )
+        || expected_witness_hash.is_some_and(|hash| !nonzero(&hash))
+        || expected_witness_len == Some(0)
+        || create_ahead.len() > MAX_LIFECYCLE_ARTIFACTS
+    {
+        return Err(LifecycleError::Corrupt);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(PRE_WITNESS_SNAPSHOT_DOMAIN);
+    hasher.update(PRE_WITNESS_INVENTORY_FORMAT_V1.to_be_bytes());
+    hasher.update(plan.archive_id().as_bytes());
+    hasher.update(deletion_fence.as_bytes());
+    hasher.update(absence_revision.to_be_bytes());
+    hasher.update(snapshot_revision.to_be_bytes());
+    hasher.update(plan.attempt_id().as_bytes());
+    hasher.update(plan.database_epoch().as_bytes());
+    hasher.update(plan.key_epoch().as_bytes());
+    hasher.update(plan.registry_object_id().as_bytes());
+    hasher.update(plan.root_object_id().as_bytes());
+    hasher.update(protocol_version.to_be_bytes());
+    match (expected_witness_hash, expected_witness_len) {
+        (None, None) => hasher.update([0]),
+        (Some(hash), Some(len)) => {
+            hasher.update([1]);
+            hasher.update(hash);
+            hasher.update(len.to_be_bytes());
+        }
+        _ => return Err(LifecycleError::Corrupt),
+    }
+    hasher.update(protocol_commitment);
+    hasher.update(
+        u32::try_from(create_ahead.len())
+            .map_err(|_| LifecycleError::Limit)?
+            .to_be_bytes(),
+    );
+    let mut previous = None;
+    for artifact in create_ahead {
+        let key = artifact.key().as_str().as_bytes();
+        let current = (
+            artifact.attempt_id(),
+            artifact.ordinal(),
+            artifact.key().as_str(),
+        );
+        if artifact.attempt_id() != plan.attempt_id()
+            || artifact.create_state() == ArtifactCreateState::OutcomeUnknown
+            || previous.is_some_and(|value| value >= current)
+        {
+            return Err(LifecycleError::Corrupt);
+        }
+        previous = Some(current);
+        hasher.update(artifact.attempt_id().as_bytes());
+        hasher.update(artifact.ordinal().to_be_bytes());
+        hasher.update(
+            u32::try_from(key.len())
+                .map_err(|_| LifecycleError::Limit)?
+                .to_be_bytes(),
+        );
+        hasher.update(key);
+        hasher.update([artifact.role() as u8]);
+        hasher.update(artifact.ciphertext_hash());
+        hasher.update(artifact.encoded_len().to_be_bytes());
+        hasher.update([artifact.create_state() as u8]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn validate_pre_witness_pages(
+    archive_id: ArchiveId,
+    pages: &[DurableInventoryPage],
+    references: &[InventoryPageReference],
+) -> Result<(u32, u32, [u8; 32]), LifecycleError> {
+    if pages.len() != references.len() || pages.len() > MAX_LIFECYCLE_PAGES {
+        return Err(LifecycleError::ChainMismatch);
+    }
+    if pages.is_empty() {
+        return Ok((0, 0, ZERO_HASH));
+    }
+    let mut previous_hash = ZERO_HASH;
+    let mut previous_object: Option<LifecycleInventoryObject> = None;
+    let mut seen = BTreeMap::<ObjectId, LifecycleInventoryObject>::new();
+    let mut artifact_count = 0usize;
+    for (index, (durable, reference)) in pages.iter().zip(references).enumerate() {
+        let page = durable.page();
+        if page.archive_id() != archive_id
+            || usize::try_from(page.page_ordinal()).ok() != Some(index)
+            || page.previous_hash() != previous_hash
+            || page.reference() != *reference
+            || InventoryPage::decode(archive_id, page.encoded())? != *page
+        {
+            return Err(LifecycleError::ChainMismatch);
+        }
+        for object in page.entries() {
+            if previous_object
+                .as_ref()
+                .is_some_and(|previous| previous >= object)
+                || seen
+                    .insert(object.key().object_id(), object.clone())
+                    .is_some()
+            {
+                return Err(LifecycleError::DuplicateConflict);
+            }
+            previous_object = Some(object.clone());
+        }
+        artifact_count = artifact_count
+            .checked_add(page.entries().len())
+            .ok_or(LifecycleError::Limit)?;
+        if artifact_count > MAX_LIFECYCLE_ARTIFACTS {
+            return Err(LifecycleError::Limit);
+        }
+        previous_hash = page.page_hash();
+    }
+    Ok((
+        u32::try_from(pages.len()).map_err(|_| LifecycleError::Limit)?,
+        u32::try_from(artifact_count).map_err(|_| LifecycleError::Limit)?,
+        previous_hash,
+    ))
+}
+
+pub(crate) fn validate_pre_witness_sealed_page_references(
+    seal: &PreWitnessDeletionInventorySeal,
+    references: &[InventoryPageReference],
+) -> Result<(), LifecycleError> {
+    validate_pre_witness_references(
+        seal.archive_id(),
+        seal.page_count(),
+        seal.terminal_page_hash(),
+        references,
+    )?;
+    let commitment = pre_witness_inventory_commitment(
+        seal.archive_id(),
+        seal.deletion_fence(),
+        seal.snapshot_revision(),
+        seal.revision(),
+        seal.snapshot_commitment(),
+        seal.page_count(),
+        seal.artifact_count(),
+        seal.terminal_page_hash(),
+        references,
+    );
+    (commitment == seal.inventory_commitment())
+        .then_some(())
+        .ok_or(LifecycleError::ChainMismatch)
+}
+
+fn validate_pre_witness_references(
+    archive_id: ArchiveId,
+    page_count: u32,
+    terminal_page_hash: [u8; 32],
+    references: &[InventoryPageReference],
+) -> Result<(), LifecycleError> {
+    if page_count == 0 {
+        return (references.is_empty() && terminal_page_hash == ZERO_HASH)
+            .then_some(())
+            .ok_or(LifecycleError::ChainMismatch);
+    }
+    if usize::try_from(page_count).ok() != Some(references.len())
+        || references.is_empty()
+        || references.len() > MAX_LIFECYCLE_PAGES
+    {
+        return Err(LifecycleError::ChainMismatch);
+    }
+    let mut previous = ZERO_HASH;
+    for (index, reference) in references.iter().enumerate() {
+        if reference.archive_id() != archive_id
+            || usize::try_from(reference.page_ordinal()).ok() != Some(index)
+            || reference.previous_hash() != previous
+        {
+            return Err(LifecycleError::ChainMismatch);
+        }
+        previous = reference.page_hash();
+    }
+    (previous == terminal_page_hash)
+        .then_some(())
+        .ok_or(LifecycleError::ChainMismatch)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pre_witness_inventory_commitment(
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    snapshot_revision: u64,
+    revision: u64,
+    snapshot_commitment: [u8; 32],
+    page_count: u32,
+    artifact_count: u32,
+    terminal_page_hash: [u8; 32],
+    references: &[InventoryPageReference],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PRE_WITNESS_INVENTORY_DOMAIN);
+    hasher.update(PRE_WITNESS_INVENTORY_FORMAT_V1.to_be_bytes());
+    hasher.update(archive_id.as_bytes());
+    hasher.update(deletion_fence.as_bytes());
+    hasher.update(snapshot_revision.to_be_bytes());
+    hasher.update(revision.to_be_bytes());
+    hasher.update(snapshot_commitment);
+    hasher.update(page_count.to_be_bytes());
+    hasher.update(artifact_count.to_be_bytes());
+    hasher.update(terminal_page_hash);
+    hasher.update(
+        u32::try_from(references.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for reference in references {
+        hasher.update(reference.archive_id().as_bytes());
+        hasher.update(reference.page_ordinal().to_be_bytes());
+        hasher.update(reference.page_id().as_bytes());
+        hasher.update(reference.previous_hash());
+        hasher.update(reference.page_hash());
+        hasher.update(reference.encoded_len().to_be_bytes());
+    }
+    hasher.finalize().into()
+}
+
 fn inventory_commitment(
     archive_id: ArchiveId,
     deletion_fence: ObjectId,
@@ -1980,6 +2636,32 @@ mod tests {
         DurableInventoryPage::from_exact_readback(page, &encoded).unwrap()
     }
 
+    fn pre_witness_snapshot(
+        archive_id: ArchiveId,
+        create_ahead: Vec<PlannedArtifact>,
+    ) -> FrozenPreWitnessInventorySnapshot {
+        let plan = BootstrapPlan::new(
+            archive_id,
+            attempt(4),
+            DatabaseEpoch::from_bytes([2; 16]),
+            KeyEpoch::from_bytes([3; 16]),
+            ObjectId::from_bytes([5; 16]),
+            ObjectId::from_bytes([6; 16]),
+        )
+        .unwrap();
+        FrozenPreWitnessInventorySnapshot::for_test(
+            plan,
+            ObjectId::from_bytes([7; 16]),
+            8,
+            9,
+            None,
+            None,
+            [10; 32],
+            create_ahead,
+        )
+        .unwrap()
+    }
+
     fn inventory(artifact: PlannedArtifact) -> LifecycleInventoryObject {
         artifact.inventory_object().unwrap()
     }
@@ -2040,6 +2722,77 @@ mod tests {
                 .unwrap();
         assert_eq!(prepared.wrapped_registry(), &[7]);
         assert_eq!(format!("{prepared:?}"), "PreparedBootstrap(<opaque>)");
+    }
+
+    #[test]
+    fn pre_witness_snapshot_and_zero_inventory_seal_bind_distinct_domains() {
+        let archive = ArchiveId::from_bytes([71; 16]);
+        let snapshot = pre_witness_snapshot(archive, vec![]);
+        assert_eq!(snapshot.absence_revision(), 8);
+        assert_eq!(snapshot.revision(), 9);
+        assert_ne!(snapshot.snapshot_commitment_for_test(), ZERO_HASH);
+        let seal = PreWitnessDeletionInventorySeal::for_test(&snapshot, &[]).unwrap();
+        assert_eq!(seal.page_count(), 0);
+        assert_eq!(seal.artifact_count(), 0);
+        assert_eq!(seal.terminal_page_hash(), ZERO_HASH);
+        assert_ne!(seal.inventory_commitment(), ZERO_HASH);
+        assert!(validate_pre_witness_sealed_page_references(&seal, &[]).is_ok());
+        assert_ne!(
+            seal.inventory_commitment(),
+            inventory_commitment(archive, snapshot.deletion_fence(), 0, 0, ZERO_HASH)
+        );
+        assert_eq!(
+            format!("{snapshot:?}"),
+            "FrozenPreWitnessInventorySnapshot(<opaque>)"
+        );
+        assert_eq!(
+            format!("{seal:?}"),
+            "PreWitnessDeletionInventorySeal(<opaque>)"
+        );
+    }
+
+    #[test]
+    fn pre_witness_nonempty_seal_rejects_reordered_or_alternate_references() {
+        let archive = ArchiveId::from_bytes([72; 16]);
+        let mut artifacts = vec![
+            artifact(archive, attempt(4), 0, 73, ArtifactCreateState::Created),
+            artifact(
+                archive,
+                attempt(4),
+                1,
+                74,
+                ArtifactCreateState::ConfirmedAbsent,
+            ),
+        ];
+        artifacts.sort_by(|left, right| {
+            (left.attempt_id(), left.ordinal(), left.key().as_str()).cmp(&(
+                right.attempt_id(),
+                right.ordinal(),
+                right.key().as_str(),
+            ))
+        });
+        let snapshot = pre_witness_snapshot(archive, artifacts.clone());
+        let mut entries = artifacts.into_iter().map(inventory).collect::<Vec<_>>();
+        entries.sort();
+        let first = InventoryPage::build(archive, 0, ZERO_HASH, vec![entries[0].clone()]).unwrap();
+        let second =
+            InventoryPage::build(archive, 1, first.page_hash(), vec![entries[1].clone()]).unwrap();
+        let pages = vec![durable(first.clone()), durable(second.clone())];
+        let seal = PreWitnessDeletionInventorySeal::for_test(&snapshot, &pages).unwrap();
+        let references = vec![first.reference(), second.reference()];
+        assert!(validate_pre_witness_sealed_page_references(&seal, &references).is_ok());
+        assert!(validate_pre_witness_sealed_page_references(
+            &seal,
+            &[references[1], references[0]],
+        )
+        .is_err());
+        let alternate =
+            InventoryPage::build(archive, 1, first.page_hash(), vec![entries[0].clone()]).unwrap();
+        assert!(validate_pre_witness_sealed_page_references(
+            &seal,
+            &[references[0], alternate.reference()],
+        )
+        .is_err());
     }
 
     #[test]

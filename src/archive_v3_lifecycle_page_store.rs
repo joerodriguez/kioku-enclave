@@ -1868,6 +1868,13 @@ mod tests {
         assert!(control.contains("archive_lifecycle_one_unresolved_page_create"));
         assert!(control.contains("unresolved_encoded_page = NULL"));
         assert!(control.contains("state != 'created'"));
-        assert!(!control.contains("if page_create_count != 0"));
+        let normal_seal = control
+            .split_once("fn seal_archive_inventory_conn(")
+            .unwrap()
+            .1
+            .split_once("fn seal_pre_witness_inventory_conn(")
+            .unwrap()
+            .0;
+        assert!(!normal_seal.contains("if page_create_count != 0"));
     }
 }

@@ -433,9 +433,17 @@ private one-shot capability consumed by control, so sibling code cannot call a r
 snapshot-to-absence API. Restart retains facts rather than
 proofs: even `absence_confirmed` requires another exact `None` read and full-state CAS to remint.
 Old anchors with no enrollment, unknown protocol versions, active or inconsistent tuples fail
-closed before witness I/O and are never inferred unsent. This capability is not consumed by the
-inventory coordinator or deletion driver and has no Store/startup/runtime/route/config/provider
-construction, credential, cloud, or deployment wiring.
+closed before witness I/O and are never inferred unsent. The fresh absence proof can now be
+consumed exactly once into a separate encrypted-control pre-witness inventory branch. That branch
+commits the full absence/protocol/bootstrap/fence/revision tuple and every settled create-ahead
+fact before any external inventory-page operation. It never invokes reachability or reads archive
+metadata. The shared page ledger derives the complete deterministic plan from that durable
+snapshot on every admission, recovery, and reconciliation: only an exact created prefix plus at
+most its exact unresolved next page is valid, and the zero-object plan rejects every page before
+durable admission or transport I/O. Restart after this boundary uses only the durable opaque archive/fence tuple and never
+remints absence or rereads Firestore. This capability still is not accepted by the deletion driver
+and has no Store/startup/runtime/route/config/provider construction, credential, cloud, or
+deployment wiring.
 Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
 rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
 source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the
@@ -526,9 +534,9 @@ unrelated retention assertion. The former independent inventory builder, test-ov
 commitment, and `FullReachabilitySeal` are removed. A complete deletion inventory is now minted
 only after the authenticated lifecycle-page loader verifies the exact durable seal (apart from
 explicit `cfg(test)` fixtures), so the reachability report remains non-authorizing on its own.
-Full activation remains blocked because the capability-only pre-witness disposition is not yet
-integrated into deletion, and by the lack of startup/runtime/provider construction and
-deletion-driver invocation.
+Full activation remains blocked because the type-separated pre-witness inventory is deliberately
+non-authorizing and is not accepted by the deletion driver, and by the lack of
+startup/runtime/provider construction and deletion-driver invocation.
 The intended lifecycle order is fixed: freeze and drain admitted/ambiguous creates; tombstone the
 exact unchanged current root (or use a separately reviewed exact-absence coordinator for a bootstrap
 that never established a witness); reauthenticate that exact Tombstoned worker/operation/fence before
@@ -547,8 +555,10 @@ and page references remain permanently. A one-snapshot control recovery read key
 and exact deletion fence revalidates those references and reconstructs the sealed-inventory receipt; after
 physical completion it additionally reconstructs the durable-control receipt from the retained provider-drain
 commitment. Restart therefore never depends on a process retaining either receipt. The separately
-compiled pre-witness disposition can prove a never-started initial send, but is intentionally not
-accepted by this driver in this slice; that reviewed integration remains an activation blocker.
+compiled pre-witness disposition can prove a never-started initial send. Its proof can seal a
+separate create-ahead-only inventory, including an explicit zero-object representation, but the
+result has no entry/provider capability and is intentionally not accepted by this driver in this
+slice; that reviewed authority integration remains an activation blocker.
 The authenticated exact-name visitor and lifecycle inventory coordinator are compiled and tested
 but inactive; neither infers paths nor discovers objects by prefix. The driver has no Store, route, runtime,
 credential, or deployment wiring.
