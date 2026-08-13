@@ -164,6 +164,12 @@ pub struct RecordingLeaseRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineRecordingUsageRequest {
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UrlResponse {
     pub url: String,
 }
@@ -514,6 +520,10 @@ pub fn router() -> Router<std::sync::Arc<CpState>> {
     Router::new()
         .route("/api/billing", get(get_billing))
         .route("/api/billing/recording-lease", post(create_recording_lease))
+        .route(
+            "/api/billing/offline-recording-usage",
+            post(record_offline_recording_usage),
+        )
         .route("/api/billing/checkout", post(create_checkout))
         .route("/api/billing/portal", post(create_portal))
         .route("/api/admin/capabilities", get(admin_capabilities))
@@ -583,6 +593,15 @@ fn valid_recording_lease(request: &RecordingLeaseRequest) -> bool {
 fn recording_event_id(account_id: &str, request_id: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"kioku.recording_seconds_v1\0");
+    digest.update(account_id.as_bytes());
+    digest.update([0]);
+    digest.update(request_id.as_bytes());
+    format!("evt_{:x}", digest.finalize())
+}
+
+fn offline_recording_event_id(account_id: &str, request_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kioku.offline_recording_seconds_v1\0");
     digest.update(account_id.as_bytes());
     digest.update([0]);
     digest.update(request_id.as_bytes());
@@ -725,6 +744,55 @@ async fn authorize_recording_seconds(
         }),
         Err(_) if !state.config.billing_enforcement_mode.enforces() => {
             warn!("recording billing shadow outage ignored");
+            Ok((
+                serde_json::json!({"recording":{"allowed":true,"shadow":true}}),
+                false,
+            ))
+        }
+        Err(_) => Err(RecordingAuthorizationFailure::Unavailable),
+    }
+}
+
+async fn authorize_offline_recording_seconds(
+    state: &CpState,
+    user_id: &str,
+    request_id: &str,
+) -> Result<(Value, bool), RecordingAuthorizationFailure> {
+    let account_id = match state.control.billing_account_id(user_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(error = %error, "offline recording billing account mapping unavailable");
+            return if state.config.billing_enforcement_mode.enforces() {
+                Err(RecordingAuthorizationFailure::Unavailable)
+            } else {
+                Ok((
+                    serde_json::json!({"recording":{"allowed":true,"shadow":true}}),
+                    false,
+                ))
+            };
+        }
+    };
+    let event_id = offline_recording_event_id(&account_id, request_id);
+    let observed_at = super::isotime::format_epoch_millis(epoch_millis());
+    let request = UsageAuthorizeRequest {
+        account_id,
+        event_id,
+        meter: "recording_seconds_v1",
+        quantity_seconds: RECORDING_LEASE_SECONDS,
+        observed_at,
+    };
+    match state.billing.authorize(&request).await {
+        Ok(response) if response.decision == "allow" => Ok((response.summary, response.duplicate)),
+        Ok(response) if !state.config.billing_enforcement_mode.enforces() => {
+            warn!("offline recording billing shadow denial ignored");
+            Ok((response.summary, response.duplicate))
+        }
+        Ok(response) => Err(RecordingAuthorizationFailure::Denied {
+            code: public_denial_code(response.reason.as_deref()).to_string(),
+            summary: response.summary,
+        }),
+        Err(_) if !state.config.billing_enforcement_mode.enforces() => {
+            warn!("offline recording billing shadow outage ignored");
             Ok((
                 serde_json::json!({"recording":{"allowed":true,"shadow":true}}),
                 false,
@@ -928,6 +996,66 @@ async fn create_recording_lease(
     recording_lease_response(lease_id, expires_at, summary)
 }
 
+async fn record_offline_recording_usage(
+    State(state): State<std::sync::Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(request): Json<OfflineRecordingUsageRequest>,
+) -> Response {
+    if !uuid_v4(&request.request_id) {
+        return no_store(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid_offline_recording_usage"})),
+            )
+                .into_response(),
+        );
+    }
+    // Serialize this accounting write with live lease admission for the same
+    // user so plan exhaustion has one deterministic order. The upstream event
+    // id is derived from the stable request id, making response-loss retries
+    // idempotent without persisting client or capture metadata in the enclave.
+    let _gate = state.recording_lease_gate.lock(&user.0).await;
+    let already_completed = match state
+        .control
+        .offline_recording_usage_receipt(&user.0, &request.request_id)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return service_unavailable(),
+    };
+    if already_completed {
+        return match current_recording_summary(&state, &user.0).await {
+            Ok(summary) => no_store(
+                Json(serde_json::json!({"duplicate":true,"billing":summary})).into_response(),
+            ),
+            Err(_) => service_unavailable(),
+        };
+    }
+    match authorize_offline_recording_seconds(&state, &user.0, &request.request_id).await {
+        Ok((summary, upstream_duplicate)) => {
+            let inserted = match state
+                .control
+                .complete_offline_recording_usage(&user.0, &request.request_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => return service_unavailable(),
+            };
+            no_store(
+                Json(serde_json::json!({
+                    "duplicate":upstream_duplicate || !inserted,
+                    "billing":summary
+                }))
+                .into_response(),
+            )
+        }
+        Err(RecordingAuthorizationFailure::Denied { code, summary }) => {
+            recording_denial_response(&code, summary)
+        }
+        Err(RecordingAuthorizationFailure::Unavailable) => service_unavailable(),
+    }
+}
+
 fn inactive_lease() -> Response {
     no_store(
         (
@@ -967,6 +1095,35 @@ pub async fn check_recording_entitlement(state: &CpState, user_id: &str) -> Resu
         Ok(_) => Err(inactive_lease()),
         Err(_) if !state.config.billing_enforcement_mode.enforces() => Ok(()),
         Err(_) => Err(service_unavailable()),
+    }
+}
+
+pub async fn reserve_recording_delivery(
+    state: &CpState,
+    user_id: &str,
+    event_id: &str,
+    media_bytes: i64,
+) -> Result<(), Response> {
+    match state
+        .control
+        .reserve_recording_delivery(user_id, event_id, media_bytes)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) if !state.config.billing_enforcement_mode.enforces() => Ok(()),
+        Ok(false) => Err(inactive_lease()),
+        Err(_) if !state.config.billing_enforcement_mode.enforces() => Ok(()),
+        Err(_) => Err(service_unavailable()),
+    }
+}
+
+pub async fn complete_recording_delivery(state: &CpState, user_id: &str, event_id: &str) {
+    if let Err(error) = state
+        .control
+        .complete_recording_delivery(user_id, event_id)
+        .await
+    {
+        warn!(error = %error, "recording delivery reservation cleanup failed");
     }
 }
 
@@ -1957,6 +2114,27 @@ mod tests {
             request_id: "not-a-uuid".into(),
             lease_id: None,
         }));
+        assert_eq!(
+            offline_recording_event_id("acct_random", &request.request_id),
+            offline_recording_event_id("acct_random", &request.request_id)
+        );
+        assert_ne!(
+            offline_recording_event_id("acct_random", &request.request_id),
+            recording_event_id("acct_random", &request.request_id)
+        );
+        assert!(
+            serde_json::from_value::<OfflineRecordingUsageRequest>(serde_json::json!({
+                "request_id":request.request_id
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<OfflineRecordingUsageRequest>(serde_json::json!({
+                "request_id":request.request_id,
+                "capture_session_id":"must-not-cross-billing-boundary"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

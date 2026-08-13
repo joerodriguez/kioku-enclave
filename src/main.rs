@@ -331,6 +331,9 @@ fn billing_request_observation(
     let route = match (method, path) {
         (method, "/api/billing") if method == Method::GET => "billing_summary",
         (method, "/api/billing/recording-lease") if method == Method::POST => "recording_lease",
+        (method, "/api/billing/offline-recording-usage") if method == Method::POST => {
+            "offline_recording_usage"
+        }
         _ => return None,
     };
     let status_class = match status.as_u16() {
@@ -347,7 +350,7 @@ fn billing_request_observation(
     })
 }
 
-/// Emits one content-free event only for the two launch-critical billing
+/// Emits one content-free event only for the fixed billing admission
 /// method-and-route pairs. Raw paths, queries, account IDs, tokens, headers,
 /// and bodies never enter the event, so its fields remain safe for
 /// low-cardinality log metrics.
@@ -1280,6 +1283,20 @@ mod billing_request_observability_tests {
             })
         );
         assert_eq!(
+            billing_request_observation(
+                &Method::POST,
+                "/api/billing/offline-recording-usage",
+                StatusCode::OK,
+                75,
+            ),
+            Some(BillingRequestObservation {
+                route: "offline_recording_usage",
+                status: 200,
+                status_class: "2xx",
+                duration_ms: 75,
+            })
+        );
+        assert_eq!(
             billing_request_observation(&Method::GET, "/api/accounts/private", StatusCode::OK, 1),
             None
         );
@@ -1292,6 +1309,7 @@ mod billing_request_observability_tests {
             (Method::OPTIONS, "/api/billing/recording-lease"),
             (Method::POST, "/api/billing"),
             (Method::GET, "/api/billing/recording-lease"),
+            (Method::GET, "/api/billing/offline-recording-usage"),
         ] {
             assert_eq!(
                 billing_request_observation(&method, path, StatusCode::METHOD_NOT_ALLOWED, 1),

@@ -1095,18 +1095,34 @@ model content. The random mapping, lease receipts, and deletion-detach outbox re
 encrypted inside the enclave. This boundary reveals subscription usage and inference-cost
 shape; compromise of both databases could link those records.
 
-New capture depends on the entitlement port in enforce mode: a denial or inactive lease is
-HTTP 402, idempotency/early-renewal conflict is HTTP 409, and unavailable durable state is
-HTTP 503 before persistence. Screenshots and references require an active lease but do not
-consume again. Existing cloud archive reads, search, export, and deletion remain ungated;
-there is no local recording or transcription fallback. Shadow mode must not log upstream
-denial detail.
+Cloud persistence of new capture depends on the entitlement port in enforce mode: a
+denial or inactive lease is HTTP 402, idempotency/early-renewal conflict is HTTP 409,
+and unavailable durable state is HTTP 503 before persistence. The Mac may continue
+capture during ordinary connectivity loss only into an account-scoped AES-256-GCM local
+outbox whose key remains in its device-only data-protection Keychain; it deletes an item
+only after enclave acknowledgement and stops new capture if the bounded outbox cannot
+write. On reconnection, a separate content-free journal settles one idempotent,
+rounded-up 60-second usage tick per offline minute before the client obtains a live lease
+and releases queued media. Those ticks expose only the random billing account pseudonym,
+meter, quantity, current observation time, and a domain-separated random idempotency
+event—never the capture session, device, stream, original time, media, or content. This
+is a local delivery fallback, not local transcription, OCR, indexing, or memory
+processing. Existing cloud archive reads, search, export, and deletion remain ungated.
+Shadow mode must not log upstream denial detail.
+
+Each newly billed live or offline minute also grants an encrypted-control-store budget of
+120 delayed events and 256 MiB. A Mac outbox request carries only a fixed delivery-mode
+header; before content persistence the enclave reserves budget by the event ID it is about
+to store. Identical retry and reference-to-canonical rebase are idempotent. This permits
+delivery after the live lease expires without charging transfer time, while preventing an
+unbounded inactive-lease upload path. Reservation telemetry contains no identifiers.
 
 ### Billing request telemetry reveals route timing and outcome
 
-The service emits one structured event after each `GET` billing-summary or `POST`
-recording-lease request. It ignores preflight and wrong-method requests. Each event
-contains only a fixed schema name, one of two fixed route labels, the numeric HTTP status
+The service emits one structured event after each `GET` billing-summary, `POST`
+recording-lease, or `POST` offline-recording-usage request. It ignores preflight and
+wrong-method requests. Each event contains only a fixed schema name, one of three fixed
+route labels, the numeric HTTP status
 and its fixed class, and elapsed milliseconds. It deliberately omits the request method,
 path and query, account and provider identifiers, tokens, headers, bodies, lease/request
 IDs, exception text, and captured content. This is request-level operational telemetry—not

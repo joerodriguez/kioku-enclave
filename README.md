@@ -67,9 +67,14 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   explicitly authorizes no speaker-quality claim and no external users.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
 - Enforces monthly wall-clock recording allowances through server-timed, idempotent
-  60-second leases. A restarted client reattaches to an unexpired paid interval when more
+  60-second leases plus domain-separated, idempotent 60-second reconciliation ticks for
+  time recorded into the Mac's encrypted local outbox during a network outage. Offline
+  ticks carry no capture, device, stream, media, or timestamp identifier. A restarted
+  client reattaches to an unexpired paid interval when more
   than the 20-second renewal headroom remains; otherwise the enclave reserves one fresh
-  minute instead of trapping the client in a lease-conflict loop. A durable pending
+  minute instead of trapping the client in a lease-conflict loop. Each paid minute also
+  grants a bounded event/byte delivery budget so acknowledged outbox replay can occur
+  after lease expiry without charging network-transfer time. A durable pending
   reservation is reconciled with its original billing idempotency key before any new
   reservation, so a crash or failed local commit neither double-charges nor blocks that
   user indefinitely. The enclave knows only the provider-neutral allowance snapshot and
