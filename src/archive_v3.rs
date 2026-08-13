@@ -40,7 +40,7 @@ const NODE_MAGIC: &[u8; 8] = b"KARNv3\0\0";
 const ROOT_MAGIC: &[u8; 8] = b"KARRv3\0\0";
 const KEY_REGISTRY_MAGIC: &[u8; 16] = b"KIOKU-KEYREG-v3\0";
 const KEY_REGISTRY_DOMAIN: &[u8] = b"kioku:archive:v3:kms-wrap\0";
-const KEY_REGISTRY_PLAINTEXT_BYTES: usize =
+pub(crate) const KEY_REGISTRY_PLAINTEXT_BYTES: usize =
     KEY_REGISTRY_MAGIC.len() + 1 + 2 + KEY_REGISTRY_DOMAIN.len() + 16 + 1 + 16 + 8 + 32;
 pub const MAX_WRAPPED_KEY_REGISTRY_BYTES: usize = 16 * 1024;
 const GCM_TAG_BYTES: usize = 16;
@@ -686,6 +686,10 @@ impl KeyRegistryContext {
         self.rotation_generation
     }
 
+    pub(crate) const fn key_kind(&self) -> KeyKind {
+        self.key_kind
+    }
+
     pub fn object_key(&self, object_id: ObjectId) -> ObjectKey {
         let archive = canonical_id_component(self.archive_id.as_bytes());
         let key_epoch = canonical_id_component(self.key_epoch.as_bytes());
@@ -703,8 +707,10 @@ impl KeyRegistryContext {
     /// deliberately separate from archive-object AAD: it binds the KMS
     /// ciphertext to precisely one archive/key namespace and rotation, while
     /// never carrying a raw DEK in any provider-visible metadata.
-    pub fn canonical_kms_aad(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(KEY_REGISTRY_DOMAIN.len() + 1 + 16 + 1 + 16 + 8);
+    pub fn canonical_kms_aad(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(
+            KEY_REGISTRY_DOMAIN.len() + 1 + 16 + 1 + 16 + 8,
+        ));
         out.extend_from_slice(KEY_REGISTRY_DOMAIN);
         out.push(ARCHIVE_FORMAT_VERSION);
         out.extend_from_slice(self.archive_id.as_bytes());

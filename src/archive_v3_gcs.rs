@@ -13,12 +13,14 @@ use crate::{
     archive_v3::{
         ArchivePrefix, ArchiveV3Error, CiphertextEnvelope, CreateIfAbsent,
         ExactKeyRegistryProvider, ImmutableObjectBackend, KeyRegistryContext, ObjectContext,
-        ObjectId, ObjectKey, Result, MAX_ENCODED_ENVELOPE_BYTES, MAX_WRAPPED_KEY_REGISTRY_BYTES,
+        ObjectId, ObjectKey, Result, KEY_REGISTRY_PLAINTEXT_BYTES, MAX_ENCODED_ENVELOPE_BYTES,
+        MAX_WRAPPED_KEY_REGISTRY_BYTES,
     },
     archive_v3_witness::{ExactRootProvider, WitnessError},
 };
 use sha2::{Digest, Sha256};
 use std::{fmt, sync::Arc};
+use zeroize::Zeroize;
 
 pub(crate) const MAX_CANONICAL_OBJECT_KEY_BYTES: usize = 512;
 pub(crate) const MAX_ENUMERATION_PAGE_BYTES: usize =
@@ -172,13 +174,23 @@ pub(crate) trait ArchiveV3GcsTransport: Send + Sync {
     }
 }
 
-/// Bounded registry KMS boundary. The adapter supplies canonical KMS AAD; no
-/// raw DEK is exposed and no legacy per-object wrapped-DEK metadata is used.
+/// Bounded registry KMS boundary. The adapter receives the typed registry
+/// context and derives its canonical, zeroizing KMS AAD internally; no raw DEK
+/// is exposed and no legacy per-object wrapped-DEK metadata is used. Every
+/// method must zero the full destination before validation or its first await,
+/// and may publish bytes only on success.
 #[async_trait::async_trait]
 pub(crate) trait ArchiveV3RegistryKms: Send + Sync {
+    async fn wrap_registry(
+        &self,
+        context: &KeyRegistryContext,
+        registry_plaintext: &[u8],
+        destination: &mut [u8],
+    ) -> std::result::Result<usize, GcsArchiveV3TransportError>;
+
     async fn unwrap_registry(
         &self,
-        canonical_aad: &[u8],
+        context: &KeyRegistryContext,
         wrapped_registry_ciphertext: &[u8],
         destination: &mut [u8],
     ) -> std::result::Result<usize, GcsArchiveV3TransportError>;
@@ -478,6 +490,41 @@ impl GcsArchiveV3RegistryProvider {
         Self { transport, kms }
     }
 
+    /// Wrap one exact registry plaintext under the typed context. The KMS
+    /// implementation, not this caller, derives the canonical AAD.
+    pub(crate) async fn wrap_registry(
+        &self,
+        context: &KeyRegistryContext,
+        registry_plaintext: &[u8],
+        destination: &mut [u8],
+    ) -> Result<usize> {
+        destination.zeroize();
+        let result = self
+            .kms
+            .wrap_registry(context, registry_plaintext, destination)
+            .await;
+        match result {
+            Ok(len)
+                if (1..=MAX_WRAPPED_KEY_REGISTRY_BYTES).contains(&len)
+                    && len <= destination.len() =>
+            {
+                Ok(len)
+            }
+            Ok(0) => {
+                destination.zeroize();
+                Err(ArchiveV3Error::InvalidContext)
+            }
+            Ok(_) => {
+                destination.zeroize();
+                Err(ArchiveV3Error::TooLarge("wrapped key registry"))
+            }
+            Err(error) => {
+                destination.zeroize();
+                Err(map_transport(error))
+            }
+        }
+    }
+
     /// Create a wrapped registry object under the same archive-wide ID claim
     /// namespace as envelopes. This is the only permitted registry write seam.
     pub(crate) async fn create_wrapped_if_absent(
@@ -528,24 +575,34 @@ impl ExactKeyRegistryProvider for GcsArchiveV3RegistryProvider {
         wrapped_registry_ciphertext: &[u8],
         destination: &mut [u8],
     ) -> Result<usize> {
+        destination.zeroize();
         if wrapped_registry_ciphertext.is_empty()
             || wrapped_registry_ciphertext.len() > MAX_WRAPPED_KEY_REGISTRY_BYTES
         {
             return Err(ArchiveV3Error::TooLarge("wrapped key registry"));
         }
-        let len = self
-            .kms
-            .unwrap_registry(
-                &context.canonical_kms_aad(),
-                wrapped_registry_ciphertext,
-                destination,
-            )
-            .await
-            .map_err(map_transport)?;
-        if len > destination.len() {
+        if destination.len() < KEY_REGISTRY_PLAINTEXT_BYTES {
             return Err(ArchiveV3Error::TooLarge("key registry plaintext"));
         }
-        Ok(len)
+        let result = self
+            .kms
+            .unwrap_registry(context, wrapped_registry_ciphertext, destination)
+            .await;
+        match result {
+            Ok(KEY_REGISTRY_PLAINTEXT_BYTES) => Ok(KEY_REGISTRY_PLAINTEXT_BYTES),
+            Ok(len) if len > destination.len() || len > KEY_REGISTRY_PLAINTEXT_BYTES => {
+                destination.zeroize();
+                Err(ArchiveV3Error::TooLarge("key registry plaintext"))
+            }
+            Ok(_) => {
+                destination.zeroize();
+                Err(ArchiveV3Error::InvalidContext)
+            }
+            Err(error) => {
+                destination.zeroize();
+                Err(map_transport(error))
+            }
+        }
     }
 }
 
@@ -788,19 +845,37 @@ mod tests {
         }
     }
     struct FakeRegistryKms {
-        expected_aad: Vec<u8>,
+        expected_context: KeyRegistryContext,
         expected_wrapped: Vec<u8>,
         plaintext: Vec<u8>,
     }
     #[async_trait::async_trait]
     impl ArchiveV3RegistryKms for FakeRegistryKms {
+        async fn wrap_registry(
+            &self,
+            context: &KeyRegistryContext,
+            registry_plaintext: &[u8],
+            destination: &mut [u8],
+        ) -> std::result::Result<usize, GcsArchiveV3TransportError> {
+            destination.zeroize();
+            if context != &self.expected_context
+                || registry_plaintext != self.plaintext
+                || self.expected_wrapped.len() > destination.len()
+            {
+                return Err(GcsArchiveV3TransportError::Protocol);
+            }
+            destination[..self.expected_wrapped.len()].copy_from_slice(&self.expected_wrapped);
+            Ok(self.expected_wrapped.len())
+        }
+
         async fn unwrap_registry(
             &self,
-            canonical_aad: &[u8],
+            context: &KeyRegistryContext,
             wrapped_registry_ciphertext: &[u8],
             destination: &mut [u8],
         ) -> std::result::Result<usize, GcsArchiveV3TransportError> {
-            if canonical_aad != self.expected_aad
+            destination.zeroize();
+            if context != &self.expected_context
                 || wrapped_registry_ciphertext != self.expected_wrapped
                 || self.plaintext.len() > destination.len()
             {
@@ -808,6 +883,55 @@ mod tests {
             }
             destination[..self.plaintext.len()].copy_from_slice(&self.plaintext);
             Ok(self.plaintext.len())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FaultyRegistryKmsMode {
+        PartialWriteThenError,
+        PartialWriteThenOversizedLength,
+    }
+
+    struct FaultyRegistryKms {
+        mode: FaultyRegistryKmsMode,
+    }
+
+    impl FaultyRegistryKms {
+        fn result(
+            &self,
+            destination: &mut [u8],
+        ) -> std::result::Result<usize, GcsArchiveV3TransportError> {
+            let partial = destination.len().min(4);
+            destination[..partial].fill(0x5a);
+            match self.mode {
+                FaultyRegistryKmsMode::PartialWriteThenError => {
+                    Err(GcsArchiveV3TransportError::Protocol)
+                }
+                FaultyRegistryKmsMode::PartialWriteThenOversizedLength => {
+                    Ok(destination.len().saturating_add(1))
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ArchiveV3RegistryKms for FaultyRegistryKms {
+        async fn wrap_registry(
+            &self,
+            _context: &KeyRegistryContext,
+            _registry_plaintext: &[u8],
+            destination: &mut [u8],
+        ) -> std::result::Result<usize, GcsArchiveV3TransportError> {
+            self.result(destination)
+        }
+
+        async fn unwrap_registry(
+            &self,
+            _context: &KeyRegistryContext,
+            _wrapped_registry_ciphertext: &[u8],
+            destination: &mut [u8],
+        ) -> std::result::Result<usize, GcsArchiveV3TransportError> {
+            self.result(destination)
         }
     }
     #[async_trait::async_trait]
@@ -1126,11 +1250,17 @@ mod tests {
                 .unwrap()
                 .to_vec();
         let kms = Arc::new(FakeRegistryKms {
-            expected_aad: context.canonical_kms_aad(),
+            expected_context: context,
             expected_wrapped: wrapped.clone(),
             plaintext: plaintext.clone(),
         });
         let provider = GcsArchiveV3RegistryProvider::new(transport, kms);
+        let mut wrapped_output = [0u8; MAX_WRAPPED_KEY_REGISTRY_BYTES];
+        let wrapped_length = provider
+            .wrap_registry(&context, &plaintext, &mut wrapped_output)
+            .await
+            .unwrap();
+        assert_eq!(&wrapped_output[..wrapped_length], wrapped.as_slice());
         let mut read = [0u8; MAX_WRAPPED_KEY_REGISTRY_BYTES];
         let length = provider
             .read_exact_wrapped(&context, object_id, &mut read)
@@ -1143,6 +1273,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&unwrapped[..length], plaintext.as_slice());
+
+        let wrong_context = KeyRegistryContext::with_rotation_generation(
+            ArchiveId::from_bytes([2; 16]),
+            KeyKind::Archive,
+            KeyEpoch::from_bytes([3; 16]),
+            7,
+        );
+        let mut rejected_wrap = [0x91; MAX_WRAPPED_KEY_REGISTRY_BYTES];
+        assert_eq!(
+            provider
+                .wrap_registry(&wrong_context, &plaintext, &mut rejected_wrap)
+                .await,
+            Err(ArchiveV3Error::InvalidContext)
+        );
+        assert!(rejected_wrap.iter().all(|byte| *byte == 0));
+
+        let mut rejected_unwrap = vec![0x92; plaintext.len()];
+        assert_eq!(
+            provider
+                .kms_unwrap_exact(&context, &[], &mut rejected_unwrap)
+                .await,
+            Err(ArchiveV3Error::TooLarge("wrapped key registry"))
+        );
+        assert!(rejected_unwrap.iter().all(|byte| *byte == 0));
+    }
+
+    #[tokio::test]
+    async fn registry_provider_scrubs_faulty_delegate_errors_and_invalid_lengths() {
+        let context = KeyRegistryContext::with_rotation_generation(
+            ArchiveId::from_bytes([1; 16]),
+            KeyKind::Archive,
+            KeyEpoch::from_bytes([3; 16]),
+            7,
+        );
+        let plaintext =
+            KeyRegistryPlaintext::encode_archive(&context, &ArchiveDek::from_bytes([9; 32]))
+                .unwrap();
+        for mode in [
+            FaultyRegistryKmsMode::PartialWriteThenError,
+            FaultyRegistryKmsMode::PartialWriteThenOversizedLength,
+        ] {
+            let provider = GcsArchiveV3RegistryProvider::new(
+                Arc::new(FakeTransport::new()),
+                Arc::new(FaultyRegistryKms { mode }),
+            );
+            let mut wrapped = [0xa1; MAX_WRAPPED_KEY_REGISTRY_BYTES];
+            let wrap_result = provider
+                .wrap_registry(&context, &plaintext, &mut wrapped)
+                .await;
+            assert_eq!(
+                wrap_result,
+                match mode {
+                    FaultyRegistryKmsMode::PartialWriteThenError => {
+                        Err(ArchiveV3Error::InvalidContext)
+                    }
+                    FaultyRegistryKmsMode::PartialWriteThenOversizedLength => {
+                        Err(ArchiveV3Error::TooLarge("wrapped key registry"))
+                    }
+                }
+            );
+            assert!(wrapped.iter().all(|byte| *byte == 0));
+
+            let mut unwrapped = [0xa2; KEY_REGISTRY_PLAINTEXT_BYTES];
+            let unwrap_result = provider
+                .kms_unwrap_exact(&context, b"wrapped", &mut unwrapped)
+                .await;
+            assert_eq!(
+                unwrap_result,
+                match mode {
+                    FaultyRegistryKmsMode::PartialWriteThenError => {
+                        Err(ArchiveV3Error::InvalidContext)
+                    }
+                    FaultyRegistryKmsMode::PartialWriteThenOversizedLength => {
+                        Err(ArchiveV3Error::TooLarge("key registry plaintext"))
+                    }
+                }
+            );
+            assert!(unwrapped.iter().all(|byte| *byte == 0));
+        }
     }
 
     #[tokio::test]
@@ -1155,7 +1364,7 @@ mod tests {
         );
         let object_id = ObjectId::from_bytes([4; 16]);
         let kms = Arc::new(FakeRegistryKms {
-            expected_aad: Vec::new(),
+            expected_context: registry_context,
             expected_wrapped: Vec::new(),
             plaintext: Vec::new(),
         });

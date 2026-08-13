@@ -364,8 +364,8 @@ retire it.
 `src/archive_v3_gcs.rs` is likewise inactive: it specifies and
 tests a redacted async GCS-shaped transport boundary (conditional immutable creation,
 read-after-create equality, bounded canonical-name pagination, and a contract requiring
-exact all-generation deletion) plus canonical KMS AAD for bounded registry unwrap. Its
-fake verifies delegation and multi-generation absence semantics; provider-level deletion
+exact all-generation deletion) plus a typed, bounded registry-KMS boundary. Its fake
+verifies wrap/unwrap delegation and multi-generation absence semantics; provider-level deletion
 evidence still requires a live drill. `src/archive_v3_gcs_http.rs` provides a concrete,
 caller-token-only rustls-only/no-proxy/no-redirect/no-retry REST implementation with exact URL encoding, bounded streamed reads/listing,
 generation-zero creates, durable claim CAS, and bounded all-generation deletion. Disabled-policy
@@ -373,6 +373,26 @@ deletion succeeds only through an external provider/audit-and-trusted-time drain
 gate is wired. The transport intentionally has no metadata-service access, environment constructor,
 credentials/runtime/deploy wiring, or authority connection; its provider errors never contain
 object paths, IDs, hashes, or cursors.
+
+`src/archive_v3_registry_kms.rs` is the concrete but still inactive registry-KMS
+adapter. It derives only a canonical numeric `CryptoKeyVersion` beneath the exact key
+already selected by the live `GcpKmsClient`; it does not add an environment input or
+change the legacy `KmsClient` encrypt/decrypt path or its production endpoints. Before
+each wrap or unwrap it verifies the exact version coordinate, `ENABLED` state,
+`GOOGLE_SYMMETRIC_ENCRYPTION` algorithm, and current `SOFTWARE` protection level. Wrap
+also decodes and context-checks the exact registry plaintext before I/O. Both directions
+clear the full caller destination first and use identical zeroizing AAD formed from the
+canonical typed registry context plus the exact version coordinate, preventing a valid
+ciphertext from another key version from being relabeled. The bounded stored wrapper
+independently rejects format, algorithm, protection-level, and version-coordinate
+substitutions before decrypt. The fixed-origin rustls-only/no-proxy/no-redirect/no-retry
+REST path checks the provider's exact encrypt coordinate, all required request-verification
+booleans, CRC32C response integrity, strict secret-bearing response shapes, and bounded
+bodies. Tokens, AAD, request JSON, returned ciphertext, and plaintext use zeroizing owners;
+provider error bodies are neither consumed nor logged, and Debug output is fixed and
+redacted. Cancellation drops the one in-flight operation with the caller destination
+remaining zero; there is no adapter retry or detached task. No startup, Store, provider
+construction, route, flag, release, or persistence authority is wired.
 
 `src/archive_v3_deletion.rs` is a compiled-but-inactive deletion-driver seam. It accepts
 only a witness-issued tombstone/restart authorization and the opaque archive context

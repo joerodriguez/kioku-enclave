@@ -70,6 +70,10 @@ mod archive_v3_export;
 // Inactive ADR-0022 GCS semantic adapters. Runtime/authority wiring remains
 // intentionally absent.
 mod archive_v3_gcs;
+// Inactive archive-v3 registry KMS adapter. It reuses only the legacy client's
+// exact key and attestation-token source, and has no provider construction,
+// Store/startup/env/route/flag/authority wiring.
+mod archive_v3_registry_kms;
 // Concrete but inactive REST transport. It has no environment constructor,
 // token acquisition, Store/VFS/witness connection, or production authority.
 mod archive_v3_gcs_http;
