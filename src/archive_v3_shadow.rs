@@ -389,9 +389,50 @@ impl WalCaptureState {
     }
 
     pub fn drain_completed(&mut self) -> Vec<CapturedWalCommit> {
-        let commits = self.completed.drain(..).collect();
-        self.completed_bytes = 0;
-        commits
+        self.drain_completed_prefix(self.completed.len())
+            .expect("the complete queue is always a valid drain prefix")
+    }
+
+    /// Remove exactly the already-observed prefix selected by a capture-drain
+    /// lease. Commits captured after that lease began remain queued for the
+    /// next attempt; a caller cannot accidentally relabel them as part of the
+    /// earlier legacy save.
+    pub(crate) fn drain_completed_prefix(
+        &mut self,
+        count: usize,
+    ) -> Option<Vec<CapturedWalCommit>> {
+        if count > self.completed.len() {
+            return None;
+        }
+        let drained_bytes = self
+            .completed
+            .iter()
+            .take(count)
+            .try_fold(0usize, |total, commit| {
+                total.checked_add(commit.frames.len())
+            })?;
+        let remaining_bytes = self.completed_bytes.checked_sub(drained_bytes)?;
+        let mut commits = Vec::with_capacity(count);
+        for _ in 0..count {
+            let commit = self.completed.pop_front()?;
+            commits.push(commit);
+        }
+        self.completed_bytes = remaining_bytes;
+        Some(commits)
+    }
+
+    pub(crate) fn completed_len(&self) -> usize {
+        self.completed.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_scrubbed_for_test(&self) -> bool {
+        self.image.is_empty()
+            && self.covered.is_empty()
+            && self.accepted_header_prefix.is_none()
+            && self.published_frames == 0
+            && self.completed.is_empty()
+            && self.completed_bytes == 0
     }
 
     pub fn metrics(&self) -> ShadowCaptureMetrics {

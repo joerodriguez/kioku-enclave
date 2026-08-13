@@ -45,7 +45,9 @@
 
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    ffi::{CStr, CString},
     hash::{Hash, Hasher},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicI64, Ordering as AtomicOrdering},
@@ -69,6 +71,7 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::{
+    archive_v3_sqlite_vfs::{CaptureRegistration, CaptureRegistry, RegisteredCaptureVfs},
     crypto::{
         decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient,
     },
@@ -175,7 +178,10 @@ struct UserHandle {
     /// The (validated) user id this handle belongs to. Stored directly so the
     /// GCS object name never has to be reconstructed from the temp-file path.
     user_id: UserId,
+    /// Rust drops fields in declaration order: the SQLite connection must
+    /// close before this registration retires its exact path/stream scope.
     conn: Connection,
+    _shadow_capture_registration: Option<CaptureRegistration>,
     blob_meta: BlobMeta,
     /// Monotonic process-local generation advanced whenever SQLite reports a
     /// possible persistent logical mutation. `dirty` remains the fail-closed
@@ -197,6 +203,9 @@ pub struct Store {
     /// connection, while deletion can still atomically close admission and
     /// wait for every admitted writer to settle.
     content_write_barrier: Arc<ContentWriteBarrier>,
+    /// Inactive local-only injection. Every production constructor stores
+    /// `None`; no startup/config/provider path can install the capture VFS.
+    shadow_capture: Option<Arc<StoreShadowCapture>>,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     /// Current media write/read bucket. New capture objects are written here.
@@ -214,6 +223,50 @@ pub struct Store {
     /// production this is the KMS-unwrapped control-store DEK, installed only
     /// after that exact encrypted control generation is durable.
     legacy_fence_key: StdRwLock<Option<Zeroizing<[u8; 32]>>>,
+}
+
+/// One explicitly named, non-default VFS installation and its bounded path
+/// registry. Construction is crate-private and performs no cloud, witness,
+/// archive-binding, route, health, or admission work.
+pub(crate) struct StoreShadowCapture {
+    registry: CaptureRegistry,
+    vfs_name: CString,
+}
+
+impl StoreShadowCapture {
+    #[allow(
+        dead_code,
+        reason = "reserved for separately reviewed default-off shadow runtime composition"
+    )]
+    pub(crate) fn install(vfs_name: &str) -> Result<Self> {
+        let registry = CaptureRegistry::new();
+        let vfs = RegisteredCaptureVfs::install(vfs_name, registry.clone())
+            .map_err(|_| EnclaveError::Store("shadow capture VFS installation failed".into()))?;
+        let vfs_name = vfs.name().to_owned();
+        // Dropping the installation handle deliberately leaks its bounded
+        // SQLite callback allocation; retain only the safe copied name in the
+        // cross-thread Store adapter.
+        drop(vfs);
+        Ok(Self { registry, vfs_name })
+    }
+
+    fn register(&self, path: &Path) -> Result<CaptureRegistration> {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| EnclaveError::Store("shadow capture path contains NUL".into()))?;
+        self.registry
+            .register(&path)
+            .map_err(|_| EnclaveError::Store("shadow capture registration failed".into()))
+    }
+
+    fn vfs_name(&self) -> &CStr {
+        &self.vfs_name
+    }
+}
+
+impl std::fmt::Debug for StoreShadowCapture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreShadowCapture(<inactive>)")
+    }
 }
 
 /// Content-free startup reconciliation state. It deliberately has no archive,
@@ -1025,6 +1078,28 @@ impl Store {
         legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
     ) -> Self {
+        Self::new_internal_with_max_open_and_shadow_capture(
+            kms,
+            gcs,
+            media_gcs,
+            legacy_media_gcs,
+            max_open,
+            None,
+        )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for separately reviewed default-off shadow runtime composition"
+    )]
+    pub(crate) fn new_internal_with_max_open_and_shadow_capture(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
+        max_open: usize,
+        shadow_capture: Option<Arc<StoreShadowCapture>>,
+    ) -> Self {
         Store {
             registry: Mutex::new(StoreRegistry {
                 actors: HashMap::new(),
@@ -1036,6 +1111,7 @@ impl Store {
             registry_changed: Arc::new(Notify::new()),
             lifecycle_gates: Mutex::new(HashMap::new()),
             content_write_barrier: Arc::new(ContentWriteBarrier::default()),
+            shadow_capture,
             kms,
             gcs,
             media_gcs,
@@ -3413,17 +3489,19 @@ impl Store {
 
         // Write plaintext to a temp file and open it with rusqlite
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
-        let (conn, migration_dirty) = match open_db(&temp_path) {
-            Ok(opened) => opened,
-            Err(e) => {
-                remove_temp_db_files(&temp_path);
-                return Err(e);
-            }
-        };
+        let (conn, shadow_capture_registration, migration_dirty) =
+            match open_db(&temp_path, self.shadow_capture.as_deref()) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    remove_temp_db_files(&temp_path);
+                    return Err(e);
+                }
+            };
 
         Ok(UserHandle {
             user_id: user_id.to_string(),
             conn,
+            _shadow_capture_registration: shadow_capture_registration,
             blob_meta,
             mutation_generation: u64::from(migration_dirty || envelope_rewrite_dirty),
             persisted_mutation_generation: 0,
@@ -4978,16 +5056,34 @@ fn database_mutation_fingerprint(conn: &Connection) -> Result<DatabaseMutationFi
     })
 }
 
-fn open_db(path: &PathBuf) -> Result<(Connection, bool)> {
+fn open_db(
+    path: &PathBuf,
+    shadow_capture: Option<&StoreShadowCapture>,
+) -> Result<(Connection, Option<CaptureRegistration>, bool)> {
     // Register the sqlite-vec extension globally before any connection opens.
     // This is idempotent (Once guard) and thread-safe.
     init_vec_extension();
-    let conn = Connection::open(path)?;
+    // Register before opening so both the main database and its first WAL
+    // attachment resolve the same connection-scoped capture state. Failure to
+    // open drops/retire the registration before the caller removes the file.
+    let captured = shadow_capture.and_then(|shadow_capture| {
+        let registration = shadow_capture.register(path).ok()?;
+        Connection::open_with_flags_and_vfs(path, OpenFlags::default(), shadow_capture.vfs_name())
+            .ok()
+            .map(|connection| (connection, registration))
+    });
+    // Capture is non-authoritative even when injected. Registry exhaustion,
+    // VFS incompatibility, or named-open failure silently falls back to the
+    // exact legacy open and can never deny user access or persistence.
+    let (conn, registration) = match captured {
+        Some((connection, registration)) => (connection, Some(registration)),
+        None => (Connection::open(path)?, None),
+    };
     let before = database_mutation_fingerprint(&conn)?;
     conn.execute_batch(SCHEMA_SQL)?;
     run_migrations(&conn)?;
     let migrated = database_mutation_fingerprint(&conn)? != before;
-    Ok((conn, migrated))
+    Ok((conn, registration, migrated))
 }
 
 /// Build a fresh empty SQLite database in memory, serialize it, encrypt it,
@@ -9470,6 +9566,187 @@ pub(crate) mod tests {
         max_open: usize,
     ) -> Store {
         Store::new_internal_with_max_open(kms, gcs, Arc::clone(&media_gcs), media_gcs, max_open)
+    }
+
+    static NEXT_STORE_CAPTURE_VFS: AtomicUsize = AtomicUsize::new(1);
+
+    #[tokio::test]
+    async fn optional_shadow_capture_survives_attempts_and_retires_on_eviction_and_deletion() {
+        let ordinary = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        assert!(ordinary.shadow_capture.is_none());
+
+        let capture = Arc::new(
+            StoreShadowCapture::install(&format!(
+                "kioku-store-capture-test-{}",
+                NEXT_STORE_CAPTURE_VFS.fetch_add(1, Ordering::Relaxed)
+            ))
+            .unwrap(),
+        );
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new_internal_with_max_open_and_shadow_capture(
+            Arc::new(FakeKms),
+            gcs.clone(),
+            gcs.clone(),
+            gcs,
+            1,
+            Some(Arc::clone(&capture)),
+        );
+        store
+            .with_user("capture-lifetime", |connection| {
+                connection.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
+                    ["2026-08-13T12:00:00Z", "first"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let actor = match store.actor_for_existing("capture-lifetime").await.unwrap() {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("capture handle unexpectedly evicted"),
+        };
+        let first_stream = {
+            let state = actor.state.lock().await;
+            let registration = state
+                .handle
+                .as_ref()
+                .unwrap()
+                ._shadow_capture_registration
+                .as_ref()
+                .unwrap();
+            let stream = registration.stream_id();
+            let first = registration
+                .begin_drain(
+                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([31; 16]),
+                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([32; 16]),
+                )
+                .unwrap()
+                .commit()
+                .unwrap();
+            assert_eq!(first.stream_id(), stream);
+            assert!(!first.commits().is_empty());
+            stream
+        };
+
+        store
+            .with_user("capture-lifetime", |connection| {
+                connection.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
+                    ["2026-08-13T12:01:00Z", "second"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        {
+            let state = actor.state.lock().await;
+            let registration = state
+                .handle
+                .as_ref()
+                .unwrap()
+                ._shadow_capture_registration
+                .as_ref()
+                .unwrap();
+            assert_eq!(registration.stream_id(), first_stream);
+            let second = registration
+                .begin_drain(
+                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([31; 16]),
+                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([33; 16]),
+                )
+                .unwrap()
+                .commit()
+                .unwrap();
+            assert!(!second.commits().is_empty());
+        }
+
+        store
+            .with_user("capture-lifetime", |connection| {
+                connection.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
+                    ["2026-08-13T12:02:00Z", "pending eviction"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let eviction_lease = {
+            let state = actor.state.lock().await;
+            state
+                .handle
+                .as_ref()
+                .unwrap()
+                ._shadow_capture_registration
+                .as_ref()
+                .unwrap()
+                .begin_drain(
+                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([31; 16]),
+                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([34; 16]),
+                )
+                .unwrap()
+        };
+        drop(actor);
+        // With a one-handle bound this access flushes, closes, and retires the
+        // first connection while its capture lease remains outstanding.
+        store
+            .with_user("capture-evictor", |connection| {
+                connection.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
+                    ["2026-08-13T12:03:00Z", "pending deletion"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            eviction_lease.commit(),
+            Err(crate::archive_v3_sqlite_vfs::CaptureRegistryError::Retired)
+        ));
+
+        let deletion_actor = match store.actor_for_existing("capture-evictor").await.unwrap() {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("deletion capture handle unexpectedly evicted"),
+        };
+        let deletion_lease = {
+            let state = deletion_actor.state.lock().await;
+            state
+                .handle
+                .as_ref()
+                .unwrap()
+                ._shadow_capture_registration
+                .as_ref()
+                .unwrap()
+                .begin_drain(
+                    crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([41; 16]),
+                    crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([42; 16]),
+                )
+                .unwrap()
+        };
+        drop(deletion_actor);
+        store.delete_user("capture-evictor").await.unwrap();
+        assert!(matches!(
+            deletion_lease.commit(),
+            Err(crate::archive_v3_sqlite_vfs::CaptureRegistryError::Retired)
+        ));
+        assert!(capture.registry.is_empty_for_test());
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let directory_path = directory.path().to_path_buf();
+        assert!(open_db(&directory_path, Some(capture.as_ref())).is_err());
+        assert!(capture.registry.is_empty_for_test());
+
+        let unavailable_capture = StoreShadowCapture {
+            registry: CaptureRegistry::new(),
+            vfs_name: CString::new("kioku-unregistered-capture-vfs").unwrap(),
+        };
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let database_path = database.path().to_path_buf();
+        let (connection, registration, _) =
+            open_db(&database_path, Some(&unavailable_capture)).unwrap();
+        assert!(registration.is_none());
+        assert!(unavailable_capture.registry.is_empty_for_test());
+        drop(connection);
+        drop(store);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

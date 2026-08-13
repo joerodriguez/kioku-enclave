@@ -306,6 +306,8 @@ impl PrivateStagedSqliteCopy {
 /// from cleanup ownership.
 pub(crate) struct OwnedPrivateStagedSqliteCopy {
     copy: PrivateStagedSqliteCopy,
+    #[cfg(test)]
+    cleanup_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl OwnedPrivateStagedSqliteCopy {
@@ -314,6 +316,8 @@ impl OwnedPrivateStagedSqliteCopy {
     ) -> Result<Self, ShadowParityError> {
         Ok(Self {
             copy: PrivateStagedSqliteCopy::from_owned_recovery(proof)?,
+            #[cfg(test)]
+            cleanup_sender: None,
         })
     }
 
@@ -324,6 +328,14 @@ impl OwnedPrivateStagedSqliteCopy {
     #[cfg(test)]
     pub(crate) fn path_for_test(&self) -> &Path {
         &self.copy.path
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_cleanup_for_test(
+        &mut self,
+        cleanup_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        self.cleanup_sender = cleanup_sender;
     }
 }
 
@@ -336,6 +348,10 @@ impl fmt::Debug for OwnedPrivateStagedSqliteCopy {
 impl Drop for OwnedPrivateStagedSqliteCopy {
     fn drop(&mut self) {
         remove_private_sqlite_family(&self.copy.path);
+        #[cfg(test)]
+        if let Some(cleanup_sender) = self.cleanup_sender.take() {
+            let _ = cleanup_sender.send(());
+        }
     }
 }
 

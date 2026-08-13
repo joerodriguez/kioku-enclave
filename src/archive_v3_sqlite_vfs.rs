@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 SQLite VFS wrapper is compiled and oracle-tested before Store wiring"
+    reason = "inactive ADR-0022 SQLite VFS capture is compiled and oracle-tested before runtime wiring"
 )]
 
 //! An inactive, transparent SQLite VFS wrapper for ADR-0022 WAL shadowing.
@@ -13,8 +13,10 @@
 //! a missing registration, poisoned capture mutex, malformed WAL, or capture
 //! panic leaves the underlying return code untouched.
 //!
-//! The wrapper is opt-in and is not registered by application startup.  It has
-//! no Store, provider, witness, route, recovery, or authority wiring.
+//! The wrapper is opt-in and is not registered by application startup. A
+//! private Store constructor can retain one connection-scoped registration for
+//! later runtime composition, but every live constructor remains disabled. It
+//! has no provider, witness, route, recovery, handoff, or authority wiring.
 
 use std::{
     collections::BTreeMap,
@@ -27,8 +29,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::ffi;
-use sha2::{Digest, Sha256};
 
 use crate::archive_v3_shadow::{CapturedWalCommit, ShadowCaptureMetrics, WalCaptureState};
 use crate::archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionId};
@@ -42,34 +44,67 @@ pub const MAX_CAPTURE_REGISTRATIONS: usize = 64;
 /// unregistered. Bound that deliberate retention independently of owners.
 pub const MAX_CAPTURE_VFS_INSTALLATIONS: usize = 8;
 const MAX_CAPTURE_PATH_BYTES: usize = 4096;
+const MAX_CAPTURE_DRAINS_PER_STREAM: usize = 1024;
 static CAPTURE_VFS_INSTALLATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-const CAPTURE_OWNER_DOMAIN: &[u8] = b"kioku:archive:v3:capture-owner\0";
+const MAX_CAPTURE_STREAM_ID_CANDIDATES: usize = 16;
 
-/// Opaque owner comparison data.  It is never formatted or logged by this
-/// module; its only purpose is preventing a caller from confusing a capture
-/// registration belonging to another owner.
+/// Random process-local identity for one exact open Store connection. It is
+/// never derived from an archive, account, session, or publication attempt,
+/// and its representation is never formatted or logged.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CaptureOwner([u8; 16]);
+pub(crate) struct CaptureStreamId([u8; 16]);
 
-impl CaptureOwner {
-    /// Bind a capture registration to one exact publication attempt. A later
-    /// attempt in the same stable session must install a fresh registration
-    /// and cannot drain commits retained by its predecessor.
-    pub fn for_shadow_attempt(session_id: ShadowSessionId, attempt_id: ShadowAttemptId) -> Self {
-        let mut hash = Sha256::new();
-        hash.update(CAPTURE_OWNER_DOMAIN);
-        hash.update(session_id.as_bytes());
-        hash.update(attempt_id.as_bytes());
-        let digest: [u8; 32] = hash.finalize().into();
-        let mut owner = [0; 16];
-        owner.copy_from_slice(&digest[..16]);
-        Self(owner)
+impl CaptureStreamId {
+    #[cfg(test)]
+    const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for CaptureStreamId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CaptureStreamId(<opaque>)")
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ActiveDrain {
+    token: u64,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    commit_count: usize,
+}
+
+struct RegisteredCaptureState {
+    capture: WalCaptureState,
+    retired: bool,
+    next_drain_token: u64,
+    active_drain: Option<ActiveDrain>,
+    settled_drains: Vec<([u8; 16], [u8; 16])>,
+}
+
+impl RegisteredCaptureState {
+    fn new() -> Self {
+        Self {
+            capture: WalCaptureState::new(),
+            retired: false,
+            next_drain_token: 0,
+            active_drain: None,
+            settled_drains: Vec::new(),
+        }
     }
 
-    #[cfg(test)]
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
+    fn retire_and_scrub(&mut self) {
+        // Replacement drops the prior WalCaptureState while this mutex is
+        // held. Its Drop implementation zeroizes raw image/header bytes and
+        // every queued commit before any outstanding lease or live VFS
+        // callback can observe the retired state.
+        self.capture = WalCaptureState::new();
+        self.active_drain = None;
+        self.settled_drains.clear();
+        self.next_drain_token = 0;
+        self.retired = true;
     }
 }
 
@@ -79,7 +114,13 @@ pub enum CaptureRegistryError {
     PathTooLong,
     PathNotCanonicalizable,
     DuplicatePath,
-    OwnerMismatch,
+    StreamIdUnavailable,
+    InvalidAttempt,
+    DrainActive,
+    AttemptAlreadySettled,
+    TooManyDrains,
+    DrainMismatch,
+    Retired,
     StateUnavailable,
 }
 
@@ -92,7 +133,13 @@ impl std::fmt::Display for CaptureRegistryError {
                 "capture path must have a canonicalizable existing parent"
             }
             Self::DuplicatePath => "capture path is already registered",
-            Self::OwnerMismatch => "capture registration owner does not match",
+            Self::StreamIdUnavailable => "capture stream identity generation exhausted",
+            Self::InvalidAttempt => "capture drain attempt identity is invalid",
+            Self::DrainActive => "capture registration already has an active drain",
+            Self::AttemptAlreadySettled => "capture drain attempt was already settled",
+            Self::TooManyDrains => "capture stream drain limit is exhausted",
+            Self::DrainMismatch => "capture drain lease no longer matches its registration",
+            Self::Retired => "capture registration is retired",
             Self::StateUnavailable => "capture registration state is unavailable",
         })
     }
@@ -112,11 +159,11 @@ struct RegistryInner {
 }
 
 struct RegistrySlot {
-    owner: CaptureOwner,
+    stream_id: CaptureStreamId,
     token: u64,
     retiring: bool,
     main_open_count: usize,
-    state: Arc<Mutex<WalCaptureState>>,
+    state: Arc<Mutex<RegisteredCaptureState>>,
 }
 
 /// A path/owner-scoped capture registration.  Dropping it prevents new main
@@ -125,9 +172,32 @@ struct RegistrySlot {
 pub struct CaptureRegistration {
     registry: CaptureRegistry,
     path: Vec<u8>,
-    owner: CaptureOwner,
+    stream_id: CaptureStreamId,
     token: u64,
-    state: Arc<Mutex<WalCaptureState>>,
+    state: Arc<Mutex<RegisteredCaptureState>>,
+}
+
+/// Exclusive selection of the commit prefix visible when one exact shadow
+/// attempt began. Drop/cancellation leaves that prefix queued. Only `commit`
+/// detaches it, and commits observed later remain for a subsequent attempt.
+pub(crate) struct CaptureDrainLease {
+    state: Arc<Mutex<RegisteredCaptureState>>,
+    stream_id: CaptureStreamId,
+    token: u64,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    commit_count: usize,
+    settled: bool,
+}
+
+/// Unforgeable owned handoff minted only by successfully settling an exact
+/// capture drain lease. Its private fields prevent relabeling commits across
+/// connections or publication attempts.
+pub(crate) struct CapturedCommitBatch {
+    stream_id: CaptureStreamId,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    commits: Vec<CapturedWalCommit>,
 }
 
 impl CaptureRegistry {
@@ -135,13 +205,49 @@ impl CaptureRegistry {
         Self::default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_empty_for_test(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.slots.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Register one exact SQLite main-database filename.  `path` is retained
     /// only as in-memory comparison data and this module never emits it.
-    pub fn register(
+    pub(crate) fn register(
         &self,
-        owner: CaptureOwner,
         path: &CStr,
     ) -> Result<CaptureRegistration, CaptureRegistryError> {
+        let stream_id = self.fresh_stream_id()?;
+        self.register_exact(stream_id, path)
+    }
+
+    fn fresh_stream_id(&self) -> Result<CaptureStreamId, CaptureRegistryError> {
+        for _ in 0..MAX_CAPTURE_STREAM_ID_CANDIDATES {
+            let mut bytes = [0u8; 16];
+            OsRng.fill_bytes(&mut bytes);
+            let candidate = CaptureStreamId(bytes);
+            if bytes != [0; 16]
+                && self
+                    .inner
+                    .lock()
+                    .is_ok_and(|inner| inner.slots.values().all(|slot| slot.stream_id != candidate))
+            {
+                return Ok(candidate);
+            }
+        }
+        Err(CaptureRegistryError::StreamIdUnavailable)
+    }
+
+    fn register_exact(
+        &self,
+        stream_id: CaptureStreamId,
+        path: &CStr,
+    ) -> Result<CaptureRegistration, CaptureRegistryError> {
+        if stream_id.0 == [0; 16] {
+            return Err(CaptureRegistryError::StreamIdUnavailable);
+        }
         let path = canonical_scope_path(path.to_bytes())?;
         if path.len() > MAX_CAPTURE_PATH_BYTES {
             return Err(CaptureRegistryError::PathTooLong);
@@ -153,6 +259,9 @@ impl CaptureRegistry {
         if inner.slots.contains_key(&path) {
             return Err(CaptureRegistryError::DuplicatePath);
         }
+        if inner.slots.values().any(|slot| slot.stream_id == stream_id) {
+            return Err(CaptureRegistryError::StreamIdUnavailable);
+        }
         if inner.slots.len() >= MAX_CAPTURE_REGISTRATIONS {
             return Err(CaptureRegistryError::TooManyRegistrations);
         }
@@ -160,11 +269,11 @@ impl CaptureRegistry {
             return Err(CaptureRegistryError::TooManyRegistrations);
         };
         inner.next_token = token;
-        let state = Arc::new(Mutex::new(WalCaptureState::new()));
+        let state = Arc::new(Mutex::new(RegisteredCaptureState::new()));
         inner.slots.insert(
             path.clone(),
             RegistrySlot {
-                owner,
+                stream_id,
                 token,
                 retiring: false,
                 main_open_count: 0,
@@ -174,7 +283,7 @@ impl CaptureRegistry {
         Ok(CaptureRegistration {
             registry: self.clone(),
             path,
-            owner,
+            stream_id,
             token,
             state,
         })
@@ -227,12 +336,12 @@ impl CaptureRegistry {
         }
     }
 
-    fn retire(&self, path: &[u8], owner: CaptureOwner, token: u64) {
+    fn retire(&self, path: &[u8], stream_id: CaptureStreamId, token: u64) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
         let remove = if let Some(slot) = inner.slots.get_mut(path) {
-            if slot.owner != owner || slot.token != token {
+            if slot.stream_id != stream_id || slot.token != token {
                 false
             } else {
                 slot.retiring = true;
@@ -274,28 +383,66 @@ fn canonical_scope_path(bytes: &[u8]) -> Result<Vec<u8>, CaptureRegistryError> {
 }
 
 impl CaptureRegistration {
-    pub fn drain_completed(
+    pub(crate) fn begin_drain(
         &self,
-        owner: CaptureOwner,
-    ) -> Result<Vec<CapturedWalCommit>, CaptureRegistryError> {
-        if owner != self.owner {
-            return Err(CaptureRegistryError::OwnerMismatch);
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+    ) -> Result<CaptureDrainLease, CaptureRegistryError> {
+        if session_id.as_bytes().iter().all(|byte| *byte == 0)
+            || attempt_id.as_bytes().iter().all(|byte| *byte == 0)
+        {
+            return Err(CaptureRegistryError::InvalidAttempt);
         }
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map(|mut state| state.drain_completed())
-            .map_err(|_| CaptureRegistryError::StateUnavailable)
+            .map_err(|_| CaptureRegistryError::StateUnavailable)?;
+        if state.retired {
+            return Err(CaptureRegistryError::Retired);
+        }
+        if state.active_drain.is_some() {
+            return Err(CaptureRegistryError::DrainActive);
+        }
+        let drain_identity = (*session_id.as_bytes(), *attempt_id.as_bytes());
+        if state.settled_drains.contains(&drain_identity) {
+            return Err(CaptureRegistryError::AttemptAlreadySettled);
+        }
+        if state.settled_drains.len() >= MAX_CAPTURE_DRAINS_PER_STREAM {
+            return Err(CaptureRegistryError::TooManyDrains);
+        }
+        let token = state
+            .next_drain_token
+            .checked_add(1)
+            .ok_or(CaptureRegistryError::StateUnavailable)?;
+        state.next_drain_token = token;
+        let commit_count = state.capture.completed_len();
+        state.active_drain = Some(ActiveDrain {
+            token,
+            session_id,
+            attempt_id,
+            commit_count,
+        });
+        drop(state);
+        Ok(CaptureDrainLease {
+            state: Arc::clone(&self.state),
+            stream_id: self.stream_id,
+            token,
+            session_id,
+            attempt_id,
+            commit_count,
+            settled: false,
+        })
     }
 
-    pub fn metrics(&self) -> ShadowCaptureMetrics {
+    pub(crate) fn metrics(&self) -> ShadowCaptureMetrics {
         self.state
             .lock()
-            .map(|state| state.metrics())
+            .map(|state| state.capture.metrics())
             .unwrap_or_default()
     }
 
-    pub fn owner(&self) -> CaptureOwner {
-        self.owner
+    pub(crate) fn stream_id(&self) -> CaptureStreamId {
+        self.stream_id
     }
 
     #[cfg(test)]
@@ -311,7 +458,92 @@ impl CaptureRegistration {
 
 impl Drop for CaptureRegistration {
     fn drop(&mut self) {
-        self.registry.retire(&self.path, self.owner, self.token);
+        // Capture callbacks are panic-contained. If one ever poisoned this
+        // mutex, retirement must still recover ownership and scrub plaintext
+        // rather than retain it behind the poison marker.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retire_and_scrub();
+        self.registry.retire(&self.path, self.stream_id, self.token);
+    }
+}
+
+impl CaptureDrainLease {
+    pub(crate) fn commit(mut self) -> Result<CapturedCommitBatch, CaptureRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CaptureRegistryError::StateUnavailable)?;
+        if state.retired {
+            return Err(CaptureRegistryError::Retired);
+        }
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count: self.commit_count,
+        };
+        if state.active_drain != Some(expected) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        let commits = state
+            .capture
+            .drain_completed_prefix(expected.commit_count)
+            .ok_or(CaptureRegistryError::DrainMismatch)?;
+        state.active_drain = None;
+        state
+            .settled_drains
+            .push((*self.session_id.as_bytes(), *self.attempt_id.as_bytes()));
+        self.settled = true;
+        Ok(CapturedCommitBatch {
+            stream_id: self.stream_id,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commits,
+        })
+    }
+}
+
+impl Drop for CaptureDrainLease {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.active_drain.is_some_and(|active| {
+            active.token == self.token
+                && active.session_id == self.session_id
+                && active.attempt_id == self.attempt_id
+        }) {
+            state.active_drain = None;
+        }
+    }
+}
+
+impl CapturedCommitBatch {
+    pub(crate) fn stream_id(&self) -> CaptureStreamId {
+        self.stream_id
+    }
+
+    pub(crate) fn session_id(&self) -> ShadowSessionId {
+        self.session_id
+    }
+
+    pub(crate) fn attempt_id(&self) -> ShadowAttemptId {
+        self.attempt_id
+    }
+
+    pub(crate) fn commits(&self) -> &[CapturedWalCommit] {
+        &self.commits
+    }
+}
+
+impl std::fmt::Debug for CapturedCommitBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CapturedCommitBatch(<redacted>)")
     }
 }
 
@@ -321,7 +553,7 @@ struct FileCapture {
     token: u64,
     is_main: bool,
     is_wal: bool,
-    state: Arc<Mutex<WalCaptureState>>,
+    state: Arc<Mutex<RegisteredCaptureState>>,
 }
 
 impl FileCapture {
@@ -331,7 +563,10 @@ impl FileCapture {
         }
         let _ = catch_unwind(AssertUnwindSafe(|| {
             if let Ok(mut state) = self.state.lock() {
-                state.observe_write(offset, bytes);
+                if state.retired {
+                    return;
+                }
+                state.capture.observe_write(offset, bytes);
             }
         }));
     }
@@ -342,7 +577,10 @@ impl FileCapture {
         }
         let _ = catch_unwind(AssertUnwindSafe(|| {
             if let Ok(mut state) = self.state.lock() {
-                state.observe_truncate(length, true);
+                if state.retired {
+                    return;
+                }
+                state.capture.observe_truncate(length, true);
             }
         }));
     }
@@ -353,7 +591,10 @@ impl FileCapture {
         }
         let _ = catch_unwind(AssertUnwindSafe(|| {
             if let Ok(mut state) = self.state.lock() {
-                let _ = state.observe_sync(true);
+                if state.retired {
+                    return;
+                }
+                let _ = state.capture.observe_sync(true);
             }
         }));
     }
@@ -1006,8 +1247,8 @@ mod tests {
         xUnfetch: None,
     };
 
-    fn synthetic_failed_file() -> (WrappedFile, Arc<Mutex<WalCaptureState>>) {
-        let state = Arc::new(Mutex::new(WalCaptureState::new()));
+    fn synthetic_failed_file() -> (WrappedFile, Arc<Mutex<RegisteredCaptureState>>) {
+        let state = Arc::new(Mutex::new(RegisteredCaptureState::new()));
         let capture = FileCapture {
             registry: CaptureRegistry::new(),
             path: Vec::new(),
@@ -1030,14 +1271,14 @@ mod tests {
         )
     }
 
-    fn setup_with_owner(
-        owner: CaptureOwner,
+    fn setup_with_stream(
+        stream_id: CaptureStreamId,
     ) -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("capture.db");
         let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
         let registry = CaptureRegistry::new();
-        let registration = registry.register(owner, &c_path).unwrap();
+        let registration = registry.register_exact(stream_id, &c_path).unwrap();
         let name = format!(
             "kioku-capture-test-{}",
             NEXT_VFS.fetch_add(1, Ordering::Relaxed)
@@ -1047,7 +1288,18 @@ mod tests {
     }
 
     fn setup() -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
-        setup_with_owner(CaptureOwner::from_bytes([7; 16]))
+        setup_with_stream(CaptureStreamId::from_bytes([7; 16]))
+    }
+
+    fn settle(registration: &CaptureRegistration, session: u8, attempt: u8) -> CapturedCommitBatch {
+        registration
+            .begin_drain(
+                ShadowSessionId::from_bytes([session; 16]),
+                ShadowAttemptId::from_bytes([attempt; 16]),
+            )
+            .unwrap()
+            .commit()
+            .unwrap()
     }
 
     fn open(path: &CStr, vfs: &RegisteredCaptureVfs) -> Connection {
@@ -1079,7 +1331,7 @@ mod tests {
         // The schema-creation commit predates this checkpoint and therefore
         // belongs to the prior base/generation. The future owner coordinates
         // checkpoint publication with this same drain boundary.
-        let _ = registration.drain_completed(registration.owner()).unwrap();
+        let _ = settle(&registration, 1, 1);
 
         connection
             .execute("INSERT INTO events(value) VALUES (41)", [])
@@ -1094,7 +1346,8 @@ mod tests {
                 .unwrap(),
             2
         );
-        let commits = registration.drain_completed(registration.owner()).unwrap();
+        let batch = settle(&registration, 1, 2);
+        let commits = batch.commits();
         assert!(
             !commits.is_empty(),
             "a successful SQLite WAL commit must be observed"
@@ -1108,7 +1361,7 @@ mod tests {
         // oracle for this platform's default VFS, not a claim that arbitrary
         // SQLite WAL scheduling produces one xSync per SQL statement.
         let mut wal = commits[0].replay_header().to_vec();
-        for commit in &commits {
+        for commit in commits {
             wal.extend_from_slice(commit.replay_frames());
         }
         fs::write(replay.with_extension("db-wal"), wal).unwrap();
@@ -1129,14 +1382,11 @@ mod tests {
         let (_directory, c_path, registration, vfs) = setup();
         let connection = open(&c_path, &vfs);
         wal_setup(&connection);
-        let _ = registration.drain_completed(registration.owner()).unwrap();
+        let _ = settle(&registration, 2, 1);
         connection
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO events VALUES (1); ROLLBACK;")
             .unwrap();
-        assert!(registration
-            .drain_completed(registration.owner())
-            .unwrap()
-            .is_empty());
+        assert!(settle(&registration, 2, 2).commits().is_empty());
         connection
             .execute("INSERT INTO events VALUES (2)", [])
             .unwrap();
@@ -1150,7 +1400,8 @@ mod tests {
                 .unwrap(),
             5
         );
-        let commits = registration.drain_completed(registration.owner()).unwrap();
+        let batch = settle(&registration, 2, 3);
+        let commits = batch.commits();
         assert!(!commits.is_empty());
         assert!(commits
             .windows(2)
@@ -1159,27 +1410,137 @@ mod tests {
     }
 
     #[test]
-    fn another_attempt_in_the_same_session_cannot_drain_a_registration() {
+    fn drain_lease_is_exclusive_and_cancelled_lease_preserves_the_exact_prefix() {
         let session_id = ShadowSessionId::from_bytes([8; 16]);
         let first_attempt = ShadowAttemptId::from_bytes([9; 16]);
         let later_attempt = ShadowAttemptId::from_bytes([10; 16]);
-        let (_directory, c_path, registration, vfs) =
-            setup_with_owner(CaptureOwner::for_shadow_attempt(session_id, first_attempt));
+        let (_directory, c_path, registration, vfs) = setup();
         let connection = open(&c_path, &vfs);
         wal_setup(&connection);
+        let _ = settle(&registration, 3, 1);
         connection
             .execute("INSERT INTO events VALUES (9)", [])
             .unwrap();
-        let wrong = CaptureOwner::for_shadow_attempt(session_id, later_attempt);
-        assert!(matches!(
-            registration.drain_completed(wrong),
-            Err(CaptureRegistryError::OwnerMismatch)
-        ));
-        assert!(!registration
-            .drain_completed(registration.owner())
+        let lease = registration.begin_drain(session_id, first_attempt).unwrap();
+        let selected_count = registration
+            .state
+            .lock()
             .unwrap()
-            .is_empty());
+            .active_drain
+            .unwrap()
+            .commit_count;
+        assert!(matches!(
+            registration.begin_drain(session_id, later_attempt),
+            Err(CaptureRegistryError::DrainActive)
+        ));
+        drop(lease);
+        let lease = registration.begin_drain(session_id, later_attempt).unwrap();
+        connection
+            .execute("INSERT INTO events VALUES (10)", [])
+            .unwrap();
+        let batch = lease.commit().unwrap();
+        assert_eq!(batch.session_id(), session_id);
+        assert_eq!(batch.attempt_id(), later_attempt);
+        assert_eq!(batch.stream_id(), registration.stream_id());
+        assert_eq!(batch.commits().len(), selected_count);
+        assert!(!settle(&registration, 8, 11).commits().is_empty());
+        assert!(matches!(
+            registration.begin_drain(session_id, later_attempt),
+            Err(CaptureRegistryError::AttemptAlreadySettled)
+        ));
         drop(connection);
+    }
+
+    #[test]
+    fn retiring_a_connection_stream_invalidates_its_lease_and_restart_is_fresh() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("restart.db");
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let registry = CaptureRegistry::new();
+        let first = registry
+            .register_exact(CaptureStreamId::from_bytes([21; 16]), &c_path)
+            .unwrap();
+        let first_stream = first.stream_id();
+        let lease = first
+            .begin_drain(
+                ShadowSessionId::from_bytes([22; 16]),
+                ShadowAttemptId::from_bytes([23; 16]),
+            )
+            .unwrap();
+        drop(first);
+        assert!(matches!(lease.commit(), Err(CaptureRegistryError::Retired)));
+
+        let restarted = registry
+            .register_exact(CaptureStreamId::from_bytes([24; 16]), &c_path)
+            .unwrap();
+        assert_ne!(restarted.stream_id(), first_stream);
+        assert!(restarted
+            .begin_drain(
+                ShadowSessionId::from_bytes([22; 16]),
+                ShadowAttemptId::from_bytes([23; 16]),
+            )
+            .unwrap()
+            .commit()
+            .unwrap()
+            .commits()
+            .is_empty());
+    }
+
+    #[test]
+    fn settlement_history_has_an_exact_1024_attempt_cap() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("settlement-cap.db");
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let registry = CaptureRegistry::new();
+        let registration = registry
+            .register_exact(CaptureStreamId::from_bytes([61; 16]), &c_path)
+            .unwrap();
+        let session_id = ShadowSessionId::from_bytes([62; 16]);
+
+        for ordinal in 1..=MAX_CAPTURE_DRAINS_PER_STREAM {
+            let mut attempt = [0u8; 16];
+            attempt[8..].copy_from_slice(&(ordinal as u64).to_be_bytes());
+            let batch = registration
+                .begin_drain(session_id, ShadowAttemptId::from_bytes(attempt))
+                .unwrap()
+                .commit()
+                .unwrap();
+            assert!(batch.commits().is_empty());
+        }
+        let mut overflow_attempt = [0u8; 16];
+        overflow_attempt[8..]
+            .copy_from_slice(&((MAX_CAPTURE_DRAINS_PER_STREAM + 1) as u64).to_be_bytes());
+        assert!(matches!(
+            registration.begin_drain(session_id, ShadowAttemptId::from_bytes(overflow_attempt)),
+            Err(CaptureRegistryError::TooManyDrains)
+        ));
+        let state = registration.state.lock().unwrap();
+        assert_eq!(state.settled_drains.len(), MAX_CAPTURE_DRAINS_PER_STREAM);
+        assert!(state.active_drain.is_none());
+    }
+
+    #[test]
+    fn drain_token_overflow_fails_without_claiming_the_queue() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("token-overflow.db");
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let registry = CaptureRegistry::new();
+        let registration = registry
+            .register_exact(CaptureStreamId::from_bytes([71; 16]), &c_path)
+            .unwrap();
+        registration.state.lock().unwrap().next_drain_token = u64::MAX;
+        assert!(matches!(
+            registration.begin_drain(
+                ShadowSessionId::from_bytes([72; 16]),
+                ShadowAttemptId::from_bytes([73; 16]),
+            ),
+            Err(CaptureRegistryError::StateUnavailable)
+        ));
+        let state = registration.state.lock().unwrap();
+        assert_eq!(state.next_drain_token, u64::MAX);
+        assert!(state.active_drain.is_none());
+        assert!(state.settled_drains.is_empty());
+        assert!(state.capture.is_scrubbed_for_test());
     }
 
     #[test]
@@ -1187,13 +1548,13 @@ mod tests {
         let (_directory, c_path, registration, vfs) = setup();
         let connection = open(&c_path, &vfs);
         wal_setup(&connection);
-        let _ = registration.drain_completed(registration.owner()).unwrap();
+        let _ = settle(&registration, 4, 1);
         connection
             .execute("INSERT INTO events VALUES (10)", [])
             .unwrap();
-        let before_restart = registration.drain_completed(registration.owner()).unwrap();
-        assert!(!before_restart.is_empty());
-        let old_generation = before_restart.last().unwrap().wal_generation();
+        let before_restart = settle(&registration, 4, 2);
+        assert!(!before_restart.commits().is_empty());
+        let old_generation = before_restart.commits().last().unwrap().wal_generation();
 
         connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -1201,9 +1562,10 @@ mod tests {
         connection
             .execute("INSERT INTO events VALUES (11)", [])
             .unwrap();
-        let after_restart = registration.drain_completed(registration.owner()).unwrap();
-        assert!(!after_restart.is_empty());
+        let after_restart = settle(&registration, 4, 3);
+        assert!(!after_restart.commits().is_empty());
         assert!(after_restart
+            .commits()
             .iter()
             .all(|commit| commit.wal_generation() > old_generation));
         assert_eq!(
@@ -1233,6 +1595,59 @@ mod tests {
         );
         drop(connection);
         assert!(directory.path().join("capture.db").exists());
+    }
+
+    #[test]
+    fn retirement_scrubs_pending_capture_and_live_connection_cannot_repopulate_it() {
+        let (_directory, c_path, registration, vfs) = setup();
+        let connection = open(&c_path, &vfs);
+        wal_setup(&connection);
+        let _ = settle(&registration, 51, 1);
+        connection
+            .execute("INSERT INTO events VALUES (51)", [])
+            .unwrap();
+        let state = Arc::clone(&registration.state);
+        let lease = registration
+            .begin_drain(
+                ShadowSessionId::from_bytes([51; 16]),
+                ShadowAttemptId::from_bytes([52; 16]),
+            )
+            .unwrap();
+        {
+            let state = state.lock().unwrap();
+            assert!(!state.capture.is_scrubbed_for_test());
+            assert!(state.active_drain.is_some());
+        }
+
+        // The connection and its FileCapture Arc remain live, as does the
+        // outstanding lease. Registration retirement must nevertheless scrub
+        // all WAL plaintext and invalidate both mutation paths atomically.
+        drop(registration);
+        {
+            let state = state.lock().unwrap();
+            assert!(state.retired);
+            assert!(state.capture.is_scrubbed_for_test());
+            assert!(state.active_drain.is_none());
+            assert!(state.settled_drains.is_empty());
+            assert_eq!(state.next_drain_token, 0);
+        }
+        assert!(matches!(lease.commit(), Err(CaptureRegistryError::Retired)));
+
+        connection
+            .execute("INSERT INTO events VALUES (52)", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT sum(value) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            103
+        );
+        let state = state.lock().unwrap();
+        assert!(state.retired);
+        assert!(state.capture.is_scrubbed_for_test());
+        assert!(state.active_drain.is_none());
+        assert!(state.settled_drains.is_empty());
     }
 
     #[test]
@@ -1291,25 +1706,33 @@ mod tests {
         };
         assert_eq!(write_code, ffi::SQLITE_IOERR_WRITE);
         assert_eq!(
-            write_state.lock().unwrap().metrics(),
+            write_state.lock().unwrap().capture.metrics(),
             ShadowCaptureMetrics::default()
         );
 
         let (mut sync_file, sync_state) = synthetic_failed_file();
-        sync_state.lock().unwrap().observe_write(0, &[0; 32]);
+        sync_state
+            .lock()
+            .unwrap()
+            .capture
+            .observe_write(0, &[0; 32]);
         let sync_code = unsafe { io_sync(ptr::addr_of_mut!(sync_file.base), 0) };
         assert_eq!(sync_code, ffi::SQLITE_IOERR_FSYNC);
         assert_eq!(
-            sync_state.lock().unwrap().metrics(),
+            sync_state.lock().unwrap().capture.metrics(),
             ShadowCaptureMetrics::default()
         );
 
         let (mut truncate_file, truncate_state) = synthetic_failed_file();
-        truncate_state.lock().unwrap().observe_write(0, &[0; 32]);
+        truncate_state
+            .lock()
+            .unwrap()
+            .capture
+            .observe_write(0, &[0; 32]);
         let truncate_code = unsafe { io_truncate(ptr::addr_of_mut!(truncate_file.base), 0) };
         assert_eq!(truncate_code, ffi::SQLITE_IOERR_TRUNCATE);
         assert_eq!(
-            truncate_state.lock().unwrap().observe_sync(true),
+            truncate_state.lock().unwrap().capture.observe_sync(true),
             crate::archive_v3_shadow::ShadowSyncOutcome::Dropped(
                 crate::archive_v3_shadow::ShadowCaptureFault::MalformedWal
             )
