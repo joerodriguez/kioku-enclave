@@ -30,10 +30,14 @@ use crate::{
     archive_v3_lifecycle::{
         ActiveCreateAdmission, ArtifactCreateState, BootstrapPlan, DeletionInventorySeal,
         DurableBootstrapReservation, DurableInventoryPage, DurablePhysicalCompletion,
-        ErasedInventoryPages, InventoryPageReference, LifecycleCreateOutcome, LifecycleError,
-        PhysicalDeletionReceipt, PlannedArtifact, PreparedBootstrap, RecoveredBootstrap,
-        RecoveredDeletionLifecycle, LIFECYCLE_FORMAT_VERSION, MAX_BOOTSTRAP_WITNESS_BYTES,
-        MAX_LIFECYCLE_PAGES,
+        ErasedInventoryPages, InventoryPage, InventoryPageReference, LifecycleCreateOutcome,
+        LifecycleError, PhysicalDeletionReceipt, PlannedArtifact, PreparedBootstrap,
+        RecoveredBootstrap, RecoveredDeletionLifecycle, LIFECYCLE_FORMAT_VERSION,
+        MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES,
+    },
+    archive_v3_lifecycle_page_store::{
+        DurablePageCreateAdmission, FrozenPageCreateSet, LifecyclePageAdmissionLedger,
+        PageCreateDisposition, RecoveredPageCreatePlan,
     },
     cp::isotime,
     crypto::{decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, KmsClient},
@@ -370,7 +374,7 @@ CREATE TABLE IF NOT EXISTS archive_lifecycle_bootstrap_creates (
 );
 CREATE TABLE IF NOT EXISTS archive_lifecycle_inventory_pages (
     archive_id BLOB NOT NULL REFERENCES archive_lifecycle_anchors(archive_id),
-    page_ordinal INTEGER NOT NULL CHECK (page_ordinal >= 0),
+    page_ordinal INTEGER NOT NULL CHECK (page_ordinal >= 0 AND page_ordinal < 4096),
     page_id BLOB NOT NULL CHECK (length(page_id) = 16 AND page_id != zeroblob(16)),
     previous_hash BLOB NOT NULL CHECK (length(previous_hash) = 32),
     page_hash BLOB NOT NULL CHECK (length(page_hash) = 32),
@@ -378,6 +382,43 @@ CREATE TABLE IF NOT EXISTS archive_lifecycle_inventory_pages (
     PRIMARY KEY (archive_id, page_ordinal),
     UNIQUE (archive_id, page_id),
     UNIQUE (archive_id, page_hash)
+);
+-- Every external page create is admitted here before provider I/O. An
+-- outcome_unknown row retains its sole bounded exact page across restart and
+-- must exact-readback to created (which scrubs those bytes) before the next
+-- ordinal can be admitted or inventory seal/cleanup can be authorized.
+CREATE TABLE IF NOT EXISTS archive_lifecycle_page_creates (
+    archive_id BLOB NOT NULL REFERENCES archive_lifecycle_anchors(archive_id),
+    deletion_fence BLOB NOT NULL CHECK (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16)),
+    page_ordinal INTEGER NOT NULL CHECK (page_ordinal >= 0 AND page_ordinal < 4096),
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16 AND page_id != zeroblob(16)),
+    previous_hash BLOB NOT NULL CHECK (length(previous_hash) = 32),
+    page_hash BLOB NOT NULL CHECK (length(page_hash) = 32),
+    encoded_len INTEGER NOT NULL CHECK (encoded_len > 0 AND encoded_len <= 65536),
+    state TEXT NOT NULL CHECK (state IN ('outcome_unknown','created')),
+    unresolved_encoded_page BLOB,
+    PRIMARY KEY (archive_id, page_ordinal),
+    UNIQUE (archive_id, page_id),
+    UNIQUE (archive_id, page_hash),
+    CHECK (
+        (state = 'outcome_unknown'
+         AND unresolved_encoded_page IS NOT NULL
+         AND length(unresolved_encoded_page) = encoded_len)
+        OR
+        (state = 'created' AND unresolved_encoded_page IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS archive_lifecycle_one_unresolved_page_create
+ON archive_lifecycle_page_creates(archive_id) WHERE state = 'outcome_unknown';
+-- One immutable boundary is crossed before the first external inventory-page
+-- create. The commitment covers every settled create-ahead row plus the exact
+-- witness-create state. Its presence closes artifact reconciliation while
+-- page bytes may be in flight, so a restart can rebuild those exact bytes.
+CREATE TABLE IF NOT EXISTS archive_lifecycle_inventory_snapshots (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_lifecycle_anchors(archive_id),
+    deletion_fence BLOB NOT NULL CHECK (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16)),
+    lifecycle_revision INTEGER NOT NULL CHECK (lifecycle_revision > 0),
+    snapshot_commitment BLOB NOT NULL CHECK (length(snapshot_commitment) = 32)
 );
 -- Durable authority for the legacy identity -> stable-ID transition. This row
 -- is encrypted inside the control blob and precedes every provider mutation.
@@ -1688,8 +1729,17 @@ fn reconcile_archive_create_conn(
     let tx = conn.unchecked_transaction()?;
     let anchor = lifecycle_anchor_conn(&tx, admission.archive_id())?
         .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let inventory_snapshot_frozen: i64 = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_lifecycle_inventory_snapshots
+             WHERE archive_id = ?1
+         )",
+        [admission.archive_id().as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
     let frozen_offset = u64::from(anchor.state == ArchiveLifecycleState::DeletionFrozen);
-    if anchor.plan.attempt_id() != admission.attempt_id()
+    if inventory_snapshot_frozen != 0
+        || anchor.plan.attempt_id() != admission.attempt_id()
         || anchor.revision != admission.revision().saturating_add(frozen_offset)
         || !matches!(
             anchor.state,
@@ -1980,6 +2030,218 @@ fn lifecycle_create_ahead_conn(
     .collect()
 }
 
+const INVENTORY_SNAPSHOT_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/inventory-snapshot/v1\0";
+
+fn lifecycle_inventory_snapshot_commitment_conn(
+    conn: &Connection,
+    plan: BootstrapPlan,
+    deletion_fence: ObjectId,
+    lifecycle_revision: u64,
+) -> Result<[u8; 32]> {
+    let create_ahead = lifecycle_create_ahead_conn(conn, plan)?;
+    let witness: (Option<Vec<u8>>, Option<i64>, Option<String>, Option<i64>) = conn.query_row(
+        "SELECT witness_record_hash, witness_record_len, witness_create_state,
+                witness_admission_revision
+         FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [plan.archive_id().as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if witness.3.is_some() || witness.2.as_deref() == Some("outcome_unknown") {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle witness create is unresolved".into(),
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(INVENTORY_SNAPSHOT_COMMITMENT_DOMAIN);
+    hasher.update(plan.archive_id().as_bytes());
+    hasher.update(deletion_fence.as_bytes());
+    hasher.update(lifecycle_revision.to_be_bytes());
+    hasher.update(plan.attempt_id().as_bytes());
+    hasher.update(plan.database_epoch().as_bytes());
+    hasher.update(plan.key_epoch().as_bytes());
+    hasher.update(plan.registry_object_id().as_bytes());
+    hasher.update(plan.root_object_id().as_bytes());
+    hasher.update(
+        u32::try_from(create_ahead.len())
+            .map_err(|_| EnclaveError::Store("archive lifecycle snapshot is too large".into()))?
+            .to_be_bytes(),
+    );
+    for artifact in &create_ahead {
+        let key = artifact.key().as_str().as_bytes();
+        hasher.update(artifact.attempt_id().as_bytes());
+        hasher.update(artifact.ordinal().to_be_bytes());
+        hasher.update(
+            u32::try_from(key.len())
+                .map_err(|_| EnclaveError::Store("archive lifecycle key is too large".into()))?
+                .to_be_bytes(),
+        );
+        hasher.update(key);
+        hasher.update([artifact.role() as u8]);
+        hasher.update(artifact.ciphertext_hash());
+        hasher.update(artifact.encoded_len().to_be_bytes());
+        hasher.update([artifact.create_state() as u8]);
+    }
+    match (witness.0, witness.1, witness.2) {
+        (None, None, None) => {
+            hasher.update([0]);
+        }
+        (Some(hash), Some(len), Some(state)) => {
+            let len = u32::try_from(len).map_err(|_| {
+                EnclaveError::Store("archive lifecycle witness length is invalid".into())
+            })?;
+            let state = lifecycle_artifact_state(&state)?;
+            hasher.update([1]);
+            hasher.update(fixed_32(hash)?);
+            hasher.update(len.to_be_bytes());
+            hasher.update([state as u8]);
+        }
+        _ => {
+            return Err(EnclaveError::Store(
+                "archive lifecycle witness snapshot is inconsistent".into(),
+            ))
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn freeze_archive_inventory_snapshot_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    expected_revision: u64,
+    deletion_fence: ObjectId,
+) -> Result<u64> {
+    let tx = conn.unchecked_transaction()?;
+    let anchor = lifecycle_anchor_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let persisted_fence: Vec<u8> = tx.query_row(
+        "SELECT deletion_fence FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if anchor.state != ArchiveLifecycleState::DeletionFrozen
+        || fixed_16(persisted_fence)? != *deletion_fence.as_bytes()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory snapshot is not frozen for deletion".into(),
+        ));
+    }
+
+    let existing: Option<(Vec<u8>, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT deletion_fence, lifecycle_revision, snapshot_commitment
+             FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((fence, revision, commitment)) = existing {
+        let revision = u64::try_from(revision).map_err(|_| {
+            EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
+        })?;
+        let expected_commitment = lifecycle_inventory_snapshot_commitment_conn(
+            &tx,
+            anchor.plan,
+            deletion_fence,
+            revision,
+        )?;
+        if fixed_16(fence)? != *deletion_fence.as_bytes()
+            || revision != anchor.revision
+            || fixed_32(commitment)? != expected_commitment
+            || !(expected_revision == revision
+                || expected_revision.checked_add(1) == Some(revision))
+        {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle inventory snapshot changed".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok(revision);
+    }
+    if anchor.revision != expected_revision {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory snapshot is stale".into(),
+        ));
+    }
+    let next_revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let commitment = lifecycle_inventory_snapshot_commitment_conn(
+        &tx,
+        anchor.plan,
+        deletion_fence,
+        next_revision,
+    )?;
+    let updated = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(expected_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory snapshot lost its compare-and-swap".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO archive_lifecycle_inventory_snapshots
+         (archive_id, deletion_fence, lifecycle_revision, snapshot_commitment)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            deletion_fence.as_bytes().as_slice(),
+            i64::try_from(next_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            commitment.as_slice(),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(next_revision)
+}
+
+fn load_archive_inventory_snapshot_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<(u64, Vec<PlannedArtifact>)> {
+    let tx = conn.unchecked_transaction()?;
+    let anchor = lifecycle_anchor_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let snapshot: Option<(Vec<u8>, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT deletion_fence, lifecycle_revision, snapshot_commitment
+             FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (fence, revision, commitment) = snapshot.ok_or_else(|| {
+        EnclaveError::Conflict("archive lifecycle inventory snapshot is not durable".into())
+    })?;
+    let revision = u64::try_from(revision).map_err(|_| {
+        EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
+    })?;
+    let expected =
+        lifecycle_inventory_snapshot_commitment_conn(&tx, anchor.plan, deletion_fence, revision)?;
+    if anchor.state != ArchiveLifecycleState::DeletionFrozen
+        || anchor.revision != revision
+        || fixed_16(fence)? != *deletion_fence.as_bytes()
+        || fixed_32(commitment)? != expected
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory snapshot changed".into(),
+        ));
+    }
+    let artifacts = lifecycle_create_ahead_conn(&tx, anchor.plan)?;
+    tx.commit()?;
+    Ok((revision, artifacts))
+}
+
 fn seal_archive_inventory_conn(
     conn: &Connection,
     archive_id: ArchiveId,
@@ -1999,14 +2261,35 @@ fn seal_archive_inventory_conn(
             "archive lifecycle inventory seal is stale".into(),
         ));
     }
-    let persisted_fence = conn.query_row(
-        "SELECT deletion_fence FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+    let snapshot = conn.query_row(
+        "SELECT a.deletion_fence, s.lifecycle_revision, s.snapshot_commitment
+         FROM archive_lifecycle_anchors a
+         JOIN archive_lifecycle_inventory_snapshots s ON s.archive_id = a.archive_id
+         WHERE a.archive_id = ?1",
         [archive_id.as_bytes().as_slice()],
-        |row| row.get::<_, Vec<u8>>(0),
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        },
     )?;
-    if fixed_16(persisted_fence)? != *deletion_fence.as_bytes() {
+    let snapshot_revision = u64::try_from(snapshot.1).map_err(|_| {
+        EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
+    })?;
+    let expected_snapshot = lifecycle_inventory_snapshot_commitment_conn(
+        conn,
+        anchor.plan,
+        deletion_fence,
+        snapshot_revision,
+    )?;
+    if fixed_16(snapshot.0)? != *deletion_fence.as_bytes()
+        || snapshot_revision != expected_revision
+        || fixed_32(snapshot.2)? != expected_snapshot
+    {
         return Err(EnclaveError::Conflict(
-            "archive lifecycle inventory fence changed".into(),
+            "archive lifecycle inventory snapshot changed".into(),
         ));
     }
     if pages.is_empty() || pages.len() > MAX_LIFECYCLE_PAGES {
@@ -2029,6 +2312,11 @@ fn seal_archive_inventory_conn(
             "archive lifecycle witness create is unresolved".into(),
         ));
     }
+    let page_references = pages
+        .iter()
+        .map(|page| page.reference())
+        .collect::<Vec<_>>();
+    lifecycle_page_create_set_drained_conn(conn, archive_id, deletion_fence, &page_references)?;
     let create_ahead = lifecycle_create_ahead_conn(conn, anchor.plan)?;
     for planned in &create_ahead {
         let included = pages.iter().flat_map(|page| page.entries()).any(|entry| {
@@ -2086,7 +2374,12 @@ fn seal_archive_inventory_conn(
              inventory_terminal_hash = ?5, inventory_commitment = ?6,
              inventory_seal_revision = revision + 1,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'",
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'
+           AND EXISTS (
+             SELECT 1 FROM archive_lifecycle_inventory_snapshots s
+             WHERE s.archive_id = ?1 AND s.deletion_fence = ?7
+               AND s.lifecycle_revision = ?2
+           )",
         rusqlite::params![
             archive_id.as_bytes().as_slice(),
             i64::try_from(expected_revision)
@@ -2095,6 +2388,7 @@ fn seal_archive_inventory_conn(
             i64::from(seal.artifact_count()),
             seal.terminal_page_hash().as_slice(),
             seal.inventory_commitment().as_slice(),
+            deletion_fence.as_bytes().as_slice(),
         ],
     )?;
     if updated != 1 {
@@ -2198,6 +2492,412 @@ fn load_sealed_archive_inventory_references_conn(
         ));
     }
     Ok(references)
+}
+
+fn admit_lifecycle_page_create_conn(
+    conn: &Connection,
+    deletion_fence: ObjectId,
+    page: &InventoryPage,
+) -> Result<DurablePageCreateAdmission> {
+    let reference = page.reference();
+    if InventoryPage::decode(reference.archive_id(), page.encoded())
+        .map_err(lifecycle_store_error)?
+        != *page
+    {
+        return Err(EnclaveError::Store(
+            "archive lifecycle page is not canonical".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let anchor: Option<(String, Vec<u8>, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT a.state, a.deletion_fence, s.lifecycle_revision,
+                    s.snapshot_commitment
+             FROM archive_lifecycle_anchors a
+             JOIN archive_lifecycle_inventory_snapshots s ON s.archive_id = a.archive_id
+             WHERE a.archive_id = ?1 AND s.lifecycle_revision = a.revision",
+            [reference.archive_id().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let (state, persisted_fence, snapshot_revision, snapshot_commitment) =
+        anchor.ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let lifecycle_revision = u64::try_from(snapshot_revision).map_err(|_| {
+        EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
+    })?;
+    let lifecycle_anchor = lifecycle_anchor_conn(&tx, reference.archive_id())?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let expected_snapshot = lifecycle_inventory_snapshot_commitment_conn(
+        &tx,
+        lifecycle_anchor.plan,
+        deletion_fence,
+        lifecycle_revision,
+    )?;
+    if ArchiveLifecycleState::from_db(&state)? != ArchiveLifecycleState::DeletionFrozen
+        || fixed_16(persisted_fence)? != *deletion_fence.as_bytes()
+        || lifecycle_revision != lifecycle_anchor.revision
+        || fixed_32(snapshot_commitment)? != expected_snapshot
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle page creates are frozen".into(),
+        ));
+    }
+    let existing_ordinal: i64 = tx.query_row(
+        "SELECT count(*) FROM archive_lifecycle_page_creates
+         WHERE archive_id = ?1 AND page_ordinal = ?2",
+        rusqlite::params![
+            reference.archive_id().as_bytes().as_slice(),
+            i64::from(reference.page_ordinal()),
+        ],
+        |row| row.get(0),
+    )?;
+    if existing_ordinal == 0 {
+        let (total, unresolved, terminal): (i64, i64, Option<Vec<u8>>) = tx.query_row(
+            "SELECT count(*),
+                    sum(CASE WHEN state = 'outcome_unknown' THEN 1 ELSE 0 END),
+                    (SELECT page_hash FROM archive_lifecycle_page_creates
+                     WHERE archive_id = ?1 ORDER BY page_ordinal DESC LIMIT 1)
+             FROM archive_lifecycle_page_creates WHERE archive_id = ?1",
+            [reference.archive_id().as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get(2)?,
+                ))
+            },
+        )?;
+        let expected_previous = match terminal {
+            Some(hash) => fixed_32(hash)?,
+            None => [0; 32],
+        };
+        if unresolved != 0
+            || u32::try_from(total).ok() != Some(reference.page_ordinal())
+            || reference.previous_hash() != expected_previous
+        {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle page partition is not the durable next page".into(),
+            ));
+        }
+    } else if existing_ordinal != 1 {
+        return Err(EnclaveError::Store(
+            "archive lifecycle page ordinal is duplicated".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO archive_lifecycle_page_creates
+         (archive_id, deletion_fence, page_ordinal, page_id, previous_hash,
+          page_hash, encoded_len, state, unresolved_encoded_page)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,'outcome_unknown',?8)",
+        rusqlite::params![
+            reference.archive_id().as_bytes().as_slice(),
+            deletion_fence.as_bytes().as_slice(),
+            i64::from(reference.page_ordinal()),
+            reference.page_id().as_bytes().as_slice(),
+            reference.previous_hash().as_slice(),
+            reference.page_hash().as_slice(),
+            i64::from(reference.encoded_len()),
+            page.encoded(),
+        ],
+    )?;
+    let row = tx.query_row(
+        "SELECT deletion_fence, page_id, previous_hash, page_hash,
+                    encoded_len, state, unresolved_encoded_page
+             FROM archive_lifecycle_page_creates
+             WHERE archive_id = ?1 AND page_ordinal = ?2",
+        rusqlite::params![
+            reference.archive_id().as_bytes().as_slice(),
+            i64::from(reference.page_ordinal()),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+            ))
+        },
+    )?;
+    if fixed_16(row.0)? != *deletion_fence.as_bytes()
+        || fixed_16(row.1)? != *reference.page_id().as_bytes()
+        || fixed_32_allow_zero(row.2)? != reference.previous_hash()
+        || fixed_32(row.3)? != reference.page_hash()
+        || u32::try_from(row.4).ok() != Some(reference.encoded_len())
+        || match row.5.as_str() {
+            "outcome_unknown" => row.6.as_deref() != Some(page.encoded()),
+            "created" => row.6.is_some(),
+            _ => true,
+        }
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle page-create admission conflicts".into(),
+        ));
+    }
+    let disposition = match row.5.as_str() {
+        "outcome_unknown" => PageCreateDisposition::OutcomeUnknown,
+        "created" => PageCreateDisposition::Created,
+        _ => {
+            return Err(EnclaveError::Store(
+                "archive lifecycle page-create state is invalid".into(),
+            ))
+        }
+    };
+    let admission = DurablePageCreateAdmission::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        deletion_fence,
+        reference,
+        disposition,
+    )
+    .map_err(lifecycle_store_error)?;
+    tx.commit()?;
+    Ok(admission)
+}
+
+fn recover_lifecycle_page_create_plan_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<RecoveredPageCreatePlan> {
+    let tx = conn.unchecked_transaction()?;
+    let anchor = lifecycle_anchor_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let snapshot: Option<(Vec<u8>, i64, Vec<u8>)> = tx
+        .query_row(
+            "SELECT deletion_fence, lifecycle_revision, snapshot_commitment
+             FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (snapshot_fence, snapshot_revision, snapshot_commitment) = snapshot.ok_or_else(|| {
+        EnclaveError::Conflict("archive lifecycle inventory snapshot is not durable".into())
+    })?;
+    let snapshot_revision = u64::try_from(snapshot_revision).map_err(|_| {
+        EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
+    })?;
+    let expected_snapshot = lifecycle_inventory_snapshot_commitment_conn(
+        &tx,
+        anchor.plan,
+        deletion_fence,
+        snapshot_revision,
+    )?;
+    if anchor.state != ArchiveLifecycleState::DeletionFrozen
+        || anchor.revision != snapshot_revision
+        || fixed_16(snapshot_fence)? != *deletion_fence.as_bytes()
+        || fixed_32(snapshot_commitment)? != expected_snapshot
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory snapshot changed".into(),
+        ));
+    }
+    let mut statement = tx.prepare(
+        "SELECT page_ordinal, page_id, previous_hash, page_hash, encoded_len,
+                state, unresolved_encoded_page
+         FROM archive_lifecycle_page_creates
+         WHERE archive_id = ?1 AND deletion_fence = ?2
+         ORDER BY page_ordinal",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            deletion_fence.as_bytes().as_slice(),
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+            ))
+        },
+    )?;
+    let mut created = Vec::new();
+    let mut outcome_unknown = None;
+    for row in rows {
+        let (ordinal, page_id, previous, hash, encoded_len, state, encoded) = row?;
+        let reference = InventoryPageReference::from_persisted(
+            &LifecyclePersistenceContext::validated(),
+            archive_id,
+            u32::try_from(ordinal).map_err(|_| {
+                EnclaveError::Store("archive lifecycle page ordinal is invalid".into())
+            })?,
+            ObjectId::from_bytes(fixed_16(page_id)?),
+            fixed_32_allow_zero(previous)?,
+            fixed_32(hash)?,
+            u32::try_from(encoded_len).map_err(|_| {
+                EnclaveError::Store("archive lifecycle page length is invalid".into())
+            })?,
+        )
+        .map_err(lifecycle_store_error)?;
+        match (state.as_str(), encoded) {
+            ("created", None) if outcome_unknown.is_none() => created.push(reference),
+            ("outcome_unknown", Some(encoded)) if outcome_unknown.is_none() => {
+                let page =
+                    InventoryPage::decode(archive_id, &encoded).map_err(lifecycle_store_error)?;
+                if page.reference() != reference {
+                    return Err(EnclaveError::Store(
+                        "archive lifecycle unresolved page bytes changed".into(),
+                    ));
+                }
+                outcome_unknown = Some(page);
+            }
+            _ => {
+                return Err(EnclaveError::Store(
+                    "archive lifecycle page-create plan is inconsistent".into(),
+                ))
+            }
+        }
+    }
+    drop(statement);
+    let plan = RecoveredPageCreatePlan::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        archive_id,
+        created,
+        outcome_unknown,
+    )
+    .map_err(lifecycle_store_error)?;
+    tx.commit()?;
+    Ok(plan)
+}
+
+fn reconcile_lifecycle_page_created_conn(
+    conn: &Connection,
+    admission: DurablePageCreateAdmission,
+    durable: &DurableInventoryPage,
+) -> Result<()> {
+    let reference = admission.reference();
+    if durable.page().reference() != reference {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle page readback changed".into(),
+        ));
+    }
+    let updated = conn.execute(
+        "UPDATE archive_lifecycle_page_creates
+         SET state = 'created', unresolved_encoded_page = NULL
+         WHERE archive_id = ?1 AND deletion_fence = ?2 AND page_ordinal = ?3
+           AND page_id = ?4 AND previous_hash = ?5 AND page_hash = ?6
+           AND encoded_len = ?7 AND state IN ('outcome_unknown','created')
+           AND EXISTS (
+             SELECT 1 FROM archive_lifecycle_anchors a
+             JOIN archive_lifecycle_inventory_snapshots s ON s.archive_id = a.archive_id
+             WHERE a.archive_id = ?1 AND a.state = 'deletion_frozen'
+               AND a.deletion_fence = ?2 AND s.lifecycle_revision = a.revision
+           )",
+        rusqlite::params![
+            reference.archive_id().as_bytes().as_slice(),
+            admission.deletion_fence().as_bytes().as_slice(),
+            i64::from(reference.page_ordinal()),
+            reference.page_id().as_bytes().as_slice(),
+            reference.previous_hash().as_slice(),
+            reference.page_hash().as_slice(),
+            i64::from(reference.encoded_len()),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle page-create reconciliation lost authority".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn lifecycle_page_create_set_drained_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    references: &[InventoryPageReference],
+) -> Result<()> {
+    let unresolved: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_lifecycle_page_creates
+         WHERE archive_id = ?1 AND deletion_fence = ?2 AND state != 'created'",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            deletion_fence.as_bytes().as_slice()
+        ],
+        |row| row.get(0),
+    )?;
+    let total: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_lifecycle_page_creates
+         WHERE archive_id = ?1 AND deletion_fence = ?2",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            deletion_fence.as_bytes().as_slice()
+        ],
+        |row| row.get(0),
+    )?;
+    if unresolved != 0 || usize::try_from(total).ok() != Some(references.len()) {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle page creates are unresolved".into(),
+        ));
+    }
+    for reference in references {
+        let exact: i64 = conn.query_row(
+            "SELECT count(*) FROM archive_lifecycle_page_creates
+             WHERE archive_id = ?1 AND deletion_fence = ?2 AND page_ordinal = ?3
+               AND page_id = ?4 AND previous_hash = ?5 AND page_hash = ?6
+               AND encoded_len = ?7 AND state = 'created'",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                deletion_fence.as_bytes().as_slice(),
+                i64::from(reference.page_ordinal()),
+                reference.page_id().as_bytes().as_slice(),
+                reference.previous_hash().as_slice(),
+                reference.page_hash().as_slice(),
+                i64::from(reference.encoded_len()),
+            ],
+            |row| row.get(0),
+        )?;
+        if exact != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle page-create inventory changed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn authorize_lifecycle_page_cleanup_conn(
+    conn: &Connection,
+    completion: DurablePhysicalCompletion,
+    references: &[InventoryPageReference],
+) -> Result<FrozenPageCreateSet> {
+    let seal = completion.physical_receipt().seal();
+    let state: Option<(String, i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT state, revision, deletion_fence
+             FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [seal.archive_id().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (state, revision, deletion_fence) =
+        state.ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    if ArchiveLifecycleState::from_db(&state)? != ArchiveLifecycleState::PhysicalComplete
+        || u64::try_from(revision).ok() != Some(completion.control_revision())
+        || fixed_16(deletion_fence)? != *seal.deletion_fence().as_bytes()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle page cleanup authority changed".into(),
+        ));
+    }
+    lifecycle_page_create_set_drained_conn(
+        conn,
+        seal.archive_id(),
+        seal.deletion_fence(),
+        references,
+    )?;
+    FrozenPageCreateSet::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        completion,
+        references,
+    )
+    .map_err(lifecycle_store_error)
 }
 
 fn recover_archive_deletion_lifecycle_conn(
@@ -6048,6 +6748,43 @@ impl ControlStore {
         dead_code,
         reason = "reserved for reviewed archive-v3 authority wiring"
     )]
+    pub(crate) async fn freeze_archive_inventory_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        deletion_fence: ObjectId,
+    ) -> Result<u64> {
+        self.write_if_changed(move |conn| {
+            freeze_archive_inventory_snapshot_conn(
+                conn,
+                archive_id,
+                expected_revision,
+                deletion_fence,
+            )
+            .map(|revision| (revision, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn load_archive_inventory_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<(u64, Vec<PlannedArtifact>)> {
+        self.read(move |conn| {
+            load_archive_inventory_snapshot_conn(conn, archive_id, deletion_fence)
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
     pub(crate) async fn seal_archive_inventory(
         &self,
         archive_id: ArchiveId,
@@ -6117,6 +6854,65 @@ impl ControlStore {
                 .map(|()| ((), true))
         })
         .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 lifecycle page-store wiring"
+    )]
+    pub(crate) async fn admit_lifecycle_page_create(
+        &self,
+        deletion_fence: ObjectId,
+        page: InventoryPage,
+    ) -> Result<DurablePageCreateAdmission> {
+        self.write_if_changed(move |conn| {
+            admit_lifecycle_page_create_conn(conn, deletion_fence, &page)
+                .map(|admission| (admission, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 lifecycle page-store wiring"
+    )]
+    pub(crate) async fn recover_lifecycle_page_create_plan(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<RecoveredPageCreatePlan> {
+        self.read(move |conn| {
+            recover_lifecycle_page_create_plan_conn(conn, archive_id, deletion_fence)
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 lifecycle page-store wiring"
+    )]
+    pub(crate) async fn reconcile_lifecycle_page_created(
+        &self,
+        admission: DurablePageCreateAdmission,
+        durable: DurableInventoryPage,
+    ) -> Result<()> {
+        self.write_if_changed(move |conn| {
+            reconcile_lifecycle_page_created_conn(conn, admission, &durable).map(|()| ((), true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 lifecycle page-store wiring"
+    )]
+    pub(crate) async fn authorize_lifecycle_page_cleanup(
+        &self,
+        completion: DurablePhysicalCompletion,
+        references: Vec<InventoryPageReference>,
+    ) -> Result<FrozenPageCreateSet> {
+        self.read(move |conn| authorize_lifecycle_page_cleanup_conn(conn, completion, &references))
+            .await
     }
 
     #[allow(
@@ -6797,10 +7593,52 @@ impl ControlStore {
     }
 }
 
+#[async_trait::async_trait]
+impl LifecyclePageAdmissionLedger for ControlStore {
+    async fn admit_page_create(
+        &self,
+        deletion_fence: ObjectId,
+        page: &InventoryPage,
+    ) -> std::result::Result<DurablePageCreateAdmission, LifecycleError> {
+        self.admit_lifecycle_page_create(deletion_fence, page.clone())
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn recover_page_create_plan(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<RecoveredPageCreatePlan, LifecycleError> {
+        self.recover_lifecycle_page_create_plan(archive_id, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn reconcile_page_created(
+        &self,
+        admission: DurablePageCreateAdmission,
+        durable: &DurableInventoryPage,
+    ) -> std::result::Result<(), LifecycleError> {
+        self.reconcile_lifecycle_page_created(admission, durable.clone())
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn authorize_page_cleanup(
+        &self,
+        completion: DurablePhysicalCompletion,
+        references: &[InventoryPageReference],
+    ) -> std::result::Result<FrozenPageCreateSet, LifecycleError> {
+        self.authorize_lifecycle_page_cleanup(completion, references.to_vec())
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive_v3_lifecycle::InventoryPage;
     use crate::store::{GcsGetResponse, GcsListVersionsResponse};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Notify;
@@ -7111,6 +7949,17 @@ mod tests {
         DurableInventoryPage::from_exact_readback(page, &encoded).unwrap()
     }
 
+    fn persist_lifecycle_page_creates(
+        conn: &Connection,
+        fence: ObjectId,
+        pages: &[DurableInventoryPage],
+    ) {
+        for page in pages {
+            let admission = admit_lifecycle_page_create_conn(conn, fence, page.page()).unwrap();
+            reconcile_lifecycle_page_created_conn(conn, admission, page).unwrap();
+        }
+    }
+
     #[test]
     fn bootstrap_recovery_needs_only_archive_authority_after_close_and_reopen() {
         let directory = tempfile::tempdir().unwrap();
@@ -7282,10 +8131,27 @@ mod tests {
             LIFECYCLE_ROOT_ORDINAL,
         )
         .is_err());
+        assert!(freeze_archive_inventory_snapshot_conn(
+            &conn,
+            plan.archive_id(),
+            frozen_revision,
+            fence,
+        )
+        .is_err());
         let reconciled =
             reconcile_archive_create_conn(&conn, &witness, LifecycleCreateOutcome::ConfirmedAbsent)
                 .unwrap();
         assert_eq!(reconciled, frozen_revision + 1);
+        let snapshot_revision =
+            freeze_archive_inventory_snapshot_conn(&conn, plan.archive_id(), reconciled, fence)
+                .unwrap();
+        assert_eq!(snapshot_revision, reconciled + 1);
+        assert!(reconcile_archive_create_conn(
+            &conn,
+            &witness,
+            LifecycleCreateOutcome::ConfirmedAbsent,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7318,6 +8184,9 @@ mod tests {
         let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
         let revision =
             freeze_archive_lifecycle_conn(&conn, plan.archive_id(), revision, fence).unwrap();
+        let revision =
+            freeze_archive_inventory_snapshot_conn(&conn, plan.archive_id(), revision, fence)
+                .unwrap();
         let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
         assert!(seal_archive_inventory_conn(
             &conn,
@@ -7332,6 +8201,10 @@ mod tests {
         .is_err());
         let page = InventoryPage::build(plan.archive_id(), 0, [0; 32], entries).unwrap();
         let pages = vec![durable_inventory_page(page)];
+        assert!(
+            seal_archive_inventory_conn(&conn, plan.archive_id(), revision, fence, &pages).is_err()
+        );
+        persist_lifecycle_page_creates(&conn, fence, &pages);
         let seal =
             seal_archive_inventory_conn(&conn, plan.archive_id(), revision, fence, &pages).unwrap();
         let references = load_sealed_archive_inventory_references_conn(&conn, &seal).unwrap();
@@ -7410,9 +8283,13 @@ mod tests {
         let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
         let frozen_revision =
             freeze_archive_lifecycle_conn(&conn, archive_id, revision, fence).unwrap();
+        let frozen_revision =
+            freeze_archive_inventory_snapshot_conn(&conn, archive_id, frozen_revision, fence)
+                .unwrap();
         let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
         let page = InventoryPage::build(archive_id, 0, [0; 32], entries).unwrap();
         let pages = vec![durable_inventory_page(page)];
+        persist_lifecycle_page_creates(&conn, fence, &pages);
         seal_archive_inventory_conn(&conn, archive_id, frozen_revision, fence, &pages).unwrap();
         drop(pages);
         drop(conn);
@@ -7450,6 +8327,219 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload_erased, 1);
+    }
+
+    #[test]
+    fn page_create_outcome_unknown_survives_close_and_blocks_seal_until_exact_reconcile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let plan = lifecycle_plan(&conn);
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let registry = admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        let revision = reconcile_archive_create_conn(
+            &conn,
+            &registry,
+            LifecycleCreateOutcome::ConfirmedAbsent,
+        )
+        .unwrap();
+        let root =
+            admit_archive_create_conn(&conn, plan.archive_id(), revision, LIFECYCLE_ROOT_ORDINAL)
+                .unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        let frozen_revision =
+            freeze_archive_lifecycle_conn(&conn, plan.archive_id(), revision, fence).unwrap();
+        let frozen_revision = freeze_archive_inventory_snapshot_conn(
+            &conn,
+            plan.archive_id(),
+            frozen_revision,
+            fence,
+        )
+        .unwrap();
+        assert_eq!(
+            freeze_archive_inventory_snapshot_conn(
+                &conn,
+                plan.archive_id(),
+                frozen_revision,
+                fence,
+            )
+            .unwrap(),
+            frozen_revision
+        );
+        let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
+        let first =
+            InventoryPage::build(plan.archive_id(), 0, [0; 32], vec![entries[0].clone()]).unwrap();
+        let second = InventoryPage::build(
+            plan.archive_id(),
+            1,
+            first.page_hash(),
+            vec![entries[1].clone()],
+        )
+        .unwrap();
+        let first_durable = durable_inventory_page(first.clone());
+        let first_admission = admit_lifecycle_page_create_conn(&conn, fence, &first).unwrap();
+        reconcile_lifecycle_page_created_conn(&conn, first_admission, &first_durable).unwrap();
+        let admission = admit_lifecycle_page_create_conn(&conn, fence, &second).unwrap();
+        let alternate_partition =
+            InventoryPage::build(plan.archive_id(), 1, first.page_hash(), entries).unwrap();
+        assert!(admit_lifecycle_page_create_conn(&conn, fence, &alternate_partition).is_err());
+        // Page admission is the irreversible boundary for canonical page
+        // bytes. Even a duplicate reconciliation for a formerly admitted
+        // artifact cannot mutate create_state after that boundary.
+        assert!(reconcile_archive_create_conn(
+            &conn,
+            &root,
+            LifecycleCreateOutcome::ConfirmedAbsent,
+        )
+        .is_err());
+        let reference = admission.reference();
+        let exact_unresolved_bytes = second.encoded().to_vec();
+        let _ = admission;
+        drop(second);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered =
+            recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert_eq!(recovered.created(), &[first.reference()]);
+        let recovered_page = recovered.outcome_unknown().unwrap().clone();
+        assert_eq!(recovered_page.reference(), reference);
+        assert_eq!(recovered_page.encoded(), exact_unresolved_bytes);
+        let mut tampered = exact_unresolved_bytes.clone();
+        *tampered.last_mut().unwrap() ^= 0xff;
+        conn.execute(
+            "UPDATE archive_lifecycle_page_creates SET unresolved_encoded_page = ?2
+             WHERE archive_id = ?1 AND state = 'outcome_unknown'",
+            rusqlite::params![plan.archive_id().as_bytes().as_slice(), tampered],
+        )
+        .unwrap();
+        assert!(recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence).is_err());
+        conn.execute(
+            "UPDATE archive_lifecycle_page_creates SET unresolved_encoded_page = ?2
+             WHERE archive_id = ?1 AND state = 'outcome_unknown'",
+            rusqlite::params![
+                plan.archive_id().as_bytes().as_slice(),
+                exact_unresolved_bytes,
+            ],
+        )
+        .unwrap();
+        let recovered_page =
+            recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+                .outcome_unknown()
+                .unwrap()
+                .clone();
+        let durable = durable_inventory_page(recovered_page);
+        assert!(seal_archive_inventory_conn(
+            &conn,
+            plan.archive_id(),
+            frozen_revision,
+            fence,
+            &[first_durable.clone(), durable.clone()],
+        )
+        .is_err());
+        let admission = admit_lifecycle_page_create_conn(&conn, fence, durable.page()).unwrap();
+        reconcile_lifecycle_page_created_conn(&conn, admission, &durable).unwrap();
+        let recovered =
+            recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert_eq!(recovered.created(), &[first.reference(), reference]);
+        assert!(recovered.outcome_unknown().is_none());
+        assert!(seal_archive_inventory_conn(
+            &conn,
+            plan.archive_id(),
+            frozen_revision,
+            fence,
+            &[first_durable, durable],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn persisted_page_create_ordinal_cap_rejects_corrupt_row() {
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let registry = admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        let revision = reconcile_archive_create_conn(
+            &conn,
+            &registry,
+            LifecycleCreateOutcome::ConfirmedAbsent,
+        )
+        .unwrap();
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        let revision =
+            freeze_archive_lifecycle_conn(&conn, plan.archive_id(), revision, fence).unwrap();
+        freeze_archive_inventory_snapshot_conn(&conn, plan.archive_id(), revision, fence).unwrap();
+        let page = InventoryPage::build(
+            plan.archive_id(),
+            u32::try_from(MAX_LIFECYCLE_PAGES - 1).unwrap(),
+            [0x52; 32],
+            lifecycle_create_ahead_conn(&conn, plan).unwrap(),
+        )
+        .unwrap();
+        let reference = page.reference();
+        assert!(conn
+            .execute(
+                "INSERT INTO archive_lifecycle_page_creates
+                 (archive_id, deletion_fence, page_ordinal, page_id, previous_hash,
+                  page_hash, encoded_len, state, unresolved_encoded_page)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'outcome_unknown',NULL)",
+                rusqlite::params![
+                    plan.archive_id().as_bytes().as_slice(),
+                    fence.as_bytes().as_slice(),
+                    i64::from(reference.page_ordinal()),
+                    reference.page_id().as_bytes().as_slice(),
+                    reference.previous_hash().as_slice(),
+                    reference.page_hash().as_slice(),
+                    i64::from(reference.encoded_len()),
+                ],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO archive_lifecycle_page_creates
+             (archive_id, deletion_fence, page_ordinal, page_id, previous_hash,
+              page_hash, encoded_len, state, unresolved_encoded_page)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'outcome_unknown',?8)",
+            rusqlite::params![
+                plan.archive_id().as_bytes().as_slice(),
+                fence.as_bytes().as_slice(),
+                i64::from(reference.page_ordinal()),
+                reference.page_id().as_bytes().as_slice(),
+                reference.previous_hash().as_slice(),
+                reference.page_hash().as_slice(),
+                i64::from(reference.encoded_len()),
+                page.encoded(),
+            ],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "UPDATE archive_lifecycle_page_creates SET page_ordinal = 4096
+             WHERE archive_id = ?1",
+            [plan.archive_id().as_bytes().as_slice()],
+        );
+        assert!(result.is_err());
     }
 
     #[test]

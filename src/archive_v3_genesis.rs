@@ -982,6 +982,26 @@ mod tests {
             Err(LifecycleError::InvalidState)
         }
 
+        async fn freeze_inventory_snapshot(
+            &self,
+            _archive_id: ArchiveId,
+            _expected_revision: u64,
+            _deletion_fence: ObjectId,
+        ) -> std::result::Result<u64, LifecycleError> {
+            Err(LifecycleError::InvalidState)
+        }
+
+        async fn load_inventory_snapshot(
+            &self,
+            _archive_id: ArchiveId,
+            _deletion_fence: ObjectId,
+        ) -> std::result::Result<
+            (u64, Vec<crate::archive_v3_lifecycle::PlannedArtifact>),
+            LifecycleError,
+        > {
+            Err(LifecycleError::InvalidState)
+        }
+
         async fn seal_inventory(
             &self,
             _archive_id: ArchiveId,
