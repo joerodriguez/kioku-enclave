@@ -472,9 +472,10 @@ entry, and the concrete GCS adapter rechecks its inventory membership plus the f
 archive/database/fence/worker/operation tuple before transport I/O. `PhysicalComplete` evidence
 hashes both the exact complete-inventory commitment and the freshly reverified provider-drain
 commitment; the driver derives that stage proof from the drain result rather than forwarding an
-unrelated retention assertion. The root/manifest formats do not yet
-carry all descendant location fields, so full activation is compile-time blocked: the inventory
-trait/builder/result are module-private and the full-reachability seal has no non-test constructor.
+unrelated retention assertion. Full activation remains compile-time blocked: the separate exact
+reachability visitor returns only a non-authorizing report, the inventory trait/builder/result are
+module-private, create-ahead union and canonical page sealing are not connected, and the
+full-reachability seal has no non-test constructor.
 The intended lifecycle order is fixed: freeze and drain admitted/ambiguous creates; tombstone the
 exact unchanged current root (or use a separately reviewed exact-absence coordinator for a bootstrap
 that never established a witness); authenticate the root graph and union all create-ahead rows;
@@ -496,6 +497,50 @@ Admitting an authenticated canonical metadata walker requires an explicit review
 that walker must enforce fixed global count/byte/depth/page bounds and cycle/duplicate rejection,
 and must not infer paths or discover objects by prefix. The driver has no Store, route, runtime,
 credential, or deployment wiring.
+
+`src/archive_v3_reachability.rs` is the first inactive, non-authorizing half of that source
+change. It accepts at most the exact current and predecessor root/registry pairs from one
+witness recovery snapshot, plus archive ciphers already resolved from each pair's exact wrapped
+registry generation/object/hash. Before its first archive read it rechecks those bindings. Its
+current and predecessor bindings are all validated as one set before any read, so a bad later
+registry/cipher cannot leak I/O from an earlier graph. Every authenticated root commitment,
+opened root, and WAL descriptor contributes its exact sequence-derived parent and grandparent
+`RootV3` facts. A parent reference does not authenticate its historical key epoch, so an unfetched
+root fact deliberately commits only archive ID, the derivable database namespace, sequence, object
+ID, and envelope hash; it never labels that fact with the current key or a guessed parent/AEAD
+context. At database-epoch cutover, a parent equal to the separately witnessed predecessor uses
+that predecessor graph's actual database namespace. When the predecessor graph is visited, the
+reference-only fact is promoted and fetched exactly once under the predecessor's exact witnessed
+registry/cipher; same-database key rotation likewise retains the old parent without relabeling it
+with the new key epoch.
+Its transport boundary can read one canonical `ObjectKey` with one response cap and has no prefix,
+enumeration, mutation, provider-construction, credential, or continuation-token operation.
+Every fetched root, checkpoint manifest, extent node, WAL commit descriptor, and WAL segment is
+full-envelope-hash checked, AEAD opened under the derived exact context, decoded, and compared to
+its authenticated parent fields. Checkpoint chunks and extent leaves need no content read because
+their exact context, object ID, envelope hash, length/range, and revision are committed by the
+already authenticated parent; conflicting object-ID reuse or a repeated fetched edge fails before
+a second request. Identical shared leaf facts may be represented once only when key, role, hash,
+and full context commitment are all equal. Object-ID lookup, exact-identity comparison, and
+fetched-state promotion remain logarithmic at the global object bound; no traversal step scans the
+accumulated report.
+
+The visitor independently caps the whole result at 131,072 objects, 64 MiB of canonical key
+bytes, and 16 MiB of authenticated metadata excluding WAL frame bodies. Each of at most two root
+graphs is additionally bounded to the format's 32,768 checkpoint chunks plus 129 manifests,
+32,768 extent leaves plus 129 nodes, 1,024 WAL descriptors, 16,384 WAL segments, 16 segments per
+commit, and one GiB of root WAL lineage. Checkpoint root level/range/checkpoint ID and every node's
+complete descriptor must agree; extent slots/height and full/final lengths are derived rather
+than caller selected; WAL root/descriptor/parent/checkpoint/count/byte/generation/frame/checksum
+and predecessor continuity are all checked. Tree traversal uses a separate depth-64 bound; WAL's
+linear chain uses its explicit count bounds. At most one commit's bounded segment buffers are
+retained at a time and their owned frame storage zeroizes before the next commit. Cancellation or
+a stalled/failed exact read produces no report; retry begins again from the same witness snapshot.
+The returned opaque, content-free report is deliberately not a `FullReachabilitySeal`, lifecycle
+page plan, complete deletion inventory, admission, or provider capability. Create-ahead union,
+canonical lifecycle paging/sealing, fresh fence/disposition revalidation, and deletion integration
+remain separate reviewed activation blockers. No Store, startup, control-store, runtime, route,
+cloud implementation, credential source, or deployment configuration constructs this visitor.
 The shadow module
 is bounded synchronous capture state only: no
 SQLite VFS is registered, and capture failure cannot alter the legacy Store result.

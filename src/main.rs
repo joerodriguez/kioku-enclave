@@ -87,6 +87,9 @@ mod archive_v3_lifecycle;
 // Inactive exact-name, control-key-derived encrypted lifecycle page store. It
 // has no provider implementation, list API, runtime construction, or walker.
 mod archive_v3_lifecycle_page_store;
+// Inactive exact-name authenticated reachability visitor. It returns only a
+// non-authorizing content-free report and has no lifecycle/deletion wiring.
+mod archive_v3_reachability;
 // Inactive ADR-0022 restart-safe genesis coordinator. It has no provider
 // construction or authority wiring; only deterministic fake-tested contracts.
 mod archive_v3_genesis;
