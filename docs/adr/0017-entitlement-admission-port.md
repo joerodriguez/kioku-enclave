@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-09
-- Revised: 2026-08-11
+- Revised: 2026-08-13
 
 ## Context
 
@@ -33,6 +33,9 @@ The external control plane owns all commercial policy and provider adapters. The
 enclave's compatibility facade may pass through a bounded entitlement snapshot or an
 opaque HTTPS account-action URL, but it does not interpret the commercial implementation.
 New clients should use the hosted account surface for purchase and plan management.
+Allowance amount and cadence are likewise external policy. The enclave forwards exact
+period bounds from the snapshot and never assumes a calendar month, calendar week, or
+rolling window.
 
 ## Consequences
 
