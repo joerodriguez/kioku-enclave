@@ -34,6 +34,7 @@ pub(crate) const MAX_LIFECYCLE_PAGE_ENTRIES: usize = 256;
 pub(crate) const MAX_LIFECYCLE_PAGES: usize = 4_096;
 pub(crate) const MAX_LIFECYCLE_PAGE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_LIFECYCLE_OBJECT_KEY_BYTES: usize = 1_024;
+pub(crate) const WITNESS_CREATE_PROTOCOL_V1: u16 = 1;
 
 const PAGE_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-page/v2\0";
 const INVENTORY_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-inventory/v2\0";
@@ -675,6 +676,91 @@ impl fmt::Debug for ActiveCreateAdmission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ActiveCreateAdmission(<opaque>)")
     }
+}
+
+/// Durable dispatch marker for the one witness create admitted by bootstrap.
+///
+/// This is deliberately non-Clone and non-serializable. The Firestore adapter
+/// may borrow it only for the exact commit whose admission was atomically
+/// marked `send_started` in encrypted control state.
+pub(crate) struct WitnessSendStarted {
+    archive_id: ArchiveId,
+    attempt_id: BootstrapAttemptId,
+    admission_revision: u64,
+    expected_hash: [u8; 32],
+    protocol_commitment: [u8; 32],
+}
+
+impl WitnessSendStarted {
+    pub(crate) fn from_persisted_dispatch(
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+        admission: &ActiveCreateAdmission,
+        protocol_commitment: [u8; 32],
+    ) -> Result<Self, LifecycleError> {
+        if admission.artifact_ordinal() != 2 || !nonzero(&protocol_commitment) {
+            return Err(LifecycleError::InvalidState);
+        }
+        Ok(Self {
+            archive_id: admission.archive_id(),
+            attempt_id: admission.attempt_id(),
+            admission_revision: admission.revision(),
+            expected_hash: admission.artifact_hash(),
+            protocol_commitment,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        admission: &ActiveCreateAdmission,
+        protocol_commitment: [u8; 32],
+    ) -> Result<Self, LifecycleError> {
+        if admission.artifact_ordinal() != 2 || !nonzero(&protocol_commitment) {
+            return Err(LifecycleError::InvalidState);
+        }
+        Ok(Self {
+            archive_id: admission.archive_id(),
+            attempt_id: admission.attempt_id(),
+            admission_revision: admission.revision(),
+            expected_hash: admission.artifact_hash(),
+            protocol_commitment,
+        })
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn attempt_id(&self) -> BootstrapAttemptId {
+        self.attempt_id
+    }
+
+    pub(crate) const fn admission_revision(&self) -> u64 {
+        self.admission_revision
+    }
+
+    pub(crate) const fn expected_hash(&self) -> [u8; 32] {
+        self.expected_hash
+    }
+
+    pub(crate) const fn protocol_commitment(&self) -> [u8; 32] {
+        self.protocol_commitment
+    }
+}
+
+impl fmt::Debug for WitnessSendStarted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WitnessSendStarted(<opaque>)")
+    }
+}
+
+/// Narrow marker boundary that must be crossed after Firestore has begun and
+/// validated its exact transaction, but before the commit can be submitted.
+#[async_trait]
+pub(crate) trait WitnessCreateDispatchLedger: Send + Sync {
+    async fn mark_witness_send_started(
+        &self,
+        admission: &ActiveCreateAdmission,
+    ) -> Result<WitnessSendStarted, LifecycleError>;
 }
 
 /// Canonical hash-chained page. The encoded bytes are safe to persist only in
@@ -1559,6 +1645,17 @@ pub(crate) trait ArchiveLifecycleLedger: Send + Sync {
         &self,
         admission: &ActiveCreateAdmission,
         outcome: LifecycleCreateOutcome,
+    ) -> Result<u64, LifecycleError>;
+
+    /// Recover only a retained send-started initial-witness create whose exact
+    /// durable candidate is now present. Implementations must atomically
+    /// validate the protocol/admission/hash tuple and clear it as created.
+    /// A merely preexisting witness with no enrolled candidate fails closed.
+    async fn adopt_existing_witness(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        exact_encoded_record: &[u8],
     ) -> Result<u64, LifecycleError>;
 
     async fn freeze_for_deletion(

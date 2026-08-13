@@ -72,6 +72,36 @@ This compiled seam does not authorize archive-v3 persistence or deletion.
 
 This compiled coordinator does not activate archive-v3 persistence or deletion.
 
+## Pre-witness exact-absence disposition capability
+
+- [x] Atomically enroll each new lifecycle reservation in a versioned,
+  domain-committed initial-witness protocol; legacy/missing/unknown enrollment
+  is manual and never inferred unsent.
+- [x] Persist exact prepared witness hash/length and admitted revision, then
+  require a producer-private non-cloneable send-start receipt before the
+  Firestore commit boundary.
+- [x] Serialize deletion with dispatch so unstarted and started/ambiguous
+  creates close into distinct monotonic phases; generic witness reconciliation
+  cannot forge absence or unknown-send state.
+- [x] Authenticate the tombstoned control binding, lifecycle, protocol, and
+  deletion fence before any exact-name witness read; only closed-unsent plus a
+  fresh `None` and full-state CAS mints a private absence proof.
+- [x] Persist facts rather than proof authority: restart and remint require full
+  row validation and another exact absent read, while started `None` remains
+  manual and a later exact retained record may resolve present.
+- [x] Support reservation/objects-prepared deletion with an exact candidate-free
+  closed tuple; permanently poison any later exact, mismatched, malformed, or
+  noncanonical present document so confirmed absence cannot resurrect.
+- [x] Seal the Genesis witness-create surface to the commit-start-aware
+  Firestore creator and recover a crash-after-commit only through the retained
+  exact send-start adoption CAS.
+- [x] Keep this capability disconnected from inventory/deletion-driver
+  invocation, Store/startup/runtime/config/routes, provider construction,
+  credentials, cloud mutation, deployment, and user-visible behavior.
+
+This compiled capability is not yet accepted by deletion and does not activate
+archive-v3 persistence or deletion.
+
 ## Firestore transport-probe release boundary
 
 - [x] Made one exact checked-in, non-secret probe profile the sole input to both build
