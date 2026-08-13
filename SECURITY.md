@@ -1060,6 +1060,23 @@ may correlate timing with other infrastructure events. Keep the method/route set
 and low-cardinality, retain privileged log access, and do not join these events to
 user-level logs.
 
+### Capture rejection telemetry reveals failed-upload timing and class
+
+The service emits one structured event only when `POST /api/v2/capture/events`
+fails. Each event contains a fixed schema and route label, numeric HTTP status
+and fixed class, one validated stream kind, `canonical`/`reference` disposition,
+one fixed failure-reason class, and elapsed milliseconds. Before a manifest can
+be validated, stream and disposition are the literal fixed value `unknown`.
+It deliberately omits account, device, install, session, stream, event, asset,
+lease, and request identifiers; paths and queries; tokens and headers; request
+and response bodies; URLs, window/app text, media, exception text, and captured
+content. Successful capture cadence is not logged by this event.
+
+This remains request-level operational telemetry: privileged log readers can
+observe the time and broad class of a failed upload and may correlate it with
+other infrastructure events. Keep the enums fixed and low-cardinality, retain
+privileged log access, and do not join these events to user-level logs.
+
 ### Stable user identifiers are linkable
 
 Google-primary user IDs preserve their deterministic historical derivation. New
