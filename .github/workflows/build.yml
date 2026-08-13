@@ -215,6 +215,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_agent_verify.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_rust_build_lifecycle.py
           python3 scripts/test_archive_witness_probe_config.py
+          python3 scripts/test_archive_v3_shadow_runtime_config.py
           python3 scripts/test_select_build_configuration.py
           python3 scripts/test_release.py
           python3 scripts/test_verify_release_metadata.py
@@ -293,6 +294,13 @@ jobs:
       archive_witness_project_id: ${{ steps.build.outputs.archive_witness_project_id }}
       archive_witness_project_number: ${{ steps.build.outputs.archive_witness_project_number }}
       archive_witness_database_id: ${{ steps.build.outputs.archive_witness_database_id }}
+      archive_v3_shadow_runtime_mode: ${{ steps.build.outputs.archive_v3_shadow_runtime_mode }}
+      archive_v3_archive_bucket: ${{ steps.build.outputs.archive_v3_archive_bucket }}
+      archive_v3_archive_gcs_project_number: ${{ steps.build.outputs.archive_v3_archive_gcs_project_number }}
+      archive_v3_registry_kms_version: ${{ steps.build.outputs.archive_v3_registry_kms_version }}
+      archive_v3_witness_project_id: ${{ steps.build.outputs.archive_v3_witness_project_id }}
+      archive_v3_witness_project_number: ${{ steps.build.outputs.archive_v3_witness_project_number }}
+      archive_v3_witness_database_id: ${{ steps.build.outputs.archive_v3_witness_database_id }}
       digest:    ${{ steps.digest.outputs.digest }}
 
     steps:
@@ -434,6 +442,13 @@ jobs:
             --build-arg ARCHIVE_WITNESS_PROJECT_ID="${ARCHIVE_WITNESS_PROJECT_ID}" \
             --build-arg ARCHIVE_WITNESS_PROJECT_NUMBER="${ARCHIVE_WITNESS_PROJECT_NUMBER}" \
             --build-arg ARCHIVE_WITNESS_DATABASE_ID="${ARCHIVE_WITNESS_DATABASE_ID}" \
+            --build-arg ARCHIVE_V3_SHADOW_RUNTIME_MODE="${ARCHIVE_V3_SHADOW_RUNTIME_MODE}" \
+            --build-arg ARCHIVE_V3_ARCHIVE_BUCKET="${ARCHIVE_V3_ARCHIVE_BUCKET}" \
+            --build-arg ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER="${ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER}" \
+            --build-arg ARCHIVE_V3_REGISTRY_KMS_VERSION="${ARCHIVE_V3_REGISTRY_KMS_VERSION}" \
+            --build-arg ARCHIVE_V3_WITNESS_PROJECT_ID="${ARCHIVE_V3_WITNESS_PROJECT_ID}" \
+            --build-arg ARCHIVE_V3_WITNESS_PROJECT_NUMBER="${ARCHIVE_V3_WITNESS_PROJECT_NUMBER}" \
+            --build-arg ARCHIVE_V3_WITNESS_DATABASE_ID="${ARCHIVE_V3_WITNESS_DATABASE_ID}" \
             --build-arg RUN_SA_EMAIL="${ENCLAVE_RUN_SA_EMAIL}" \
             --build-arg ENCLAVE_AUDIENCE="${ENCLAVE_AUDIENCE}" \
             --build-arg ATTEST_STS_AUDIENCE="${ENCLAVE_ATTEST_STS_AUDIENCE}" \
@@ -476,6 +491,13 @@ jobs:
           echo "archive_witness_project_id=${ARCHIVE_WITNESS_PROJECT_ID}" >> "$GITHUB_OUTPUT"
           echo "archive_witness_project_number=${ARCHIVE_WITNESS_PROJECT_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "archive_witness_database_id=${ARCHIVE_WITNESS_DATABASE_ID}" >> "$GITHUB_OUTPUT"
+          echo "archive_v3_shadow_runtime_mode=${ARCHIVE_V3_SHADOW_RUNTIME_MODE}" >> "$GITHUB_OUTPUT"
+          echo "archive_v3_archive_bucket=${ARCHIVE_V3_ARCHIVE_BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "archive_v3_archive_gcs_project_number=${ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "archive_v3_registry_kms_version=${ARCHIVE_V3_REGISTRY_KMS_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "archive_v3_witness_project_id=${ARCHIVE_V3_WITNESS_PROJECT_ID}" >> "$GITHUB_OUTPUT"
+          echo "archive_v3_witness_project_number=${ARCHIVE_V3_WITNESS_PROJECT_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "archive_v3_witness_database_id=${ARCHIVE_V3_WITNESS_DATABASE_ID}" >> "$GITHUB_OUTPUT"
           echo "billing_enforcement_mode=${BILLING_ENFORCEMENT_MODE}" >> "$GITHUB_OUTPUT"
           echo "build_profile=${KIOKU_BUILD_PROFILE}" >> "$GITHUB_OUTPUT"
 
@@ -488,6 +510,8 @@ jobs:
             ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING \
             ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_GCS_LEGACY_MEDIA_BUCKET \
             ARCHIVE_WITNESS_SHADOW_MODE ARCHIVE_WITNESS_PROJECT_ID ARCHIVE_WITNESS_PROJECT_NUMBER ARCHIVE_WITNESS_DATABASE_ID \
+            ARCHIVE_V3_SHADOW_RUNTIME_MODE ARCHIVE_V3_ARCHIVE_BUCKET ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER \
+            ARCHIVE_V3_REGISTRY_KMS_VERSION ARCHIVE_V3_WITNESS_PROJECT_ID ARCHIVE_V3_WITNESS_PROJECT_NUMBER ARCHIVE_V3_WITNESS_DATABASE_ID \
             ENCLAVE_RUN_SA_EMAIL ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE \
             GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID \
             APPLE_TEAM_ID APPLE_KEY_ID APPLE_IOS_CLIENT_ID \
@@ -638,7 +662,7 @@ jobs:
       - name: Preserve SBOM attestation bundle
         run: cp "${{ steps.attest_sbom.outputs.bundle-path }}" enclave-sbom-attestation.jsonl
 
-      # Keep schema-v6 release metadata machine-readable as well as visible in the job
+      # Keep schema-v7 release metadata machine-readable as well as visible in the job
       # summary. scripts/release.sh publishes this file on the public GitHub
       # Release, giving auditors a stable source commit -> image digest record.
       - name: Write release metadata
@@ -669,13 +693,20 @@ jobs:
             "${{ steps.build.outputs.archive_witness_project_id }}" \
             "${{ steps.build.outputs.archive_witness_project_number }}" \
             "${{ steps.build.outputs.archive_witness_database_id }}" \
+            "${{ steps.build.outputs.archive_v3_shadow_runtime_mode }}" \
+            "${{ steps.build.outputs.archive_v3_archive_bucket }}" \
+            "${{ steps.build.outputs.archive_v3_archive_gcs_project_number }}" \
+            "${{ steps.build.outputs.archive_v3_registry_kms_version }}" \
+            "${{ steps.build.outputs.archive_v3_witness_project_id }}" \
+            "${{ steps.build.outputs.archive_v3_witness_project_number }}" \
+            "${{ steps.build.outputs.archive_v3_witness_database_id }}" \
             > enclave-release.json <<'PY'
           import json
           import sys
 
-          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode, gcs_bucket, gcs_media_bucket, gcs_legacy_media_bucket, archive_witness_shadow_mode, archive_witness_project_id, archive_witness_project_number, archive_witness_database_id = sys.argv[1:]
+          source_ref, commit, image_uri, digest_uri, digest, build_url, build_profile, voice_quality_gate, billing_enforcement_mode, gcs_bucket, gcs_media_bucket, gcs_legacy_media_bucket, archive_witness_shadow_mode, archive_witness_project_id, archive_witness_project_number, archive_witness_database_id, archive_v3_shadow_runtime_mode, archive_v3_archive_bucket, archive_v3_archive_gcs_project_number, archive_v3_registry_kms_version, archive_v3_witness_project_id, archive_v3_witness_project_number, archive_v3_witness_database_id = sys.argv[1:]
           print(json.dumps({
-              "schema_version": 6,
+              "schema_version": 7,
               "source_repository": "https://github.com/${{ github.repository }}",
               "source_ref": source_ref,
               "source_commit": commit,
@@ -693,6 +724,13 @@ jobs:
               "archive_witness_project_id": archive_witness_project_id,
               "archive_witness_project_number": archive_witness_project_number,
               "archive_witness_database_id": archive_witness_database_id,
+              "archive_v3_shadow_runtime_mode": archive_v3_shadow_runtime_mode,
+              "archive_v3_archive_bucket": archive_v3_archive_bucket,
+              "archive_v3_archive_gcs_project_number": archive_v3_archive_gcs_project_number,
+              "archive_v3_registry_kms_version": archive_v3_registry_kms_version,
+              "archive_v3_witness_project_id": archive_v3_witness_project_id,
+              "archive_v3_witness_project_number": archive_v3_witness_project_number,
+              "archive_v3_witness_database_id": archive_v3_witness_database_id,
           }, indent=2))
           PY
 

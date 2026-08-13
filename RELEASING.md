@@ -91,7 +91,7 @@ For this ADR-0022 Phase-0 dual-media migration, `ENCLAVE_GCS_MEDIA_BUCKET` is re
 as the current write bucket and may differ from `ENCLAVE_GCS_BUCKET`.
 `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` is required and must exactly equal
 `ENCLAVE_GCS_BUCKET`. CI rejects a missing or mismatched value before Docker runs, bakes
-all three `ENV` values into the image, and records them in a schema-v6 release manifest.
+all three `ENV` values into the image, and records them in a schema-v7 release manifest.
 The selected values are a build/release binding and the runtime Store uses them for the
 dual-media migration; this workflow does not create either bucket, delete objects, wire
 archive-v3 authority, or deploy a VM.
@@ -233,7 +233,7 @@ The script and workflow then:
 6. push the image to the configured
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>` destination;
 7. generate an SPDX SBOM, fail on fixed high-severity image findings, and create
-   GitHub-signed image-provenance, SBOM, and schema-v6 release-manifest attestations;
+   GitHub-signed image-provenance, SBOM, and schema-v7 release-manifest attestations;
 8. verify the signed release-manifest subject before parsing it, then validate its exact
    source repository/ref/commit, image digest, configured Artifact Registry repository,
    and Phase-0 claims for the exact current-media bucket and legacy-media bucket equal
@@ -257,10 +257,17 @@ quarantined workflow artifacts; it never grants publication eligibility. A tag s
 any key other than the out-of-band `RELEASE_SIGNER_FINGERPRINT` is rejected by the sole
 publisher even when GitHub reports that signature as verified.
 
-Images whose immutable release lacks the signed schema-v6 release manifest and its
+Images whose immutable release lacks the signed schema-v7 release manifest and its
 matching provenance bundle are ineligible for promotion, including an attempted rollback.
 An old release, a mutable tag, a manually copied manifest, or a runtime fallback is not
 evidence that a digest was built for the dual-media migration.
+
+Before publishing or rolling the first schema-v7 enclave release, the deployment
+repository's ordinary-roll verifier must merge and deploy an independently reviewed
+schema-v7 compatibility update that requires the exact `off`/empty archive-v3 shadow-
+runtime claim. Until that prerequisite is present, schema-v7 images are intentionally
+ineligible for every production roll. This enclave repository does not update deployment
+policy, create cloud resources, or grant runtime authority.
 
 Publishing creates a verified public release; it does not change production. An operator
 may then use `--roll` with an explicitly configured `DEPLOYMENT_REPO` to request that
@@ -337,7 +344,7 @@ For a billing-enforcement promotion, first verify the pinned billing credential,
 catalog price, reconciliation with zero failures, the idempotent 60-second
 authorize/replay/detach canary, and the signed cloud-only client quota-denial upgrade UI.
 Then set `BILLING_ENFORCEMENT_MODE=enforce` and cut a new signed release; the mode is baked
-into the image and attested in schema-v6 metadata. To roll back enforcement, set the
+into the image and attested in schema-v7 metadata. To roll back enforcement, set the
 variable to `shadow`, cut another signed release, and roll its verified digest. Do not
 attempt a live launch-metadata override.
 

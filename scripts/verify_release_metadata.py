@@ -14,6 +14,10 @@ from archive_witness_probe_config import (
     load_probe_config,
     select_probe_config,
 )
+from archive_v3_shadow_runtime_config import (
+    ShadowRuntimeConfigError,
+    load_shadow_runtime_config,
+)
 
 
 BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]\Z")
@@ -40,12 +44,25 @@ FIELDS = (
     "archive_witness_project_id",
     "archive_witness_project_number",
     "archive_witness_database_id",
+    "archive_v3_shadow_runtime_mode",
+    "archive_v3_archive_bucket",
+    "archive_v3_archive_gcs_project_number",
+    "archive_v3_registry_kms_version",
+    "archive_v3_witness_project_id",
+    "archive_v3_witness_project_number",
+    "archive_v3_witness_database_id",
 )
 
 EMPTY_ALLOWED_FIELDS = {
     "archive_witness_project_id",
     "archive_witness_project_number",
     "archive_witness_database_id",
+    "archive_v3_archive_bucket",
+    "archive_v3_archive_gcs_project_number",
+    "archive_v3_registry_kms_version",
+    "archive_v3_witness_project_id",
+    "archive_v3_witness_project_number",
+    "archive_v3_witness_database_id",
 }
 
 
@@ -95,8 +112,8 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         reject("expected legacy media GCS bucket has an invalid format")
     if arguments.expected_gcs_bucket != arguments.expected_gcs_legacy_media_bucket:
         reject("expected legacy media GCS bucket must equal the expected GCS bucket for Phase-0")
-    if data["schema_version"] != 6:
-        reject("schema_version must be 6; older manifests are ineligible for promotion")
+    if data["schema_version"] != 7:
+        reject("schema_version must be 7; older manifests are ineligible for promotion")
 
     expected_repository = f"https://github.com/{arguments.repository}"
     if data["source_repository"] != expected_repository:
@@ -177,6 +194,24 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
     else:
         reject("archive witness shadow mode is invalid")
 
+    shadow_runtime_claim = (
+        data["archive_v3_shadow_runtime_mode"],
+        data["archive_v3_archive_bucket"],
+        data["archive_v3_archive_gcs_project_number"],
+        data["archive_v3_registry_kms_version"],
+        data["archive_v3_witness_project_id"],
+        data["archive_v3_witness_project_number"],
+        data["archive_v3_witness_database_id"],
+    )
+    try:
+        expected_shadow_runtime_claim = load_shadow_runtime_config(
+            arguments.archive_v3_shadow_runtime_config
+        ).as_claim()
+    except ShadowRuntimeConfigError as error:
+        reject(str(error))
+    if shadow_runtime_claim != expected_shadow_runtime_claim:
+        reject("archive-v3 shadow-runtime claim does not match the release configuration")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -193,10 +228,18 @@ def main() -> None:
         type=Path,
         default=Path("config/archive-witness-probe.json"),
     )
+    parser.add_argument(
+        "--archive-v3-shadow-runtime-config",
+        type=Path,
+        default=Path("config/archive-v3-shadow-runtime.json"),
+    )
     arguments = parser.parse_args()
     data = parse_metadata(arguments.metadata)
     validate(arguments, data)
-    print("\t".join(str(data[key]) for key in FIELDS))
+    # Emit the already-validated exact document rather than a whitespace-
+    # delimited record. Several exact-off claims are empty by design; JSON
+    # preserves their positions and types without shell IFS collapsing them.
+    print(json.dumps(data, separators=(",", ":"), ensure_ascii=True))
 
 
 if __name__ == "__main__":

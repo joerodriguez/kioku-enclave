@@ -63,7 +63,7 @@ surfaces.
   production data access. The operator has retired that isolated runtime; production is
   now the only active owner evaluation environment.
 - Production selection accepts only the reviewed `shadow` and `enforce` billing modes.
-  The selected mode is preserved in schema-v6 release metadata, and a fresh release
+  The selected mode is preserved in schema-v7 release metadata, and a fresh release
   rechecks that it matches the repository variable observed before tagging. A later
   configuration change therefore cannot silently alter the signed image's enforcement
   behavior.
@@ -71,7 +71,7 @@ surfaces.
   `ENCLAVE_GCS_BUCKET` for indexes, `ENCLAVE_GCS_MEDIA_BUCKET` for current-media
   writes, and `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` for migration-only media reads and
   deletes. The current media bucket may differ from the index bucket; legacy media must
-  exactly equal it. The exact three-value claim is carried in a schema-v6 release
+  exactly equal it. The exact three-value claim is carried in a schema-v7 release
   manifest that is itself a GitHub-signed provenance subject. Runtime has no missing
   legacy-bucket fallback; an unsigned/copied or older manifest is not promotion evidence.
   This is not archive-v3 wiring, a deletion action, or deployment authority.
@@ -88,9 +88,19 @@ surfaces.
   magic/version, monotonic generation, and random opaque attempt ID. It has no AppState/
   CpState/route/health/admission/deletion/acknowledgement connection, never constructs a
   witness bootstrap, and cannot change canonical archive-witness state. Commit ambiguity is
-  never blindly retried and is confirmed only by rereading the exact attempt. Schema-v6
+  never blindly retried and is confirmed only by rereading the exact attempt. Schema-v7
   signed release metadata binds the mode and complete-or-empty namespace but grants no
   Firestore, rollout, health, or archive authority.
+- The ADR-0022 construction-only shadow runtime is separately fixed to exact `off` by
+  checked-in `config/archive-v3-shadow-runtime.json`. Its sole shared parser rejects every
+  nonempty archive bucket, archive-GCS project number, registry KMS version, witness
+  project/number/database, and every mode other than `off`; no repository variable,
+  dispatch input, tag form, or process environment can override that selection. Schema-v7
+  signed release metadata binds all seven exact values. The compiled bundle can only
+  synchronously construct fixed-origin clients behind private fields, exposes no operation
+  or runtime handle, and has an always-deny hard-delete gate. Startup does not construct
+  it, so off performs zero archive-GCS, KMS, or Firestore I/O and cannot affect Store/VFS,
+  lifecycle, routes, health, admission, deletion, rollout, roots, or user-visible behavior.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL
@@ -1042,7 +1052,7 @@ Rust crates visible in that image SBOM, and CI fails if representative core/nati
 packages are absent. The credentialed build job accepts only main or `v*` tag refs; the
 GCP OIDC provider must additionally constrain immutable repository/owner IDs and the
 expected workflow identity. A tagged build produces GitHub-signed image provenance, an
-SPDX SBOM, a signed SBOM attestation, and a signed schema-v6 release-manifest subject,
+SPDX SBOM, a signed SBOM attestation, and a signed schema-v7 release-manifest subject,
 but has read-only repository-content permission and no GitHub Release publication step.
 The sole publisher is `scripts/release.sh`: before any release mutation it requires the
 exact tag-signing fingerprint from a separately published trusted anchor, then verifies

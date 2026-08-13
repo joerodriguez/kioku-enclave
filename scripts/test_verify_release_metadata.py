@@ -21,7 +21,7 @@ MEDIA_BUCKET = "kioku-production-media"
 
 def manifest() -> dict[str, object]:
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "source_repository": "https://github.com/owner/repository",
         "source_ref": "v1.2.3",
         "source_commit": COMMIT,
@@ -39,6 +39,13 @@ def manifest() -> dict[str, object]:
         "archive_witness_project_id": "",
         "archive_witness_project_number": "",
         "archive_witness_database_id": "",
+        "archive_v3_shadow_runtime_mode": "off",
+        "archive_v3_archive_bucket": "",
+        "archive_v3_archive_gcs_project_number": "",
+        "archive_v3_registry_kms_version": "",
+        "archive_v3_witness_project_id": "",
+        "archive_v3_witness_project_number": "",
+        "archive_v3_witness_database_id": "",
     }
 
 
@@ -51,6 +58,13 @@ def schema_v4_manifest() -> dict[str, object]:
         "archive_witness_project_id",
         "archive_witness_project_number",
         "archive_witness_database_id",
+        "archive_v3_shadow_runtime_mode",
+        "archive_v3_archive_bucket",
+        "archive_v3_archive_gcs_project_number",
+        "archive_v3_registry_kms_version",
+        "archive_v3_witness_project_id",
+        "archive_v3_witness_project_number",
+        "archive_v3_witness_database_id",
     ):
         del data[key]
     return data
@@ -63,6 +77,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         *,
         tag: str = "v1.2.3",
         probe_config: dict[str, object] | None = None,
+        shadow_runtime_config: dict[str, object] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "enclave-release.json"
@@ -71,6 +86,16 @@ class ReleaseMetadataTests(unittest.TestCase):
             if probe_config is not None:
                 config_path = Path(directory) / "archive-witness-probe.json"
                 config_path.write_text(json.dumps(probe_config), encoding="utf-8")
+            shadow_runtime_config_path = (
+                ROOT / "config" / "archive-v3-shadow-runtime.json"
+            )
+            if shadow_runtime_config is not None:
+                shadow_runtime_config_path = (
+                    Path(directory) / "archive-v3-shadow-runtime.json"
+                )
+                shadow_runtime_config_path.write_text(
+                    json.dumps(shadow_runtime_config), encoding="utf-8"
+                )
             return subprocess.run(
                 [
                     "python3",
@@ -92,6 +117,8 @@ class ReleaseMetadataTests(unittest.TestCase):
                     BUCKET,
                     "--archive-witness-probe-config",
                     str(config_path),
+                    "--archive-v3-shadow-runtime-config",
+                    str(shadow_runtime_config_path),
                 ],
                 cwd=ROOT,
                 text=True,
@@ -102,7 +129,7 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_valid_current_manifest_is_eligible(self) -> None:
         completed = self.verify(manifest())
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(f"\t{BUCKET}\t{MEDIA_BUCKET}\t{BUCKET}\toff", completed.stdout)
+        self.assertEqual(json.loads(completed.stdout), manifest())
 
     def test_missing_build_profile_is_ineligible(self) -> None:
         data = manifest()
@@ -200,7 +227,11 @@ class ReleaseMetadataTests(unittest.TestCase):
         }
         completed = self.verify(data, tag=tag, probe_config=probe)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("\tprobe-v1\tproject-1\t123456789\twitness-db", completed.stdout)
+        verified = json.loads(completed.stdout)
+        self.assertEqual(verified["archive_witness_shadow_mode"], "probe-v1")
+        self.assertEqual(verified["archive_witness_project_id"], "project-1")
+        self.assertEqual(verified["archive_witness_project_number"], "123456789")
+        self.assertEqual(verified["archive_witness_database_id"], "witness-db")
 
         data["source_ref"] = "v1.2.3"
         completed = self.verify(data, tag="v1.2.3", probe_config=probe)
@@ -217,6 +248,44 @@ class ReleaseMetadataTests(unittest.TestCase):
         completed = self.verify(data)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("does not match", completed.stderr)
+
+    def test_shadow_runtime_claim_is_exact_off_and_bound_to_shared_config(self) -> None:
+        for field, value in (
+            ("archive_v3_shadow_runtime_mode", "shadow-v1"),
+            ("archive_v3_archive_bucket", "archive-bucket"),
+            ("archive_v3_archive_gcs_project_number", "123456789"),
+            ("archive_v3_registry_kms_version", "7"),
+            ("archive_v3_witness_project_id", "project-1"),
+            ("archive_v3_witness_project_number", "987654321"),
+            ("archive_v3_witness_database_id", "witness-db"),
+        ):
+            with self.subTest(field=field):
+                data = manifest()
+                data[field] = value
+                completed = self.verify(data)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("shadow-runtime claim does not match", completed.stderr)
+
+        hostile_config = {
+            "schema_version": 1,
+            "mode": "shadow-v1",
+            "archive_bucket": "archive-bucket",
+            "archive_gcs_project_number": "123456789",
+            "registry_kms_version": "7",
+            "witness_project_id": "project-1",
+            "witness_project_number": "987654321",
+            "witness_database_id": "witness-db",
+        }
+        completed = self.verify(manifest(), shadow_runtime_config=hostile_config)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("must be exact off", completed.stderr)
+
+    def test_schema_v6_manifest_is_ineligible_for_promotion(self) -> None:
+        data = manifest()
+        data["schema_version"] = 6
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("schema_version must be 7", completed.stderr)
 
 
 if __name__ == "__main__":

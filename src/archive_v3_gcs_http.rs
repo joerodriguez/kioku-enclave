@@ -91,7 +91,7 @@ impl GcpArchiveV3HttpTransport {
         tokens: Arc<dyn ArchiveV3BearerTokenProvider>,
         soft_delete_drain: Arc<dyn ArchiveV3SoftDeleteDrainGate>,
     ) -> std::result::Result<Self, GcsArchiveV3TransportError> {
-        if !valid_bucket_name(&bucket) || !valid_endpoint(endpoint) {
+        if !valid_archive_v3_bucket_name(&bucket) || !valid_endpoint(endpoint) {
             return Err(GcsArchiveV3TransportError::Protocol);
         }
         let http = reqwest::Client::builder()
@@ -948,7 +948,9 @@ fn valid_endpoint(endpoint: &str) -> bool {
         && url.fragment().is_none()
 }
 
-fn valid_bucket_name(bucket: &str) -> bool {
+/// Validate the one canonical bucket-name grammar shared by inactive runtime
+/// deployment construction and this transport. This performs no I/O.
+pub(crate) fn valid_archive_v3_bucket_name(bucket: &str) -> bool {
     let length_ok = if bucket.contains('.') {
         bucket.len() <= 222
             && bucket
@@ -1447,9 +1449,9 @@ mod tests {
             Arc::new(FixedDrainGate(true)),
         )
         .is_err());
-        assert!(valid_bucket_name("test-bucket"));
-        assert!(!valid_bucket_name("192.168.1.1"));
-        assert!(!valid_bucket_name("goog-bucket"));
+        assert!(valid_archive_v3_bucket_name("test-bucket"));
+        assert!(!valid_archive_v3_bucket_name("192.168.1.1"));
+        assert!(!valid_archive_v3_bucket_name("goog-bucket"));
         assert!(valid_bearer_token(b"abc.DEF_123-~+/="));
         assert!(!valid_bearer_token(b"abc\r\ndef"));
     }
