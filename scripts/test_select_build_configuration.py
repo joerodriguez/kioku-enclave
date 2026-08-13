@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,6 +17,8 @@ WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
 DOCKERFILE = ROOT / "Dockerfile"
 RELEASE_SCRIPT = ROOT / "scripts" / "release.sh"
 METADATA_VERIFIER = ROOT / "scripts" / "verify_release_metadata.py"
+PROBE_PARSER = ROOT / "scripts" / "archive_witness_probe_config.py"
+MAIN = ROOT / "src" / "main.rs"
 
 CONFIGURATION = {
     "ENCLAVE_KMS_PROJECT": "kioku-joerodriguez",
@@ -92,16 +95,30 @@ def environment() -> dict[str, str]:
 
 class SelectorTests(unittest.TestCase):
     def run_selector(
-        self, profile: str, env: dict[str, str]
+        self,
+        profile: str,
+        env: dict[str, str],
+        *,
+        source_ref: str = "main",
+        probe_config: dict[str, object] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         with tempfile.TemporaryDirectory() as directory:
             github_env = Path(directory) / "github-env"
+            probe_config_path = Path(directory) / "archive-witness-probe.json"
+            if probe_config is None:
+                probe_config_path = ROOT / "config" / "archive-witness-probe.json"
+            else:
+                probe_config_path.write_text(json.dumps(probe_config), encoding="utf-8")
             completed = subprocess.run(
                 [
                     "python3",
                     str(SELECTOR),
                     "--profile",
                     profile,
+                    "--source-ref",
+                    source_ref,
+                    "--archive-witness-probe-config",
+                    str(probe_config_path),
                     "--github-env",
                     str(github_env),
                 ],
@@ -217,7 +234,7 @@ class SelectorTests(unittest.TestCase):
 
     def test_every_evaluation_value_is_required(self) -> None:
         for key in CONFIGURATION:
-            if key.startswith("ARCHIVE_WITNESS_") and key != "ARCHIVE_WITNESS_SHADOW_MODE":
+            if key.startswith("ARCHIVE_WITNESS_"):
                 continue
             source_name = f"EVALUATION_{key}"
             with self.subTest(source_name=source_name):
@@ -301,9 +318,12 @@ class SelectorTests(unittest.TestCase):
         self.assertNotIn('"${KIOKU_BUILD_PROFILE}"', metadata_step)
         self.assertIn('"build_profile": build_profile', workflow)
         for key in CONFIGURATION:
+            if key.startswith("ARCHIVE_WITNESS_"):
+                self.assertNotIn(f"EVALUATION_{key}:", workflow)
+                self.assertNotIn(f"PRODUCTION_{key}:", workflow)
+                continue
             self.assertIn(f"EVALUATION_{key}:", workflow)
-            if not key.startswith("ARCHIVE_WITNESS_"):
-                self.assertIn(f"EVAL_{key}", workflow)
+            self.assertIn(f"EVAL_{key}", workflow)
         for key in APPLE_CONFIGURATION:
             self.assertIn(f"EVALUATION_{key}:", workflow)
             self.assertIn(f"EVAL_{key}", workflow)
@@ -417,11 +437,86 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("ARCHIVE_WITNESS_PROJECT_NUMBER=\n", selected)
         self.assertIn("ARCHIVE_WITNESS_DATABASE_ID=\n", selected)
 
-        partial = environment()
-        partial["PRODUCTION_ARCHIVE_WITNESS_PROJECT_ID"] = "project-1"
-        completed, _ = self.run_selector("production", partial)
+        hostile = environment()
+        hostile["PRODUCTION_ARCHIVE_WITNESS_SHADOW_MODE"] = "probe-v1"
+        hostile["PRODUCTION_ARCHIVE_WITNESS_PROJECT_ID"] = "attacker-project"
+        completed, selected = self.run_selector("production", hostile)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=off\n", selected)
+        self.assertNotIn("attacker-project", selected)
+
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        for prefix in ("PRODUCTION", "EVALUATION"):
+            for key in (
+                "ARCHIVE_WITNESS_SHADOW_MODE",
+                "ARCHIVE_WITNESS_PROJECT_ID",
+                "ARCHIVE_WITNESS_PROJECT_NUMBER",
+                "ARCHIVE_WITNESS_DATABASE_ID",
+            ):
+                self.assertNotIn(f"{prefix}_{key}:", workflow)
+        self.assertNotIn("inputs.archive_witness", workflow.lower())
+        self.assertIn('--source-ref "${GITHUB_REF_NAME}"', workflow)
+
+    def test_probe_profile_is_tag_bound_and_evaluation_is_always_off(self) -> None:
+        probe = {
+            "schema_version": 1,
+            "mode": "probe-v1",
+            "project_id": "project-1",
+            "project_number": "123456789",
+            "database_id": "witness-db",
+        }
+        completed, selected = self.run_selector(
+            "production",
+            environment(),
+            source_ref="v1.2.3-witness-probe.1",
+            probe_config=probe,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=probe-v1\n", selected)
+        self.assertIn("ARCHIVE_WITNESS_PROJECT_ID=project-1\n", selected)
+
+        completed, selected = self.run_selector(
+            "evaluation",
+            environment(),
+            source_ref="v1.2.3-witness-probe.1",
+            probe_config=probe,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=off\n", selected)
+        self.assertNotIn("project-1", selected)
+
+        completed, selected = self.run_selector(
+            "production", environment(), source_ref="main", probe_config=probe
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_WITNESS_SHADOW_MODE=off\n", selected)
+
+        completed, selected = self.run_selector(
+            "production", environment(), source_ref="v1.2.3", probe_config=probe
+        )
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("namespace must be empty", completed.stderr)
+        self.assertEqual(selected, "")
+        self.assertIn("exact vX.Y.Z-witness-probe.N", completed.stderr)
+
+    def test_shared_parser_and_startup_order_are_static_boundaries(self) -> None:
+        selector = SELECTOR.read_text(encoding="utf-8")
+        verifier = METADATA_VERIFIER.read_text(encoding="utf-8")
+        parser = PROBE_PARSER.read_text(encoding="utf-8")
+        for source in (selector, verifier):
+            self.assertIn("from archive_witness_probe_config import", source)
+            self.assertIn("load_probe_config", source)
+            self.assertIn("select_probe_config", source)
+        self.assertIn("PROBE_TAG_PATTERN", parser)
+
+        main = MAIN.read_text(encoding="utf-8")
+        probe = main.index("archive_v3_firestore_probe::run_startup_probe")
+        kms = main.index("crypto::GcpKmsClient::from_env()", probe)
+        gcs = main.index("GcpGcsClient::from_env()", probe)
+        store = main.index("Store::new_with_media_and_legacy", probe)
+        self.assertLess(probe, kms)
+        self.assertLess(probe, gcs)
+        self.assertLess(probe, store)
+        self.assertIn(".await\n    .expect", main[probe:kms])
 
 
 if __name__ == "__main__":

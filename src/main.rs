@@ -635,13 +635,15 @@ async fn main() {
         "kioku-enclave starting"
     );
 
-    // Non-authoritative ADR-0022 transport probe. Off is the baked default;
-    // probe-v1 owns one isolated bounded task and one fixed singleton document.
-    // Keep the guard in this stack frame across the complete server lifetime.
-    let _firestore_probe_guard = archive_v3_firestore_probe::FirestoreProbeTaskGuard::start(
+    // Non-authoritative ADR-0022 transport probe. Off is the baked default and
+    // performs zero I/O. probe-v1 is awaited under one fixed deadline before
+    // any application Store/KMS/GCS construction. Its redacted result is
+    // observational only and never gates startup, health, or archive authority.
+    archive_v3_firestore_probe::run_startup_probe(
         archive_v3_firestore_probe::FirestoreProbeStartupConfig::from_env()
             .expect("valid image-baked archive witness probe configuration"),
     )
+    .await
     .expect("construct archive witness transport probe");
 
     // ── Auth config ───────────────────────────────────────────────────────────

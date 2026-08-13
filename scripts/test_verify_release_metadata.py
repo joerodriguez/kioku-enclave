@@ -57,10 +57,20 @@ def schema_v4_manifest() -> dict[str, object]:
 
 
 class ReleaseMetadataTests(unittest.TestCase):
-    def verify(self, data: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    def verify(
+        self,
+        data: dict[str, object],
+        *,
+        tag: str = "v1.2.3",
+        probe_config: dict[str, object] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "enclave-release.json"
             path.write_text(json.dumps(data), encoding="utf-8")
+            config_path = ROOT / "config" / "archive-witness-probe.json"
+            if probe_config is not None:
+                config_path = Path(directory) / "archive-witness-probe.json"
+                config_path.write_text(json.dumps(probe_config), encoding="utf-8")
             return subprocess.run(
                 [
                     "python3",
@@ -69,7 +79,7 @@ class ReleaseMetadataTests(unittest.TestCase):
                     "--repository",
                     "owner/repository",
                     "--tag",
-                    "v1.2.3",
+                    tag,
                     "--commit",
                     COMMIT,
                     "--image-repository",
@@ -80,6 +90,8 @@ class ReleaseMetadataTests(unittest.TestCase):
                     MEDIA_BUCKET,
                     "--expected-gcs-legacy-media-bucket",
                     BUCKET,
+                    "--archive-witness-probe-config",
+                    str(config_path),
                 ],
                 cwd=ROOT,
                 text=True,
@@ -168,6 +180,32 @@ class ReleaseMetadataTests(unittest.TestCase):
         completed = self.verify(data)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("does not match", completed.stderr)
+
+    def test_exact_probe_prerelease_matches_the_shared_checked_config(self) -> None:
+        tag = "v1.2.3-witness-probe.1"
+        data = manifest()
+        data["source_ref"] = tag
+        data.update({
+            "archive_witness_shadow_mode": "probe-v1",
+            "archive_witness_project_id": "project-1",
+            "archive_witness_project_number": "123456789",
+            "archive_witness_database_id": "witness-db",
+        })
+        probe = {
+            "schema_version": 1,
+            "mode": "probe-v1",
+            "project_id": "project-1",
+            "project_number": "123456789",
+            "database_id": "witness-db",
+        }
+        completed = self.verify(data, tag=tag, probe_config=probe)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("\tprobe-v1\tproject-1\t123456789\twitness-db", completed.stdout)
+
+        data["source_ref"] = "v1.2.3"
+        completed = self.verify(data, tag="v1.2.3", probe_config=probe)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("exact vX.Y.Z-witness-probe.N", completed.stderr)
 
         data = manifest()
         data.update({
