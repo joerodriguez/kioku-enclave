@@ -133,6 +133,24 @@ counterparts are Actions variables. Then manually dispatch `build.yml` from `mai
 
 The selector validates the entire chosen profile before exporting any value. Missing or
 malformed evaluation values fail the build; production settings are never substitutes.
+The archive-witness probe is not an `EVAL_*` or production repository variable. Its only
+source is checked-in `config/archive-witness-probe.json`, parsed by the same shared module
+for build selection and signed release-metadata verification. Evaluation and `main`
+images force the tuple to exact off/empty even if a future reviewed file selects
+`probe-v1`; no manual-dispatch input can enable it.
+
+### Non-authoritative witness-probe prereleases
+
+The checked-in witness profile remains off for ordinary releases. A future reviewed
+change may populate the exact named-database tuple and select `probe-v1`. While that file
+is enabled, only a signed tag named exactly `vX.Y.Z-witness-probe.N` can build the probe
+configuration; `X.Y.Z` must equal the Cargo package version and `N` is a nonzero canonical
+decimal sequence. Stable and other prerelease tags fail before publication, and
+`release.sh --roll` rejects the probe before tagging or any deployment dispatch.
+
+At runtime the probe is awaited once under a fixed deadline before application Store,
+KMS, or GCS construction. It emits only one fixed content-free result and startup
+continues regardless. The result is not readiness, health, rollout, or archive authority.
 The resulting `eval-*` image and its metadata are historical evaluation inputs only. They
 must use a separate service account, KMS key, index bucket, media bucket, HTTPS hostname/audience,
 and VM with no production bucket or KMS access. Do not tag it `v*`, publish it as a
@@ -204,7 +222,8 @@ RELEASE_SIGNER_FINGERPRINT=<trusted-key-fingerprint> \
 The script and workflow then:
 
 1. verify clean, synchronized public `main` and all required repository variables;
-2. require the tag version to match the Cargo package version;
+2. require the stable tag version—or the stable prefix of an exact witness-probe
+   prerelease—to match the Cargo package version;
 3. run formatting, locked tests, warnings-denied Clippy, and the deterministic
    ADR-0016 real-corpus report check;
 4. create, verify against `RELEASE_SIGNER_FINGERPRINT`, and push a signed source tag;
@@ -296,6 +315,9 @@ condition, replace the Confidential Space VM, and record the successful pin. Do 
 bypass it with direct metadata edits, mutable image tags, or a digest from an unverified
 build. Merging this code or publishing a release does not deploy it; the separate
 deployment workflow remains the only rollout authority.
+
+An archive-witness probe prerelease is never eligible for this command: `--roll` rejects
+it before creating or pushing a tag.
 
 After approval and rollout:
 

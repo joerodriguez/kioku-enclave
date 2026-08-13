@@ -15,6 +15,20 @@
 
 # ADR-0022 task evidence
 
+## Firestore transport-probe release boundary
+
+- [x] Made one exact checked-in, non-secret probe profile the sole input to both build
+  selection and schema-v6 release verification; it starts `off` with an empty namespace.
+- [x] Removed repository-variable and manual-dispatch witness inputs, forced evaluation
+  and ordinary `main` images off, and limited `probe-v1` to exact
+  `vX.Y.Z-witness-probe.N` prereleases that cannot use `release.sh --roll`.
+- [x] Awaited the one-shot probe under a fixed deadline before application Store/KMS/GCS
+  construction, emitted only one fixed redacted outcome, and retained no health/startup/
+  archive-authority connection.
+
+These release and runtime boundaries do not create a Firestore database, grant provider
+IAM, publish a probe release, deploy an image, or activate archive-v3 authority.
+
 ## Capacity fixture and local gate
 
 - [x] Versioned deterministic, numeric-only 12-month fixtures for 40, 80, and 100

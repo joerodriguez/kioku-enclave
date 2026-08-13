@@ -404,6 +404,12 @@ deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` 
 `WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the
 build.
 
+The four `ARCHIVE_WITNESS_*` Docker arguments below are low-level image inputs. Public
+CI never accepts them from repository variables or manual dispatch: both build selection
+and release verification derive them through one strict parser from the reviewed
+[`config/archive-witness-probe.json`](config/archive-witness-probe.json). The checked-in
+file is exact `off` with an empty namespace.
+
 ```sh
 docker build --platform linux/amd64 \
   --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
@@ -455,7 +461,7 @@ binding.
 | `GCS_BUCKET` | Encrypted database bucket |
 | `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
 | `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
-| `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe. Checked-in builds use `off` and three empty namespace fields; `probe-v1` requires all three exact named-database fields and grants no archive authority |
+| `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, repository variables/dispatch cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |

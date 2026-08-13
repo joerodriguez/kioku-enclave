@@ -185,7 +185,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           EXPECTED_TAG="v$(grep '^version =' Cargo.toml | head -1 | cut -d '"' -f 2)"
-          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
+          PACKAGE_TAG="$(python3 - "${GITHUB_REF_NAME}" <<'PY'
+          import sys
+          from scripts.archive_witness_probe_config import probe_base_tag
+
+          print(probe_base_tag(sys.argv[1]) or sys.argv[1])
+          PY
+          )"
+          if [[ "${PACKAGE_TAG}" != "${EXPECTED_TAG}" ]]; then
             echo "::error::Cargo version ${EXPECTED_TAG} does not match pushed tag ${GITHUB_REF_NAME}."
             exit 1
           fi
@@ -207,6 +214,7 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_agent_verify.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_rust_build_lifecycle.py
+          python3 scripts/test_archive_witness_probe_config.py
           python3 scripts/test_select_build_configuration.py
           python3 scripts/test_release.py
           python3 scripts/test_verify_release_metadata.py
@@ -314,10 +322,6 @@ jobs:
           PRODUCTION_ENCLAVE_GCS_BUCKET: ${{ vars.ENCLAVE_GCS_BUCKET }}
           PRODUCTION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_MEDIA_BUCKET }}
           PRODUCTION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET: ${{ vars.ENCLAVE_GCS_LEGACY_MEDIA_BUCKET }}
-          PRODUCTION_ARCHIVE_WITNESS_SHADOW_MODE: off
-          PRODUCTION_ARCHIVE_WITNESS_PROJECT_ID: ""
-          PRODUCTION_ARCHIVE_WITNESS_PROJECT_NUMBER: ""
-          PRODUCTION_ARCHIVE_WITNESS_DATABASE_ID: ""
           PRODUCTION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.ENCLAVE_RUN_SA_EMAIL }}
           PRODUCTION_ENCLAVE_AUDIENCE: ${{ vars.ENCLAVE_AUDIENCE }}
           PRODUCTION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.ENCLAVE_ATTEST_STS_AUDIENCE }}
@@ -355,10 +359,6 @@ jobs:
           EVALUATION_ENCLAVE_GCS_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_BUCKET }}
           EVALUATION_ENCLAVE_GCS_MEDIA_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_MEDIA_BUCKET }}
           EVALUATION_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET: ${{ vars.EVAL_ENCLAVE_GCS_LEGACY_MEDIA_BUCKET }}
-          EVALUATION_ARCHIVE_WITNESS_SHADOW_MODE: off
-          EVALUATION_ARCHIVE_WITNESS_PROJECT_ID: ""
-          EVALUATION_ARCHIVE_WITNESS_PROJECT_NUMBER: ""
-          EVALUATION_ARCHIVE_WITNESS_DATABASE_ID: ""
           EVALUATION_ENCLAVE_RUN_SA_EMAIL: ${{ vars.EVAL_ENCLAVE_RUN_SA_EMAIL }}
           EVALUATION_ENCLAVE_AUDIENCE: ${{ vars.EVAL_ENCLAVE_AUDIENCE }}
           EVALUATION_ENCLAVE_ATTEST_STS_AUDIENCE: ${{ vars.EVAL_ENCLAVE_ATTEST_STS_AUDIENCE }}
@@ -396,6 +396,7 @@ jobs:
           fi
           python3 scripts/select_build_configuration.py \
             --profile "${SELECTED_BUILD_PROFILE}" \
+            --source-ref "${GITHUB_REF_NAME}" \
             --github-env "${GITHUB_ENV}"
 
       - name: Build image
