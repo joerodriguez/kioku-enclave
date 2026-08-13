@@ -826,6 +826,15 @@ pub struct VertexCoverageAnchor {
     pub observed_at: String,
 }
 
+/// Aggregate owner-reporting counts derived inside the encrypted control
+/// store. The shape deliberately cannot carry account identifiers or signup
+/// timestamps across the owner API boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedAccountMetrics {
+    pub retained_active_accounts: u64,
+    pub new_retained_active_accounts_mtd: u64,
+}
+
 fn valid_utc_month(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 7
@@ -837,6 +846,26 @@ fn valid_utc_month(value: &str) -> bool {
     }
     let month = (bytes[5] - b'0') * 10 + (bytes[6] - b'0');
     (1..=12).contains(&month)
+}
+
+fn retained_active_account_metrics_conn(
+    conn: &Connection,
+    period: &str,
+) -> Result<RetainedAccountMetrics> {
+    let (retained, new_mtd): (i64, i64) = conn.query_row(
+        "SELECT count(*),
+                COALESCE(SUM(CASE WHEN substr(created_at,1,7)=?1 THEN 1 ELSE 0 END),0)
+         FROM users
+         WHERE status='active'",
+        [period],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(RetainedAccountMetrics {
+        retained_active_accounts: u64::try_from(retained)
+            .map_err(|_| EnclaveError::Config("active account count overflow".into()))?,
+        new_retained_active_accounts_mtd: u64::try_from(new_mtd)
+            .map_err(|_| EnclaveError::Config("new active account count overflow".into()))?,
+    })
 }
 
 fn is_active_user_conn(conn: &Connection, user_id: &str) -> Result<bool> {
@@ -5107,6 +5136,22 @@ impl ControlStore {
         .await
     }
 
+    /// Count retained active accounts and the subset created in one UTC
+    /// calendar month. This owner-reporting read returns aggregates only.
+    pub async fn retained_active_account_metrics(
+        &self,
+        period: &str,
+    ) -> Result<RetainedAccountMetrics> {
+        if !valid_utc_month(period) {
+            return Err(EnclaveError::InvalidRequest(
+                "account metrics period must be YYYY-MM".into(),
+            ));
+        }
+        let period = period.to_string();
+        self.read(move |conn| retained_active_account_metrics_conn(conn, &period))
+            .await
+    }
+
     /// Global coverage completeness comes from the control-plane high-water
     /// anchors, so an admin page never has to open every active user index.
     pub async fn active_vertex_coverage_complete(&self, period: &str) -> Result<bool> {
@@ -7476,6 +7521,31 @@ mod tests {
         )
         .unwrap();
         assert!(lifecycle_create_ahead_conn(&conn, plan).is_err());
+    }
+
+    #[test]
+    fn retained_account_metrics_count_only_active_rows_in_the_requested_utc_month() {
+        let conn = account_conn();
+        conn.execute(
+            "UPDATE users SET created_at='2026-08-01T00:00:00.000Z' WHERE id=?1",
+            [USER_ID],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO users (id,google_sub,email,status,created_at) VALUES
+               ('11111111-1111-4111-8111-111111111112','prior','prior@example.com','active','2026-07-31T23:59:59.999Z'),
+               ('11111111-1111-4111-8111-111111111113','future','future@example.com','active','2026-09-01T00:00:00.000Z'),
+               ('11111111-1111-4111-8111-111111111114','deleting','deleting@example.com','deleting','2026-08-02T00:00:00.000Z');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            retained_active_account_metrics_conn(&conn, "2026-08").unwrap(),
+            RetainedAccountMetrics {
+                retained_active_accounts: 3,
+                new_retained_active_accounts_mtd: 1,
+            }
+        );
     }
 
     #[test]

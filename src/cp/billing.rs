@@ -23,7 +23,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use super::{auth::AuthUser, CpState};
+use super::{auth::AuthUser, control_store::RetainedAccountMetrics, CpState};
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_ID_TOKEN_BYTES: usize = 32 * 1024;
@@ -1221,6 +1221,7 @@ async fn admin_capabilities(
     }
     no_store(
         Json(serde_json::json!({
+            "owner": true,
             "admin": true,
             "margin_report": true,
             "margin_kind": "estimated_contribution_margin",
@@ -1321,6 +1322,15 @@ fn null_row_vertex_cost(account: &mut serde_json::Map<String, Value>) {
     {
         direct.insert("complete".into(), Value::Bool(false));
         direct.insert("estimated_total_usd_micros".into(), Value::Null);
+        if let Some(audio) = direct
+            .get_mut("by_operation")
+            .and_then(Value::as_object_mut)
+            .and_then(|operations| operations.get_mut("audio_understanding"))
+            .and_then(Value::as_object_mut)
+        {
+            audio.insert("complete".into(), Value::Bool(false));
+            audio.insert("uncached_input_audio_usd_micros".into(), Value::Null);
+        }
     }
     for key in [
         "allocated_known_cost_usd_micros",
@@ -1408,6 +1418,9 @@ fn decorate_margin(
     report: Value,
     identities: &[MarginIdentity],
     anchored_global_coverage_complete: bool,
+    account_metrics: RetainedAccountMetrics,
+    period: &str,
+    account_metrics_as_of: &str,
 ) -> Value {
     let mut object = report.as_object().cloned().unwrap_or_default();
     let generated_at = object
@@ -1504,6 +1517,15 @@ fn decorate_margin(
     object.insert(
         "margin_kind".into(),
         Value::String("estimated_contribution_margin".into()),
+    );
+    object.insert(
+        "account_metrics".into(),
+        serde_json::json!({
+            "retained_active_accounts": account_metrics.retained_active_accounts,
+            "new_retained_active_accounts_mtd": account_metrics.new_retained_active_accounts_mtd,
+            "period": period,
+            "as_of": account_metrics_as_of,
+        }),
     );
     Value::Object(object)
 }
@@ -1728,6 +1750,11 @@ async fn admin_margin(
         Some(account_ids) => account_ids,
         None => return service_unavailable(),
     };
+    let account_metrics = match state.control.retained_active_account_metrics(&period).await {
+        Ok(metrics) => metrics,
+        Err(_) => return service_unavailable(),
+    };
+    let account_metrics_as_of = super::isotime::format_epoch_millis(epoch_millis());
     let users = match state
         .control
         .active_identities_for_billing_accounts(account_ids)
@@ -1761,6 +1788,9 @@ async fn admin_margin(
             report,
             &identities,
             anchored_global_coverage_complete,
+            account_metrics,
+            &period,
+            &account_metrics_as_of,
         ))
         .into_response(),
     )
@@ -2216,6 +2246,12 @@ mod tests {
                 }),
             }],
             true,
+            RetainedAccountMetrics {
+                retained_active_accounts: 7,
+                new_retained_active_accounts_mtd: 2,
+            },
+            "2026-08",
+            "2026-08-09T12:01:01.000Z",
         );
         let account = &decorated["accounts"][0];
         assert_eq!(account["email"], "owner@example.com");
@@ -2235,6 +2271,15 @@ mod tests {
             "bounded_recent_zero_backlog"
         );
         assert_eq!(decorated["margin_kind"], "estimated_contribution_margin");
+        assert_eq!(
+            decorated["account_metrics"],
+            serde_json::json!({
+                "retained_active_accounts": 7,
+                "new_retained_active_accounts_mtd": 2,
+                "period": "2026-08",
+                "as_of": "2026-08-09T12:01:01.000Z"
+            })
+        );
     }
 
     #[test]
@@ -2248,6 +2293,11 @@ mod tests {
                     "direct_vertex": {
                         "complete": true,
                         "estimated_total_usd_micros": 100,
+                        "by_operation": {"audio_understanding": {
+                            "event_count":1,"incomplete_event_count":0,
+                            "estimated_known_uncached_input_audio_usd_micros":40,
+                            "uncached_input_audio_usd_micros":40,"complete":true
+                        }},
                         "producer_coverage": {"reported":true,"pending_events":0,"lost_events":0,"sequence":6,
                             "observed_at":"2026-08-09T12:00:00.000Z","age_seconds":120,
                             "freshness_max_seconds":300,"fresh":true,"basis":"bounded_recent_zero_backlog_snapshot",
@@ -2288,10 +2338,25 @@ mod tests {
                 }),
             }],
             true,
+            RetainedAccountMetrics {
+                retained_active_accounts: 7,
+                new_retained_active_accounts_mtd: 2,
+            },
+            "2026-08",
+            "2026-08-09T12:01:01.000Z",
         );
         let account = &decorated["accounts"][0];
         assert_eq!(account["direct_vertex"]["complete"], false);
         assert!(account["direct_vertex"]["estimated_total_usd_micros"].is_null());
+        assert_eq!(
+            account["direct_vertex"]["by_operation"]["audio_understanding"]["complete"],
+            false
+        );
+        assert!(
+            account["direct_vertex"]["by_operation"]["audio_understanding"]
+                ["uncached_input_audio_usd_micros"]
+                .is_null()
+        );
         assert_eq!(
             account["direct_vertex"]["producer_coverage"],
             serde_json::json!({
@@ -2379,6 +2444,45 @@ mod tests {
         assert!(
             validated_margin_account_ids(&report(vec![opaque_commercial_extension]), 50).is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn admin_capabilities_are_owner_named_and_legacy_compatible() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = admin_capabilities(
+            State(probe_state(calls.clone())),
+            Extension(AuthUser("11111111-1111-4111-8111-111111111111".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static("no-store")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["owner"], true);
+        assert_eq!(value["admin"], true);
+        assert_eq!(value["margin_report"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_admin_capability_denial_is_no_store() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = admin_capabilities(
+            State(probe_state(calls.clone())),
+            Extension(AuthUser("22222222-2222-4222-8222-222222222222".into())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static("no-store")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
