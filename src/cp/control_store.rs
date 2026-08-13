@@ -34,11 +34,16 @@ use crate::{
         ErasedInventoryPages, FrozenInventorySnapshot, InventoryPage, InventoryPageReference,
         LifecycleCreateOutcome, LifecycleError, PhysicalDeletionReceipt, PlannedArtifact,
         PreparedBootstrap, RecoveredBootstrap, RecoveredDeletionLifecycle,
-        LIFECYCLE_FORMAT_VERSION, MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES,
+        WitnessCreateDispatchLedger, WitnessSendStarted, LIFECYCLE_FORMAT_VERSION,
+        MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES, WITNESS_CREATE_PROTOCOL_V1,
     },
     archive_v3_lifecycle_page_store::{
         DurablePageCreateAdmission, FrozenPageCreateSet, LifecyclePageAdmissionLedger,
         PageCreateDisposition, RecoveredPageCreatePlan,
+    },
+    archive_v3_witness_disposition::{
+        AuthenticatedPreWitnessAbsence, ClosedWitnessPhase, ClosedWitnessProtocol,
+        ExactNoneObservation, PreWitnessControlState, PreWitnessDispositionControl,
     },
     cp::isotime,
     crypto::{decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, KmsClient},
@@ -58,6 +63,7 @@ const MAX_ARCHIVE_ID_CANDIDATES: usize = 8;
 const LIFECYCLE_REGISTRY_ORDINAL: u32 = 0;
 const LIFECYCLE_ROOT_ORDINAL: u32 = 1;
 const LIFECYCLE_WITNESS_ORDINAL: u32 = 2;
+const WITNESS_PROTOCOL_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/witness-create-protocol/v1\0";
 
 fn grant_recording_delivery_minute(tx: &rusqlite::Transaction<'_>, user_id: &str) -> Result<()> {
     tx.execute(
@@ -358,6 +364,31 @@ CREATE TABLE IF NOT EXISTS archive_lifecycle_anchors (
               OR (length(witness_record_bytes) = witness_record_len
                   AND witness_create_state IS NOT NULL)))
     )
+);
+-- Separate no-send/send-started protocol authority for the initial witness
+-- create. Old lifecycle anchors deliberately have no inferred enrollment.
+CREATE TABLE IF NOT EXISTS archive_lifecycle_witness_protocols (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_lifecycle_anchors(archive_id),
+    bootstrap_attempt_id BLOB NOT NULL CHECK (length(bootstrap_attempt_id) = 16 AND bootstrap_attempt_id != zeroblob(16)),
+    protocol_version INTEGER NOT NULL,
+    expected_witness_hash BLOB CHECK (expected_witness_hash IS NULL OR (length(expected_witness_hash) = 32 AND expected_witness_hash != zeroblob(32))),
+    expected_witness_len INTEGER CHECK (expected_witness_len IS NULL OR expected_witness_len > 0),
+    admission_revision INTEGER CHECK (admission_revision IS NULL OR admission_revision > 0),
+    phase TEXT NOT NULL CHECK (phase IN (
+        'open_unstarted', 'send_started', 'present_exact',
+        'deletion_closed_unsent', 'absence_confirmed',
+        'deletion_closed_started', 'manual_required'
+    )),
+    deletion_fence BLOB CHECK (deletion_fence IS NULL OR (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16))),
+    commitment BLOB NOT NULL CHECK (length(commitment) = 32 AND commitment != zeroblob(32)),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK ((expected_witness_hash IS NULL) = (expected_witness_len IS NULL)),
+    CHECK (admission_revision IS NULL OR expected_witness_hash IS NOT NULL),
+    CHECK (phase NOT IN ('send_started','present_exact','deletion_closed_started') OR
+           (expected_witness_hash IS NOT NULL AND admission_revision IS NOT NULL)),
+    CHECK (phase != 'absence_confirmed' OR admission_revision IS NULL),
+    CHECK (phase = 'present_exact' OR
+           ((phase IN ('deletion_closed_unsent','absence_confirmed','deletion_closed_started','manual_required')) = (deletion_fence IS NOT NULL)))
 );
 CREATE TABLE IF NOT EXISTS archive_lifecycle_bootstrap_creates (
     archive_id BLOB NOT NULL REFERENCES archive_lifecycle_anchors(archive_id),
@@ -1041,6 +1072,70 @@ enum ArchiveLifecycleState {
     PhysicalComplete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WitnessProtocolPhase {
+    OpenUnstarted,
+    SendStarted,
+    PresentExact,
+    DeletionClosedUnsent,
+    AbsenceConfirmed,
+    DeletionClosedStarted,
+    ManualRequired,
+}
+
+impl WitnessProtocolPhase {
+    const fn as_db(self) -> &'static str {
+        match self {
+            Self::OpenUnstarted => "open_unstarted",
+            Self::SendStarted => "send_started",
+            Self::PresentExact => "present_exact",
+            Self::DeletionClosedUnsent => "deletion_closed_unsent",
+            Self::AbsenceConfirmed => "absence_confirmed",
+            Self::DeletionClosedStarted => "deletion_closed_started",
+            Self::ManualRequired => "manual_required",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "open_unstarted" => Ok(Self::OpenUnstarted),
+            "send_started" => Ok(Self::SendStarted),
+            "present_exact" => Ok(Self::PresentExact),
+            "deletion_closed_unsent" => Ok(Self::DeletionClosedUnsent),
+            "absence_confirmed" => Ok(Self::AbsenceConfirmed),
+            "deletion_closed_started" => Ok(Self::DeletionClosedStarted),
+            "manual_required" => Ok(Self::ManualRequired),
+            _ => Err(EnclaveError::Store(
+                "invalid archive witness protocol phase".into(),
+            )),
+        }
+    }
+
+    const fn closed(self) -> Option<ClosedWitnessPhase> {
+        match self {
+            Self::DeletionClosedUnsent => Some(ClosedWitnessPhase::ClosedUnsent),
+            Self::DeletionClosedStarted => Some(ClosedWitnessPhase::ClosedStarted),
+            Self::AbsenceConfirmed => Some(ClosedWitnessPhase::AbsenceConfirmed),
+            Self::PresentExact => Some(ClosedWitnessPhase::PresentExact),
+            Self::ManualRequired => Some(ClosedWitnessPhase::ManualRequired),
+            Self::OpenUnstarted | Self::SendStarted => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WitnessProtocolRow {
+    archive_id: ArchiveId,
+    attempt_id: crate::archive_v3_lifecycle::BootstrapAttemptId,
+    protocol_version: u16,
+    expected_hash: Option<[u8; 32]>,
+    expected_len: Option<u32>,
+    admission_revision: Option<u64>,
+    phase: WitnessProtocolPhase,
+    deletion_fence: Option<ObjectId>,
+    commitment: [u8; 32],
+}
+
 /// Unforgeable outside this producer module. Archive lifecycle receipt
 /// factories require this witness that state was just validated in the
 /// encrypted control-store transaction/read snapshot.
@@ -1121,6 +1216,144 @@ fn fixed_32_allow_zero(value: Vec<u8>) -> Result<[u8; 32]> {
         .as_slice()
         .try_into()
         .map_err(|_| EnclaveError::Store("invalid archive lifecycle commitment".into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn witness_protocol_commitment(
+    archive_id: ArchiveId,
+    attempt_id: crate::archive_v3_lifecycle::BootstrapAttemptId,
+    protocol_version: u16,
+    expected_hash: Option<[u8; 32]>,
+    expected_len: Option<u32>,
+    admission_revision: Option<u64>,
+    phase: WitnessProtocolPhase,
+    deletion_fence: Option<ObjectId>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(WITNESS_PROTOCOL_COMMITMENT_DOMAIN);
+    hasher.update(archive_id.as_bytes());
+    hasher.update(attempt_id.as_bytes());
+    hasher.update(protocol_version.to_be_bytes());
+    match (expected_hash, expected_len) {
+        (Some(hash), Some(len)) => {
+            hasher.update([1]);
+            hasher.update(hash);
+            hasher.update(len.to_be_bytes());
+        }
+        _ => hasher.update([0]),
+    }
+    match admission_revision {
+        Some(revision) => {
+            hasher.update([1]);
+            hasher.update(revision.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(phase.as_db().as_bytes());
+    match deletion_fence {
+        Some(fence) => {
+            hasher.update([1]);
+            hasher.update(fence.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.finalize().into()
+}
+
+fn witness_protocol_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<WitnessProtocolRow>> {
+    let row = conn
+        .query_row(
+            "SELECT bootstrap_attempt_id, protocol_version,
+                    expected_witness_hash, expected_witness_len,
+                    admission_revision, phase, deletion_fence, commitment
+             FROM archive_lifecycle_witness_protocols WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(attempt, version, expected_hash, expected_len, admission, phase, fence, commitment)| {
+            let attempt_id =
+                crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes(fixed_16(attempt)?)
+                    .map_err(lifecycle_store_error)?;
+            let protocol_version = u16::try_from(version).map_err(|_| {
+                EnclaveError::Store("invalid archive witness protocol version".into())
+            })?;
+            let expected_hash = expected_hash.map(fixed_32).transpose()?;
+            let expected_len = expected_len
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store("invalid witness expected length".into()))?;
+            let admission_revision = admission
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store("invalid witness admission revision".into()))?;
+            let phase = WitnessProtocolPhase::from_db(&phase)?;
+            let deletion_fence = fence.map(fixed_16).transpose()?.map(ObjectId::from_bytes);
+            let commitment = fixed_32(commitment)?;
+            let has_expected = expected_hash.is_some() && expected_len.is_some();
+            if expected_hash.is_some() != expected_len.is_some()
+                || (admission_revision.is_some() && !has_expected)
+                || (matches!(
+                    phase,
+                    WitnessProtocolPhase::SendStarted
+                        | WitnessProtocolPhase::PresentExact
+                        | WitnessProtocolPhase::DeletionClosedStarted
+                ) && (!has_expected || admission_revision.is_none()))
+                || (phase == WitnessProtocolPhase::AbsenceConfirmed && admission_revision.is_some())
+                || (phase != WitnessProtocolPhase::PresentExact
+                    && deletion_fence.is_some()
+                        != matches!(
+                            phase,
+                            WitnessProtocolPhase::DeletionClosedUnsent
+                                | WitnessProtocolPhase::AbsenceConfirmed
+                                | WitnessProtocolPhase::DeletionClosedStarted
+                                | WitnessProtocolPhase::ManualRequired
+                        ))
+                || commitment
+                    != witness_protocol_commitment(
+                        archive_id,
+                        attempt_id,
+                        protocol_version,
+                        expected_hash,
+                        expected_len,
+                        admission_revision,
+                        phase,
+                        deletion_fence,
+                    )
+            {
+                return Err(EnclaveError::Store(
+                    "archive witness protocol row is inconsistent".into(),
+                ));
+            }
+            Ok(WitnessProtocolRow {
+                archive_id,
+                attempt_id,
+                protocol_version,
+                expected_hash,
+                expected_len,
+                admission_revision,
+                phase,
+                deletion_fence,
+                commitment,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn lifecycle_anchor_conn(
@@ -1272,7 +1505,8 @@ fn reserve_archive_bootstrap_conn(
         )
         .map_err(lifecycle_store_error);
     }
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO archive_lifecycle_anchors
          (archive_id, format_version, revision, state, bootstrap_attempt_id,
           database_epoch, key_epoch, registry_object_id, root_object_id)
@@ -1287,6 +1521,28 @@ fn reserve_archive_bootstrap_conn(
             plan.root_object_id().as_bytes().as_slice(),
         ],
     )?;
+    let commitment = witness_protocol_commitment(
+        plan.archive_id(),
+        plan.attempt_id(),
+        WITNESS_CREATE_PROTOCOL_V1,
+        None,
+        None,
+        None,
+        WitnessProtocolPhase::OpenUnstarted,
+        None,
+    );
+    tx.execute(
+        "INSERT INTO archive_lifecycle_witness_protocols
+         (archive_id, bootstrap_attempt_id, protocol_version, phase, commitment)
+         VALUES (?1, ?2, ?3, 'open_unstarted', ?4)",
+        rusqlite::params![
+            plan.archive_id().as_bytes().as_slice(),
+            plan.attempt_id().as_bytes().as_slice(),
+            i64::from(WITNESS_CREATE_PROTOCOL_V1),
+            commitment.as_slice(),
+        ],
+    )?;
+    tx.commit()?;
     DurableBootstrapReservation::from_persisted(&LifecyclePersistenceContext::validated(), plan, 1)
         .map_err(lifecycle_store_error)
 }
@@ -1551,6 +1807,18 @@ fn prepare_archive_witness_conn(
                 "archive lifecycle witness preparation changed".into(),
             ));
         }
+        let protocol = witness_protocol_conn(conn, archive_id)?.ok_or_else(|| {
+            EnclaveError::Conflict("archive witness protocol is not enrolled".into())
+        })?;
+        if protocol.protocol_version != WITNESS_CREATE_PROTOCOL_V1
+            || protocol.attempt_id != anchor.plan.attempt_id()
+            || protocol.expected_hash != Some(hash)
+            || protocol.expected_len != u32::try_from(encoded_witness.len()).ok()
+        {
+            return Err(EnclaveError::Conflict(
+                "archive witness protocol preparation changed".into(),
+            ));
+        }
         return Ok(anchor.revision);
     }
     let unresolved: i64 = conn.query_row(
@@ -1564,7 +1832,31 @@ fn prepare_archive_witness_conn(
             "archive lifecycle witness cannot precede exact object reconciliation".into(),
         ));
     }
-    let updated = conn.execute(
+    let protocol = witness_protocol_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Conflict("archive witness protocol is not enrolled".into()))?;
+    if protocol.protocol_version != WITNESS_CREATE_PROTOCOL_V1
+        || protocol.attempt_id != anchor.plan.attempt_id()
+        || protocol.phase != WitnessProtocolPhase::OpenUnstarted
+        || protocol.expected_hash.is_some()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive witness protocol cannot prepare this candidate".into(),
+        ));
+    }
+    let encoded_len = u32::try_from(encoded_witness.len())
+        .map_err(|_| EnclaveError::Store("archive lifecycle witness too large".into()))?;
+    let next_commitment = witness_protocol_commitment(
+        archive_id,
+        anchor.plan.attempt_id(),
+        WITNESS_CREATE_PROTOCOL_V1,
+        Some(hash),
+        Some(encoded_len),
+        None,
+        WitnessProtocolPhase::OpenUnstarted,
+        None,
+    );
+    let tx = conn.unchecked_transaction()?;
+    let updated = tx.execute(
         "UPDATE archive_lifecycle_anchors
          SET revision = revision + 1, state = 'witness_prepared',
              witness_record_hash = ?3, witness_record_len = ?4,
@@ -1587,9 +1879,33 @@ fn prepare_archive_witness_conn(
             "archive lifecycle witness prepare lost its compare-and-swap".into(),
         ));
     }
-    expected_revision
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_witness_protocols
+         SET expected_witness_hash = ?3, expected_witness_len = ?4,
+             commitment = ?5, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+           AND protocol_version = 1 AND phase = 'open_unstarted'
+           AND expected_witness_hash IS NULL AND expected_witness_len IS NULL
+           AND commitment = ?6",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            anchor.plan.attempt_id().as_bytes().as_slice(),
+            hash.as_slice(),
+            i64::from(encoded_len),
+            next_commitment.as_slice(),
+            protocol.commitment.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive witness protocol prepare lost its compare-and-swap".into(),
+        ));
+    }
+    let next = expected_revision
         .checked_add(1)
-        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    tx.commit()?;
+    Ok(next)
 }
 
 fn admit_archive_create_conn(
@@ -1647,6 +1963,21 @@ fn admit_archive_create_conn(
                 "archive lifecycle has a different unreconciled create".into(),
             ));
         }
+        if artifact_ordinal == LIFECYCLE_WITNESS_ORDINAL {
+            let protocol = witness_protocol_conn(&tx, archive_id)?.ok_or_else(|| {
+                EnclaveError::Conflict("archive witness protocol is not enrolled".into())
+            })?;
+            if !matches!(
+                protocol.phase,
+                WitnessProtocolPhase::OpenUnstarted | WitnessProtocolPhase::SendStarted
+            ) || protocol.admission_revision != Some(expected_revision)
+                || protocol.expected_hash != Some(fixed_32(artifact_hash.clone())?)
+            {
+                return Err(EnclaveError::Conflict(
+                    "archive witness admission protocol changed".into(),
+                ));
+            }
+        }
         let receipt = ActiveCreateAdmission::from_fresh_cas(
             &LifecyclePersistenceContext::validated(),
             archive_id,
@@ -1685,7 +2016,51 @@ fn admit_archive_create_conn(
             "archive lifecycle create admission lost its compare-and-swap".into(),
         ));
     }
-    if artifact_ordinal != LIFECYCLE_WITNESS_ORDINAL {
+    if artifact_ordinal == LIFECYCLE_WITNESS_ORDINAL {
+        let protocol = witness_protocol_conn(&tx, archive_id)?.ok_or_else(|| {
+            EnclaveError::Conflict("archive witness protocol is not enrolled".into())
+        })?;
+        if protocol.phase != WitnessProtocolPhase::OpenUnstarted
+            || protocol.admission_revision.is_some()
+            || protocol.expected_hash != Some(fixed_32(artifact_hash.clone())?)
+        {
+            return Err(EnclaveError::Conflict(
+                "archive witness admission protocol is stale".into(),
+            ));
+        }
+        let commitment = witness_protocol_commitment(
+            archive_id,
+            anchor.plan.attempt_id(),
+            protocol.protocol_version,
+            protocol.expected_hash,
+            protocol.expected_len,
+            Some(admission_revision),
+            WitnessProtocolPhase::OpenUnstarted,
+            None,
+        );
+        let changed = tx.execute(
+            "UPDATE archive_lifecycle_witness_protocols
+             SET admission_revision = ?3, commitment = ?4,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+               AND phase = 'open_unstarted' AND admission_revision IS NULL
+               AND commitment = ?5",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                anchor.plan.attempt_id().as_bytes().as_slice(),
+                i64::try_from(admission_revision).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+                commitment.as_slice(),
+                protocol.commitment.as_slice(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive witness admission protocol CAS failed".into(),
+            ));
+        }
+    } else {
         let changed = tx.execute(
             "UPDATE archive_lifecycle_bootstrap_creates SET admission_revision = ?3
              WHERE archive_id = ?1 AND artifact_ordinal = ?2 AND admission_revision IS NULL",
@@ -1715,11 +2090,108 @@ fn admit_archive_create_conn(
     .map_err(lifecycle_store_error)
 }
 
+fn mark_witness_send_started_conn(
+    conn: &Connection,
+    admission: &ActiveCreateAdmission,
+) -> Result<WitnessSendStarted> {
+    if admission.artifact_ordinal() != LIFECYCLE_WITNESS_ORDINAL {
+        return Err(EnclaveError::Conflict(
+            "non-witness admission cannot start witness dispatch".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    lifecycle_archive_active_conn(&tx, admission.archive_id())?;
+    let anchor = lifecycle_anchor_conn(&tx, admission.archive_id())?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let protocol = witness_protocol_conn(&tx, admission.archive_id())?
+        .ok_or_else(|| EnclaveError::Conflict("archive witness protocol is not enrolled".into()))?;
+    if protocol.protocol_version != WITNESS_CREATE_PROTOCOL_V1
+        || protocol.attempt_id != admission.attempt_id()
+        || protocol.expected_hash != Some(admission.artifact_hash())
+        || anchor.plan.attempt_id() != admission.attempt_id()
+        || anchor.revision != admission.revision()
+        || !matches!(
+            anchor.state,
+            ArchiveLifecycleState::WitnessPrepared | ArchiveLifecycleState::Witnessed
+        )
+    {
+        return Err(EnclaveError::Conflict(
+            "archive witness dispatch admission is stale".into(),
+        ));
+    }
+    if protocol.phase == WitnessProtocolPhase::SendStarted
+        && protocol.admission_revision == Some(admission.revision())
+    {
+        let receipt = WitnessSendStarted::from_persisted_dispatch(
+            &LifecyclePersistenceContext::validated(),
+            admission,
+            protocol.commitment,
+        )
+        .map_err(lifecycle_store_error)?;
+        tx.commit()?;
+        return Ok(receipt);
+    }
+    if protocol.phase != WitnessProtocolPhase::OpenUnstarted
+        || protocol.admission_revision != Some(admission.revision())
+    {
+        return Err(EnclaveError::Conflict(
+            "archive witness dispatch has already closed".into(),
+        ));
+    }
+    let commitment = witness_protocol_commitment(
+        admission.archive_id(),
+        admission.attempt_id(),
+        WITNESS_CREATE_PROTOCOL_V1,
+        protocol.expected_hash,
+        protocol.expected_len,
+        Some(admission.revision()),
+        WitnessProtocolPhase::SendStarted,
+        None,
+    );
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_witness_protocols
+         SET phase = 'send_started', commitment = ?4,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+           AND protocol_version = 1 AND phase = 'open_unstarted'
+           AND admission_revision = ?3 AND expected_witness_hash = ?5
+           AND commitment = ?6",
+        rusqlite::params![
+            admission.archive_id().as_bytes().as_slice(),
+            admission.attempt_id().as_bytes().as_slice(),
+            i64::try_from(admission.revision())
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            commitment.as_slice(),
+            admission.artifact_hash().as_slice(),
+            protocol.commitment.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive witness dispatch marker lost its compare-and-swap".into(),
+        ));
+    }
+    tx.commit()?;
+    WitnessSendStarted::from_persisted_dispatch(
+        &LifecyclePersistenceContext::validated(),
+        admission,
+        commitment,
+    )
+    .map_err(lifecycle_store_error)
+}
+
 fn reconcile_archive_create_conn(
     conn: &Connection,
     admission: &ActiveCreateAdmission,
     outcome: LifecycleCreateOutcome,
 ) -> Result<u64> {
+    if admission.artifact_ordinal() == LIFECYCLE_WITNESS_ORDINAL
+        && outcome == LifecycleCreateOutcome::ConfirmedAbsent
+    {
+        return Err(EnclaveError::Conflict(
+            "generic witness reconciliation cannot prove absence".into(),
+        ));
+    }
     let state = match outcome {
         LifecycleCreateOutcome::Created | LifecycleCreateOutcome::AlreadyPresentExact => {
             ArtifactCreateState::Created
@@ -1754,6 +2226,27 @@ fn reconcile_archive_create_conn(
             "archive lifecycle reconciliation is stale".into(),
         ));
     }
+    let witness_protocol = if admission.artifact_ordinal() == LIFECYCLE_WITNESS_ORDINAL {
+        let protocol = witness_protocol_conn(&tx, admission.archive_id())?.ok_or_else(|| {
+            EnclaveError::Conflict("archive witness protocol is not enrolled".into())
+        })?;
+        if protocol.protocol_version != WITNESS_CREATE_PROTOCOL_V1
+            || protocol.attempt_id != admission.attempt_id()
+            || protocol.expected_hash != Some(admission.artifact_hash())
+            || protocol.admission_revision != Some(admission.revision())
+            || !matches!(
+                protocol.phase,
+                WitnessProtocolPhase::SendStarted | WitnessProtocolPhase::DeletionClosedStarted
+            )
+        {
+            return Err(EnclaveError::Conflict(
+                "archive witness reconciliation lacks a matching send marker".into(),
+            ));
+        }
+        Some(protocol)
+    } else {
+        None
+    };
     if outcome == LifecycleCreateOutcome::OutcomeUnknown {
         let changed = if admission.artifact_ordinal() == LIFECYCLE_WITNESS_ORDINAL {
             tx.execute(
@@ -1864,8 +2357,755 @@ fn reconcile_archive_create_conn(
             "archive lifecycle reconciliation lost its compare-and-swap".into(),
         ));
     }
+    if let Some(protocol) = witness_protocol {
+        let next_phase = WitnessProtocolPhase::PresentExact;
+        let commitment = witness_protocol_commitment(
+            admission.archive_id(),
+            admission.attempt_id(),
+            protocol.protocol_version,
+            protocol.expected_hash,
+            protocol.expected_len,
+            protocol.admission_revision,
+            next_phase,
+            protocol.deletion_fence,
+        );
+        let protocol_changed = tx.execute(
+            "UPDATE archive_lifecycle_witness_protocols
+             SET phase = 'present_exact', commitment = ?4,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+               AND admission_revision = ?3 AND commitment = ?5
+               AND phase IN ('send_started','deletion_closed_started')",
+            rusqlite::params![
+                admission.archive_id().as_bytes().as_slice(),
+                admission.attempt_id().as_bytes().as_slice(),
+                i64::try_from(admission.revision()).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+                commitment.as_slice(),
+                protocol.commitment.as_slice(),
+            ],
+        )?;
+        if protocol_changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive witness protocol reconciliation lost its compare-and-swap".into(),
+            ));
+        }
+    }
     tx.commit()?;
     Ok(next_revision)
+}
+
+fn adopt_existing_archive_witness_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    expected_revision: u64,
+    exact_encoded_record: &[u8],
+) -> Result<u64> {
+    type ExistingWitnessRow = (
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+    );
+
+    if exact_encoded_record.is_empty() || exact_encoded_record.len() > MAX_BOOTSTRAP_WITNESS_BYTES {
+        return Err(EnclaveError::Store(
+            "archive existing witness encoding is invalid".into(),
+        ));
+    }
+    let hash: [u8; 32] = Sha256::digest(exact_encoded_record).into();
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let protocol = witness_protocol_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Conflict("archive witness protocol is not enrolled".into()))?;
+    let (stored, stored_hash, stored_len, create_state, anchor_admission): ExistingWitnessRow =
+        conn.query_row(
+            "SELECT witness_record_bytes, witness_record_hash, witness_record_len,
+                witness_create_state, witness_admission_revision
+         FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+    let exact_tuple = stored.as_deref() == Some(exact_encoded_record)
+        && stored_hash.as_deref() == Some(hash.as_slice())
+        && stored_len.and_then(|value| usize::try_from(value).ok())
+            == Some(exact_encoded_record.len())
+        && protocol.expected_hash == Some(hash)
+        && protocol.expected_len == u32::try_from(exact_encoded_record.len()).ok();
+    if anchor.revision != expected_revision
+        || anchor.plan.attempt_id() != protocol.attempt_id
+        || protocol.protocol_version != WITNESS_CREATE_PROTOCOL_V1
+        || !exact_tuple
+    {
+        return Err(EnclaveError::Conflict(
+            "archive existing witness is not the retained candidate".into(),
+        ));
+    }
+    if anchor.state == ArchiveLifecycleState::Witnessed
+        && create_state.as_deref() == Some("created")
+        && anchor_admission.is_none()
+        && protocol.phase == WitnessProtocolPhase::PresentExact
+    {
+        return Ok(anchor.revision);
+    }
+    if anchor.state != ArchiveLifecycleState::WitnessPrepared
+        || !matches!(create_state.as_deref(), Some("planned" | "outcome_unknown"))
+        || protocol.phase != WitnessProtocolPhase::SendStarted
+        || protocol
+            .admission_revision
+            .and_then(|value| i64::try_from(value).ok())
+            != anchor_admission
+    {
+        return Err(EnclaveError::Conflict(
+            "archive existing witness has no matching send-started admission".into(),
+        ));
+    }
+    let next_revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let commitment = witness_protocol_commitment(
+        archive_id,
+        protocol.attempt_id,
+        protocol.protocol_version,
+        protocol.expected_hash,
+        protocol.expected_len,
+        protocol.admission_revision,
+        WitnessProtocolPhase::PresentExact,
+        None,
+    );
+    let tx = conn.unchecked_transaction()?;
+    let anchor_changed = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'witnessed',
+             witness_create_state = 'created', witness_admission_revision = NULL,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'witness_prepared'
+           AND witness_admission_revision = ?3 AND witness_record_hash = ?4",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(expected_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            anchor_admission,
+            hash.as_slice(),
+        ],
+    )?;
+    let protocol_changed = tx.execute(
+        "UPDATE archive_lifecycle_witness_protocols
+         SET phase = 'present_exact', commitment = ?3,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND commitment = ?2 AND phase = 'send_started'",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            protocol.commitment.as_slice(),
+            commitment.as_slice(),
+        ],
+    )?;
+    if anchor_changed != 1 || protocol_changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive existing witness adoption CAS failed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(next_revision)
+}
+
+fn close_witness_dispatch_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<()> {
+    let version = conn
+        .query_row(
+            "SELECT protocol_version FROM archive_lifecycle_witness_protocols
+             WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(version) = version else {
+        // Legacy anchors are never backfilled or treated as definitely unsent.
+        return Ok(());
+    };
+    if version != i64::from(WITNESS_CREATE_PROTOCOL_V1) {
+        // Unknown protocols remain opaque. The surrounding tombstone/freeze
+        // transaction still closes lifecycle admissions atomically, while
+        // disposition later reports UnsupportedManual without witness I/O.
+        return Ok(());
+    }
+    let Some(protocol) = witness_protocol_conn(conn, archive_id)? else {
+        return Err(EnclaveError::Store(
+            "archive witness protocol disappeared".into(),
+        ));
+    };
+    let (phase, admission_revision) = match protocol.phase {
+        WitnessProtocolPhase::OpenUnstarted => (
+            WitnessProtocolPhase::DeletionClosedUnsent,
+            protocol.admission_revision,
+        ),
+        WitnessProtocolPhase::SendStarted => (
+            WitnessProtocolPhase::DeletionClosedStarted,
+            protocol.admission_revision,
+        ),
+        WitnessProtocolPhase::DeletionClosedUnsent
+        | WitnessProtocolPhase::AbsenceConfirmed
+        | WitnessProtocolPhase::DeletionClosedStarted
+        | WitnessProtocolPhase::ManualRequired => {
+            if protocol.deletion_fence != Some(deletion_fence) {
+                return Err(EnclaveError::Conflict(
+                    "archive witness dispatch deletion fence changed".into(),
+                ));
+            }
+            return Ok(());
+        }
+        WitnessProtocolPhase::PresentExact => {
+            if let Some(existing) = protocol.deletion_fence {
+                if existing != deletion_fence {
+                    return Err(EnclaveError::Conflict(
+                        "archive witness-present deletion fence changed".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            (
+                WitnessProtocolPhase::PresentExact,
+                protocol.admission_revision,
+            )
+        }
+    };
+    let commitment = witness_protocol_commitment(
+        archive_id,
+        protocol.attempt_id,
+        protocol.protocol_version,
+        protocol.expected_hash,
+        protocol.expected_len,
+        admission_revision,
+        phase,
+        Some(deletion_fence),
+    );
+    let changed = conn.execute(
+        "UPDATE archive_lifecycle_witness_protocols
+         SET phase = ?3, deletion_fence = ?4, commitment = ?5,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+           AND commitment = ?6 AND phase = ?7",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            protocol.attempt_id.as_bytes().as_slice(),
+            phase.as_db(),
+            deletion_fence.as_bytes().as_slice(),
+            commitment.as_slice(),
+            protocol.commitment.as_slice(),
+            protocol.phase.as_db(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive witness dispatch close lost its compare-and-swap".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn authenticate_closed_witness_protocol_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<PreWitnessControlState> {
+    let authority = conn
+        .query_row(
+            "SELECT b.state, d.state, d.deletion_fence_id
+             FROM archive_deletion_ledgers d
+             JOIN archive_bindings b ON b.archive_id = d.archive_id
+             WHERE d.archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| EnclaveError::Conflict("archive deletion authority is missing".into()))?;
+    if authority.0 != "tombstoned"
+        || authority.1 != "tombstoned"
+        || fixed_16(authority.2)? != *deletion_fence.as_bytes()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness authority is not exactly tombstoned".into(),
+        ));
+    }
+    let Some(anchor) = lifecycle_anchor_conn(conn, archive_id)? else {
+        return Ok(PreWitnessControlState::NotParticipating);
+    };
+    let lifecycle_fence = conn.query_row(
+        "SELECT deletion_fence FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    if fixed_16(lifecycle_fence)? != *deletion_fence.as_bytes()
+        || anchor.state != ArchiveLifecycleState::DeletionFrozen
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness lifecycle is not exactly frozen".into(),
+        ));
+    }
+    let version = conn
+        .query_row(
+            "SELECT protocol_version FROM archive_lifecycle_witness_protocols
+             WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(version) = version else {
+        return Ok(PreWitnessControlState::UnsupportedManual);
+    };
+    if version != i64::from(WITNESS_CREATE_PROTOCOL_V1) {
+        return Ok(PreWitnessControlState::UnsupportedManual);
+    }
+    let protocol = witness_protocol_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive witness protocol disappeared".into()))?;
+    let phase = protocol.phase.closed().ok_or_else(|| {
+        EnclaveError::Conflict("archive witness dispatch was not closed by deletion".into())
+    })?;
+    if protocol.archive_id != archive_id
+        || protocol.attempt_id != anchor.plan.attempt_id()
+        || protocol.deletion_fence != Some(deletion_fence)
+    {
+        return Err(EnclaveError::Store(
+            "archive witness protocol binding changed".into(),
+        ));
+    }
+    let (bytes, hash, len, state, anchor_admission) = conn.query_row(
+        "SELECT witness_record_bytes, witness_record_hash, witness_record_len,
+                witness_create_state, witness_admission_revision
+         FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get::<_, Option<Vec<u8>>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        },
+    )?;
+    let hash = hash.map(fixed_32).transpose()?;
+    let len = len
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("archive witness record length is invalid".into()))?;
+    let anchor_admission = anchor_admission
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("archive witness admission is invalid".into()))?;
+    if bytes.as_ref().map(Vec::len) != len.and_then(|value| usize::try_from(value).ok())
+        || hash != protocol.expected_hash
+        || len != protocol.expected_len
+        || bytes
+            .as_ref()
+            .zip(hash)
+            .is_some_and(|(bytes, hash)| <[u8; 32]>::from(Sha256::digest(bytes)) != hash)
+    {
+        return Err(EnclaveError::Store(
+            "archive witness protocol candidate changed".into(),
+        ));
+    }
+    let state_valid = match phase {
+        ClosedWitnessPhase::ClosedUnsent => {
+            anchor_admission == protocol.admission_revision
+                && matches!(state.as_deref(), None | Some("planned"))
+        }
+        ClosedWitnessPhase::AbsenceConfirmed => {
+            anchor_admission.is_none()
+                && matches!(state.as_deref(), None | Some("confirmed_absent"))
+        }
+        ClosedWitnessPhase::ClosedStarted => {
+            anchor_admission == protocol.admission_revision
+                && matches!(state.as_deref(), Some("planned" | "outcome_unknown"))
+        }
+        ClosedWitnessPhase::ManualRequired if protocol.admission_revision.is_some() => {
+            anchor_admission == protocol.admission_revision
+                && matches!(state.as_deref(), Some("planned" | "outcome_unknown"))
+        }
+        ClosedWitnessPhase::ManualRequired => {
+            anchor_admission.is_none()
+                && matches!(
+                    state.as_deref(),
+                    None | Some("planned" | "confirmed_absent")
+                )
+        }
+        ClosedWitnessPhase::PresentExact => {
+            anchor_admission.is_none() && state.as_deref() == Some("created")
+        }
+    };
+    if !state_valid {
+        return Err(EnclaveError::Store(
+            "archive witness protocol lifecycle tuple is inconsistent".into(),
+        ));
+    }
+    ClosedWitnessProtocol::from_control_snapshot(
+        &LifecyclePersistenceContext::validated(),
+        archive_id,
+        protocol.attempt_id,
+        deletion_fence,
+        anchor.revision,
+        bytes,
+        hash,
+        len,
+        protocol.admission_revision,
+        protocol.protocol_version,
+        protocol.commitment,
+        phase,
+    )
+    .map(PreWitnessControlState::Participating)
+    .map_err(lifecycle_store_error)
+}
+
+fn confirm_pre_witness_absence_conn(
+    conn: &Connection,
+    snapshot: &ClosedWitnessProtocol,
+) -> Result<AuthenticatedPreWitnessAbsence> {
+    let current = match authenticate_closed_witness_protocol_conn(
+        conn,
+        snapshot.archive_id(),
+        snapshot.deletion_fence(),
+    )? {
+        PreWitnessControlState::Participating(current) => current,
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness protocol is unavailable".into(),
+            ))
+        }
+    };
+    if current.protocol_commitment() != snapshot.protocol_commitment()
+        || current.lifecycle_revision() != snapshot.lifecycle_revision()
+        || !matches!(
+            current.phase(),
+            ClosedWitnessPhase::ClosedUnsent | ClosedWitnessPhase::AbsenceConfirmed
+        )
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness absence snapshot is stale".into(),
+        ));
+    }
+    let commitment = witness_protocol_commitment(
+        current.archive_id(),
+        current.attempt_id(),
+        current.protocol_version(),
+        current.expected_hash(),
+        current.expected_len(),
+        None,
+        WitnessProtocolPhase::AbsenceConfirmed,
+        Some(current.deletion_fence()),
+    );
+    let resulting_revision = current
+        .lifecycle_revision()
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let tx = conn.unchecked_transaction()?;
+    let anchor_admission = (current.phase() == ClosedWitnessPhase::ClosedUnsent)
+        .then(|| current.admission_revision())
+        .flatten();
+    let anchor_changed = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1,
+             witness_create_state = CASE
+                 WHEN witness_record_hash IS NULL THEN NULL ELSE 'confirmed_absent' END,
+             witness_admission_revision = NULL,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'
+           AND deletion_fence = ?3
+           AND witness_admission_revision IS ?4",
+        rusqlite::params![
+            current.archive_id().as_bytes().as_slice(),
+            i64::try_from(current.lifecycle_revision())
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            current.deletion_fence().as_bytes().as_slice(),
+            anchor_admission
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+        ],
+    )?;
+    if anchor_changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness absence lifecycle CAS failed".into(),
+        ));
+    }
+    if current.phase() == ClosedWitnessPhase::ClosedUnsent {
+        let changed = tx.execute(
+            "UPDATE archive_lifecycle_witness_protocols
+             SET phase = 'absence_confirmed', admission_revision = NULL,
+                 commitment = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id = ?1 AND commitment = ?2
+               AND phase = 'deletion_closed_unsent' AND deletion_fence = ?4
+               AND EXISTS (SELECT 1 FROM archive_lifecycle_anchors a
+                           JOIN archive_deletion_ledgers d ON d.archive_id = a.archive_id
+                           JOIN archive_bindings b ON b.archive_id = a.archive_id
+                           WHERE a.archive_id = ?1 AND a.revision = ?5
+                             AND a.state = 'deletion_frozen'
+                             AND a.deletion_fence = ?4
+                             AND d.state = 'tombstoned' AND d.deletion_fence_id = ?4
+                             AND b.state = 'tombstoned')",
+            rusqlite::params![
+                current.archive_id().as_bytes().as_slice(),
+                current.protocol_commitment().as_slice(),
+                commitment.as_slice(),
+                current.deletion_fence().as_bytes().as_slice(),
+                i64::try_from(resulting_revision).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness absence CAS failed".into(),
+            ));
+        }
+    } else {
+        let unchanged: i64 = tx.query_row(
+            "SELECT count(*) FROM archive_lifecycle_witness_protocols
+             WHERE archive_id = ?1 AND phase = 'absence_confirmed'
+               AND commitment = ?2 AND deletion_fence = ?3",
+            rusqlite::params![
+                current.archive_id().as_bytes().as_slice(),
+                commitment.as_slice(),
+                current.deletion_fence().as_bytes().as_slice(),
+            ],
+            |row| row.get(0),
+        )?;
+        if unchanged != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness confirmed absence changed".into(),
+            ));
+        }
+    }
+    tx.commit()?;
+    AuthenticatedPreWitnessAbsence::from_control_cas(
+        &LifecyclePersistenceContext::validated(),
+        &current,
+        resulting_revision,
+        commitment,
+    )
+    .map_err(lifecycle_store_error)
+}
+
+fn require_manual_pre_witness_conn(
+    conn: &Connection,
+    snapshot: &ClosedWitnessProtocol,
+) -> Result<()> {
+    let current = match authenticate_closed_witness_protocol_conn(
+        conn,
+        snapshot.archive_id(),
+        snapshot.deletion_fence(),
+    )? {
+        PreWitnessControlState::Participating(current) => current,
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness protocol is unavailable".into(),
+            ))
+        }
+    };
+    if current.protocol_commitment() != snapshot.protocol_commitment()
+        || current.lifecycle_revision() != snapshot.lifecycle_revision()
+        || current.phase() != snapshot.phase()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness manual snapshot is stale".into(),
+        ));
+    }
+    if current.phase() == ClosedWitnessPhase::ManualRequired {
+        return Ok(());
+    }
+    if !matches!(
+        current.phase(),
+        ClosedWitnessPhase::ClosedStarted
+            | ClosedWitnessPhase::ClosedUnsent
+            | ClosedWitnessPhase::AbsenceConfirmed
+    ) {
+        return Err(EnclaveError::Conflict(
+            "archive witness protocol cannot enter manual review".into(),
+        ));
+    }
+    let poison_absence = matches!(
+        current.phase(),
+        ClosedWitnessPhase::ClosedUnsent | ClosedWitnessPhase::AbsenceConfirmed
+    );
+    let admission = (!poison_absence)
+        .then_some(current.admission_revision())
+        .flatten();
+    let commitment = witness_protocol_commitment(
+        current.archive_id(),
+        current.attempt_id(),
+        current.protocol_version(),
+        current.expected_hash(),
+        current.expected_len(),
+        admission,
+        WitnessProtocolPhase::ManualRequired,
+        Some(current.deletion_fence()),
+    );
+    let tx = conn.unchecked_transaction()?;
+    if poison_absence {
+        let expected_anchor_admission = (current.phase() == ClosedWitnessPhase::ClosedUnsent)
+            .then_some(current.admission_revision())
+            .flatten();
+        let anchor_changed = tx.execute(
+            "UPDATE archive_lifecycle_anchors
+             SET revision = revision + 1, witness_admission_revision = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'
+               AND deletion_fence = ?3 AND witness_admission_revision IS ?4",
+            rusqlite::params![
+                current.archive_id().as_bytes().as_slice(),
+                i64::try_from(current.lifecycle_revision()).map_err(|_| {
+                    EnclaveError::Store("archive lifecycle revision overflow".into())
+                })?,
+                current.deletion_fence().as_bytes().as_slice(),
+                expected_anchor_admission
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| EnclaveError::Store(
+                        "archive lifecycle revision overflow".into()
+                    ))?,
+            ],
+        )?;
+        if anchor_changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive witness manual lifecycle CAS failed".into(),
+            ));
+        }
+    }
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_witness_protocols
+         SET phase = 'manual_required', admission_revision = ?3, commitment = ?4,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND commitment = ?2
+           AND phase = ?5 AND deletion_fence = ?6",
+        rusqlite::params![
+            current.archive_id().as_bytes().as_slice(),
+            current.protocol_commitment().as_slice(),
+            admission
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            commitment.as_slice(),
+            match current.phase() {
+                ClosedWitnessPhase::ClosedStarted => "deletion_closed_started",
+                ClosedWitnessPhase::ClosedUnsent => "deletion_closed_unsent",
+                ClosedWitnessPhase::AbsenceConfirmed => "absence_confirmed",
+                ClosedWitnessPhase::PresentExact | ClosedWitnessPhase::ManualRequired => {
+                    unreachable!("phase checked above")
+                }
+            },
+            current.deletion_fence().as_bytes().as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive witness manual-review CAS failed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn record_present_pre_witness_conn(
+    conn: &Connection,
+    snapshot: &ClosedWitnessProtocol,
+) -> Result<()> {
+    if snapshot.phase() == ClosedWitnessPhase::PresentExact {
+        return Ok(());
+    }
+    if !matches!(
+        snapshot.phase(),
+        ClosedWitnessPhase::ClosedStarted | ClosedWitnessPhase::ManualRequired
+    ) {
+        return Err(EnclaveError::Conflict(
+            "archive witness presence contradicts unsent state".into(),
+        ));
+    }
+    let protocol = witness_protocol_conn(conn, snapshot.archive_id())?
+        .ok_or_else(|| EnclaveError::Store("archive witness protocol disappeared".into()))?;
+    let admission = protocol
+        .admission_revision
+        .ok_or_else(|| EnclaveError::Store("archive witness send marker disappeared".into()))?;
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, witness_create_state = 'created',
+             witness_admission_revision = NULL,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'
+           AND deletion_fence = ?3 AND witness_admission_revision = ?4
+           AND witness_record_hash = ?5",
+        rusqlite::params![
+            snapshot.archive_id().as_bytes().as_slice(),
+            i64::try_from(snapshot.lifecycle_revision())
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            snapshot.deletion_fence().as_bytes().as_slice(),
+            i64::try_from(admission)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            snapshot
+                .expected_hash()
+                .ok_or_else(|| EnclaveError::Store(
+                    "archive witness expected hash disappeared".into()
+                ))?
+                .as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive witness presence lifecycle CAS failed".into(),
+        ));
+    }
+    let commitment = witness_protocol_commitment(
+        snapshot.archive_id(),
+        snapshot.attempt_id(),
+        snapshot.protocol_version(),
+        snapshot.expected_hash(),
+        snapshot.expected_len(),
+        Some(admission),
+        WitnessProtocolPhase::PresentExact,
+        Some(snapshot.deletion_fence()),
+    );
+    let protocol_changed = tx.execute(
+        "UPDATE archive_lifecycle_witness_protocols
+         SET phase = 'present_exact', commitment = ?3,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND commitment = ?2 AND deletion_fence = ?4
+           AND admission_revision = ?5
+           AND phase IN ('deletion_closed_started','manual_required')",
+        rusqlite::params![
+            snapshot.archive_id().as_bytes().as_slice(),
+            snapshot.protocol_commitment().as_slice(),
+            commitment.as_slice(),
+            snapshot.deletion_fence().as_bytes().as_slice(),
+            i64::try_from(admission)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+        ],
+    )?;
+    if protocol_changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive witness presence protocol CAS failed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn freeze_archive_lifecycle_conn(
@@ -1896,6 +3136,7 @@ fn freeze_archive_lifecycle_conn(
             "archive lifecycle deletion fence changed".into(),
         ));
     }
+    close_witness_dispatch_conn(&tx, archive_id, deletion_fence)?;
     let updated = tx.execute(
         "UPDATE archive_lifecycle_anchors
          SET revision = revision + 1, state = 'deletion_frozen', deletion_fence = ?3,
@@ -3838,6 +5079,8 @@ fn tombstone_archive_deletion_ledger_conn(
     let fence = ledger
         .deletion_fence_id
         .ok_or_else(|| EnclaveError::Store("archive deletion fence disappeared".into()))?;
+    let lifecycle_fence = ObjectId::from_bytes(*fence.as_bytes());
+    close_witness_dispatch_conn(conn, binding.archive_id, lifecycle_fence)?;
     // If this archive has opted into the inactive lifecycle ledger, close its
     // create-admission state in this same control-store transaction as the
     // account/binding tombstone. In-flight admissions remain reconcilable, but
@@ -6740,6 +7983,28 @@ impl ControlStore {
         dead_code,
         reason = "reserved for reviewed archive-v3 authority wiring"
     )]
+    pub(crate) async fn adopt_existing_archive_witness(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        exact_encoded_record: Vec<u8>,
+    ) -> Result<u64> {
+        self.write_if_changed(move |conn| {
+            adopt_existing_archive_witness_conn(
+                conn,
+                archive_id,
+                expected_revision,
+                &exact_encoded_record,
+            )
+            .map(|revision| (revision, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
     pub(crate) async fn freeze_archive_lifecycle(
         &self,
         archive_id: ArchiveId,
@@ -7585,6 +8850,105 @@ impl ControlStore {
 }
 
 #[async_trait::async_trait]
+impl WitnessCreateDispatchLedger for ControlStore {
+    async fn mark_witness_send_started(
+        &self,
+        admission: &ActiveCreateAdmission,
+    ) -> std::result::Result<WitnessSendStarted, LifecycleError> {
+        let archive_id = admission.archive_id();
+        let attempt_id = admission.attempt_id();
+        let revision = admission.revision();
+        let ordinal = admission.artifact_ordinal();
+        let hash = admission.artifact_hash();
+        self.write_if_changed(move |conn| {
+            let admission = ActiveCreateAdmission::from_fresh_cas(
+                &LifecyclePersistenceContext::validated(),
+                archive_id,
+                attempt_id,
+                revision,
+                ordinal,
+                hash,
+            )
+            .map_err(lifecycle_store_error)?;
+            mark_witness_send_started_conn(conn, &admission).map(|receipt| (receipt, true))
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+}
+
+fn rebuild_closed_protocol(
+    snapshot: &ClosedWitnessProtocol,
+) -> std::result::Result<ClosedWitnessProtocol, LifecycleError> {
+    ClosedWitnessProtocol::from_control_snapshot(
+        &LifecyclePersistenceContext::validated(),
+        snapshot.archive_id(),
+        snapshot.attempt_id(),
+        snapshot.deletion_fence(),
+        snapshot.lifecycle_revision(),
+        snapshot.expected_record().map(<[u8]>::to_vec),
+        snapshot.expected_hash(),
+        snapshot.expected_len(),
+        snapshot.admission_revision(),
+        snapshot.protocol_version(),
+        snapshot.protocol_commitment(),
+        snapshot.phase(),
+    )
+}
+
+#[async_trait::async_trait]
+impl PreWitnessDispositionControl for ControlStore {
+    async fn authenticate_closed_protocol(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<PreWitnessControlState, LifecycleError> {
+        self.read(move |conn| {
+            authenticate_closed_witness_protocol_conn(conn, archive_id, deletion_fence)
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn confirm_absence(
+        &self,
+        observation: ExactNoneObservation,
+    ) -> std::result::Result<AuthenticatedPreWitnessAbsence, LifecycleError> {
+        let snapshot = observation.into_control_snapshot();
+        let snapshot = rebuild_closed_protocol(&snapshot)?;
+        self.write_if_changed(move |conn| {
+            confirm_pre_witness_absence_conn(conn, &snapshot).map(|proof| (proof, true))
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn record_present_exact(
+        &self,
+        snapshot: &ClosedWitnessProtocol,
+    ) -> std::result::Result<(), LifecycleError> {
+        let snapshot = rebuild_closed_protocol(snapshot)?;
+        self.write_if_changed(move |conn| {
+            record_present_pre_witness_conn(conn, &snapshot).map(|()| ((), true))
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn require_manual(
+        &self,
+        snapshot: &ClosedWitnessProtocol,
+    ) -> std::result::Result<(), LifecycleError> {
+        let snapshot = rebuild_closed_protocol(snapshot)?;
+        self.write_if_changed(move |conn| {
+            require_manual_pre_witness_conn(conn, &snapshot).map(|()| ((), true))
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+}
+
+#[async_trait::async_trait]
 impl DeletionInventoryControl for ControlStore {
     async fn freeze_snapshot(
         &self,
@@ -8065,6 +9429,484 @@ mod tests {
         seal_archive_inventory_conn(conn, &authenticated)
     }
 
+    fn prepare_lifecycle_witness_for_protocol(
+        conn: &Connection,
+    ) -> (BootstrapPlan, ActiveCreateAdmission) {
+        let plan = lifecycle_plan(conn);
+        let reservation = reserve_archive_bootstrap_conn(conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(conn, reservation, b"wrapped", b"root").unwrap();
+        let registry = admit_archive_create_conn(
+            conn,
+            plan.archive_id(),
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        let revision =
+            reconcile_archive_create_conn(conn, &registry, LifecycleCreateOutcome::Created)
+                .unwrap();
+        let root =
+            admit_archive_create_conn(conn, plan.archive_id(), revision, LIFECYCLE_ROOT_ORDINAL)
+                .unwrap();
+        let revision =
+            reconcile_archive_create_conn(conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        let revision = prepare_archive_witness_conn(
+            conn,
+            plan.archive_id(),
+            revision,
+            b"exact-witness-record",
+        )
+        .unwrap();
+        let admission =
+            admit_archive_create_conn(conn, plan.archive_id(), revision, LIFECYCLE_WITNESS_ORDINAL)
+                .unwrap();
+        (plan, admission)
+    }
+
+    #[test]
+    fn deletion_wins_admission_to_marker_race_and_absence_remints_only_after_fresh_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pre-witness.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, admission) = prepare_lifecycle_witness_for_protocol(&conn);
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        assert!(mark_witness_send_started_conn(&conn, &admission).is_err());
+        let closed =
+            match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+            {
+                PreWitnessControlState::Participating(closed) => closed,
+                other => panic!("unexpected protocol state: {other:?}"),
+            };
+        assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedUnsent);
+        assert_eq!(closed.admission_revision(), Some(admission.revision()));
+        let proof = confirm_pre_witness_absence_conn(&conn, &closed).unwrap();
+        assert_eq!(proof.archive_id(), plan.archive_id());
+        let first_revision = lifecycle_anchor_conn(&conn, plan.archive_id())
+            .unwrap()
+            .unwrap()
+            .revision;
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let confirmed =
+            match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+            {
+                PreWitnessControlState::Participating(closed) => closed,
+                other => panic!("unexpected protocol state: {other:?}"),
+            };
+        assert_eq!(confirmed.phase(), ClosedWitnessPhase::AbsenceConfirmed);
+        let _fresh_read_proof = confirm_pre_witness_absence_conn(&conn, &confirmed).unwrap();
+        assert_eq!(
+            lifecycle_anchor_conn(&conn, plan.archive_id())
+                .unwrap()
+                .unwrap()
+                .revision,
+            first_revision + 1
+        );
+        let tuple: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT witness_admission_revision, witness_create_state
+                 FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tuple, (None, Some("confirmed_absent".into())));
+    }
+
+    #[test]
+    fn contradictory_presence_permanently_poisons_unsent_and_confirmed_absence() {
+        for poison_after_confirmation in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("poisoned-pre-witness.sqlite");
+            let conn = lifecycle_file_conn(&path);
+            let (plan, _admission) = prepare_lifecycle_witness_for_protocol(&conn);
+            let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+            let ledger =
+                tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+            let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+            let mut closed =
+                match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                    .unwrap()
+                {
+                    PreWitnessControlState::Participating(closed) => closed,
+                    other => panic!("unexpected protocol state: {other:?}"),
+                };
+            if poison_after_confirmation {
+                confirm_pre_witness_absence_conn(&conn, &closed).unwrap();
+                closed = match authenticate_closed_witness_protocol_conn(
+                    &conn,
+                    plan.archive_id(),
+                    fence,
+                )
+                .unwrap()
+                {
+                    PreWitnessControlState::Participating(closed) => closed,
+                    other => panic!("unexpected protocol state: {other:?}"),
+                };
+                assert_eq!(closed.phase(), ClosedWitnessPhase::AbsenceConfirmed);
+            }
+            // This is the full-state CAS used by either an exact or mismatched
+            // observed Some. The provider bytes are deliberately not stored.
+            require_manual_pre_witness_conn(&conn, &closed).unwrap();
+            drop(conn);
+
+            let conn = lifecycle_file_conn(&path);
+            let poisoned =
+                match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                    .unwrap()
+                {
+                    PreWitnessControlState::Participating(closed) => closed,
+                    other => panic!("unexpected protocol state: {other:?}"),
+                };
+            assert_eq!(poisoned.phase(), ClosedWitnessPhase::ManualRequired);
+            assert_eq!(poisoned.admission_revision(), None);
+            assert!(confirm_pre_witness_absence_conn(&conn, &poisoned).is_err());
+            require_manual_pre_witness_conn(&conn, &poisoned).unwrap();
+        }
+    }
+
+    #[test]
+    fn candidate_free_reservation_and_objects_prepared_close_and_remint_absence() {
+        for prepare_objects in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("candidate-free-pre-witness.sqlite");
+            let conn = lifecycle_file_conn(&path);
+            let plan = lifecycle_plan(&conn);
+            let reservation = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+            if prepare_objects {
+                prepare_archive_bootstrap_conn(&conn, reservation, b"wrapped", b"root").unwrap();
+            }
+            let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+            let ledger =
+                tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+            let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+            let closed =
+                match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                    .unwrap()
+                {
+                    PreWitnessControlState::Participating(closed) => closed,
+                    other => panic!("unexpected protocol state: {other:?}"),
+                };
+            assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedUnsent);
+            assert_eq!(closed.expected_hash(), None);
+            assert_eq!(closed.expected_len(), None);
+            assert_eq!(closed.admission_revision(), None);
+            confirm_pre_witness_absence_conn(&conn, &closed).unwrap();
+            drop(conn);
+
+            let conn = lifecycle_file_conn(&path);
+            let confirmed =
+                match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                    .unwrap()
+                {
+                    PreWitnessControlState::Participating(closed) => closed,
+                    other => panic!("unexpected protocol state: {other:?}"),
+                };
+            assert_eq!(confirmed.phase(), ClosedWitnessPhase::AbsenceConfirmed);
+            assert_eq!(confirmed.expected_hash(), None);
+            confirm_pre_witness_absence_conn(&conn, &confirmed).unwrap();
+        }
+    }
+
+    #[test]
+    fn delayed_post_marker_commit_survives_manual_restart_and_resolves_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("started-witness.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, admission) = prepare_lifecycle_witness_for_protocol(&conn);
+        mark_witness_send_started_conn(&conn, &admission).unwrap();
+        reconcile_archive_create_conn(&conn, &admission, LifecycleCreateOutcome::OutcomeUnknown)
+            .unwrap();
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        assert!(reconcile_archive_create_conn(
+            &conn,
+            &admission,
+            LifecycleCreateOutcome::ConfirmedAbsent,
+        )
+        .is_err());
+        let closed =
+            match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+            {
+                PreWitnessControlState::Participating(closed) => closed,
+                other => panic!("unexpected protocol state: {other:?}"),
+            };
+        assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedStarted);
+        require_manual_pre_witness_conn(&conn, &closed).unwrap();
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let manual =
+            match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+            {
+                PreWitnessControlState::Participating(closed) => closed,
+                other => panic!("unexpected protocol state: {other:?}"),
+            };
+        assert_eq!(manual.phase(), ClosedWitnessPhase::ManualRequired);
+        assert_eq!(manual.admission_revision(), Some(admission.revision()));
+        // Model the already accepted delayed Firestore commit becoming
+        // observable after restart: exact equality, never absence, resolves
+        // the retained outcome-unknown admission.
+        record_present_pre_witness_conn(&conn, &manual).unwrap();
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let present =
+            match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+            {
+                PreWitnessControlState::Participating(closed) => closed,
+                other => panic!("unexpected protocol state: {other:?}"),
+            };
+        assert_eq!(present.phase(), ClosedWitnessPhase::PresentExact);
+    }
+
+    #[test]
+    fn active_send_started_admission_recovers_exactly_after_close_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("active-send-started.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, admission) = prepare_lifecycle_witness_for_protocol(&conn);
+        let first = mark_witness_send_started_conn(&conn, &admission).unwrap();
+        assert_eq!(first.admission_revision(), admission.revision());
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            admission.revision(),
+            LIFECYCLE_WITNESS_ORDINAL,
+        )
+        .unwrap();
+        assert_eq!(recovered, admission);
+        let marker = mark_witness_send_started_conn(&conn, &recovered).unwrap();
+        assert_eq!(marker.admission_revision(), admission.revision());
+        assert_eq!(marker.expected_hash(), admission.artifact_hash());
+        reconcile_archive_create_conn(&conn, &recovered, LifecycleCreateOutcome::OutcomeUnknown)
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_existing_witness_adoption_survives_close_after_commit_before_reconcile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing-witness-adoption.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, admission) = prepare_lifecycle_witness_for_protocol(&conn);
+        mark_witness_send_started_conn(&conn, &admission).unwrap();
+        // Model Firestore accepting the exact candidate followed by process
+        // loss before lifecycle reconciliation: only durable send-start state
+        // remains locally.
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let revision = adopt_existing_archive_witness_conn(
+            &conn,
+            plan.archive_id(),
+            admission.revision(),
+            b"exact-witness-record",
+        )
+        .unwrap();
+        let anchor = lifecycle_anchor_conn(&conn, plan.archive_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision, admission.revision() + 1);
+        assert_eq!(anchor.revision, revision);
+        assert_eq!(anchor.state, ArchiveLifecycleState::Witnessed);
+        let tuple: (String, Option<i64>, String) = conn
+            .query_row(
+                "SELECT a.witness_create_state, a.witness_admission_revision, p.phase
+                 FROM archive_lifecycle_anchors a
+                 JOIN archive_lifecycle_witness_protocols p USING (archive_id)
+                 WHERE a.archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tuple, ("created".into(), None, "present_exact".into()));
+        assert_eq!(
+            adopt_existing_archive_witness_conn(
+                &conn,
+                plan.archive_id(),
+                revision,
+                b"exact-witness-record",
+            )
+            .unwrap(),
+            revision
+        );
+        assert!(adopt_existing_archive_witness_conn(
+            &conn,
+            plan.archive_id(),
+            revision,
+            b"different-witness-record",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn self_consistent_unknown_send_protocol_cannot_adopt_existing_witness() {
+        let conn = account_conn();
+        let (plan, admission) = prepare_lifecycle_witness_for_protocol(&conn);
+        mark_witness_send_started_conn(&conn, &admission).unwrap();
+        let unknown_commitment = witness_protocol_commitment(
+            plan.archive_id(),
+            plan.attempt_id(),
+            99,
+            Some(admission.artifact_hash()),
+            Some(u32::try_from(b"exact-witness-record".len()).unwrap()),
+            Some(admission.revision()),
+            WitnessProtocolPhase::SendStarted,
+            None,
+        );
+        conn.execute(
+            "UPDATE archive_lifecycle_witness_protocols
+             SET protocol_version = 99, commitment = ?2
+             WHERE archive_id = ?1",
+            rusqlite::params![
+                plan.archive_id().as_bytes().as_slice(),
+                unknown_commitment.as_slice(),
+            ],
+        )
+        .unwrap();
+        assert!(adopt_existing_archive_witness_conn(
+            &conn,
+            plan.archive_id(),
+            admission.revision(),
+            b"exact-witness-record",
+        )
+        .is_err());
+        let tuple: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT phase, admission_revision
+                 FROM archive_lifecycle_witness_protocols WHERE archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            tuple,
+            (
+                "send_started".into(),
+                Some(i64::try_from(admission.revision()).unwrap()),
+            )
+        );
+    }
+
+    #[test]
+    fn missing_or_unknown_witness_protocol_is_manual_and_never_inferred_unsent() {
+        for version in [None, Some(99_i64)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("unsupported-witness.sqlite");
+            let conn = lifecycle_file_conn(&path);
+            let plan = lifecycle_plan(&conn);
+            reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+            match version {
+                None => {
+                    conn.execute(
+                        "DELETE FROM archive_lifecycle_witness_protocols WHERE archive_id = ?1",
+                        [plan.archive_id().as_bytes().as_slice()],
+                    )
+                    .unwrap();
+                }
+                Some(version) => {
+                    let commitment = witness_protocol_commitment(
+                        plan.archive_id(),
+                        plan.attempt_id(),
+                        u16::try_from(version).unwrap(),
+                        None,
+                        None,
+                        None,
+                        WitnessProtocolPhase::OpenUnstarted,
+                        None,
+                    );
+                    conn.execute(
+                        "UPDATE archive_lifecycle_witness_protocols
+                         SET protocol_version = ?2, commitment = ?3
+                         WHERE archive_id = ?1",
+                        rusqlite::params![
+                            plan.archive_id().as_bytes().as_slice(),
+                            version,
+                            commitment.as_slice(),
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+            let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+            let ledger =
+                tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+            let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+            assert!(matches!(
+                authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence).unwrap(),
+                PreWitnessControlState::UnsupportedManual
+            ));
+            drop(conn);
+            let conn = lifecycle_file_conn(&path);
+            assert!(matches!(
+                authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence).unwrap(),
+                PreWitnessControlState::UnsupportedManual
+            ));
+            if version.is_some() {
+                let tuple: (i64, String, Vec<u8>) = conn
+                    .query_row(
+                        "SELECT protocol_version, phase, commitment
+                         FROM archive_lifecycle_witness_protocols WHERE archive_id = ?1",
+                        [plan.archive_id().as_bytes().as_slice()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(tuple.0, 99);
+                assert_eq!(tuple.1, "open_unstarted");
+            }
+        }
+    }
+
+    #[test]
+    fn witness_protocol_corruption_tuple_fails_closed() {
+        let corruptions = [
+            "expected_witness_len = expected_witness_len + 1",
+            "expected_witness_hash = zeroblob(32)",
+            "admission_revision = admission_revision + 1",
+            "deletion_fence = zeroblob(16)",
+            "commitment = randomblob(32)",
+        ];
+        for corruption in corruptions {
+            let conn = account_conn();
+            let (plan, admission) = prepare_lifecycle_witness_for_protocol(&conn);
+            mark_witness_send_started_conn(&conn, &admission).unwrap();
+            let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+            let ledger =
+                tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+            let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+            let update = conn.execute(
+                &format!(
+                    "UPDATE archive_lifecycle_witness_protocols SET {corruption}
+                     WHERE archive_id = ?1"
+                ),
+                [plan.archive_id().as_bytes().as_slice()],
+            );
+            // SQLite CHECK constraints may reject malformed zero values at
+            // write time. Any corruption which survives them must fail the
+            // full commitment/tuple loader.
+            if update.is_err() {
+                continue;
+            }
+            assert!(
+                authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence,)
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn bootstrap_recovery_needs_only_archive_authority_after_close_and_reopen() {
         let directory = tempfile::tempdir().unwrap();
@@ -8199,6 +10041,7 @@ mod tests {
             LIFECYCLE_WITNESS_ORDINAL,
         )
         .unwrap();
+        mark_witness_send_started_conn(&conn, &witness).unwrap();
         reconcile_archive_create_conn(&conn, &witness, LifecycleCreateOutcome::OutcomeUnknown)
             .unwrap();
 
@@ -8243,18 +10086,26 @@ mod tests {
             fence,
         )
         .is_err());
-        let reconciled =
-            reconcile_archive_create_conn(&conn, &witness, LifecycleCreateOutcome::ConfirmedAbsent)
-                .unwrap();
-        assert_eq!(reconciled, frozen_revision + 1);
-        let snapshot_revision =
-            freeze_archive_inventory_snapshot_conn(&conn, plan.archive_id(), reconciled, fence)
-                .unwrap();
-        assert_eq!(snapshot_revision, reconciled + 1);
         assert!(reconcile_archive_create_conn(
             &conn,
             &witness,
             LifecycleCreateOutcome::ConfirmedAbsent,
+        )
+        .is_err());
+        let closed =
+            match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+            {
+                PreWitnessControlState::Participating(closed) => closed,
+                other => panic!("unexpected protocol state: {other:?}"),
+            };
+        assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedStarted);
+        require_manual_pre_witness_conn(&conn, &closed).unwrap();
+        assert!(freeze_archive_inventory_snapshot_conn(
+            &conn,
+            plan.archive_id(),
+            frozen_revision,
+            fence,
         )
         .is_err());
     }

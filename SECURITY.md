@@ -400,8 +400,42 @@ construction, or deployment configuration activates the lifecycle.
 Producer-authorized recovery reads need only the opaque archive authority: after close/reopen
 they reconstruct the original reservation or exact prepared bytes from the anchor, never from
 caller-retained random IDs or ciphertext. The page seam likewise has no provider implementation,
-credential/config source, runtime construction, pre-witness exact-absence branch, deletion-driver
-invocation, or production authority.
+credential/config source, runtime construction, deletion-driver invocation, or production authority.
+
+The inactive pre-witness disposition capability closes the remaining logical ambiguity without
+granting deletion authority. Every new bootstrap reservation atomically enrolls a separate
+protocol-v1 control row binding the opaque archive/attempt, exact prepared witness hash and length,
+admission revision, monotonic phase, deletion fence, and a domain-separated commitment. The
+closed-unsent and confirmed-absent phases also support the exact all-`None` candidate/admission
+tuple needed when deletion wins while the anchor is only reserved or objects-prepared.
+Firestore bootstrap boundary performs token acquisition, transaction begin, exact transactional
+read, and exact candidate encoding before it asks encrypted control for a non-cloneable send-start
+receipt; its private commit path borrows that receipt and accepts no raw production bootstrap
+bypass. Genesis can select only the sealed Firestore witness creator (or its test fixture), not an
+implementation-defined raw witness-create hook. Failures before the marker issue no Firestore commit. Once marked, cancellation, ABORTED
+retry, transport failure, or a lost response remains outcome-unknown until an exact read resolves
+the same retained bytes. A post-marker create-precondition failure itself triggers a fresh exact
+read because a delayed earlier attempt may have committed. Genesis restart adopts an exact
+existing witness only through the retained send-start admission/hash CAS; a witness with no
+enrolled candidate never takes the early success path. Generic reconciliation cannot label witness ordinal 2 absent and cannot
+record an unknown outcome without the matching send marker.
+
+Account tombstoning and explicit lifecycle freeze atomically close `open_unstarted` as
+`deletion_closed_unsent` or `send_started` as `deletion_closed_started`. The capability authenticates
+the exact tombstoned binding, deletion ledger, lifecycle anchor, protocol commitment, and fence
+before any witness I/O. Only closed-unsent plus a fresh exact-name `None` read can advance a
+full-state CAS and mint a private non-cloneable absence proof. Started/unknown plus `None` becomes
+manual and stays so across restart; a later exact retained record may resolve to present. A
+mismatch or a definite found-but-malformed/noncanonical document atomically poisons both
+closed-unsent and confirmed-absent into admission-free `manual_required`; later `None` can never
+remint absence. Provider-unavailable reads cause no transition. The exact-`None` observation is a
+private one-shot capability consumed by control, so sibling code cannot call a raw
+snapshot-to-absence API. Restart retains facts rather than
+proofs: even `absence_confirmed` requires another exact `None` read and full-state CAS to remint.
+Old anchors with no enrollment, unknown protocol versions, active or inconsistent tuples fail
+closed before witness I/O and are never inferred unsent. This capability is not consumed by the
+inventory coordinator or deletion driver and has no Store/startup/runtime/route/config/provider
+construction, credential, cloud, or deployment wiring.
 Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
 rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
 source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the
@@ -492,8 +526,9 @@ unrelated retention assertion. The former independent inventory builder, test-ov
 commitment, and `FullReachabilitySeal` are removed. A complete deletion inventory is now minted
 only after the authenticated lifecycle-page loader verifies the exact durable seal (apart from
 explicit `cfg(test)` fixtures), so the reachability report remains non-authorizing on its own.
-Full activation remains blocked by the absent pre-witness exact-absence path and by the lack of
-startup/runtime/provider construction and deletion-driver invocation.
+Full activation remains blocked because the capability-only pre-witness disposition is not yet
+integrated into deletion, and by the lack of startup/runtime/provider construction and
+deletion-driver invocation.
 The intended lifecycle order is fixed: freeze and drain admitted/ambiguous creates; tombstone the
 exact unchanged current root (or use a separately reviewed exact-absence coordinator for a bootstrap
 that never established a witness); reauthenticate that exact Tombstoned worker/operation/fence before
@@ -511,8 +546,9 @@ therefore retain enough exact-name inventory for restart. The content-free ancho
 and page references remain permanently. A one-snapshot control recovery read keyed by the opaque archive
 and exact deletion fence revalidates those references and reconstructs the sealed-inventory receipt; after
 physical completion it additionally reconstructs the durable-control receipt from the retained provider-drain
-commitment. Restart therefore never depends on a process retaining either receipt. The pre-witness exact-absence
-coordinator is not implemented in this slice and therefore remains an explicit activation blocker.
+commitment. Restart therefore never depends on a process retaining either receipt. The separately
+compiled pre-witness disposition can prove a never-started initial send, but is intentionally not
+accepted by this driver in this slice; that reviewed integration remains an activation blocker.
 The authenticated exact-name visitor and lifecycle inventory coordinator are compiled and tested
 but inactive; neither infers paths nor discovers objects by prefix. The driver has no Store, route, runtime,
 credential, or deployment wiring.
@@ -634,6 +670,13 @@ namespace/audience config without I/O. Its coordinator bridge preserves a lost c
 ordinary adapter calls retain their exact fresh-read resolution. There is no Firestore IAM runtime
 wiring, query/list/delete/batch-write/create-document capability, additional field,
 Store/VFS/route/startup connection, environment flag, archive bootstrap, or production authority.
+The initial witness-create adapter has no production raw-bootstrap entrypoint: it validates the
+exact absent transaction and durable candidate first, invokes the injected encrypted-control
+send-start CAS once, and only its private receipt-borrowing helper can submit the commit. Bounded
+ABORTED retry retains that same marker; a later iteration may accept only the exact retained
+record. A precondition failure after send-start is resolved only by a fresh exact read; exact is
+success, mismatch is rejection, and absent/unavailable remains outcome-unknown. Any other
+post-marker failure remains outcome-unknown rather than reviving an absence claim.
 Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
 acknowledge a write from archive-v3 until ADR-0022
@@ -664,7 +707,12 @@ creates the witness only after exact read-back authentication. A collision or a
 lost response is resolved solely by a bounded exact read and byte/commitment
 equality; it is never blindly retried. Every registry, root, and witness request
 requires a fresh revision-bound create admission; exact initial witness bytes are
-committed before its create. Tombstoned, frozen, or deleting states
+committed before its create. The backend has no raw witness-create hook: only the
+sealed Firestore creator can accept that admission, and its commit borrows the
+durable send-start receipt. After a crash between accepted commit and lifecycle
+reconciliation, the exact-existing path succeeds only through an atomic adoption
+CAS over the retained attempt/revision/hash/admission; unrelated pre-ledger existing
+data fails closed. Tombstoned, frozen, or deleting states
 reject bootstrap. After authenticating root and registry, both the existing and
 create paths reread the exact witness immediately before success and require the
 entire authenticated snapshot plus a final active-ledger reread to remain equal; a

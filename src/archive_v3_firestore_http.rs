@@ -641,7 +641,16 @@ fn parse_batch_get_response_array(
         .as_array()
         .ok_or(FirestoreWitnessTransportError::Protocol)?;
     if responses.len() != 1 || !responses[0].is_object() {
-        return Err(FirestoreWitnessTransportError::Protocol);
+        return Err(
+            if responses
+                .iter()
+                .any(|response| response.get("found").is_some())
+            {
+                FirestoreWitnessTransportError::DefinitelyPresentInvalid
+            } else {
+                FirestoreWitnessTransportError::Protocol
+            },
+        );
     }
     let response =
         serde_json::to_vec(&responses[0]).map_err(|_| FirestoreWitnessTransportError::Protocol)?;
@@ -1038,6 +1047,19 @@ mod tests {
         format!(r#"{{"missing":"{}","readTime":"{}"}}"#, document(), TIME)
     }
 
+    fn found_batch_body() -> String {
+        serde_json::to_string(&json!({
+            "found": {
+                "name": document(),
+                "createTime": TIME,
+                "updateTime": TIME,
+                "fields": {"r": {"bytesValue": STANDARD.encode(record())}},
+            },
+            "readTime": TIME,
+        }))
+        .unwrap()
+    }
+
     fn batch_array_body() -> String {
         format!("[{}]", batch_body())
     }
@@ -1099,11 +1121,24 @@ mod tests {
     fn batch_json_array_requires_exactly_one_response_object() {
         let object = batch_body();
         assert!(parse_batch_get_response_array(batch_array_body().as_bytes(), &document()).is_ok());
+        let found = found_batch_body();
+        let mixed_missing_found = format!("[{object},{found}]");
+        assert_eq!(
+            parse_batch_get_response_array(mixed_missing_found.as_bytes(), &document()),
+            Err(FirestoreWitnessTransportError::DefinitelyPresentInvalid)
+        );
+        assert_eq!(
+            parse_batch_get_response_array(format!("[{found},{found}]").as_bytes(), &document()),
+            Err(FirestoreWitnessTransportError::DefinitelyPresentInvalid)
+        );
+        assert_eq!(
+            parse_batch_get_response_array(format!("[{object},{object}]").as_bytes(), &document()),
+            Err(FirestoreWitnessTransportError::Protocol)
+        );
         for body in [
             String::new(),
             object.clone(),
             "[]".to_owned(),
-            format!("[{object},{object}]"),
             format!("[[{object}]]"),
             format!("[{object}] {{}}"),
             "[null]".to_owned(),

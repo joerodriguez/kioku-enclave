@@ -19,16 +19,23 @@ use crate::{
         singleton_document_suffix, FirestoreProbeAttemptId, FirestoreProbeOutcome,
         FirestoreProbeRecord, PROBE_RECORD_BYTES,
     },
+    archive_v3_lifecycle::{
+        ActiveCreateAdmission, WitnessCreateDispatchLedger, WitnessSendStarted,
+    },
     archive_v3_witness::{
         DeletionAdvance, DeletionRecovery, DeletionStageProof, DeletionState,
         DeletionWorkerCredential, InMemoryWitness, RecoveryRoot, RootAdvance, TombstoneReceipt,
         Witness, WitnessBootstrap, WitnessError, WitnessLease, WitnessReceipt, WitnessRecord,
         WITNESS_RECORD_BYTES,
     },
+    archive_v3_witness_disposition::{
+        ExactPreWitnessObservation, ExactPreWitnessReader, PreWitnessDispositionError,
+    },
     legacy_gcm::ExactLegacyWitness,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fmt,
     sync::{Arc, Mutex},
@@ -61,6 +68,10 @@ pub(crate) enum FirestoreWitnessTransportError {
     EndpointNotFound,
     TooLarge,
     Protocol,
+    /// A strict exact-name response included a `found` document, but its
+    /// document name/field set/encoding was noncanonical. This is permanent
+    /// presence evidence for pre-witness disposition, never retryable absence.
+    DefinitelyPresentInvalid,
 }
 
 #[cfg(test)]
@@ -98,11 +109,32 @@ mod tests {
         }
     }
 
+    struct FakeDispatch {
+        marks: Mutex<usize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WitnessCreateDispatchLedger for FakeDispatch {
+        async fn mark_witness_send_started(
+            &self,
+            admission: &ActiveCreateAdmission,
+        ) -> std::result::Result<WitnessSendStarted, crate::archive_v3_lifecycle::LifecycleError>
+        {
+            *self.marks.lock().unwrap() += 1;
+            if self.fail {
+                return Err(crate::archive_v3_lifecycle::LifecycleError::Unavailable);
+            }
+            WitnessSendStarted::for_test(admission, [88; 32])
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum CommitOutcome {
         Ok,
         Aborted,
         LostResponse,
+        DelayedLostResponse,
         CompetingWrite,
     }
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +150,7 @@ mod tests {
         requests: Vec<Value>,
         time: String,
         failure: Option<FailureStage>,
+        delayed_record: Option<[u8; WITNESS_RECORD_BYTES]>,
     }
     struct FakeTransport(Mutex<FakeState>);
     impl FakeTransport {
@@ -133,6 +166,7 @@ mod tests {
                 requests: Vec::new(),
                 time: TIME.to_owned(),
                 failure: None,
+                delayed_record: None,
             }))
         }
         fn push_outcome(&self, outcome: CommitOutcome) {
@@ -200,6 +234,10 @@ mod tests {
         ) -> std::result::Result<(), FirestoreWitnessTransportError> {
             let mut state = self.0.lock().unwrap();
             state.commits += 1;
+            if let Some(delayed) = state.delayed_record.take() {
+                state.record = Some(delayed);
+                state.update_time = Some(TIME.to_owned());
+            }
             match (state.record.as_ref(), state.update_time.as_deref()) {
                 (None, None)
                     if request["writes"][0]["currentDocument"] == json!({"exists": false}) => {}
@@ -239,6 +277,10 @@ mod tests {
                 CommitOutcome::Ok => Ok(()),
                 CommitOutcome::Aborted => Err(FirestoreWitnessTransportError::Aborted),
                 CommitOutcome::LostResponse => Err(FirestoreWitnessTransportError::OutcomeUnknown),
+                CommitOutcome::DelayedLostResponse => {
+                    state.delayed_record = Some(record);
+                    Err(FirestoreWitnessTransportError::OutcomeUnknown)
+                }
                 CommitOutcome::CompetingWrite => unreachable!("handled above"),
             }
         }
@@ -273,6 +315,111 @@ mod tests {
         .unwrap()
     }
 
+    fn witness_admission() -> ActiveCreateAdmission {
+        let bootstrap = bootstrap();
+        ActiveCreateAdmission::for_test(
+            bootstrap.archive_id(),
+            crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes([8; 16]).unwrap(),
+            9,
+            2,
+            Sha256::digest(bootstrap.expected_initial_record_bytes().unwrap()).into(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn commit_started_bootstrap_marks_once_and_resolves_aborted_or_lost_response() {
+        for outcomes in [
+            vec![CommitOutcome::Aborted, CommitOutcome::Ok],
+            vec![CommitOutcome::LostResponse],
+        ] {
+            let transport = Arc::new(FakeTransport::new(None, outcomes));
+            let adapter = witness(transport.clone());
+            let dispatch = FakeDispatch {
+                marks: Mutex::new(0),
+                fail: false,
+            };
+            let result = adapter
+                .bootstrap_commit_started(&witness_admission(), &dispatch, bootstrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                result.encode(),
+                bootstrap().expected_initial_record_bytes().unwrap()
+            );
+            assert_eq!(*dispatch.marks.lock().unwrap(), 1);
+            assert!(transport.0.lock().unwrap().commits >= 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_started_bootstrap_pre_marker_failures_are_definitely_unsent() {
+        let transport = Arc::new(FakeTransport::new(None, []));
+        transport.fail_next(FailureStage::BatchGet);
+        let adapter = witness(transport.clone());
+        let dispatch = FakeDispatch {
+            marks: Mutex::new(0),
+            fail: false,
+        };
+        assert!(matches!(
+            adapter
+                .bootstrap_commit_started(&witness_admission(), &dispatch, bootstrap())
+                .await,
+            Err(FirestoreWitnessBootstrapError::DefinitelyUnsent(_))
+        ));
+        assert_eq!(*dispatch.marks.lock().unwrap(), 0);
+        assert_eq!(transport.0.lock().unwrap().commits, 0);
+
+        let dispatch = FakeDispatch {
+            marks: Mutex::new(0),
+            fail: true,
+        };
+        assert!(matches!(
+            adapter
+                .bootstrap_commit_started(&witness_admission(), &dispatch, bootstrap())
+                .await,
+            Err(FirestoreWitnessBootstrapError::DefinitelyUnsent(_))
+        ));
+        assert_eq!(*dispatch.marks.lock().unwrap(), 1);
+        assert_eq!(transport.0.lock().unwrap().commits, 0);
+    }
+
+    #[tokio::test]
+    async fn delayed_first_create_then_second_precondition_resolves_by_fresh_exact_read() {
+        let transport = Arc::new(FakeTransport::new(
+            None,
+            [CommitOutcome::DelayedLostResponse, CommitOutcome::Ok],
+        ));
+        let adapter = witness(transport.clone());
+        let dispatch = FakeDispatch {
+            marks: Mutex::new(0),
+            fail: false,
+        };
+        let record = adapter
+            .bootstrap_commit_started(&witness_admission(), &dispatch, bootstrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            record.encode(),
+            bootstrap().expected_initial_record_bytes().unwrap()
+        );
+        assert_eq!(*dispatch.marks.lock().unwrap(), 1);
+        assert_eq!(transport.0.lock().unwrap().commits, 2);
+    }
+
+    #[tokio::test]
+    async fn exact_pre_witness_reader_classifies_malformed_found_as_definite_presence() {
+        let transport = Arc::new(FakeTransport::new(Some([0xff; WITNESS_RECORD_BYTES]), []));
+        let adapter = witness(transport);
+        assert!(matches!(
+            adapter
+                .read_exact_witness(ArchiveId::from_bytes(id(1)))
+                .await
+                .unwrap(),
+            ExactPreWitnessObservation::DefinitelyPresentInvalid
+        ));
+    }
+
     #[test]
     fn strict_codec_and_emulator_request_shapes() {
         let namespace = FirestoreWitnessNamespace::new("project-1", "witness-db").unwrap();
@@ -301,6 +448,22 @@ mod tests {
             parse_batch_get_response(&malformed, &document),
             Err(FirestoreWitnessTransportError::Protocol)
         );
+        let malformed_stream = serde_json::to_vec(&malformed).unwrap();
+        assert_eq!(
+            parse_exact_batch_get_stream([malformed_stream.as_slice()], &document),
+            Err(FirestoreWitnessTransportError::DefinitelyPresentInvalid)
+        );
+        for invalid_found in [
+            json!({"found": {"name": format!("{document}-wrong"), "createTime": CREATE_TIME, "updateTime": TIME, "fields": {"r": {"bytesValue": STANDARD.encode(encoded)}}}, "readTime": TIME}),
+            json!({"found": {"name": document, "createTime": CREATE_TIME, "updateTime": TIME, "fields": {"wrong": {"bytesValue": STANDARD.encode(encoded)}}}, "readTime": TIME}),
+            json!({"found": {"name": document, "createTime": CREATE_TIME, "updateTime": TIME, "fields": {"r": {"bytesValue": STANDARD.encode(encoded)}}, "extra": true}, "readTime": TIME}),
+        ] {
+            let invalid = serde_json::to_vec(&invalid_found).unwrap();
+            assert_eq!(
+                parse_exact_batch_get_stream([invalid.as_slice()], &document),
+                Err(FirestoreWitnessTransportError::DefinitelyPresentInvalid)
+            );
+        }
     }
 
     #[test]
@@ -373,7 +536,7 @@ mod tests {
         );
         assert_eq!(
             parse_exact_batch_get_stream([response.as_slice(), response.as_slice()], &document),
-            Err(FirestoreWitnessTransportError::Protocol)
+            Err(FirestoreWitnessTransportError::DefinitelyPresentInvalid)
         );
         assert_eq!(
             parse_exact_batch_get_stream(
@@ -1454,6 +1617,7 @@ fn map_transport(error: FirestoreWitnessTransportError) -> WitnessError {
         FirestoreWitnessTransportError::TooLarge | FirestoreWitnessTransportError::Protocol => {
             WitnessError::Corrupt
         }
+        FirestoreWitnessTransportError::DefinitelyPresentInvalid => WitnessError::Corrupt,
         FirestoreWitnessTransportError::Unavailable
         | FirestoreWitnessTransportError::Aborted
         | FirestoreWitnessTransportError::OutcomeUnknown => WitnessError::Unavailable,
@@ -1490,8 +1654,9 @@ fn decode_read(
 }
 
 /// Strictly decodes one already size-bounded JSON object from Firestore's
-/// `batchGet` response array. The expected document prevents a substituted name from
-/// becoming an authority record.
+/// `batchGet` response array. The expected document prevents a substituted
+/// name from becoming an authority record. The outer exact parser preserves
+/// rejected `found` evidence so it can never become evidence of absence.
 fn parse_batch_get_response(
     value: &Value,
     expected_document: &str,
@@ -1589,8 +1754,9 @@ fn parse_batch_get_response(
 
 /// Parses exactly one size-bounded batch-get response object. A concrete HTTP
 /// transport must cap the complete JSON response array before deserializing
-/// it, require exactly one object, then pass that object here; an empty or
-/// multi-object response is a protocol failure rather than a partial read.
+/// it, require exactly one object, then pass that object here. Empty responses
+/// are protocol failures; rejected multi-object responses preserve definite
+/// presence when a `found` document was included.
 pub(crate) fn parse_exact_batch_get_stream<'a>(
     responses: impl IntoIterator<Item = &'a [u8]>,
     expected_document: &str,
@@ -1604,9 +1770,19 @@ pub(crate) fn parse_exact_batch_get_stream<'a>(
     }
     let response: Value =
         serde_json::from_slice(response).map_err(|_| FirestoreWitnessTransportError::Protocol)?;
-    let parsed = parse_batch_get_response(&response, expected_document)?;
+    let parsed = parse_batch_get_response(&response, expected_document).map_err(|error| {
+        if response.get("found").is_some() {
+            FirestoreWitnessTransportError::DefinitelyPresentInvalid
+        } else {
+            error
+        }
+    })?;
     if responses.next().is_some() {
-        return Err(FirestoreWitnessTransportError::Protocol);
+        return Err(if parsed.record.is_some() {
+            FirestoreWitnessTransportError::DefinitelyPresentInvalid
+        } else {
+            FirestoreWitnessTransportError::Protocol
+        });
     }
     Ok(parsed)
 }
@@ -1977,6 +2153,17 @@ pub(crate) enum FirestoreWitnessCommitError {
     OutcomeUnknown,
 }
 
+/// Phase-precise initial witness create outcome. `DefinitelyUnsent` is
+/// returned only before the durable send-start marker exists. Once it exists,
+/// every transport failure remains `OutcomeUnknown` until an exact read
+/// resolves the retained candidate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FirestoreWitnessBootstrapError {
+    DefinitelyUnsent(WitnessError),
+    Rejected(WitnessError),
+    OutcomeUnknown,
+}
+
 #[derive(Debug)]
 enum FirestoreUpdateError {
     Rejected(WitnessError),
@@ -2139,6 +2326,185 @@ impl FirestoreWitness {
             }
         }
     }
+    async fn commit_initial_witness(
+        &self,
+        token: &FirestoreWitnessBearerToken,
+        transaction: &FirestoreTransaction,
+        document: &str,
+        admission: &ActiveCreateAdmission,
+        send_started: &WitnessSendStarted,
+        encoded: &[u8; WITNESS_RECORD_BYTES],
+    ) -> std::result::Result<(), FirestoreWitnessBootstrapError> {
+        if admission.archive_id() != send_started.archive_id()
+            || admission.attempt_id() != send_started.attempt_id()
+            || admission.revision() != send_started.admission_revision()
+            || admission.artifact_ordinal() != 2
+            || admission.artifact_hash() != send_started.expected_hash()
+            || <[u8; 32]>::from(Sha256::digest(encoded)) != admission.artifact_hash()
+        {
+            return Err(FirestoreWitnessBootstrapError::Rejected(
+                WitnessError::CompareFailed,
+            ));
+        }
+        // At this point the transport request may be accepted before any
+        // response is available. Apart from a definitive precondition
+        // rejection, all provider/transport outcomes are ambiguous.
+        match self
+            .transport
+            .commit_full_record(
+                token.as_str(),
+                transaction,
+                commit_request_json(document, transaction, encoded, None),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(FirestoreWitnessTransportError::PreconditionFailed) => {
+                // A prior response-ambiguous attempt may have committed
+                // between this transaction's exact read and its create
+                // precondition. Only a fresh exact read can distinguish that
+                // success from a competing document. Absence or read failure
+                // remains ambiguous once send-start is durable.
+                match self.fresh_record(admission.archive_id()).await {
+                    Ok((_, Some(observed))) if observed == *encoded => Ok(()),
+                    Ok((_, Some(_))) => Err(FirestoreWitnessBootstrapError::Rejected(
+                        WitnessError::AlreadyExists,
+                    )),
+                    Ok((_, None)) | Err(_) => Err(FirestoreWitnessBootstrapError::OutcomeUnknown),
+                }
+            }
+            Err(_) => Err(FirestoreWitnessBootstrapError::OutcomeUnknown),
+        }
+    }
+
+    pub(crate) async fn bootstrap_commit_started<D>(
+        &self,
+        admission: &ActiveCreateAdmission,
+        dispatch: &D,
+        bootstrap: WitnessBootstrap,
+    ) -> std::result::Result<WitnessRecord, FirestoreWitnessBootstrapError>
+    where
+        D: WitnessCreateDispatchLedger + ?Sized,
+    {
+        let archive_id = bootstrap.archive_id();
+        if admission.archive_id() != archive_id || admission.artifact_ordinal() != 2 {
+            return Err(FirestoreWitnessBootstrapError::Rejected(
+                WitnessError::CompareFailed,
+            ));
+        }
+        let document = self.namespace.document(archive_id);
+        let mut send_started = None;
+        for attempt in 0..MAX_ABORTED_ATTEMPTS {
+            let token = match self.token().await {
+                Ok(token) => token,
+                Err(error) if send_started.is_none() => {
+                    return Err(FirestoreWitnessBootstrapError::DefinitelyUnsent(error))
+                }
+                Err(_) => return Err(FirestoreWitnessBootstrapError::OutcomeUnknown),
+            };
+            let transaction = match self
+                .transport
+                .begin_read_write(token.as_str(), begin_request_json())
+                .await
+            {
+                Ok(transaction) => transaction,
+                Err(error) if send_started.is_none() => {
+                    return Err(FirestoreWitnessBootstrapError::DefinitelyUnsent(
+                        map_transport(error),
+                    ))
+                }
+                Err(_) => return Err(FirestoreWitnessBootstrapError::OutcomeUnknown),
+            };
+            let read = match self
+                .transport
+                .batch_get_exact(
+                    token.as_str(),
+                    &transaction,
+                    batch_get_request_json(&document, Some(&transaction)),
+                )
+                .await
+            {
+                Ok(read) => read,
+                Err(error) if send_started.is_none() => {
+                    return Err(FirestoreWitnessBootstrapError::DefinitelyUnsent(
+                        map_transport(error),
+                    ))
+                }
+                Err(_) => return Err(FirestoreWitnessBootstrapError::OutcomeUnknown),
+            };
+            let existing = decode_read(&read, archive_id).map_err(|error| {
+                if send_started.is_none() {
+                    FirestoreWitnessBootstrapError::DefinitelyUnsent(error)
+                } else {
+                    FirestoreWitnessBootstrapError::OutcomeUnknown
+                }
+            })?;
+            let encoded = bootstrap.expected_initial_record_bytes().map_err(|error| {
+                if send_started.is_none() {
+                    FirestoreWitnessBootstrapError::DefinitelyUnsent(error)
+                } else {
+                    FirestoreWitnessBootstrapError::OutcomeUnknown
+                }
+            })?;
+            if let Some(existing) = existing {
+                let record = WitnessRecord::decode(&existing)
+                    .map_err(FirestoreWitnessBootstrapError::Rejected)?;
+                let candidate = WitnessRecord::decode(&encoded)
+                    .map_err(FirestoreWitnessBootstrapError::Rejected)?;
+                return if record == candidate && send_started.is_some() {
+                    Ok(record)
+                } else {
+                    Err(FirestoreWitnessBootstrapError::Rejected(
+                        WitnessError::AlreadyExists,
+                    ))
+                };
+            }
+            let record = WitnessRecord::decode(&encoded)
+                .map_err(FirestoreWitnessBootstrapError::DefinitelyUnsent)?;
+            if <[u8; 32]>::from(Sha256::digest(encoded)) != admission.artifact_hash() {
+                return Err(FirestoreWitnessBootstrapError::Rejected(
+                    WitnessError::CompareFailed,
+                ));
+            }
+            if send_started.is_none() {
+                send_started = Some(
+                    dispatch
+                        .mark_witness_send_started(admission)
+                        .await
+                        .map_err(|_| {
+                            FirestoreWitnessBootstrapError::DefinitelyUnsent(
+                                WitnessError::CompareFailed,
+                            )
+                        })?,
+                );
+            }
+            match self
+                .commit_initial_witness(
+                    &token,
+                    &transaction,
+                    &document,
+                    admission,
+                    send_started.as_ref().expect("set before commit"),
+                    &encoded,
+                )
+                .await
+            {
+                Ok(()) => return Ok(record),
+                Err(FirestoreWitnessBootstrapError::OutcomeUnknown)
+                    if attempt + 1 < MAX_ABORTED_ATTEMPTS =>
+                {
+                    // Only an exact transaction reread may resolve whether an
+                    // ABORTED/ambiguous attempt created the candidate. The
+                    // durable marker is intentionally retained across retry.
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(FirestoreWitnessBootstrapError::OutcomeUnknown)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn bootstrap_async(
         &self,
         bootstrap: WitnessBootstrap,
@@ -2405,6 +2771,49 @@ impl ExactLegacyWitness for FirestoreWitness {
         self.read_current_async(archive_id)
             .await?
             .ok_or(WitnessError::MissingArchive)
+    }
+}
+
+#[async_trait::async_trait]
+impl ExactPreWitnessReader for FirestoreWitness {
+    async fn read_exact_witness(
+        &self,
+        archive_id: ArchiveId,
+    ) -> std::result::Result<ExactPreWitnessObservation, PreWitnessDispositionError> {
+        let token = self
+            .token()
+            .await
+            .map_err(|_| PreWitnessDispositionError::WitnessRead)?;
+        let document = self.namespace.document(archive_id);
+        let read = match self
+            .transport
+            .read_exact(token.as_str(), batch_get_request_json(&document, None))
+            .await
+        {
+            Ok(read) => read,
+            Err(FirestoreWitnessTransportError::DefinitelyPresentInvalid) => {
+                return Ok(ExactPreWitnessObservation::DefinitelyPresentInvalid)
+            }
+            Err(_) => return Err(PreWitnessDispositionError::WitnessRead),
+        };
+        match (&read.record, &read.update_time) {
+            (None, None) => decode_read(&read, archive_id)
+                .map(|_| ExactPreWitnessObservation::Absent)
+                .map_err(|_| PreWitnessDispositionError::Corrupt),
+            (Some(_), Some(_)) => match decode_read(&read, archive_id) {
+                Ok(Some(bytes)) => match WitnessRecord::decode(&bytes) {
+                    Ok(record) => Ok(ExactPreWitnessObservation::Present(Box::new(record))),
+                    Err(_) => Ok(ExactPreWitnessObservation::DefinitelyPresentInvalid),
+                },
+                Ok(None) | Err(_) => Ok(ExactPreWitnessObservation::DefinitelyPresentInvalid),
+            },
+            // Private transport implementations can only construct a read
+            // through strict parsing; nevertheless, fail closed as definite
+            // presence if either found-side field survived alone.
+            (Some(_), None) | (None, Some(_)) => {
+                Ok(ExactPreWitnessObservation::DefinitelyPresentInvalid)
+            }
+        }
     }
 }
 

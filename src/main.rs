@@ -87,6 +87,9 @@ mod archive_v3_lifecycle;
 // Inactive exact-name, control-key-derived encrypted lifecycle page store. It
 // has no provider implementation, list API, runtime construction, or walker.
 mod archive_v3_lifecycle_page_store;
+// Inactive capability-only resolution for deletion before the first witness
+// send. It has injected exact-read/control boundaries and no runtime caller.
+mod archive_v3_witness_disposition;
 // Inactive authenticated inventory coordinator. It joins exact tombstoned
 // witness recovery, the frozen lifecycle snapshot, reachability, and encrypted
 // v2 pages without startup/runtime/provider construction or deletion calls.

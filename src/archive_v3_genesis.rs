@@ -29,6 +29,7 @@ use crate::{
     archive_v3_lifecycle::{
         ActiveCreateAdmission, ArchiveLifecycleLedger, BootstrapAttemptId,
         DurableBootstrapReservation, LifecycleCreateOutcome, LifecycleError, PreparedBootstrap,
+        WitnessCreateDispatchLedger,
     },
     archive_v3_witness::{
         DeletionState, ExactRootProvider, KeyRegistryReference, RootCommitment, RootReference,
@@ -40,6 +41,49 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroizing;
+
+mod witness_creator_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed initial-witness creator. Production has exactly one implementation:
+/// the Firestore adapter's commit-start-aware protocol. A future composite can
+/// select that implementation but cannot replace the create hook with one
+/// that accepts raw witness authority and skips the durable marker.
+#[async_trait]
+pub(crate) trait WitnessBootstrapCreator:
+    witness_creator_sealed::Sealed + Send + Sync
+{
+    async fn create_commit_started_witness(
+        &self,
+        dispatch: &(dyn ArchiveGenesisBackend + Sync),
+        admission: &ActiveCreateAdmission,
+        bootstrap: WitnessBootstrap,
+    ) -> Result<BootstrapCreate, BootstrapError>;
+}
+
+impl witness_creator_sealed::Sealed for crate::archive_v3_firestore_witness::FirestoreWitness {}
+
+#[async_trait]
+impl WitnessBootstrapCreator for crate::archive_v3_firestore_witness::FirestoreWitness {
+    async fn create_commit_started_witness(
+        &self,
+        dispatch: &(dyn ArchiveGenesisBackend + Sync),
+        admission: &ActiveCreateAdmission,
+        bootstrap: WitnessBootstrap,
+    ) -> Result<BootstrapCreate, BootstrapError> {
+        use crate::archive_v3_firestore_witness::FirestoreWitnessBootstrapError;
+
+        self.bootstrap_commit_started(admission, dispatch, bootstrap)
+            .await
+            .map(|_| BootstrapCreate::Created)
+            .map_err(|error| match error {
+                FirestoreWitnessBootstrapError::DefinitelyUnsent(error)
+                | FirestoreWitnessBootstrapError::Rejected(error) => BootstrapError::Witness(error),
+                FirestoreWitnessBootstrapError::OutcomeUnknown => BootstrapError::OutcomeUnknown,
+            })
+    }
+}
 
 /// A control-plane-owned, opaque persistent archive binding.  It intentionally
 /// accepts neither a user ID nor a value derived from one.
@@ -281,8 +325,10 @@ pub(crate) enum BootstrapError {
 /// create-if-absent semantics.  No implementation is constructed here.
 #[async_trait]
 pub(crate) trait ArchiveGenesisBackend:
-    ExactRootProvider + ExactKeyRegistryProvider + ArchiveLifecycleLedger
+    ExactRootProvider + ExactKeyRegistryProvider + ArchiveLifecycleLedger + WitnessCreateDispatchLedger
 {
+    fn witness_bootstrap_creator(&self) -> &dyn WitnessBootstrapCreator;
+
     async fn read_witness(
         &self,
         archive_id: ArchiveId,
@@ -301,12 +347,6 @@ pub(crate) trait ArchiveGenesisBackend:
         admission: &ActiveCreateAdmission,
         context: &ObjectContext,
         envelope: &CiphertextEnvelope,
-    ) -> Result<BootstrapCreate, BootstrapError>;
-
-    async fn create_witness_if_absent(
-        &self,
-        admission: &ActiveCreateAdmission,
-        bootstrap: WitnessBootstrap,
     ) -> Result<BootstrapCreate, BootstrapError>;
 }
 
@@ -352,11 +392,20 @@ impl ArchiveGenesis {
             .await?
         {
             self.authenticate_stable_record(backend, &record).await?;
-            let fresh_revision = backend
-                .revalidate_active(self.candidate.binding.archive_id(), lifecycle_revision)
+            let exact_encoded = record.encode();
+            let adopted_revision = backend
+                .adopt_existing_witness(
+                    self.candidate.binding.archive_id(),
+                    lifecycle_revision,
+                    &exact_encoded,
+                )
                 .await
                 .map_err(BootstrapError::Lifecycle)?;
-            if fresh_revision != lifecycle_revision {
+            let fresh_revision = backend
+                .revalidate_active(self.candidate.binding.archive_id(), adopted_revision)
+                .await
+                .map_err(BootstrapError::Lifecycle)?;
+            if fresh_revision != adopted_revision {
                 return Err(BootstrapError::Lifecycle(LifecycleError::StaleRevision));
             }
             return Ok(GenesisResolution::Existing);
@@ -389,7 +438,8 @@ impl ArchiveGenesis {
             Sha256::digest(expected_record).into(),
         )?;
         let outcome = backend
-            .create_witness_if_absent(&admission, bootstrap)
+            .witness_bootstrap_creator()
+            .create_commit_started_witness(backend, &admission, bootstrap)
             .await;
         let reconciliation = match &outcome {
             Ok(BootstrapCreate::Created) => Some(LifecycleCreateOutcome::Created),
@@ -637,6 +687,7 @@ impl fmt::Debug for ArchiveGenesis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_v3_lifecycle::WitnessSendStarted;
     use crate::{
         archive_v3::{
             ArchiveCipher, ArchiveDek, ArchiveRoot, ARCHIVE_FORMAT_VERSION, SQLITE_PAGE_SIZE,
@@ -649,6 +700,7 @@ mod tests {
     enum WriteMode {
         Normal,
         LostResponse,
+        CommitThenReadUnavailable,
         LostResponseMismatch,
         Collision,
     }
@@ -689,6 +741,7 @@ mod tests {
         expected_root_hash: [u8; 32],
         prepared_witness_hash: Mutex<Option<[u8; 32]>>,
         admission_fault: Mutex<Option<(u32, AdmissionFault)>>,
+        fail_next_witness_read: Mutex<bool>,
     }
 
     impl FakeBackend {
@@ -712,6 +765,7 @@ mod tests {
                 expected_root_hash: genesis.candidate.root_envelope.hash(),
                 prepared_witness_hash: Mutex::new(None),
                 admission_fault: Mutex::new(None),
+                fail_next_witness_read: Mutex::new(false),
             }
         }
 
@@ -734,7 +788,9 @@ mod tests {
         fn result_for(mode: WriteMode, inserted: bool) -> Result<BootstrapCreate, BootstrapError> {
             if matches!(
                 mode,
-                WriteMode::LostResponse | WriteMode::LostResponseMismatch
+                WriteMode::LostResponse
+                    | WriteMode::CommitThenReadUnavailable
+                    | WriteMode::LostResponseMismatch
             ) && inserted
             {
                 Err(BootstrapError::OutcomeUnknown)
@@ -973,6 +1029,26 @@ mod tests {
             Ok(*revision)
         }
 
+        async fn adopt_existing_witness(
+            &self,
+            archive_id: ArchiveId,
+            expected_revision: u64,
+            exact_encoded_record: &[u8],
+        ) -> std::result::Result<u64, LifecycleError> {
+            self.event("adopt_existing_witness");
+            let exact_hash: [u8; 32] = Sha256::digest(exact_encoded_record).into();
+            if archive_id != ArchiveId::from_bytes([1; 16])
+                || self.prepared_witness_hash.lock().unwrap().as_ref() != Some(&exact_hash)
+            {
+                return Err(LifecycleError::InvalidState);
+            }
+            let revision = *self.lifecycle_revision.lock().unwrap();
+            if revision != expected_revision {
+                return Err(LifecycleError::StaleRevision);
+            }
+            Ok(revision)
+        }
+
         async fn freeze_for_deletion(
             &self,
             _archive_id: ArchiveId,
@@ -1032,11 +1108,70 @@ mod tests {
     }
 
     #[async_trait]
+    impl WitnessCreateDispatchLedger for FakeBackend {
+        async fn mark_witness_send_started(
+            &self,
+            admission: &ActiveCreateAdmission,
+        ) -> Result<WitnessSendStarted, LifecycleError> {
+            self.event("mark_witness_send_started");
+            WitnessSendStarted::for_test(admission, [91; 32])
+        }
+    }
+
+    impl witness_creator_sealed::Sealed for FakeBackend {}
+
+    #[async_trait]
+    impl WitnessBootstrapCreator for FakeBackend {
+        async fn create_commit_started_witness(
+            &self,
+            dispatch: &(dyn ArchiveGenesisBackend + Sync),
+            admission: &ActiveCreateAdmission,
+            bootstrap: WitnessBootstrap,
+        ) -> Result<BootstrapCreate, BootstrapError> {
+            if admission.artifact_ordinal() != 2 {
+                return Err(BootstrapError::Lifecycle(LifecycleError::InvalidState));
+            }
+            let send_started = dispatch
+                .mark_witness_send_started(admission)
+                .await
+                .map_err(BootstrapError::Lifecycle)?;
+            if send_started.archive_id() != admission.archive_id()
+                || send_started.attempt_id() != admission.attempt_id()
+                || send_started.admission_revision() != admission.revision()
+                || send_started.expected_hash() != admission.artifact_hash()
+            {
+                return Err(BootstrapError::Lifecycle(LifecycleError::InvalidState));
+            }
+            self.event("create_witness");
+            self.hit();
+            let result = self
+                .witness
+                .bootstrap(bootstrap)
+                .map_err(|error| match error {
+                    WitnessError::AlreadyExists => BootstrapError::Conflict,
+                    other => BootstrapError::Witness(other),
+                })?;
+            let _ = result;
+            if self.witness_mode == WriteMode::CommitThenReadUnavailable {
+                *self.fail_next_witness_read.lock().unwrap() = true;
+            }
+            Self::result_for(self.witness_mode, true)
+        }
+    }
+
+    #[async_trait]
     impl ArchiveGenesisBackend for FakeBackend {
+        fn witness_bootstrap_creator(&self) -> &dyn WitnessBootstrapCreator {
+            self
+        }
+
         async fn read_witness(
             &self,
             archive: ArchiveId,
         ) -> Result<Option<WitnessRecord>, BootstrapError> {
+            if std::mem::take(&mut *self.fail_next_witness_read.lock().unwrap()) {
+                return Err(BootstrapError::Witness(WitnessError::Unavailable));
+            }
             self.hit();
             if let Some(record) = self.forced_record.lock().unwrap().clone() {
                 return Ok(Some(record));
@@ -1107,26 +1242,6 @@ mod tests {
                 return Err(BootstrapError::Conflict);
             }
             Self::result_for(self.root_mode, true)
-        }
-        async fn create_witness_if_absent(
-            &self,
-            admission: &ActiveCreateAdmission,
-            bootstrap: WitnessBootstrap,
-        ) -> Result<BootstrapCreate, BootstrapError> {
-            if admission.artifact_ordinal() != 2 {
-                return Err(BootstrapError::Lifecycle(LifecycleError::InvalidState));
-            }
-            self.event("create_witness");
-            self.hit();
-            let result = self
-                .witness
-                .bootstrap(bootstrap)
-                .map_err(|error| match error {
-                    WitnessError::AlreadyExists => BootstrapError::Conflict,
-                    other => BootstrapError::Witness(other),
-                })?;
-            let _ = result;
-            Self::result_for(self.witness_mode, true)
         }
     }
 
@@ -1212,6 +1327,7 @@ mod tests {
                 "create_root",
                 "prepare_witness",
                 "admit_witness",
+                "mark_witness_send_started",
                 "create_witness",
             ]
         );
@@ -1291,6 +1407,44 @@ mod tests {
             genesis.resolve(&backend).await.unwrap(),
             GenesisResolution::Existing
         );
+    }
+
+    #[tokio::test]
+    async fn restart_adopts_exact_commit_lost_before_lifecycle_reconcile() {
+        let (genesis, plaintext) = candidate();
+        let backend = FakeBackend {
+            witness_mode: WriteMode::CommitThenReadUnavailable,
+            ..FakeBackend::new(&genesis, plaintext)
+        };
+        assert_eq!(
+            genesis.resolve(&backend).await,
+            Err(BootstrapError::Witness(WitnessError::Unavailable))
+        );
+        assert_eq!(
+            genesis.resolve(&backend).await.unwrap(),
+            GenesisResolution::Existing
+        );
+        assert!(backend
+            .events
+            .lock()
+            .unwrap()
+            .contains(&"adopt_existing_witness"));
+    }
+
+    #[test]
+    fn witness_create_surface_is_sealed_and_has_no_raw_backend_hook() {
+        let source = include_str!("archive_v3_genesis.rs");
+        let sealed_trait = concat!("trait WitnessBootstrap", "Creator:");
+        let sealed_module = concat!("mod witness_creator_", "sealed");
+        let production_impl = concat!(
+            "impl WitnessBootstrapCreator for crate::archive_v3_firestore_witness::",
+            "FirestoreWitness"
+        );
+        let raw_backend_hook = concat!("async fn create_witness_", "if_absent");
+        assert!(source.contains(sealed_trait));
+        assert!(source.contains(sealed_module));
+        assert!(source.contains(production_impl));
+        assert!(!source.contains(raw_backend_hook));
     }
     #[tokio::test]
     async fn existing_path_rejects_freeze_before_final_lifecycle_reread() {
