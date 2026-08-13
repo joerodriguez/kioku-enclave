@@ -21,14 +21,14 @@ MEDIA_BUCKET = "kioku-production-media"
 
 def manifest() -> dict[str, object]:
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "source_repository": "https://github.com/owner/repository",
         "source_ref": "v1.2.3",
         "source_commit": COMMIT,
         "image_uri": f"{IMAGE_REPOSITORY}:abc1234-123",
         "image_digest_uri": f"{IMAGE_REPOSITORY}@{DIGEST}",
         "image_digest": DIGEST,
-        "build_url": "https://github.com/owner/repository/actions/runs/123",
+        "release_url": "https://github.com/owner/repository/releases/tag/v1.2.3",
         "build_profile": "production",
         "voice_quality_gate": "owner_only_unvalidated",
         "billing_enforcement_mode": "shadow",
@@ -212,6 +212,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         tag = "v1.2.3-witness-probe.1"
         data = manifest()
         data["source_ref"] = tag
+        data["release_url"] = "https://github.com/owner/repository/releases/tag/" + tag
         data.update({
             "archive_witness_shadow_mode": "probe-v1",
             "archive_witness_project_id": "project-1",
@@ -234,6 +235,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertEqual(verified["archive_witness_database_id"], "witness-db")
 
         data["source_ref"] = "v1.2.3"
+        data["release_url"] = "https://github.com/owner/repository/releases/tag/v1.2.3"
         completed = self.verify(data, tag="v1.2.3", probe_config=probe)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("exact vX.Y.Z-witness-probe.N", completed.stderr)
@@ -280,12 +282,12 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("must be exact off", completed.stderr)
 
-    def test_schema_v6_manifest_is_ineligible_for_promotion(self) -> None:
+    def test_schema_v7_manifest_is_ineligible_for_promotion(self) -> None:
         data = manifest()
-        data["schema_version"] = 6
+        data["schema_version"] = 7
         completed = self.verify(data)
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("schema_version must be 7", completed.stderr)
+        self.assertIn("schema_version must be 8", completed.stderr)
 
 
 if __name__ == "__main__":
