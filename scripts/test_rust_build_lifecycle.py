@@ -303,7 +303,10 @@ class RustBuildLifecycleTests(unittest.TestCase):
                 target.symlink_to(outside, target_is_directory=True)
             original_rename(source, destination)
 
-        with mock.patch.object(RETIRE_MODULE.os, "rename", side_effect=swap_then_rename):
+        with (
+            mock.patch.object(RETIRE_MODULE.os, "rename", side_effect=swap_then_rename),
+            mock.patch.object(RETIRE_MODULE, "validate_no_active_rust_process"),
+        ):
             with self.assertRaisesRegex(SystemExit, "identity changed; preserved at") as raised:
                 RETIRE_MODULE.remove_target(target, expected)
 
