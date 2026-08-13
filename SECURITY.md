@@ -75,17 +75,22 @@ surfaces.
   manifest that is itself a GitHub-signed provenance subject. Runtime has no missing
   legacy-bucket fallback; an unsigned/copied or older manifest is not promotion evidence.
   This is not archive-v3 wiring, a deletion action, or deployment authority.
-- The ADR-0022 Firestore transport probe is non-authoritative and defaults to
-  `ARCHIVE_WITNESS_SHADOW_MODE=off` in both checked-in image profiles. Off requires
-  empty project/number/database fields. `probe-v1`, if separately reviewed and baked,
-  can touch only `archive_witness_transport_probe_v1/singleton`, whose sole `r` field
-  is a strict fixed-size magic/version, monotonic generation, and random opaque attempt
-  ID. It runs as at most one retained startup task, has no Store/AppState/CpState/route/
-  health/admission/deletion/acknowledgement connection, and never constructs a witness
-  bootstrap or changes canonical archive-witness state. Commit ambiguity is never
-  blindly retried and is confirmed only by rereading the exact attempt. Schema-v6
+- The ADR-0022 Firestore transport probe is non-authoritative and the exact checked-in
+  `config/archive-witness-probe.json` defaults to `off` with empty project/number/database
+  fields. Build selection and signed-metadata verification use one strict parser; no
+  repository variable or manual-dispatch witness input can override it, evaluation and
+  main builds force it off, and `probe-v1` is eligible only for an exact
+  `vX.Y.Z-witness-probe.N` prerelease that `release.sh --roll` rejects. Off constructs no
+  Firestore credentials or transport and performs zero I/O. A probe prerelease awaits one
+  bounded attempt before any application Store/KMS/GCS construction, emits only a fixed
+  redacted outcome, and continues startup regardless of that outcome. It can touch only
+  `archive_witness_transport_probe_v1/singleton`, whose sole `r` field is a strict fixed-size
+  magic/version, monotonic generation, and random opaque attempt ID. It has no AppState/
+  CpState/route/health/admission/deletion/acknowledgement connection, never constructs a
+  witness bootstrap, and cannot change canonical archive-witness state. Commit ambiguity is
+  never blindly retried and is confirmed only by rereading the exact attempt. Schema-v6
   signed release metadata binds the mode and complete-or-empty namespace but grants no
-  Firestore, rollout, or archive authority.
+  Firestore, rollout, health, or archive authority.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL

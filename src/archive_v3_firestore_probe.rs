@@ -17,6 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use crate::{
@@ -32,6 +33,7 @@ pub(crate) const PROBE_COLLECTION: &str = "archive_witness_transport_probe_v1";
 pub(crate) const PROBE_DOCUMENT_ID: &str = "singleton";
 pub(crate) const PROBE_RECORD_BYTES: usize = 64;
 static PROBE_TASK_STARTED: AtomicBool = AtomicBool::new(false);
+const PROBE_STARTUP_DEADLINE: Duration = Duration::from_secs(120);
 const PROBE_MAGIC: &[u8; 16] = b"KIOKU-WIT-PROBE\0";
 const PROBE_VERSION: u32 = 1;
 const GENERATION_OFFSET: usize = 24;
@@ -45,6 +47,21 @@ pub(crate) enum FirestoreProbeOutcome {
     Stale,
     OutcomeUnknown,
     Failed,
+    TimedOut,
+}
+
+impl FirestoreProbeOutcome {
+    /// Fixed content-free marker used by the sole startup log. No provider
+    /// error, namespace, attempt, record, or timing is exposed.
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Stale => "stale",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+        }
+    }
 }
 
 /// Image-baked startup selector. `Off` is the checked-in default; `ProbeV1`
@@ -113,52 +130,33 @@ impl fmt::Debug for FirestoreProbeStartupConfig {
     }
 }
 
-/// Retains the sole startup probe task for the complete server lifetime.
-/// Dropping it synchronously aborts the future, including any auth/read/commit
-/// await, and prevents a detached retry from surviving shutdown/startup error.
-pub(crate) struct FirestoreProbeTaskGuard {
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl FirestoreProbeTaskGuard {
-    pub(crate) fn start(config: FirestoreProbeStartupConfig) -> Result<Self, WitnessError> {
-        match (config.mode, config.witness) {
-            (FirestoreProbeMode::Off, None) => Ok(Self { task: None }),
-            (FirestoreProbeMode::ProbeV1, Some(config)) => {
-                if PROBE_TASK_STARTED
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    return Err(WitnessError::Synchronization);
-                }
-                let runner = FirestoreProbeRunner::new(config)?;
-                let task = tokio::spawn(async move {
-                    let outcome = runner.run_once().await;
-                    tracing::info!(outcome = ?outcome, "archive witness transport probe finished");
-                });
-                Ok(Self { task: Some(task) })
+/// Await the sole bounded one-shot probe before any application Store, KMS, or
+/// GCS construction. Off returns without constructing credentials or transport.
+/// The fixed marker is logged here and the outcome is not returned, so callers
+/// cannot connect it to readiness, health, admission, or archive authority.
+pub(crate) async fn run_startup_probe(
+    config: FirestoreProbeStartupConfig,
+) -> Result<(), WitnessError> {
+    match (config.mode, config.witness) {
+        (FirestoreProbeMode::Off, None) => Ok(()),
+        (FirestoreProbeMode::ProbeV1, Some(config)) => {
+            if PROBE_TASK_STARTED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(WitnessError::Synchronization);
             }
-            _ => Err(WitnessError::Malformed),
+            let runner = FirestoreProbeRunner::new(config)?;
+            let outcome = tokio::time::timeout(PROBE_STARTUP_DEADLINE, runner.run_once())
+                .await
+                .unwrap_or(FirestoreProbeOutcome::TimedOut);
+            tracing::info!(
+                outcome = outcome.marker(),
+                "archive witness transport probe finished"
+            );
+            Ok(())
         }
-    }
-
-    #[cfg(test)]
-    fn from_test_task(task: tokio::task::JoinHandle<()>) -> Self {
-        Self { task: Some(task) }
-    }
-}
-
-impl Drop for FirestoreProbeTaskGuard {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
-impl fmt::Debug for FirestoreProbeTaskGuard {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("FirestoreProbeTaskGuard(<redacted>)")
+        _ => Err(WitnessError::Malformed),
     }
 }
 
@@ -379,9 +377,8 @@ mod tests {
     #[test]
     fn startup_config_is_all_or_nothing_and_off_has_empty_namespace() {
         let off = FirestoreProbeStartupConfig::from_values("off", "", "", "").unwrap();
-        let guard = FirestoreProbeTaskGuard::start(off).unwrap();
-        assert!(guard.task.is_none());
-        assert_eq!(format!("{guard:?}"), "FirestoreProbeTaskGuard(<redacted>)");
+        assert_eq!(off.mode, FirestoreProbeMode::Off);
+        assert!(off.witness.is_none());
         assert!(FirestoreProbeStartupConfig::from_values(
             "probe-v1",
             "project-1",
@@ -404,22 +401,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_task_guard_cancels_the_retained_task() {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let never = Arc::new(tokio::sync::Notify::new());
-        let task = tokio::spawn({
-            let entered = Arc::clone(&entered);
-            let never = Arc::clone(&never);
-            async move {
-                entered.notify_one();
-                never.notified().await;
-            }
-        });
-        entered.notified().await;
-        let abort = task.abort_handle();
-        let guard = FirestoreProbeTaskGuard::from_test_task(task);
-        drop(guard);
-        tokio::task::yield_now().await;
-        assert!(abort.is_finished());
+    async fn off_startup_probe_is_zero_io_and_has_no_result_authority() {
+        let off = FirestoreProbeStartupConfig::from_values("off", "", "", "").unwrap();
+        run_startup_probe(off).await.unwrap();
+    }
+
+    #[test]
+    fn outcome_markers_are_fixed_and_content_free() {
+        assert_eq!(FirestoreProbeOutcome::Confirmed.marker(), "confirmed");
+        assert_eq!(FirestoreProbeOutcome::Stale.marker(), "stale");
+        assert_eq!(
+            FirestoreProbeOutcome::OutcomeUnknown.marker(),
+            "outcome_unknown"
+        );
+        assert_eq!(FirestoreProbeOutcome::Failed.marker(), "failed");
+        assert_eq!(FirestoreProbeOutcome::TimedOut.marker(), "timed_out");
     }
 }
