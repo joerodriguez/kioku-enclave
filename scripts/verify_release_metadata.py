@@ -9,6 +9,12 @@ from pathlib import Path
 import re
 import sys
 
+from archive_witness_probe_config import (
+    ProbeConfigError,
+    load_probe_config,
+    select_probe_config,
+)
+
 
 BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]\Z")
 DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -147,12 +153,14 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         data["archive_witness_project_number"],
         data["archive_witness_database_id"],
     )
-    expected_probe_claim = (
-        arguments.expected_archive_witness_shadow_mode,
-        arguments.expected_archive_witness_project_id,
-        arguments.expected_archive_witness_project_number,
-        arguments.expected_archive_witness_database_id,
-    )
+    try:
+        expected_probe_claim = select_probe_config(
+            load_probe_config(arguments.archive_witness_probe_config),
+            profile="production",
+            source_ref=arguments.tag,
+        ).as_claim()
+    except ProbeConfigError as error:
+        reject(str(error))
     if probe_claim != expected_probe_claim:
         reject("archive witness probe claim does not match the release configuration")
     mode, project_id, project_number, database_id = probe_claim
@@ -180,10 +188,11 @@ def main() -> None:
     parser.add_argument("--expected-gcs-bucket", required=True)
     parser.add_argument("--expected-gcs-media-bucket", required=True)
     parser.add_argument("--expected-gcs-legacy-media-bucket", required=True)
-    parser.add_argument("--expected-archive-witness-shadow-mode", default="off")
-    parser.add_argument("--expected-archive-witness-project-id", default="")
-    parser.add_argument("--expected-archive-witness-project-number", default="")
-    parser.add_argument("--expected-archive-witness-database-id", default="")
+    parser.add_argument(
+        "--archive-witness-probe-config",
+        type=Path,
+        default=Path("config/archive-witness-probe.json"),
+    )
     arguments = parser.parse_args()
     data = parse_metadata(arguments.metadata)
     validate(arguments, data)
