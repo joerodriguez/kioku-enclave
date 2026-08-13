@@ -327,10 +327,29 @@ pub struct WalSegment {
 
 impl Drop for WalSegment {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let observe_zeroization = self.frames.get(SQLITE_WAL_FRAME_HEADER_BYTES) == Some(&0xa7);
         self.frames.zeroize();
         self.wal_header.zeroize();
         self.checksum_before.zeroize();
+        #[cfg(test)]
+        if observe_zeroization
+            && self.frames.iter().all(|byte| *byte == 0)
+            && self.wal_header.iter().all(|byte| *byte == 0)
+            && self.checksum_before == [0, 0]
+        {
+            WAL_SEGMENT_ZEROIZATION_OBSERVATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
+}
+
+#[cfg(test)]
+static WAL_SEGMENT_ZEROIZATION_OBSERVATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn wal_segment_zeroization_observations() -> usize {
+    WAL_SEGMENT_ZEROIZATION_OBSERVATIONS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 impl WalSegment {
