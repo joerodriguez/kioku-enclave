@@ -136,7 +136,8 @@ record configuration values, credentials, plaintext, ciphertext, or user identif
 
 ## Local cutover and ongoing checks
 
-After both repositories' local commands have been merged and dry-run successfully:
+Production completed this cutover on 2026-08-13. The guarded sequence below remains the
+audit/recovery reference for another environment; ordinary releases do not repeat it.
 
 1. From the monorepo, bootstrap and verify the exact human-to-deployer and
    human-to-builder impersonation grants:
@@ -161,7 +162,9 @@ After both repositories' local commands have been merged and dry-run successfull
    ```
 
 4. Review and apply the monorepo's local infrastructure plan so Terraform forgets the
-   retired pool and removes the deployer's temporary pool-administration role.
+   retired GitHub pool and bindings. Retain the deployer's pool-administration role:
+   Terraform still manages the separate `enclave-attest` pool/provider used for
+   Confidential Space admission. A fresh post-cutover plan must report no changes.
 
 The setting cutover removes and verifies stale branch-protection status checks before
 disabling Actions; active ruleset status checks must be reviewed and removed separately,
