@@ -287,7 +287,7 @@ pub trait CheckpointSource: Send {
 /// Recovery destination with a fixed caller-owned capacity or a streamed
 /// tmpfs implementation. `abort` is mandatory because the final plaintext
 /// hash can only be checked after streaming the last chunk.
-pub trait CheckpointSink {
+pub trait CheckpointSink: Send {
     fn write_exact(&mut self, logical_offset: u64, bytes: &[u8]) -> Result<()>;
     fn commit(&mut self, logical_file_length: u64) -> Result<()>;
     fn abort(&mut self);
@@ -607,7 +607,7 @@ async fn recover_checkpoint_from_recovery_root_inner<C: CheckpointCipher>(
         .as_ref()
         .ok_or(ArchiveV3Error::Malformed("witness root has no checkpoint"))?
         .clone();
-    let total_chunks = validate_snapshot_length(root.logical_file_length)?;
+    let total_chunks = validate_snapshot_length(root.checkpoint_logical_file_length)?;
     let tree_height = manifest_tree_height(total_chunks)?;
     // Root manifest IDs intentionally equal their checkpoint ID. Together
     // with the deterministic fanout-derived root level/range, every context
@@ -634,7 +634,7 @@ async fn recover_checkpoint_from_recovery_root_inner<C: CheckpointCipher>(
     let expected = ManifestExpectation {
         checkpoint_id,
         total_chunks,
-        logical_file_length: root.logical_file_length,
+        logical_file_length: root.checkpoint_logical_file_length,
         database_plaintext_hash: expected_hash,
     };
     validate_manifest_shape(&root_manifest, tree_height, 0, total_chunks, &expected)?;
@@ -718,11 +718,11 @@ async fn recover_checkpoint_from_recovery_root_inner<C: CheckpointCipher>(
     if <[u8; 32]>::from(database_hash.finalize()) != expected_hash {
         return Err(ArchiveV3Error::Authentication.into());
     }
-    sink.commit(root.logical_file_length)?;
+    sink.commit(root.checkpoint_logical_file_length)?;
     Ok(UploadedCheckpoint {
         checkpoint_id,
         root: checkpoint_reference,
-        logical_file_length: root.logical_file_length,
+        logical_file_length: root.checkpoint_logical_file_length,
         total_chunks,
         database_plaintext_hash: expected_hash,
         user_schema_version: root.user_schema_version,
@@ -1515,14 +1515,17 @@ mod tests {
             key_epoch: cipher.key_epoch(),
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: uploaded.logical_file_length(),
             logical_file_length: uploaded.logical_file_length(),
             user_schema_version: 1,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: Some(uploaded.root().clone()),
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let envelope = cipher.seal(&root_context, &root.encode().unwrap()).unwrap();
         backend

@@ -2002,17 +2002,20 @@ mod tests {
             key_epoch: KeyEpoch::from_bytes([3; 16]),
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: u64::from(SQLITE_PAGE_SIZE),
             user_schema_version: 1,
             storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: Some(ImmutableReference {
                 object_id: ObjectId::from_bytes([8; 16]),
                 envelope_hash: [9; 32],
             }),
-            wal_chain_root: None,
+            wal_commit_tail: None,
         }
     }
 
@@ -2283,14 +2286,17 @@ mod tests {
                 key_epoch: key,
                 owner_fencing_epoch: 0,
                 sqlite_page_size: SQLITE_PAGE_SIZE,
+                checkpoint_logical_file_length: 0,
                 logical_file_length: uploaded.logical_file_length(),
                 user_schema_version: 1,
                 storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
                 wal_generation: 0,
+                wal_commit_count: 0,
                 wal_segment_count: 0,
+                wal_tail_bytes: 0,
                 checkpoint_root: None,
                 extent_tree_root: Some(uploaded.root().clone()),
-                wal_chain_root: None,
+                wal_commit_tail: None,
             },
         )
         .unwrap()
@@ -3471,14 +3477,17 @@ mod tests {
             key_epoch: k,
             owner_fencing_epoch: binding.owner_fence(),
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: binding.plaintext_len(),
             user_schema_version: 1,
             storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: Some(tree.root().clone()),
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let envelope = cipher.seal(&context, &root.encode().unwrap()).unwrap();
 
@@ -3610,17 +3619,20 @@ mod tests {
                 key_epoch: k,
                 owner_fencing_epoch: 0,
                 sqlite_page_size: SQLITE_PAGE_SIZE,
+                checkpoint_logical_file_length: 0,
                 logical_file_length: u64::from(EXTENT_BYTES),
                 user_schema_version: 1,
                 storage_format_version: crate::archive_v3::ARCHIVE_FORMAT_VERSION,
                 wal_generation: 0,
+                wal_commit_count: 0,
                 wal_segment_count: 0,
+                wal_tail_bytes: 0,
                 checkpoint_root: None,
                 extent_tree_root: Some(ImmutableReference {
                     object_id: node_id,
                     envelope_hash: envelope.hash(),
                 }),
-                wal_chain_root: None,
+                wal_commit_tail: None,
             },
         )
         .unwrap();

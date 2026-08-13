@@ -17,10 +17,9 @@
 //! Therefore the public seam accepts only [`PrivateStagedSqliteCopy`] values;
 //! a private helper opens those disposable copies read-write solely for six
 //! fixed FTS commands. It accepts no caller SQL and verifies the expected FTS5
-//! virtual-table/source binding before each command. This inactive release has
-//! no non-test constructor for the staging capability, so original/live paths
-//! cannot reach the write path. Future recovery wiring must mint it only while
-//! creating and owning a fresh private copy.
+//! virtual-table/source binding before each command. The only production mint
+//! consumes an unforgeable proof created by exact composite recovery, so
+//! original/live or caller-selected paths cannot reach the write path.
 
 use std::{
     fmt,
@@ -32,6 +31,7 @@ use std::{
 use rusqlite::{types::ValueRef, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use crate::archive_v3_shadow_wal::CompositeRecoveryProof;
 use crate::cp::sync::{
     canonical_logical_export_stream_digest_guarded, CANONICAL_LOGICAL_EXPORT_VERSION,
 };
@@ -287,12 +287,66 @@ impl PrivateStagedSqliteCopy {
         Ok(Self { path, identity })
     }
 
+    fn from_owned_recovery(proof: CompositeRecoveryProof) -> Result<Self, ShadowParityError> {
+        let path = proof.into_path();
+        let identity = staged_identity(&path)?;
+        Ok(Self { path, identity })
+    }
+
     fn validate_unchanged(&self) -> Result<(), ShadowParityError> {
         if staged_identity(&self.path)? != self.identity {
             return Err(ShadowParityError::InvalidStagedCopy);
         }
         Ok(())
     }
+}
+
+/// Owns the disposable recovered database and every SQLite sidecar name. A
+/// caller may borrow its parity capability but cannot detach the capability
+/// from cleanup ownership.
+pub(crate) struct OwnedPrivateStagedSqliteCopy {
+    copy: PrivateStagedSqliteCopy,
+}
+
+impl OwnedPrivateStagedSqliteCopy {
+    pub(super) fn from_recovery_proof(
+        proof: CompositeRecoveryProof,
+    ) -> Result<Self, ShadowParityError> {
+        Ok(Self {
+            copy: PrivateStagedSqliteCopy::from_owned_recovery(proof)?,
+        })
+    }
+
+    pub(crate) fn copy(&self) -> &PrivateStagedSqliteCopy {
+        &self.copy
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_for_test(&self) -> &Path {
+        &self.copy.path
+    }
+}
+
+impl fmt::Debug for OwnedPrivateStagedSqliteCopy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnedPrivateStagedSqliteCopy(<redacted>)")
+    }
+}
+
+impl Drop for OwnedPrivateStagedSqliteCopy {
+    fn drop(&mut self) {
+        remove_private_sqlite_family(&self.copy.path);
+    }
+}
+
+fn remove_private_sqlite_family(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let _ = std::fs::remove_file(PathBuf::from(wal));
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    let _ = std::fs::remove_file(PathBuf::from(shm));
 }
 
 impl fmt::Debug for PrivateStagedSqliteCopy {
@@ -1757,5 +1811,29 @@ mod tests {
         assert!(!rendered.contains("private OCR"));
         assert!(!rendered.contains(fixtures.primary_path.to_string_lossy().as_ref()));
         assert!(!rendered.contains(fixtures.shadow_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn owned_recovery_capability_removes_database_and_sidecars_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovered.db");
+        std::fs::write(&path, b"private staged bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        std::fs::write(&wal, b"wal").unwrap();
+        std::fs::write(&shm, b"shm").unwrap();
+        let owned = OwnedPrivateStagedSqliteCopy::from_recovery_proof(
+            CompositeRecoveryProof::for_test(path.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{owned:?}"),
+            "OwnedPrivateStagedSqliteCopy(<redacted>)"
+        );
+        drop(owned);
+        assert!(!path.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
     }
 }

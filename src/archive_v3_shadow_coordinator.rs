@@ -547,14 +547,17 @@ pub(crate) async fn publish_shadow_checkpoint(
         key_epoch: expected.key_epoch(),
         owner_fencing_epoch: request.lease.fencing_epoch(),
         sqlite_page_size: SQLITE_PAGE_SIZE,
+        checkpoint_logical_file_length: checkpoint.logical_file_length(),
         logical_file_length: checkpoint.logical_file_length(),
         user_schema_version: checkpoint.user_schema_version(),
         storage_format_version: ARCHIVE_FORMAT_VERSION,
         wal_generation: 0,
+        wal_commit_count: 0,
         wal_segment_count: 0,
+        wal_tail_bytes: 0,
         checkpoint_root: Some(checkpoint.root().clone()),
         extent_tree_root: None,
-        wal_chain_root: None,
+        wal_commit_tail: None,
     };
     let envelope = cipher.seal(&context, &root.encode()?)?;
     let root_facts = staging
@@ -1486,14 +1489,17 @@ mod tests {
             key_epoch: key,
             owner_fencing_epoch: 0,
             sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
             logical_file_length: 0,
             user_schema_version: 1,
             storage_format_version: ARCHIVE_FORMAT_VERSION,
             wal_generation: 0,
+            wal_commit_count: 0,
             wal_segment_count: 0,
+            wal_tail_bytes: 0,
             checkpoint_root: None,
             extent_tree_root: None,
-            wal_chain_root: None,
+            wal_commit_tail: None,
         };
         let envelope = cipher.seal(&root_context, &root.encode().unwrap()).unwrap();
         backend

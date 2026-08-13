@@ -118,15 +118,16 @@ mod archive_v3_shadow;
 // Inactive ADR-0022 durable shadow-session codec. The operation module persists
 // it, but no Store, VFS, startup, flag, route, or authority wiring constructs it.
 mod archive_v3_shadow_session;
-// Inactive ADR-0022 private-staging SQLite shadow-parity verifier. It has no
-// Store, VFS, provider, credential, route, scheduler, flag, or authority wiring.
+// Inactive ADR-0022 private-staging SQLite shadow-parity verifier. Only the
+// exact composite recovery seam can mint its owned production capability; it
+// has no Store, VFS, provider, route, scheduler, flag, or authority wiring.
 mod archive_v3_shadow_parity;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
 // Store/VFS runtime connection, provider construction, flag, route, or authority.
 mod archive_v3_shadow_checkpoint;
-// Inactive ADR-0022 immutable WAL upload/readback and exact witness-nominated
-// recovery seam. It has no VFS, Store, runtime, flag, provider, or authority
-// wiring; legacy whole-snapshot persistence remains authoritative.
+// Inactive ADR-0022 bounded multi-commit WAL lineage and exact witnessed
+// checkpoint+WAL recovery into an owned private staging copy. It never lists
+// objects and has no VFS, Store, startup, flag, provider, route, or authority.
 mod archive_v3_shadow_wal;
 // Inactive ADR-0022 checkpoint publication composition with durable exact-
 // candidate reconciliation. It has no Store, VFS, route, flag, provider
