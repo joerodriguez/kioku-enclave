@@ -71,7 +71,7 @@ subtle = "2.6.1"
 # Direct declaration of the already-locked HKDF implementation used by the
 # inactive ADR-0022 archive-v3 format foundation.  Keeping this explicit makes
 # the archive KDF auditable rather than relying on a transitive dependency.
-hkdf = "0.12.4"
+hkdf = "0.13.0"
 rand = "0.8.5"
 zeroize = { version = "1.8.2", features = ["derive"] }
 
