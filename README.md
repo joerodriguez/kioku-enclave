@@ -66,7 +66,7 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   `validated_real_corpus`. The former permits owner-only production evaluation but
   explicitly authorizes no speaker-quality claim and no external users.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
-- Enforces monthly wall-clock recording allowances through server-timed, idempotent
+- Enforces provider-authored wall-clock recording allowances through server-timed, idempotent
   60-second leases plus domain-separated, idempotent 60-second reconciliation ticks for
   time recorded into the Mac's encrypted local outbox during a network outage. Offline
   ticks carry no capture, device, stream, media, or timestamp identifier. A restarted
@@ -77,7 +77,8 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   after lease expiry without charging network-transfer time. A durable pending
   reservation is reconciled with its original billing idempotency key before any new
   reservation, so a crash or failed local commit neither double-charges nor blocks that
-  user indefinitely. The enclave knows only the provider-neutral allowance snapshot and
+  user indefinitely. Allowance amount, period cadence, catalog, and pricing remain opaque:
+  the enclave knows only the provider-neutral allowance snapshot and
   reservation decision. Catalog, pricing, payment, and subscription implementations live
   behind the external control-plane port and are not part of this repository.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.

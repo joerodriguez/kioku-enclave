@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-09
-- Revised: 2026-08-11
+- Revised: 2026-08-13
 
 ## Context
 
@@ -49,6 +49,8 @@ records only bounded operational warnings and never logs upstream detail.
 ## Consequences
 
 - This repository contains the admission protocol, not a commerce implementation.
+- A change between monthly, weekly, or another bounded allowance cadence requires no
+  enclave code or release; the external authority supplies exact snapshot period bounds.
 - A pending remote outcome is retried with the same deterministic key and cannot be
   replaced by an unrelated reservation.
 - The external control plane may replace its commercial provider without changing the

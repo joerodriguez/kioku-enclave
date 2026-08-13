@@ -11029,7 +11029,7 @@ mod tests {
             .deny_recording_lease_request(
                 &second.id,
                 "other-user-pending",
-                "monthly_allowance_exhausted",
+                "allowance_exhausted",
                 &serde_json::json!({"recording":{"allowed":false}}),
             )
             .await
@@ -11051,7 +11051,7 @@ mod tests {
                 .deny_recording_lease_request(
                     &second.id,
                     &request_id,
-                    "monthly_allowance_exhausted",
+                    "allowance_exhausted",
                     &serde_json::json!({"recording":{"allowed":false}}),
                 )
                 .await
