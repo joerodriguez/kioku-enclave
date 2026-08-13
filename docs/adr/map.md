@@ -7,3 +7,4 @@
 | [ADR-0019](0019-privacy-preserving-vertex-cost-attribution.md) | Durable, content-free Vertex usage attribution |
 | [ADR-0020](0020-owner-economics-facade.md) | Owner-only opaque economics join and local coverage measurement |
 | [ADR-0021](0021-external-service-ports.md) | Provider-neutral external-service ports and deploy-time adapters |
+| [ADR-0030](0030-in-enclave-silence-compaction-and-source-clock-restoration.md) | Proposed in-enclave speech-time compaction with exact source-clock restoration and measured cost gates |
