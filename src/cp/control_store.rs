@@ -27,15 +27,21 @@ use crate::{
         ArchiveId, KeyKind, KeyRegistryContext, LogicalLocation, ObjectContext, ObjectId,
         ObjectRole,
     },
-    archive_v3_inventory_coordinator::{AuthenticatedInventoryPlan, DeletionInventoryControl},
+    archive_v3_inventory_coordinator::{
+        pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
+        AuthenticatedPreWitnessInventoryPlan, DeletionInventoryControl, PreWitnessInventoryControl,
+        RecoveredPreWitnessInventory,
+    },
     archive_v3_lifecycle::{
         ActiveCreateAdmission, ArtifactCreateState, BootstrapPlan, DeletionInventorySeal,
         DurableBootstrapReservation, DurableInventoryPage, DurablePhysicalCompletion,
-        ErasedInventoryPages, FrozenInventorySnapshot, InventoryPage, InventoryPageReference,
-        LifecycleCreateOutcome, LifecycleError, PhysicalDeletionReceipt, PlannedArtifact,
+        ErasedInventoryPages, FrozenInventorySnapshot, FrozenPreWitnessInventorySnapshot,
+        InventoryPage, InventoryPageReference, LifecycleCreateOutcome, LifecycleError,
+        PhysicalDeletionReceipt, PlannedArtifact, PreWitnessDeletionInventorySeal,
         PreparedBootstrap, RecoveredBootstrap, RecoveredDeletionLifecycle,
         WitnessCreateDispatchLedger, WitnessSendStarted, LIFECYCLE_FORMAT_VERSION,
-        MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES, WITNESS_CREATE_PROTOCOL_V1,
+        MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES, PRE_WITNESS_INVENTORY_FORMAT_V1,
+        WITNESS_CREATE_PROTOCOL_V1,
     },
     archive_v3_lifecycle_page_store::{
         DurablePageCreateAdmission, FrozenPageCreateSet, LifecyclePageAdmissionLedger,
@@ -451,6 +457,53 @@ CREATE TABLE IF NOT EXISTS archive_lifecycle_inventory_snapshots (
     deletion_fence BLOB NOT NULL CHECK (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16)),
     lifecycle_revision INTEGER NOT NULL CHECK (lifecycle_revision > 0),
     snapshot_commitment BLOB NOT NULL CHECK (length(snapshot_commitment) = 32)
+);
+-- Type-separated branch for a deletion whose initial witness send was
+-- cryptographically proven never started. The full tuple is retained so
+-- restart needs only opaque archive/fence authority and never another
+-- Firestore read or caller-retained absence receipt.
+CREATE TABLE IF NOT EXISTS archive_lifecycle_prewitness_inventory_snapshots (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_lifecycle_anchors(archive_id),
+    format_version INTEGER NOT NULL CHECK (format_version = 1),
+    deletion_fence BLOB NOT NULL CHECK (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16)),
+    absence_revision INTEGER NOT NULL CHECK (absence_revision > 0),
+    lifecycle_revision INTEGER NOT NULL CHECK (lifecycle_revision = absence_revision + 1),
+    bootstrap_attempt_id BLOB NOT NULL CHECK (length(bootstrap_attempt_id) = 16 AND bootstrap_attempt_id != zeroblob(16)),
+    database_epoch BLOB NOT NULL CHECK (length(database_epoch) = 16 AND database_epoch != zeroblob(16)),
+    key_epoch BLOB NOT NULL CHECK (length(key_epoch) = 16 AND key_epoch != zeroblob(16)),
+    registry_object_id BLOB NOT NULL CHECK (length(registry_object_id) = 16 AND registry_object_id != zeroblob(16)),
+    root_object_id BLOB NOT NULL CHECK (length(root_object_id) = 16 AND root_object_id != zeroblob(16)),
+    protocol_version INTEGER NOT NULL CHECK (protocol_version = 1),
+    expected_witness_hash BLOB CHECK (expected_witness_hash IS NULL OR (length(expected_witness_hash) = 32 AND expected_witness_hash != zeroblob(32))),
+    expected_witness_len INTEGER CHECK (expected_witness_len IS NULL OR expected_witness_len > 0),
+    protocol_commitment BLOB NOT NULL CHECK (length(protocol_commitment) = 32 AND protocol_commitment != zeroblob(32)),
+    snapshot_commitment BLOB NOT NULL CHECK (length(snapshot_commitment) = 32 AND snapshot_commitment != zeroblob(32)),
+    CHECK ((expected_witness_hash IS NULL) = (expected_witness_len IS NULL))
+);
+CREATE TABLE IF NOT EXISTS archive_lifecycle_prewitness_inventory_seals (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_lifecycle_prewitness_inventory_snapshots(archive_id),
+    format_version INTEGER NOT NULL CHECK (format_version = 1),
+    deletion_fence BLOB NOT NULL CHECK (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16)),
+    snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision > 0),
+    seal_revision INTEGER NOT NULL CHECK (seal_revision = snapshot_revision + 1),
+    snapshot_commitment BLOB NOT NULL CHECK (length(snapshot_commitment) = 32 AND snapshot_commitment != zeroblob(32)),
+    page_count INTEGER NOT NULL CHECK (page_count >= 0 AND page_count <= 4096),
+    artifact_count INTEGER NOT NULL CHECK (artifact_count >= 0 AND artifact_count <= 131072),
+    terminal_page_hash BLOB NOT NULL CHECK (length(terminal_page_hash) = 32),
+    inventory_commitment BLOB NOT NULL CHECK (length(inventory_commitment) = 32 AND inventory_commitment != zeroblob(32)),
+    CHECK ((page_count = 0 AND artifact_count = 0 AND terminal_page_hash = zeroblob(32))
+           OR (page_count > 0 AND artifact_count > 0 AND terminal_page_hash != zeroblob(32)))
+);
+CREATE TABLE IF NOT EXISTS archive_lifecycle_prewitness_inventory_pages (
+    archive_id BLOB NOT NULL REFERENCES archive_lifecycle_prewitness_inventory_seals(archive_id),
+    page_ordinal INTEGER NOT NULL CHECK (page_ordinal >= 0 AND page_ordinal < 4096),
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16 AND page_id != zeroblob(16)),
+    previous_hash BLOB NOT NULL CHECK (length(previous_hash) = 32),
+    page_hash BLOB NOT NULL CHECK (length(page_hash) = 32 AND page_hash != zeroblob(32)),
+    encoded_len INTEGER NOT NULL CHECK (encoded_len > 0 AND encoded_len <= 65536),
+    PRIMARY KEY (archive_id, page_ordinal),
+    UNIQUE (archive_id, page_id),
+    UNIQUE (archive_id, page_hash)
 );
 -- Durable authority for the legacy identity -> stable-ID transition. This row
 -- is encrypted inside the control blob and precedes every provider mutation.
@@ -2204,8 +2257,9 @@ fn reconcile_archive_create_conn(
         .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
     let inventory_snapshot_frozen: i64 = tx.query_row(
         "SELECT EXISTS(
-             SELECT 1 FROM archive_lifecycle_inventory_snapshots
-             WHERE archive_id = ?1
+             SELECT 1 FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1
+             UNION ALL
+             SELECT 1 FROM archive_lifecycle_prewitness_inventory_snapshots WHERE archive_id = ?1
          )",
         [admission.archive_id().as_bytes().as_slice()],
         |row| row.get(0),
@@ -2644,6 +2698,19 @@ fn authenticate_closed_witness_protocol_conn(
     {
         return Err(EnclaveError::Conflict(
             "archive pre-witness authority is not exactly tombstoned".into(),
+        ));
+    }
+    let pre_witness_snapshot_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_lifecycle_prewitness_inventory_snapshots
+             WHERE archive_id = ?1
+         )",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if pre_witness_snapshot_exists != 0 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness absence was already consumed into durable inventory".into(),
         ));
     }
     let Some(anchor) = lifecycle_anchor_conn(conn, archive_id)? else {
@@ -3354,6 +3421,12 @@ fn freeze_archive_inventory_snapshot_conn(
     deletion_fence: ObjectId,
 ) -> Result<u64> {
     let tx = conn.unchecked_transaction()?;
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(&tx, archive_id)?;
+    if pre_witness_branch != 0 || normal_branch > 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory branch conflicts".into(),
+        ));
+    }
     let anchor = lifecycle_anchor_conn(&tx, archive_id)?
         .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
     let persisted_fence: Vec<u8> = tx.query_row(
@@ -3452,6 +3525,12 @@ fn load_archive_inventory_snapshot_conn(
     deletion_fence: ObjectId,
 ) -> Result<(u64, Vec<PlannedArtifact>)> {
     let tx = conn.unchecked_transaction()?;
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(&tx, archive_id)?;
+    if normal_branch != 1 || pre_witness_branch != 0 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory branch is unavailable".into(),
+        ));
+    }
     let anchor = lifecycle_anchor_conn(&tx, archive_id)?
         .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
     let snapshot: Option<(Vec<u8>, i64, Vec<u8>)> = tx
@@ -3484,6 +3563,363 @@ fn load_archive_inventory_snapshot_conn(
     Ok((revision, artifacts))
 }
 
+fn exact_inventory_branch_counts_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT
+             EXISTS(SELECT 1 FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1),
+             EXISTS(SELECT 1 FROM archive_lifecycle_prewitness_inventory_snapshots WHERE archive_id = ?1)",
+        [archive_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(Into::into)
+}
+
+fn freeze_pre_witness_inventory_snapshot_conn(
+    conn: &Connection,
+    absence: AuthenticatedPreWitnessAbsence,
+) -> Result<FrozenPreWitnessInventorySnapshot> {
+    let persistence = LifecyclePersistenceContext::validated();
+    let (
+        archive_id,
+        attempt_id,
+        deletion_fence,
+        absence_revision,
+        expected_hash,
+        expected_len,
+        protocol_version,
+        protocol_commitment,
+    ) = absence
+        .into_control_view(&persistence)
+        .into_control_parts(&persistence);
+    if protocol_version != WITNESS_CREATE_PROTOCOL_V1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness absence binding is not sealable".into(),
+        ));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(&tx, archive_id)?;
+    if normal_branch != 0 || pre_witness_branch != 0 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory branch is already selected".into(),
+        ));
+    }
+    let authority: (String, String, Vec<u8>) = tx.query_row(
+        "SELECT b.state, d.state, d.deletion_fence_id
+         FROM archive_deletion_ledgers d
+         JOIN archive_bindings b ON b.archive_id = d.archive_id
+         WHERE d.archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if authority.0 != "tombstoned"
+        || authority.1 != "tombstoned"
+        || fixed_16(authority.2)? != *deletion_fence.as_bytes()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory authority changed".into(),
+        ));
+    }
+    let anchor = lifecycle_anchor_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    type PreWitnessAnchorTuple = (
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+    );
+    let anchor_tuple: PreWitnessAnchorTuple = tx.query_row(
+        "SELECT deletion_fence, witness_record_hash, witness_record_len,
+                    witness_create_state, witness_admission_revision
+             FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let anchor_hash = anchor_tuple.1.map(fixed_32).transpose()?;
+    let anchor_len = anchor_tuple
+        .2
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("archive witness length is invalid".into()))?;
+    if anchor.state != ArchiveLifecycleState::DeletionFrozen
+        || anchor.revision != absence_revision
+        || anchor.plan.attempt_id() != attempt_id
+        || fixed_16(anchor_tuple.0)? != *deletion_fence.as_bytes()
+        || anchor_hash != expected_hash
+        || anchor_len != expected_len
+        || anchor_tuple.4.is_some()
+        || !matches!(anchor_tuple.3.as_deref(), None | Some("confirmed_absent"))
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory lifecycle binding changed".into(),
+        ));
+    }
+    let protocol = witness_protocol_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive witness protocol disappeared".into()))?;
+    if protocol.archive_id != archive_id
+        || protocol.attempt_id != attempt_id
+        || protocol.protocol_version != protocol_version
+        || protocol.phase != WitnessProtocolPhase::AbsenceConfirmed
+        || protocol.deletion_fence != Some(deletion_fence)
+        || protocol.expected_hash != expected_hash
+        || protocol.expected_len != expected_len
+        || protocol.admission_revision.is_some()
+        || protocol.commitment != protocol_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness absence protocol changed".into(),
+        ));
+    }
+    let page_create_count: i64 = tx.query_row(
+        "SELECT count(*) FROM archive_lifecycle_page_creates WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if page_create_count != 0 {
+        return Err(EnclaveError::Store(
+            "archive pre-witness page creates predate their snapshot".into(),
+        ));
+    }
+    let create_ahead = lifecycle_create_ahead_conn(&tx, anchor.plan)?;
+    let revision = absence_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let snapshot_commitment = crate::archive_v3_lifecycle::pre_witness_snapshot_commitment(
+        anchor.plan,
+        deletion_fence,
+        absence_revision,
+        revision,
+        protocol_version,
+        expected_hash,
+        expected_len,
+        protocol_commitment,
+        &create_ahead,
+    )
+    .map_err(lifecycle_store_error)?;
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'
+           AND deletion_fence = ?3 AND witness_admission_revision IS NULL",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(absence_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            deletion_fence.as_bytes().as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory snapshot lost its compare-and-swap".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO archive_lifecycle_prewitness_inventory_snapshots
+         (archive_id, format_version, deletion_fence, absence_revision,
+          lifecycle_revision, bootstrap_attempt_id, database_epoch, key_epoch,
+          registry_object_id, root_object_id, protocol_version,
+          expected_witness_hash, expected_witness_len, protocol_commitment,
+          snapshot_commitment)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            deletion_fence.as_bytes().as_slice(),
+            i64::try_from(absence_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            i64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            anchor.plan.attempt_id().as_bytes().as_slice(),
+            anchor.plan.database_epoch().as_bytes().as_slice(),
+            anchor.plan.key_epoch().as_bytes().as_slice(),
+            anchor.plan.registry_object_id().as_bytes().as_slice(),
+            anchor.plan.root_object_id().as_bytes().as_slice(),
+            i64::from(protocol_version),
+            expected_hash.as_ref().map(|hash| hash.as_slice()),
+            expected_len.map(i64::from),
+            protocol_commitment.as_slice(),
+            snapshot_commitment.as_slice(),
+        ],
+    )?;
+    tx.commit()?;
+    FrozenPreWitnessInventorySnapshot::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        anchor.plan,
+        deletion_fence,
+        absence_revision,
+        revision,
+        protocol_version,
+        expected_hash,
+        expected_len,
+        protocol_commitment,
+        snapshot_commitment,
+        create_ahead,
+    )
+    .map_err(lifecycle_store_error)
+}
+
+fn load_pre_witness_inventory_snapshot_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    allow_sealed: bool,
+) -> Result<FrozenPreWitnessInventorySnapshot> {
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(conn, archive_id)?;
+    if normal_branch != 0 || pre_witness_branch != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory branch is unavailable".into(),
+        ));
+    }
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    type SnapshotRow = (
+        i64,
+        Vec<u8>,
+        i64,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Vec<u8>,
+        Vec<u8>,
+    );
+    let row: SnapshotRow = conn.query_row(
+        "SELECT format_version, deletion_fence, absence_revision,
+                lifecycle_revision, bootstrap_attempt_id, database_epoch,
+                key_epoch, registry_object_id, root_object_id, protocol_version,
+                expected_witness_hash, expected_witness_len,
+                protocol_commitment, snapshot_commitment
+         FROM archive_lifecycle_prewitness_inventory_snapshots WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+            ))
+        },
+    )?;
+    let absence_revision = u64::try_from(row.2)
+        .map_err(|_| EnclaveError::Store("archive absence revision is invalid".into()))?;
+    let revision = u64::try_from(row.3)
+        .map_err(|_| EnclaveError::Store("archive snapshot revision is invalid".into()))?;
+    let protocol_version = u16::try_from(row.9)
+        .map_err(|_| EnclaveError::Store("archive witness protocol version is invalid".into()))?;
+    let expected_hash = row.10.map(fixed_32).transpose()?;
+    let expected_len = row
+        .11
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("archive witness length is invalid".into()))?;
+    let protocol_commitment = fixed_32(row.12)?;
+    let snapshot_commitment = fixed_32(row.13)?;
+    let anchor_matches_snapshot =
+        anchor.state == ArchiveLifecycleState::DeletionFrozen && anchor.revision == revision;
+    let anchor_matches_seal = allow_sealed
+        && anchor.state == ArchiveLifecycleState::InventorySealed
+        && revision.checked_add(1) == Some(anchor.revision);
+    if row.0 != i64::from(PRE_WITNESS_INVENTORY_FORMAT_V1)
+        || fixed_16(row.1)? != *deletion_fence.as_bytes()
+        || !(anchor_matches_snapshot || anchor_matches_seal)
+        || fixed_16(row.4)? != *anchor.plan.attempt_id().as_bytes()
+        || fixed_16(row.5)? != *anchor.plan.database_epoch().as_bytes()
+        || fixed_16(row.6)? != *anchor.plan.key_epoch().as_bytes()
+        || fixed_16(row.7)? != *anchor.plan.registry_object_id().as_bytes()
+        || fixed_16(row.8)? != *anchor.plan.root_object_id().as_bytes()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory snapshot changed".into(),
+        ));
+    }
+    let authority: (String, String, Vec<u8>) = conn.query_row(
+        "SELECT b.state, d.state, d.deletion_fence_id
+         FROM archive_deletion_ledgers d
+         JOIN archive_bindings b ON b.archive_id = d.archive_id
+         WHERE d.archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let protocol = witness_protocol_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive witness protocol disappeared".into()))?;
+    let anchor_witness: (Option<Vec<u8>>, Option<i64>, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT witness_record_hash, witness_record_len, witness_create_state,
+                witness_admission_revision
+         FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let anchor_hash = anchor_witness.0.map(fixed_32).transpose()?;
+    let anchor_len = anchor_witness
+        .1
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("archive witness length is invalid".into()))?;
+    if authority.0 != "tombstoned"
+        || authority.1 != "tombstoned"
+        || fixed_16(authority.2)? != *deletion_fence.as_bytes()
+        || protocol.protocol_version != WITNESS_CREATE_PROTOCOL_V1
+        || protocol.phase != WitnessProtocolPhase::AbsenceConfirmed
+        || protocol.attempt_id != anchor.plan.attempt_id()
+        || protocol.deletion_fence != Some(deletion_fence)
+        || protocol.expected_hash != expected_hash
+        || protocol.expected_len != expected_len
+        || protocol.admission_revision.is_some()
+        || protocol.commitment != protocol_commitment
+        || anchor_hash != expected_hash
+        || anchor_len != expected_len
+        || !matches!(anchor_witness.2.as_deref(), None | Some("confirmed_absent"))
+        || anchor_witness.3.is_some()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness durable tuple changed".into(),
+        ));
+    }
+    let create_ahead = lifecycle_create_ahead_conn(conn, anchor.plan)?;
+    FrozenPreWitnessInventorySnapshot::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        anchor.plan,
+        deletion_fence,
+        absence_revision,
+        revision,
+        protocol_version,
+        expected_hash,
+        expected_len,
+        protocol_commitment,
+        snapshot_commitment,
+        create_ahead,
+    )
+    .map_err(lifecycle_store_error)
+}
+
 fn seal_archive_inventory_conn(
     conn: &Connection,
     authenticated: &AuthenticatedInventoryPlan,
@@ -3497,6 +3933,12 @@ fn seal_archive_inventory_conn(
         .iter()
         .map(DurableInventoryPage::page)
         .collect::<Vec<_>>();
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(conn, archive_id)?;
+    if normal_branch != 1 || pre_witness_branch != 0 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory branch conflicts".into(),
+        ));
+    }
     let anchor = lifecycle_anchor_conn(conn, archive_id)?
         .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
     if anchor.state != ArchiveLifecycleState::DeletionFrozen || anchor.revision != expected_revision
@@ -3650,10 +4092,286 @@ fn seal_archive_inventory_conn(
     Ok(seal)
 }
 
+fn seal_pre_witness_inventory_conn(
+    conn: &Connection,
+    authenticated: &AuthenticatedPreWitnessInventoryPlan,
+) -> Result<PreWitnessDeletionInventorySeal> {
+    let snapshot = authenticated.snapshot();
+    let archive_id = snapshot.archive_id();
+    let deletion_fence = snapshot.deletion_fence();
+    let tx = conn.unchecked_transaction()?;
+    let loaded = load_pre_witness_inventory_snapshot_conn(&tx, archive_id, deletion_fence, false)?;
+    if &loaded != snapshot {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory snapshot changed before seal".into(),
+        ));
+    }
+    let expected_pages = pre_witness_page_plan_for_snapshot(&loaded)
+        .map_err(|_| EnclaveError::Store("archive pre-witness page plan is invalid".into()))?;
+    if expected_pages != authenticated.planned_pages()
+        || expected_pages.len() != authenticated.durable_pages().len()
+        || expected_pages
+            .iter()
+            .zip(authenticated.durable_pages())
+            .any(|(expected, durable)| expected != durable.page())
+        || expected_pages
+            .iter()
+            .map(InventoryPage::reference)
+            .ne(authenticated.references().iter().copied())
+    {
+        return Err(EnclaveError::Store(
+            "archive pre-witness coordinator proof changed".into(),
+        ));
+    }
+    lifecycle_page_create_set_drained_conn(
+        &tx,
+        archive_id,
+        deletion_fence,
+        authenticated.references(),
+    )?;
+    let revision = snapshot
+        .revision()
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let seal = PreWitnessDeletionInventorySeal::from_authenticated_pages(
+        &LifecyclePersistenceContext::validated(),
+        snapshot,
+        revision,
+        authenticated.durable_pages(),
+        authenticated.references(),
+    )
+    .map_err(lifecycle_store_error)?;
+    let snapshot_commitment =
+        snapshot.snapshot_commitment_for_control(&LifecyclePersistenceContext::validated());
+    tx.execute(
+        "INSERT INTO archive_lifecycle_prewitness_inventory_seals
+         (archive_id, format_version, deletion_fence, snapshot_revision,
+          seal_revision, snapshot_commitment, page_count, artifact_count,
+          terminal_page_hash, inventory_commitment)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            deletion_fence.as_bytes().as_slice(),
+            i64::try_from(snapshot.revision())
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            i64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            snapshot_commitment.as_slice(),
+            i64::from(seal.page_count()),
+            i64::from(seal.artifact_count()),
+            seal.terminal_page_hash().as_slice(),
+            seal.inventory_commitment().as_slice(),
+        ],
+    )?;
+    for reference in authenticated.references() {
+        tx.execute(
+            "INSERT INTO archive_lifecycle_prewitness_inventory_pages
+             (archive_id, page_ordinal, page_id, previous_hash, page_hash, encoded_len)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                i64::from(reference.page_ordinal()),
+                reference.page_id().as_bytes().as_slice(),
+                reference.previous_hash().as_slice(),
+                reference.page_hash().as_slice(),
+                i64::from(reference.encoded_len()),
+            ],
+        )?;
+    }
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'inventory_sealed',
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'
+           AND deletion_fence = ?3
+           AND EXISTS (
+             SELECT 1 FROM archive_lifecycle_prewitness_inventory_snapshots s
+             WHERE s.archive_id = ?1 AND s.lifecycle_revision = ?2
+               AND s.deletion_fence = ?3 AND s.snapshot_commitment = ?4
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM archive_lifecycle_inventory_snapshots n
+             WHERE n.archive_id = ?1
+           )",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(snapshot.revision())
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            deletion_fence.as_bytes().as_slice(),
+            snapshot_commitment.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory seal lost its compare-and-swap".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(seal)
+}
+
+fn load_pre_witness_sealed_inventory_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<(PreWitnessDeletionInventorySeal, Vec<InventoryPageReference>)> {
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(conn, archive_id)?;
+    if normal_branch != 0 || pre_witness_branch != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory branch is unavailable".into(),
+        ));
+    }
+    type SealRow = (i64, Vec<u8>, i64, i64, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>);
+    let row: SealRow = conn
+        .query_row(
+            "SELECT format_version, deletion_fence, snapshot_revision,
+                    seal_revision, snapshot_commitment, page_count,
+                    artifact_count, terminal_page_hash, inventory_commitment
+             FROM archive_lifecycle_prewitness_inventory_seals WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            EnclaveError::Conflict("archive pre-witness inventory is not sealed".into())
+        })?;
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let snapshot_revision = u64::try_from(row.2)
+        .map_err(|_| EnclaveError::Store("archive snapshot revision is invalid".into()))?;
+    let revision = u64::try_from(row.3)
+        .map_err(|_| EnclaveError::Store("archive seal revision is invalid".into()))?;
+    if row.0 != i64::from(PRE_WITNESS_INVENTORY_FORMAT_V1)
+        || fixed_16(row.1)? != *deletion_fence.as_bytes()
+        || anchor.state != ArchiveLifecycleState::InventorySealed
+        || anchor.revision != revision
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness seal anchor changed".into(),
+        ));
+    }
+    let snapshot =
+        load_pre_witness_inventory_snapshot_conn(conn, archive_id, deletion_fence, true)?;
+    if snapshot.revision() != snapshot_revision
+        || snapshot.snapshot_commitment_for_control(&LifecyclePersistenceContext::validated())
+            != fixed_32(row.4.clone())?
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness sealed snapshot changed".into(),
+        ));
+    }
+    let mut statement = conn.prepare(
+        "SELECT page_ordinal, page_id, previous_hash, page_hash, encoded_len
+         FROM archive_lifecycle_prewitness_inventory_pages
+         WHERE archive_id = ?1 ORDER BY page_ordinal",
+    )?;
+    let rows = statement.query_map([archive_id.as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut references = Vec::new();
+    for page in rows {
+        let (ordinal, page_id, previous, hash, encoded_len) = page?;
+        references.push(
+            InventoryPageReference::from_persisted(
+                &LifecyclePersistenceContext::validated(),
+                archive_id,
+                u32::try_from(ordinal).map_err(|_| {
+                    EnclaveError::Store("archive lifecycle page ordinal is invalid".into())
+                })?,
+                ObjectId::from_bytes(fixed_16(page_id)?),
+                fixed_32_allow_zero(previous)?,
+                fixed_32(hash)?,
+                u32::try_from(encoded_len).map_err(|_| {
+                    EnclaveError::Store("archive lifecycle page length is invalid".into())
+                })?,
+            )
+            .map_err(lifecycle_store_error)?,
+        );
+    }
+    drop(statement);
+    let seal = PreWitnessDeletionInventorySeal::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        archive_id,
+        deletion_fence,
+        snapshot_revision,
+        revision,
+        snapshot.snapshot_commitment_for_control(&LifecyclePersistenceContext::validated()),
+        u32::try_from(row.5)
+            .map_err(|_| EnclaveError::Store("archive page count is invalid".into()))?,
+        u32::try_from(row.6)
+            .map_err(|_| EnclaveError::Store("archive artifact count is invalid".into()))?,
+        fixed_32_allow_zero(row.7)?,
+        fixed_32(row.8)?,
+        &references,
+    )
+    .map_err(lifecycle_store_error)?;
+    lifecycle_page_create_set_drained_conn(conn, archive_id, deletion_fence, &references)?;
+    Ok((seal, references))
+}
+
+fn recover_pre_witness_inventory_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<RecoveredPreWitnessInventory> {
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(conn, archive_id)?;
+    if normal_branch != 0 || pre_witness_branch != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness inventory branch is unavailable".into(),
+        ));
+    }
+    let seal_count: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_lifecycle_prewitness_inventory_seals
+         WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    match (anchor.state, seal_count) {
+        (ArchiveLifecycleState::DeletionFrozen, 0) => Ok(RecoveredPreWitnessInventory::Frozen(
+            load_pre_witness_inventory_snapshot_conn(conn, archive_id, deletion_fence, false)?,
+        )),
+        (ArchiveLifecycleState::InventorySealed, 1) => {
+            let (seal, _) =
+                load_pre_witness_sealed_inventory_conn(conn, archive_id, deletion_fence)?;
+            Ok(RecoveredPreWitnessInventory::Sealed(seal))
+        }
+        _ => Err(EnclaveError::Conflict(
+            "archive pre-witness inventory restart state is inconsistent".into(),
+        )),
+    }
+}
+
 fn load_sealed_archive_inventory_references_conn(
     conn: &Connection,
     expected: &DeletionInventorySeal,
 ) -> Result<Vec<InventoryPageReference>> {
+    let (normal_branch, pre_witness_branch) =
+        exact_inventory_branch_counts_conn(conn, expected.archive_id())?;
+    if normal_branch != 1 || pre_witness_branch != 0 {
+        return Err(EnclaveError::Conflict(
+            "sealed archive lifecycle inventory branch conflicts".into(),
+        ));
+    }
     let row = conn
         .query_row(
             "SELECT inventory_seal_revision, state, deletion_fence, inventory_page_count,
@@ -3744,6 +4462,129 @@ fn load_sealed_archive_inventory_references_conn(
     Ok(references)
 }
 
+fn validate_open_inventory_snapshot_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<Option<Vec<InventoryPage>>> {
+    let (normal_branch, pre_witness_branch) = exact_inventory_branch_counts_conn(conn, archive_id)?;
+    match (normal_branch, pre_witness_branch) {
+        (1, 0) => {
+            let anchor = lifecycle_anchor_conn(conn, archive_id)?.ok_or_else(|| {
+                EnclaveError::Store("archive lifecycle anchor disappeared".into())
+            })?;
+            let snapshot: (Vec<u8>, i64, Vec<u8>) = conn.query_row(
+                "SELECT deletion_fence, lifecycle_revision, snapshot_commitment
+                 FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1",
+                [archive_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let revision = u64::try_from(snapshot.1).map_err(|_| {
+                EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
+            })?;
+            let expected = lifecycle_inventory_snapshot_commitment_conn(
+                conn,
+                anchor.plan,
+                deletion_fence,
+                revision,
+            )?;
+            if anchor.state != ArchiveLifecycleState::DeletionFrozen
+                || anchor.revision != revision
+                || fixed_16(snapshot.0)? != *deletion_fence.as_bytes()
+                || fixed_32(snapshot.2)? != expected
+            {
+                return Err(EnclaveError::Conflict(
+                    "archive lifecycle inventory snapshot changed".into(),
+                ));
+            }
+        }
+        (0, 1) => {
+            let snapshot =
+                load_pre_witness_inventory_snapshot_conn(conn, archive_id, deletion_fence, false)?;
+            let pages = pre_witness_page_plan_for_snapshot(&snapshot).map_err(|_| {
+                EnclaveError::Store("archive pre-witness page plan is invalid".into())
+            })?;
+            return Ok(Some(pages));
+        }
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle inventory branch is invalid".into(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_pre_witness_page_rows_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    expected: &[InventoryPage],
+) -> Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT deletion_fence, page_ordinal, page_id, previous_hash, page_hash,
+                encoded_len, state, unresolved_encoded_page
+         FROM archive_lifecycle_page_creates
+         WHERE archive_id = ?1 ORDER BY page_ordinal",
+    )?;
+    let rows = statement.query_map([archive_id.as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(7)?,
+        ))
+    })?;
+    let mut saw_outcome_unknown = false;
+    for (index, row) in rows.enumerate() {
+        let (fence, ordinal, page_id, previous, hash, encoded_len, state, encoded) = row?;
+        let reference = InventoryPageReference::from_persisted(
+            &LifecyclePersistenceContext::validated(),
+            archive_id,
+            u32::try_from(ordinal).map_err(|_| {
+                EnclaveError::Store("archive lifecycle page ordinal is invalid".into())
+            })?,
+            ObjectId::from_bytes(fixed_16(page_id)?),
+            fixed_32_allow_zero(previous)?,
+            fixed_32(hash)?,
+            u32::try_from(encoded_len).map_err(|_| {
+                EnclaveError::Store("archive lifecycle page length is invalid".into())
+            })?,
+        )
+        .map_err(lifecycle_store_error)?;
+        let Some(expected_page) = expected.get(index) else {
+            return Err(EnclaveError::Store(
+                "archive pre-witness page rows exceed the exact plan".into(),
+            ));
+        };
+        if fixed_16(fence)? != *deletion_fence.as_bytes()
+            || usize::try_from(reference.page_ordinal()).ok() != Some(index)
+            || reference != expected_page.reference()
+            || saw_outcome_unknown
+        {
+            return Err(EnclaveError::Store(
+                "archive pre-witness durable page prefix changed".into(),
+            ));
+        }
+        match (state.as_str(), encoded) {
+            ("created", None) => {}
+            ("outcome_unknown", Some(encoded)) if encoded == expected_page.encoded() => {
+                saw_outcome_unknown = true;
+            }
+            _ => {
+                return Err(EnclaveError::Store(
+                    "archive pre-witness durable page disposition changed".into(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn admit_lifecycle_page_create_conn(
     conn: &Connection,
     deletion_fence: ObjectId,
@@ -3759,38 +4600,19 @@ fn admit_lifecycle_page_create_conn(
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    let anchor: Option<(String, Vec<u8>, i64, Vec<u8>)> = tx
-        .query_row(
-            "SELECT a.state, a.deletion_fence, s.lifecycle_revision,
-                    s.snapshot_commitment
-             FROM archive_lifecycle_anchors a
-             JOIN archive_lifecycle_inventory_snapshots s ON s.archive_id = a.archive_id
-             WHERE a.archive_id = ?1 AND s.lifecycle_revision = a.revision",
-            [reference.archive_id().as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let (state, persisted_fence, snapshot_revision, snapshot_commitment) =
-        anchor.ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
-    let lifecycle_revision = u64::try_from(snapshot_revision).map_err(|_| {
-        EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
-    })?;
-    let lifecycle_anchor = lifecycle_anchor_conn(&tx, reference.archive_id())?
-        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
-    let expected_snapshot = lifecycle_inventory_snapshot_commitment_conn(
-        &tx,
-        lifecycle_anchor.plan,
-        deletion_fence,
-        lifecycle_revision,
-    )?;
-    if ArchiveLifecycleState::from_db(&state)? != ArchiveLifecycleState::DeletionFrozen
-        || fixed_16(persisted_fence)? != *deletion_fence.as_bytes()
-        || lifecycle_revision != lifecycle_anchor.revision
-        || fixed_32(snapshot_commitment)? != expected_snapshot
-    {
-        return Err(EnclaveError::Conflict(
-            "archive lifecycle page creates are frozen".into(),
-        ));
+    let pre_witness_plan =
+        validate_open_inventory_snapshot_conn(&tx, reference.archive_id(), deletion_fence)?;
+    if let Some(planned) = pre_witness_plan.as_ref() {
+        validate_pre_witness_page_rows_conn(&tx, reference.archive_id(), deletion_fence, planned)?;
+        if usize::try_from(reference.page_ordinal())
+            .ok()
+            .and_then(|ordinal| planned.get(ordinal))
+            != Some(page)
+        {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness page is not in the exact durable plan".into(),
+            ));
+        }
     }
     let existing_ordinal: i64 = tx.query_row(
         "SELECT count(*) FROM archive_lifecycle_page_creates
@@ -3912,36 +4734,9 @@ fn recover_lifecycle_page_create_plan_conn(
     deletion_fence: ObjectId,
 ) -> Result<RecoveredPageCreatePlan> {
     let tx = conn.unchecked_transaction()?;
-    let anchor = lifecycle_anchor_conn(&tx, archive_id)?
-        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
-    let snapshot: Option<(Vec<u8>, i64, Vec<u8>)> = tx
-        .query_row(
-            "SELECT deletion_fence, lifecycle_revision, snapshot_commitment
-             FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1",
-            [archive_id.as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let (snapshot_fence, snapshot_revision, snapshot_commitment) = snapshot.ok_or_else(|| {
-        EnclaveError::Conflict("archive lifecycle inventory snapshot is not durable".into())
-    })?;
-    let snapshot_revision = u64::try_from(snapshot_revision).map_err(|_| {
-        EnclaveError::Store("archive lifecycle snapshot revision is invalid".into())
-    })?;
-    let expected_snapshot = lifecycle_inventory_snapshot_commitment_conn(
-        &tx,
-        anchor.plan,
-        deletion_fence,
-        snapshot_revision,
-    )?;
-    if anchor.state != ArchiveLifecycleState::DeletionFrozen
-        || anchor.revision != snapshot_revision
-        || fixed_16(snapshot_fence)? != *deletion_fence.as_bytes()
-        || fixed_32(snapshot_commitment)? != expected_snapshot
-    {
-        return Err(EnclaveError::Conflict(
-            "archive lifecycle inventory snapshot changed".into(),
-        ));
+    let pre_witness_plan = validate_open_inventory_snapshot_conn(&tx, archive_id, deletion_fence)?;
+    if let Some(expected) = pre_witness_plan.as_ref() {
+        validate_pre_witness_page_rows_conn(&tx, archive_id, deletion_fence, expected)?;
     }
     let mut statement = tx.prepare(
         "SELECT page_ordinal, page_id, previous_hash, page_hash, encoded_len,
@@ -4005,6 +4800,23 @@ fn recover_lifecycle_page_create_plan_conn(
         }
     }
     drop(statement);
+    if let Some(expected) = pre_witness_plan {
+        let created_matches = created.iter().enumerate().all(|(ordinal, reference)| {
+            expected.get(ordinal).map(InventoryPage::reference) == Some(*reference)
+        });
+        let unresolved_matches = match outcome_unknown.as_ref() {
+            Some(page) => expected.get(created.len()) == Some(page),
+            None => true,
+        };
+        if !created_matches
+            || !unresolved_matches
+            || created.len() + usize::from(outcome_unknown.is_some()) > expected.len()
+        {
+            return Err(EnclaveError::Store(
+                "archive pre-witness recovered page plan changed".into(),
+            ));
+        }
+    }
     let plan = RecoveredPageCreatePlan::from_persisted(
         &LifecyclePersistenceContext::validated(),
         archive_id,
@@ -4027,18 +4839,36 @@ fn reconcile_lifecycle_page_created_conn(
             "archive lifecycle page readback changed".into(),
         ));
     }
-    let updated = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let pre_witness_plan = validate_open_inventory_snapshot_conn(
+        &tx,
+        reference.archive_id(),
+        admission.deletion_fence(),
+    )?;
+    if let Some(planned) = pre_witness_plan.as_ref() {
+        validate_pre_witness_page_rows_conn(
+            &tx,
+            reference.archive_id(),
+            admission.deletion_fence(),
+            planned,
+        )?;
+        if usize::try_from(reference.page_ordinal())
+            .ok()
+            .and_then(|ordinal| planned.get(ordinal))
+            .map(InventoryPage::reference)
+            != Some(reference)
+        {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness page reconciliation changed plan".into(),
+            ));
+        }
+    }
+    let updated = tx.execute(
         "UPDATE archive_lifecycle_page_creates
          SET state = 'created', unresolved_encoded_page = NULL
          WHERE archive_id = ?1 AND deletion_fence = ?2 AND page_ordinal = ?3
            AND page_id = ?4 AND previous_hash = ?5 AND page_hash = ?6
-           AND encoded_len = ?7 AND state IN ('outcome_unknown','created')
-           AND EXISTS (
-             SELECT 1 FROM archive_lifecycle_anchors a
-             JOIN archive_lifecycle_inventory_snapshots s ON s.archive_id = a.archive_id
-             WHERE a.archive_id = ?1 AND a.state = 'deletion_frozen'
-               AND a.deletion_fence = ?2 AND s.lifecycle_revision = a.revision
-           )",
+           AND encoded_len = ?7 AND state IN ('outcome_unknown','created')",
         rusqlite::params![
             reference.archive_id().as_bytes().as_slice(),
             admission.deletion_fence().as_bytes().as_slice(),
@@ -4054,6 +4884,7 @@ fn reconcile_lifecycle_page_created_conn(
             "archive lifecycle page-create reconciliation lost authority".into(),
         ));
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -9026,6 +9857,74 @@ impl DeletionInventoryControl for ControlStore {
 }
 
 #[async_trait::async_trait]
+impl PreWitnessInventoryControl for ControlStore {
+    async fn freeze_pre_witness_snapshot(
+        &self,
+        absence: AuthenticatedPreWitnessAbsence,
+    ) -> std::result::Result<FrozenPreWitnessInventorySnapshot, LifecycleError> {
+        self.write_if_changed(move |conn| {
+            freeze_pre_witness_inventory_snapshot_conn(conn, absence)
+                .map(|snapshot| (snapshot, true))
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn recover_pre_witness_inventory(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<RecoveredPreWitnessInventory, LifecycleError> {
+        self.read(move |conn| recover_pre_witness_inventory_conn(conn, archive_id, deletion_fence))
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn recover_pre_witness_page_plan(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<RecoveredPageCreatePlan, LifecycleError> {
+        self.recover_lifecycle_page_create_plan(archive_id, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn seal_authenticated_pre_witness_pages(
+        &self,
+        plan: AuthenticatedPreWitnessInventoryPlan,
+    ) -> std::result::Result<PreWitnessDeletionInventorySeal, LifecycleError> {
+        self.write_if_changed(move |conn| {
+            seal_pre_witness_inventory_conn(conn, &plan).map(|seal| (seal, true))
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn load_pre_witness_sealed_references(
+        &self,
+        seal: &PreWitnessDeletionInventorySeal,
+    ) -> std::result::Result<Vec<InventoryPageReference>, LifecycleError> {
+        let seal = *seal;
+        self.read(move |conn| {
+            let (loaded, references) = load_pre_witness_sealed_inventory_conn(
+                conn,
+                seal.archive_id(),
+                seal.deletion_fence(),
+            )?;
+            if loaded != seal {
+                return Err(EnclaveError::Conflict(
+                    "archive pre-witness inventory seal changed".into(),
+                ));
+            }
+            Ok(references)
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+}
+
+#[async_trait::async_trait]
 impl LifecyclePageAdmissionLedger for ControlStore {
     async fn admit_page_create(
         &self,
@@ -9392,6 +10291,28 @@ mod tests {
         objects
     }
 
+    fn arbitrary_pre_witness_page(plan: BootstrapPlan) -> InventoryPage {
+        let key = ObjectContext::new(
+            plan.archive_id(),
+            plan.database_epoch(),
+            plan.key_epoch(),
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: 0 },
+            plan.root_object_id(),
+            None,
+        )
+        .unwrap()
+        .object_key();
+        let object = crate::archive_v3_lifecycle::LifecycleInventoryObject::for_archive(
+            plan.archive_id(),
+            key,
+            ObjectRole::RootV3,
+            [0xa5; 32],
+        )
+        .unwrap();
+        InventoryPage::build(plan.archive_id(), 0, [0; 32], vec![object]).unwrap()
+    }
+
     fn persist_lifecycle_page_creates(
         conn: &Connection,
         fence: ObjectId,
@@ -9464,6 +10385,48 @@ mod tests {
         (plan, admission)
     }
 
+    fn confirmed_pre_witness_absence_fixture(
+        conn: &Connection,
+        prepare_objects: bool,
+    ) -> (BootstrapPlan, ObjectId, AuthenticatedPreWitnessAbsence) {
+        let plan = lifecycle_plan(conn);
+        let reservation = reserve_archive_bootstrap_conn(conn, plan).unwrap();
+        if prepare_objects {
+            let prepared =
+                prepare_archive_bootstrap_conn(conn, reservation, b"wrapped", b"root").unwrap();
+            let registry = admit_archive_create_conn(
+                conn,
+                plan.archive_id(),
+                prepared.revision(),
+                LIFECYCLE_REGISTRY_ORDINAL,
+            )
+            .unwrap();
+            let revision =
+                reconcile_archive_create_conn(conn, &registry, LifecycleCreateOutcome::Created)
+                    .unwrap();
+            let root = admit_archive_create_conn(
+                conn,
+                plan.archive_id(),
+                revision,
+                LIFECYCLE_ROOT_ORDINAL,
+            )
+            .unwrap();
+            reconcile_archive_create_conn(conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        }
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        let closed = match authenticate_closed_witness_protocol_conn(conn, plan.archive_id(), fence)
+            .unwrap()
+        {
+            PreWitnessControlState::Participating(closed) => closed,
+            other => panic!("unexpected protocol state: {other:?}"),
+        };
+        assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedUnsent);
+        let absence = confirm_pre_witness_absence_conn(conn, &closed).unwrap();
+        (plan, fence, absence)
+    }
+
     #[test]
     fn deletion_wins_admission_to_marker_race_and_absence_remints_only_after_fresh_state() {
         let directory = tempfile::tempdir().unwrap();
@@ -9484,7 +10447,10 @@ mod tests {
         assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedUnsent);
         assert_eq!(closed.admission_revision(), Some(admission.revision()));
         let proof = confirm_pre_witness_absence_conn(&conn, &closed).unwrap();
-        assert_eq!(proof.archive_id(), plan.archive_id());
+        assert_eq!(
+            format!("{proof:?}"),
+            "AuthenticatedPreWitnessAbsence(<opaque>)"
+        );
         let first_revision = lifecycle_anchor_conn(&conn, plan.archive_id())
             .unwrap()
             .unwrap()
@@ -9517,6 +10483,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tuple, (None, Some("confirmed_absent".into())));
+    }
+
+    #[test]
+    fn admitted_before_marker_absence_freezes_pages_seals_and_restarts_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("admitted-before-marker-inventory.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, admission) = prepare_lifecycle_witness_for_protocol(&conn);
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+
+        // Deletion serialized before the Firestore send marker. The closed
+        // protocol retains the pre-CAS admission only until an exact None is
+        // confirmed; the resulting absence state clears current admission.
+        assert!(mark_witness_send_started_conn(&conn, &admission).is_err());
+        let closed =
+            match authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence)
+                .unwrap()
+            {
+                PreWitnessControlState::Participating(closed) => closed,
+                other => panic!("unexpected protocol state: {other:?}"),
+            };
+        assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedUnsent);
+        assert_eq!(closed.admission_revision(), Some(admission.revision()));
+        let exact_none = confirm_pre_witness_absence_conn(&conn, &closed).unwrap();
+        let snapshot = freeze_pre_witness_inventory_snapshot_conn(&conn, exact_none).unwrap();
+        assert_eq!(snapshot.create_ahead().len(), 2);
+        let durable_revision = snapshot.revision();
+        drop(snapshot);
+        drop(conn);
+
+        // Snapshot recovery needs neither the old closed-state admission nor
+        // a reminted Firestore absence proof.
+        let conn = lifecycle_file_conn(&path);
+        let snapshot =
+            match recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).unwrap() {
+                RecoveredPreWitnessInventory::Frozen(snapshot) => snapshot,
+                other => panic!("unexpected recovery state: {other:?}"),
+            };
+        assert_eq!(snapshot.revision(), durable_revision);
+        let pages = pre_witness_page_plan_for_snapshot(&snapshot).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].entries().len(), 2);
+        let durable_pages = pages
+            .iter()
+            .cloned()
+            .map(durable_inventory_page)
+            .collect::<Vec<_>>();
+        persist_lifecycle_page_creates(&conn, fence, &durable_pages);
+        let authenticated =
+            AuthenticatedPreWitnessInventoryPlan::for_test(snapshot, pages.clone(), durable_pages)
+                .unwrap();
+        let seal = seal_pre_witness_inventory_conn(&conn, &authenticated).unwrap();
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered =
+            recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert!(matches!(recovered, RecoveredPreWitnessInventory::Sealed(value) if value == seal));
+        let (loaded, references) =
+            load_pre_witness_sealed_inventory_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert_eq!(loaded, seal);
+        assert_eq!(
+            references,
+            pages
+                .iter()
+                .map(InventoryPage::reference)
+                .collect::<Vec<_>>()
+        );
+        let current_admissions: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT a.witness_admission_revision, p.admission_revision
+                 FROM archive_lifecycle_anchors a
+                 JOIN archive_lifecycle_witness_protocols p ON p.archive_id = a.archive_id
+                 WHERE a.archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current_admissions, (None, None));
     }
 
     #[test]
@@ -9904,6 +10953,279 @@ mod tests {
                 authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence,)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn pre_witness_zero_inventory_freezes_restarts_and_seals_without_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pre-witness-zero.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, fence, absence) = confirmed_pre_witness_absence_fixture(&conn, false);
+        let snapshot = freeze_pre_witness_inventory_snapshot_conn(&conn, absence).unwrap();
+        assert!(snapshot.create_ahead().is_empty());
+        assert_eq!(
+            pre_witness_page_plan_for_snapshot(&snapshot).unwrap(),
+            Vec::<InventoryPage>::new()
+        );
+        let forbidden_page = arbitrary_pre_witness_page(plan);
+        assert!(admit_lifecycle_page_create_conn(&conn, fence, &forbidden_page).is_err());
+        let durable_admissions: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM archive_lifecycle_page_creates WHERE archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(durable_admissions, 0);
+        assert!(
+            authenticate_closed_witness_protocol_conn(&conn, plan.archive_id(), fence).is_err()
+        );
+        drop(snapshot);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let snapshot =
+            match recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).unwrap() {
+                RecoveredPreWitnessInventory::Frozen(snapshot) => snapshot,
+                other => panic!("unexpected recovery state: {other:?}"),
+            };
+        let authenticated =
+            AuthenticatedPreWitnessInventoryPlan::for_test(snapshot, Vec::new(), Vec::new())
+                .unwrap();
+        let seal = seal_pre_witness_inventory_conn(&conn, &authenticated).unwrap();
+        assert_eq!((seal.page_count(), seal.artifact_count()), (0, 0));
+        assert_eq!(seal.terminal_page_hash(), [0; 32]);
+        assert_ne!(seal.inventory_commitment(), [0; 32]);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered =
+            recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).unwrap();
+        let recovered = match recovered {
+            RecoveredPreWitnessInventory::Sealed(recovered) => recovered,
+            other => panic!("unexpected recovery state: {other:?}"),
+        };
+        assert_eq!(recovered, seal);
+        let (loaded, references) =
+            load_pre_witness_sealed_inventory_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert_eq!(loaded, seal);
+        assert!(references.is_empty());
+        let page_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM archive_lifecycle_page_creates WHERE archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_rows, 0);
+    }
+
+    #[test]
+    fn pre_witness_prepared_inventory_requires_exact_canonical_plan_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pre-witness-prepared.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, fence, absence) = confirmed_pre_witness_absence_fixture(&conn, true);
+        let snapshot = freeze_pre_witness_inventory_snapshot_conn(&conn, absence).unwrap();
+        let pages = pre_witness_page_plan_for_snapshot(&snapshot).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].entries().len(), 2);
+
+        let subset = AuthenticatedPreWitnessInventoryPlan::for_test(
+            load_pre_witness_inventory_snapshot_conn(&conn, plan.archive_id(), fence, false)
+                .unwrap(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(seal_pre_witness_inventory_conn(&conn, &subset).is_err());
+
+        let extra = InventoryPage::build(
+            plan.archive_id(),
+            1,
+            pages[0].page_hash(),
+            vec![pages[0].entries()[0].clone()],
+        )
+        .unwrap();
+        let superset_pages = vec![pages[0].clone(), extra];
+        let superset_durable = superset_pages
+            .iter()
+            .cloned()
+            .map(durable_inventory_page)
+            .collect::<Vec<_>>();
+        let superset = AuthenticatedPreWitnessInventoryPlan::for_test(
+            load_pre_witness_inventory_snapshot_conn(&conn, plan.archive_id(), fence, false)
+                .unwrap(),
+            superset_pages,
+            superset_durable,
+        )
+        .unwrap();
+        assert!(seal_pre_witness_inventory_conn(&conn, &superset).is_err());
+
+        let durable_pages = pages
+            .iter()
+            .cloned()
+            .map(durable_inventory_page)
+            .collect::<Vec<_>>();
+        persist_lifecycle_page_creates(&conn, fence, &durable_pages);
+        let authenticated =
+            AuthenticatedPreWitnessInventoryPlan::for_test(snapshot, pages.clone(), durable_pages)
+                .unwrap();
+        let seal = seal_pre_witness_inventory_conn(&conn, &authenticated).unwrap();
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered =
+            recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert!(matches!(recovered, RecoveredPreWitnessInventory::Sealed(value) if value == seal));
+        let (_, references) =
+            load_pre_witness_sealed_inventory_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert_eq!(references, vec![pages[0].reference()]);
+        conn.execute(
+            "UPDATE archive_lifecycle_prewitness_inventory_pages
+             SET previous_hash = randomblob(32) WHERE archive_id = ?1",
+            [plan.archive_id().as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(load_pre_witness_sealed_inventory_conn(&conn, plan.archive_id(), fence).is_err());
+    }
+
+    #[test]
+    fn pre_witness_page_ledger_rejects_alternate_and_tampered_recovered_prefix() {
+        let conn = account_conn();
+        let (plan, fence, absence) = confirmed_pre_witness_absence_fixture(&conn, true);
+        let snapshot = freeze_pre_witness_inventory_snapshot_conn(&conn, absence).unwrap();
+        let pages = pre_witness_page_plan_for_snapshot(&snapshot).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].entries().len(), 2);
+        let alternate = InventoryPage::build(
+            plan.archive_id(),
+            0,
+            [0; 32],
+            vec![pages[0].entries()[0].clone()],
+        )
+        .unwrap();
+
+        assert!(admit_lifecycle_page_create_conn(&conn, fence, &alternate).is_err());
+        let durable_admissions: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM archive_lifecycle_page_creates WHERE archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(durable_admissions, 0);
+
+        // Simulate a corrupted durable prefix that bypassed the admission
+        // API. Recovery must compare it to the deterministic snapshot plan,
+        // not merely accept a contiguous, internally consistent KILP row.
+        let reference = alternate.reference();
+        conn.execute(
+            "INSERT INTO archive_lifecycle_page_creates
+             (archive_id, deletion_fence, page_ordinal, page_id, previous_hash,
+              page_hash, encoded_len, state, unresolved_encoded_page)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'created',NULL)",
+            rusqlite::params![
+                plan.archive_id().as_bytes().as_slice(),
+                fence.as_bytes().as_slice(),
+                i64::from(reference.page_ordinal()),
+                reference.page_id().as_bytes().as_slice(),
+                reference.previous_hash().as_slice(),
+                reference.page_hash().as_slice(),
+                i64::from(reference.encoded_len()),
+            ],
+        )
+        .unwrap();
+        assert!(recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence).is_err());
+    }
+
+    #[test]
+    fn pre_witness_branch_is_exclusive_and_dual_row_corruption_fails_closed() {
+        let conn = account_conn();
+        let (plan, fence, absence) = confirmed_pre_witness_absence_fixture(&conn, false);
+        let snapshot = freeze_pre_witness_inventory_snapshot_conn(&conn, absence).unwrap();
+        assert!(freeze_archive_inventory_snapshot_conn(
+            &conn,
+            plan.archive_id(),
+            snapshot.revision(),
+            fence,
+        )
+        .is_err());
+        conn.execute(
+            "INSERT INTO archive_lifecycle_inventory_snapshots
+             (archive_id,deletion_fence,lifecycle_revision,snapshot_commitment)
+             VALUES (?1,?2,?3,randomblob(32))",
+            rusqlite::params![
+                plan.archive_id().as_bytes().as_slice(),
+                fence.as_bytes().as_slice(),
+                i64::try_from(snapshot.revision()).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).is_err());
+        assert!(recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence).is_err());
+    }
+
+    #[test]
+    fn pre_witness_outcome_unknown_page_restarts_with_identical_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pre-witness-unresolved.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, fence, absence) = confirmed_pre_witness_absence_fixture(&conn, true);
+        let snapshot = freeze_pre_witness_inventory_snapshot_conn(&conn, absence).unwrap();
+        let pages = pre_witness_page_plan_for_snapshot(&snapshot).unwrap();
+        let exact = pages[0].encoded().to_vec();
+        let admission = admit_lifecycle_page_create_conn(&conn, fence, &pages[0]).unwrap();
+        assert_eq!(admission.reference(), pages[0].reference());
+        drop(snapshot);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered =
+            recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence).unwrap();
+        assert!(recovered.created().is_empty());
+        let unresolved = recovered.outcome_unknown().unwrap();
+        assert_eq!(unresolved.encoded(), exact);
+        let durable = durable_inventory_page(unresolved.clone());
+        let admission = admit_lifecycle_page_create_conn(&conn, fence, unresolved).unwrap();
+        reconcile_lifecycle_page_created_conn(&conn, admission, &durable).unwrap();
+        let snapshot =
+            match recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).unwrap() {
+                RecoveredPreWitnessInventory::Frozen(snapshot) => snapshot,
+                other => panic!("unexpected recovery state: {other:?}"),
+            };
+        let authenticated =
+            AuthenticatedPreWitnessInventoryPlan::for_test(snapshot, pages, vec![durable]).unwrap();
+        assert!(seal_pre_witness_inventory_conn(&conn, &authenticated).is_ok());
+    }
+
+    #[test]
+    fn pre_witness_unknown_version_and_tuple_corruption_fail_before_page_admission() {
+        for corruption in [
+            "protocol_version = 99",
+            "protocol_commitment = randomblob(32)",
+            "snapshot_commitment = randomblob(32)",
+            "lifecycle_revision = lifecycle_revision + 1",
+        ] {
+            let conn = account_conn();
+            let (plan, fence, absence) = confirmed_pre_witness_absence_fixture(&conn, false);
+            let _ = freeze_pre_witness_inventory_snapshot_conn(&conn, absence).unwrap();
+            let table = if corruption.starts_with("protocol_commitment") {
+                "archive_lifecycle_prewitness_inventory_snapshots"
+            } else if corruption.starts_with("protocol_version") {
+                "archive_lifecycle_witness_protocols"
+            } else {
+                "archive_lifecycle_prewitness_inventory_snapshots"
+            };
+            let update = conn.execute(
+                &format!("UPDATE {table} SET {corruption} WHERE archive_id = ?1"),
+                [plan.archive_id().as_bytes().as_slice()],
+            );
+            if update.is_err() {
+                continue;
+            }
+            assert!(recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).is_err());
         }
     }
 

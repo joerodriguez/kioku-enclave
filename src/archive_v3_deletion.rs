@@ -559,6 +559,65 @@ impl fmt::Debug for CompleteDeletionInventory {
     }
 }
 
+/// Fully authenticated create-ahead inventory for the branch where the
+/// initial witness send was proven absent. This type is deliberately not a
+/// `CompleteDeletionInventory`: it has no `authorize`, entry, provider, or
+/// conversion surface and cannot be passed to the deletion driver. Driver
+/// integration is a later authority change.
+pub(crate) struct CompletePreWitnessDeletionInventory {
+    objects: Vec<LifecycleInventoryObject>,
+    commitment: [u8; 32],
+    key_bytes: usize,
+    pages: usize,
+}
+
+impl CompletePreWitnessDeletionInventory {
+    pub(crate) fn from_authenticated_lifecycle_pages(
+        _producer: &crate::archive_v3_inventory_coordinator::AuthenticatedPreWitnessInventoryLoad,
+        seal: &crate::archive_v3_lifecycle::PreWitnessDeletionInventorySeal,
+        objects: Vec<LifecycleInventoryObject>,
+        key_bytes: usize,
+    ) -> Result<Self> {
+        if objects.len() != usize::try_from(seal.artifact_count()).unwrap_or(usize::MAX)
+            || (objects.is_empty()
+                && (key_bytes != 0
+                    || seal.page_count() != 0
+                    || seal.terminal_page_hash() != [0; 32]))
+            || (!objects.is_empty() && (key_bytes == 0 || seal.page_count() == 0))
+        {
+            return Err(ArchiveDeletionError::InvalidInventory);
+        }
+        Ok(Self {
+            objects,
+            commitment: seal.inventory_commitment(),
+            key_bytes,
+            pages: usize::try_from(seal.page_count())
+                .map_err(|_| ArchiveDeletionError::InventoryLimit)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn objects_for_test(&self) -> &[LifecycleInventoryObject] {
+        &self.objects
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn commitment_for_test(&self) -> [u8; 32] {
+        self.commitment
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn dimensions_for_test(&self) -> (usize, usize) {
+        (self.key_bytes, self.pages)
+    }
+}
+
+impl fmt::Debug for CompletePreWitnessDeletionInventory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletePreWitnessDeletionInventory(<opaque>)")
+    }
+}
+
 /// Opaque deletion session reconstructed only from a witness tombstone receipt
 /// or deletion-only restart authorization.
 #[derive(Clone)]

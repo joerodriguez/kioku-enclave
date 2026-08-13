@@ -260,7 +260,9 @@ impl fmt::Debug for PreWitnessControlState {
 }
 
 /// Non-cloneable proof of one fresh exact absent read and a matching
-/// full-state encrypted-control CAS.
+/// full-state encrypted-control CAS. The proof binds the resulting
+/// `absence_confirmed` state, whose current admission is cleared; it does not
+/// retain a historical admission from the closed pre-CAS state.
 pub(crate) struct AuthenticatedPreWitnessAbsence {
     archive_id: ArchiveId,
     attempt_id: BootstrapAttemptId,
@@ -269,9 +271,34 @@ pub(crate) struct AuthenticatedPreWitnessAbsence {
     expected_hash: Option<[u8; 32]>,
     expected_len: Option<u32>,
     protocol_version: u16,
-    admission_revision: Option<u64>,
     protocol_commitment: [u8; 32],
 }
+
+/// One-shot producer-gated view used only by encrypted control when it binds
+/// the absence receipt into the durable pre-witness inventory snapshot. It has
+/// no field getters and can be consumed only while holding control's private
+/// persistence token.
+pub(crate) struct PreWitnessAbsenceControlView {
+    archive_id: ArchiveId,
+    attempt_id: BootstrapAttemptId,
+    deletion_fence: ObjectId,
+    lifecycle_revision: u64,
+    expected_hash: Option<[u8; 32]>,
+    expected_len: Option<u32>,
+    protocol_version: u16,
+    protocol_commitment: [u8; 32],
+}
+
+pub(crate) type PreWitnessAbsenceControlParts = (
+    ArchiveId,
+    BootstrapAttemptId,
+    ObjectId,
+    u64,
+    Option<[u8; 32]>,
+    Option<u32>,
+    u16,
+    [u8; 32],
+);
 
 impl AuthenticatedPreWitnessAbsence {
     pub(crate) fn from_control_cas(
@@ -291,7 +318,6 @@ impl AuthenticatedPreWitnessAbsence {
             expected_hash: snapshot.expected_hash,
             expected_len: snapshot.expected_len,
             protocol_version: snapshot.protocol_version,
-            admission_revision: snapshot.admission_revision,
             protocol_commitment: resulting_commitment,
         })
     }
@@ -312,17 +338,42 @@ impl AuthenticatedPreWitnessAbsence {
             expected_hash: snapshot.expected_hash,
             expected_len: snapshot.expected_len,
             protocol_version: snapshot.protocol_version,
-            admission_revision: snapshot.admission_revision,
             protocol_commitment: resulting_commitment,
         })
     }
 
-    pub(crate) const fn archive_id(&self) -> ArchiveId {
-        self.archive_id
+    pub(crate) fn into_control_view(
+        self,
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+    ) -> PreWitnessAbsenceControlView {
+        PreWitnessAbsenceControlView {
+            archive_id: self.archive_id,
+            attempt_id: self.attempt_id,
+            deletion_fence: self.deletion_fence,
+            lifecycle_revision: self.lifecycle_revision,
+            expected_hash: self.expected_hash,
+            expected_len: self.expected_len,
+            protocol_version: self.protocol_version,
+            protocol_commitment: self.protocol_commitment,
+        }
     }
+}
 
-    pub(crate) const fn deletion_fence(&self) -> ObjectId {
-        self.deletion_fence
+impl PreWitnessAbsenceControlView {
+    pub(crate) fn into_control_parts(
+        self,
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+    ) -> PreWitnessAbsenceControlParts {
+        (
+            self.archive_id,
+            self.attempt_id,
+            self.deletion_fence,
+            self.lifecycle_revision,
+            self.expected_hash,
+            self.expected_len,
+            self.protocol_version,
+            self.protocol_commitment,
+        )
     }
 }
 
@@ -776,8 +827,6 @@ mod tests {
             include_str!("store.rs"),
             include_str!("cp/mod.rs"),
             include_str!("cp/sync.rs"),
-            include_str!("archive_v3_inventory_coordinator.rs"),
-            include_str!("archive_v3_deletion.rs"),
         );
         for forbidden in [
             "resolve_pre_witness_disposition(",
@@ -797,5 +846,8 @@ mod tests {
         assert!(!disposition_source.contains(visible_none_factory));
         let control_source = include_str!("cp/control_store.rs");
         assert!(!control_source.contains("pub(crate) async fn confirm_pre_witness_absence"));
+        let coordinator_source = include_str!("archive_v3_inventory_coordinator.rs");
+        assert!(coordinator_source.contains("absence: AuthenticatedPreWitnessAbsence"));
+        assert!(!coordinator_source.contains("resolve_pre_witness_disposition("));
     }
 }
