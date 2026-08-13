@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::error::{EnclaveError, Result};
+use crate::error::{CaptureReferenceFailureReason, EnclaveError, Result};
 
 use super::isotime::parse_epoch_millis;
 use super::{auth::AuthUser, limits, CpState};
@@ -87,6 +88,13 @@ pub enum MediaDisposition {
 impl MediaDisposition {
     fn is_canonical(&self) -> bool {
         matches!(self, Self::Canonical)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::Reference => "reference",
+        }
     }
 }
 
@@ -754,23 +762,39 @@ async fn upload_capture_event(
     Extension(user): Extension<AuthUser>,
     mut multipart: Multipart,
 ) -> Response {
+    let started_at = Instant::now();
     let user_id = user.0;
     match limits::account_active(&state.control, &user_id).await {
         Ok(true) => {}
         Ok(false) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "account_suspended"})),
+            return capture_failure_response(
+                started_at,
+                None,
+                CaptureIngestFailureReason::AccountSuspended,
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "account_suspended"})),
+                )
+                    .into_response(),
             )
-                .into_response()
         }
         Err(error) => {
             tracing::error!(error = %error, "capture account status lookup failed");
-            return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
+            return capture_failure_response(
+                started_at,
+                None,
+                CaptureIngestFailureReason::AccountStatusUnavailable,
+                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response(),
+            );
         }
     }
     if !state.sync_limiter.consume(&user_id).await {
-        return rate_limited_response();
+        return capture_failure_response(
+            started_at,
+            None,
+            CaptureIngestFailureReason::RateLimited,
+            rate_limited_response(),
+        );
     }
 
     let mut manifest_bytes: Option<Vec<u8>> = None;
@@ -780,7 +804,14 @@ async fn upload_capture_event(
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(_) => return bad_request("invalid multipart body"),
+            Err(_) => {
+                return capture_failure_response(
+                    started_at,
+                    None,
+                    CaptureIngestFailureReason::MultipartInvalid,
+                    bad_request("invalid multipart body"),
+                )
+            }
         };
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
@@ -788,8 +819,22 @@ async fn upload_capture_event(
                 Ok(bytes) if bytes.len() <= MAX_MANIFEST_BYTES => {
                     manifest_bytes = Some(bytes.to_vec())
                 }
-                Ok(_) => return bad_request("manifest is too large"),
-                Err(_) => return bad_request("invalid manifest field"),
+                Ok(_) => {
+                    return capture_failure_response(
+                        started_at,
+                        None,
+                        CaptureIngestFailureReason::ManifestTooLarge,
+                        bad_request("manifest is too large"),
+                    )
+                }
+                Err(_) => {
+                    return capture_failure_response(
+                        started_at,
+                        None,
+                        CaptureIngestFailureReason::MultipartInvalid,
+                        bad_request("invalid manifest field"),
+                    )
+                }
             },
             "media" if media_bytes.is_none() => {
                 media_content_type = field.content_type().map(ToOwned::to_owned);
@@ -798,49 +843,101 @@ async fn upload_capture_event(
                         media_bytes = Some(bytes.to_vec())
                     }
                     Ok(_) => {
-                        return (StatusCode::PAYLOAD_TOO_LARGE, "media is too large")
-                            .into_response()
+                        return capture_failure_response(
+                            started_at,
+                            None,
+                            CaptureIngestFailureReason::MediaTooLarge,
+                            (StatusCode::PAYLOAD_TOO_LARGE, "media is too large").into_response(),
+                        )
                     }
-                    Err(_) => return bad_request("invalid media field"),
+                    Err(_) => {
+                        return capture_failure_response(
+                            started_at,
+                            None,
+                            CaptureIngestFailureReason::MultipartInvalid,
+                            bad_request("invalid media field"),
+                        )
+                    }
                 }
             }
-            "manifest" | "media" => return bad_request("duplicate multipart field"),
-            _ => return bad_request("unknown multipart field"),
+            "manifest" | "media" => {
+                return capture_failure_response(
+                    started_at,
+                    None,
+                    CaptureIngestFailureReason::MultipartInvalid,
+                    bad_request("duplicate multipart field"),
+                )
+            }
+            _ => {
+                return capture_failure_response(
+                    started_at,
+                    None,
+                    CaptureIngestFailureReason::MultipartInvalid,
+                    bad_request("unknown multipart field"),
+                )
+            }
         }
     }
     let Some(manifest_bytes) = manifest_bytes else {
-        return bad_request("manifest field is required");
+        return capture_failure_response(
+            started_at,
+            None,
+            CaptureIngestFailureReason::ManifestMissing,
+            bad_request("manifest field is required"),
+        );
     };
     let manifest: CaptureEventManifest = match serde_json::from_slice(&manifest_bytes) {
         Ok(value) => value,
-        Err(_) => return bad_request("manifest is not valid capture schema v2 JSON"),
+        Err(_) => {
+            return capture_failure_response(
+                started_at,
+                None,
+                CaptureIngestFailureReason::ManifestInvalid,
+                bad_request("manifest is not valid capture schema v2 JSON"),
+            )
+        }
     };
     if let Err(error) = manifest.validate() {
-        return error.into_response();
+        return capture_error_response(started_at, Some(&manifest), error);
     }
     match manifest.media_disposition {
         MediaDisposition::Canonical => {
             let Some(bytes) = media_bytes.as_deref() else {
-                return bad_request("canonical events require a media field");
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::MediaMissing,
+                    bad_request("canonical events require a media field"),
+                );
             };
             if let Err(error) =
                 validate_media_bytes(&manifest, bytes, media_content_type.as_deref())
             {
-                return error.into_response();
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::MediaInvalid,
+                    error.into_response(),
+                );
             }
         }
         MediaDisposition::Reference if media_bytes.is_some() => {
-            return bad_request("reference events cannot contain a media field")
+            return capture_failure_response(
+                started_at,
+                Some(&manifest),
+                CaptureIngestFailureReason::MediaInvalid,
+                bad_request("reference events cannot contain a media field"),
+            )
         }
         MediaDisposition::Reference => {}
     }
     let digest = match manifest_digest(&manifest) {
         Ok(value) => value,
-        Err(error) => return error.into_response(),
+        Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     };
     let asset_id = match response_asset_id(&manifest) {
         Ok(value) => value,
-        Err(error) => return error.into_response(),
+        Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     };
     let object_key = manifest
         .media
@@ -848,14 +945,28 @@ async fn upload_capture_event(
         .map(|media| format!("raw/{user_id}/{}.enc", media.asset_id));
     let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
         Ok(guard) => guard,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            return capture_failure_response(
+                started_at,
+                Some(&manifest),
+                CaptureIngestFailureReason::LifecycleUnavailable,
+                error.into_response(),
+            )
+        }
     };
     // Keep admission alive through the GCS object and durable SQLite record.
     // DELETE /api/account closes this barrier before it inventories media, so
     // an already-authorized capture cannot recreate an object afterward.
     let _content_write = match state.store.acquire_content_write(&user_id).await {
         Ok(lease) => lease,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            return capture_failure_response(
+                started_at,
+                Some(&manifest),
+                CaptureIngestFailureReason::LifecycleUnavailable,
+                error.into_response(),
+            )
+        }
     };
     let preflight = state
         .store
@@ -884,14 +995,15 @@ async fn upload_capture_event(
                 .into_response()
         }
         Ok(PreflightOutcome::New) => {}
-        Err(error) => return error.into_response(),
+        Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     }
 
     // Wall-clock allowance is consumed by short idempotent recording leases,
     // not by VAD-triggered media duration, which can overlap across streams.
     if capture_requires_recording_lease(manifest.stream_kind) {
         if let Err(response) = super::billing::check_recording_entitlement(&state, &user_id).await {
-            return response;
+            let reason = recording_entitlement_failure_reason(response.status());
+            return capture_failure_response(started_at, Some(&manifest), reason, response);
         }
     }
 
@@ -905,7 +1017,12 @@ async fn upload_capture_event(
             Ok(value) => value,
             Err(error) => {
                 tracing::error!(error = %error, "capture media key setup failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::MediaStorageUnavailable,
+                    (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+                );
             }
         };
         let media_context = crate::store::media_blob_context(&user_id, object_key);
@@ -914,8 +1031,12 @@ async fn upload_capture_event(
                 Ok(value) => value,
                 Err(error) => {
                     tracing::error!(error = %error, "capture media encryption failed");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
-                        .into_response();
+                    return capture_failure_response(
+                        started_at,
+                        Some(&manifest),
+                        CaptureIngestFailureReason::MediaStorageUnavailable,
+                        (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+                    );
                 }
             };
         // The child keeps the provider PUT alive if the HTTP future is
@@ -940,21 +1061,35 @@ async fn upload_capture_event(
                         .await
                 {
                     tracing::error!(error = %put_error, verify_error = %error, "capture media storage failed");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
-                        .into_response();
+                    return capture_failure_response(
+                        started_at,
+                        Some(&manifest),
+                        CaptureIngestFailureReason::MediaStorageUnavailable,
+                        (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+                    );
                 }
                 media_generation = match state.store.get_media(object_key).await {
                     Ok(existing) => Some(existing.generation),
                     Err(error) => {
                         tracing::error!(error = %error, "capture media generation lookup failed");
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
-                            .into_response();
+                        return capture_failure_response(
+                            started_at,
+                            Some(&manifest),
+                            CaptureIngestFailureReason::MediaStorageUnavailable,
+                            (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed")
+                                .into_response(),
+                        );
                     }
                 };
             }
             Err(error) => {
                 tracing::error!(error = %error, "capture media storage task failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::MediaStorageUnavailable,
+                    (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+                );
             }
         }
     }
@@ -982,11 +1117,16 @@ async fn upload_capture_event(
         .await;
     let committed = match outcome {
         Ok(value) => value,
-        Err(error) => return error.into_response(),
+        Err(error) => return capture_error_response(started_at, Some(&manifest), error),
     };
     if let Err(error) = state.store.save_user(&user_id).await {
         tracing::error!(error = %error, "capture database persistence failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        return capture_failure_response(
+            started_at,
+            Some(&manifest),
+            CaptureIngestFailureReason::PersistenceUnavailable,
+            (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response(),
+        );
     }
     (
         StatusCode::CREATED,
@@ -1545,6 +1685,154 @@ fn load_person_statements(
         (statements.len() > limit).then(|| statements[limit - 1].speaker_observation_id);
     statements.truncate(limit);
     Ok((statements, next_cursor))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureIngestFailureReason {
+    AccountSuspended,
+    AccountStatusUnavailable,
+    RateLimited,
+    MultipartInvalid,
+    ManifestMissing,
+    ManifestTooLarge,
+    ManifestInvalid,
+    MediaMissing,
+    MediaTooLarge,
+    MediaInvalid,
+    RequestInvalid,
+    IdempotencyConflict,
+    LifecycleUnavailable,
+    RecordingLeaseInactive,
+    RecordingLeaseConflict,
+    RecordingLeaseUnavailable,
+    MediaStorageUnavailable,
+    PersistenceUnavailable,
+    CanonicalUnavailable,
+    ContextFingerprintMismatch,
+    ReferenceTargetMismatch,
+    CanonicalContextUnavailable,
+    ReferenceContextTransition,
+    Internal,
+}
+
+impl CaptureIngestFailureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccountSuspended => "account_suspended",
+            Self::AccountStatusUnavailable => "account_status_unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::MultipartInvalid => "multipart_invalid",
+            Self::ManifestMissing => "manifest_missing",
+            Self::ManifestTooLarge => "manifest_too_large",
+            Self::ManifestInvalid => "manifest_invalid",
+            Self::MediaMissing => "media_missing",
+            Self::MediaTooLarge => "media_too_large",
+            Self::MediaInvalid => "media_invalid",
+            Self::RequestInvalid => "request_invalid",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::LifecycleUnavailable => "lifecycle_unavailable",
+            Self::RecordingLeaseInactive => "recording_lease_inactive",
+            Self::RecordingLeaseConflict => "recording_lease_conflict",
+            Self::RecordingLeaseUnavailable => "recording_lease_unavailable",
+            Self::MediaStorageUnavailable => "media_storage_unavailable",
+            Self::PersistenceUnavailable => "persistence_unavailable",
+            Self::CanonicalUnavailable => "canonical_unavailable",
+            Self::ContextFingerprintMismatch => "context_fingerprint_mismatch",
+            Self::ReferenceTargetMismatch => "target_mismatch",
+            Self::CanonicalContextUnavailable => "canonical_context_unavailable",
+            Self::ReferenceContextTransition => "context_transition",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+fn capture_failure_response(
+    started_at: Instant,
+    manifest: Option<&CaptureEventManifest>,
+    reason: CaptureIngestFailureReason,
+    response: Response,
+) -> Response {
+    let status = response.status().as_u16();
+    let status_class = match status {
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    };
+    let stream_kind = manifest
+        .map(|value| value.stream_kind.as_str())
+        .unwrap_or("unknown");
+    let media_disposition = manifest
+        .map(|value| value.media_disposition.as_str())
+        .unwrap_or("unknown");
+    let reason = reason.as_str();
+    let duration_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    if status_class == "5xx" {
+        tracing::error!(
+            target: "kioku::capture_ingest",
+            metric_schema = "capture_ingest_failure_v1",
+            route = "capture_event",
+            status,
+            status_class,
+            stream_kind,
+            media_disposition,
+            reason,
+            duration_ms,
+            "capture ingest failed"
+        );
+    } else {
+        tracing::warn!(
+            target: "kioku::capture_ingest",
+            metric_schema = "capture_ingest_failure_v1",
+            route = "capture_event",
+            status,
+            status_class,
+            stream_kind,
+            media_disposition,
+            reason,
+            duration_ms,
+            "capture ingest failed"
+        );
+    }
+    response
+}
+
+fn capture_error_response(
+    started_at: Instant,
+    manifest: Option<&CaptureEventManifest>,
+    error: EnclaveError,
+) -> Response {
+    let reason = match &error {
+        EnclaveError::CaptureReference(reason) => match reason {
+            CaptureReferenceFailureReason::CanonicalUnavailable => {
+                CaptureIngestFailureReason::CanonicalUnavailable
+            }
+            CaptureReferenceFailureReason::ContextFingerprintMismatch => {
+                CaptureIngestFailureReason::ContextFingerprintMismatch
+            }
+            CaptureReferenceFailureReason::TargetMismatch => {
+                CaptureIngestFailureReason::ReferenceTargetMismatch
+            }
+            CaptureReferenceFailureReason::CanonicalContextUnavailable => {
+                CaptureIngestFailureReason::CanonicalContextUnavailable
+            }
+            CaptureReferenceFailureReason::ContextTransition => {
+                CaptureIngestFailureReason::ReferenceContextTransition
+            }
+        },
+        EnclaveError::InvalidRequest(_) => CaptureIngestFailureReason::RequestInvalid,
+        EnclaveError::Conflict(_) => CaptureIngestFailureReason::IdempotencyConflict,
+        _ => CaptureIngestFailureReason::Internal,
+    };
+    let response = error.into_response();
+    capture_failure_response(started_at, manifest, reason, response)
+}
+
+fn recording_entitlement_failure_reason(status: StatusCode) -> CaptureIngestFailureReason {
+    match status {
+        StatusCode::PAYMENT_REQUIRED => CaptureIngestFailureReason::RecordingLeaseInactive,
+        StatusCode::CONFLICT => CaptureIngestFailureReason::RecordingLeaseConflict,
+        _ => CaptureIngestFailureReason::RecordingLeaseUnavailable,
+    }
 }
 
 fn bad_request(message: &'static str) -> Response {
@@ -2616,8 +2904,8 @@ fn record_reference_event(
         .context_fingerprint
         .eq_ignore_ascii_case(&semantic_context_fingerprint(current_context)?)
     {
-        return Err(EnclaveError::InvalidRequest(
-            "reference context fingerprint does not match the manifest".into(),
+        return Err(EnclaveError::CaptureReference(
+            CaptureReferenceFailureReason::ContextFingerprintMismatch,
         ));
     }
 
@@ -2644,8 +2932,8 @@ fn record_reference_event(
         )
         .optional()?;
     let Some(canonical) = canonical else {
-        return Err(EnclaveError::InvalidRequest(
-            "referenced canonical screen is unavailable".into(),
+        return Err(EnclaveError::CaptureReference(
+            CaptureReferenceFailureReason::CanonicalUnavailable,
         ));
     };
     if canonical.media_disposition != "canonical"
@@ -2659,25 +2947,26 @@ fn record_reference_event(
             .media_sha256
             .eq_ignore_ascii_case(&reference.canonical_media_sha256)
     {
-        return Err(EnclaveError::InvalidRequest(
-            "referenced screen must be an earlier canonical event in the same capture stream"
-                .into(),
+        return Err(EnclaveError::CaptureReference(
+            CaptureReferenceFailureReason::TargetMismatch,
         ));
     }
     let canonical_context: CaptureContext = canonical
         .context_json
         .as_deref()
-        .ok_or_else(|| {
-            EnclaveError::InvalidRequest("canonical screen has no capture context".into())
-        })
+        .ok_or(EnclaveError::CaptureReference(
+            CaptureReferenceFailureReason::CanonicalContextUnavailable,
+        ))
         .and_then(|raw| {
             serde_json::from_str(raw).map_err(|_| {
-                EnclaveError::InvalidRequest("canonical screen context is invalid".into())
+                EnclaveError::CaptureReference(
+                    CaptureReferenceFailureReason::CanonicalContextUnavailable,
+                )
             })
         })?;
     if semantic_context_value(&canonical_context) != semantic_context_value(current_context) {
-        return Err(EnclaveError::InvalidRequest(
-            "reference events cannot hide a visible context transition".into(),
+        return Err(EnclaveError::CaptureReference(
+            CaptureReferenceFailureReason::ContextTransition,
         ));
     }
 
@@ -3108,6 +3397,87 @@ mod tests {
             dedupe_version: 1,
         });
         reference
+    }
+
+    #[test]
+    fn screen_context_fingerprint_matches_macos_fractional_geometry_vector() {
+        let context: CaptureContext = serde_json::from_value(json!({
+            "capture_status": "stable",
+            "active_app": "Safari",
+            "primary_bundle_id": "com.apple.Safari",
+            "primary_window_id": 123,
+            "window_title": "Meeting — José",
+            "display_id": 1,
+            "active_url": "https://example.com/a/b?x=1",
+            "active_url_title": "Meeting",
+            "browser_permission_status": "granted",
+            "visible_windows": [{
+                "window_id": 123,
+                "owner_pid": 456,
+                "bundle_id": "com.apple.Safari",
+                "app_name": "Safari",
+                "window_title": "Meeting — José",
+                "intersection_ratio": 1.0 / 3.0,
+                "z_index": 0
+            }],
+            "visible_windows_truncated": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            semantic_context_fingerprint(&context).unwrap(),
+            "fba21879bdcd32f61bed713119be4eda7a9736e3fff52ea1576f284fba83dabc"
+        );
+    }
+
+    #[test]
+    fn missing_screen_reference_has_a_stable_rebase_reason() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        let reference = reference_to(&canonical, 1, "screen-event-1");
+
+        assert!(matches!(
+            record_reference_event(&conn, "account-1", &reference, &"b".repeat(64)),
+            Err(EnclaveError::CaptureReference(
+                crate::error::CaptureReferenceFailureReason::CanonicalUnavailable
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn screen_reference_rebase_response_is_content_free_and_machine_readable() {
+        let response = EnclaveError::CaptureReference(
+            CaptureReferenceFailureReason::ContextFingerprintMismatch,
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1_024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "error": "screen_reference_rebase_required",
+                "reason": "context_fingerprint_mismatch"
+            })
+        );
+    }
+
+    #[test]
+    fn capture_failure_telemetry_uses_only_fixed_reason_classes() {
+        assert_eq!(
+            CaptureIngestFailureReason::ContextFingerprintMismatch.as_str(),
+            "context_fingerprint_mismatch"
+        );
+        assert_eq!(
+            recording_entitlement_failure_reason(StatusCode::PAYMENT_REQUIRED),
+            CaptureIngestFailureReason::RecordingLeaseInactive
+        );
+        assert_eq!(
+            recording_entitlement_failure_reason(StatusCode::SERVICE_UNAVAILABLE),
+            CaptureIngestFailureReason::RecordingLeaseUnavailable
+        );
     }
 
     #[test]

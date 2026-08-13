@@ -33,6 +33,33 @@ impl std::fmt::Display for DeletionPendingReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureReferenceFailureReason {
+    CanonicalUnavailable,
+    ContextFingerprintMismatch,
+    TargetMismatch,
+    CanonicalContextUnavailable,
+    ContextTransition,
+}
+
+impl CaptureReferenceFailureReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalUnavailable => "canonical_unavailable",
+            Self::ContextFingerprintMismatch => "context_fingerprint_mismatch",
+            Self::TargetMismatch => "target_mismatch",
+            Self::CanonicalContextUnavailable => "canonical_context_unavailable",
+            Self::ContextTransition => "context_transition",
+        }
+    }
+}
+
+impl std::fmt::Display for CaptureReferenceFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionPending {
     pub reason: DeletionPendingReason,
@@ -87,6 +114,9 @@ pub enum EnclaveError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("screen reference must be rebased: {0}")]
+    CaptureReference(CaptureReferenceFailureReason),
+
     #[error("not found")]
     NotFound,
 
@@ -99,8 +129,19 @@ pub enum EnclaveError {
 
 impl IntoResponse for EnclaveError {
     fn into_response(self) -> Response {
+        if let EnclaveError::CaptureReference(reason) = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "screen_reference_rebase_required",
+                    "reason": reason.as_str(),
+                })),
+            )
+                .into_response();
+        }
         let (status, message) = match &self {
             EnclaveError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            EnclaveError::CaptureReference(_) => unreachable!("handled above"),
             EnclaveError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             EnclaveError::Conflict(_) | EnclaveError::DeletionPending(_) => {
                 (StatusCode::CONFLICT, self.to_string())

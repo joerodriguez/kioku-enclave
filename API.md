@@ -220,9 +220,16 @@ The enclave recomputes the fingerprint, compares the literal visible context,
 and requires the target to be an earlier canonical event for the same
 authenticated account, device, install, session, stream, and display. It also
 verifies the canonical asset and SHA-256. Missing/forward references, chains,
-digest mismatches, and context transitions fail with HTTP 400. A valid
-reference creates no media object and no Gemini job, but it advances contiguous
-acknowledgement and remains in export and deletion coverage.
+digest mismatches, and context transitions fail with HTTP 400 and the fixed,
+content-free response `{"error":"screen_reference_rebase_required","reason":"..."}`.
+The bounded `reason` is one of `canonical_unavailable`,
+`context_fingerprint_mismatch`, `target_mismatch`,
+`canonical_context_unavailable`, or `context_transition`. The client must retry
+that same observation and stream sequence once as a canonical screenshot; this
+screen-local recovery does not mean the audio upload path or recording lease
+failed. A valid reference creates no media object and no Gemini job, but it
+advances contiguous acknowledgement and remains in export and deletion
+coverage.
 
 iOS imported screenshots remain intentional canonical assets; clients must not
 apply perceptual suppression to them.
@@ -275,7 +282,9 @@ ascending stream sequence and never upload a reference until its canonical has
 been acknowledged. Delete a local spool item only when its sequence is at or below
 `committed_through_sequence`. Retry network failures and HTTP 5xx with bounded
 exponential backoff plus jitter. Respect HTTP `429` and its `retry_after`
-seconds. Do not retry malformed requests (HTTP 400) without correcting them.
+seconds. Do not retry malformed requests (HTTP 400) without correcting them;
+the one defined exception is `screen_reference_rebase_required`, which is
+corrected by a single canonical retry at the same stream sequence.
 
 ## Resume a stream
 
