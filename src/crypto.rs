@@ -42,6 +42,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use serde::Deserialize;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 use crate::attestation::AttestationCredentials;
 use crate::error::{EnclaveError, Result};
@@ -270,6 +271,20 @@ impl GcpKmsClient {
     /// decrypt grant and must not grant decrypt to the VM service account.
     async fn kms_token(&self) -> Result<String> {
         self.attestation_creds.kms_access_token().await
+    }
+
+    /// Exact CryptoKey resource already selected by the production KMS
+    /// constructor. The inactive archive-registry adapter may derive one
+    /// numeric version below this key; it cannot substitute another project,
+    /// location, key ring, or key.
+    pub(crate) fn archive_registry_key_name(&self) -> &str {
+        &self.key_name
+    }
+
+    /// Reuse only the existing attestation-derived KMS credential path. The
+    /// returned copy is zeroized when the inactive registry request drops.
+    pub(crate) async fn archive_registry_access_token(&self) -> Result<Zeroizing<String>> {
+        self.kms_token().await.map(Zeroizing::new)
     }
 }
 
