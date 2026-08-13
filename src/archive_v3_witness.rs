@@ -1353,6 +1353,26 @@ impl DeletionRecovery {
             operation_id,
         })
     }
+
+    /// Convert deletion-only authorization into the exact immutable graph
+    /// snapshot accepted by the reachability visitor. Only the Tombstoned
+    /// state is usable: after key erasure, archive metadata must never be
+    /// opened again, and Active is not deletion authority.
+    pub(crate) fn tombstoned_recovery_root(&self) -> Result<RecoveryRoot> {
+        let record = self.receipt.record();
+        let _binding = self.execution_binding()?;
+        if record.deletion != DeletionState::Tombstoned {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(RecoveryRoot {
+            archive_id: record.archive_id,
+            root: record.root,
+            registry: record.registry,
+            predecessor: record.predecessor,
+            migration: record.migration,
+            deletion: record.deletion,
+        })
+    }
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryRoot {
@@ -1779,6 +1799,38 @@ pub(crate) fn deletion_driver_test_fixture() -> DeletionDriverTestFixture {
         inventory: DeletionStageProof::new(b"driver-inventory").expect("driver inventory proof"),
         retention: DeletionStageProof::new(b"driver-retention").expect("driver retention proof"),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn active_deletion_test_fixture(
+) -> (InMemoryWitness, ArchiveId, DeletionWorkerCredential) {
+    let archive_id = ArchiveId::from_bytes([81; 16]);
+    let database_epoch = DatabaseEpoch::from_bytes([82; 16]);
+    let key_epoch = KeyEpoch::from_bytes([83; 16]);
+    let registry =
+        KeyRegistryReference::new(key_epoch, 0, ObjectId::from_bytes([84; 16]), [85; 32]);
+    let root = RootCommitment::genesis(
+        database_epoch,
+        key_epoch,
+        RootReference::new(0, ObjectId::from_bytes([86; 16]), [87; 32]),
+    );
+    let witness = InMemoryWitness::with_clock_and_authenticator(
+        Arc::new(SystemClock),
+        Arc::new(DeletionDriverTestAuthenticator { archive_id }),
+    );
+    witness
+        .bootstrap(WitnessBootstrap::new(
+            archive_id,
+            database_epoch,
+            root,
+            registry,
+        ))
+        .expect("active deletion fixture bootstrap");
+    (
+        witness,
+        archive_id,
+        DeletionWorkerCredential::new(b"driver-worker").expect("active deletion credential"),
+    )
 }
 
 impl Witness for InMemoryWitness {

@@ -1002,17 +1002,6 @@ mod tests {
             Err(LifecycleError::InvalidState)
         }
 
-        async fn seal_inventory(
-            &self,
-            _archive_id: ArchiveId,
-            _expected_revision: u64,
-            _deletion_fence: ObjectId,
-            _pages: &[crate::archive_v3_lifecycle::DurableInventoryPage],
-        ) -> std::result::Result<crate::archive_v3_lifecycle::DeletionInventorySeal, LifecycleError>
-        {
-            Err(LifecycleError::InvalidState)
-        }
-
         async fn load_sealed_inventory(
             &self,
             _seal: &crate::archive_v3_lifecycle::DeletionInventorySeal,

@@ -27,13 +27,14 @@ use crate::{
         ArchiveId, KeyKind, KeyRegistryContext, LogicalLocation, ObjectContext, ObjectId,
         ObjectRole,
     },
+    archive_v3_inventory_coordinator::{AuthenticatedInventoryPlan, DeletionInventoryControl},
     archive_v3_lifecycle::{
         ActiveCreateAdmission, ArtifactCreateState, BootstrapPlan, DeletionInventorySeal,
         DurableBootstrapReservation, DurableInventoryPage, DurablePhysicalCompletion,
-        ErasedInventoryPages, InventoryPage, InventoryPageReference, LifecycleCreateOutcome,
-        LifecycleError, PhysicalDeletionReceipt, PlannedArtifact, PreparedBootstrap,
-        RecoveredBootstrap, RecoveredDeletionLifecycle, LIFECYCLE_FORMAT_VERSION,
-        MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES,
+        ErasedInventoryPages, FrozenInventorySnapshot, InventoryPage, InventoryPageReference,
+        LifecycleCreateOutcome, LifecycleError, PhysicalDeletionReceipt, PlannedArtifact,
+        PreparedBootstrap, RecoveredBootstrap, RecoveredDeletionLifecycle,
+        LIFECYCLE_FORMAT_VERSION, MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES,
     },
     archive_v3_lifecycle_page_store::{
         DurablePageCreateAdmission, FrozenPageCreateSet, LifecyclePageAdmissionLedger,
@@ -2244,11 +2245,13 @@ fn load_archive_inventory_snapshot_conn(
 
 fn seal_archive_inventory_conn(
     conn: &Connection,
-    archive_id: ArchiveId,
-    expected_revision: u64,
-    deletion_fence: ObjectId,
-    durable_pages: &[DurableInventoryPage],
+    authenticated: &AuthenticatedInventoryPlan,
 ) -> Result<DeletionInventorySeal> {
+    let snapshot_proof = authenticated.snapshot();
+    let archive_id = snapshot_proof.archive_id();
+    let expected_revision = snapshot_proof.revision();
+    let deletion_fence = snapshot_proof.deletion_fence();
+    let durable_pages = authenticated.durable_pages();
     let pages = durable_pages
         .iter()
         .map(DurableInventoryPage::page)
@@ -2316,18 +2319,24 @@ fn seal_archive_inventory_conn(
         .iter()
         .map(|page| page.reference())
         .collect::<Vec<_>>();
+    if page_references != authenticated.references() {
+        return Err(EnclaveError::Store(
+            "archive lifecycle coordinator proof changed".into(),
+        ));
+    }
     lifecycle_page_create_set_drained_conn(conn, archive_id, deletion_fence, &page_references)?;
     let create_ahead = lifecycle_create_ahead_conn(conn, anchor.plan)?;
+    if create_ahead != snapshot_proof.create_ahead() {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle coordinator snapshot changed".into(),
+        ));
+    }
     for planned in &create_ahead {
-        let included = pages.iter().flat_map(|page| page.entries()).any(|entry| {
-            entry.attempt_id() == planned.attempt_id()
-                && entry.ordinal() == planned.ordinal()
-                && entry.key() == planned.key()
-                && entry.role() == planned.role()
-                && entry.ciphertext_hash() == planned.ciphertext_hash()
-                && entry.encoded_len() == planned.encoded_len()
-                && entry.create_state() == planned.create_state()
-        });
+        let expected = planned.inventory_object().map_err(lifecycle_store_error)?;
+        let included = pages
+            .iter()
+            .flat_map(|page| page.entries())
+            .any(|entry| entry == &expected);
         if !included {
             return Err(EnclaveError::Store(
                 "archive lifecycle inventory omitted create-ahead work".into(),
@@ -6785,24 +6794,6 @@ impl ControlStore {
         dead_code,
         reason = "reserved for reviewed archive-v3 authority wiring"
     )]
-    pub(crate) async fn seal_archive_inventory(
-        &self,
-        archive_id: ArchiveId,
-        expected_revision: u64,
-        deletion_fence: ObjectId,
-        pages: Vec<DurableInventoryPage>,
-    ) -> Result<DeletionInventorySeal> {
-        self.write_if_changed(move |conn| {
-            seal_archive_inventory_conn(conn, archive_id, expected_revision, deletion_fence, &pages)
-                .map(|seal| (seal, true))
-        })
-        .await
-    }
-
-    #[allow(
-        dead_code,
-        reason = "reserved for reviewed archive-v3 authority wiring"
-    )]
     pub(crate) async fn load_sealed_archive_inventory_references(
         &self,
         seal: DeletionInventorySeal,
@@ -7594,6 +7585,83 @@ impl ControlStore {
 }
 
 #[async_trait::async_trait]
+impl DeletionInventoryControl for ControlStore {
+    async fn freeze_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<FrozenInventorySnapshot, LifecycleError> {
+        let revision = self
+            .freeze_archive_inventory_snapshot(archive_id, expected_revision, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)?;
+        let (loaded_revision, create_ahead) = self
+            .load_archive_inventory_snapshot(archive_id, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)?;
+        if revision != loaded_revision {
+            return Err(LifecycleError::StaleRevision);
+        }
+        FrozenInventorySnapshot::from_persisted(
+            &LifecyclePersistenceContext::validated(),
+            archive_id,
+            deletion_fence,
+            revision,
+            create_ahead,
+        )
+    }
+
+    async fn load_snapshot(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<FrozenInventorySnapshot, LifecycleError> {
+        let (revision, create_ahead) = self
+            .load_archive_inventory_snapshot(archive_id, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)?;
+        FrozenInventorySnapshot::from_persisted(
+            &LifecyclePersistenceContext::validated(),
+            archive_id,
+            deletion_fence,
+            revision,
+            create_ahead,
+        )
+    }
+
+    async fn recover_page_plan(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> std::result::Result<RecoveredPageCreatePlan, LifecycleError> {
+        self.recover_lifecycle_page_create_plan(archive_id, deletion_fence)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn seal_authenticated_pages(
+        &self,
+        plan: AuthenticatedInventoryPlan,
+    ) -> std::result::Result<DeletionInventorySeal, LifecycleError> {
+        self.write_if_changed(move |conn| {
+            seal_archive_inventory_conn(conn, &plan).map(|seal| (seal, true))
+        })
+        .await
+        .map_err(|_| LifecycleError::Unavailable)
+    }
+
+    async fn load_sealed_references(
+        &self,
+        seal: &DeletionInventorySeal,
+    ) -> std::result::Result<Vec<InventoryPageReference>, LifecycleError> {
+        self.load_sealed_archive_inventory_references(*seal)
+            .await
+            .map_err(|_| LifecycleError::Unavailable)
+    }
+}
+
+#[async_trait::async_trait]
 impl LifecyclePageAdmissionLedger for ControlStore {
     async fn admit_page_create(
         &self,
@@ -7949,6 +8017,17 @@ mod tests {
         DurableInventoryPage::from_exact_readback(page, &encoded).unwrap()
     }
 
+    fn inventory_entries(
+        entries: Vec<PlannedArtifact>,
+    ) -> Vec<crate::archive_v3_lifecycle::LifecycleInventoryObject> {
+        let mut objects = entries
+            .into_iter()
+            .map(|entry| entry.inventory_object().unwrap())
+            .collect::<Vec<_>>();
+        objects.sort();
+        objects
+    }
+
     fn persist_lifecycle_page_creates(
         conn: &Connection,
         fence: ObjectId,
@@ -7958,6 +8037,32 @@ mod tests {
             let admission = admit_lifecycle_page_create_conn(conn, fence, page.page()).unwrap();
             reconcile_lifecycle_page_created_conn(conn, admission, page).unwrap();
         }
+    }
+
+    fn seal_test_inventory_conn(
+        conn: &Connection,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        fence: ObjectId,
+        pages: &[DurableInventoryPage],
+    ) -> Result<DeletionInventorySeal> {
+        let (revision, create_ahead) =
+            load_archive_inventory_snapshot_conn(conn, archive_id, fence)?;
+        if revision != expected_revision {
+            return Err(EnclaveError::Conflict(
+                "test coordinator snapshot changed".into(),
+            ));
+        }
+        let snapshot = FrozenInventorySnapshot::for_test(archive_id, fence, revision, create_ahead)
+            .map_err(lifecycle_store_error)?;
+        let planned = pages
+            .iter()
+            .map(|page| page.page().clone())
+            .collect::<Vec<_>>();
+        let authenticated =
+            AuthenticatedInventoryPlan::for_test(&snapshot, &planned, pages.to_vec())
+                .map_err(|_| EnclaveError::Store("test coordinator plan is invalid".into()))?;
+        seal_archive_inventory_conn(conn, &authenticated)
     }
 
     #[test]
@@ -8188,25 +8293,31 @@ mod tests {
             freeze_archive_inventory_snapshot_conn(&conn, plan.archive_id(), revision, fence)
                 .unwrap();
         let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
-        assert!(seal_archive_inventory_conn(
+        assert!(seal_test_inventory_conn(
             &conn,
             plan.archive_id(),
             revision,
             fence,
             &[durable_inventory_page(
-                InventoryPage::build(plan.archive_id(), 0, [0; 32], vec![entries[0].clone()])
-                    .unwrap(),
+                InventoryPage::build(
+                    plan.archive_id(),
+                    0,
+                    [0; 32],
+                    vec![entries[0].inventory_object().unwrap()],
+                )
+                .unwrap(),
             )],
         )
         .is_err());
-        let page = InventoryPage::build(plan.archive_id(), 0, [0; 32], entries).unwrap();
+        let page = InventoryPage::build(plan.archive_id(), 0, [0; 32], inventory_entries(entries))
+            .unwrap();
         let pages = vec![durable_inventory_page(page)];
         assert!(
-            seal_archive_inventory_conn(&conn, plan.archive_id(), revision, fence, &pages).is_err()
+            seal_test_inventory_conn(&conn, plan.archive_id(), revision, fence, &pages).is_err()
         );
         persist_lifecycle_page_creates(&conn, fence, &pages);
         let seal =
-            seal_archive_inventory_conn(&conn, plan.archive_id(), revision, fence, &pages).unwrap();
+            seal_test_inventory_conn(&conn, plan.archive_id(), revision, fence, &pages).unwrap();
         let references = load_sealed_archive_inventory_references_conn(&conn, &seal).unwrap();
         assert_eq!(references.len(), 1);
         let stale = DeletionInventorySeal::for_test(
@@ -8287,10 +8398,11 @@ mod tests {
             freeze_archive_inventory_snapshot_conn(&conn, archive_id, frozen_revision, fence)
                 .unwrap();
         let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
-        let page = InventoryPage::build(archive_id, 0, [0; 32], entries).unwrap();
+        let page =
+            InventoryPage::build(archive_id, 0, [0; 32], inventory_entries(entries)).unwrap();
         let pages = vec![durable_inventory_page(page)];
         persist_lifecycle_page_creates(&conn, fence, &pages);
-        seal_archive_inventory_conn(&conn, archive_id, frozen_revision, fence, &pages).unwrap();
+        seal_test_inventory_conn(&conn, archive_id, frozen_revision, fence, &pages).unwrap();
         drop(pages);
         drop(conn);
 
@@ -8379,21 +8491,32 @@ mod tests {
             frozen_revision
         );
         let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
-        let first =
-            InventoryPage::build(plan.archive_id(), 0, [0; 32], vec![entries[0].clone()]).unwrap();
+        let canonical_entries = inventory_entries(entries.clone());
+        let first = InventoryPage::build(
+            plan.archive_id(),
+            0,
+            [0; 32],
+            vec![canonical_entries[0].clone()],
+        )
+        .unwrap();
         let second = InventoryPage::build(
             plan.archive_id(),
             1,
             first.page_hash(),
-            vec![entries[1].clone()],
+            vec![canonical_entries[1].clone()],
         )
         .unwrap();
         let first_durable = durable_inventory_page(first.clone());
         let first_admission = admit_lifecycle_page_create_conn(&conn, fence, &first).unwrap();
         reconcile_lifecycle_page_created_conn(&conn, first_admission, &first_durable).unwrap();
         let admission = admit_lifecycle_page_create_conn(&conn, fence, &second).unwrap();
-        let alternate_partition =
-            InventoryPage::build(plan.archive_id(), 1, first.page_hash(), entries).unwrap();
+        let alternate_partition = InventoryPage::build(
+            plan.archive_id(),
+            1,
+            first.page_hash(),
+            inventory_entries(entries),
+        )
+        .unwrap();
         assert!(admit_lifecycle_page_create_conn(&conn, fence, &alternate_partition).is_err());
         // Page admission is the irreversible boundary for canonical page
         // bytes. Even a duplicate reconciliation for a formerly admitted
@@ -8442,7 +8565,7 @@ mod tests {
                 .unwrap()
                 .clone();
         let durable = durable_inventory_page(recovered_page);
-        assert!(seal_archive_inventory_conn(
+        assert!(seal_test_inventory_conn(
             &conn,
             plan.archive_id(),
             frozen_revision,
@@ -8456,7 +8579,7 @@ mod tests {
             recover_lifecycle_page_create_plan_conn(&conn, plan.archive_id(), fence).unwrap();
         assert_eq!(recovered.created(), &[first.reference(), reference]);
         assert!(recovered.outcome_unknown().is_none());
-        assert!(seal_archive_inventory_conn(
+        assert!(seal_test_inventory_conn(
             &conn,
             plan.archive_id(),
             frozen_revision,
@@ -8496,7 +8619,7 @@ mod tests {
             plan.archive_id(),
             u32::try_from(MAX_LIFECYCLE_PAGES - 1).unwrap(),
             [0x52; 32],
-            lifecycle_create_ahead_conn(&conn, plan).unwrap(),
+            inventory_entries(lifecycle_create_ahead_conn(&conn, plan).unwrap()),
         )
         .unwrap();
         let reference = page.reference();

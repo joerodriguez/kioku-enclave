@@ -39,6 +39,39 @@
 
 This compiled seam does not authorize archive-v3 persistence or deletion.
 
+## Authenticated deletion-inventory coordinator
+
+- [x] Replaced final lifecycle-page `PlannedArtifact` payloads with strict
+  canonical key/role/ciphertext-hash facts; create attempt, ordinal, state, and
+  encoded length remain only in the frozen create-ahead snapshot.
+- [x] Introduced a separate KILP-v2 codec, page-hash domain, and inventory-seal
+  domain while retaining the independent lifecycle control-anchor format v1;
+  the never-live page v1 is rejected rather than migrated.
+- [x] Added injected exact Tombstoned witness and encrypted-control boundaries,
+  current/predecessor authenticated reachability union, exact object-ID
+  dedup/conflict handling, and deterministic greedy paging under combined
+  object/key/page/entry/encoded limits.
+- [x] Revalidate the complete witness recovery and frozen control snapshot
+  immediately before page I/O and before the atomic seal; cancellation/restart
+  accepts only the durable Created prefix and sole unresolved exact next page.
+- [x] Authenticate exact Tombstoned deletion authority before the snapshot CAS,
+  then reauthenticate the unchanged record after freeze and before the graph's
+  first exact read, so wrong credentials/Active state cause zero control or
+  external I/O.
+- [x] Require a producer-private one-shot coordinator proof binding the frozen
+  snapshot, canonical plan, exact references, and authenticated readbacks at
+  the control seal CAS; removed raw/generic pages-to-seal entry points.
+- [x] Added a restart-only sealed loader that validates the full reference set
+  before GET, authenticates the exact v2 chain/count/terminal/global object set,
+  and mints deletion inventory with exactly the lifecycle seal commitment.
+- [x] Removed the deletion driver's obsolete independent inventory builder,
+  test-overwritten commitment, and `FullReachabilitySeal`.
+- [x] Kept pre-witness absence, Store/startup/runtime/config/routes/health,
+  provider construction, deletion-driver invocation, cloud I/O, and deployment
+  out of scope and disconnected.
+
+This compiled coordinator does not activate archive-v3 persistence or deletion.
+
 ## Firestore transport-probe release boundary
 
 - [x] Made one exact checked-in, non-secret probe profile the sole input to both build
