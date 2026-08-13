@@ -341,9 +341,12 @@ wrap or encryption, then retains the exact wrapped registry, root-envelope, and 
 witness bytes so cancellation or ambiguous creates can retry only the same bytes. A
 monotonic revision admits one exact create at a time; deletion atomically freezes new
 admissions and cannot seal while an admitted or outcome-unknown request remains. Registry
-and root bootstrap rows are bounded in SQLite. The full exact artifact inventory instead
-lives in separately control-key-encrypted, canonical hash-chained pages; the whole control
-blob stores only bounded page IDs/hashes/lengths and one terminal commitment. Planned and
+and root bootstrap rows are bounded in SQLite. Create-ahead attempt/ordinal/outcome/encoded-length
+state remains only in that frozen control snapshot. The full exact deletion inventory instead
+lives in separately control-key-encrypted, canonical hash-chained KILP-v2 pages containing only
+exact key/role/ciphertext-hash facts; the whole control blob stores only bounded page
+IDs/hashes/lengths and one v2 terminal commitment. The decoder rejects the never-live v1 page
+format while the independent bounded control anchor remains format v1. Planned and
 confirmed-absent rows remain deletion work. Canonical object-name parsing also binds every
 stored role, including the v3 WAL segment and WAL commit-descriptor roles, so relabeling an
 object cannot bypass registry-first erasure. Page reordering, truncation, cross-archive use,
@@ -354,7 +357,19 @@ versioned envelope authenticates the deterministic full-hash exact object name, 
 fence, ordinal, page ID, predecessor, hash, and encoded length. Conditional-create success,
 precondition failure, and ambiguous response can mint a durable receipt only after a bounded
 exact read decrypts and decodes to that same canonical page. The narrow transport has no list
-or overwrite operation. Cleanup first validates the complete sealed reference chain carried
+or overwrite operation. The inactive inventory coordinator requires exact Tombstoned witness
+recovery, freezes/loads the settled create-ahead snapshot, authenticates the exact current and
+optional predecessor graphs, and unions facts by object ID; only byte-for-byte identical
+key/role/hash facts deduplicate and every conflict fails closed. It sorts that complete set and
+uses one deterministic greedy split under the combined 131,072-object, 64-MiB-key, 4,096-page,
+256-entry, and 64-KiB-page bounds. The complete witness recovery and control snapshot are reread
+for equality immediately before page I/O and again before the atomic seal. Restart accepts only
+the durable Created prefix plus the sole unresolved exact next page and rejects an alternate
+split. The sealed loader validates the entire retained reference set before its first GET, then
+authenticates the full page chain, exact count, terminal hash, canonical global object ordering,
+and object-ID uniqueness. Its deletion inventory commitment is exactly the durable lifecycle
+seal commitment; there is no second builder or independently computed deletion commitment.
+Cleanup first validates the complete sealed reference chain carried
 by a durable-control physical-completion receipt, then deletes every generation of each exact
 name and separately verifies live, noncurrent, and soft-deleted state absent before its private
 producer token can mint page absence. Cancellation leaves at most an immutable exact-name
@@ -385,8 +400,8 @@ construction, or deployment configuration activates the lifecycle.
 Producer-authorized recovery reads need only the opaque archive authority: after close/reopen
 they reconstruct the original reservation or exact prepared bytes from the anchor, never from
 caller-retained random IDs or ciphertext. The page seam likewise has no provider implementation,
-credential/config source, runtime construction, reachability walker, pre-witness coordinator,
-or production authority.
+credential/config source, runtime construction, pre-witness exact-absence branch, deletion-driver
+invocation, or production authority.
 Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
 rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
 source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the
@@ -473,14 +488,18 @@ entry, and the concrete GCS adapter rechecks its inventory membership plus the f
 archive/database/fence/worker/operation tuple before transport I/O. `PhysicalComplete` evidence
 hashes both the exact complete-inventory commitment and the freshly reverified provider-drain
 commitment; the driver derives that stage proof from the drain result rather than forwarding an
-unrelated retention assertion. Full activation remains compile-time blocked: the separate exact
-reachability visitor returns only a non-authorizing report, the inventory trait/builder/result are
-module-private, create-ahead union and canonical page sealing are not connected, and the
-full-reachability seal has no non-test constructor.
+unrelated retention assertion. The former independent inventory builder, test-overwritten
+commitment, and `FullReachabilitySeal` are removed. A complete deletion inventory is now minted
+only after the authenticated lifecycle-page loader verifies the exact durable seal (apart from
+explicit `cfg(test)` fixtures), so the reachability report remains non-authorizing on its own.
+Full activation remains blocked by the absent pre-witness exact-absence path and by the lack of
+startup/runtime/provider construction and deletion-driver invocation.
 The intended lifecycle order is fixed: freeze and drain admitted/ambiguous creates; tombstone the
 exact unchanged current root (or use a separately reviewed exact-absence coordinator for a bootstrap
-that never established a witness); authenticate the root graph and union all create-ahead rows;
-durably seal the page chain; freshly revalidate fence/worker/operation/commitment; erase and exactly
+that never established a witness); reauthenticate that exact Tombstoned worker/operation/fence before
+the control snapshot CAS; freeze the snapshot; reauthenticate the unchanged tombstone again before
+the first graph GET; authenticate the root graph and union all create-ahead rows; durably seal the
+page chain; freshly revalidate fence/worker/operation/commitment; erase and exactly
 verify every registry epoch before advancing `CryptographicallyErased`; then delete exact content
 and claims, drain provider generations/soft-delete state, and advance `PhysicalComplete` with the
 same inventory commitment. Restarts after registry erasure read only the control-key lifecycle pages,
@@ -494,9 +513,8 @@ and exact deletion fence revalidates those references and reconstructs the seale
 physical completion it additionally reconstructs the durable-control receipt from the retained provider-drain
 commitment. Restart therefore never depends on a process retaining either receipt. The pre-witness exact-absence
 coordinator is not implemented in this slice and therefore remains an explicit activation blocker.
-Admitting an authenticated canonical metadata walker requires an explicit reviewed source change;
-that walker must enforce fixed global count/byte/depth/page bounds and cycle/duplicate rejection,
-and must not infer paths or discover objects by prefix. The driver has no Store, route, runtime,
+The authenticated exact-name visitor and lifecycle inventory coordinator are compiled and tested
+but inactive; neither infers paths nor discovers objects by prefix. The driver has no Store, route, runtime,
 credential, or deployment wiring.
 
 `src/archive_v3_reachability.rs` is the first inactive, non-authorizing half of that source
@@ -537,11 +555,17 @@ and predecessor continuity are all checked. Tree traversal uses a separate depth
 linear chain uses its explicit count bounds. At most one commit's bounded segment buffers are
 retained at a time and their owned frame storage zeroizes before the next commit. Cancellation or
 a stalled/failed exact read produces no report; retry begins again from the same witness snapshot.
-The returned opaque, content-free report is deliberately not a `FullReachabilitySeal`, lifecycle
-page plan, complete deletion inventory, admission, or provider capability. Create-ahead union,
-canonical lifecycle paging/sealing, fresh fence/disposition revalidation, and deletion integration
-remain separate reviewed activation blockers. No Store, startup, control-store, runtime, route,
-cloud implementation, credential source, or deployment configuration constructs this visitor.
+The returned opaque, content-free report is deliberately not a lifecycle page plan, complete
+deletion inventory, admission, or provider capability. Only the separate inactive inventory
+coordinator may consume it together with exact Tombstoned witness recovery and the frozen control
+snapshot; that coordinator performs create-ahead union, deterministic v2 paging, repeated freshness
+checks, sealing, and restart loading without changing the visitor's authority. Its final control CAS
+accepts only a one-shot opaque coordinator proof binding the frozen archive/fence/revision, exact
+canonical page plan, and every authenticated external readback. The generic lifecycle trait and
+ControlStore expose no raw pages-to-seal method, so a create-ahead-only subset, extra superset, or
+alternate split cannot bypass the authenticated union. No Store, startup,
+runtime, route, cloud implementation, credential source, or deployment configuration constructs
+either component.
 The shadow module
 is bounded synchronous capture state only: no
 SQLite VFS is registered, and capture failure cannot alter the legacy Store result.

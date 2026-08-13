@@ -23,7 +23,11 @@ use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+/// Version of the bounded lifecycle control anchor. The independently stored
+/// inventory-page codec has its own version because those pages never became
+/// live and intentionally have no v1 compatibility path.
 pub(crate) const LIFECYCLE_FORMAT_VERSION: u16 = 1;
+pub(crate) const LIFECYCLE_INVENTORY_PAGE_VERSION: u16 = 2;
 pub(crate) const MAX_BOOTSTRAP_WITNESS_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_LIFECYCLE_ARTIFACTS: usize = 131_072;
 pub(crate) const MAX_LIFECYCLE_PAGE_ENTRIES: usize = 256;
@@ -31,8 +35,8 @@ pub(crate) const MAX_LIFECYCLE_PAGES: usize = 4_096;
 pub(crate) const MAX_LIFECYCLE_PAGE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_LIFECYCLE_OBJECT_KEY_BYTES: usize = 1_024;
 
-const PAGE_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-page/v1\0";
-const INVENTORY_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-inventory/v1\0";
+const PAGE_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-page/v2\0";
+const INVENTORY_DOMAIN: &[u8] = b"kioku/archive-v3/lifecycle-inventory/v2\0";
 const ZERO_HASH: [u8; 32] = [0; 32];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -404,11 +408,180 @@ impl PlannedArtifact {
     pub(crate) const fn create_state(&self) -> ArtifactCreateState {
         self.create_state
     }
+
+    /// Remove create-operation state from the immutable deletion fact. The
+    /// attempt, ordinal, outcome, and encoded length remain only in the frozen
+    /// create-ahead snapshot and never enter final inventory pages.
+    pub(crate) fn inventory_object(&self) -> Result<LifecycleInventoryObject, LifecycleError> {
+        LifecycleInventoryObject::new(self.key.clone(), self.role, self.ciphertext_hash)
+    }
 }
 
 impl fmt::Debug for PlannedArtifact {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PlannedArtifact(<opaque>)")
+    }
+}
+
+/// Content-free, immutable create-ahead snapshot durably frozen before the
+/// authenticated graph walk. It is not a page admission or deletion seal.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FrozenInventorySnapshot {
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    revision: u64,
+    create_ahead: Vec<PlannedArtifact>,
+}
+
+impl FrozenInventorySnapshot {
+    pub(crate) fn from_persisted(
+        _producer: &crate::cp::control_store::LifecyclePersistenceContext,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+        revision: u64,
+        create_ahead: Vec<PlannedArtifact>,
+    ) -> Result<Self, LifecycleError> {
+        Self::validated(archive_id, deletion_fence, revision, create_ahead)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+        revision: u64,
+        create_ahead: Vec<PlannedArtifact>,
+    ) -> Result<Self, LifecycleError> {
+        Self::validated(archive_id, deletion_fence, revision, create_ahead)
+    }
+
+    fn validated(
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+        revision: u64,
+        create_ahead: Vec<PlannedArtifact>,
+    ) -> Result<Self, LifecycleError> {
+        if !nonzero(archive_id.as_bytes())
+            || !nonzero(deletion_fence.as_bytes())
+            || revision == 0
+            || create_ahead.len() > MAX_LIFECYCLE_ARTIFACTS
+            || create_ahead.iter().any(|artifact| {
+                artifact.create_state == ArtifactCreateState::OutcomeUnknown
+                    || !artifact
+                        .key
+                        .as_str()
+                        .starts_with(ArchivePrefix::for_archive(archive_id).as_str())
+            })
+        {
+            return Err(LifecycleError::Malformed);
+        }
+        let mut previous = None;
+        for artifact in &create_ahead {
+            let current = (artifact.attempt_id, artifact.ordinal, artifact.key.as_str());
+            if previous.is_some_and(|value| value >= current) {
+                return Err(LifecycleError::Malformed);
+            }
+            previous = Some(current);
+        }
+        Ok(Self {
+            archive_id,
+            deletion_fence,
+            revision,
+            create_ahead,
+        })
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn deletion_fence(&self) -> ObjectId {
+        self.deletion_fence
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn create_ahead(&self) -> &[PlannedArtifact] {
+        &self.create_ahead
+    }
+}
+
+impl fmt::Debug for FrozenInventorySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FrozenInventorySnapshot(<opaque>)")
+    }
+}
+
+/// Canonical exact-object fact stored in the final deletion inventory.
+///
+/// This intentionally carries no create-attempt state, caller/account
+/// identity, encoded length, or provider capability. Strict canonical parsing
+/// binds the key, embedded object ID, role, archive prefix, and ciphertext
+/// hash before a fact can participate in paging or deletion.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LifecycleInventoryObject {
+    key: ObjectKey,
+    role: ObjectRole,
+    ciphertext_hash: [u8; 32],
+}
+
+impl LifecycleInventoryObject {
+    fn new(
+        key: ObjectKey,
+        role: ObjectRole,
+        ciphertext_hash: [u8; 32],
+    ) -> Result<Self, LifecycleError> {
+        let Some((object_id, canonical_role)) = canonical_object_identity(key.as_str()) else {
+            return Err(LifecycleError::Malformed);
+        };
+        if key.as_str().len() > MAX_LIFECYCLE_OBJECT_KEY_BYTES
+            || object_id != key.object_id()
+            || canonical_role != role
+            || !nonzero(key.object_id().as_bytes())
+            || !nonzero(&ciphertext_hash)
+        {
+            return Err(LifecycleError::Malformed);
+        }
+        Ok(Self {
+            key,
+            role,
+            ciphertext_hash,
+        })
+    }
+
+    pub(crate) fn for_archive(
+        archive_id: ArchiveId,
+        key: ObjectKey,
+        role: ObjectRole,
+        ciphertext_hash: [u8; 32],
+    ) -> Result<Self, LifecycleError> {
+        if !nonzero(archive_id.as_bytes())
+            || !key
+                .as_str()
+                .starts_with(ArchivePrefix::for_archive(archive_id).as_str())
+        {
+            return Err(LifecycleError::Malformed);
+        }
+        Self::new(key, role, ciphertext_hash)
+    }
+
+    pub(crate) fn key(&self) -> &ObjectKey {
+        &self.key
+    }
+
+    pub(crate) const fn role(&self) -> ObjectRole {
+        self.role
+    }
+
+    pub(crate) const fn ciphertext_hash(&self) -> [u8; 32] {
+        self.ciphertext_hash
+    }
+}
+
+impl fmt::Debug for LifecycleInventoryObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LifecycleInventoryObject(<opaque>)")
     }
 }
 
@@ -511,7 +684,7 @@ pub(crate) struct InventoryPage {
     archive_id: ArchiveId,
     page_ordinal: u32,
     previous_hash: [u8; 32],
-    entries: Vec<PlannedArtifact>,
+    entries: Vec<LifecycleInventoryObject>,
     encoded: Vec<u8>,
     page_hash: [u8; 32],
     page_id: ObjectId,
@@ -522,7 +695,7 @@ impl InventoryPage {
         archive_id: ArchiveId,
         page_ordinal: u32,
         previous_hash: [u8; 32],
-        entries: Vec<PlannedArtifact>,
+        entries: Vec<LifecycleInventoryObject>,
     ) -> Result<Self, LifecycleError> {
         if entries.is_empty()
             || entries.len() > MAX_LIFECYCLE_PAGE_ENTRIES
@@ -554,7 +727,7 @@ impl InventoryPage {
             return Err(LifecycleError::Limit);
         }
         let mut cursor = Cursor::new(bytes);
-        if cursor.take(4)? != b"KILP" || cursor.u16()? != LIFECYCLE_FORMAT_VERSION {
+        if cursor.take(4)? != b"KILP" || cursor.u16()? != LIFECYCLE_INVENTORY_PAGE_VERSION {
             return Err(LifecycleError::Corrupt);
         }
         let archive_id = ArchiveId::from_bytes(cursor.array()?);
@@ -571,14 +744,9 @@ impl InventoryPage {
         }
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            let attempt_id = BootstrapAttemptId::from_bytes(cursor.array()?)
-                .map_err(|_| LifecycleError::Corrupt)?;
-            let ordinal = cursor.u32()?;
             let role = role(cursor.u8()?)?;
-            let create_state = ArtifactCreateState::decode(cursor.u8()?)?;
             let object_id = ObjectId::from_bytes(cursor.array()?);
             let ciphertext_hash = cursor.array()?;
-            let encoded_len = cursor.u32()?;
             let key_len = usize::from(cursor.u16()?);
             if key_len == 0 || key_len > MAX_LIFECYCLE_OBJECT_KEY_BYTES {
                 return Err(LifecycleError::Corrupt);
@@ -586,16 +754,15 @@ impl InventoryPage {
             let key = std::str::from_utf8(cursor.take(key_len)?)
                 .map_err(|_| LifecycleError::Corrupt)?
                 .to_owned();
-            entries.push(PlannedArtifact::new(
-                archive_id,
-                attempt_id,
-                ordinal,
-                ObjectKey::from_validated_canonical(key, object_id),
-                role,
-                ciphertext_hash,
-                usize::try_from(encoded_len).map_err(|_| LifecycleError::Corrupt)?,
-                create_state,
-            )?);
+            entries.push(
+                LifecycleInventoryObject::for_archive(
+                    archive_id,
+                    ObjectKey::from_validated_canonical(key, object_id),
+                    role,
+                    ciphertext_hash,
+                )
+                .map_err(|_| LifecycleError::Corrupt)?,
+            );
         }
         if !cursor.finished() {
             return Err(LifecycleError::Corrupt);
@@ -624,7 +791,7 @@ impl InventoryPage {
         self.previous_hash
     }
 
-    pub(crate) fn entries(&self) -> &[PlannedArtifact] {
+    pub(crate) fn entries(&self) -> &[LifecycleInventoryObject] {
         &self.entries
     }
 
@@ -941,7 +1108,8 @@ impl DeletionInventorySeal {
         }
         let mut expected_previous = ZERO_HASH;
         let mut artifact_count = 0usize;
-        let mut seen = BTreeMap::<ObjectId, (&str, [u8; 32], u32, ObjectRole)>::new();
+        let mut seen = BTreeMap::<ObjectId, (&str, [u8; 32], ObjectRole)>::new();
+        let mut previous_object: Option<LifecycleInventoryObject> = None;
         for (index, durable) in pages.iter().enumerate() {
             let page = durable.page();
             if page.archive_id != archive_id
@@ -952,25 +1120,22 @@ impl DeletionInventorySeal {
                 return Err(LifecycleError::ChainMismatch);
             }
             for entry in &page.entries {
-                if let Some(previous) = seen.insert(
-                    entry.key.object_id(),
-                    (
-                        entry.key.as_str(),
-                        entry.ciphertext_hash,
-                        entry.encoded_len,
-                        entry.role,
-                    ),
-                ) {
-                    let current = (
-                        entry.key.as_str(),
-                        entry.ciphertext_hash,
-                        entry.encoded_len,
-                        entry.role,
-                    );
-                    if previous != current {
-                        return Err(LifecycleError::DuplicateConflict);
-                    }
+                if previous_object
+                    .as_ref()
+                    .is_some_and(|previous| previous >= entry)
+                {
+                    return Err(LifecycleError::ChainMismatch);
                 }
+                if seen
+                    .insert(
+                        entry.key.object_id(),
+                        (entry.key.as_str(), entry.ciphertext_hash, entry.role),
+                    )
+                    .is_some()
+                {
+                    return Err(LifecycleError::DuplicateConflict);
+                }
+                previous_object = Some(entry.clone());
             }
             artifact_count = artifact_count
                 .checked_add(page.entries.len())
@@ -1283,6 +1448,38 @@ pub(crate) fn validate_cleanup_page_chain(
     Ok(())
 }
 
+/// Validate the entire retained reference set before an authenticated loader
+/// performs its first exact external read. Unlike cleanup authorization this
+/// grants no mutation capability and is valid before physical completion.
+pub(crate) fn validate_sealed_page_references(
+    seal: &DeletionInventorySeal,
+    references: &[InventoryPageReference],
+) -> Result<(), LifecycleError> {
+    if references.is_empty()
+        || references.len() > MAX_LIFECYCLE_PAGES
+        || usize::try_from(seal.page_count()).ok() != Some(references.len())
+    {
+        return Err(LifecycleError::ChainMismatch);
+    }
+    let mut previous = ZERO_HASH;
+    for (index, reference) in references.iter().enumerate() {
+        if reference.archive_id() != seal.archive_id()
+            || usize::try_from(reference.page_ordinal()).ok() != Some(index)
+            || reference.previous_hash() != previous
+            || reference.encoded_len() == 0
+            || usize::try_from(reference.encoded_len())
+                .map_or(true, |length| length > MAX_LIFECYCLE_PAGE_BYTES)
+        {
+            return Err(LifecycleError::ChainMismatch);
+        }
+        previous = reference.page_hash();
+    }
+    if previous != seal.terminal_page_hash() {
+        return Err(LifecycleError::ChainMismatch);
+    }
+    Ok(())
+}
+
 impl fmt::Debug for ErasedInventoryPages {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ErasedInventoryPages(<opaque>)")
@@ -1341,9 +1538,9 @@ pub(crate) trait ArchiveLifecycleLedger: Send + Sync {
         expected_encoded_record: &[u8],
     ) -> Result<u64, LifecycleError>;
 
-    /// Append one exact create-ahead artifact to the external encrypted page
-    /// chain before any immutable-provider request. Implementations atomically
-    /// advance the small control anchor to the new page head.
+    /// Append one exact create-ahead artifact to durable control state before
+    /// any immutable-provider request. Final external inventory pages are a
+    /// separate, post-freeze v2 projection containing no operation state.
     async fn plan_exact_artifact(
         &self,
         archive_id: ArchiveId,
@@ -1390,14 +1587,6 @@ pub(crate) trait ArchiveLifecycleLedger: Send + Sync {
         deletion_fence: ObjectId,
     ) -> Result<(u64, Vec<PlannedArtifact>), LifecycleError>;
 
-    async fn seal_inventory(
-        &self,
-        archive_id: ArchiveId,
-        expected_revision: u64,
-        deletion_fence: ObjectId,
-        pages: &[DurableInventoryPage],
-    ) -> Result<DeletionInventorySeal, LifecycleError>;
-
     async fn load_sealed_inventory(
         &self,
         seal: &DeletionInventorySeal,
@@ -1412,13 +1601,15 @@ pub(crate) trait ArchiveLifecycleLedger: Send + Sync {
 
 fn ensure_entries(
     archive_id: ArchiveId,
-    entries: &[PlannedArtifact],
+    entries: &[LifecycleInventoryObject],
 ) -> Result<(), LifecycleError> {
     let prefix = ArchivePrefix::for_archive(archive_id);
-    let mut previous: Option<(BootstrapAttemptId, u32, &str)> = None;
+    let mut previous: Option<(&str, ObjectRole, [u8; 32])> = None;
     for entry in entries {
-        let current = (entry.attempt_id, entry.ordinal, entry.key.as_str());
+        let current = (entry.key.as_str(), entry.role, entry.ciphertext_hash);
         if !entry.key.as_str().starts_with(prefix.as_str())
+            || canonical_object_identity(entry.key.as_str())
+                != Some((entry.key.object_id(), entry.role))
             || previous.is_some_and(|value| value >= current)
         {
             return Err(LifecycleError::Malformed);
@@ -1432,11 +1623,11 @@ fn encode_page(
     archive_id: ArchiveId,
     page_ordinal: u32,
     previous_hash: [u8; 32],
-    entries: &[PlannedArtifact],
+    entries: &[LifecycleInventoryObject],
 ) -> Result<Vec<u8>, LifecycleError> {
     let mut encoded = Vec::new();
     encoded.extend_from_slice(b"KILP");
-    encoded.extend_from_slice(&LIFECYCLE_FORMAT_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&LIFECYCLE_INVENTORY_PAGE_VERSION.to_be_bytes());
     encoded.extend_from_slice(archive_id.as_bytes());
     encoded.extend_from_slice(&page_ordinal.to_be_bytes());
     encoded.extend_from_slice(&previous_hash);
@@ -1446,13 +1637,9 @@ fn encode_page(
             .to_be_bytes(),
     );
     for entry in entries {
-        encoded.extend_from_slice(entry.attempt_id.as_bytes());
-        encoded.extend_from_slice(&entry.ordinal.to_be_bytes());
         encoded.push(entry.role as u8);
-        encoded.push(entry.create_state as u8);
         encoded.extend_from_slice(entry.key.object_id().as_bytes());
         encoded.extend_from_slice(&entry.ciphertext_hash);
-        encoded.extend_from_slice(&entry.encoded_len.to_be_bytes());
         encoded.extend_from_slice(
             &u16::try_from(entry.key.as_str().len())
                 .map_err(|_| LifecycleError::Limit)?
@@ -1696,6 +1883,10 @@ mod tests {
         DurableInventoryPage::from_exact_readback(page, &encoded).unwrap()
     }
 
+    fn inventory(artifact: PlannedArtifact) -> LifecycleInventoryObject {
+        artifact.inventory_object().unwrap()
+    }
+
     fn role_artifact(
         archive_id: ArchiveId,
         ordinal: u32,
@@ -1761,31 +1952,37 @@ mod tests {
             archive,
             0,
             ZERO_HASH,
-            vec![artifact(
+            vec![inventory(artifact(
                 archive,
                 attempt(12),
                 0,
                 13,
                 ArtifactCreateState::OutcomeUnknown,
-            )],
+            ))],
         )
         .unwrap();
         let second = InventoryPage::build(
             archive,
             1,
             first.page_hash(),
-            vec![artifact(
+            vec![inventory(artifact(
                 archive,
                 attempt(12),
                 1,
                 14,
                 ArtifactCreateState::ConfirmedAbsent,
-            )],
+            ))],
         )
         .unwrap();
         assert_eq!(
             InventoryPage::decode(archive, first.encoded()).unwrap(),
             first
+        );
+        let mut legacy_v1 = first.encoded().to_vec();
+        legacy_v1[4..6].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            InventoryPage::decode(archive, &legacy_v1),
+            Err(LifecycleError::Corrupt)
         );
         assert!(InventoryPage::decode(ArchiveId::from_bytes([99; 16]), first.encoded()).is_err());
         let seal = DeletionInventorySeal::for_test(
@@ -1809,13 +2006,13 @@ mod tests {
             archive,
             max_ordinal,
             previous,
-            vec![artifact(
+            vec![inventory(artifact(
                 archive,
                 attempt(12),
                 max_ordinal,
                 15,
                 ArtifactCreateState::Created,
-            )],
+            ))],
         )
         .unwrap();
         assert_eq!(
@@ -1827,13 +2024,13 @@ mod tests {
             archive,
             rejected_ordinal,
             previous,
-            vec![artifact(
+            vec![inventory(artifact(
                 archive,
                 attempt(12),
                 rejected_ordinal,
                 16,
                 ArtifactCreateState::Created,
-            )],
+            ))],
         )
         .is_err());
         assert!(InventoryPageReference::for_test(
@@ -1874,13 +2071,17 @@ mod tests {
             ObjectRole::WalCommitDescriptorV3,
             LogicalLocation::WalCommitDescriptor { root_seq: 1 },
         );
-        let page = InventoryPage::build(archive, 0, ZERO_HASH, vec![wal, commit]).unwrap();
+        let mut entries = vec![inventory(wal), inventory(commit)];
+        entries.sort();
+        let page = InventoryPage::build(archive, 0, ZERO_HASH, entries).unwrap();
         let decoded = InventoryPage::decode(archive, page.encoded()).unwrap();
-        assert_eq!(decoded.entries()[0].role(), ObjectRole::WalSegmentV3);
-        assert_eq!(
-            decoded.entries()[1].role(),
-            ObjectRole::WalCommitDescriptorV3
-        );
+        let roles = decoded
+            .entries()
+            .iter()
+            .map(LifecycleInventoryObject::role)
+            .collect::<Vec<_>>();
+        assert!(roles.contains(&ObjectRole::WalSegmentV3));
+        assert!(roles.contains(&ObjectRole::WalCommitDescriptorV3));
 
         let root = artifact(archive, attempt(20), 0, 21, ArtifactCreateState::Created);
         assert!(PlannedArtifact::new(
@@ -1894,9 +2095,9 @@ mod tests {
             root.create_state(),
         )
         .is_err());
-        let page = InventoryPage::build(archive, 0, ZERO_HASH, vec![root]).unwrap();
+        let page = InventoryPage::build(archive, 0, ZERO_HASH, vec![inventory(root)]).unwrap();
         let mut tampered = page.encoded().to_vec();
-        const FIRST_ENTRY_ROLE_OFFSET: usize = 4 + 2 + 16 + 4 + 32 + 2 + 16 + 4;
+        const FIRST_ENTRY_ROLE_OFFSET: usize = 4 + 2 + 16 + 4 + 32 + 2;
         tampered[FIRST_ENTRY_ROLE_OFFSET] = ObjectRole::KeyRegistryV3 as u8;
         assert!(InventoryPage::decode(archive, &tampered).is_err());
     }
@@ -1908,13 +2109,13 @@ mod tests {
             archive,
             0,
             ZERO_HASH,
-            vec![artifact(
+            vec![inventory(artifact(
                 archive,
                 attempt(23),
                 0,
                 24,
                 ArtifactCreateState::OutcomeUnknown,
-            )],
+            ))],
         )
         .unwrap();
         let fence = ObjectId::from_bytes([25; 16]);
@@ -1944,13 +2145,13 @@ mod tests {
             ArchiveId::from_bytes([27; 16]),
             0,
             ZERO_HASH,
-            vec![artifact(
+            vec![inventory(artifact(
                 ArchiveId::from_bytes([27; 16]),
                 attempt(28),
                 0,
                 29,
                 ArtifactCreateState::Created,
-            )],
+            ))],
         )
         .unwrap();
         let wrong_seal = DeletionInventorySeal::for_test(
@@ -1982,26 +2183,26 @@ mod tests {
             archive,
             0,
             ZERO_HASH,
-            vec![artifact(
+            vec![inventory(artifact(
                 archive,
                 attempt(22),
                 0,
                 23,
                 ArtifactCreateState::Planned,
-            )],
+            ))],
         )
         .unwrap();
         let second = InventoryPage::build(
             archive,
             1,
             first.page_hash(),
-            vec![artifact(
+            vec![inventory(artifact(
                 archive,
                 attempt(22),
                 1,
                 24,
                 ArtifactCreateState::Created,
-            )],
+            ))],
         )
         .unwrap();
         let fence = ObjectId::from_bytes([25; 16]);
@@ -2036,7 +2237,9 @@ mod tests {
             ArtifactCreateState::OutcomeUnknown,
         )
         .unwrap();
-        let page = InventoryPage::build(archive, 0, ZERO_HASH, vec![one, conflicting]).unwrap();
+        let mut entries = vec![inventory(one), inventory(conflicting)];
+        entries.sort();
+        let page = InventoryPage::build(archive, 0, ZERO_HASH, entries).unwrap();
         assert_eq!(
             DeletionInventorySeal::for_test(
                 archive,
@@ -2077,6 +2280,22 @@ mod tests {
             [54; 32],
             10,
             ArtifactCreateState::Planned,
+        )
+        .is_err());
+
+        let valid = artifact(archive, attempt(53), 1, 55, ArtifactCreateState::Created);
+        assert!(LifecycleInventoryObject::for_archive(
+            archive,
+            valid.key().clone(),
+            valid.role(),
+            ZERO_HASH,
+        )
+        .is_err());
+        assert!(LifecycleInventoryObject::for_archive(
+            ArchiveId::from_bytes([0; 16]),
+            valid.key().clone(),
+            valid.role(),
+            valid.ciphertext_hash(),
         )
         .is_err());
     }

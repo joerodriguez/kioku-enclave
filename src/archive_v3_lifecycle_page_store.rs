@@ -330,7 +330,7 @@ impl RecoveredPageCreatePlan {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         archive_id: ArchiveId,
         created: Vec<InventoryPageReference>,
         outcome_unknown: Option<InventoryPage>,
@@ -1253,7 +1253,13 @@ mod tests {
             ArtifactCreateState::Created,
         )
         .unwrap();
-        InventoryPage::build(archive_id, page_ordinal, previous_hash, vec![artifact]).unwrap()
+        InventoryPage::build(
+            archive_id,
+            page_ordinal,
+            previous_hash,
+            vec![artifact.inventory_object().unwrap()],
+        )
+        .unwrap()
     }
 
     fn store(transport: Arc<FakeTransport>) -> EncryptedLifecyclePageStore {

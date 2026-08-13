@@ -71,6 +71,59 @@ pub(crate) trait ExactReachabilityReader: Send + Sync {
     ) -> std::result::Result<Option<Vec<u8>>, ExactReachabilityReadError>;
 }
 
+#[cfg(test)]
+struct CoordinatorTestRegistryProvider {
+    wrapped: Vec<u8>,
+    plaintext: Vec<u8>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl crate::archive_v3::ExactKeyRegistryProvider for CoordinatorTestRegistryProvider {
+    async fn read_exact_wrapped(
+        &self,
+        _context: &KeyRegistryContext,
+        _object_id: ObjectId,
+        destination: &mut [u8],
+    ) -> std::result::Result<usize, ArchiveV3Error> {
+        destination[..self.wrapped.len()].copy_from_slice(&self.wrapped);
+        Ok(self.wrapped.len())
+    }
+
+    async fn kms_unwrap_exact(
+        &self,
+        _context: &KeyRegistryContext,
+        _wrapped_registry_ciphertext: &[u8],
+        destination: &mut [u8],
+    ) -> std::result::Result<usize, ArchiveV3Error> {
+        destination[..self.plaintext.len()].copy_from_slice(&self.plaintext);
+        Ok(self.plaintext.len())
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn verified_cipher_for_coordinator_test(
+    archive_id: ArchiveId,
+) -> VerifiedArchiveCipher {
+    let key_epoch = crate::archive_v3::KeyEpoch::from_bytes([0x61; 16]);
+    let context = KeyRegistryContext::new(archive_id, KeyKind::Archive, key_epoch);
+    let wrapped = vec![0x62, 0x63, 0x64];
+    let plaintext = crate::archive_v3::KeyRegistryPlaintext::encode_archive(
+        &context,
+        &crate::archive_v3::ArchiveDek::from_bytes([0x65; 32]),
+    )
+    .unwrap()
+    .to_vec();
+    crate::archive_v3::resolve_archive_cipher(
+        &context,
+        ObjectId::from_bytes([0x66; 16]),
+        Sha256::digest(&wrapped).into(),
+        &CoordinatorTestRegistryProvider { wrapped, plaintext },
+    )
+    .await
+    .unwrap()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub(crate) enum ReachabilityError {
     #[error("archive-v3 reachability snapshot or registry binding is invalid")]
@@ -107,6 +160,17 @@ pub(crate) struct ReachableObject {
 }
 
 impl ReachableObject {
+    #[cfg(test)]
+    pub(crate) fn for_test(key: ObjectKey, role: ObjectRole, ciphertext_hash: [u8; 32]) -> Self {
+        Self {
+            key,
+            role,
+            ciphertext_hash,
+            identity_commitment: [0x7f; 32],
+            fetched: true,
+        }
+    }
+
     pub(crate) fn key(&self) -> &ObjectKey {
         &self.key
     }
