@@ -617,7 +617,7 @@ jobs:
 
       - name: Attest image provenance
         id: attest
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.build.outputs.image_repository }}
           subject-digest: ${{ steps.digest.outputs.digest }}
@@ -628,7 +628,7 @@ jobs:
 
       - name: Attest image SBOM
         id: attest_sbom
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.build.outputs.image_repository }}
           subject-digest: ${{ steps.digest.outputs.digest }}
@@ -702,7 +702,7 @@ jobs:
       # separately verifies the image provenance before it can promote a tag.
       - name: Attest release metadata manifest
         id: attest_metadata
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: enclave-release.json
 
