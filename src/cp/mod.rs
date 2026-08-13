@@ -11,7 +11,9 @@
 //! Identity and accounting live in [`control_store`] as an encrypted SQLite
 //! blob in GCS.
 
+pub mod apple;
 pub mod auth;
+pub mod billing;
 pub mod control_store;
 pub mod cors;
 pub mod delivery;
@@ -24,14 +26,29 @@ pub mod limits;
 pub mod mcp_projection;
 pub mod mcp_query;
 pub(crate) mod mcp_safety;
+pub mod media;
+pub mod media_planner;
+pub mod media_worker;
+pub mod model_usage;
 pub mod oauth;
+pub mod push;
 pub mod query;
 pub mod reviewer;
+// Retained for legacy-index migrations and focused regression tests after
+// local screenshot ingestion was retired.
+#[allow(dead_code)]
 pub mod screen_understanding;
 pub mod summarizer;
 pub mod sync;
 pub mod tokens;
 pub mod vertex;
+pub mod voice_eval;
+pub mod voice_eval_assets;
+pub mod voice_eval_evidence;
+pub mod voice_eval_similarity;
+pub mod voice_lineage;
+pub mod voice_memory;
+pub mod voice_quality;
 pub mod webhook_worker;
 
 use serde::Deserialize;
@@ -60,10 +77,17 @@ pub struct CpConfig {
     /// JWT signing secrets: current first, then rotation-fallback(s).
     pub jwt_secrets: Vec<String>,
     pub google_desktop_client_id: String,
+    pub google_ios_client_id: String,
     pub google_web_client_id: String,
     pub google_web_client_secret: String,
+    /// Optional Sign in with Apple public configuration. The private key is
+    /// fetched separately from Secret Manager and never enters image metadata.
+    pub apple_sign_in: Option<apple::AppleSignInConfig>,
     /// Lowercased allow-list. `None` is permitted only in debug test mode.
     pub allowed_emails: Option<Vec<String>>,
+    /// Stable UUIDs authorized for owner-only operational reporting. This is
+    /// intentionally independent from the broader sign-in email allow-list.
+    pub admin_user_ids: Vec<String>,
     pub scheduler_sa_email: Option<String>,
     pub vertex_project: String,
     pub vertex_location: String,
@@ -71,10 +95,24 @@ pub struct CpConfig {
     pub quota_utterances_per_day: i64,
     pub quota_screenshots_per_day: i64,
     pub quota_mcp_calls_per_day: i64,
+    pub quota_vertex_output_tokens_per_day: i64,
     pub web_origin: String,
     /// Optional exact-match Google Identity Platform account used only by the
     /// public plugin-review login page. The password never enters this config.
     pub reviewer_auth: Option<ReviewerAuthConfig>,
+    pub billing_enforcement_mode: BillingEnforcementMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BillingEnforcementMode {
+    Shadow,
+    Enforce,
+}
+
+impl BillingEnforcementMode {
+    pub fn enforces(self) -> bool {
+        self == Self::Enforce
+    }
 }
 
 #[derive(Clone)]
@@ -143,6 +181,23 @@ impl CpConfig {
         {
             return Err(crate::error::EnclaveError::Config(
                 "ALLOWED_EMAILS does not permit a wildcard".into(),
+            ));
+        }
+        let admin_user_ids = std::env::var("ADMIN_USER_IDS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if (!crate::test_mode_enabled() && admin_user_ids.is_empty())
+            || admin_user_ids.iter().any(|value| !is_stable_uuid(value))
+        {
+            return Err(crate::error::EnclaveError::Config(
+                "ADMIN_USER_IDS must contain explicit stable UUIDs".into(),
             ));
         }
 
@@ -234,7 +289,83 @@ impl CpConfig {
             })
         };
 
-        let vertex_model = config_value("VERTEX_MODEL", "gemini-2.5-flash")?;
+        let apple_values = [
+            std::env::var("APPLE_TEAM_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("APPLE_KEY_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("APPLE_IOS_CLIENT_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("APPLE_MACOS_CLIENT_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            std::env::var("APPLE_WEB_CLIENT_ID")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        ];
+        let apple_sign_in = if apple_values.iter().all(String::is_empty) {
+            None
+        } else if apple_values.iter().any(String::is_empty) {
+            return Err(crate::error::EnclaveError::Config(
+                "APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_IOS_CLIENT_ID, APPLE_MACOS_CLIENT_ID, and APPLE_WEB_CLIENT_ID must be set together".into(),
+            ));
+        } else {
+            let [team_id, key_id, ios_client_id, macos_client_id, web_client_id] = apple_values;
+            let identifier_valid = |value: &str| {
+                value.len() == 10 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            };
+            if !identifier_valid(&team_id)
+                || !identifier_valid(&key_id)
+                || ios_client_id != "com.kioku.ios"
+                || macos_client_id != "com.kiokuu.app"
+                || web_client_id != "com.kiokuu.web"
+            {
+                return Err(crate::error::EnclaveError::Config(
+                    "Sign in with Apple public configuration is invalid".into(),
+                ));
+            }
+            Some(apple::AppleSignInConfig {
+                team_id,
+                key_id,
+                ios_client_id,
+                macos_client_id,
+                web_client_id,
+                web_redirect_uri: format!("{base_url}/oauth/apple/callback"),
+            })
+        };
+
+        let vertex_model = config_value("VERTEX_MODEL", "gemini-3.5-flash")?;
+        if !vertex_model_name_is_billing_safe(&vertex_model) {
+            return Err(crate::error::EnclaveError::Config(
+                "VERTEX_MODEL must be 1-128 ASCII letters, digits, '.', '_', ':', or '-'".into(),
+            ));
+        }
+        let billing_enforcement_mode = match std::env::var("BILLING_ENFORCEMENT_MODE")
+            .unwrap_or_else(|_| {
+                if crate::test_mode_enabled() {
+                    "enforce".into()
+                } else {
+                    String::new()
+                }
+            })
+            .as_str()
+        {
+            "shadow" => BillingEnforcementMode::Shadow,
+            "enforce" => BillingEnforcementMode::Enforce,
+            _ => {
+                return Err(crate::error::EnclaveError::Config(
+                    "BILLING_ENFORCEMENT_MODE must be shadow or enforce".into(),
+                ))
+            }
+        };
 
         Ok(Self {
             base_url,
@@ -247,8 +378,14 @@ impl CpConfig {
                 "GOOGLE_WEB_CLIENT_ID",
                 "test-web.apps.googleusercontent.com",
             )?,
+            google_ios_client_id: config_value(
+                "GOOGLE_IOS_CLIENT_ID",
+                "test-ios.apps.googleusercontent.com",
+            )?,
             google_web_client_secret,
+            apple_sign_in,
             allowed_emails,
+            admin_user_ids,
             scheduler_sa_email: std::env::var("SCHEDULER_SA_EMAIL")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -258,18 +395,27 @@ impl CpConfig {
             quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000)?,
             quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000)?,
             quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000)?,
+            quota_vertex_output_tokens_per_day: parse_i64(
+                "QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY",
+                524_288,
+            )?,
             web_origin,
             reviewer_auth,
+            billing_enforcement_mode,
         })
     }
 
     /// Google ID-token audiences accepted for end-user (device + web) sign-in.
     pub fn user_audiences(&self) -> Vec<String> {
-        [&self.google_desktop_client_id, &self.google_web_client_id]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
+        [
+            &self.google_desktop_client_id,
+            &self.google_ios_client_id,
+            &self.google_web_client_id,
+        ]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
     }
 
     pub fn email_allowed(&self, email: &str) -> bool {
@@ -278,6 +424,25 @@ impl CpConfig {
             Some(list) => list.contains(&email.to_lowercase()),
         }
     }
+
+    pub fn is_admin(&self, user_id: &str) -> bool {
+        self.admin_user_ids.iter().any(|value| value == user_id)
+    }
+}
+
+fn is_stable_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+pub(crate) fn vertex_model_name_is_billing_safe(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 /// Shared state for the control-plane HTTP surface. Holds the same `Arc<Store>`
@@ -287,17 +452,24 @@ impl CpConfig {
 pub struct CpState {
     pub store: Arc<Store>,
     pub control: Arc<control_store::ControlStore>,
+    pub billing: Arc<dyn billing::BillingGateway>,
+    pub recording_lease_gate: Arc<billing::RecordingLeaseGates>,
     pub config: Arc<CpConfig>,
     pub user_verifier: Arc<auth::UserIdTokenVerifier>,
     pub reviewer_verifier: Option<Arc<auth::ReviewerIdentityVerifier>>,
+    pub apple_provider: Option<Arc<apple::AppleIdentityProvider>>,
     pub sync_limiter: limits::RateLimiter,
     pub mcp_limiter: limits::RateLimiter,
     pub oauth_limiter: limits::RateLimiter,
     pub test_email_limiter: limits::RateLimiter,
     pub email_transport: Option<Arc<dyn email_worker::EmailTransport>>,
+    pub push_transport: Option<Arc<dyn push::PushTransport>>,
     /// In-enclave query embedder (hybrid search). `None` → FTS-only mode
     /// (model not baked/downloaded, or failed to load — never fatal).
     pub embedding: Option<Arc<crate::embedding::EmbeddingEngine>>,
+    /// Python-free WeSpeaker voiceprint engine. The production image bakes the
+    /// pinned ONNX model; local tests may run without it.
+    pub voice: Option<Arc<voice_memory::VoiceEngine>>,
 }
 
 /// Helper to fetch a secret from GCP Secret Manager at runtime, using the GCE metadata server token.
@@ -404,4 +576,20 @@ pub async fn fetch_secret_from_manager(secret_id: &str, version: &str) -> Result
         .map_err(|e| format!("Secret {} payload is not valid UTF-8: {}", secret_id, e))?;
 
     Ok(decoded_str)
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::vertex_model_name_is_billing_safe;
+
+    #[test]
+    fn vertex_model_grammar_matches_the_billing_contract() {
+        assert!(vertex_model_name_is_billing_safe("gemini-3.5-flash"));
+        assert!(vertex_model_name_is_billing_safe("publisher:model_001"));
+        assert!(!vertex_model_name_is_billing_safe(
+            "publishers/google/model"
+        ));
+        assert!(!vertex_model_name_is_billing_safe(&"m".repeat(129)));
+        assert!(!vertex_model_name_is_billing_safe(""));
+    }
 }

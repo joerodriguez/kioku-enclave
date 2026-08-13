@@ -22,8 +22,9 @@
 //! The Confidential Space launcher listens on the UNIX domain socket
 //! `/run/container_launcher/teeserver.sock`. We perform a minimal HTTP/1.1
 //! POST over a `tokio::net::UnixStream` rather than pulling in hyperlocal,
-//! since the binary already minimises dependencies. The response is a quoted
-//! JSON string (the raw JWT).
+//! since the binary already minimises dependencies. Production launcher
+//! responses contain the bare JWT; the parser also tolerates a legacy
+//! JSON-quoted JWT while keeping all response/token intermediates zeroizing.
 //!
 //! The path `POST /v1/token` with JSON body
 //! `{"audience":"…","token_type":"OIDC","nonces":["…"]}` matches the
@@ -38,8 +39,44 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
-use crate::error::{EnclaveError, Result};
+use crate::{
+    archive_v3_firestore_witness::FirestoreWitnessAudience,
+    archive_v3_gcs_auth::ArchiveV3GcsAudience,
+    error::{EnclaveError, Result},
+};
+
+/// A non-public, type-preserving handle for an internal WIF audience.
+///
+/// This trait shares only the launcher socket serialization. Each credential
+/// boundary owns its concrete audience type, STS client, cache, and secrets;
+/// an arbitrary `String` can never be passed to this helper.
+pub(crate) trait InternalWifAudience: internal_wif_audience_seal::Sealed {
+    fn internal_wif_audience(&self) -> &str;
+}
+
+// The launcher helper must not become a generic minting oracle: these are the
+// only two credential-boundary types allowed to use its no-nonce WIF request.
+// Keeping this supertrait private means other crate modules cannot implement
+// `InternalWifAudience` for an arbitrary string-owning type.
+mod internal_wif_audience_seal {
+    pub trait Sealed {}
+}
+
+impl internal_wif_audience_seal::Sealed for FirestoreWitnessAudience {}
+impl InternalWifAudience for FirestoreWitnessAudience {
+    fn internal_wif_audience(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl internal_wif_audience_seal::Sealed for ArchiveV3GcsAudience {}
+impl InternalWifAudience for ArchiveV3GcsAudience {
+    fn internal_wif_audience(&self) -> &str {
+        self.as_str()
+    }
+}
 
 // ── Token-server socket ───────────────────────────────────────────────────────
 
@@ -191,15 +228,30 @@ impl AttestationCache {
 /// wrapped in any framing beyond TCP-over-unix). We issue a minimal POST
 /// and read the full response body.
 ///
-/// Expected response: a JSON-quoted string, e.g. `"eyJ…"` (the raw JWT).
-pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Result<String> {
-    let request_body = launcher_token_request_body(audience, nonce).to_string();
+/// Expected response: the bare JWT. Legacy surrounding JSON quotes are
+/// tolerated for compatibility and stripped inside zeroizing storage.
+async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Result<String> {
+    // Public attestation intentionally returns an ordinary `String` to its
+    // legacy caller. Keep all launcher-response intermediates zeroizing, then
+    // make this one explicit returned-value copy at the public boundary.
+    let token = fetch_launcher_token_zeroizing(audience, nonce).await?;
+    Ok(token.as_str().to_owned())
+}
 
-    let request = format!(
+/// Private launcher protocol implementation shared by the public verifier
+/// path and the internal WIF helper. Everything received from the launcher,
+/// including dechunked and normalized token copies, remains zeroizing here.
+async fn fetch_launcher_token_zeroizing(
+    audience: &str,
+    nonce: Option<&str>,
+) -> Result<Zeroizing<String>> {
+    let request_body = Zeroizing::new(launcher_token_request_body(audience, nonce).to_string());
+
+    let request = Zeroizing::new(format!(
         "POST /v1/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         request_body.len(),
-        request_body,
-    );
+        request_body.as_str(),
+    ));
 
     // Connect and send.
     let mut stream = tokio::time::timeout(LAUNCHER_IO_TIMEOUT, UnixStream::connect(TEE_SOCKET))
@@ -218,7 +270,7 @@ pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Res
 
     // Read a bounded response (normally only a few KiB). The host can deny
     // availability, but it must not be able to grow enclave memory without bound.
-    let mut response = Vec::new();
+    let mut response = Zeroizing::new(Vec::new());
     let mut limited = stream.take(MAX_LAUNCHER_RESPONSE_BYTES + 1);
     tokio::time::timeout(LAUNCHER_IO_TIMEOUT, limited.read_to_end(&mut response))
         .await
@@ -255,9 +307,9 @@ pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Res
     {
         dechunk_http_body(body)?
     } else {
-        body.to_string()
+        Zeroizing::new(body.to_string())
     };
-    let jwt = decoded.trim().trim_matches('"').to_string();
+    let jwt = Zeroizing::new(decoded.trim().trim_matches('"').to_string());
 
     if jwt.is_empty() || !jwt.contains('.') {
         return Err(EnclaveError::Attestation(
@@ -266,6 +318,19 @@ pub async fn fetch_attestation_token(audience: &str, nonce: Option<&str>) -> Res
     }
 
     Ok(jwt)
+}
+
+/// Fetch an internal WIF-audience OIDC token from the Confidential Space
+/// launcher. This deliberately exposes only the no-nonce form needed by
+/// internal credential exchanges; public attestation continues to use the
+/// separate verifier-audience path above.
+///
+/// The returned token is zeroized when dropped, and this helper neither caches
+/// it nor logs it.
+pub(crate) async fn fetch_internal_wif_attestation_token<A: InternalWifAudience + ?Sized>(
+    audience: &A,
+) -> Result<Zeroizing<String>> {
+    fetch_launcher_token_zeroizing(audience.internal_wif_audience(), None).await
 }
 
 /// Build the JSON contract accepted by the Confidential Space launcher.
@@ -286,9 +351,9 @@ fn launcher_token_request_body(audience: &str, nonce: Option<&str>) -> serde_jso
 
 /// Decode an HTTP/1.1 chunked-transfer body into its payload.
 /// Each chunk is `<hex-size>\r\n<data>\r\n`, terminated by a `0\r\n` chunk.
-fn dechunk_http_body(body: &str) -> Result<String> {
+fn dechunk_http_body(body: &str) -> Result<Zeroizing<String>> {
     let bytes = body.as_bytes();
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     let mut offset = 0usize;
     loop {
         let relative_line_end = bytes[offset..]
@@ -305,8 +370,19 @@ fn dechunk_http_body(body: &str) -> Result<String> {
             .map_err(|e| EnclaveError::Attestation(format!("bad chunk size {size_hex:?}: {e}")))?;
         offset = line_end + 2;
         if size == 0 {
-            return String::from_utf8(out)
-                .map_err(|_| EnclaveError::Attestation("chunked body is not UTF-8".into()));
+            let raw = std::mem::take(&mut *out);
+            return match String::from_utf8(raw) {
+                Ok(text) => Ok(Zeroizing::new(text)),
+                Err(error) => {
+                    // `FromUtf8Error` otherwise owns the decoded response
+                    // bytes on its error path; move them back under a
+                    // zeroizing owner before returning the redacted error.
+                    let _invalid = Zeroizing::new(error.into_bytes());
+                    Err(EnclaveError::Attestation(
+                        "chunked body is not UTF-8".into(),
+                    ))
+                }
+            };
         }
         let data_end = offset
             .checked_add(size)
@@ -411,7 +487,8 @@ mod tests {
         // The launcher's real wire format (observed in prod): one hex-sized
         // chunk holding the raw JWT, then a terminating 0-chunk.
         let body = "5\r\nhello\r\n0\r\n\r\n";
-        assert_eq!(dechunk_http_body(body).unwrap(), "hello");
+        let decoded = dechunk_http_body(body).unwrap();
+        assert_eq!(&*decoded, "hello");
     }
 
     #[test]
@@ -419,14 +496,15 @@ mod tests {
         // 0xb = 11 bytes "eyJ.aaa.bbb"
         let body = "b\r\neyJ.aaa.bbb\r\n0\r\n\r\n";
         let jwt = dechunk_http_body(body).unwrap();
-        assert_eq!(jwt, "eyJ.aaa.bbb");
+        assert_eq!(&*jwt, "eyJ.aaa.bbb");
         assert!(jwt.contains('.'));
     }
 
     #[test]
     fn dechunk_multi_chunk() {
         let body = "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n";
-        assert_eq!(dechunk_http_body(body).unwrap(), "abcdef");
+        let decoded = dechunk_http_body(body).unwrap();
+        assert_eq!(&*decoded, "abcdef");
     }
 
     #[test]

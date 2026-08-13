@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kioku.example/schemas/archive-v3-capacity-evidence-v2.json",
+  "title": "Inactive, blocked ADR-0022 capacity preauthorization report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "contract_id", "activation_blockers", "policy_sha256", "request_sha256", "ledger_sha256", "time_assertion_sha256", "release", "environment", "evaluator", "evidence", "signature_binding", "artifact_bindings", "workloads", "case_results", "measurements", "transport_breakdowns", "durable_write_samples", "durable_write_summaries", "ann_results", "bounded_records", "invariants", "correctness", "cleanup"],
+  "properties": {
+    "schema": {"const": "kioku-archive-v3-capacity-evidence-v2"},
+    "contract_id": {"const": "adr0022-phase1-32gib-v2"},
+    "activation_blockers": {"type": "array", "minItems": 6, "maxItems": 6, "uniqueItems": true},
+    "policy_sha256": {"$ref": "#/$defs/hash"},
+    "request_sha256": {"$ref": "#/$defs/hash"},
+    "ledger_sha256": {"$ref": "#/$defs/hash"},
+    "time_assertion_sha256": {"$ref": "#/$defs/hash"},
+    "release": {"type": "object"}, "environment": {"type": "object"}, "evaluator": {"type": "object"},
+    "evidence": {"type": "object"}, "signature_binding": {"type": "object"}, "artifact_bindings": {"type": "object"},
+    "workloads": {"type": "array", "minItems": 3, "maxItems": 3},
+    "case_results": {"type": "array", "minItems": 243, "maxItems": 243},
+    "measurements": {"type": "array", "minItems": 126, "maxItems": 126},
+    "transport_breakdowns": {"type": "array", "minItems": 9, "maxItems": 9},
+    "durable_write_samples": {"type": "array", "minItems": 18, "maxItems": 18},
+    "durable_write_summaries": {"type": "array", "minItems": 18, "maxItems": 18},
+    "ann_results": {"type": "array", "anyOf": [{"maxItems": 0}, {"minItems": 3, "maxItems": 3}]},
+    "bounded_records": {"type": "array", "minItems": 3, "maxItems": 3},
+    "invariants": {"type": "object"}, "correctness": {"type": "object"}, "cleanup": {"type": "object"}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+}

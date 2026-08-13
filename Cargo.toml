@@ -1,6 +1,6 @@
 [package]
 name = "kioku-enclave"
-version = "0.7.6"
+version = "0.8.15"
 edition = "2021"
 rust-version = "1.96"
 description = "Attested Kioku backend for encrypted personal-memory storage and retrieval"
@@ -26,8 +26,9 @@ path = "src/main.rs"
 [dependencies]
 # HTTP server — axum on tokio
 axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio", "multipart"] }
-tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net"] }
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time"] }
 tower = { version = "0.5.2", default-features = false }
+futures-util = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }
 
 # Production TLS termination inside the enclave (ADR-0001). The attested binary
 # is the first server-side application code to see request plaintext. rustls only
@@ -57,11 +58,22 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 # Serialisation
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
+serde_json = { version = "1.0.140", features = ["raw_value"] }
 
 # Crypto: AES-256-GCM
 aes-gcm = { version = "0.10.3", features = ["std"] }
+# Direct, locked primitives used only by the inactive legacy-GCM migration
+# reader. Keeping them explicit makes the low-level composition auditable.
+aes = { version = "0.8.4", features = ["zeroize"] }
+ctr = { version = "0.9.2", features = ["zeroize"] }
+ghash = { version = "0.5.1", features = ["zeroize"] }
+subtle = "2.6.1"
+# Direct declaration of the already-locked HKDF implementation used by the
+# inactive ADR-0022 archive-v3 format foundation.  Keeping this explicit makes
+# the archive KDF auditable rather than relying on a transitive dependency.
+hkdf = "0.12.4"
 rand = "0.8.5"
+zeroize = { version = "1.8.2", features = ["derive"] }
 
 # Typed errors
 thiserror = "2.0.12"
@@ -73,7 +85,10 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 # HTTP client for KMS / GCS REST — rustls only, NO openssl.
 # webpki-roots bundles Mozilla's CA roots into the binary so the FROM-scratch
 # container image needs no /etc/ssl/certs on the filesystem.
-reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls-webpki-roots", "json", "http2"] }
+# Strict parsing of the authenticated GCS response Date used for durable
+# legacy-write intent leases. Already present transitively through hyper.
+httpdate = "1.0.3"
 
 # Async trait support (used by KmsClient and GcsClient traits)
 async-trait = "0.1.88"
@@ -88,13 +103,13 @@ urlencoding = "2.1.3"
 tempfile = "3.20.0"
 
 # JWT verification for caller ID-token auth (Google RS256 tokens).
-# "use-pem" / "use-native-tls" excluded; we use the rustls path everywhere.
-# rsa feature pulls in the rsa crate for RS256 verify; we exclude pem (not needed at runtime).
+# "use-native-tls" is excluded; we use the rustls path everywhere. "use_pem"
+# is required to load Apple's ES256 private key for client-secret signing.
 # rust_crypto = pure-Rust CryptoProvider (no C/system deps — required for the
 # musl static FROM-scratch build). WITHOUT a provider feature, jsonwebtoken 10
 # PANICS at signature-verify time ("Could not determine CryptoProvider"), which
 # crashed the enclave on every real ID token. "rsa" alone is NOT a provider.
-jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto", "use_pem"] }
 
 # Self-signed certificate generation at boot for RA-TLS (ADR-0001).
 # Pinned to the same version instant-acme's ACME path uses (ADR-0003) so the
@@ -127,13 +142,38 @@ candle-transformers = { version = "0.11", default-features = false }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 regex = "1.10"
 
+# Offline ADR-0016 corpus derivation. These are already locked transitive
+# dependencies of the attested binary; direct declarations let the public
+# evaluator read exact members from hash-pinned .tar.gz or ZIP source bundles
+# without shell extraction or writing licensed content into the source checkout.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+tar = "0.4.46"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+
 # Decode uploaded visual-evidence JPEGs inside the enclave so multipart MIME,
 # dimensions, and hashes cannot stand in for inspection of the actual bytes.
 jpeg-decoder = { version = "0.3.2", default-features = false }
 
+# Server-side voice memory (no Python and no dynamic runtime): decode the
+# bounded AAC/M4A or WAV capture in pure Rust, compute Kaldi-compatible fbank
+# features, and execute the pinned WeSpeaker ONNX model with tract.
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4", "wav", "pcm"] }
+kaldi-native-fbank = "0.1.0"
+tract-onnx = { version = "0.23.4", default-features = false }
+
 [dev-dependencies]
-tokio = { version = "1.45.1", features = ["rt", "macros"] }
+tokio = { version = "1.45.1", features = ["rt", "macros", "test-util"] }
 tempfile = "3.20.0"
+
+[profile.dev]
+# Preserve incremental compilation for active local work while avoiding bulky
+# full debug information in each agent worktree's artifacts.
+debug = "line-tables-only"
+
+[profile.test]
+# Tests share the same space-conscious debug setting without changing release
+# or production-image profiles.
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = "z"

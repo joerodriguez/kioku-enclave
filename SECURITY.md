@@ -3,15 +3,16 @@
 ## Scope
 
 `kioku-enclave` is the production Kioku backend, not only a storage data plane. The
-same attested Rust process terminates TLS and implements Google OAuth, token issuance,
+same attested Rust process terminates TLS and implements Google/Apple authentication, token issuance,
 device sync, MCP and REST queries, account export/deletion, quotas, summarisation, and
 encrypted persistence. This threat model therefore includes those control-plane
 surfaces.
 
 ### In scope
 
-- Confidentiality and integrity of transcripts, OCR text, opted-in screenshot evidence,
-  episode data, identity state, and OAuth credentials handled by this service.
+- Confidentiality and integrity of uploaded audio, screenshots, timestamped capture and
+  browser metadata, transcripts, OCR text, episode data, learned identity/voice state,
+  and OAuth credentials handled by this service.
 - TLS transport to public clients and to Google APIs.
 - OAuth, bearer-token, and legacy service-identity authentication and authorization.
 - Per-user isolation, export, deletion, quotas, and abuse controls.
@@ -24,19 +25,27 @@ surfaces.
 ### Out of scope or accepted external trust
 
 - The macOS client, which is a separate binary with its own threat model.
-- Payment processing; no billing provider is implemented here.
+- Payment processing, tax, invoices, subscription webhooks, and catalog pricing occur in
+  an external control plane. The enclave's pseudonymous usage reservation, entitlement
+  enforcement, bounded compatibility facade, and owner authorization are in scope. This
+  repository contains no merchant adapter or commercial catalog.
 - CPU-level microarchitectural side channels. Confidential Space provides VM memory
   encryption, not complete Spectre-class protection.
-- **Vertex Gemini inference confidentiality.** Core processing always sends synced
-  settled-episode transcripts, complete OCR, app/window/URL and browser-tab metadata,
-  deterministic visual statistics, and derived text together from this process to Vertex under Google's applicable
-  enterprise terms. Raw audio and screenshot pixels are excluded by typed request DTOs
-  and serialization tests. The privacy claim is “attested enclave + Google Vertex
-  inference,” not enclave-only inference.
+- **Vertex Gemini inference confidentiality.** Audio transcription/diarization,
+  screenshot understanding, identity/fact evidence extraction, settled-episode transcripts, OCR,
+  app/window/URL metadata, browser-tab metadata, and summarisation send bounded user
+  content from this process to Vertex under Google's applicable enterprise terms. The
+  privacy claim is “attested enclave + Google Vertex inference,” not enclave-only
+  inference.
 - **User-configured webhooks.** A finalized-episode event leaves the TEE only after a
   user adds an HTTPS destination. Events are content-free by default; full brief content
   is a separate opt-in and is then processed by that destination outside Kioku's trust
   boundary.
+- **Apple Push Notification service.** An opted-in installation sends Apple a device
+  token, exact app topic, generic `Your memory is ready.` alert, and delivery timing.
+  Every installation receives a different opaque handoff handle. APNs payloads contain
+  no memory/episode ID, title, people, transcript, summary, action items, account
+  identity, timestamp, arbitrary URL, or credential.
 
 ## Security invariants
 
@@ -47,6 +56,41 @@ surfaces.
 - The Confidential Space launch policy permits only `PORT` to be changed at launch.
   KMS, GCS, caller identity, OAuth, TLS, attestation, and migration settings are baked
   into the image and therefore covered by its digest.
+- CI selects exactly one complete image configuration before Docker runs. Manual
+  evaluation builds never inherit production values, are marked with an `eval-` tag and
+  metadata profile, cannot become signed releases, and may run only with an isolated
+  service account, KMS key, buckets, hostname, and attestation binding that have no
+  production data access. The operator has retired that isolated runtime; production is
+  now the only active owner evaluation environment.
+- Production selection accepts only the reviewed `shadow` and `enforce` billing modes.
+  The selected mode is preserved in schema-v6 release metadata, and a fresh release
+  rechecks that it matches the repository variable observed before tagging. A later
+  configuration change therefore cannot silently alter the signed image's enforcement
+  behavior.
+- ADR-0022 Phase-0 requires three baked non-secret repository variables:
+  `ENCLAVE_GCS_BUCKET` for indexes, `ENCLAVE_GCS_MEDIA_BUCKET` for current-media
+  writes, and `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` for migration-only media reads and
+  deletes. The current media bucket may differ from the index bucket; legacy media must
+  exactly equal it. The exact three-value claim is carried in a schema-v6 release
+  manifest that is itself a GitHub-signed provenance subject. Runtime has no missing
+  legacy-bucket fallback; an unsigned/copied or older manifest is not promotion evidence.
+  This is not archive-v3 wiring, a deletion action, or deployment authority.
+- The ADR-0022 Firestore transport probe is non-authoritative and the exact checked-in
+  `config/archive-witness-probe.json` defaults to `off` with empty project/number/database
+  fields. Build selection and signed-metadata verification use one strict parser; no
+  repository variable or manual-dispatch witness input can override it, evaluation and
+  main builds force it off, and `probe-v1` is eligible only for an exact
+  `vX.Y.Z-witness-probe.N` prerelease that `release.sh --roll` rejects. Off constructs no
+  Firestore credentials or transport and performs zero I/O. A probe prerelease awaits one
+  bounded attempt before any application Store/KMS/GCS construction, emits only a fixed
+  redacted outcome, and continues startup regardless of that outcome. It can touch only
+  `archive_witness_transport_probe_v1/singleton`, whose sole `r` field is a strict fixed-size
+  magic/version, monotonic generation, and random opaque attempt ID. It has no AppState/
+  CpState/route/health/admission/deletion/acknowledgement connection, never constructs a
+  witness bootstrap, and cannot change canonical archive-witness state. Commit ambiguity is
+  never blindly retried and is confirmed only by rereading the exact attempt. Schema-v6
+  signed release metadata binds the mode and complete-or-empty namespace but grants no
+  Firestore, rollout, health, or archive authority.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL
@@ -55,11 +99,72 @@ surfaces.
   leave the enclave.
 - Decrypted databases exist only in the `/tmp` Confidential Space tmpfs and in process
   memory. User content and key material must never be logged.
+- The ADR-0022 SQLite shadow-parity checker is inactive and advisory-only. If future
+  rollout code invokes it, a separately reviewed recovery factory must mint two distinct
+  owner-private disposable staging copies; this release has no non-test constructor for
+  that capability. Normal inspections use independent read-only connections. It
+  streams every ordinary live table, the canonical export representation, and exact
+  vector row ids/encoded bytes under hard row/field/total budgets; bounded 64-row probes
+  remain diagnostic and are never the full parity gate. SQLite exposes FTS5's documented
+  no-op external-content integrity command only as an `INSERT`, so a private staging-only
+  connection may execute at most six compile-time FTS check commands after exact,
+  comment-rejecting verification of each expected virtual-table/source schema; it accepts
+  no caller SQL and grants no live persistence authority. Alias-bearing and `WITHOUT
+  ROWID` tables fail closed until an index-backed traversal is reviewed. It emits only
+  typed outcomes plus opaque versioned digests and
+  exposes cancellation/deadline checks. It has no Store, VFS, route,
+  credential, provider, scheduler, publication, recovery, deletion, or cutover
+  authority; a match never authorizes any of those actions.
+- Archive storage telemetry is process-aggregate and content-free. Its in-process state
+  and structured events have no user/archive IDs, object names or paths, URLs, queries,
+  content, keys, per-user labels, or timestamps sourced from user records. Only fixed
+  byte/latency/ratio buckets and aggregate save outcome counters are permitted.
+- Capacity fixtures contain deterministic numeric shapes only. Generated records and
+  sparse files stay under ignored `target/` output or outside the checkout; no captured
+  content, realistic text/media, user identifier, object path, biometric vector, or key
+  may be introduced as capacity input.
 - Legacy encrypted blobs are rejected unless a reviewed migration image explicitly
   bakes in `ENCLAVE_ALLOW_LEGACY_BLOBS=1`.
 - Unified episode-analysis requests contain text and metadata only. Code that builds a Vertex
   request must not load an image object, image bytes, a signed image URL, or a local image
   path. Cloud Screenshot Evidence consent controls pixel sync, not text inference.
+- Voice embeddings, sample diagnostics, robust profile representatives, biometric
+  match scores, and the identity graph remain inside the encrypted per-user database.
+  They are never sent to Gemini, returned by a public API, emitted in logs/metrics, or
+  compared across users. Candidate names supplied to Gemini are bounded spelling
+  vocabulary only and are never accepted as identity evidence by themselves.
+- Automatic biometric enrollment is quality-gated and versioned. Short samples are
+  match-only, contaminated samples are quarantined, same-name people remain separate
+  opaque identities, and ambiguous/conflicting evidence must abstain rather than
+  overwrite accepted identity history.
+- Voice-profile merge/split work is an append-only derivation inside the encrypted
+  user database. Proposals are bounded, scorer/version bound, same-space/domain
+  checked, identity-conflict checked, and transactionally stale-checked before apply.
+  Source profiles and assignment history are retained; reversal fails closed if a
+  result acquired later samples. No similarity threshold can auto-apply a proposal
+  until the hash-bound real-audio release corpus has calibrated that scorer version.
+- A signed release may carry the exact `owner-only-production.json` marker only while
+  `external_users` is zero and `voice_quality_claims_allowed` is false. Release metadata
+  then records `owner_only_unvalidated`. The marker must be removed—and the complete
+  real-corpus trio must pass—before any external user is allowed or any voice-quality
+  claim is made. The marker and real evidence may never coexist.
+- Validated voice-quality releases require schema-v3 evidence derived by the public
+  reducer plus a schema-v2 source manifest. Separately hashed media/label/bundle/
+  augmentation artifacts, licensed-playback lineage, physical-capture assertions,
+  authorization hashes, and exact device/UI routes fail closed before scoring. The
+  reducer pins the evaluated image/source/model/scorer plus export and post-delete
+  artifact hashes, derives all release counters from opaque timing and
+  exact record sets. Every predicted speaker has exactly one identity-decision row;
+  every reference speaker has exactly one case; and a case's predicted person/state
+  must match the hypothesis chosen by the scorer's deterministic global diarization
+  mapping. The reducer rejects names, transcripts, URLs, paths, embeddings, raw scores,
+  unknown fields, modified derived values, and legacy hand-authored real aggregates.
+  The offline derivation command performs no network access, refuses artifact/output
+  directories inside the public checkout, verifies both media and label artifacts,
+  extracts only an exact traversal-free `.tar.gz` member in memory, accepts only bounded
+  mono 16-kHz PCM16 input, and refuses to replace a different output. Its private recipe,
+  restricted media, opaque labels, receipt, and authorization documents remain outside
+  Git; only the later content-free cases/report may be committed.
 
 ## Key hierarchy and encrypted objects
 
@@ -80,16 +185,561 @@ Cloud KMS KEK
 
 Version 2 uses AES-GCM Additional Authenticated Data containing a domain separator and
 the object's logical identity. User databases are bound to their exact
-`indexes/{user_id}.db.enc` name, screenshot evidence is bound to both the authenticated
-user and exact media object key, and control/ACME state uses fixed, distinct contexts.
+`indexes/{user_id}.db.enc` name, raw capture and screenshot evidence objects are bound to
+both the authenticated user and exact media object key. New selected screenshot evidence is
+restricted to `raw/{user_id}/evidence/{opaque_key}.enc`; legacy `media/{opaque_key}` rows
+remain readable and deletable until normal retention or account deletion. Control/ACME state uses fixed,
+distinct contexts.
 Moving ciphertext and its wrapped DEK to another object or user therefore fails
 authentication.
 
-User databases, the control database, ACME state, and screenshot evidence are rewritten
+User databases, the control database, ACME state, and media evidence are rewritten
 to v2 immediately when successfully opened by an explicitly enabled migration image.
 Strict images default to `ENCLAVE_ALLOW_LEGACY_BLOBS=0`. The migration is one-way; see
 [`RELEASING.md`](RELEASING.md#one-time-legacy-blob-migration) before upgrading a
 deployment that contains pre-v2 objects.
+
+The repository also contains an **inactive, migration-only** bounded streaming reader for
+the exact historical `nonce[12] || ciphertext || tag[16]` AES-256-GCM envelope. It has no
+Store, GCS, route, environment-flag, or authority connection. A future migration adapter
+must independently select and seal the source identity commitment, generation, and total;
+the primitive constant-time checks that commitment against the requested canonical identity
+before its first range read. It authenticates the entire ciphertext before starting temporary
+staging, re-reads that same pinned source in fixed-size chunks, and commits only after the
+second pass has the same ciphertext digest and valid GCM tag. The primitive
+uses async range and sink contracts; after staging begins, a synchronous-abort guard removes
+temporary plaintext even if the migration future is cancelled at an I/O await point.
+Staging creation itself is synchronous, so it cannot leave an unguarded temporary object on
+cancellation. First-pass authentication returns an internal sealed, non-seekable source;
+its pull and completion types are private to the module and its children. Pulled bytes are
+explicitly provisional and attacker-controlled until completion, so a future child
+composition may write them only to encrypted, non-observable, non-authoritative staging.
+The source retains the pinned identity commitment/generation/total, nonce/tag, first-pass
+digest, owned AAD, and zeroizing cipher state, and mints one non-cloneable completion carrying
+the exact source binding only after second-pass exact EOF, tag, digest, and range-receipt
+checks. Its fixed-size redacted binding is domain-separated SHA-256 over the fixed identity
+commitment, pinned lengths and generation, AAD profile discriminator, and first-pass digest;
+it never retains or logs a raw identity, path, user ID, or AAD in that binding. A future child
+composition may obtain the pre-staging binding, but it must consume the completion and
+constant-time equality-check its exact binding before persisting any root candidate or other
+authority-bearing record. The compatibility wrapper performs that consuming check before its
+atomic staging commit. Any future concrete adapter must live in the isolated legacy-GCM
+module (or a child), require an
+exact-generation GCS `206` response with a parsed `Content-Range` total and observed
+generation on every range, and receive dedicated review for atomic commit, non-observability,
+and reconciliation if cancellation races an externally completed commit. The in-memory
+receipt checks reject inconsistencies but cannot prove that a malicious concrete adapter
+reported provider metadata honestly.
+The private `legacy_gcm/extent_candidate.rs` child is an inactive, provisional-only SQLite
+extent source: it accepts only nonzero, page-aligned authenticated lengths within the fixed
+32-GiB cap; validates the required first 100-byte SQLite header fields and their bounded
+header-only relations before it returns an extent; and emits every dense sequential
+1-MiB-or-final-page-aligned extent, including all-zero content. It does
+not authenticate B-tree, FTS, or vector contents, finish or verify the second pass, stage an
+object, construct a root candidate, or connect to a provider, Store, runtime, route, flag,
+witness, CAS, or cutover authority. A later reviewed coordinator must own the parent source,
+scope and drop this adapter, finish and consume its binding, re-read the witness, then perform
+any staging or publication.
+It accepts only an explicit historic empty-AAD profile (SQLite/control/ACME) or the exact
+historic media-user-id AAD profile; it never probes multiple AADs and explicitly rejects a
+v2 marker. Its AES/CTR/GHASH composition is intentionally isolated because it needs a
+dedicated low-level cryptographic review, including the production range-reader and
+all-or-nothing encrypted staging implementation, before it can be connected to any runtime
+path.
+### ADR-0022 archive-v3 foundation is inactive
+
+The inactive legacy SQLite extent-candidate coordinator is private to
+`legacy_gcm/extent_candidate/`. It can persist only a content-free
+`CandidateReady` ledger record after asynchronous exact witness reads, a
+pinned full legacy-GCM authentication/decryption pass, an exact hash-bound
+AEAD-open/decode/context validation of the witness-nominated base root, sealed
+immutable-object readback, and production root-admission validation. Before
+the first durable row or provider write it also completes a bounded,
+zeroizing-buffer SQLite-header preflight through exact EOF and one-shot source
+completion, rejecting malformed headers and schema rollback. Its
+caller-retained attempt handle keeps durable IDs/binding and blocking ledger
+tasks across cancellation; exact reconciliation observes CandidateReady or
+orphans only Prepared attempts through bounded exact ledger pages. Restart
+discovery is derived solely from archive/database/operation identity and fully
+validated persisted rows; it deliberately takes no live witness/lease/root/
+registry/source input and requires exclusive future caller ownership. It has no
+witness CAS/publication, provider construction, Store/VFS/route/flag wiring,
+deletion, or GC. Provider-scale cleanup is intentionally deferred.
+
+The offline `scripts/run_archive_capacity_harness.py` creates deterministic,
+content-free SQLite smoke databases only outside the checkout or under ignored `target/`.
+Its exclusive run receipt rejects foreign/symlinked output and incompatible resume state.
+Its reports permanently classify as non-evidence (`release_evidence: false` and
+`sqlite_local_evidence: false`), and full mode fails closed. It cannot grant archive-v3
+authority or evidence the production image/VM, backend, VFS, witness, cache/concurrency,
+fault, deletion, lifecycle, or 32-GiB release gates.
+
+`scripts/run_archive_capacity_gate.py` is a separate, explicit local gate over the v2
+12-month 40/80/100-hour-per-month numeric fixture. It requires an operator confirmation,
+an empty safe output directory, and a free-space preflight before it creates anything.
+Its canonical 32-GiB path streams bounded numeric SQLite batches, observes local WAL and
+checkpoint results, materializes only deterministic zero-filled bounded payload/vector-shape
+BLOBs, validates `max_page_count` geometry, and uses sparse regular-file
+extent probes one page below/at/above the ceiling. Those probes contain no SQLite or user
+content and first refuse filesystems without observable sparse allocation; they do not
+materialize, download, upload, or encrypt a 32-GiB snapshot. Its report
+is permanently marked local non-authority/non-release evidence; it cannot change runtime
+authority or satisfy the image/backend/VFS/witness/fault/lifecycle/cache/concurrency gates.
+
+The inactive Phase-1 signed capacity-evidence contract adds no authority. Its offline
+verifier accepts a restricted ASCII/JCS profile only; enforces exact workload geometry,
+the workload-by-case/metric/result cross-product, policy-pinned environment, context-bound
+ADR metrics and transport components, strict bounds, paired live-size write traces with
+recomputed summaries and amplification growth,
+root/witness caps, ANN completeness, and conditional deletion semantics; and DER-validates
+a pinned P-256 SPKI. Request, time,
+replay-ledger, provenance, SBOM, and environment files are hash-bound wrappers, not trusted
+facts. The `preauthorization_only` receipt lists rollback-protected challenge issuance,
+transactional replay consumption, authenticated time, cryptographic provenance/environment
+verification, and independent measurement authenticity as unsatisfied activation blockers.
+It always carries `authority: false` and cannot authorize an archive-v3 transition.
+
+`src/archive_v3.rs`, `src/archive_v3_journal.rs`, `src/archive_v3_shadow.rs`, and `src/archive_v3_sqlite_vfs.rs` define only audited, unit-tested
+format primitives for the future
+immutable archive: opaque archive/database/key/object IDs; canonical context-bound
+HKDF-SHA-256 subkeys with randomly nonced AES-256-GCM envelopes; bounded root/Merkle decoding; and an
+immutable-object backend contract. Key-registry entries are explicitly outside the
+archive-DEK AEAD: a canonical plaintext binds domain, archive, archive/media key kind,
+and key epoch to the DEK before KMS wrapping, and unwrap must verify those fields before
+exposing the key. New DEK holders, KMS plaintext buffers, and derived object-key buffers
+zeroize on drop and do not implement revealing debug formatting. Random nonces are encoded
+into and covered by each envelope hash, so cross-process reuse of an object context cannot
+reuse an AES-GCM key/nonce pair before immutable storage rejects the duplicate. The
+process-local duplicate-seal guard is defense in depth, not the nonce uniqueness boundary.
+The root-key registry
+epoch/object/hash must come from the independent witness so cold recovery can unwrap the
+key before decrypting the root. This foundation makes no KMS calls and has no live Store,
+SQLite VFS, GCS, witness, route, migration,
+export, or deletion wiring. The legacy context-bound v2 database blob remains the sole
+production authority. The encrypted control database now assigns each canonical account
+one independently random opaque archive ID and retains an internal-only tombstone plus
+bounded opaque inventory-cursor slots before identity removal. This is a local fencing
+prerequisite only: it does not construct any v3 transport/witness/VFS/shadow runtime,
+does not send a provider request, and has no cryptographic, logical, or physical-complete
+state. Finalization erases the identity-to-archive binding while retaining only the
+archive-keyed tombstone, so a deleted identity cannot reconnect old ciphertext. Archive
+IDs, fences, and cursors are neither logged nor exposed through API/export models.
+Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
+rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
+source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the
+first provider mutation. Store then locks and blocks both process-local namespaces together,
+drains admitted raw writes, and force-flushes the latest actor. A content-free GCS marker fences
+the old namespace across instances. Its retained object name is a domain-separated HMAC under
+the KMS-protected control-store DEK rather than the legacy user ID or a public hash. The key is
+installed only from an exact durable control generation, is absent from the decrypted control
+rows, and cannot be changed in a live process; therefore the archive-keyed deletion ledger does
+not preserve an enumerable identity-to-archive link. Every legacy index write (including generation zero), raw
+media create, recovery-checkpoint copy, and stable create first persists a provider-side exact
+write intent. The intent binds a random request ID, owner namespace, destination backend/name,
+generation precondition or exact copy source, encrypted request bytes, and their commitments.
+Only after rereading the retained marker does a writer CAS a bounded ownership lease and issue the
+data request in an owned task. Lease timestamps come from the strict HTTP `Date` on an authenticated,
+read-only metadata GET of the exact existing intent generation, never a clock write or the process
+wall clock; missing, malformed, or regressing provider time fails closed. The provider future remains
+owned by the intent executor: caller
+cancellation drops it, and its awaited timeout expires before the lease plus a conservative margin,
+so no detached request is authorized beyond lease expiry. Ambiguous responses are reconciled
+against the exact destination; an expired lease can be CAS-taken over from the encrypted request
+only after that provider timeout window.
+Marker creation precedes strongly consistent bounded intent inventory: prepared intents are
+fenced without data I/O, active requests keep deletion/rebind pending, and expired requests are
+taken over. Terminal tombstones erase request bytes and purge their noncurrent payload generations
+but remain live through Phase 6. Rebind then performs a same-plaintext generation-CAS bump, so a
+pre-fence writer is either incorporated by an exact durable rebase or loses without an
+acknowledged mutation. Stable creation remains generation-zero conditional and exact-validated;
+old generations are deleted exactly and idempotently. Startup drains operations in bounded
+64-row pages before request admission (failing closed above a global safety cap), without user
+reauthentication. A live account-deletion retry actively resumes `SourceFreezing` or
+`StableWriting` under the same lifecycle and durable intent ownership instead of waiting for a
+restart. Deletion creates/adopts retained markers for both exact namespaces, drains intents before
+inventory, drains again after physical purge, and cannot finalize identity state until rebind reaches
+`deletion_reconciled`. The content-free old-namespace marker is intentionally retained as a
+ledger-known no-resurrection tombstone; only the later Phase-6 authority-drain/witness cutover may
+retire it.
+`src/archive_v3_gcs.rs` is likewise inactive: it specifies and
+tests a redacted async GCS-shaped transport boundary (conditional immutable creation,
+read-after-create equality, bounded canonical-name pagination, and a contract requiring
+exact all-generation deletion) plus canonical KMS AAD for bounded registry unwrap. Its
+fake verifies delegation and multi-generation absence semantics; provider-level deletion
+evidence still requires a live drill. `src/archive_v3_gcs_http.rs` provides a concrete,
+caller-token-only rustls-only/no-proxy/no-redirect/no-retry REST implementation with exact URL encoding, bounded streamed reads/listing,
+generation-zero creates, durable claim CAS, and bounded all-generation deletion. Disabled-policy
+deletion succeeds only through an external provider/audit-and-trusted-time drain gate; no such live
+gate is wired. The transport intentionally has no metadata-service access, environment constructor,
+credentials/runtime/deploy wiring, or authority connection; its provider errors never contain
+object paths, IDs, hashes, or cursors.
+
+`src/archive_v3_deletion.rs` is a compiled-but-inactive deletion-driver seam. It accepts
+only a witness-issued tombstone/restart authorization and the opaque archive context
+authenticated by that witness; no caller can provide an account ID, object key, prefix, or
+list-all selector. It advances the existing key-erasure, inventory, and retention evidence
+stages only after exact all-generation content and permanent-claim deletion, and it reconciles
+a lost mutation response only by an exact absence read/list. GCS soft-delete residue remains a
+provider-drain gate. Immediately before any destructive I/O it reauthenticates the exact
+worker/operation/fence through deletion-only witness recovery, compares the fresh full record and
+authorization to its session, and passes every provider call an opaque execution binding. Final
+retention requires the provider to re-list exact content and claim generations (including
+soft-delete state) for the same inventory-bound commitment. Raw keys and object IDs are not
+provider capabilities: the sealed complete inventory mints an opaque capability for each indexed
+entry, and the concrete GCS adapter rechecks its inventory membership plus the full fresh
+archive/database/fence/worker/operation tuple before transport I/O. `PhysicalComplete` evidence
+hashes both the exact complete-inventory commitment and the freshly reverified provider-drain
+commitment; the driver derives that stage proof from the drain result rather than forwarding an
+unrelated retention assertion. The root/manifest formats do not yet
+carry all descendant location fields, so full activation is compile-time blocked: the inventory
+trait/builder/result are module-private and the full-reachability seal has no non-test constructor.
+Admitting an authenticated canonical metadata walker requires an explicit reviewed source change;
+that walker must enforce fixed global count/byte/depth/page bounds and cycle/duplicate rejection,
+and must not infer paths or discover objects by prefix. The driver has no Store, route, runtime,
+credential, or deployment wiring.
+The shadow module
+is bounded synchronous capture state only: no
+SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
+The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its image tail is zeroized before a nonzero truncate, and reset, fault, and owner-drop paths zeroize raw image/header bytes; queued captures independently zeroize on drop. Its exact session-and-attempt-derived owner/canonical-path registry is process-local, bounded, never logged, and retires only after an attached main connection closes; a later attempt in the same stable session cannot drain its predecessor's commits. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. The wrapper is not installed by startup and has no Store, provider, witness, route, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
+
+`src/archive_v3_witness.rs` additionally defines a compiled,
+in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
+read the exact immutable root object back through a provider boundary, authenticate and
+decrypt that stored envelope, validate its `ArchiveRoot` against the
+full `ObjectContext`, and require one provider resolver to fetch/hash the exact
+witness-nominated wrapped key-registry object, pass those same bytes to KMS unwrap, verify
+the unwrapped plaintext context, and retain that binding before deriving the
+object/hash/parent/database/key/fence commitment.
+Fixed-size records durably retain the owner, current/next fencing epoch, server-derived
+lease expiry, full predecessor root and key-registry reference, and an append-only
+four-stage deletion-evidence chain. Its trusted-clock API never accepts caller-selected
+time; tombstoning invalidates ordinary recovery/ownership, while a deletion-only restart
+path requires provider authentication on every step, matches the exact durable
+worker/operation identity derived from that opaque credential (never from persisted IDs),
+and accepts only provider-verified stage proofs whose canonical commitments bind the
+archive, operation identity, deletion fence, target state, root, registry, prior evidence,
+and provider proof commitment. Physical-completion proofs additionally bind the exact sealed
+inventory and fresh provider-drain commitments. Database-epoch cutover requires extent authority, derives a
+never-reused next epoch from the durable generation/current root, consumes that gate into a
+post-cutover state, retains the predecessor, and only then permits legacy retirement. A
+durable decoder rejects any lifecycle field combination that could reopen the consumed
+gate; this inactive v3 contract deliberately permits only that one bounded cutover. A
+registry generation authenticated inside the KMS plaintext prevents key rollback.
+Fenced compare-and-advance, direct
+large-archive extent shadowing, migration/deletion, database-epoch rollback, and
+key-rotation transitions are linearizable only in the test model.
+`src/archive_v3_firestore_witness.rs` adds an equally inactive provider-neutral Firestore
+metadata boundary: exactly one canonical document per opaque archive, exactly one bytes
+field `r` containing the fixed witness codec, read-write transaction begin, exact
+transactional batch read, full-record conditional commit, and an exact fresh-read check
+after an ambiguous response. It parses Firestore `readTime` as the trusted monotonic
+clock and retries only bounded `ABORTED` commits. The inactive boundary rejects `(default)`
+and accepts only the documented named-database grammar. The separately compiled inactive
+Firestore bearer source receives and uses the one dedicated
+`archive-witness-attest/providers/archive-witness` WIF provider-resource audience on every
+mint. Batch-get transport is capped before JSON parsing
+and accepts exactly one response, while record/base64, transaction, token, `readTime`, and
+`updateTime` material are bounded and fail closed. `src/archive_v3_firestore_http.rs` is a
+compiled but equally inactive concrete transport: its production origin is fixed to
+`https://firestore.googleapis.com/v1` (a plaintext loopback origin is test-only), it uses
+rustls with no proxy or redirects and finite connect/request/body timeouts, and it validates
+only the adapter's begin/read/commit request shapes before sending them. It caps every body
+before parsing; batch-get accepts only a JSON array containing exactly one strict response
+object and rejects bare, empty, multi-object, nested, or trailing JSON shapes. Canonical
+bounded Google error envelopes are accepted either bare or in an exact one-element array,
+validated, and never logged or returned. Automatic HTTP retries are disabled so a refused
+connection is known unsent while every failure after acceptance remains ambiguous. Update-time
+preconditions are canonical UTC and microsecond-aligned; a found document may omit `createTime`,
+but if present it must be canonical and no later than `updateTime`. A post-send commit
+transport/timeout/429/5xx or
+malformed success remains `OutcomeUnknown`; `ABORTED` and `FAILED_PRECONDITION` retain their
+typed meanings, and an HTTP 404 is only an endpoint/database failure, never a missing
+witness document. The REST transport and the separately compiled bearer source have no runtime
+connection; neither uses metadata/default-token fallback or service-account impersonation. An
+inactive composition seam constructs those fixed clients and the semantic adapter from one typed
+namespace/audience config without I/O. Its coordinator bridge preserves a lost commit response as
+`OutcomeUnknown` so the exact candidate/parent handle remains the only reconciliation path;
+ordinary adapter calls retain their exact fresh-read resolution. There is no Firestore IAM runtime
+wiring, query/list/delete/batch-write/create-document capability, additional field,
+Store/VFS/route/startup connection, environment flag, archive bootstrap, or production authority.
+Recovery must fetch only the
+exact witness-nominated object/hash and must never use prefix/list discovery. No image may
+acknowledge a write from archive-v3 until ADR-0022
+Phase 1 shadow recovery, VFS crash/conformance, witness, fault, lifecycle, and capacity
+gates have passed and an explicit authority change is reviewed.
+
+The journal foundation uses independently authenticated, page-aligned checkpoint chunks
+and a persistent fixed-fanout encrypted manifest tree; neither the manifest root nor any
+node grows with database size. Immutable WAL segments repeat the exact SQLite WAL header,
+carry the prior rolling-checksum state, and verify every frame salt and checksum. A large
+SQLite commit may span many bounded predecessor-linked segments; only the final segment
+may contain its commit frame, and the root fixes the exact final reference, WAL generation,
+and segment count. Chain validation rejects frame gaps, checksum discontinuity, wrong
+predecessors, root-sequence substitution, locally valid orphan candidates, and a commit
+marker anywhere but the final frame. These checks do not turn post-commit WAL-file
+scraping into a valid capture mechanism: Phase 1 still requires a SQLite VFS shim that
+observes the exact `xSync` boundary, plus independent shadow recovery and crash
+conformance.
+
+`src/archive_v3_genesis.rs` is a separately compiled but inactive restart-safe
+bootstrap seam. Its constructor accepts only a control-plane-supplied opaque
+archive binding and a retained candidate with bounded registry/root bytes; it
+does not construct credentials or providers and cannot issue I/O. Resolution
+first authenticates an exact existing active witness, registry, and root using
+the canonical KMS AAD and archive object context. If absent, it attempts
+immutable create-if-absent for the exact registry and root candidates, then
+creates the witness only after exact read-back authentication. A collision or a
+lost response is resolved solely by a bounded exact read and byte/commitment
+equality; it is never blindly retried. Tombstoned or deleting witness states
+reject bootstrap. After authenticating root and registry, both the existing and
+create paths reread the exact witness immediately before success and require the
+entire authenticated snapshot to remain byte-for-byte equal and active; a
+concurrent tombstone is a distinct failure and any root/registry advance fails
+closed. Before any provider create, future runtime wiring must durably retain
+the opaque archive binding, all genesis IDs, and the exact registry/root
+candidate bytes, and its account-deletion inventory must cover partial objects
+created before the witness exists. This seam deliberately cannot satisfy that
+prerequisite because it owns no persistence or deletion path. It also has no
+Store, VFS, route, runtime flag, Firestore/GCS construction,
+environment/default credential path, logging, or production authority.
+
+The inactive mutation ledger records a stable opaque operation ID, a domain-separated
+canonical request fingerprint, the proposed committed root sequence, an internally
+derived exact result digest, and either a bounded inline result or an opaque
+entity/version reference. Its owning batch API derives the 64-operation/1-MiB bounds from
+the exact canonical mutation bytes and commits domain SQL plus every validated ledger row
+in one SQLite transaction; any late failure rolls back both. A matching retry can
+reconstruct the prior result, while reuse with another request or result fails closed.
+This codec/table is not yet route-wired, witnessed, or eligible as idempotency evidence;
+retention and GC remain disabled until source-entity and retry-window semantics are
+implemented.
+
+Root objects are explicitly named as candidates. Crashes and CAS races may leave more
+than one immutable candidate for a sequence; none has authority unless the independent
+witness names its exact object ID and ciphertext hash, and recovery never selects one by
+listing a storage prefix.
+
+The foundation refuses a monolithic checkpoint object: each encrypted checkpoint chunk is
+at most 1 MiB and each manifest node is at most 32 KiB with fixed fanout. A WAL-bearing
+root must still name the checkpoint-manifest base reference, preventing publication of an
+unrecoverable WAL chain. Chunking/manifest construction and recovery remain inactive until
+their storage/witness fault gates pass.
+
+**ADR-0022 inactive extent-tree seam:** `src/archive_v3_extent.rs` streams one
+caller-owned, page-aligned 1 MiB buffer at a time into context-bound immutable
+extent objects and persistent 256-way sparse Merkle nodes. Each extent/node
+create uses the inactive session-bound shadow-object inventory: it durably
+reserves the exact canonical AAD, provider-neutral key, and ciphertext hash
+before create; then exact-gets the object, authenticates/decrypts it under the
+expected context, and checks the expected extent bytes or canonical decoded
+node before materializing that inventory row or linking its reference. A
+maximum 32-GiB tree consumes at most
+32,768 extent objects plus 129 nodes (32,897 rows), leaving the shared 32,898th
+attempt ordinal for the separately staged root candidate; this uploader does
+not create that root. A transient error or cancellation after reservation
+leaves the row Reserved for exact-key restart reconciliation, never a
+replacement/list/delete path. Exact-root range recovery is transactionally
+staged in zeroizing memory and derives every node/extent key from an already
+authenticated root, never lists storage, then verifies each envelope hash, AEAD context, node range and
+level, bounded traversal/object counts, and exact full-or-final extent length
+before copying an intersection into a caller-owned buffer; only absent sparse
+extents are zeroes. Its returned sparse-content commitment is domain-separated
+and binds the logical length plus every stored extent number, length, and byte
+stream; it is not a hash of a zero-filled logical SQLite image. The common
+format contexts, extent geometry, upload, and recovery all reject lengths and
+ranges beyond the fixed 32-GiB/8,388,608-page/32,768-extent ceiling. The source
+buffer is cleared before each declared source read, so a buggy underfilling
+source deterministically commits zeroes instead of stale bytes from a previous
+extent; future activation still requires a reviewed stable snapshot source.
+This is not a live recovery or authority path: it has no Store, VFS, provider,
+witness, route, flag, or credential wiring. The current codec intentionally
+has no authenticated empty-tree representation, so an all-hole file is
+rejected. These tests and format bounds do not satisfy the 32-GiB release gate.
+The separately compiled legacy-conversion session codec/ledger is likewise
+inactive and content-free: it persists only exact Active/Legacy witness/lease,
+registry/base-root/fence/request, witness-record digest, authenticated source
+completion commitment, and bounded object facts. Its distinct tables never
+reuse WAL shadow rows. Its stable session ID is domain-separated over the exact
+archive, database epoch, and operation, and every record must match that
+derivation. The separately bound request fingerprint is therefore conflict data
+inside that one family, so neither alternate IDs nor request substitutions can
+split the family or evade its 16-attempt cap. A candidate-ready root requires
+one contiguous fully materialized extent/node inventory followed by the final
+exact root, and is
+accepted only with an opaque admission committed to that exact canonical root
+context for an authenticated, decoded root whose parent/fence/length/epoch/
+conversion shape exactly match the session. Non-root contexts must have no
+parent. The sealed legacy staging capability shares that same 32,898-row ordinal
+with the tree: it reserves legacy-ledger facts before create, requires exact
+envelope readback equality, and materializes only after caller extent/node
+authentication. Its root-specific operation additionally requires the resolved
+cipher's exact registry generation/object/hash, verifies the complete
+materialized tree inventory in the same attempt, requires the decoded root's
+tree reference to equal that staged tree, then AEAD-opens/decodes/context-validates
+the root and checks every binding field before minting a private-field admission
+token. Production code cannot pass raw root/context/hash values to that seam,
+and the generic staging callback rejects roots. This remains no coordinator or
+publication path: the admission alone neither persists CandidateReady nor
+advances a witness root.
+Restart and orphaning rescan every exact canonical row. Orphan records retain an
+exact count and domain-separated ordered-inventory commitment, and schema checks
+reject triggers on all three legacy ledger tables. Opaque cursors bind bounded
+contiguous pages to one session/attempt and each page rechecks its complete prior
+ordinal prefix in one SQLite snapshot. CandidateReady is not
+witness-retained and grants no root advance. It has no source adapter, provider
+call, Store/VFS/runtime/route/flag, witness CAS, recovery, deletion, or cutover
+authority.
+`AuthenticatedExtentRoot` now has a crate-private mint that accepts only an
+active `RecoveryRoot` plus an injected exact-current witness admission; it
+re-admits that full snapshot before and after exact-getting the witness-nominated
+root object, verifies its retained envelope hash and AEAD/context, and binds
+archive, database/key epochs, registry object/hash/rotation, sequence, parent,
+fence, and a present extent tree before returning the sealed capability. It
+never enumerates or deletes provider objects. The generic constructor remains test-only; durable
+publication-session/orphan-inventory/reconciliation integration remains an
+explicit activation blocker.
+
+`src/archive_v3_export.rs` is an equally inactive, compiled export-parity seam. It accepts
+only an opaque `ArchiveId` and reads one exact active witness record through a sealed,
+cancellation/deadline-aware witness adapter. A separate sealed publication boundary then
+atomically admits that full record and holds deletion-aware authority through conditional
+commit. Every root, registry, and deletion transition must serialize with admissions;
+deletion closes new admissions and wins or drains existing admissions before tombstoning.
+The defensive final full-record reread is not the race-safety claim: only the admission's
+atomic exact-active conditional commit may publish. If deletion closure wins at commit, the
+pending artifact is aborted and remains unpublished.
+
+Tombstoned/deleting/deleted records and root or key-registry changes abort the transaction.
+The source pulls one reconstructed SQLite page into a caller-owned fixed-size buffer; fixed
+cursor storage plus cursor sequence, page number/size/count, nonzero total-page,
+snapshot-byte, nonempty output-chunk, nonzero completed output, output-write-count, and
+output-byte checks prevent provider-owned unbounded responses, empty-write amplification,
+empty publication, or a whole 32-GiB allocation.
+A cursorless page is terminal, must exactly reach the declared page count, and is never
+followed by another source call. One finite deadline-budget/cancellation control is passed
+into witness reads, source open/descriptor/pulls, the canonical adapter, transactional sink
+begin/write operations, admission, and conditional publication; it is also checked around
+each potentially blocking call. This does not claim that outer polling interrupts an
+implementation that ignores the control or blocks without its own transport deadline. A
+transaction guard aborts partial output on every pre-commit error or drop.
+The sink is a trusted boundary: it must isolate writes, discard them on abort, and atomically
+honor stop state while committing; a failed commit must remain abortable and unpublished. A
+dishonest implementation is outside this code proof.
+
+The cancellation-aware witness, authenticated source, deletion-aware publication/admission,
+and canonical export adapter are all sealed to deterministic test fakes. The current formats
+do not yet supply one complete authenticated checkpoint/WAL/extent walker, and no admitted
+adapter yet binds the live route's exact table, ordering, value encoding, JSON schema, and
+content semantics. The seam never drains a partially consumed reader after an adapter
+returns; only complete consumption inside that same sealed adapter call can reach publication.
+These are compile-time activation blockers, not claims
+that arbitrary output bytes establish parity. The module has no Store, route, startup,
+environment, credentials, logging of identifiers/content, or live I/O wiring. The active
+`/api/export` route remains the legacy Store export until both blockers and their provider
+fault/lifecycle evidence are reviewed as an explicit authority change.
+
+During the ADR-0022 legacy lifecycle transition, before the first whole-blob overwrite
+for each user and UTC day, the service creates or verifies one immutable server-side
+recovery copy under `legacy-recovery/{user_id}/YYYY-MM-DD.db.enc`. A generation-zero
+initial create has no prior remote state to protect; its first overwrite establishes the
+checkpoint. The copy is pinned to the exact currently authoritative source generation,
+preserves the wrapped-DEK metadata, and atomically records a protocol marker binding the
+source name, generation, size, and CRC32C. Created and pre-existing destinations must
+verify against that marker and provider generation/integrity metadata without downloading
+or decrypting the database. A checkpoint copy retains the original ciphertext's logical
+binding; it is recovery/inventory material, not an independently relocatable blob. The
+overwrite is withheld when the required checkpoint cannot be verified. Checkpoint names
+and their content-free metadata are included in later export/deletion inventories. Once a
+flush begins, any failure before the authoritative generation-checked PUT succeeds fences
+the local handle: its next access must retry persistence before request code can observe an
+idempotency duplicate and acknowledge it.
+
+At startup, a serial, bounded-memory reconciler also lists only live `indexes/` objects
+one page at a time and resolves each listed name through an explicit live-object read
+before copying it. It therefore never treats a listed noncurrent generation as current
+authority. It creates or
+verifies today's named immutable checkpoint with the same source-generation and
+destination-create preconditions, retries incomplete passes with bounded backoff, and
+reports only aggregate counts/readiness, including the public health readiness field.
+Readiness remains false until one error-free scan finishes; this worker does not enable
+lifecycle policy or change archive authority.
+Checkpoint copy/verification holds the same per-user content-write admission lease as raw
+capture. Account deletion first closes that lease, waits every admitted raw PUT and
+checkpoint copy to reach a provider outcome, and only then inventories remote objects; a
+checkpoint cannot appear after deletion's recovery-prefix scan.
+If GCS committed that PUT but its response was lost or the caller was cancelled, the retry's
+generation conflict is accepted only after the current object carries the exact same wrapped
+DEK metadata and decrypts under that DEK/context to the exact pending SQLite image. A different
+or unverifiable current object remains a conflict; reconciliation never overwrites it.
+
+Legacy whole-database persistence tracks a process-local dirty generation around every
+SQLite operation. Cumulative row changes include SQL-trigger effects; schema version,
+user version, and application ID cover persistent schema/header mutations. A failed
+post-operation state check is treated as dirty. The explicit read API also enables
+SQLite `query_only`, while extension or FFI mutations can use an unconditional dirty
+guard. Successfully persisted generations become clean; failed uploads and detected
+open-time migrations remain dirty through retry or eviction. A clean save or eviction
+does no checkpoint, plaintext file read, KMS unwrap, encryption, or GCS upload. This is a
+write-amplification optimization only: it does not change ciphertext format, authority,
+or acknowledgement requirements.
+
+### Legacy Store concurrency (ADR-0022 Phase 0d)
+
+The legacy whole-database blob remains the sole persistence format and authority, but it
+no longer places every user's SQLite, filesystem, KMS, and GCS work behind one global
+mutex. A brief registry lock now finds or creates a per-user actor and tracks deletion
+fences, bounded open-handle reservations, LRU order, and bounded recent-eviction
+completion markers. Each actor serializes that user's connection operations, loads,
+saves, and deletion. The registry lock is released before SQLite work or any filesystem,
+KMS, or GCS await, so a slow user cannot serialize already-admitted work for unrelated
+users. Open-handle loading reservations count against `STORE_MAX_OPEN`; successful
+eviction flushes before dropping the handle, while a failed flush retains the exact live
+connection and temp files and fails the requesting cache miss.
+
+Deletion first closes a per-user content-write admission barrier, then waits for every
+already-admitted raw-media PUT (including a request-cancellation-safe owned PUT task) and
+checkpoint copy to settle before installing its actor fence and scanning remote objects.
+It force-flushes a dirty local SQLite image before any remote delete, so the authoritative
+encrypted database durably contains every media reference used by a restart retry. A failed
+flush retains the handle and leaves deletion pending; it never drops an unsaved inventory.
+After that durable point deletion can release the SQLite slot during slow remote deletes:
+the still-retained remote database reconstructs the exact sorted, deduplicated inventory
+on every retry without storing object names in the control database.
+
+This is containment, not the later ADR-0022 content-addressed deletion ledger. The actor
+fence and recent-eviction completion markers remain process-local, but deletion inventory
+does not: it is recovered from the durable encrypted user database. The encrypted control
+database persists a content-free legacy deletion operation—an opaque random operation ID,
+`pending`/`failed_retryable`/`physical_complete` status, machine-readable reason, retry
+delay, and provider `hardDeleteTime`—plus a separately internal random archive binding and
+pre-v3 tombstone. That tombstone retains only a random fence and bounded opaque cursor
+slots for a future exact v3 inventory; it neither authorizes v3 I/O nor records any
+cryptographic/logical/physical-complete outcome.
+`DELETE /api/account` returns HTTP 202 until physical completion, and the same tombstoned
+authentication is accepted only by that retry route and `GET /api/account/deletion`.
+A bounded serial background sweep starts
+at boot and retries eligible `deleting` rows, so clients that sign out after any 2xx do not
+prevent eventual finalization after provider retention expires. Sweep logs contain only
+aggregate outcome counts.
+
+Before each remote attempt, the control operation is durably marked
+`content_deletion_attempt_unconfirmed`. That marker remains `pending`: cancellation or a
+restart safely retries the ordered Store protocol. If an exact legacy database generation
+disappears between listing and either the generation-pinned metadata or media GET,
+deletion records `failed_retryable` with reason `legacy_generation_unavailable`. The
+512 MiB compatibility-reader cap is also `failed_retryable` until a streaming converter
+ships. A restart or later empty listing cannot turn either failed case into completion;
+explicit inventory remediation/migration is required. Other KMS, GCS, or
+decrypt/inventory failures remain separately pending and retryable and must not be
+mistaken for the irreversible missing-generation gap.
+
+The remote database is retained until deletion succeeds, so media references can be
+rediscovered after restart, including references that were local-only when deletion began
+because deletion force-flushes them before remote work. If all configured handle slots are actively loading/evicting, a new cold user
+waits for a slot; and a corrupt database that cannot enumerate deletion media must remain
+fenced and retained rather than discard an unknown inventory. These cases do not
+reintroduce a registry lock across remote I/O, but they remain capacity/repair limits.
+Store diagnostics in this path are content-free and do not emit user IDs or object names.
 
 ## Attestation and TLS
 
@@ -107,6 +757,31 @@ Confidential Space tokens:
    expiry, audience, nonce, relevant Confidential Space claims, and image digest rather
    than merely decoding the JWT.
 
+The compiled-but-inactive ADR-0022 Firestore witness boundary is deliberately a third,
+type-separated credential path. It derives only the exact dedicated
+`archive-witness-attest/archive-witness` provider audience, requests a no-nonce launcher
+OIDC token for that audience, and exchanges it only at fixed Google STS with the
+cloud-platform scope. It has a separate mutex-coalesced zeroizing cache refreshed 60
+seconds early; it does not share KMS credentials or cache state, use metadata/default
+credentials, impersonate a service account, expose its tokens publicly, or enable any
+runtime witness authority. The three paths share only the bounded launcher socket protocol;
+the Firestore audience type, STS client, secret-owning request/response buffers, and cache are
+separate. Its STS client is rustls-only, proxy-free, redirect-free, retry-disabled, and
+bounded; neither OIDC/STS tokens, audience, nor provider bodies are logged.
+
+The compiled-but-inactive ADR-0022 archive-GCS bearer is a fourth, separately typed
+credential path. It accepts only the dedicated
+`archive-gcs-attest/archive-gcs` provider-resource audience, requests a no-nonce launcher
+OIDC token for that audience, and exchanges it only at fixed Google STS for the fixed
+`devstorage.read_write` scope. Its audience type derives the exact provider resource only from
+a validated project number (never a full caller-controlled audience); its launcher boundary, rustls-only
+no-proxy/no-redirect/no-retry STS client, zeroizing request/response material, and
+mutex-coalesced cache are independent of KMS, public attestation, and Firestore. It has no
+environment/request/header authority selection, metadata/default credentials, service-account
+impersonation, transport/Store/VFS/route connection, or runtime authority. Launcher and STS
+responses are bounded with finite timeouts and strict RFC 8693/response parsing; cancellation
+or refresh failure drops expired cached secret material.
+
 TLS terminates inside the attested binary, so no external reverse proxy receives request
 plaintext. ACME generates the private key inside the TEE and persists account,
 certificate, and key state only as a KMS-wrapped, context-bound encrypted blob. Port 80
@@ -120,25 +795,59 @@ configured `PORT`.
 **Threat:** An operator with broad GCP IAM access attempts to decrypt user data or boot
 the approved image with weaker settings.
 
-**Mitigation:** The KEK's decrypt grant is limited to the attestation-gated
-`principalSet`; no human or service-account principal should hold that role. Changing
-code or baked configuration changes the image digest and invalidates the KMS condition.
-The launch policy permits only `PORT`, so an operator cannot replace KMS coordinates,
-trusted callers, auth policy, TLS policy, or the legacy-blob gate through VM metadata.
+**Mitigation:** The KEK uses an authoritative decrypt binding containing only the
+attestation-gated `principalSet`. Deployment also removes every standing project,
+key-ring, and key binding whose resolved role contains direct or delegated KMS decrypt;
+this is required because inherited roles such as project Owner can otherwise decrypt even
+when the key-local policy contains no human member. A fail-closed rollout guard resolves
+predefined and custom role permissions and audits all three policy levels against the
+exact live digest. Changing code or baked configuration changes the image digest and loses
+the allow binding. The launch policy permits only `PORT`, so an operator cannot replace
+KMS coordinates, trusted callers, auth policy, TLS policy, or the legacy-blob gate through
+VM metadata.
 
-**Operator verification:** inspect the KMS IAM policy and confirm that
-`roles/cloudkms.cryptoKeyEncrypterDecrypter` has only the expected attestation-gated
-principal set—no `user:`, `group:`, or `serviceAccount:` member.
+**Residual risk:** The project has no organization ancestor at which Kioku can administer
+an IAM deny policy. A sufficiently privileged project or repository administrator can
+change IAM, KMS policy, the rollout guard, or the deployed workload and then authorize a
+new path. Removing and continuously auditing standing decrypt grants is containment, not
+an operator-independent cryptographic boundary. A literal guarantee against a malicious
+administrator with policy-changing authority requires user-held keys or an independently
+controlled key-authorization system.
+
+**Operator verification:** inspect project, KMS key-ring, and KEK IAM policies; resolve
+every predefined and custom role; and reject both
+`cloudkms.cryptoKeyVersions.useToDecrypt` and
+`cloudkms.cryptoKeyVersions.useToDecryptViaDelegation` everywhere except the exact
+digest-scoped workload principal on the KEK. Confirm that
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` has exactly that one member—no `user:`,
+`group:`, or `serviceAccount:` member. The key-local check alone is insufficient.
 
 ### T2 — Compromised client token or legacy caller
 
-**Threat:** An attacker steals a Kioku bearer token, a Google identity token, or the
+**Threat:** An attacker steals a Kioku bearer token, a Google identity token, an Apple
+authorization response, or the
 identity of the service account trusted by legacy `/v1/*` routes.
 
 **Mitigation:** Public OAuth validates configured Google audiences and the account
-allow-list. Authenticated routes derive the user from the Kioku token rather than trusting
-a caller-supplied identity. OAuth uses PKCE and persisted, single-use authorization-code
-state. Legacy routes accept only Google-signed ID tokens with the baked audience and
+allow-list. Native and browser Apple login verify Apple's signature, issuer, exact
+platform audience, expiry, verified email, nonce, and subject, exchange the single-use
+code server-side, and never link accounts by email. Native nonces are SHA-256 bound;
+browser state/raw nonce and downstream PKCE state are signed and short-lived.
+Authenticated routes derive the user from the Kioku token rather
+than trusting a caller-supplied identity. OAuth uses PKCE and persisted, single-use
+authorization-code state. The first-party dashboard uses one fixed public PKCE client so
+normal sign-ins cannot exhaust bounded third-party registration. The directly distributed
+Mac app uses a separate fixed public native client whose browser return must be exact
+HTTP `127.0.0.1`, include an explicit ephemeral port, use only `/oauth/callback`, and have
+no query before the server appends the single-use code and state; lookalike hosts and
+paths are rejected. That public native client ID and caller-selected loopback port do not
+independently prove that the receiving local process is the official Kioku binary. Its
+consent page therefore retains the requesting-app, redirect-destination, and full-archive
+access disclosure; only the fixed web client returning to Kioku's exact owned origin uses
+official first-party sign-in copy. Apple refresh
+authorization is held per issuing iPhone/Mac/web client only in the encrypted control
+store and every retained grant is revoked before identity deletion. Legacy routes accept only
+Google-signed ID tokens with the baked audience and
 service-account email; there is no shared-secret or auth-disable fallback. User IDs are
 validated before use in paths or object names.
 
@@ -163,6 +872,74 @@ below.
 **Mitigation:** GCS contains ciphertext and KMS-wrapped DEKs. KMS access is separately
 attestation-gated. AES-GCM authenticates contents, GCS generation preconditions reject
 lost-update races, and v2 AAD binds each blob to its intended logical object and user.
+Account deletion enumerates every exact live and noncurrent object generation, deletes
+each generation explicitly, and verifies no matching generation remains.
+
+**ADR-0022 inactive checkpoint seam:** the compiled-but-unwired checkpoint module rejects a
+declared length over the shared 32-GiB ceiling before source reads, hashing, encryption, or any
+immutable create, then uses independently authenticated 1 MiB chunks and bounded 256-way manifest
+nodes. Before every create, a session/attempt-bound encrypted SQLite inventory reserves the exact
+opaque context-AAD and ciphertext commitment; it marks the row materialized only after exact-key
+readback equality, so an `AlreadyPresentIdentical` response still cannot link a parent without a
+readback. The bounded 32,898-row attempt inventory contains no user ID, provider name/URL, cursor,
+timestamp, plaintext, or debug payload. Recovery accepts
+only the exact root commitment returned by the witness; it derives every manifest and chunk
+context from that root and never selects objects by GCS listing. It checks envelope hashes, AEAD
+context, manifest coverage, per-chunk hashes, and the full plaintext hash before atomically
+exposing a `/tmp` output. This is not yet an authority path: no Store, SQLite VFS, runtime flag,
+provider token, or deployment wiring invokes it.
+
+**ADR-0022 inactive shadow coordinator:** publication first obtains and authenticates the exact
+independent witness-nominated current root, checks the lease's archive/database/key/fence binding
+(the witness transaction remains authoritative for trusted-time expiry), derives SQLite
+`user_version` from the same hash-checked two-pass checkpoint source, and rejects downgrades. Each
+immutable create must succeed and the candidate root is read back and authenticated before the
+witness CAS; later recovery authenticates the complete nominated checkpoint graph. Both a success
+and a lost transaction response are accepted only after an exact witness reread names the same
+root, parent, database/key/registry, fence, migration/deletion states, and predecessor
+commitments. The Firestore boundary type-separates definitive comparison/precondition rejection,
+non-terminal token/begin/batch-get/provider failure, and ambiguous commit response; only the first
+can durably supersede an attempt. Before CAS, a fixed-size content-free record durably binds one stable operation/session,
+one retained attempt, the exact base/registry/fence/migration/WAL boundary, and the authenticated
+candidate root. The encrypted SQLite ledger permits at most one active and 16 retained attempts;
+candidate replacement is forbidden, and a root candidate cannot persist until its exact root
+inventory row is materialized. Witnessed completion atomically retains the attempt's inventory.
+A CAS-unknown outcome leaves its exact reserved/materialized rows unchanged for restart's exact-key
+reconciliation. A prepared partial upload is never resumed with replacement objects: restart gets
+only each recorded exact key, materializes matching ciphertext, leaves an exact missing key reserved,
+and then explicitly aborts the attempt; tampering blocks that abort. Only definitive rejection,
+supersession, or that explicit abort atomically changes
+them to orphan-pending-grace. There is no deletion in this slice. Every superseded/aborted attempt remains
+inventory-visible before a new attempt can be prepared. Unknown responses are durably marked before
+reread. Process restart reads one exact attempt and one exact witness record and can return only
+`Witnessed`, non-authorizing `RetrySameCandidate`, `Superseded`, or `Aborted`; it never lists storage,
+creates replacement objects, or invents a candidate. A witnessed attempt and its exact root-sequence operation replay result commit in one
+SQLite transaction. While the runtime remains alive, the cancellation-safe committing phase still
+owns its witness provider until reread finishes; a post-send task failure also returns an opaque
+in-memory handle. A non-nominating reread is never proof of non-commit because commit completion or a
+subsequent advance may race it. Failures can leave unreachable ciphertext for the later authorized
+GC/deletion walker. The seam never truncates WAL, mutates legacy persistence, or performs cleanup,
+and no Store, VFS registration, provider construction, flag, route, startup path, or production
+authority wires it.
+
+**ADR-0022 inactive captured-WAL seam:** a post-successful-`xSync`, checksum-validated VFS
+capture can now be split only at bounded SQLite frame boundaries into independently encrypted,
+predecessor-linked immutable WAL segments. Every create is followed by an exact readback,
+envelope-hash, AEAD-context, and format check before its reference can appear in a candidate root.
+That root retains the exact checkpoint base and final WAL reference; composition rejects a prior
+WAL chain or extent base so it cannot discard history. WAL page numbers and the final commit's
+page-count-derived length are bounded by the fixed 8,388,608-page/32-GiB ceiling; because the
+current root format has one logical length also used to derive checkpoint-manifest contexts, this
+slice rejects WAL growth and shrink unless that effective length exactly equals its checkpoint
+base. A future root-format revision must bind distinct checkpoint and post-WAL lengths before
+enabling growth or shrink. Capture frames, decoded segment frames, and transient encoded plaintext
+are zeroized when their owners drop. Recovery begins only with one
+witness-nominated root, requires its exact registry epoch/rotation/object/hash to match the
+already resolved verified cipher, authenticates that root plus every reverse predecessor link
+before a staging sink receives a byte, and never enumerates storage. This is still not an authority or
+restore path: no VFS capture is drained, no `Store`/provider/flag/route/startup path calls it,
+no local WAL is truncated, and no composite staging adapter yet atomically joins checkpoint and
+WAL recovery before exposing a database.
 
 ### T5 — Hypervisor or memory inspection
 
@@ -189,12 +966,14 @@ review, and an SBOM-based image scan. Cargo-auditable metadata makes statically 
 Rust crates visible in that image SBOM, and CI fails if representative core/native
 packages are absent. The credentialed build job accepts only main or `v*` tag refs; the
 GCP OIDC provider must additionally constrain immutable repository/owner IDs and the
-expected workflow identity. A tagged build publishes GitHub-signed image
-provenance, an SPDX SBOM, and a signed SBOM attestation; the release script verifies the
-expected repository, workflow, source ref, commit, image repository, digest, and
-attestations before publishing or rolling. Verifiers must also authenticate the tag's
-signing-key fingerprint against a separately published trusted anchor; signature validity
-alone does not establish signer identity.
+expected workflow identity. A tagged build produces GitHub-signed image provenance, an
+SPDX SBOM, a signed SBOM attestation, and a signed schema-v6 release-manifest subject,
+but has read-only repository-content permission and no GitHub Release publication step.
+The sole publisher is `scripts/release.sh`: before any release mutation it requires the
+exact tag-signing fingerprint from a separately published trusted anchor, then verifies
+the expected repository, workflow, source ref, commit, image repository, digest, manifest
+claim, and attestations. GitHub's generic verified-signature result and CI artifacts from
+a differently signed tag do not grant release or rollout eligibility.
 
 ## Residual risks and limitations
 
@@ -211,9 +990,10 @@ Release notes must say “publicly auditable with signed build provenance,” no
 snapshot-pinned OS packages, deterministic build inputs/timestamps, network-disabled
 compilation, and independent rebuild comparison.
 
-### Vertex and user-configured webhooks cross the TEE boundary
+### Vertex, user-configured webhooks, and APNs cross the TEE boundary
 
-Episode summarisation and holistic settled-episode analysis send text and metadata to Google Vertex
+Audio transcription/diarization, screenshot understanding, identity/fact evidence extraction,
+episode summarisation, and evidence verification send bounded content to Google Vertex
 Gemini from this process. Google's no-data-retention terms apply, but the data is outside
 the Confidential Space boundary while Vertex processes it. Webhook events similarly
 leave Confidential Space for the user-selected destination. They are content-free by
@@ -222,11 +1002,61 @@ enabled. The sender revalidates public DNS addresses on every attempt, pins the 
 address, refuses redirects, signs the exact body, and never logs endpoint paths, payloads,
 signatures, or response bodies.
 
+APNs ready alerts are a separate, explicitly enabled metadata-only boundary. Environment-
+separated provider keys come from dedicated Secret Manager containers available only to
+the enclave runtime identity; production startup fails closed if either key is missing.
+The worker uses a generic alert and a distinct per-installation opaque handoff, rechecks
+registration before send, generation-fences terminal-token responses, and never logs
+tokens, handles, payloads, provider paths, or response bodies. Apple may correlate the
+device token, topic, generic alert, and delivery timing; Focus/device settings determine
+display and an already accepted generic alert cannot be recalled after offline sign-out.
+
+### Pseudonymous entitlement and usage events cross the TEE boundary
+
+The external control plane receives a random account pseudonym and content-free usage
+events over HTTPS authenticated with an exact-audience Google OIDC token. It does not
+receive email, Google subject, stable enclave user UUID, capture/episode identifiers, or
+model content. The random mapping, lease receipts, and deletion-detach outbox remain
+encrypted inside the enclave. This boundary reveals subscription usage and inference-cost
+shape; compromise of both databases could link those records.
+
+New capture depends on the entitlement port in enforce mode: a denial or inactive lease is
+HTTP 402, idempotency/early-renewal conflict is HTTP 409, and unavailable durable state is
+HTTP 503 before persistence. Screenshots and references require an active lease but do not
+consume again. Existing cloud archive reads, search, export, and deletion remain ungated;
+there is no local recording or transcription fallback. Shadow mode must not log upstream
+denial detail.
+
+### Billing request telemetry reveals route timing and outcome
+
+The service emits one structured event after each `GET` billing-summary or `POST`
+recording-lease request. It ignores preflight and wrong-method requests. Each event
+contains only a fixed schema name, one of two fixed route labels, the numeric HTTP status
+and its fixed class, and elapsed milliseconds. It deliberately omits the request method,
+path and query, account and provider identifiers, tokens, headers, bodies, lease/request
+IDs, exception text, and captured content. This is request-level operational telemetry—not
+an anonymous aggregate—so privileged log readers can observe billing request cadence and
+may correlate timing with other infrastructure events. Keep the method/route set fixed
+and low-cardinality, retain privileged log access, and do not join these events to
+user-level logs.
+
 ### Stable user identifiers are linkable
 
-User IDs are deterministically derived from the Google subject identifier. Anyone who
-already knows that subject can derive the corresponding `indexes/{user_id}.db.enc` name.
-This is an accepted availability trade-off, not an encryption bypass.
+Google-primary user IDs preserve their deterministic historical derivation. New
+Apple-primary IDs are deterministically derived from a provider-domain-separated Apple
+subject; explicitly linked providers retain the existing canonical account ID. Anyone who
+already knows a primary subject and provider can derive the corresponding
+`indexes/{user_id}.db.enc` name. This is an accepted availability trade-off, not an
+encryption bypass.
+
+### Aggregate storage telemetry reveals process-wide activity
+
+The existing structured log sink receives at most one cumulative archive-storage metric
+event per active minute. It reveals process-wide operation timing, byte-volume buckets and
+save outcomes, but deliberately cannot attribute an observation to a user, archive,
+object, request or content value. Counters are process-local and reset on restart. Access
+to operational logs remains privileged; do not join these events to request-level user
+logs or add high-cardinality labels.
 
 ## Reporting vulnerabilities
 

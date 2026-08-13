@@ -15,7 +15,10 @@ use tracing::{info, warn};
 pub(crate) const FINALIZATION_VERSION: i32 = crate::store::EPISODE_FINALIZATION_VERSION;
 #[cfg(test)]
 const MIRRORED_UTTERANCE_WINDOW_MS: i64 = 3_000;
-const MAX_EPISODE_ANALYSIS_INPUT_BYTES: usize = 3 * 1024 * 1024;
+const MAX_EPISODE_ANALYSIS_INPUT_BYTES: usize = 512 * 1024;
+const MAX_BACKGROUND_FINALIZATIONS_PER_SWEEP: usize = 1;
+const FINALIZER_MAX_OUTPUT_TOKENS: u32 = 8_192;
+const MAX_FINALIZATION_ATTEMPTS: i64 = 3;
 #[cfg(test)]
 const MAX_FINALIZER_CANDIDATE_BYTES: usize = 32 * 1024;
 #[cfg(test)]
@@ -28,6 +31,44 @@ enum FinalizationMode {
     Initial,
     Regeneration,
     AlreadyCurrent,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RetryDisposition {
+    status: &'static str,
+    delay_seconds: Option<i64>,
+}
+
+fn retry_disposition(attempt_count: i64) -> RetryDisposition {
+    if attempt_count >= MAX_FINALIZATION_ATTEMPTS {
+        return RetryDisposition {
+            status: "failed_terminal",
+            delay_seconds: None,
+        };
+    }
+    match attempt_count {
+        0 | 1 => RetryDisposition {
+            status: "retry_wait",
+            delay_seconds: Some(10 * 60),
+        },
+        2 => RetryDisposition {
+            status: "retry_wait",
+            delay_seconds: Some(60 * 60),
+        },
+        _ => unreachable!("terminal attempts returned above"),
+    }
+}
+
+#[cfg(test)]
+fn background_finalization_due(
+    finalized_at: Option<&str>,
+    status: &str,
+    next_attempt_at: Option<&str>,
+    now: &str,
+) -> bool {
+    finalized_at.is_none()
+        && status != "failed_terminal"
+        && next_attempt_at.is_none_or(|next| next <= now)
 }
 
 fn finalization_mode(
@@ -1354,6 +1395,103 @@ async fn set_finalization_status(
     Ok(())
 }
 
+async fn record_finalization_failure(
+    state: &CpState,
+    user_id: &str,
+    episode_id: i64,
+    error: &str,
+) -> Result<()> {
+    let user = user_id.to_string();
+    let error = error.chars().take(1_000).collect::<String>();
+    let now = isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    state
+        .store
+        .with_user(&user, move |conn| {
+            let previous: i64 = conn.query_row(
+                "SELECT finalization_attempt_count FROM episodes WHERE id = ?1",
+                [episode_id],
+                |row| row.get(0),
+            )?;
+            let attempts = previous.saturating_add(1);
+            let disposition = retry_disposition(attempts);
+            let next_attempt_at = disposition
+                .delay_seconds
+                .map(|seconds| isotime::add_seconds(&now, seconds as f64));
+            conn.execute(
+                "UPDATE episodes
+                 SET finalization_status = ?1,
+                     finalization_error = ?2,
+                     finalization_attempt_count = ?3,
+                     finalization_next_attempt_at = ?4,
+                     updated_at = ?5
+                 WHERE id = ?6",
+                rusqlite::params![
+                    disposition.status,
+                    error,
+                    attempts,
+                    next_attempt_at,
+                    now,
+                    episode_id
+                ],
+            )?;
+            Ok(())
+        })
+        .await?;
+    state.store.save_user(&user).await
+}
+
+async fn defer_finalization_for_budget(
+    state: &CpState,
+    user_id: &str,
+    episode_id: i64,
+) -> Result<()> {
+    let user = user_id.to_string();
+    let now = isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let next_attempt_at = isotime::add_seconds(&now, 60.0 * 60.0);
+    state
+        .store
+        .with_user(&user, move |conn| {
+            conn.execute(
+                "UPDATE episodes
+                 SET finalization_status = 'budget_wait',
+                     finalization_error = 'daily Vertex output-token budget exhausted',
+                     finalization_next_attempt_at = ?1,
+                     updated_at = ?2
+                 WHERE id = ?3",
+                rusqlite::params![next_attempt_at, now, episode_id],
+            )?;
+            Ok(())
+        })
+        .await?;
+    state.store.save_user(&user).await
+}
+
+async fn reserve_finalizer_output(state: &CpState, user_id: &str) -> Result<()> {
+    let reserved = super::limits::reserve_vertex_output_tokens_for_class(
+        &state.control,
+        user_id,
+        super::limits::VertexWorkClass::DerivedText,
+        i64::from(FINALIZER_MAX_OUTPUT_TOKENS),
+        state.config.quota_vertex_output_tokens_per_day,
+    )
+    .await?;
+    if reserved.allowed {
+        Ok(())
+    } else {
+        Err(EnclaveError::Config("vertex_daily_budget".into()))
+    }
+}
+
 /// Sweep all eligible episodes for a user and finalize them.
 pub async fn finalize_user_episodes(state: &CpState, user_id: &str) -> Result<()> {
     finalize_user_episodes_scoped(state, user_id, None).await
@@ -1418,16 +1556,27 @@ async fn finalize_user_episodes_scoped(
     let summarized_until_ms = isotime::parse_epoch_millis(&summarized_until).unwrap_or(0);
 
     // Fetch candidates from user content DB
+    let now_iso = isotime::format_epoch_millis(now);
     let candidates: Vec<EpisodeRow> = state.store.with_user(&user, move |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, started_at, ended_at, type, title, summary, participants, languages, action_items, model
              FROM episodes
-             WHERE (finalized_at IS NULL OR COALESCE(finalization_version, 1) < ?2)
-               AND substance != 'none'
-               AND (ended_at < ?1 OR ?3 IS NOT NULL)
-               AND (?3 IS NULL OR id = ?3)"
+             WHERE substance != 'none'
+               AND (ended_at < ?1 OR ?2 IS NOT NULL)
+               AND ((?2 IS NULL
+                     AND finalized_at IS NULL
+                     AND finalization_status != 'failed_terminal'
+                     AND (finalization_next_attempt_at IS NULL OR finalization_next_attempt_at <= ?3))
+                    OR (?2 IS NOT NULL AND id = ?2))
+             ORDER BY ended_at ASC, id ASC
+             LIMIT ?4"
         )?;
-        let rows = stmt.query_map(rusqlite::params![&horizon_iso, FINALIZATION_VERSION, target_episode_id], |r| {
+        let rows = stmt.query_map(rusqlite::params![
+            &horizon_iso,
+            target_episode_id,
+            &now_iso,
+            MAX_BACKGROUND_FINALIZATIONS_PER_SWEEP as i64
+        ], |r| {
             Ok(EpisodeRow {
                 id: r.get(0)?,
                 started_at: r.get(1)?,
@@ -1664,19 +1813,17 @@ async fn finalize_user_episodes_scoped(
         ) {
             Ok(input) => input,
             Err(error) => {
-                let _ = set_finalization_status(
-                    state,
-                    user_id,
-                    ep.id,
-                    "retry_model",
-                    Some(&error.to_string()),
-                    false,
-                )
-                .await;
+                let _ =
+                    record_finalization_failure(state, user_id, ep.id, &error.to_string()).await;
                 continue;
             }
         };
         let analysis_revision = episode_analysis_revision(&model_input);
+
+        if reserve_finalizer_output(state, user_id).await.is_err() {
+            let _ = defer_finalization_for_budget(state, user_id, ep.id).await;
+            continue;
+        }
 
         info!(
             episode_id = ep.id,
@@ -1684,26 +1831,20 @@ async fn finalize_user_episodes_scoped(
         );
 
         let model_resp = match vertex::generate_custom(
-            &state.config,
+            state,
+            user_id,
+            vertex::VertexOperation::FinalEpisodeAnalysis,
             FINALIZER_SYSTEM_PROMPT,
             &model_input,
             brief_response_schema(),
-            65_535,
+            FINALIZER_MAX_OUTPUT_TOKENS,
         )
         .await
         {
-            Ok(r) => r,
+            Ok(r) => r.text,
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "Gemini unified episode analysis failed");
-                let _ = set_finalization_status(
-                    state,
-                    user_id,
-                    ep.id,
-                    "retry_model",
-                    Some(&e.to_string()),
-                    false,
-                )
-                .await;
+                let _ = record_finalization_failure(state, user_id, ep.id, &e.to_string()).await;
                 continue;
             }
         };
@@ -1712,13 +1853,11 @@ async fn finalize_user_episodes_scoped(
             Ok(p) => p,
             Err(e) => {
                 warn!(episode_id = ep.id, error = %e, "Gemini episode analysis response unparseable");
-                let _ = set_finalization_status(
+                let _ = record_finalization_failure(
                     state,
                     user_id,
                     ep.id,
-                    "retry_model",
-                    Some("episode analysis response was not valid JSON"),
-                    false,
+                    "episode analysis response was not valid JSON",
                 )
                 .await;
                 continue;
@@ -1727,13 +1866,11 @@ async fn finalize_user_episodes_scoped(
 
         let missing = missing_grounded_entities(&parsed, &grounding);
         if !missing.is_empty() {
-            let _ = set_finalization_status(
+            let _ = record_finalization_failure(
                 state,
                 user_id,
                 ep.id,
-                "retry_model",
-                Some("episode analysis omitted required grounded entities"),
-                false,
+                "episode analysis omitted required grounded entities",
             )
             .await;
             continue;
@@ -1741,15 +1878,7 @@ async fn finalize_user_episodes_scoped(
         let ranked_screens = match validate_and_rank_screens(&parsed, &screenshot_rows) {
             Ok(screens) => screens,
             Err(error_code) => {
-                let _ = set_finalization_status(
-                    state,
-                    user_id,
-                    ep.id,
-                    "retry_model",
-                    Some(error_code),
-                    false,
-                )
-                .await;
+                let _ = record_finalization_failure(state, user_id, ep.id, error_code).await;
                 continue;
             }
         };
@@ -1809,13 +1938,11 @@ async fn finalize_user_episodes_scoped(
             .map(|candidate| (candidate.id.as_str(), candidate))
             .collect::<HashMap<_, _>>();
         if !valid_link_candidate_selection(&parsed.important_links, &model_candidates) {
-            let _ = set_finalization_status(
+            let _ = record_finalization_failure(
                 state,
                 user_id,
                 ep.id,
-                "retry_model",
-                Some("episode analysis returned an unknown or duplicate URL candidate id"),
-                false,
+                "episode analysis returned an unknown or duplicate URL candidate id",
             )
             .await;
             continue;
@@ -1858,6 +1985,26 @@ async fn finalize_user_episodes_scoped(
             .await
             .ok()
             .filter(|pref| pref.enabled);
+
+        // Snapshot active installations before the user-content transaction.
+        // The worker re-resolves each installation before sending, so a later
+        // opt-out cancels its opaque row while a later opt-in receives no
+        // historical notification.
+        let push_destinations: Vec<(String, String, String, String)> = state
+            .control
+            .list_push_installations(user_id)
+            .await?
+            .into_iter()
+            .map(|installation| {
+                let random = super::tokens::random_token_hex();
+                (
+                    installation.id,
+                    super::tokens::new_uuid(),
+                    super::tokens::pkce_s256(&random),
+                    super::tokens::new_uuid(),
+                )
+            })
+            .collect();
 
         // 8. Optimistic commit transaction
         let user_cloned4 = user.clone();
@@ -2004,8 +2151,11 @@ async fn finalize_user_episodes_scoped(
             // Only a first finalization may enqueue outbound events. Versioned
             // repairs update the canonical web/export brief without replaying
             // the same historical episode to external automations.
-            let deliveries_enqueued =
-                mode.should_enqueue_delivery(!webhook_destinations.is_empty() || email_preference.is_some());
+            let deliveries_enqueued = mode.should_enqueue_delivery(
+                !webhook_destinations.is_empty()
+                    || email_preference.is_some()
+                    || !push_destinations.is_empty(),
+            );
             if deliveries_enqueued {
                 for (subscription_id, event_id) in &webhook_destinations {
                     transaction.execute(
@@ -2029,7 +2179,7 @@ async fn finalize_user_episodes_scoped(
                             .unwrap_or_default()
                             .as_millis() as i64,
                     );
-                    conn.execute(
+                    transaction.execute(
                         "INSERT OR IGNORE INTO email_deliveries
                             (episode_id, delivery_version, delivery_id, include_content, state, attempt_count, next_attempt_at, created_at, updated_at)
                          VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5, ?5)",
@@ -2038,6 +2188,32 @@ async fn finalize_user_episodes_scoped(
                             FINALIZATION_VERSION,
                             delivery_id,
                             if pref.include_content { 1 } else { 0 },
+                            now,
+                        ],
+                    )?;
+                }
+                for (installation_id, delivery_id, handoff_handle, collapse_id) in
+                    &push_destinations
+                {
+                    let now = isotime::format_epoch_millis(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                    );
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO push_deliveries \
+                           (episode_id,installation_id,delivery_version,delivery_id, \
+                            handoff_handle,collapse_id,state,attempt_count,next_attempt_at, \
+                            created_at,updated_at) \
+                         VALUES (?1,?2,?3,?4,?5,?6,'pending',0,?7,?7,?7)",
+                        rusqlite::params![
+                            ep_id,
+                            installation_id,
+                            FINALIZATION_VERSION,
+                            delivery_id,
+                            handoff_handle,
+                            collapse_id,
                             now,
                         ],
                     )?;
@@ -2058,6 +2234,8 @@ async fn finalize_user_episodes_scoped(
                      finalization_version = ?2,
                      finalization_status = 'complete',
                      finalization_error = NULL,
+                     finalization_attempt_count = 0,
+                     finalization_next_attempt_at = NULL,
                      updated_at = ?1
                  WHERE id = ?3",
                 rusqlite::params![now_iso, FINALIZATION_VERSION, ep_id]
@@ -2065,7 +2243,7 @@ async fn finalize_user_episodes_scoped(
 
             transaction.commit()?;
             Ok(if deliveries_enqueued {
-                webhook_destinations.len()
+                webhook_destinations.len() + push_destinations.len()
             } else {
                 0
             })
@@ -2087,15 +2265,8 @@ async fn finalize_user_episodes_scoped(
                     let _ = set_finalization_status(state, user_id, ep.id, "complete", None, false)
                         .await;
                 } else {
-                    let _ = set_finalization_status(
-                        state,
-                        user_id,
-                        ep.id,
-                        "retry_model",
-                        Some(&e.to_string()),
-                        false,
-                    )
-                    .await;
+                    let _ =
+                        record_finalization_failure(state, user_id, ep.id, &e.to_string()).await;
                 }
             }
         }
@@ -2320,6 +2491,61 @@ mod tests {
         assert!(FINALIZER_SYSTEM_PROMPT.contains("Do not produce a topic inventory"));
         assert!(FINALIZER_SYSTEM_PROMPT.contains("Never invent"));
         assert!(FINALIZER_SYSTEM_PROMPT.contains("grounding requirement"));
+    }
+
+    #[test]
+    fn background_finalization_is_bounded_to_one_episode() {
+        assert_eq!(MAX_BACKGROUND_FINALIZATIONS_PER_SWEEP, 1);
+        assert_eq!(FINALIZER_MAX_OUTPUT_TOKENS, 8_192);
+    }
+
+    #[test]
+    fn retries_back_off_and_become_terminal_after_three_attempts() {
+        let first = retry_disposition(1);
+        assert_eq!(first.status, "retry_wait");
+        assert_eq!(first.delay_seconds, Some(600));
+
+        let second = retry_disposition(2);
+        assert_eq!(second.status, "retry_wait");
+        assert_eq!(second.delay_seconds, Some(3_600));
+
+        let third = retry_disposition(3);
+        assert_eq!(third.status, "failed_terminal");
+        assert_eq!(third.delay_seconds, None);
+    }
+
+    #[test]
+    fn background_worker_never_regenerates_an_already_finalized_episode() {
+        assert!(background_finalization_due(
+            None,
+            "pending_horizon",
+            None,
+            "2026-08-01T12:00:00Z"
+        ));
+        assert!(!background_finalization_due(
+            Some("2026-07-31T12:00:00Z"),
+            "regeneration_queued",
+            None,
+            "2026-08-01T12:00:00Z"
+        ));
+        assert!(!background_finalization_due(
+            None,
+            "failed_terminal",
+            None,
+            "2026-08-01T12:00:00Z"
+        ));
+        assert!(!background_finalization_due(
+            None,
+            "retry_wait",
+            Some("2026-08-01T13:00:00Z"),
+            "2026-08-01T12:00:00Z"
+        ));
+        assert!(background_finalization_due(
+            None,
+            "retry_wait",
+            Some("2026-08-01T11:00:00Z"),
+            "2026-08-01T12:00:00Z"
+        ));
     }
 
     #[test]

@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "environment": "owner_only_production",
+  "external_users": 0,
+  "voice_quality_claims_allowed": false
+}

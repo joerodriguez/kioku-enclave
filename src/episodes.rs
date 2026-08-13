@@ -23,6 +23,7 @@ use crate::{error::Result, AppState};
 
 /// A fully-hydrated episode row returned by list / upsert.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)] // hydrated only by the retired `/v1/episodes/list` handler
 pub struct EpisodeRow {
     pub id: i64,
     pub started_at: String,
@@ -228,12 +229,14 @@ pub(crate) fn merge_visual_evidence(
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct EpisodesUpsertRequest {
     pub user_id: String,
     pub episodes: Vec<EpisodeInput>,
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct EpisodesUpsertResponse {
     pub upserted: usize,
     /// Resulting episode ids, in the same order as the request's `episodes`.
@@ -241,6 +244,7 @@ pub struct EpisodesUpsertResponse {
     pub ids: Vec<i64>,
 }
 
+#[allow(dead_code)] // authenticated legacy route is now an explicit 410 tombstone
 pub async fn handle_episodes_upsert(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EpisodesUpsertRequest>,
@@ -410,6 +414,7 @@ pub(crate) fn upsert_episodes(
 // ── List ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct EpisodesListRequest {
     pub user_id: String,
     pub time_start: Option<String>,
@@ -420,15 +425,18 @@ pub struct EpisodesListRequest {
     pub offset: usize,
 }
 
+#[allow(dead_code)]
 fn default_list_limit() -> usize {
     100
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct EpisodesListResponse {
     pub episodes: Vec<EpisodeRow>,
 }
 
+#[allow(dead_code)]
 pub async fn handle_episodes_list(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EpisodesListRequest>,
@@ -445,6 +453,7 @@ pub async fn handle_episodes_list(
     Ok(Json(EpisodesListResponse { episodes }))
 }
 
+#[allow(dead_code)]
 fn list_episodes(
     conn: &rusqlite::Connection,
     req: &EpisodesListRequest,
@@ -481,6 +490,7 @@ fn list_episodes(
 // ── Delete range ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct EpisodesDeleteRangeRequest {
     pub user_id: String,
     pub from: String,
@@ -488,10 +498,12 @@ pub struct EpisodesDeleteRangeRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct EpisodesDeleteRangeResponse {
     pub deleted: usize,
 }
 
+#[allow(dead_code)]
 pub async fn handle_episodes_delete_range(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EpisodesDeleteRangeRequest>,
@@ -659,6 +671,7 @@ pub(crate) fn purge_episode(
 // ── Members (drill-in) ───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct EpisodesMembersRequest {
     pub user_id: String,
     pub episode_id: i64,
@@ -667,6 +680,7 @@ pub struct EpisodesMembersRequest {
 /// Return the records bound to one episode (debugger drill-in). Utterances are
 /// joined to audio_segments for their absolute timestamp; both lists come back
 /// time-ascending.
+#[allow(dead_code)]
 pub async fn handle_episodes_members(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EpisodesMembersRequest>,
@@ -683,6 +697,7 @@ pub async fn handle_episodes_members(
     Ok(Json(result))
 }
 
+#[allow(dead_code)]
 fn fetch_members(conn: &rusqlite::Connection, episode_id: i64) -> Result<Value> {
     let mut ustmt = conn.prepare(
         r#"SELECT u.id, u.text, u.language, u.speaker_label, s.started_at, u.source_key
@@ -735,11 +750,13 @@ fn fetch_members(conn: &rusqlite::Connection, episode_id: i64) -> Result<Value> 
 /// Parse a JSON-text column into a [`serde_json::Value`] array.
 /// Returns `Value::Array([])` on NULL or parse failure so the response is
 /// always a JSON array rather than null.
+#[allow(dead_code)]
 fn parse_json_array(raw: Option<String>) -> Value {
     raw.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(Value::Array(vec![]))
 }
 
+#[allow(dead_code)]
 fn parse_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRow> {
     Ok(EpisodeRow {
         id: row.get(0)?,

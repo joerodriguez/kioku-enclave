@@ -2,23 +2,38 @@
 
 A production image must be traceable to signed public source and a content-addressable
 image digest. A release therefore includes a signed Git tag, immutable GitHub Release,
-validated image metadata, GitHub-signed build provenance, an SPDX SBOM, and a signed SBOM
-attestation. The image digest is the value authorized by the deployment's KMS
+validated image metadata with its own GitHub-signed provenance bundle, GitHub-signed image
+provenance, an SPDX SBOM, and a signed SBOM attestation. The image digest is the value authorized by the deployment's KMS
 attestation condition.
 
-## Automated Release Workflow (Primary Method)
+## Signed release workflow
 
-Releasing a new enclave version requires **bumping `version` in `Cargo.toml`**.
+Releasing a new enclave version requires a reviewed version bump, a fail-closed ADR-0016
+release classification, and an operator-created signed tag. A `main` push builds
+production configuration. CI never creates a release tag from `main`.
+This prevents an unsigned automated tag from bypassing the release operator's
+trust anchor.
 
-### For AI/LLM Agents & Developers:
 To cut a new release:
-1. Run `./scripts/bump_version.sh <NEW_VERSION>` (e.g. `./scripts/bump_version.sh 0.6.15`), or update `version = "X.Y.Z"` in `Cargo.toml` and run `cargo check`.
-2. Commit `Cargo.toml` & `Cargo.lock` and push to `main` (or merge your PR to `main`).
-3. GitHub Actions (`.github/workflows/build.yml`) will automatically:
-   - Create git tag `vX.Y.Z` on `main`.
-   - Build the container image and bake configuration into the attested image digest.
-   - Generate Sigstore build provenance and SPDX SBOM attestations.
-   - Publish the public GitHub Release for `vX.Y.Z` with all attestation assets attached.
+
+1. Run `./scripts/bump_version.sh <NEW_VERSION>` (for example `0.8.4`), or
+   update `version = "X.Y.Z"` in `Cargo.toml` and refresh `Cargo.lock`.
+2. Choose exactly one release classification described in
+   [`eval/voice/README.md`](eval/voice/README.md): retain the exact
+   `eval/voice/owner-only-production.json` marker while there are zero external users and
+   no quality claim, or remove it and commit the complete passing real-corpus manifest,
+   cases, and report. Never commit both classifications.
+3. Merge those changes through a green pull request, then synchronize a clean
+   local `main` with `origin/main`.
+4. Run `scripts/release.sh` with the trusted signing-key fingerprint. It validates the
+   selected classification (including the Rust scorer for real evidence), creates and
+   verifies the signed tag, and pushes it.
+5. The tag workflow independently requires GitHub to verify the tag signature,
+   checks the selected classification, builds the image, generates provenance/SBOM attestations,
+   and uploads workflow artifacts with read-only repository-content permission. It cannot
+   publish a GitHub Release. The local script rechecks the tag against the trusted
+   `RELEASE_SIGNER_FINGERPRINT`, verifies the evidence, and is the sole release publisher;
+   it may then request a separately approved production roll.
 
 ## Prerequisites
 
@@ -31,6 +46,11 @@ To cut a new release:
 - Configure a Git signing key. `scripts/release.sh` creates `git tag -s` tags and rejects
   a tag that cannot be verified against the required `RELEASE_SIGNER_FINGERPRINT`
   trust anchor (an OpenPGP fingerprint or `SHA256:…` SSH key fingerprint).
+- Check in exactly one ADR-0016 classification documented in `eval/voice/README.md`.
+  Missing, ambiguous, partial, malformed, stale, unbound, synthetic-only, incomplete, or
+  regressed evidence blocks both the local release command and release-tag CI. The
+  owner-only marker is invalid as soon as any external user exists or a quality claim is
+  intended.
 - Publish the trusted signing public key and fingerprint through a separately authenticated
   channel, and require release verifiers to pin that identity. A cryptographically valid
   signature from an unknown key does not authenticate the release operator.
@@ -40,8 +60,10 @@ To cut a new release:
 - Authenticate `gcloud` with read-only access to the configured Artifact Registry
   repository. OCI attestation verification resolves the image manifest even when the
   signed bundle is local; the script configures the standard Docker credential helper
-  and fails before tagging if the repository is not readable. Writer, deploy, IAM,
-  Secret Manager, and KMS permissions are unnecessary.
+  and fails before tagging if the repository is not readable. For `--roll`, the operator
+  also needs Secret Manager metadata/IAM-policy read access for the two APNs key
+  containers, but never secret payload access or runtime-service-account impersonation.
+  Writer, deploy, service-account Token Creator, and KMS permissions are unnecessary.
 - When using `--roll`, set `DEPLOYMENT_REPO=owner/repository`.
 - Enable GitHub immutable releases. The release script requires the setting, uploads all
   assets while a release is still a draft, and confirms GitHub made the published release
@@ -55,12 +77,24 @@ The public build validates these non-secret GitHub Actions variables before Dock
 |---|---|
 | Keyless image push | `GCP_WIF_PROVIDER`, `GCP_SERVICE_ACCOUNT` |
 | Artifact Registry destination | `GCP_PROJECT_ID`, `GCP_REGION`, `AR_REPOSITORY`, `IMAGE_NAME` |
-| KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
+| KMS/GCS and legacy caller | `ENCLAVE_KMS_PROJECT`, `ENCLAVE_KMS_LOCATION`, `ENCLAVE_KMS_KEY_RING`, `ENCLAVE_KMS_KEY`, `ENCLAVE_GCS_BUCKET`, `ENCLAVE_GCS_MEDIA_BUCKET`, `ENCLAVE_GCS_LEGACY_MEDIA_BUCKET`, `ENCLAVE_RUN_SA_EMAIL`, `ENCLAVE_AUDIENCE` |
 | Internal KMS attestation exchange | `ENCLAVE_ATTEST_STS_AUDIENCE` |
-| OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
+| OAuth and origins | `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID`, `BASE_URL`, `WEB_ORIGIN` |
+| APNs ready alerts | `APNS_TEAM_ID`, `APNS_PRODUCTION_KEY_ID`, `APNS_SANDBOX_KEY_ID` |
+| Apple login (optional, all or none) | `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` |
 | Synthetic plugin reviewer | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` |
 | Vertex | `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` |
+| Billing boundary | `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE`, `BILLING_ENFORCEMENT_MODE` (`shadow` or `enforce`) |
 | Production TLS | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY` |
+
+For this ADR-0022 Phase-0 dual-media migration, `ENCLAVE_GCS_MEDIA_BUCKET` is required
+as the current write bucket and may differ from `ENCLAVE_GCS_BUCKET`.
+`ENCLAVE_GCS_LEGACY_MEDIA_BUCKET` is required and must exactly equal
+`ENCLAVE_GCS_BUCKET`. CI rejects a missing or mismatched value before Docker runs, bakes
+all three `ENV` values into the image, and records them in a schema-v6 release manifest.
+The selected values are a build/release binding and the runtime Store uses them for the
+dual-media migration; this workflow does not create either bucket, delete objects, wire
+archive-v3 authority, or deploy a VM.
 
 Set them in GitHub Settings → Secrets and variables → Actions or with
 `gh variable set`. The workflow maps the `ENCLAVE_*` repository-variable names to the
@@ -72,11 +106,66 @@ prevents account and contact addresses from being copied into public Actions log
 resulting values remain baked into the image, so they must not contain authentication
 secrets.
 
+When native Apple login is enabled, put the `.p8` contents in the runtime project's
+Secret Manager secret `kioku-apple-sign-in-private-key`; never place that key in an
+Actions variable, Docker build argument, image layer, or launch metadata. The three
+non-secret Apple identifiers are image-baked and must be supplied together.
+
+Ready alerts require externally populated Secret Manager versions in
+`kioku-apns-production-private-key` and `kioku-apns-sandbox-private-key`. The deployment
+repository's Terraform owns those containers and grants secret-level accessor to the
+actual `kioku-enclave@<project>.iam.gserviceaccount.com` runtime identity; it never owns
+the Apple-issued bytes. Before a `--roll`, `scripts/release.sh` verifies that each
+`latest` version is `ENABLED` and that the exact runtime accessor binding exists by
+reading metadata and IAM policy only. It deliberately never reads a key, impersonates
+the runtime identity, or requires `roles/iam.serviceAccountTokenCreator`.
+
+### Retired isolated evaluation profile
+
+The isolated evaluation runtime is retired; owner-controlled corpus runs now use the
+production API and a dedicated owner-controlled corpus account. The historical manual
+build profile remains source-visible for reproducibility only. To reconstruct a
+non-release image, configure an `EVAL_`
+counterpart for every build-arg variable in the table above. Store
+`EVAL_ALLOWED_EMAILS` and `EVAL_ENCLAVE_ACME_CONTACT` as Actions secrets; all other
+counterparts are Actions variables. Then manually dispatch `build.yml` from `main` with
+`build_profile=evaluation`.
+
+The selector validates the entire chosen profile before exporting any value. Missing or
+malformed evaluation values fail the build; production settings are never substitutes.
+The archive-witness probe is not an `EVAL_*` or production repository variable. Its only
+source is checked-in `config/archive-witness-probe.json`, parsed by the same shared module
+for build selection and signed release-metadata verification. Evaluation and `main`
+images force the tuple to exact off/empty even if a future reviewed file selects
+`probe-v1`; no manual-dispatch input can enable it.
+
+### Non-authoritative witness-probe prereleases
+
+The checked-in witness profile remains off for ordinary releases. A future reviewed
+change may populate the exact named-database tuple and select `probe-v1`. While that file
+is enabled, only a signed tag named exactly `vX.Y.Z-witness-probe.N` can build the probe
+configuration; `X.Y.Z` must equal the Cargo package version and `N` is a nonzero canonical
+decimal sequence. Stable and other prerelease tags fail before publication, and
+`release.sh --roll` rejects the probe before tagging or any deployment dispatch.
+
+At runtime the probe is awaited once under a fixed deadline before application Store,
+KMS, or GCS construction. It emits only one fixed content-free result and startup
+continues regardless. The result is not readiness, health, rollout, or archive authority.
+The resulting `eval-*` image and its metadata are historical evaluation inputs only. They
+must use a separate service account, KMS key, index bucket, media bucket, HTTPS hostname/audience,
+and VM with no production bucket or KMS access. Do not tag it `v*`, publish it as a
+release, pass it to `scripts/release.sh`, deploy it to production, or recreate the retired
+service. The evaluated
+source commit, image digest, model, scorer, corpus sources, and thresholds are instead
+bound into the content-free ADR-0016 run evidence.
+
 Production requirements are fail-closed:
 
 - `BASE_URL` and `WEB_ORIGIN` must be HTTPS origins; legacy `ENCLAVE_AUDIENCE` must match
   the caller's ID-token `aud` exactly and should normally be the public HTTPS API URL;
 - `ALLOWED_EMAILS` must be nonempty and must not be `*`;
+- `BILLING_SERVICE_URL` and `BILLING_SERVICE_AUDIENCE` must be the same HTTPS origin,
+  and `BILLING_ENFORCEMENT_MODE` must be `shadow` or `enforce`;
 - `ENCLAVE_ACME` must be `1`; and
 - `ENCLAVE_ATTEST_STS_AUDIENCE` is an internal WIF provider resource, never the audience
   of the public `/v1/attestation` token.
@@ -133,27 +222,45 @@ RELEASE_SIGNER_FINGERPRINT=<trusted-key-fingerprint> \
 The script and workflow then:
 
 1. verify clean, synchronized public `main` and all required repository variables;
-2. require the tag version to match the Cargo package version;
-3. run `cargo fmt --all -- --check`, locked tests, and clippy with warnings denied;
+2. require the stable tag version—or the stable prefix of an exact witness-probe
+   prerelease—to match the Cargo package version;
+3. run formatting, locked tests, warnings-denied Clippy, and the deterministic
+   ADR-0016 real-corpus report check;
 4. create, verify against `RELEASE_SIGNER_FINGERPRINT`, and push a signed source tag;
-5. run CI and build with full-SHA-pinned Actions, a digest-pinned Rust builder, and a
-   revision- and hash-pinned embedding model;
+5. run tag CI, independently verify the tag signature, repeat the voice report
+   check, and build with full-SHA-pinned Actions, a digest-pinned Rust builder,
+   and a revision- and hash-pinned embedding model;
 6. push the image to the configured
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>` destination;
 7. generate an SPDX SBOM, fail on fixed high-severity image findings, and create
-   GitHub-signed image-provenance and SBOM attestations;
-8. validate the source repository/ref/commit, build URL, configured image repository,
-   digest, provenance signer workflow, and exact equality between the standalone SBOM
+   GitHub-signed image-provenance, SBOM, and schema-v6 release-manifest attestations;
+8. verify the signed release-manifest subject before parsing it, then validate its exact
+   source repository/ref/commit, image digest, configured Artifact Registry repository,
+   and Phase-0 claims for the exact current-media bucket and legacy-media bucket equal
+   to the exact index bucket; verify
+   the image provenance signer workflow and exact equality between the standalone SBOM
    and the verified SBOM-attestation predicate; and
-9. create a draft, attach `enclave-release.json`,
-   `enclave-provenance.jsonl`, `enclave-sbom.spdx.json`, and
-   `enclave-sbom-attestation.jsonl`, publish it, and verify GitHub's immutable-release
-   attestation.
+9. return publication control to the fingerprint-enforcing local script, which alone
+   creates a draft and attaches `enclave-release.json`,
+   `enclave-release-metadata-provenance.jsonl`, `enclave-provenance.jsonl`,
+   `enclave-sbom.spdx.json`, and `enclave-sbom-attestation.jsonl`, publishes it, and
+   verifies GitHub's immutable-release attestation.
 
-If a prior invocation left a draft, the script repairs only the four expected assets and
+If a prior invocation left a draft, the script repairs only the five expected assets and
 rejects unexpected ones before publication. If a public release already exists, the
 script requires GitHub to report it as immutable and does not edit or clobber it.
 Investigate a mismatch; do not delete and recreate provenance to make verification pass.
+
+The build workflow has `contents: read` and no release-creation step. GitHub's generic
+`verification.verified` tag result is sufficient only to spend CI resources producing
+quarantined workflow artifacts; it never grants publication eligibility. A tag signed by
+any key other than the out-of-band `RELEASE_SIGNER_FINGERPRINT` is rejected by the sole
+publisher even when GitHub reports that signature as verified.
+
+Images whose immutable release lacks the signed schema-v6 release manifest and its
+matching provenance bundle are ineligible for promotion, including an attempted rollback.
+An old release, a mutable tag, a manually copied manifest, or a runtime fallback is not
+evidence that a digest was built for the dual-media migration.
 
 Publishing creates a verified public release; it does not change production. An operator
 may then use `--roll` with an explicitly configured `DEPLOYMENT_REPO` to request that
@@ -175,8 +282,13 @@ gh release download vX.Y.Z \
 
 Check that:
 
-- `enclave-release.json` names this repository, tag, signed-tag commit, build URL, and the
-  expected digest-qualified Artifact Registry repository;
+- `enclave-release.json` names the `production` build profile, this repository, tag,
+  signed-tag commit, build URL, the expected digest-qualified Artifact Registry
+  repository, plus exact `gcs_bucket`, current `gcs_media_bucket`, and
+  `gcs_legacy_media_bucket == gcs_bucket` claims;
+- `enclave-release-metadata-provenance.jsonl` verifies `enclave-release.json` itself as
+  a GitHub-signed subject from this workflow, tag, and commit—do not treat the JSON file
+  alone as evidence;
 - `gh attestation verify` accepts the image provenance for this repository's
   `.github/workflows/build.yml`, tag, and commit;
 - the SPDX SBOM is present and its signed attestation verifies for the same image digest;
@@ -201,7 +313,11 @@ approval-gated `enclave.yml` workflow with the digest-qualified image URI and di
 deployment workflow must verify the same release evidence, update the KMS image-digest
 condition, replace the Confidential Space VM, and record the successful pin. Do not
 bypass it with direct metadata edits, mutable image tags, or a digest from an unverified
-build.
+build. Merging this code or publishing a release does not deploy it; the separate
+deployment workflow remains the only rollout authority.
+
+An archive-witness probe prerelease is never eligible for this command: `--roll` rejects
+it before creating or pushing a tag.
 
 After approval and rollout:
 
@@ -216,6 +332,14 @@ After approval and rollout:
 
 Record the release URL, signed tag commit, digest-qualified image, provenance result,
 deployment run, and verification result in the operator's deployment record.
+
+For a billing-enforcement promotion, first verify the pinned billing credential, every
+catalog price, reconciliation with zero failures, the idempotent 60-second
+authorize/replay/detach canary, and the signed cloud-only client quota-denial upgrade UI.
+Then set `BILLING_ENFORCEMENT_MODE=enforce` and cut a new signed release; the mode is baked
+into the image and attested in schema-v6 metadata. To roll back enforcement, set the
+variable to `shadow`, cut another signed release, and roll its verified digest. Do not
+attempt a live launch-metadata override.
 
 ## One-time legacy-blob migration
 

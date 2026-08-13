@@ -54,6 +54,8 @@ const SIG_MIN_SUBSTANTIVE_UTT: i64 = 3;
 const SIG_MIN_SCREEN_MS: i64 = 2 * 60 * 1000;
 const SIG_MIN_UTT_PER_MIN: f64 = 1.0 / 5.0;
 const SCHEDULER_INTERVAL_SECS: u64 = 600; // 10 min internal cron (replaces Cloud Scheduler)
+const MAX_WINDOWS_PER_SWEEP: u32 = 1;
+const CLASSIFIER_MAX_OUTPUT_TOKENS: u32 = 2_048;
 const SUBSTANCE_BACKFILL_KEY: &str = "adr_0009_substance_backfill_v1";
 const SUBSTANCE_BACKFILL_BATCH: usize = 50;
 const VISUAL_EVIDENCE_BACKFILL_KEY: &str = "adr_0010_visual_evidence_backfill_v1";
@@ -81,6 +83,22 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+async fn reserve_vertex_output(state: &CpState, user_id: &str, output_tokens: u32) -> Result<()> {
+    let reserved = super::limits::reserve_vertex_output_tokens_for_class(
+        &state.control,
+        user_id,
+        super::limits::VertexWorkClass::DerivedText,
+        i64::from(output_tokens),
+        state.config.quota_vertex_output_tokens_per_day,
+    )
+    .await?;
+    if reserved.allowed {
+        Ok(())
+    } else {
+        Err(EnclaveError::Config("vertex_daily_budget".into()))
+    }
 }
 
 fn ms(ts: &str) -> i64 {
@@ -499,6 +517,7 @@ fn visual_evidence_backfill_schema() -> Value {
 /// best-effort at the call site: a Vertex outage must not block current-window
 /// summarization. The completion marker is written only after every stored row
 /// has a valid classification, so interrupted runs safely resume.
+#[allow(dead_code)]
 async fn run_substance_backfill(state: &CpState, user_id: &str) -> Result<()> {
     let user = user_id.to_string();
     let pending: Option<Vec<(i64, String)>> = state
@@ -550,15 +569,18 @@ async fn run_substance_backfill(state: &CpState, user_id: &str) -> Result<()> {
             "Classify every episode in this JSON array. Preserve each id exactly.\n\n{}",
             serde_json::to_string(&input)?
         );
+        reserve_vertex_output(state, user_id, CLASSIFIER_MAX_OUTPUT_TOKENS).await?;
         let response = super::vertex::generate_custom(
-            &state.config,
+            state,
+            user_id,
+            super::vertex::VertexOperation::SubstanceBackfill,
             SUBSTANCE_BACKFILL_PROMPT,
             &message,
             substance_backfill_schema(),
-            8_192,
+            CLASSIFIER_MAX_OUTPUT_TOKENS,
         )
         .await?;
-        let parsed = extract_json(&response).ok_or_else(|| {
+        let parsed = extract_json(&response.text).ok_or_else(|| {
             EnclaveError::Config("substance backfill response was not valid JSON".into())
         })?;
         let classifications = parsed
@@ -643,6 +665,7 @@ async fn run_substance_backfill(state: &CpState, user_id: &str) -> Result<()> {
 /// only already-synced episode text and member screenshot metadata/OCR; image
 /// bytes are never loaded or sent. The per-user marker makes the pass one-shot,
 /// while the completion-after-validation rule makes an interrupted run retryable.
+#[allow(dead_code)]
 async fn run_visual_evidence_backfill(state: &CpState, user_id: &str) -> Result<()> {
     let user = user_id.to_string();
     let pending: Option<Vec<(i64, String)>> = state
@@ -750,15 +773,18 @@ async fn run_visual_evidence_backfill(state: &CpState, user_id: &str) -> Result<
             "Classify every episode in this JSON array. Preserve each id exactly.\n\n{}",
             serde_json::to_string(&input)?
         );
+        reserve_vertex_output(state, user_id, CLASSIFIER_MAX_OUTPUT_TOKENS).await?;
         let response = super::vertex::generate_custom(
-            &state.config,
+            state,
+            user_id,
+            super::vertex::VertexOperation::VisualEvidenceBackfill,
             VISUAL_EVIDENCE_BACKFILL_PROMPT,
             &message,
             visual_evidence_backfill_schema(),
-            8_192,
+            CLASSIFIER_MAX_OUTPUT_TOKENS,
         )
         .await?;
-        let parsed = extract_json(&response).ok_or_else(|| {
+        let parsed = extract_json(&response.text).ok_or_else(|| {
             EnclaveError::Config("visual evidence backfill response was not valid JSON".into())
         })?;
         let classifications = parsed
@@ -882,16 +908,9 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     static SUMMARIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = SUMMARIZE_LOCK.get_or_init(|| Mutex::new(())).lock().await;
 
-    if let Err(e) = run_substance_backfill(state, user_id).await {
-        // Backfill is corrective and retryable; current capture must continue
-        // to summarize even when its separate short Vertex call fails.
-        warn!(user_id, error = %e, "episode substance backfill deferred");
-    }
-    if let Err(e) = run_visual_evidence_backfill(state, user_id).await {
-        // Historical screenshot eligibility is also corrective and retryable;
-        // never let it block current-window summarization.
-        warn!(user_id, error = %e, "episode visual evidence backfill deferred");
-    }
+    // Historical model migrations are never launched by the recurring worker.
+    // Existing rows remain readable and can be explicitly repaired by a
+    // future bounded operator/user queue without competing with live capture.
 
     let summarized_until = state.control.summarized_until(user_id).await?;
     let now = now_ms();
@@ -969,9 +988,17 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
     // `window_to` so the sweep can skip past a window that fails
     // deterministically (see summarize_all) instead of stalling forever.
     let system_prompt = format!("{SYSTEM_PROMPT}\n\n{WORKFLOW_CONTINUITY_RULE}");
-    let response = match super::vertex::generate(&state.config, &system_prompt, &user_message).await
+    reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await?;
+    let response = match super::vertex::generate(
+        state,
+        user_id,
+        super::vertex::VertexOperation::EpisodeSummary,
+        &system_prompt,
+        &user_message,
+    )
+    .await
     {
-        Ok(t) => t,
+        Ok(t) => t.text,
         Err(e) if e.to_string().contains("quota") => {
             return Ok(serde_json::json!({ "skipped": true, "reason": "quota" }));
         }
@@ -1006,9 +1033,18 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        match super::vertex::generate(&state.config, &system_prompt, &repair_message).await {
+        reserve_vertex_output(state, user_id, super::vertex::MAX_TEXT_OUTPUT_TOKENS).await?;
+        match super::vertex::generate(
+            state,
+            user_id,
+            super::vertex::VertexOperation::EpisodeSummaryRepair,
+            &system_prompt,
+            &repair_message,
+        )
+        .await
+        {
             Ok(repaired_text) => {
-                if let Some(repaired) = extract_json(&repaired_text) {
+                if let Some(repaired) = extract_json(&repaired_text.text) {
                     if missing_grounded_entities(&repaired, &grounding).is_empty() {
                         parsed = repaired;
                     } else {
@@ -1453,7 +1489,6 @@ async fn fetch_open_episodes(
 /// (bounded) so a cold-start backfill — up to 7 d ÷ 6 h = 28 windows — catches
 /// up within one tick instead of one window per 10-min tick (~5 h).
 pub async fn summarize_all(state: &CpState) {
-    const MAX_WINDOWS_PER_SWEEP: u32 = 32;
     let ids = match state.control.all_user_ids().await {
         Ok(ids) => ids,
         Err(e) => {
@@ -1547,6 +1582,11 @@ pub async fn summarize_all(state: &CpState) {
                 warn!(user_id = %id, error = %e, "deliver_user_emails failed");
             }
         }
+        if let Some(ref transport) = state.push_transport {
+            if let Err(e) = super::push::deliver_user_pushes(state, transport.as_ref(), &id).await {
+                warn!(user_id = %id, error = %e, "deliver_user_pushes failed");
+            }
+        }
     }
 }
 
@@ -1597,6 +1637,12 @@ Return STRICT JSON only: {"episodes":[{"episode_ref":"E0 or omit","started_at":"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_summarization_is_bounded_to_one_window_per_sweep() {
+        assert_eq!(MAX_WINDOWS_PER_SWEEP, 1);
+        assert_eq!(CLASSIFIER_MAX_OUTPUT_TOKENS, 2_048);
+    }
 
     const MIN: i64 = 60 * 1000;
     const HOUR: i64 = 60 * MIN;

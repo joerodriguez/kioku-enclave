@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "corpus_id": "synthetic-contract-v1",
+  "source_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "diarization_error_baselines": {
+    "noise": 0.3,
+    "overlap": 0.4,
+    "room_audio": 0.3
+  },
+  "cases": [
+    {"id":"case-0000000000000001","corpus_kind":"synthetic_contract","slice":"clean_remote_call","expected_person":"person-aaaaaaaaaaaaaaaa","predicted_person":"person-aaaaaaaaaaaaaaaa","accepted_name":true,"cross_meeting_link":false,"after_three_high_quality_samples":false,"speech_ms":10000,"diarization_error_ms":1000,"fact_count":2,"facts_with_provenance":2,"display_name_collision_group":null,"new_record_count":3,"exported_new_record_count":3,"deleted_new_record_count":3},
+    {"id":"case-0000000000000002","corpus_kind":"synthetic_contract","slice":"clean_remote_call","expected_person":"person-aaaaaaaaaaaaaaaa","predicted_person":"person-aaaaaaaaaaaaaaaa","accepted_name":false,"cross_meeting_link":true,"after_three_high_quality_samples":true,"speech_ms":10000,"diarization_error_ms":1000,"fact_count":1,"facts_with_provenance":1,"display_name_collision_group":null,"new_record_count":2,"exported_new_record_count":2,"deleted_new_record_count":2},
+    {"id":"case-0000000000000003","corpus_kind":"synthetic_contract","slice":"same_display_name","expected_person":"person-1111111111111111","predicted_person":"person-1111111111111111","accepted_name":true,"cross_meeting_link":true,"after_three_high_quality_samples":true,"speech_ms":5000,"diarization_error_ms":0,"fact_count":1,"facts_with_provenance":1,"display_name_collision_group":"collision-aaaaaaaaaaaaaaaa","new_record_count":2,"exported_new_record_count":2,"deleted_new_record_count":2},
+    {"id":"case-0000000000000004","corpus_kind":"synthetic_contract","slice":"same_display_name","expected_person":"person-2222222222222222","predicted_person":"person-2222222222222222","accepted_name":true,"cross_meeting_link":true,"after_three_high_quality_samples":true,"speech_ms":5000,"diarization_error_ms":0,"fact_count":1,"facts_with_provenance":1,"display_name_collision_group":"collision-aaaaaaaaaaaaaaaa","new_record_count":2,"exported_new_record_count":2,"deleted_new_record_count":2},
+    {"id":"case-0000000000000005","corpus_kind":"synthetic_contract","slice":"overlap","expected_person":"person-bbbbbbbbbbbbbbbb","predicted_person":null,"accepted_name":false,"cross_meeting_link":false,"after_three_high_quality_samples":false,"speech_ms":5000,"diarization_error_ms":2000,"fact_count":0,"facts_with_provenance":0,"display_name_collision_group":null,"new_record_count":1,"exported_new_record_count":1,"deleted_new_record_count":1},
+    {"id":"case-0000000000000006","corpus_kind":"synthetic_contract","slice":"mixed_language","expected_person":"person-cccccccccccccccc","predicted_person":"person-cccccccccccccccc","accepted_name":true,"cross_meeting_link":true,"after_three_high_quality_samples":true,"speech_ms":8000,"diarization_error_ms":800,"fact_count":2,"facts_with_provenance":2,"display_name_collision_group":null,"new_record_count":2,"exported_new_record_count":2,"deleted_new_record_count":2}
+  ]
+}

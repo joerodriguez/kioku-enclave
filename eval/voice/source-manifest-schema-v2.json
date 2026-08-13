@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/joerodriguez/kioku-enclave/eval/voice/source-manifest-schema-v2.json",
+  "title": "Kioku ADR-0016 voice evaluation source manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "corpus_id", "sources", "owner_fixtures"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "corpus_id": {"$ref": "#/$defs/opaqueId"},
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {"$ref": "#/$defs/source"}
+    },
+    "owner_fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/ownerFixture"}
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "httpsUrl": {
+      "type": "string",
+      "pattern": "^https://[^/@:]+(?:\\.[^/@:]+|/)(?:[^@]*)$"
+    },
+    "slice": {
+      "enum": [
+        "clean_remote_call",
+        "three_plus_speakers",
+        "overlap",
+        "introduction",
+        "repeated_meeting",
+        "same_display_name",
+        "similar_voices",
+        "system_audio",
+        "room_audio",
+        "mac_microphone",
+        "iphone_microphone",
+        "bluetooth",
+        "compression",
+        "noise",
+        "music",
+        "echo",
+        "french",
+        "english",
+        "mixed_language",
+        "active_speaker_ui",
+        "roster_only",
+        "conflicting_evidence"
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "url", "sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/opaqueId"},
+        "kind": {"enum": ["media", "labels", "bundle", "augmentation"]},
+        "url": {"$ref": "#/$defs/httpsUrl"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "license_id",
+        "license_url",
+        "artifacts",
+        "selected_item_ids",
+        "slices",
+        "derivation_command"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/opaqueId"},
+        "license_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "license_url": {"$ref": "#/$defs/httpsUrl"},
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/artifact"}
+        },
+        "selected_item_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/opaqueId"}
+        },
+        "slices": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/slice"}
+        },
+        "derivation_command": {"type": "string", "minLength": 1, "maxLength": 2048}
+      }
+    },
+    "ownerFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "media_sha256",
+        "labels_sha256",
+        "authorization_record_sha256",
+        "physical_capture",
+        "capture_origin",
+        "derived_from_source_ids",
+        "capture_routes",
+        "slices"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/opaqueId"},
+        "media_sha256": {"$ref": "#/$defs/sha256"},
+        "labels_sha256": {"$ref": "#/$defs/sha256"},
+        "authorization_record_sha256": {"$ref": "#/$defs/sha256"},
+        "physical_capture": {"const": true},
+        "capture_origin": {"enum": ["owner_speech", "licensed_playback", "mixed"]},
+        "derived_from_source_ids": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/opaqueId"}
+        },
+        "capture_routes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "mac_system_audio",
+              "mac_microphone",
+              "iphone_microphone",
+              "bluetooth",
+              "screen_capture"
+            ]
+          }
+        },
+        "slices": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/slice"}
+        }
+      }
+    }
+  }
+}

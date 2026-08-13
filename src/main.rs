@@ -7,8 +7,9 @@
 //!
 //! ## Authentication
 //!
-//! The compatibility `/v1/*` data routes require a Google-signed service-account
-//! ID token (RS256, `https://accounts.google.com`) with:
+//! Retired `/v1/*` data routes require the former Google-signed service-account
+//! ID token before returning an explicit `410 Gone`; they cannot read or write
+//! user data. The public `/v1/attestation` verifier route remains active.
 //!
 //! - `aud` == `ENCLAVE_AUDIENCE` env var (baked into the image)
 //! - `email` == `RUN_SA_EMAIL` env var (the trusted control-plane service
@@ -36,39 +37,104 @@
 //! live cert hot-swapped on renewal. See `acme.rs`. Static `ENCLAVE_TLS_*`
 //! inputs remain only for debug/custom bootstrap images.
 //!
-//! ## Compatibility routes
+//! ## Public and retired compatibility routes
 //!
 //! | Method | Path                       | Description                                  |
 //! |--------|----------------------------|----------------------------------------------|
 //! | GET    | /health                    | Liveness probe; returns `{"ok":true}`        |
-//! | POST   | /v1/ingest                 | Append utterances / screenshots to user index|
-//! | POST   | /v1/search                 | FTS5 search (optional kinds filter)          |
-//! | POST   | /v1/context                | Rows nearest a center timestamp              |
-//! | POST   | /v1/range                  | Raw rows in [from, to) for summariser        |
-//! | POST   | /v1/episodes/upsert        | Write / replace summarised episodes          |
-//! | POST   | /v1/episodes/list          | List episodes newest-first                   |
-//! | POST   | /v1/episodes/delete_range  | Delete episodes in [from, to)                |
-//! | POST   | /v1/stats                  | Per-user row counts + latest timestamps      |
-//! | GET    | /v1/export                 | Full JSON export of user's index             |
-//! | DELETE | /v1/user                   | Legacy content-only delete (trusted SA)      |
+//! | ANY    | /v1/* data routes          | Authenticated `410 Gone`; permanently retired|
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use axum::{
-    extract::{Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, post},
+    routing::{any, get},
     Router,
 };
-use base64::Engine as _; // trait in scope for .encode()
-use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod acme;
+// ADR-0022 format/crypto/backend and checkpoint/WAL primitives only.  These are
+// intentionally not connected to the live Store, SQLite VFS, witness, routes,
+// or write authority.
+mod archive_v3;
+// Inactive archive-v3 export parity seam. Its cancellation-aware witness,
+// exact walker, deletion-safe publication admission, and canonical product
+// adapter are sealed test-only blockers; live `/api/export` remains legacy.
+mod archive_v3_export;
+// Inactive ADR-0022 GCS semantic adapters. Runtime/authority wiring remains
+// intentionally absent.
+mod archive_v3_gcs;
+// Concrete but inactive REST transport. It has no environment constructor,
+// token acquisition, Store/VFS/witness connection, or production authority.
+mod archive_v3_gcs_http;
+// Inactive, archive-GCS-only Confidential Space bearer path. It deliberately
+// has its own audience type, launcher boundary, STS client, cache, and no
+// Store/VFS/route/transport/authority connection.
+mod archive_v3_gcs_auth;
+// Inactive ADR-0022 restart-safe genesis coordinator. It has no provider
+// construction or authority wiring; only deterministic fake-tested contracts.
+mod archive_v3_genesis;
+// Inactive ADR-0022 deletion-driver seam. It accepts only witness-fenced
+// archive contexts and authenticated canonical metadata; no route, Store,
+// runtime/provider construction, or production authority is connected.
+mod archive_v3_deletion;
+// Inactive ADR-0022 immutable sparse-extent tree. It is fake-tested only and
+// has no Store/VFS/provider/witness/route/flag/authority wiring.
+mod archive_v3_extent;
+// Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
+// REST transport. They have no runtime construction, Store, VFS, route, or
+// authority wiring.
+mod archive_v3_firestore_http;
+mod archive_v3_firestore_witness;
+// Inactive, Firestore-witness-only Confidential Space bearer path. It is
+// deliberately distinct from the KMS and public attestation credential paths.
+mod archive_v3_firestore_auth;
+// Inert, non-authoritative singleton transaction probe for the dedicated
+// named Firestore witness database. It has no Store, route, root, or rollout
+// wiring while its image-baked mode remains off.
+mod archive_v3_firestore_probe;
+// Inactive, no-I/O composition of the exact Firestore namespace, dedicated
+// bearer, fixed REST transport, and shadow-coordinator transaction boundary.
+mod archive_v3_firestore_shadow;
+mod archive_v3_journal;
+// Inactive ADR-0022 legacy-conversion session codec and inventory ledger.
+// It has no source adapter, provider, Store, VFS, route, witness CAS, recovery,
+// deletion, cutover, or other production authority.
+mod archive_v3_legacy_extent_session;
+mod archive_v3_operation;
+// ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
+// registered SQLite VFS and has no Store, provider, route, or authority wiring.
+mod archive_v3_shadow;
+// Inactive ADR-0022 durable shadow-session codec. The operation module persists
+// it, but no Store, VFS, startup, flag, route, or authority wiring constructs it.
+mod archive_v3_shadow_session;
+// Inactive ADR-0022 private-staging SQLite shadow-parity verifier. It has no
+// Store, VFS, provider, credential, route, scheduler, flag, or authority wiring.
+mod archive_v3_shadow_parity;
+// ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
+// Store/VFS runtime connection, provider construction, flag, route, or authority.
+mod archive_v3_shadow_checkpoint;
+// Inactive ADR-0022 immutable WAL upload/readback and exact witness-nominated
+// recovery seam. It has no VFS, Store, runtime, flag, provider, or authority
+// wiring; legacy whole-snapshot persistence remains authoritative.
+mod archive_v3_shadow_wal;
+// Inactive ADR-0022 checkpoint publication composition with durable exact-
+// candidate reconciliation. It has no Store, VFS, route, flag, provider
+// construction, or authority wiring.
+mod archive_v3_shadow_coordinator;
+// ADR-0022's opt-in transparent SQLite VFS wrapper. It is compiled and
+// oracle-tested, but startup never registers it and it has no Store/provider/
+// witness/route/authority wiring.
+mod archive_v3_sqlite_vfs;
+// ADR-0022's inactive, in-memory witness contract.  It intentionally has no
+// provider, Store, VFS, route, or authority wiring.
+mod archive_v3_witness;
 mod attestation;
 mod auth;
 mod cp;
@@ -76,10 +142,20 @@ mod crypto;
 mod embedding;
 mod episodes;
 mod error;
+// Inactive migration-only reader for the historic GCM envelope. It has no
+// Store, GCS provider, route, flag, or authority wiring.
+mod legacy_gcm;
+// The retired local-sync route no longer calls this legacy ingestion surface,
+// but its core remains as migration/regression-test coverage for old indexes.
+#[allow(dead_code)]
 mod ingest;
 mod ocr;
 mod search;
+mod storage_observability;
 mod store;
+// Retained for historical index regression tests after the `/v1` query routes
+// were tombstoned.
+#[allow(dead_code)]
 mod timeline;
 mod tls;
 
@@ -90,16 +166,75 @@ pub(crate) fn test_mode_enabled() -> bool {
     cfg!(debug_assertions) && std::env::var("ENCLAVE_TEST_MODE").as_deref() == Ok("1")
 }
 
-use crate::{
-    episodes::{
-        handle_episodes_delete_range, handle_episodes_list, handle_episodes_members,
-        handle_episodes_upsert,
-    },
-    ingest::handle_ingest,
-    search::handle_search,
-    store::{GcpGcsClient, Store},
-    timeline::{handle_context, handle_range, handle_stats},
-};
+use crate::store::{GcpGcsClient, Store};
+
+async fn resolve_resend_api_key<F, Fut>(
+    test_mode: bool,
+    local_key: Option<String>,
+    fetch_production_key: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if test_mode {
+        local_key.map(validate_resend_api_key).transpose()
+    } else {
+        fetch_production_key()
+            .await
+            .and_then(validate_resend_api_key)
+            .map(Some)
+    }
+}
+
+fn validate_resend_api_key(api_key: String) -> Result<String, String> {
+    let api_key = api_key.trim();
+    if !api_key.starts_with("re_")
+        || !(8..=256).contains(&api_key.len())
+        || !api_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("Resend API key has an invalid format".into());
+    }
+    Ok(api_key.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApnsIdentifiers {
+    team_id: String,
+    production_key_id: String,
+    sandbox_key_id: String,
+}
+
+fn resolve_apns_identifiers(
+    profile: &str,
+    team_id: Option<String>,
+    production_key_id: Option<String>,
+    sandbox_key_id: Option<String>,
+) -> Result<Option<ApnsIdentifiers>, String> {
+    let supplied = [
+        team_id.as_ref(),
+        production_key_id.as_ref(),
+        sandbox_key_id.as_ref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some_and(|value| !value.trim().is_empty()))
+    .count();
+    if supplied == 0 && profile == "evaluation" {
+        return Ok(None);
+    }
+    if supplied != 3 {
+        return Err(format!(
+            "{profile} startup requires a complete APNs team, production key, and sandbox key configuration"
+        ));
+    }
+    Ok(Some(ApnsIdentifiers {
+        team_id: team_id.unwrap().trim().to_string(),
+        production_key_id: production_key_id.unwrap().trim().to_string(),
+        sandbox_key_id: sandbox_key_id.unwrap().trim().to_string(),
+    }))
+}
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -109,59 +244,6 @@ pub struct AppState {
     id_token_verifier: Arc<auth::IdTokenVerifier>,
     pub attestation_cache: Option<Arc<attestation::AttestationCache>>,
     pub tls_keystone: Option<Arc<tls::TlsKeystone>>,
-}
-
-/// In-process full export of a user's index as JSON (utterances, screenshots,
-/// episodes). Shared by the legacy `/v1/export` handler and the control-plane
-/// `/api/export` route (ADR-0001).
-pub(crate) async fn dump_user_export(
-    store: &Store,
-    user_id: &str,
-) -> error::Result<serde_json::Value> {
-    store::validate_user_id(user_id)?;
-    store
-        .with_user(user_id, |conn| {
-            let utterances = dump_table(conn, "SELECT * FROM utterances ORDER BY id")?;
-            let screenshots = dump_table(conn, "SELECT * FROM screenshots ORDER BY id")?;
-            let screenshot_images = {
-                let table_exists: i64 = conn.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if table_exists > 0 {
-                    dump_table(conn, "SELECT * FROM screenshot_images ORDER BY id")?
-                } else {
-                    Vec::new()
-                }
-            };
-            let episodes = dump_table(conn, "SELECT * FROM episodes ORDER BY id")?;
-            let final_briefs = dump_table(conn, "SELECT * FROM episode_final_briefs ORDER BY episode_id")?;
-            let webhook_deliveries =
-                dump_table(conn, "SELECT * FROM webhook_deliveries ORDER BY episode_id, subscription_id")?;
-            let email_deliveries = {
-                let table_exists: i64 = conn.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='email_deliveries'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if table_exists > 0 {
-                    dump_table(conn, "SELECT * FROM email_deliveries ORDER BY episode_id, delivery_version")?
-                } else {
-                    Vec::new()
-                }
-            };
-            Ok(json!({
-                "utterances": utterances,
-                "screenshots": screenshots,
-                "screenshot_images": screenshot_images,
-                "episodes": episodes,
-                "episode_final_briefs": final_briefs,
-                "webhook_deliveries": webhook_deliveries,
-                "email_deliveries": email_deliveries,
-            }))
-        })
-        .await
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -213,89 +295,132 @@ async fn require_auth(
     }
 }
 
-// ── Export handler ────────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct ExportQuery {
-    user_id: String,
+async fn legacy_data_plane_retired() -> Response {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "legacy_data_plane_retired",
+            "message": "Use Kioku Cloud Capture v2."
+        })),
+    )
+        .into_response()
 }
 
-async fn handle_export(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<ExportQuery>,
-) -> error::Result<Json<serde_json::Value>> {
-    info!(user_id = %q.user_id, "export request");
-    let data = dump_user_export(&state.store, &q.user_id).await?;
-    Ok(Json(data))
+#[derive(Debug, PartialEq, Eq)]
+struct BillingRequestObservation {
+    route: &'static str,
+    status: u16,
+    status_class: &'static str,
+    duration_ms: u64,
 }
 
-fn dump_table(
-    conn: &rusqlite::Connection,
-    sql: &str,
-) -> crate::error::Result<Vec<serde_json::Value>> {
-    let mut stmt = conn.prepare(sql)?;
-    let col_count = stmt.column_count();
-    let col_names: Vec<String> = (0..col_count)
-        .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
-        .collect();
-
-    let rows = stmt.query_map([], |row| {
-        let mut map = serde_json::Map::new();
-        for (i, name) in col_names.iter().enumerate() {
-            let val: rusqlite::types::Value = row.get(i)?;
-            map.insert(name.clone(), sqlite_value_to_json(val));
-        }
-        Ok(serde_json::Value::Object(map))
-    })?;
-
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+fn billing_request_observation(
+    method: &Method,
+    path: &str,
+    status: StatusCode,
+    duration_ms: u64,
+) -> Option<BillingRequestObservation> {
+    let route = match (method, path) {
+        (method, "/api/billing") if method == Method::GET => "billing_summary",
+        (method, "/api/billing/recording-lease") if method == Method::POST => "recording_lease",
+        _ => return None,
+    };
+    let status_class = match status.as_u16() {
+        200..=299 => "2xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    };
+    Some(BillingRequestObservation {
+        route,
+        status: status.as_u16(),
+        status_class,
+        duration_ms,
+    })
 }
 
-fn sqlite_value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
-    match v {
-        rusqlite::types::Value::Null => serde_json::Value::Null,
-        rusqlite::types::Value::Integer(i) => serde_json::Value::Number(i.into()),
-        rusqlite::types::Value::Real(f) => serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-        rusqlite::types::Value::Blob(b) => {
-            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+/// Emits one content-free event only for the two launch-critical billing
+/// method-and-route pairs. Raw paths, queries, account IDs, tokens, headers,
+/// and bodies never enter the event, so its fields remain safe for
+/// low-cardinality log metrics.
+async fn observe_billing_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    if let Some(observation) =
+        billing_request_observation(&method, &path, response.status(), duration_ms)
+    {
+        let route = observation.route;
+        let status = observation.status;
+        let status_class = observation.status_class;
+        let duration_ms = observation.duration_ms;
+        if status_class == "5xx" {
+            warn!(
+                target: "kioku::billing_request",
+                metric_schema = "billing_request_v1",
+                route,
+                status,
+                status_class,
+                duration_ms,
+                "billing request completed"
+            );
+        } else {
+            info!(
+                target: "kioku::billing_request",
+                metric_schema = "billing_request_v1",
+                route,
+                status,
+                status_class,
+                duration_ms,
+                "billing request completed"
+            );
         }
     }
+    response
 }
 
-// ── Delete handler ────────────────────────────────────────────────────────────
-
-// This legacy route intentionally deletes only the per-user content blob. It
-// is reachable only through the service-account-authenticated router; end-user
-// identity cleanup and tombstoning use DELETE /api/account instead.
-#[derive(Deserialize)]
-struct DeleteBody {
-    user_id: String,
-}
-
-async fn handle_delete_user(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<DeleteBody>,
-) -> error::Result<Json<serde_json::Value>> {
-    let user_id = body.user_id;
-    store::validate_user_id(&user_id)?;
-    info!(user_id = %user_id, "delete user request");
-
-    state.store.delete_user(&user_id).await?;
-
-    Ok(Json(json!({
-        "deleted": true,
-        "user_id": user_id,
-    })))
+fn legacy_data_plane_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/ingest", any(legacy_data_plane_retired))
+        .route("/v1/search", any(legacy_data_plane_retired))
+        .route("/v1/context", any(legacy_data_plane_retired))
+        .route("/v1/range", any(legacy_data_plane_retired))
+        .route("/v1/episodes/upsert", any(legacy_data_plane_retired))
+        .route("/v1/episodes/list", any(legacy_data_plane_retired))
+        .route("/v1/episodes/members", any(legacy_data_plane_retired))
+        .route("/v1/episodes/delete_range", any(legacy_data_plane_retired))
+        .route("/v1/stats", any(legacy_data_plane_retired))
+        .route("/v1/export", any(legacy_data_plane_retired))
+        .route("/v1/user", any(legacy_data_plane_retired))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_auth,
+        ))
+        .with_state::<Arc<AppState>>(state)
 }
 
 // ── Health handler ────────────────────────────────────────────────────────────
 
-async fn handle_health() -> Json<serde_json::Value> {
-    Json(json!({"ok": true, "service": "kioku-enclave"}))
+async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let progress = state.store.legacy_checkpoint_reconciliation().await;
+    Json(health_json(progress))
+}
+
+fn health_json(progress: store::LegacyCheckpointReconciliation) -> serde_json::Value {
+    json!({
+        "ok": true,
+        "service": "kioku-enclave",
+        "legacy_checkpoint_reconciliation_ready": progress.ready,
+        "legacy_checkpoint_reconciliation": {
+            "completed_scans": progress.completed_scans,
+            "listed_live_objects": progress.listed_live_objects,
+            "live_archives_checked": progress.live_archives_checked,
+            "checkpoints_verified": progress.checkpoints_verified,
+            "failures": progress.failures,
+        }
+    })
 }
 
 async fn limit_public_oauth(
@@ -373,6 +498,130 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 #[tokio::main]
 async fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--measure-voice-eval-similarity") {
+        let spec_path = args.get(2).expect(
+            "--measure-voice-eval-similarity requires private specification, media directory, and voice model paths",
+        );
+        let media_directory = args.get(3).expect(
+            "--measure-voice-eval-similarity requires private specification, media directory, and voice model paths",
+        );
+        let model_path = args.get(4).expect(
+            "--measure-voice-eval-similarity requires private specification, media directory, and voice model paths",
+        );
+        let spec = std::fs::read_to_string(spec_path)
+            .expect("read private voice similarity specification");
+        match cp::voice_eval_similarity::measure_similarity(
+            &spec,
+            std::path::Path::new(media_directory),
+            std::path::Path::new(model_path),
+        ) {
+            Ok(report) => print!("{report}"),
+            Err(error) => {
+                eprintln!("Voice similarity measurement failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--derive-voice-eval-assets") {
+        let manifest_path = args.get(2).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let recipe_path = args.get(3).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let artifact_directory = args.get(4).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let output_directory = args.get(5).expect(
+            "--derive-voice-eval-assets requires manifest, private recipe, artifact directory, and output directory paths",
+        );
+        let manifest =
+            std::fs::read_to_string(manifest_path).expect("read voice evaluation manifest");
+        let recipe = std::fs::read_to_string(recipe_path).expect("read private derivation recipe");
+        match cp::voice_eval_assets::derive_assets(
+            &manifest,
+            &recipe,
+            std::path::Path::new(artifact_directory),
+            std::path::Path::new(output_directory),
+        ) {
+            Ok(receipt) => print!("{receipt}"),
+            Err(error) => {
+                eprintln!("Voice evaluation asset derivation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--build-voice-eval-cases") {
+        let manifest_path = args.get(2).expect(
+            "--build-voice-eval-cases requires source manifest and private run-evidence paths",
+        );
+        let evidence_path = args.get(3).expect(
+            "--build-voice-eval-cases requires source manifest and private run-evidence paths",
+        );
+        let manifest =
+            std::fs::read_to_string(manifest_path).expect("read voice evaluation manifest");
+        let evidence =
+            std::fs::read_to_string(evidence_path).expect("read private voice run evidence");
+        match cp::voice_eval_evidence::build_cases_json(&manifest, &evidence) {
+            Ok(cases) => println!("{cases}"),
+            Err(error) => {
+                eprintln!("Voice evaluation case generation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--score-voice-eval") {
+        let path = args
+            .get(2)
+            .expect("--score-voice-eval requires one aggregate case JSON path");
+        let raw = std::fs::read_to_string(path).expect("read voice evaluation cases");
+        println!(
+            "{}",
+            cp::voice_eval::score_json(&raw).expect("score voice evaluation cases")
+        );
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--validate-voice-eval-manifest") {
+        let path = args
+            .get(2)
+            .expect("--validate-voice-eval-manifest requires one manifest JSON path");
+        let raw = std::fs::read_to_string(path).expect("read voice evaluation manifest");
+        match cp::voice_eval::validate_manifest_json(&raw) {
+            Ok(sha256) => {
+                println!("Voice evaluation manifest is valid; raw-byte SHA-256: {sha256}")
+            }
+            Err(error) => {
+                eprintln!("Voice evaluation manifest validation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--check-voice-eval") {
+        let manifest_path = args
+            .get(2)
+            .expect("--check-voice-eval requires manifest, aggregate cases, and report paths");
+        let cases_path = args
+            .get(3)
+            .expect("--check-voice-eval requires manifest, aggregate cases, and report paths");
+        let report_path = args
+            .get(4)
+            .expect("--check-voice-eval requires manifest, aggregate cases, and report paths");
+        let manifest =
+            std::fs::read_to_string(manifest_path).expect("read voice evaluation manifest");
+        let cases = std::fs::read_to_string(cases_path).expect("read voice evaluation cases");
+        let report = std::fs::read_to_string(report_path).expect("read voice evaluation report");
+        if let Err(error) = cp::voice_eval::validate_release_bundle(&manifest, &cases, &report) {
+            eprintln!("Voice evaluation release gate failed: {error}");
+            std::process::exit(1);
+        }
+        println!("Voice evaluation release gates passed.");
+        return;
+    }
     // Structured logging; RUST_LOG overrides the default.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -385,6 +634,17 @@ async fn main() {
         version = env!("CARGO_PKG_VERSION"),
         "kioku-enclave starting"
     );
+
+    // Non-authoritative ADR-0022 transport probe. Off is the baked default and
+    // performs zero I/O. probe-v1 is awaited under one fixed deadline before
+    // any application Store/KMS/GCS construction. Its redacted result is
+    // observational only and never gates startup, health, or archive authority.
+    archive_v3_firestore_probe::run_startup_probe(
+        archive_v3_firestore_probe::FirestoreProbeStartupConfig::from_env()
+            .expect("valid image-baked archive witness probe configuration"),
+    )
+    .await
+    .expect("construct archive witness transport probe");
 
     // ── Auth config ───────────────────────────────────────────────────────────
     //
@@ -422,18 +682,27 @@ async fn main() {
     let gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_env().expect("GCS_BUCKET must be set"));
 
+    let media_bucket =
+        std::env::var("GCS_MEDIA_BUCKET").expect("GCS_MEDIA_BUCKET must be baked into the image");
+    let legacy_media_bucket = std::env::var("GCS_LEGACY_MEDIA_BUCKET")
+        .expect("GCS_LEGACY_MEDIA_BUCKET must be baked into the image");
+    let index_bucket =
+        std::env::var("GCS_BUCKET").expect("GCS_BUCKET must be baked into the image");
+    if legacy_media_bucket != index_bucket {
+        panic!("GCS_LEGACY_MEDIA_BUCKET must exactly match GCS_BUCKET for the Phase-0 dual-media migration");
+    }
     let media_gcs: Arc<dyn crate::store::GcsClient> =
-        if let Ok(bucket) = std::env::var("GCS_MEDIA_BUCKET") {
-            Arc::new(GcpGcsClient::from_bucket(bucket))
-        } else {
-            Arc::clone(&gcs)
-        };
+        Arc::new(GcpGcsClient::from_bucket(media_bucket));
+    let legacy_media_gcs: Arc<dyn crate::store::GcsClient> =
+        Arc::new(GcpGcsClient::from_bucket(legacy_media_bucket));
 
-    let store = Arc::new(Store::new_with_media(
+    let store = Arc::new(Store::new_with_media_and_legacy(
         Arc::clone(&kms),
         Arc::clone(&gcs),
         media_gcs,
+        legacy_media_gcs,
     ));
+    Store::spawn_metrics_reporter(Arc::clone(&store));
 
     // ACME renewal (ADR-0003) shares the KMS/GCS clients; take clones before the
     // control store consumes the originals.
@@ -441,7 +710,26 @@ async fn main() {
     let acme_gcs = Arc::clone(&gcs);
 
     // ── In-enclave control plane (ADR-0001): OAuth, sync, account, MCP. ─────────
-    let control_store = Arc::new(cp::control_store::ControlStore::new(kms, gcs));
+    let control_store = Arc::new(cp::control_store::ControlStore::new_with_store(
+        kms,
+        gcs,
+        Arc::clone(&store),
+    ));
+    control_store
+        .initialize_legacy_fence_key()
+        .await
+        .unwrap_or_else(|error| panic!("Failed to initialize legacy fence key: {error}"));
+    Store::spawn_legacy_checkpoint_reconciler(Arc::clone(&store));
+    let recovered_rebinds = control_store
+        .reconcile_pending_identity_rebinds()
+        .await
+        .unwrap_or_else(|error| panic!("Failed to reconcile identity rebinds: {error}"));
+    if recovered_rebinds > 0 {
+        info!(
+            recovered = recovered_rebinds,
+            "reconciled pending identity rebinds before request admission"
+        );
+    }
 
     let (jwt_secrets, google_web_client_secret) = if test_mode_enabled() {
         let jwt_secret =
@@ -475,6 +763,22 @@ async fn main() {
         cp::CpConfig::from_env(jwt_secrets, google_web_client_secret)
             .expect("control-plane config"),
     );
+    let apple_provider = if let Some(config) = cp_config.apple_sign_in.clone() {
+        let private_key = if test_mode_enabled() {
+            std::env::var("APPLE_PRIVATE_KEY_PEM")
+                .unwrap_or_else(|_| panic!("APPLE_PRIVATE_KEY_PEM is required when Apple sign-in is configured in test mode"))
+        } else {
+            cp::fetch_secret_from_manager("kioku-apple-sign-in-private-key", "latest")
+                .await
+                .unwrap_or_else(|e| panic!("Failed to fetch Sign in with Apple private key: {e}"))
+        };
+        Some(Arc::new(
+            cp::apple::AppleIdentityProvider::new(config, &private_key)
+                .expect("valid Sign in with Apple private key"),
+        ))
+    } else {
+        None
+    };
 
     // ── TLS & Attestation setup ───────────────────────────────────────────────
     let port: u16 = std::env::var("PORT")
@@ -554,8 +858,23 @@ async fn main() {
     // warm-up: ~470 MB of weights, seconds) so the first MCP query doesn't
     // eat the cold start; absence is non-fatal (FTS-only mode).
     let embedding_engine = embedding::EmbeddingEngine::from_env();
+    let voice_engine = cp::voice_memory::VoiceEngine::from_env();
+    assert!(
+        voice_engine.is_some() || test_mode_enabled(),
+        "the pinned voice embedding model is required in production"
+    );
 
-    let resend_api_key = std::env::var("RESEND_API_KEY").ok();
+    // Production always reads the credential from Secret Manager. It is never
+    // accepted as a launch-time environment override, which keeps it out of
+    // the Confidential Space attestation token and VM configuration. Local
+    // test mode may opt into Resend with RESEND_API_KEY or omit it entirely.
+    let resend_api_key = resolve_resend_api_key(
+        test_mode_enabled(),
+        std::env::var("RESEND_API_KEY").ok(),
+        || cp::fetch_secret_from_manager("kioku-resend-api-key", "latest"),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("Failed to configure Resend API key: {error}"));
     let email_from_address = std::env::var("EMAIL_FROM_ADDRESS")
         .unwrap_or_else(|_| "Kioku <notifications@notify.kiokuu.com>".to_string());
 
@@ -567,9 +886,81 @@ async fn main() {
             )) as Arc<dyn cp::email_worker::EmailTransport>
         });
 
+    let build_profile = std::env::var("KIOKU_BUILD_PROFILE").unwrap_or_else(|_| {
+        if test_mode_enabled() {
+            "evaluation"
+        } else {
+            "production"
+        }
+        .into()
+    });
+    let apns_identifiers = resolve_apns_identifiers(
+        &build_profile,
+        std::env::var("APNS_TEAM_ID").ok(),
+        std::env::var("APNS_PRODUCTION_KEY_ID").ok(),
+        std::env::var("APNS_SANDBOX_KEY_ID").ok(),
+    )
+    .unwrap_or_else(|error| panic!("Failed to configure APNs: {error}"));
+    let push_transport: Option<Arc<dyn cp::push::PushTransport>> =
+        if let Some(identifiers) = apns_identifiers {
+            let production_key = if test_mode_enabled() {
+                std::env::var("APNS_PRODUCTION_PRIVATE_KEY_PEM").ok()
+            } else {
+                Some(
+                    cp::fetch_secret_from_manager("kioku-apns-production-private-key", "latest")
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to configure production APNs credential: {error}")
+                        }),
+                )
+            };
+            let sandbox_key = if test_mode_enabled() {
+                std::env::var("APNS_SANDBOX_PRIVATE_KEY_PEM").ok()
+            } else {
+                Some(
+                    cp::fetch_secret_from_manager("kioku-apns-sandbox-private-key", "latest")
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("Failed to configure sandbox APNs credential: {error}")
+                        }),
+                )
+            };
+            match (production_key, sandbox_key) {
+                (Some(production_key), Some(sandbox_key)) => {
+                    let production = cp::push::ApnsCredential::new(
+                        identifiers.team_id.clone(),
+                        identifiers.production_key_id,
+                        &production_key,
+                    )
+                    .expect("valid production APNs credential");
+                    let sandbox = cp::push::ApnsCredential::new(
+                        identifiers.team_id,
+                        identifiers.sandbox_key_id,
+                        &sandbox_key,
+                    )
+                    .expect("valid sandbox APNs credential");
+                    Some(
+                        Arc::new(cp::push::ApnsTransport::new(production, Some(sandbox)))
+                            as Arc<dyn cp::push::PushTransport>,
+                    )
+                }
+                _ if build_profile == "evaluation" => None,
+                _ => panic!("production startup requires both APNs private-key secrets"),
+            }
+        } else {
+            None
+        };
+
+    let billing_gateway: Arc<dyn cp::billing::BillingGateway> = Arc::new(
+        cp::billing::HttpBillingGateway::from_env()
+            .unwrap_or_else(|error| panic!("Invalid billing service configuration: {error}")),
+    );
+
     let cp_state = Arc::new(cp::CpState {
         store: Arc::clone(&store),
         control: control_store,
+        billing: billing_gateway,
+        recording_lease_gate: Arc::new(cp::billing::RecordingLeaseGates::default()),
         user_verifier: Arc::new(cp::auth::UserIdTokenVerifier::new(
             cp_config.user_audiences(),
         )),
@@ -577,43 +968,35 @@ async fn main() {
             .reviewer_auth
             .as_ref()
             .map(|config| Arc::new(cp::auth::ReviewerIdentityVerifier::new(config.clone()))),
+        apple_provider,
         sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
         mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
         oauth_limiter: cp::limits::RateLimiter::new(120.0, 2.0),
         test_email_limiter: cp::limits::RateLimiter::new(3.0, 0.05),
         email_transport,
+        push_transport,
         config: cp_config,
         embedding: embedding_engine,
+        voice: voice_engine,
     });
 
     // Internal summarizer cron (replaces Cloud Scheduler — no external trigger).
     cp::summarizer::spawn_scheduler(Arc::clone(&cp_state));
+    cp::media_worker::spawn_scheduler(Arc::clone(&cp_state));
+    cp::model_usage::spawn_delivery_worker(Arc::clone(&cp_state));
+    cp::billing::spawn_detach_worker(Arc::clone(&cp_state));
+    cp::sync::spawn_account_deletion_reconciler(Arc::clone(&cp_state));
 
-    // ── Legacy data-plane routes ──────────────────────────────────────────────
-    let authenticated = Router::new()
-        .route("/v1/ingest", post(handle_ingest))
-        .route("/v1/search", post(handle_search))
-        .route("/v1/context", post(handle_context))
-        .route("/v1/range", post(handle_range))
-        .route("/v1/episodes/upsert", post(handle_episodes_upsert))
-        .route("/v1/episodes/list", post(handle_episodes_list))
-        .route("/v1/episodes/members", post(handle_episodes_members))
-        .route(
-            "/v1/episodes/delete_range",
-            post(handle_episodes_delete_range),
-        )
-        .route("/v1/stats", post(handle_stats))
-        .route("/v1/export", get(handle_export))
-        .route("/v1/user", delete(handle_delete_user))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_auth,
-        ))
-        .with_state(Arc::clone(&state));
+    // ── Retired legacy data-plane tombstones ─────────────────────────────────
+    let authenticated = legacy_data_plane_router(Arc::clone(&state));
 
     // Public OAuth routes + auth-gated sync/account/MCP/REST routes.
     let cp_authed = cp::sync::router()
+        .merge(cp::media::router())
+        .merge(cp::push::router())
         .merge(cp::query::router())
+        .merge(cp::billing::router())
+        .merge(cp::apple::authenticated_router())
         .layer(middleware::from_fn_with_state(
             Arc::clone(&cp_state),
             cp::auth::require_auth,
@@ -622,10 +1005,16 @@ async fn main() {
             Arc::clone(&cp_state),
             cp::cors::cors_middleware,
         ));
-    let public_oauth = cp::oauth::router().layer(middleware::from_fn_with_state(
-        Arc::clone(&cp_state),
-        limit_public_oauth,
-    ));
+    let public_oauth = cp::oauth::router()
+        .merge(cp::apple::public_router())
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&cp_state),
+            limit_public_oauth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&cp_state),
+            cp::cors::cors_middleware,
+        ));
     let control_plane = public_oauth
         .merge(cp_authed)
         .with_state(Arc::clone(&cp_state));
@@ -635,6 +1024,7 @@ async fn main() {
         .route("/v1/attestation", get(handle_attestation))
         .merge(authenticated)
         .merge(control_plane)
+        .layer(middleware::from_fn(observe_billing_request))
         .layer(middleware::from_fn(security_headers))
         .with_state(Arc::clone(&state));
 
@@ -735,5 +1125,251 @@ async fn serve_tls(
                 tracing::debug!(error = %e, "connection closed with error");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod email_startup_tests {
+    use super::{health_json, resolve_apns_identifiers, resolve_resend_api_key};
+    use crate::store::LegacyCheckpointReconciliation;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn production_startup_requires_complete_apns_identifiers() {
+        assert!(resolve_apns_identifiers("production", None, None, None).is_err());
+        assert!(resolve_apns_identifiers(
+            "production",
+            Some("ABCDE12345".into()),
+            Some("PRODKEY123".into()),
+            None,
+        )
+        .is_err());
+        assert!(resolve_apns_identifiers(
+            "production",
+            Some("ABCDE12345".into()),
+            Some("PRODKEY123".into()),
+            Some("SBOXKEY123".into()),
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(
+            resolve_apns_identifiers("evaluation", None, None, None).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn local_test_mode_can_omit_email_without_fetching_a_secret() {
+        let fetched = Arc::new(AtomicBool::new(false));
+        let fetched_in_closure = Arc::clone(&fetched);
+
+        let key = resolve_resend_api_key(true, None, move || async move {
+            fetched_in_closure.store(true, Ordering::SeqCst);
+            Ok("re_production_key".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(key, None);
+        assert!(!fetched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn production_ignores_environment_key_and_fetches_secret_manager() {
+        let key = resolve_resend_api_key(false, Some("re_environment_key".into()), || async {
+            Ok("re_secret_manager_key".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(key.as_deref(), Some("re_secret_manager_key"));
+    }
+
+    #[tokio::test]
+    async fn production_normalizes_surrounding_whitespace_from_secret_manager() {
+        let key = resolve_resend_api_key(false, None, || async {
+            Ok("\n\tre_secret_manager_key\r\n".to_string())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(key.as_deref(), Some("re_secret_manager_key"));
+    }
+
+    #[tokio::test]
+    async fn production_fails_closed_for_missing_or_malformed_secret() {
+        let missing = resolve_resend_api_key(false, None, || async {
+            Err("secret version unavailable".to_string())
+        })
+        .await;
+        assert_eq!(missing.unwrap_err(), "secret version unavailable");
+
+        let malformed = resolve_resend_api_key(false, None, || async {
+            Ok("re_bad\r\nInjected: value".to_string())
+        })
+        .await;
+        assert_eq!(
+            malformed.unwrap_err(),
+            "Resend API key has an invalid format"
+        );
+    }
+
+    #[test]
+    fn health_serializes_only_aggregate_checkpoint_readiness() {
+        let health = health_json(LegacyCheckpointReconciliation {
+            ready: true,
+            completed_scans: 2,
+            listed_live_objects: 3,
+            live_archives_checked: 3,
+            checkpoints_verified: 3,
+            failures: 0,
+        });
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["service"], "kioku-enclave");
+        assert_eq!(health["legacy_checkpoint_reconciliation_ready"], true);
+        assert_eq!(
+            health["legacy_checkpoint_reconciliation"]["checkpoints_verified"],
+            3
+        );
+        assert!(health
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.contains("user")));
+    }
+}
+
+#[cfg(test)]
+mod billing_request_observability_tests {
+    use super::*;
+
+    #[test]
+    fn only_fixed_billing_routes_produce_content_free_observations() {
+        assert_eq!(
+            billing_request_observation(&Method::GET, "/api/billing", StatusCode::OK, 61),
+            Some(BillingRequestObservation {
+                route: "billing_summary",
+                status: 200,
+                status_class: "2xx",
+                duration_ms: 61,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(
+                &Method::POST,
+                "/api/billing/recording-lease",
+                StatusCode::SERVICE_UNAVAILABLE,
+                2_001,
+            ),
+            Some(BillingRequestObservation {
+                route: "recording_lease",
+                status: 503,
+                status_class: "5xx",
+                duration_ms: 2_001,
+            })
+        );
+        assert_eq!(
+            billing_request_observation(&Method::GET, "/api/accounts/private", StatusCode::OK, 1),
+            None
+        );
+        assert_eq!(
+            billing_request_observation(&Method::GET, "/api/billing/private", StatusCode::OK, 1),
+            None
+        );
+        for (method, path) in [
+            (Method::OPTIONS, "/api/billing"),
+            (Method::OPTIONS, "/api/billing/recording-lease"),
+            (Method::POST, "/api/billing"),
+            (Method::GET, "/api/billing/recording-lease"),
+        ] {
+            assert_eq!(
+                billing_request_observation(&method, path, StatusCode::METHOD_NOT_ALLOWED, 1),
+                None,
+                "observed wrong method {method} for {path}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retired_route_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn every_retired_v1_route_authenticates_before_gone_and_never_mutates() {
+        let gcs = Arc::new(crate::store::tests::FakeGcs::new());
+        let store = Arc::new(Store::new(
+            Arc::new(crate::store::tests::FakeKms),
+            gcs.clone(),
+        ));
+        let user_id = "legacy-route-test";
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at,ocr_text)
+                     VALUES ('2026-08-09T12:00:00.000Z','must survive')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(user_id).await.unwrap();
+        let object_name = format!("indexes/{user_id}.db.enc");
+        let generations_before = gcs.exact_generation_count(&object_name);
+
+        let state = Arc::new(AppState {
+            store: Arc::clone(&store),
+            id_token_verifier: Arc::new(auth::IdTokenVerifier::new(
+                "test-audience".into(),
+                "caller@example.com".into(),
+            )),
+            attestation_cache: None,
+            tls_keystone: None,
+        });
+        let router = legacy_data_plane_router(Arc::clone(&state)).with_state(state);
+        for path in [
+            "/v1/ingest",
+            "/v1/search",
+            "/v1/context",
+            "/v1/range",
+            "/v1/episodes/upsert",
+            "/v1/episodes/list",
+            "/v1/episodes/members",
+            "/v1/episodes/delete_range",
+            "/v1/stats",
+            "/v1/export",
+            "/v1/user",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::from(r#"{"user_id":"legacy-route-test"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        // This is the post-authentication destination for all paths above.
+        let gone = legacy_data_plane_retired().await;
+        assert_eq!(gone.status(), StatusCode::GONE);
+        assert_eq!(gcs.exact_generation_count(&object_name), generations_before);
+        let surviving: i64 = store
+            .with_user(user_id, |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(surviving, 1);
     }
 }

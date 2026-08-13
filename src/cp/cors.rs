@@ -77,9 +77,12 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             jwt_secrets: vec!["secret".to_string()],
             google_desktop_client_id: "".to_string(),
+            google_ios_client_id: "".to_string(),
             google_web_client_id: "".to_string(),
             google_web_client_secret: "".to_string(),
+            apple_sign_in: None,
             allowed_emails: None,
+            admin_user_ids: Vec::new(),
             scheduler_sa_email: None,
             vertex_project: "".to_string(),
             vertex_location: "".to_string(),
@@ -87,8 +90,10 @@ mod tests {
             quota_utterances_per_day: 0,
             quota_screenshots_per_day: 0,
             quota_mcp_calls_per_day: 0,
+            quota_vertex_output_tokens_per_day: 524_288,
             web_origin: web_origin.to_string(),
             reviewer_auth: None,
+            billing_enforcement_mode: crate::cp::BillingEnforcementMode::Enforce,
         });
 
         use crate::store::tests::{FakeGcs, FakeKms};
@@ -100,15 +105,20 @@ mod tests {
         let cp_state = Arc::new(CpState {
             store,
             control,
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config,
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             embedding: None,
+            voice: None,
         });
 
         Router::new()

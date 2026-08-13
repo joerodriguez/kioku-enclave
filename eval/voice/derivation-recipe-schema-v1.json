@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/joerodriguez/kioku-enclave/eval/voice/derivation-recipe-schema-v1.json",
+  "title": "Kioku ADR-0016 private voice evaluation derivation recipe v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "corpus_id",
+    "source_manifest_sha256",
+    "derivation_id",
+    "inputs",
+    "recordings"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "corpus_id": {"$ref": "#/$defs/opaqueId"},
+    "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "derivation_id": {
+      "type": "string",
+      "pattern": "^derivation-[0-9a-f]{16,64}$"
+    },
+    "inputs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": {"$ref": "#/$defs/input"}
+    },
+    "recordings": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": {"$ref": "#/$defs/recording"}
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_id",
+        "artifact_id",
+        "archive_format",
+        "member_path",
+        "member_sha256"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/opaqueId"},
+        "source_id": {"$ref": "#/$defs/opaqueId"},
+        "artifact_id": {"$ref": "#/$defs/opaqueId"},
+        "archive_format": {"enum": ["plain", "tar_gzip", "zip"]},
+        "member_path": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 1024},
+            {"type": "null"}
+          ]
+        },
+        "member_sha256": {
+          "oneOf": [
+            {"$ref": "#/$defs/sha256"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"archive_format": {"const": "plain"}}},
+          "then": {
+            "properties": {
+              "member_path": {"type": "null"},
+              "member_sha256": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"archive_format": {"const": "tar_gzip"}}},
+          "then": {
+            "properties": {
+              "member_path": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "member_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"archive_format": {"const": "zip"}}},
+          "then": {
+            "properties": {
+              "member_path": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "member_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      ]
+    },
+    "track": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_id",
+        "source_start_ms",
+        "source_end_ms",
+        "output_start_ms",
+        "gain_milli"
+      ],
+      "properties": {
+        "input_id": {"$ref": "#/$defs/opaqueId"},
+        "source_start_ms": {"type": "integer", "minimum": 0, "maximum": 1800000},
+        "source_end_ms": {"type": "integer", "minimum": 1, "maximum": 1800000},
+        "output_start_ms": {"type": "integer", "minimum": 0, "maximum": 1800000},
+        "gain_milli": {"type": "integer", "minimum": 1, "maximum": 4000}
+      }
+    },
+    "referenceTurn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_ms", "end_ms", "speaker_id"],
+      "properties": {
+        "start_ms": {"type": "integer", "minimum": 0, "maximum": 1800000},
+        "end_ms": {"type": "integer", "minimum": 1, "maximum": 1800000},
+        "speaker_id": {
+          "type": "string",
+          "pattern": "^speaker-[0-9a-f]{16,64}$"
+        }
+      }
+    },
+    "recording": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_id",
+        "media_artifact_id",
+        "labels_artifact_id",
+        "selected_item_id",
+        "slice",
+        "duration_ms",
+        "tracks",
+        "reference_turns"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^recording-[0-9a-f]{16,64}$"
+        },
+        "source_id": {"$ref": "#/$defs/opaqueId"},
+        "media_artifact_id": {"$ref": "#/$defs/opaqueId"},
+        "labels_artifact_id": {"$ref": "#/$defs/opaqueId"},
+        "selected_item_id": {"$ref": "#/$defs/opaqueId"},
+        "slice": {"$ref": "#/$defs/opaqueId"},
+        "duration_ms": {"type": "integer", "minimum": 1, "maximum": 1800000},
+        "tracks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": {"$ref": "#/$defs/track"}
+        },
+        "reference_turns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10000,
+          "items": {"$ref": "#/$defs/referenceTurn"}
+        }
+      }
+    }
+  }
+}

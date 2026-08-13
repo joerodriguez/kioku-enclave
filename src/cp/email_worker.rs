@@ -449,8 +449,11 @@ mod tests {
             jwt_secrets: vec!["test-secret".into()],
             google_desktop_client_id: "desktop".into(),
             google_web_client_id: "web".into(),
+            google_ios_client_id: "ios".into(),
             google_web_client_secret: "secret".into(),
+            apple_sign_in: None,
             allowed_emails: None,
+            admin_user_ids: Vec::new(),
             scheduler_sa_email: None,
             vertex_project: "project".into(),
             vertex_location: "location".into(),
@@ -458,8 +461,10 @@ mod tests {
             quota_utterances_per_day: 1,
             quota_screenshots_per_day: 1,
             quota_mcp_calls_per_day: 1,
+            quota_vertex_output_tokens_per_day: 524_288,
             web_origin: "http://localhost:3000".into(),
             reviewer_auth: None,
+            billing_enforcement_mode: crate::cp::BillingEnforcementMode::Enforce,
         })
     }
 
@@ -500,15 +505,20 @@ mod tests {
         let state = Arc::new(CpState {
             store: store.clone(),
             control: control.clone(),
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: test_cp_config(),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             embedding: None,
+            voice: None,
         });
 
         let fake_transport = FakeEmailTransport::new();
@@ -570,15 +580,20 @@ mod tests {
         let state = Arc::new(CpState {
             store: store.clone(),
             control: control.clone(),
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: test_cp_config(),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             embedding: None,
+            voice: None,
         });
 
         let fake_transport = FakeEmailTransport::new();
@@ -628,15 +643,20 @@ mod tests {
         let state = Arc::new(CpState {
             store: store.clone(),
             control: control.clone(),
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: test_cp_config(),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             embedding: None,
+            voice: None,
         });
 
         let fake_transport = FakeEmailTransport::new();

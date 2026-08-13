@@ -9,6 +9,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEPLOYMENT_REPO="${DEPLOYMENT_REPO:-}"
 RELEASE_SIGNER_FINGERPRINT="${RELEASE_SIGNER_FINGERPRINT:-}"
 ROLL=false
+EXPECTED_VOICE_QUALITY_GATE=""
+EXPECTED_BILLING_ENFORCEMENT_MODE=""
 
 usage() {
   echo "Usage: $0 <vMAJOR.MINOR.PATCH> [--roll]"
@@ -37,6 +39,13 @@ if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; the
   exit 2
 fi
 
+PROBE_RELEASE=false
+PACKAGE_RELEASE_TAG="$RELEASE_TAG"
+if [[ "$RELEASE_TAG" =~ ^(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))-witness-probe\.([1-9][0-9]*)$ ]]; then
+  PROBE_RELEASE=true
+  PACKAGE_RELEASE_TAG="${BASH_REMATCH[1]}"
+fi
+
 if [[ "$ROLL" == "true" && ! "$DEPLOYMENT_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "Error: --roll requires DEPLOYMENT_REPO=owner/repository." >&2
   exit 2
@@ -62,6 +71,31 @@ done
 cd "$REPO_ROOT"
 gh auth status >/dev/null
 
+# The same checked-in parser used by the build and metadata verifier decides
+# whether this exact tag may carry probe-v1. This runs before any tag/release
+# mutation. The probe can never enter the production roll path.
+SELECTED_ARCHIVE_WITNESS_MODE="$(python3 - "$RELEASE_TAG" <<'PY'
+import sys
+from pathlib import Path
+from scripts.archive_witness_probe_config import load_probe_config, select_probe_config
+
+selected = select_probe_config(
+    load_probe_config(Path("config/archive-witness-probe.json")),
+    profile="production",
+    source_ref=sys.argv[1],
+)
+print(selected.mode)
+PY
+)"
+if [[ "$SELECTED_ARCHIVE_WITNESS_MODE" == "probe-v1" && "$PROBE_RELEASE" != "true" ]]; then
+  echo "Error: probe-v1 requires an exact vX.Y.Z-witness-probe.N prerelease tag." >&2
+  exit 1
+fi
+if [[ "$SELECTED_ARCHIVE_WITNESS_MODE" == "probe-v1" && "$ROLL" == "true" ]]; then
+  echo "Error: refusing to roll an archive witness probe release to production." >&2
+  exit 1
+fi
+
 REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 VISIBILITY="$(gh repo view --json visibility --jq .visibility)"
 if [[ "$VISIBILITY" != "PUBLIC" ]]; then
@@ -80,11 +114,13 @@ REQUIRED_REPO_VARIABLES=(
   GCP_WIF_PROVIDER GCP_SERVICE_ACCOUNT
   GCP_PROJECT_ID GCP_REGION AR_REPOSITORY IMAGE_NAME
   ENCLAVE_KMS_PROJECT ENCLAVE_KMS_LOCATION ENCLAVE_KMS_KEY_RING
-  ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_RUN_SA_EMAIL
+  ENCLAVE_KMS_KEY ENCLAVE_GCS_BUCKET ENCLAVE_GCS_MEDIA_BUCKET ENCLAVE_GCS_LEGACY_MEDIA_BUCKET ENCLAVE_RUN_SA_EMAIL
   ENCLAVE_AUDIENCE ENCLAVE_ATTEST_STS_AUDIENCE
-  GOOGLE_DESKTOP_CLIENT_ID GOOGLE_WEB_CLIENT_ID BASE_URL WEB_ORIGIN
+  GOOGLE_DESKTOP_CLIENT_ID GOOGLE_IOS_CLIENT_ID GOOGLE_WEB_CLIENT_ID BASE_URL WEB_ORIGIN
+  APNS_TEAM_ID APNS_PRODUCTION_KEY_ID APNS_SANDBOX_KEY_ID
   REVIEWER_AUTH_API_KEY REVIEWER_AUTH_UID REVIEWER_AUTH_EMAIL
   VERTEX_PROJECT VERTEX_LOCATION VERTEX_MODEL
+  BILLING_SERVICE_URL BILLING_SERVICE_AUDIENCE BILLING_ENFORCEMENT_MODE
   ENCLAVE_ACME ENCLAVE_ACME_DIRECTORY
 )
 CONFIGURED_VARIABLES="$(gh variable list --repo "$REPOSITORY" --json name --jq '.[].name')"
@@ -108,6 +144,14 @@ PROJECT_ID="$(gh variable get GCP_PROJECT_ID --repo "$REPOSITORY")"
 REGION="$(gh variable get GCP_REGION --repo "$REPOSITORY")"
 AR_REPOSITORY="$(gh variable get AR_REPOSITORY --repo "$REPOSITORY")"
 IMAGE_NAME="$(gh variable get IMAGE_NAME --repo "$REPOSITORY")"
+EXPECTED_GCS_BUCKET="$(gh variable get ENCLAVE_GCS_BUCKET --repo "$REPOSITORY")"
+EXPECTED_GCS_MEDIA_BUCKET="$(gh variable get ENCLAVE_GCS_MEDIA_BUCKET --repo "$REPOSITORY")"
+EXPECTED_GCS_LEGACY_MEDIA_BUCKET="$(gh variable get ENCLAVE_GCS_LEGACY_MEDIA_BUCKET --repo "$REPOSITORY")"
+ENCLAVE_RUN_SA_EMAIL="$(gh variable get ENCLAVE_RUN_SA_EMAIL --repo "$REPOSITORY")"
+if [[ -z "$EXPECTED_GCS_BUCKET" || -z "$EXPECTED_GCS_MEDIA_BUCKET" || -z "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" || "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" != "$EXPECTED_GCS_BUCKET" ]]; then
+  echo "Error: ENCLAVE_GCS_LEGACY_MEDIA_BUCKET must be configured and exactly match ENCLAVE_GCS_BUCKET for the Phase-0 dual-media migration." >&2
+  exit 1
+fi
 REGISTRY_HOST="${REGION}-docker.pkg.dev"
 
 CURRENT_BRANCH="$(git branch --show-current)"
@@ -136,6 +180,46 @@ gcloud artifacts repositories describe "$AR_REPOSITORY" \
   --project "$PROJECT_ID" \
   --location "$REGION" >/dev/null
 gcloud auth configure-docker "$REGISTRY_HOST" --quiet >/dev/null
+if [[ "$ROLL" == "true" ]]; then
+  apns_runtime_member="serviceAccount:${ENCLAVE_RUN_SA_EMAIL}"
+  for apns_secret in kioku-apns-production-private-key kioku-apns-sandbox-private-key; do
+    apns_latest_state="$(gcloud secrets versions describe latest \
+      --secret "$apns_secret" \
+      --project "$PROJECT_ID" \
+      --format='value(state)' 2>/dev/null || true)"
+    if [[ "$apns_latest_state" != "ENABLED" ]]; then
+      echo "Error: required APNs secret has no enabled latest version: $apns_secret" >&2
+      echo "       Refusing traffic promotion without reading or exposing the credential." >&2
+      exit 1
+    fi
+
+    apns_policy="$(gcloud secrets get-iam-policy "$apns_secret" \
+      --project "$PROJECT_ID" \
+      --format=json 2>/dev/null || true)"
+    if ! python3 -c '
+import json
+import sys
+
+expected_member = sys.argv[1]
+try:
+    policy = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+
+matches = [
+    binding
+    for binding in policy.get("bindings", [])
+    if binding.get("role") == "roles/secretmanager.secretAccessor"
+    and expected_member in binding.get("members", [])
+]
+raise SystemExit(0 if matches else 1)
+' "$apns_runtime_member" <<< "$apns_policy"; then
+      echo "Error: APNs secret lacks exact enclave runtime accessor binding: $apns_secret" >&2
+      echo "       Expected roles/secretmanager.secretAccessor for $apns_runtime_member." >&2
+      exit 1
+    fi
+  done
+fi
 
 REMOTE_TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG" 2>/dev/null || true)"
 RELEASE_EXISTS=false
@@ -185,16 +269,98 @@ print(match.group(1))
 else
   PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 fi
-if [[ "$RELEASE_TAG" != "v${PACKAGE_VERSION}" ]]; then
-  echo "Error: Cargo package version ${PACKAGE_VERSION} does not match ${RELEASE_TAG}." >&2
+if [[ "$PACKAGE_RELEASE_TAG" != "v${PACKAGE_VERSION}" ]]; then
+  echo "Error: Cargo package version ${PACKAGE_VERSION} does not match ${PACKAGE_RELEASE_TAG}." >&2
   exit 1
 fi
 
+verify_required_ci_success() {
+  local commit="$1"
+  local run_json run_id jobs_json
+
+  if ! run_json="$(gh run list \
+    --repo "$REPOSITORY" \
+    --workflow build.yml \
+    --commit "$commit" \
+    --event push \
+    --limit 100 \
+    --json databaseId,headBranch,headSha,status,conclusion)"; then
+    echo "Error: could not query required CI for exact commit ${commit}." >&2
+    return 1
+  fi
+  run_id="$(printf '%s' "$run_json" | python3 -c '
+import json
+import sys
+
+expected_commit = sys.argv[1]
+runs = json.load(sys.stdin)
+matching = [
+    run
+    for run in runs
+    if type(run) is dict
+    and type(run.get("databaseId")) is int
+    and run.get("headBranch") == "main"
+    and run.get("headSha") == expected_commit
+    and run.get("status") == "completed"
+    and run.get("conclusion") == "success"
+]
+if not matching:
+    raise SystemExit(
+        "no successful completed push workflow run for the exact main commit"
+    )
+print(max(run["databaseId"] for run in matching))
+' "$commit")" || {
+    echo "Error: required CI has not succeeded for exact commit ${commit}." >&2
+    echo "       Wait for the main push workflow to complete successfully, then retry." >&2
+    return 1
+  }
+
+  if ! jobs_json="$(gh run view "$run_id" --repo "$REPOSITORY" --json jobs)"; then
+    echo "Error: could not inspect required CI run ${run_id}." >&2
+    return 1
+  fi
+  if ! printf '%s' "$jobs_json" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+jobs = data.get("jobs") if type(data) is dict else None
+ci_jobs = [
+    job
+    for job in jobs or []
+    if type(job) is dict and job.get("name") == "CI"
+]
+if len(ci_jobs) != 1:
+    raise SystemExit("the exact workflow run did not contain exactly one CI job")
+job = ci_jobs[0]
+if job.get("status") != "completed" or job.get("conclusion") != "success":
+    raise SystemExit("the required CI job did not complete successfully")
+'; then
+    echo "Error: required CI job did not succeed for exact commit ${commit}." >&2
+    return 1
+  fi
+
+  echo "Verified required CI run ${run_id} for exact commit ${commit}."
+}
+
+if [[ "$ROLLBACK_EXISTING" == "false" ]]; then
+  REQUIRED_CI_COMMIT="$COMMIT"
+  if [[ "$RESUME_EXISTING" == "true" ]]; then
+    REQUIRED_CI_COMMIT="$REMOTE_TAG_COMMIT"
+  fi
+  echo "Verifying required CI..."
+  verify_required_ci_success "$REQUIRED_CI_COMMIT"
+fi
+
 if [[ "$ROLLBACK_EXISTING" == "false" && "$RESUME_EXISTING" == "false" ]]; then
-  echo "Running release checks..."
-  cargo fmt --all -- --check
-  cargo test --locked
-  cargo clippy --locked --all-targets -- -D warnings
+  echo "Checking release-only metadata..."
+  VOICE_QUALITY_GATE="$(python3 scripts/check_voice_release_gate.py)"
+  EXPECTED_VOICE_QUALITY_GATE="$VOICE_QUALITY_GATE"
+  EXPECTED_BILLING_ENFORCEMENT_MODE="$(gh variable get BILLING_ENFORCEMENT_MODE --repo "$REPOSITORY")"
+  if [[ "$EXPECTED_BILLING_ENFORCEMENT_MODE" != "shadow" && "$EXPECTED_BILLING_ENFORCEMENT_MODE" != "enforce" ]]; then
+    echo "Error: BILLING_ENFORCEMENT_MODE must be either shadow or enforce." >&2
+    exit 1
+  fi
 fi
 
 verify_tag_signer() {
@@ -235,6 +401,7 @@ fi
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 METADATA_FILE="$WORK_DIR/enclave-release.json"
+METADATA_PROVENANCE_FILE="$WORK_DIR/enclave-release-metadata-provenance.jsonl"
 PROVENANCE_FILE="$WORK_DIR/enclave-provenance.jsonl"
 SBOM_FILE="$WORK_DIR/enclave-sbom.spdx.json"
 SBOM_ATTESTATION_FILE="$WORK_DIR/enclave-sbom-attestation.jsonl"
@@ -302,47 +469,40 @@ else
   echo "Using durable metadata from the existing public release."
 fi
 
-if [[ ! -s "$METADATA_FILE" ]]; then
-  echo "Error: build did not produce enclave-release.json" >&2
+if [[ ! -s "$METADATA_FILE" || ! -s "$METADATA_PROVENANCE_FILE" ]]; then
+  echo "Error: build did not produce the signed enclave release metadata manifest and provenance bundle" >&2
   exit 1
 fi
 
-RELEASE_METADATA="$(python3 - "$METADATA_FILE" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    data = json.load(handle)
-keys = ("schema_version", "source_repository", "source_ref", "source_commit", "image_uri", "image_digest_uri", "image_digest", "build_url")
-print("\t".join(str(data[key]) for key in keys))
-PY
-)"
-IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL <<< "$RELEASE_METADATA"
+echo "Verifying signed release metadata manifest..."
+gh attestation verify "$METADATA_FILE" \
+  --repo "$REPOSITORY" \
+  --bundle "$METADATA_PROVENANCE_FILE" \
+  --deny-self-hosted-runners \
+  --signer-workflow "${REPOSITORY}/.github/workflows/build.yml" \
+  --source-digest "$REMOTE_TAG_COMMIT" \
+  --source-ref "refs/tags/${RELEASE_TAG}" >/dev/null
 
-if [[ "$SCHEMA_VERSION" != "1" || "$SOURCE_REPOSITORY" != "https://github.com/${REPOSITORY}" ]]; then
-  echo "Error: build metadata has an unexpected schema or source repository." >&2
-  exit 1
-fi
-if [[ "$BUILT_REF" != "$RELEASE_TAG" || "$BUILT_COMMIT" != "$REMOTE_TAG_COMMIT" ]]; then
-  echo "Error: build metadata does not match the requested source tag and commit." >&2
-  exit 1
-fi
-if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo "Error: build returned an invalid image digest: $DIGEST" >&2
-  exit 1
-fi
+RELEASE_METADATA="$(python3 scripts/verify_release_metadata.py \
+  "$METADATA_FILE" \
+  --repository "$REPOSITORY" \
+  --tag "$RELEASE_TAG" \
+  --commit "$REMOTE_TAG_COMMIT" \
+  --image-repository "${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}" \
+  --expected-gcs-bucket "$EXPECTED_GCS_BUCKET" \
+  --expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET" \
+  --expected-gcs-legacy-media-bucket "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET")"
+IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE GCS_BUCKET GCS_MEDIA_BUCKET GCS_LEGACY_MEDIA_BUCKET ARCHIVE_WITNESS_SHADOW_MODE ARCHIVE_WITNESS_PROJECT_ID ARCHIVE_WITNESS_PROJECT_NUMBER ARCHIVE_WITNESS_DATABASE_ID <<< "$RELEASE_METADATA"
 
+if [[ -n "$EXPECTED_VOICE_QUALITY_GATE" && "$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE" ]]; then
+  echo "Error: build metadata voice-quality classification does not match the checked source." >&2
+  exit 1
+fi
+if [[ -n "$EXPECTED_BILLING_ENFORCEMENT_MODE" && "$BILLING_ENFORCEMENT_MODE" != "$EXPECTED_BILLING_ENFORCEMENT_MODE" ]]; then
+  echo "Error: build metadata billing-enforcement mode does not match the checked repository configuration." >&2
+  exit 1
+fi
 EXPECTED_IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
-if [[ "$IMAGE_URI" != "${EXPECTED_IMAGE_REPOSITORY}:"* ]]; then
-  echo "Error: image URI is outside the configured Artifact Registry repository." >&2
-  exit 1
-fi
-if [[ "$DIGEST_URI" != "${EXPECTED_IMAGE_REPOSITORY}@${DIGEST}" ]]; then
-  echo "Error: digest-qualified image URI does not match the configured repository and digest." >&2
-  exit 1
-fi
-if [[ "$BUILD_URL" != "https://github.com/${REPOSITORY}/actions/runs/"* ]]; then
-  echo "Error: build URL is outside this source repository." >&2
-  exit 1
-fi
 REGISTRY_DIGEST="$(gcloud artifacts docker images describe "$DIGEST_URI" \
   --project "$PROJECT_ID" \
   --format='value(image_summary.digest)')"
@@ -428,6 +588,9 @@ printf '%s\n' \
   "| Image | \`${DIGEST_URI}\` |" \
   "| Image digest | \`${DIGEST}\` |" \
   "| Build | [GitHub Actions run](${BUILD_URL}) |" \
+  "| Voice quality gate | \`${VOICE_QUALITY_GATE}\` |" \
+  "| Phase-0 current media bucket | \`${GCS_MEDIA_BUCKET}\` |" \
+  "| Phase-0 legacy media bucket | \`${GCS_LEGACY_MEDIA_BUCKET}\` (must equal index \`${GCS_BUCKET}\`) |" \
   "" \
   "The digest is the attestation anchor used by the deployment's KMS policy." \
   "See README.md for the trust boundary and current reproducibility caveats." \
@@ -435,6 +598,7 @@ printf '%s\n' \
 
 RELEASE_ASSETS=(
   "$METADATA_FILE"
+  "$METADATA_PROVENANCE_FILE"
   "$PROVENANCE_FILE"
   "$SBOM_FILE"
   "$SBOM_ATTESTATION_FILE"
@@ -442,8 +606,10 @@ RELEASE_ASSETS=(
 EXPECTED_ASSET_NAMES="$(printf '%s\n' \
   enclave-provenance.jsonl \
   enclave-release.json \
+  enclave-release-metadata-provenance.jsonl \
   enclave-sbom-attestation.jsonl \
   enclave-sbom.spdx.json | sort)"
+EXPECTED_ASSETS_CSV="$(tr '\n' ',' <<< "$EXPECTED_ASSET_NAMES" | sed 's/,$//')"
 EXPECTED_PRERELEASE=false
 PRERELEASE_ARGS=(--prerelease=false)
 if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -451,15 +617,120 @@ if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   PRERELEASE_ARGS=(--prerelease)
 fi
 
-if [[ "$RELEASE_EXISTS" == "false" ]]; then
-  # gh creates a draft internally, uploads every asset, and only then publishes;
-  # this is required because immutable releases lock assets at publication.
-  gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
+# Another fingerprint-authorized operator invocation may publish while this
+# script is waiting for and verifying build evidence. Refresh immediately
+# before the first release mutation so a stale "missing" observation cannot
+# lead to an unsafe create attempt. Existing immutable assets are never modified.
+refresh_release_state_before_mutation() {
+  local release_json release_state
+  RELEASE_EXISTS=false
+  RELEASE_IS_DRAFT=false
+  RELEASE_IS_IMMUTABLE=false
+  RELEASE_IS_PRERELEASE=false
+  RELEASE_PUBLISHED_AT=""
+  RELEASE_ASSETS_CSV=""
+
+  if ! release_json="$(gh release view "$RELEASE_TAG" \
+    --repo "$REPOSITORY" \
+    --json isDraft,isImmutable,isPrerelease,publishedAt,assets 2>/dev/null)"; then
+    return 0
+  fi
+  if ! release_state="$(printf '%s' "$release_json" | python3 -c '
+from datetime import datetime
+import json, re, sys
+release = json.load(sys.stdin)
+for key in ("isDraft", "isImmutable", "isPrerelease"):
+    if type(release.get(key)) is not bool:
+        raise SystemExit("release state has a malformed boolean")
+published_at = release.get("publishedAt")
+if published_at is not None and not isinstance(published_at, str):
+    raise SystemExit("release state has a malformed publication time")
+if published_at:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", published_at):
+        raise SystemExit("release state has a malformed publication time")
+    normalized_published_at = published_at[:-1] + "+00:00" if published_at.endswith("Z") else published_at
+    try:
+        parsed_published_at = datetime.fromisoformat(normalized_published_at)
+    except ValueError as error:
+        raise SystemExit("release state has a malformed publication time") from error
+    if parsed_published_at.utcoffset() is None:
+        raise SystemExit("release state has a malformed publication time")
+assets = release.get("assets")
+if not isinstance(assets, list) or any(not isinstance(asset, dict) or not isinstance(asset.get("name"), str) for asset in assets):
+    raise SystemExit("release state has malformed assets")
+names = [asset["name"] for asset in assets]
+if len(names) != len(set(names)) or any("\t" in name or "\n" in name or "\r" in name for name in names):
+    raise SystemExit("release state has unsafe asset names")
+print("\t".join((str(release["isDraft"]).lower(), str(release["isImmutable"]).lower(), str(release["isPrerelease"]).lower(), published_at or "", ",".join(sorted(names)))))
+')"; then
+    echo "Error: release state is malformed; refusing to mutate the release." >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r RELEASE_IS_DRAFT RELEASE_IS_IMMUTABLE RELEASE_IS_PRERELEASE RELEASE_PUBLISHED_AT RELEASE_ASSETS_CSV <<< "$release_state"
+  RELEASE_EXISTS=true
+}
+
+reverify_published_immutable_release() {
+  local release_assets_dir asset_name
+  if [[ "$RELEASE_IS_DRAFT" != "false" || "$RELEASE_IS_IMMUTABLE" != "true" || "$RELEASE_IS_PRERELEASE" != "$EXPECTED_PRERELEASE" || -z "$RELEASE_PUBLISHED_AT" ]]; then
+    echo "Error: refreshed release is not a published immutable release matching the requested tag." >&2
+    exit 1
+  fi
+  if [[ "$RELEASE_ASSETS_CSV" != "$EXPECTED_ASSETS_CSV" ]]; then
+    echo "Error: refreshed immutable release does not contain exactly the expected assets." >&2
+    exit 1
+  fi
+  release_assets_dir="$WORK_DIR/refreshed-immutable-release"
+  mkdir -p "$release_assets_dir"
+  for asset_name in $EXPECTED_ASSET_NAMES; do
+    gh release download "$RELEASE_TAG" \
+      --repo "$REPOSITORY" \
+      --pattern "$asset_name" \
+      --dir "$release_assets_dir"
+    if ! cmp -s "$WORK_DIR/$asset_name" "$release_assets_dir/$asset_name"; then
+      echo "Error: refreshed immutable release asset does not match verified build evidence: $asset_name" >&2
+      exit 1
+    fi
+  done
+}
+
+create_release_or_reverify_publication_race() {
+  if gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
     --repo "$REPOSITORY" \
     --verify-tag \
     --title "Kioku enclave $RELEASE_TAG" \
     --notes-file "$NOTES_FILE" \
-    "${PRERELEASE_ARGS[@]}"
+    "${PRERELEASE_ARGS[@]}"; then
+    return 0
+  fi
+
+  # Close the remaining check/create race as well as the longer evidence-wait
+  # race above. A failed create may mean another authorized invocation
+  # published first (or that the create response was lost). Only an exact
+  # immutable release is accepted; an absent or draft release remains an
+  # incomplete operation for a later explicit resume.
+  echo "Release create did not complete; checking for concurrent authorized publication..."
+  refresh_release_state_before_mutation
+  if [[ "$RELEASE_EXISTS" == "true" && "$RELEASE_IS_DRAFT" == "false" ]]; then
+    reverify_published_immutable_release
+    return 0
+  fi
+  echo "Error: release create failed without an exact published immutable release." >&2
+  return 1
+}
+
+refresh_release_state_before_mutation
+if [[ "$RELEASE_EXISTS" == "true" && "$RELEASE_IS_DRAFT" == "false" ]]; then
+  # This includes the publication race: only a complete immutable public
+  # release may replace the planned create path, and it is re-verified before
+  # proceeding without any edit or upload.
+  reverify_published_immutable_release
+fi
+
+if [[ "$RELEASE_EXISTS" == "false" ]]; then
+  # gh creates a draft internally, uploads every asset, and only then publishes;
+  # this is required because immutable releases lock assets at publication.
+  create_release_or_reverify_publication_race
 elif [[ "$RELEASE_IS_DRAFT" == "true" ]]; then
   # Repair an interrupted draft only when it contains no unexpected assets.
   while IFS= read -r asset_name; do
@@ -493,7 +764,6 @@ FINAL_RELEASE_STATE="$(gh release view "$RELEASE_TAG" \
   --json isDraft,isImmutable,isPrerelease,publishedAt,assets \
   --jq '[.isDraft, .isImmutable, .isPrerelease, (.publishedAt // ""), ([.assets[].name] | sort | join(","))] | @tsv')"
 IFS=$'\t' read -r FINAL_IS_DRAFT FINAL_IS_IMMUTABLE FINAL_IS_PRERELEASE FINAL_PUBLISHED_AT FINAL_ASSETS <<< "$FINAL_RELEASE_STATE"
-EXPECTED_ASSETS_CSV="$(tr '\n' ',' <<< "$EXPECTED_ASSET_NAMES" | sed 's/,$//')"
 if [[ "$FINAL_IS_DRAFT" != "false" || "$FINAL_IS_IMMUTABLE" != "true" || -z "$FINAL_PUBLISHED_AT" ]]; then
   echo "Error: release was not published immutably." >&2
   exit 1

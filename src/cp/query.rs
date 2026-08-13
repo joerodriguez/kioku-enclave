@@ -92,6 +92,7 @@ const MAX_EPISODE_IMAGE_BYTES: i64 = 4000 * 1024;
 const MAX_EPISODE_IMAGES: i64 = 24;
 const MAX_SCREENSHOT_LONG_EDGE: u16 = 960;
 const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
+const CLOUD_CAPTURE_IMAGE_ID_PREFIX: &str = "capture-v2:";
 
 pub fn router() -> Router<Arc<CpState>> {
     Router::new()
@@ -344,7 +345,7 @@ async fn query_episodes_value(
                         "finalization_attempted_at": finalization_attempted_at,
                         "finalization_retryable": matches!(
                             finalization_status.as_str(),
-                            "retry_model" | "regeneration_queued"
+                            "retry_wait" | "budget_wait" | "failed_terminal"
                         ),
                         "final_brief": final_brief,
                     }))
@@ -1123,11 +1124,9 @@ async fn rest_episode_members(
     let result = s
         .store
         .with_user(&user.0, move |conn| {
-            // source_key ({device_id}:{segment_local_id}:{local_id} for
-            // utterances, {device_id}:{local_id} for screenshots) lets the
-            // debugger — running on the Mac beside the local store — join a
-            // member back to its local row and serve the actual screenshot
-            // image (full-resolution originals stay on the Mac; see ADR-0010 for Cloud Screenshot Evidence).
+            // Legacy source keys let the Mac-selected evidence flow join a
+            // member to screenshot_images. Cloud Capture v2 source keys bind
+            // canonical screenshots to their retained encrypted media object.
             let mut us = conn.prepare(
                 "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text, u.source_key \
                  FROM episode_members m \
@@ -1158,7 +1157,9 @@ async fn rest_episode_members(
                 "SELECT c.id, c.captured_at, c.active_app, c.window_title, c.url, \
                         substr(c.ocr_text,1,4000), substr(c.salient_ocr_text,1,4000), \
                         CASE WHEN length(c.ocr_text) > 4000 THEN 1 ELSE 0 END, \
-                        c.source_key, img.id, \
+                        c.source_key, COALESCE(img.id, \
+                          CASE WHEN capture_img.asset_id IS NOT NULL \
+                               THEN 'capture-v2:' || capture_img.asset_id END), \
                         o.status, o.generation_method, o.literal_description, o.screen_state, \
                         o.content_type, o.visible_text_summary, o.notable_items_json, \
                         i.activity_summary, i.relevance_level, i.relevance_reason, i.key_rank, \
@@ -1168,6 +1169,13 @@ async fn rest_episode_members(
                  FROM episode_members m \
                  JOIN screenshots c ON c.id = m.record_id \
                  LEFT JOIN screenshot_images img ON img.source_key = c.source_key \
+                 LEFT JOIN media_objects capture_img \
+                   ON capture_img.event_id = CASE \
+                        WHEN c.source_key GLOB 'cloud-v2:*' \
+                        THEN substr(c.source_key, length('cloud-v2:') + 1) END \
+                  AND capture_img.mime_type = 'image/jpeg' \
+                  AND capture_img.processing_state = 'ready' \
+                  AND capture_img.deleted_at IS NULL \
                  LEFT JOIN screen_observations o ON o.screenshot_id = c.id \
                  LEFT JOIN episode_screen_interpretations i \
                    ON i.episode_id = m.episode_id AND i.screenshot_id = c.id \
@@ -1397,6 +1405,8 @@ async fn rest_episode_finalize(
                 "UPDATE episodes
                  SET finalization_status = 'queued',
                      finalization_error = NULL,
+                     finalization_attempt_count = 0,
+                     finalization_next_attempt_at = NULL,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id = ?1",
                 [id],
@@ -2286,6 +2296,14 @@ async fn rest_screenshot_image_upload(
         }
     };
 
+    // Retain one admission lease from preflight through the durable record.
+    // Its owned PUT child prevents cancellation from letting deletion finish
+    // before an admitted evidence object has a definite provider outcome.
+    let _content_write = match s.store.acquire_content_write(&user_id).await {
+        Ok(lease) => lease,
+        Err(error) => return error.into_response(),
+    };
+
     // Reject ineligible bytes before KMS, encryption, or object storage. The
     // same predicate runs again under BEGIN IMMEDIATE when recording the row.
     let user_id_cloned = user_id.clone();
@@ -2401,7 +2419,13 @@ async fn rest_screenshot_image_upload(
     let mut random_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random_bytes);
     let opaque_key: String = random_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    let object_key = format!("media/{}", opaque_key);
+    let object_key = match crate::store::selected_evidence_media_object_key(&user_id, &opaque_key) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(error = %e, "selected evidence media key construction failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+    };
     let media_context = crate::store::media_blob_context(&user_id, &object_key);
     let encrypted_data =
         match crate::crypto::encrypt_bound_blob(&media_dek, &image_bytes, &media_context) {
@@ -2413,13 +2437,32 @@ async fn rest_screenshot_image_upload(
         };
 
     // 3. Upload to GCS
-    if let Err(e) = s
-        .store
-        .put_media(&object_key, &encrypted_data, &wrapped_b64)
-        .await
-    {
-        tracing::error!(error = %e, "media upload GCS write failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+    let put_lease = _content_write.child();
+    let put_store = Arc::clone(&s.store);
+    let put_user_id = user_id.clone();
+    let put_object_key = object_key.clone();
+    let put_wrapped_b64 = wrapped_b64.clone();
+    let put = tokio::spawn(async move {
+        let _put_lease = put_lease;
+        put_store
+            .put_user_media(
+                &put_user_id,
+                &put_object_key,
+                &encrypted_data,
+                &put_wrapped_b64,
+            )
+            .await
+    });
+    match put.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "media upload GCS write failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "media upload GCS task failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
+        }
     }
 
     // 4. Revalidate eligibility and episode budgets transactionally, then
@@ -2451,13 +2494,13 @@ async fn rest_screenshot_image_upload(
         Ok(ScreenshotRecordOutcome::Created(stored)) => stored,
         Ok(ScreenshotRecordOutcome::Existing(existing)) => {
             if let Err(e) = s.store.delete_media(&object_key).await {
-                tracing::error!(error = %e, object_key, "failed to clean up redundant media object");
+                tracing::error!(error = %e, "failed to clean up redundant selected evidence media");
             }
             return (StatusCode::OK, Json(existing.response_json())).into_response();
         }
         Err(e) => {
             if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
-                tracing::error!(error = %cleanup_error, object_key, "failed to clean up rejected media object");
+                tracing::error!(error = %cleanup_error, "failed to clean up rejected selected evidence media");
             }
             tracing::warn!(error = %e, "media upload database insert failed");
             return match e {
@@ -2489,7 +2532,7 @@ async fn rest_screenshot_image_upload(
             }
         }
         if let Err(cleanup_error) = s.store.delete_media(&object_key).await {
-            tracing::error!(error = %cleanup_error, object_key, "failed to clean up media object after database save failure");
+            tracing::error!(error = %cleanup_error, "failed to clean up selected evidence media after database save failure");
         }
         return (StatusCode::INTERNAL_SERVER_ERROR, "media upload failed").into_response();
     }
@@ -2511,26 +2554,21 @@ async fn rest_screenshot_image_content(
             .into_response();
     }
 
-    // 1. Retrieve the object_key from the database
+    // 1. Resolve either a legacy selected-evidence ID or a namespaced Cloud
+    // Capture v2 asset ID inside this authenticated user's database.
     let user_id_cloned = user_id.clone();
     let query_res = s
         .store
         .with_user(&user_id_cloned, {
             let id_clone = id.clone();
-            move |conn| {
-                let object_key: String = conn.query_row(
-                    "SELECT object_key FROM screenshot_images WHERE id = ?1",
-                    [&id_clone],
-                    |r| r.get(0),
-                )?;
-                Ok(object_key)
-            }
+            move |conn| screenshot_image_object_key(conn, &id_clone)
         })
         .await;
 
     let object_key = match query_res {
-        Ok(ok) => ok,
+        Ok(Some(ok)) => ok,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     // 2. Fetch the encrypted object from GCS
@@ -2589,6 +2627,34 @@ async fn rest_screenshot_image_content(
         opened.plaintext,
     )
         .into_response()
+}
+
+fn screenshot_image_object_key(
+    conn: &Connection,
+    id: &str,
+) -> crate::error::Result<Option<String>> {
+    if let Some(asset_id) = id.strip_prefix(CLOUD_CAPTURE_IMAGE_ID_PREFIX) {
+        if asset_id.is_empty() {
+            return Ok(None);
+        }
+        return Ok(conn
+            .query_row(
+                "SELECT object_key FROM media_objects \
+                 WHERE asset_id = ?1 AND mime_type = 'image/jpeg' \
+                   AND processing_state = 'ready' AND deleted_at IS NULL",
+                [asset_id],
+                |row| row.get(0),
+            )
+            .optional()?);
+    }
+
+    Ok(conn
+        .query_row(
+            "SELECT object_key FROM screenshot_images WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 #[derive(Deserialize)]
@@ -2929,13 +2995,18 @@ mod tests {
         Arc::new(CpState {
             store,
             control: Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs)),
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: Arc::new(crate::cp::CpConfig {
                 base_url: "http://localhost:8080".into(),
                 jwt_secrets: vec!["test-secret".into()],
                 google_desktop_client_id: "desktop".into(),
+                google_ios_client_id: "ios".into(),
                 google_web_client_id: "web".into(),
                 google_web_client_secret: "secret".into(),
+                apple_sign_in: None,
                 allowed_emails: None,
+                admin_user_ids: Vec::new(),
                 scheduler_sa_email: None,
                 vertex_project: "project".into(),
                 vertex_location: "location".into(),
@@ -2943,17 +3014,22 @@ mod tests {
                 quota_utterances_per_day: 1,
                 quota_screenshots_per_day: 1,
                 quota_mcp_calls_per_day: 1,
+                quota_vertex_output_tokens_per_day: 524_288,
                 web_origin: "http://localhost:3000".into(),
                 reviewer_auth: None,
+                billing_enforcement_mode: crate::cp::BillingEnforcementMode::Enforce,
             }),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             embedding: None,
+            voice: None,
         })
     }
 
@@ -3279,6 +3355,265 @@ mod tests {
         )
         .await;
         assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn episode_members_expose_ready_cloud_capture_images_without_regressing_legacy_ids() {
+        let state = query_test_state();
+        let user_id = "episode-cloud-images-user";
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute_batch(
+                    "
+                    INSERT INTO capture_sessions
+                        (id, device_id, install_id, started_at, last_event_at, schema_version)
+                    VALUES
+                        ('session-1', 'device-1', 'install-1', '2026-08-01T10:00:00Z',
+                         '2026-08-01T10:05:00Z', 2);
+                    INSERT INTO capture_streams (id, capture_session_id, device_id, stream_kind)
+                    VALUES ('stream-1', 'session-1', 'device-1', 'mac_screen');
+                    INSERT INTO episodes (id, started_at, ended_at, title, summary)
+                    VALUES (326, '2026-08-01T10:00:00Z', '2026-08-01T10:05:00Z',
+                            'Cloud capture', 'Processed screens');
+
+                    INSERT INTO screenshots (id, captured_at, source_key, is_duplicate) VALUES
+                        (1, '2026-08-01T10:00:01Z', 'cloud-v2:event-ready', 0),
+                        (2, '2026-08-01T10:00:02Z', 'cloud-v2:event-processing', 0),
+                        (3, '2026-08-01T10:00:03Z', 'cloud-v2:event-deleted', 0),
+                        (4, '2026-08-01T10:00:04Z', 'cloud-v2:event-audio', 0),
+                        (5, '2026-08-01T10:00:05Z', 'legacy-device:5', 0);
+                    INSERT INTO episode_members (episode_id, record_type, record_id) VALUES
+                        (326, 'screenshot', 1), (326, 'screenshot', 2),
+                        (326, 'screenshot', 3), (326, 'screenshot', 4),
+                        (326, 'screenshot', 5);
+
+                    INSERT INTO capture_events
+                        (event_id, device_id, install_id, capture_session_id, stream_id,
+                         stream_kind, sequence, source_wall_at, source_monotonic_ns,
+                         started_at, ended_at, timezone_id, utc_offset_minutes,
+                         clock_uncertainty_ms, asset_id, manifest_digest)
+                    VALUES
+                        ('event-ready', 'device-1', 'install-1', 'session-1', 'stream-1',
+                         'mac_screen', 1, '2026-08-01T10:00:01Z', '1',
+                         '2026-08-01T10:00:01Z', '2026-08-01T10:00:01Z', 'UTC', 0, 0,
+                         'asset-ready', 'digest-ready'),
+                        ('event-processing', 'device-1', 'install-1', 'session-1', 'stream-1',
+                         'mac_screen', 2, '2026-08-01T10:00:02Z', '2',
+                         '2026-08-01T10:00:02Z', '2026-08-01T10:00:02Z', 'UTC', 0, 0,
+                         'asset-processing', 'digest-processing'),
+                        ('event-deleted', 'device-1', 'install-1', 'session-1', 'stream-1',
+                         'mac_screen', 3, '2026-08-01T10:00:03Z', '3',
+                         '2026-08-01T10:00:03Z', '2026-08-01T10:00:03Z', 'UTC', 0, 0,
+                         'asset-deleted', 'digest-deleted'),
+                        ('event-audio', 'device-1', 'install-1', 'session-1', 'stream-1',
+                         'mac_screen', 4, '2026-08-01T10:00:04Z', '4',
+                         '2026-08-01T10:00:04Z', '2026-08-01T10:00:04Z', 'UTC', 0, 0,
+                         'asset-audio', 'digest-audio');
+                    INSERT INTO media_objects
+                        (asset_id, event_id, object_key, mime_type, codec, byte_length, sha256,
+                         processing_state, deleted_at)
+                    VALUES
+                        ('asset-ready', 'event-ready', 'media/ready', 'image/jpeg', 'jpeg', 10,
+                         'sha-ready', 'ready', NULL),
+                        ('asset-processing', 'event-processing', 'media/processing', 'image/jpeg',
+                         'jpeg', 10, 'sha-processing', 'processing', NULL),
+                        ('asset-deleted', 'event-deleted', 'media/deleted', 'image/jpeg', 'jpeg',
+                         10, 'sha-deleted', 'ready', '2026-08-02T00:00:00Z'),
+                        ('asset-audio', 'event-audio', 'media/audio', 'audio/mp4', 'aac', 10,
+                         'sha-audio', 'ready', NULL);
+                    INSERT INTO screenshot_images
+                        (id, screenshot_id, episode_id, source_key, captured_at, object_key,
+                         mime_type, width, height, byte_length, sha256)
+                    VALUES
+                        ('legacy-image-id', 5, 326, 'legacy-device:5',
+                         '2026-08-01T10:00:05Z', 'media/legacy', 'image/jpeg', 2, 2, 10,
+                         'sha-legacy');
+                    ",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let response =
+            rest_episode_members(State(state), Extension(AuthUser(user_id.into())), Path(326))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail: Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<Option<&str>> = detail["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["cloud_image_id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("capture-v2:asset-ready"),
+                None,
+                None,
+                None,
+                Some("legacy-image-id")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn screenshot_content_serves_only_the_owners_ready_cloud_capture_image() {
+        let state = query_test_state();
+        let user_id = "cloud-image-owner";
+        let object_key = "media/cloud-image";
+        let legacy_object_key = "media/legacy-image";
+        let plaintext = b"test-jpeg-bytes";
+        let legacy_plaintext = b"legacy-jpeg-bytes";
+        let (dek, wrapped_dek) = crate::crypto::generate_and_wrap_dek(state.store.kms.as_ref())
+            .await
+            .unwrap();
+        let encrypted = crate::crypto::encrypt_bound_blob(
+            &dek,
+            plaintext,
+            &crate::store::media_blob_context(user_id, object_key),
+        )
+        .unwrap();
+        state
+            .store
+            .put_media(object_key, &encrypted, &wrapped_dek)
+            .await
+            .unwrap();
+        let encrypted_legacy = crate::crypto::encrypt_bound_blob(
+            &dek,
+            legacy_plaintext,
+            &crate::store::media_blob_context(user_id, legacy_object_key),
+        )
+        .unwrap();
+        state
+            .store
+            .put_media(legacy_object_key, &encrypted_legacy, &wrapped_dek)
+            .await
+            .unwrap();
+        state
+            .store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![MEDIA_DEK_METADATA_KEY, wrapped_dek],
+                )?;
+                conn.execute_batch(
+                    "
+                    INSERT INTO capture_sessions
+                        (id, device_id, install_id, started_at, last_event_at, schema_version)
+                    VALUES ('content-session', 'content-device', 'content-install',
+                            '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 2);
+                    INSERT INTO capture_streams (id, capture_session_id, device_id, stream_kind)
+                    VALUES ('content-stream', 'content-session', 'content-device', 'mac_screen');
+                    INSERT INTO capture_events
+                        (event_id, device_id, install_id, capture_session_id, stream_id,
+                         stream_kind, sequence, source_wall_at, source_monotonic_ns,
+                         started_at, ended_at, timezone_id, utc_offset_minutes,
+                         clock_uncertainty_ms, asset_id, manifest_digest)
+                    VALUES
+                        ('content-event', 'content-device', 'content-install', 'content-session',
+                         'content-stream', 'mac_screen', 0, '2026-08-01T10:00:00Z', '1',
+                         '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 'UTC', 0, 0,
+                         'content-asset', 'content-digest'),
+                        ('processing-event', 'content-device', 'content-install',
+                         'content-session', 'content-stream', 'mac_screen', 1,
+                         '2026-08-01T10:00:01Z', '2', '2026-08-01T10:00:01Z',
+                         '2026-08-01T10:00:02Z', 'UTC', 0, 0, 'processing-asset',
+                         'processing-digest'),
+                        ('deleted-event', 'content-device', 'content-install', 'content-session',
+                         'content-stream', 'mac_screen', 2, '2026-08-01T10:00:02Z', '3',
+                         '2026-08-01T10:00:02Z', '2026-08-01T10:00:03Z', 'UTC', 0, 0,
+                         'deleted-asset', 'deleted-digest'),
+                        ('audio-event', 'content-device', 'content-install', 'content-session',
+                         'content-stream', 'mac_screen', 3, '2026-08-01T10:00:03Z', '4',
+                         '2026-08-01T10:00:03Z', '2026-08-01T10:00:04Z', 'UTC', 0, 0,
+                         'audio-asset', 'audio-digest');
+                    INSERT INTO media_objects
+                        (asset_id, event_id, object_key, mime_type, codec, byte_length, sha256,
+                         processing_state)
+                    VALUES
+                        ('content-asset', 'content-event', 'media/cloud-image', 'image/jpeg',
+                         'jpeg', 15, 'content-sha', 'ready'),
+                        ('processing-asset', 'processing-event', 'media/processing-image',
+                         'image/jpeg', 'jpeg', 15, 'processing-sha', 'processing'),
+                        ('deleted-asset', 'deleted-event', 'media/deleted-image', 'image/jpeg',
+                         'jpeg', 15, 'deleted-sha', 'ready'),
+                        ('audio-asset', 'audio-event', 'media/audio', 'audio/mp4', 'aac', 15,
+                         'audio-sha', 'ready');
+                    UPDATE media_objects SET deleted_at = '2026-08-02T00:00:00Z'
+                    WHERE asset_id = 'deleted-asset';
+                    INSERT INTO episodes (id, started_at, ended_at, title)
+                    VALUES (99, '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 'Legacy');
+                    INSERT INTO screenshots (id, captured_at, source_key, is_duplicate)
+                    VALUES (99, '2026-08-01T10:00:00Z', 'legacy:99', 0);
+                    INSERT INTO screenshot_images
+                        (id, screenshot_id, episode_id, source_key, captured_at, object_key,
+                         mime_type, width, height, byte_length, sha256)
+                    VALUES
+                        ('legacy-content-id', 99, 99, 'legacy:99',
+                         '2026-08-01T10:00:00Z', 'media/legacy-image', 'image/jpeg', 2, 2,
+                         17, 'legacy-content-sha');
+                    ",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let response = rest_screenshot_image_content(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path("capture-v2:content-asset".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), plaintext);
+
+        let legacy_response = rest_screenshot_image_content(
+            State(Arc::clone(&state)),
+            Extension(AuthUser(user_id.into())),
+            Path("legacy-content-id".into()),
+        )
+        .await;
+        assert_eq!(legacy_response.status(), StatusCode::OK);
+        let legacy_body = axum::body::to_bytes(legacy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(legacy_body.as_ref(), legacy_plaintext);
+
+        let other_user = rest_screenshot_image_content(
+            State(Arc::clone(&state)),
+            Extension(AuthUser("different-cloud-image-user".into())),
+            Path("capture-v2:content-asset".into()),
+        )
+        .await;
+        assert_eq!(other_user.status(), StatusCode::NOT_FOUND);
+
+        for unavailable_id in [
+            "capture-v2:",
+            "capture-v2:missing",
+            "capture-v2:../content-asset",
+            "capture-v2:processing-asset",
+            "capture-v2:deleted-asset",
+            "capture-v2:audio-asset",
+        ] {
+            let unavailable = rest_screenshot_image_content(
+                State(Arc::clone(&state)),
+                Extension(AuthUser(user_id.into())),
+                Path(unavailable_id.into()),
+            )
+            .await;
+            assert_eq!(unavailable.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]
@@ -3855,17 +4190,22 @@ mod tests {
                 Arc::new(FakeKms),
                 Arc::new(FakeGcs::new()),
             )),
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             config: Arc::new(
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
             embedding: None,
+            voice: None,
         });
 
         // Query using correct UTC bounds for 7:30 PM - 8:15 PM EDT
@@ -3932,17 +4272,22 @@ mod tests {
                 Arc::new(FakeKms),
                 Arc::new(FakeGcs::new()),
             )),
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: None,
+            push_transport: None,
             config: Arc::new(
                 crate::cp::CpConfig::from_env(vec!["secret".into()], "secret".into()).unwrap(),
             ),
             embedding: None,
+            voice: None,
         });
 
         // Query with EDT offset timestamps: 7:00 PM to 8:00 PM EDT = 23:00-00:00 UTC
@@ -3982,15 +4327,20 @@ mod tests {
         let s = Arc::new(CpState {
             store,
             control,
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
             config: query_test_state().config.clone(),
             user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
             reviewer_verifier: None,
+            apple_provider: None,
             sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 0.2),
             mcp_limiter: crate::cp::limits::RateLimiter::new(60.0, 1.0),
             oauth_limiter: crate::cp::limits::RateLimiter::new(120.0, 2.0),
             test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
             email_transport: Some(Arc::new(crate::cp::email_worker::FakeEmailTransport::new())),
+            push_transport: None,
             embedding: None,
+            voice: None,
         });
 
         // 1. GET default preference

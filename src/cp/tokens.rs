@@ -69,7 +69,9 @@ pub fn new_uuid() -> String {
     )
 }
 
-/// Derive a stable, deterministic UUIDv5-like string from google_sub using SHA-256.
+/// Derive a stable, deterministic UUIDv5-like string from a legacy Google
+/// subject using SHA-256. This exact function is retained so existing Google
+/// accounts keep their encrypted archive object names.
 /// This prevents orphaning user index GCS blobs on control DB resets.
 pub fn derive_stable_uuid(google_sub: &str) -> String {
     // Fixed namespace UUID for Kioku user IDs (randomly generated once)
@@ -92,6 +94,17 @@ pub fn derive_stable_uuid(google_sub: &str) -> String {
     )
 }
 
+/// Derive the canonical Kioku account id for a newly created provider
+/// identity. Google deliberately preserves the historical derivation. Other
+/// providers are domain-separated so equal opaque subjects cannot collide.
+pub fn derive_provider_uuid(provider: &str, subject: &str) -> String {
+    if provider == "google" {
+        derive_stable_uuid(subject)
+    } else {
+        derive_stable_uuid(&format!("{provider}\0{subject}"))
+    }
+}
+
 // ── Access token (our own HS256 JWT) ────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -102,7 +115,7 @@ struct AccessClaims {
     exp: u64,
 }
 
-/// Issue a 1-hour HS256 access JWT for a user id.
+/// Issue a 15-minute HS256 access JWT for a user id.
 pub fn issue_access_token(secret: &str, base_url: &str, user_id: &str) -> Result<String> {
     let claims = AccessClaims {
         sub: user_id.to_string(),
@@ -157,6 +170,17 @@ pub struct StateClaims {
     pub code_challenge: String,
     #[serde(default)]
     pub resource: String,
+    /// Present only while the browser Sign in with Apple round-trip is in
+    /// flight. It is signed into the same short-lived state token as the
+    /// downstream OAuth request, so the Apple identity token cannot be replayed
+    /// against a different assistant/web authorization.
+    #[serde(default)]
+    pub apple_nonce: String,
+    /// Present only for an authenticated browser request to attach an Apple
+    /// identity to an existing Kioku account. The user ID is signed and never
+    /// accepted from Apple's response or from a query parameter.
+    #[serde(default)]
+    pub apple_link_user_id: String,
     pub exp: u64,
 }
 
@@ -167,6 +191,8 @@ pub fn issue_state(secret: &str, claims: &StateClaims) -> Result<String> {
         client_state: claims.client_state.clone(),
         code_challenge: claims.code_challenge.clone(),
         resource: claims.resource.clone(),
+        apple_nonce: claims.apple_nonce.clone(),
+        apple_link_user_id: claims.apple_link_user_id.clone(),
         exp: now_secs() + STATE_TTL_SECS,
     };
     if claims.exp != 0 {
@@ -359,6 +385,28 @@ mod tests {
     }
 
     #[test]
+    fn apple_browser_state_round_trips_nonce_and_authenticated_link_target() {
+        let token = issue_state(
+            "secret",
+            &StateClaims {
+                client_id: String::new(),
+                redirect_uri: String::new(),
+                client_state: String::new(),
+                code_challenge: String::new(),
+                resource: String::new(),
+                apple_nonce: "n".repeat(43),
+                apple_link_user_id: "user-123".into(),
+                exp: 0,
+            },
+        )
+        .unwrap();
+        let claims = verify_state("secret", &token).unwrap();
+        assert_eq!(claims.apple_nonce, "n".repeat(43));
+        assert_eq!(claims.apple_link_user_id, "user-123");
+        assert!(verify_state("wrong", &token).is_err());
+    }
+
+    #[test]
     fn uuid_shape() {
         let u = new_uuid();
         assert_eq!(u.len(), 36);
@@ -384,5 +432,22 @@ mod tests {
 
         let u3 = derive_stable_uuid("different_sub");
         assert_ne!(u1, u3);
+    }
+
+    #[test]
+    fn provider_ids_preserve_google_and_domain_separate_apple() {
+        let subject = "same-provider-subject";
+        assert_eq!(
+            derive_provider_uuid("google", subject),
+            derive_stable_uuid(subject)
+        );
+        assert_ne!(
+            derive_provider_uuid("apple", subject),
+            derive_stable_uuid(subject)
+        );
+        assert_ne!(
+            derive_provider_uuid("apple", subject),
+            derive_provider_uuid("other", subject)
+        );
     }
 }

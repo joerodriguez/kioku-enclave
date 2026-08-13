@@ -2,7 +2,8 @@
 //! Public endpoints (no auth): discovery, /register, /authorize, the Google
 //! callback, the exact-match reviewer bridge, and /token. MCP clients
 //! (Claude/ChatGPT) use this to obtain our HS256 access tokens; Google is the
-//! upstream IdP for both normal and reviewer identities.
+//! upstream IdP for Google, while the sibling Apple module reuses the same
+//! validated downstream request and consent/code machinery.
 
 use std::{net::IpAddr, str::FromStr, sync::Arc};
 
@@ -35,6 +36,91 @@ const MAX_CLIENT_STATE_BYTES: usize = 1024;
 const AUTH_CODE_TTL_SECS: i64 = 5 * 60;
 const REFRESH_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MCP_SCOPE: &str = "kioku:read";
+/// Fixed public first-party client used only by signed Kioku native apps after
+/// the enclave has verified an Apple authorization grant. It is a UUID so the
+/// normal refresh-token validation path remains shared and auditable.
+pub const FIRST_PARTY_NATIVE_CLIENT_ID: &str = "a3f42956-2dc1-4e58-9f05-a83fac1f9328";
+const FIRST_PARTY_NATIVE_REDIRECT_URI: &str = "http://127.0.0.1/oauth/callback";
+/// Fixed public browser client used by Kioku's own dashboard. Third-party MCP
+/// clients still use Dynamic Client Registration; normal dashboard logins must
+/// not consume the bounded registration table.
+pub const FIRST_PARTY_WEB_CLIENT_ID: &str = "b9b7d59f-3fdd-4cd4-93a2-a68972aef42f";
+
+pub(super) async fn ensure_first_party_web_client(s: &Arc<CpState>) -> crate::error::Result<()> {
+    let redirect_uri = format!("{}/app/apple-callback", s.config.web_origin);
+    let redirect_uris = serde_json::to_string(&[redirect_uri])?;
+    s.control
+        .write_if_changed(move |conn| {
+            let existing: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
+                    [FIRST_PARTY_WEB_CLIENT_ID],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((name, stored_redirects)) = existing {
+                if name.as_deref() != Some("Kioku Web") || stored_redirects != redirect_uris {
+                    return Err(crate::error::EnclaveError::Conflict(
+                        "first-party web OAuth client configuration mismatch".into(),
+                    ));
+                }
+                return Ok(((), false));
+            }
+            conn.execute(
+                "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
+                 VALUES (?1, 'Kioku Web', ?2)",
+                rusqlite::params![FIRST_PARTY_WEB_CLIENT_ID, redirect_uris],
+            )?;
+            Ok(((), true))
+        })
+        .await
+}
+
+/// Register the public first-party native client for the browser-based Apple
+/// flow used by directly distributed Developer ID builds. RFC 8252 requires
+/// the authorization server to allow an ephemeral loopback port for native
+/// clients; the stored URI deliberately omits that port and the matcher below
+/// still requires the exact loopback host and callback path.
+pub(super) async fn ensure_first_party_native_client(s: &Arc<CpState>) -> crate::error::Result<()> {
+    let redirect_uris = serde_json::to_string(&[FIRST_PARTY_NATIVE_REDIRECT_URI])?;
+    s.control
+        .write_if_changed(move |conn| {
+            let existing: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT client_name, redirect_uris FROM oauth_clients WHERE client_id = ?1",
+                    [FIRST_PARTY_NATIVE_CLIENT_ID],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((name, stored_redirects))
+                    if name.as_deref() == Some("Kioku Native Apps")
+                        && (stored_redirects == "[]" || stored_redirects == redirect_uris) =>
+                {
+                    if stored_redirects == redirect_uris {
+                        return Ok(((), false));
+                    }
+                    conn.execute(
+                        "UPDATE oauth_clients SET redirect_uris = ?1 WHERE client_id = ?2",
+                        rusqlite::params![redirect_uris, FIRST_PARTY_NATIVE_CLIENT_ID],
+                    )?;
+                    Ok(((), true))
+                }
+                Some(_) => Err(crate::error::EnclaveError::Conflict(
+                    "first-party native OAuth client configuration mismatch".into(),
+                )),
+                None => {
+                    conn.execute(
+                        "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) \
+                         VALUES (?1, 'Kioku Native Apps', ?2)",
+                        rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, redirect_uris],
+                    )?;
+                    Ok(((), true))
+                }
+            }
+        })
+        .await
+}
 
 fn is_valid_client_id(value: &str) -> bool {
     value.len() == 36
@@ -612,12 +698,17 @@ fn register_client_conn(
         return Ok((ClientRegistration::Existing(client_id), false));
     }
 
-    let mut count: i64 = tx.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+    let mut count: i64 = tx.query_row(
+        "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
+        rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
+        |r| r.get(0),
+    )?;
     let mut reclaimed = 0;
     if count >= MAX_OAUTH_CLIENTS {
         reclaimed = tx.execute(
             "DELETE FROM oauth_clients \
-             WHERE created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?1) \
+             WHERE client_id NOT IN (?2, ?3) \
+               AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now', ?1) \
                AND NOT EXISTS (SELECT 1 FROM oauth_consents p \
                                WHERE p.client_id = oauth_clients.client_id \
                                  AND p.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
@@ -628,9 +719,17 @@ fn register_client_conn(
                                WHERE r.client_id = oauth_clients.client_id \
                                  AND r.revoked = 0 \
                                  AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            [format!("-{UNUSED_CLIENT_TTL_SECS} seconds")],
+            rusqlite::params![
+                format!("-{UNUSED_CLIENT_TTL_SECS} seconds"),
+                FIRST_PARTY_NATIVE_CLIENT_ID,
+                FIRST_PARTY_WEB_CLIENT_ID
+            ],
         )?;
-        count = tx.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+        count = tx.query_row(
+            "SELECT count(*) FROM oauth_clients WHERE client_id NOT IN (?1, ?2)",
+            rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
+            |r| r.get(0),
+        )?;
     }
     if count >= MAX_OAUTH_CLIENTS {
         if reclaimed == 0 {
@@ -712,7 +811,7 @@ async fn register(State(s): State<Arc<CpState>>, Json(body): Json<RegisterBody>)
 // ── /authorize ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct AuthorizeQuery {
+pub(super) struct AuthorizeQuery {
     client_id: Option<String>,
     redirect_uri: Option<String>,
     state: Option<String>,
@@ -723,7 +822,7 @@ struct AuthorizeQuery {
     resource: Option<String>,
 }
 
-async fn validated_authorization_request(
+pub(super) async fn validated_authorization_request(
     s: &Arc<CpState>,
     q: AuthorizeQuery,
 ) -> std::result::Result<tokens::StateClaims, Response> {
@@ -807,6 +906,8 @@ async fn validated_authorization_request(
         client_state,
         code_challenge,
         resource,
+        apple_nonce: String::new(),
+        apple_link_user_id: String::new(),
         exp: 0,
     })
 }
@@ -1025,7 +1126,11 @@ struct GoogleTokenResp {
     id_token: String,
 }
 
-fn callback_error(status: StatusCode, heading: &'static str, message: &'static str) -> Response {
+pub(super) fn callback_error(
+    status: StatusCode,
+    heading: &'static str,
+    message: &'static str,
+) -> Response {
     let content = format!(
         r#"<section class="card" aria-labelledby="page-title">
       <div class="status-icon" aria-hidden="true">!</div>
@@ -1093,20 +1198,87 @@ fn registered_client_conn(
         return Ok(None);
     };
     let redirect_uris: Vec<String> = serde_json::from_str(&redirect_uris_json)?;
-    if !is_valid_redirect_uri(redirect_uri) || !redirect_uris.iter().any(|uri| uri == redirect_uri)
-    {
+    let exact_match = redirect_uris.iter().any(|uri| uri == redirect_uri);
+    let redirect_matches = if client_id == FIRST_PARTY_NATIVE_CLIENT_ID {
+        native_loopback_redirect_matches(redirect_uri)
+    } else {
+        exact_match
+    };
+    if !is_valid_redirect_uri(redirect_uri) || !redirect_matches {
         return Ok(None);
     }
     Ok(Some(RegisteredClient { name }))
 }
 
-fn consent_page(client_name: Option<&str>, origin: &str, consent_token: &str) -> Response {
+fn native_loopback_redirect_matches(redirect_uri: &str) -> bool {
+    let Ok(uri) = Uri::from_str(redirect_uri) else {
+        return false;
+    };
+    uri.scheme_str() == Some("http")
+        && uri.host() == Some("127.0.0.1")
+        && uri
+            .authority()
+            .and_then(|authority| authority.port_u16())
+            .is_some()
+        && uri.path() == "/oauth/callback"
+        && uri.query().is_none()
+}
+
+fn uses_owned_web_sign_in_copy(client_id: &str) -> bool {
+    client_id == FIRST_PARTY_WEB_CLIENT_ID
+}
+
+fn consent_page(
+    owned_web_sign_in: bool,
+    client_name: Option<&str>,
+    origin: &str,
+    consent_token: &str,
+) -> Response {
     let display_name = client_name
         .map(|name| name.chars().take(MAX_CLIENT_NAME_BYTES).collect::<String>())
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "Unnamed OAuth client".to_string());
-    let content = format!(
-        r#"<section class="card" aria-labelledby="page-title">
+    let content = if owned_web_sign_in {
+        format!(
+            r#"<section class="card" aria-labelledby="page-title">
+      <p class="eyebrow">Kioku sign-in</p>
+      <h1 id="page-title">Finish signing in to Kioku</h1>
+      <p class="lede">Your identity is verified. Continue to return securely to the Kioku app.</p>
+      <div class="context">
+        <div class="context-row">
+          <span class="context-label">Official app</span>
+          <span class="context-value">Kioku</span>
+        </div>
+        <div class="context-row">
+          <span class="context-label">Returns to</span>
+          <code>{}</code>
+        </div>
+      </div>
+      <div class="permission">
+        <span class="permission-icon" aria-hidden="true">→</span>
+        <div>
+          <strong>Your Kioku account</strong>
+          <p>Continue to use your private archive in the official Kioku app.</p>
+        </div>
+      </div>
+      <p class="trust-note">
+        <span class="trust-note-symbol" aria-hidden="true">◆</span>
+        <span>This sign-in returns only to the verified Kioku destination shown above.</span>
+      </p>
+      <form method="post" action="/oauth/consent">
+        <input type="hidden" name="consent_token" value="{}">
+        <div class="actions">
+          <button class="primary" type="submit" name="decision" value="approve">Continue to Kioku</button>
+          <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
+        </div>
+      </form>
+    </section>"#,
+            html_escape(origin),
+            html_escape(consent_token),
+        )
+    } else {
+        format!(
+            r#"<section class="card" aria-labelledby="page-title">
       <p class="eyebrow">MCP connection request</p>
       <h1 id="page-title">Connect this app to your memory?</h1>
       <p class="lede">Review the app and destination before giving it access to your Kioku archive.</p>
@@ -1139,11 +1311,19 @@ fn consent_page(client_name: Option<&str>, origin: &str, consent_token: &str) ->
         </div>
       </form>
     </section>"#,
-        html_escape(&display_name),
-        html_escape(origin),
-        html_escape(consent_token),
+            html_escape(&display_name),
+            html_escape(origin),
+            html_escape(consent_token),
+        )
+    };
+    let body = oauth_page(
+        if owned_web_sign_in {
+            "Sign in to Kioku"
+        } else {
+            "Connect to Kioku"
+        },
+        &content,
     );
-    let body = oauth_page("Connect to Kioku", &content);
     // Browsers enforce `form-action` across redirects from a submitted form.
     // Allow the already-validated registered client origin so the consent POST's
     // 302 can complete without permitting arbitrary form destinations.
@@ -1389,7 +1569,23 @@ async fn google_callback(
         }
     };
 
+    begin_authorization_consent(&s, state, &user.id).await
+}
+
+/// Continue a server-verified upstream identity through Kioku's ordinary
+/// explicit OAuth consent screen. Google and Apple both enter here so an
+/// assistant never gets a provider-specific consent bypass.
+pub(super) async fn begin_authorization_consent(
+    s: &Arc<CpState>,
+    state: tokens::StateClaims,
+    user_id: &str,
+) -> Response {
     let (client_id, redirect_uri) = (state.client_id.clone(), state.redirect_uri.clone());
+    // Only the fixed web client returns to Kioku's exact owned origin. The
+    // native client ID is public and accepts a caller-chosen loopback port, so
+    // another local app can reuse it with its own PKCE verifier. Keep the
+    // archive-access disclosure for that path rather than calling it official.
+    let owned_web_sign_in = uses_owned_web_sign_in_copy(&client_id);
     let registered = s
         .control
         .read({
@@ -1419,7 +1615,7 @@ async fn google_callback(
     let consent_token = match tokens::issue_consent(
         &s.config.jwt_secrets[0],
         &tokens::ConsentClaims {
-            user_id: user.id.clone(),
+            user_id: user_id.to_string(),
             client_id: client_id.clone(),
             redirect_uri: redirect_uri.clone(),
             client_state: state.client_state,
@@ -1438,7 +1634,7 @@ async fn google_callback(
         }
     };
     let consent_hash = tokens::sha256_hex(&consent_token);
-    let user_id = user.id;
+    let user_id = user_id.to_string();
     let stored = s
         .control
         .write_if_changed(move |conn| {
@@ -1459,7 +1655,7 @@ async fn google_callback(
             "The authorization could not be completed.",
         );
     }
-    consent_page(name.as_deref(), &origin, &consent_token)
+    consent_page(owned_web_sign_in, name.as_deref(), &origin, &consent_token)
 }
 
 #[derive(Deserialize)]
@@ -1833,6 +2029,51 @@ async fn token_refresh(s: Arc<CpState>, form: TokenForm) -> Response {
     token_response(&access, &raw_refresh)
 }
 
+/// Issue the first Kioku access/refresh pair for a server-verified native
+/// identity. The fixed first-party client is inserted idempotently and the
+/// refresh token is persisted atomically before it is returned.
+pub async fn issue_native_session(
+    s: &Arc<CpState>,
+    user_id: &str,
+) -> crate::error::Result<(String, String)> {
+    let access = tokens::issue_access_token(&s.config.jwt_secrets[0], &s.config.base_url, user_id)?;
+    let raw_refresh = tokens::random_token_hex();
+    let refresh_hash = tokens::sha256_hex(&raw_refresh);
+    let user_id = user_id.to_string();
+    s.control
+        .write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let active: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active')",
+                [&user_id],
+                |row| row.get(0),
+            )?;
+            if active == 0 {
+                tx.rollback()?;
+                return Err(crate::error::EnclaveError::Auth("account inactive".into()));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO oauth_clients (client_id, client_name, redirect_uris) \
+                 VALUES (?1, 'Kioku Native Apps', '[]')",
+                [FIRST_PARTY_NATIVE_CLIENT_ID],
+            )?;
+            tx.execute(
+                "INSERT INTO refresh_tokens (token_hash, user_id, client_id, expires_at) \
+                 VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now', ?4))",
+                rusqlite::params![
+                    refresh_hash,
+                    user_id,
+                    FIRST_PARTY_NATIVE_CLIENT_ID,
+                    format!("+{REFRESH_TTL_SECS} seconds")
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok((access, raw_refresh))
+}
+
 fn token_response(access: &str, refresh: &str) -> Response {
     (
         [
@@ -1943,6 +2184,47 @@ mod tests {
     }
 
     #[test]
+    fn fixed_native_client_accepts_only_ephemeral_kioku_loopback_redirects() {
+        let conn = oauth_conn();
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) \
+             VALUES (?1, 'Kioku Native Apps', ?2)",
+            rusqlite::params![
+                FIRST_PARTY_NATIVE_CLIENT_ID,
+                serde_json::to_string(&[FIRST_PARTY_NATIVE_REDIRECT_URI]).unwrap()
+            ],
+        )
+        .unwrap();
+
+        assert!(registered_client_conn(
+            &conn,
+            FIRST_PARTY_NATIVE_CLIENT_ID,
+            "http://127.0.0.1:49152/oauth/callback"
+        )
+        .unwrap()
+        .is_some());
+        for rejected in [
+            FIRST_PARTY_NATIVE_REDIRECT_URI,
+            "http://localhost:49152/oauth/callback",
+            "http://127.0.0.1:49152/other",
+            "http://127.0.0.1:49152/oauth/callback?next=1",
+            "https://127.0.0.1:49152/oauth/callback",
+        ] {
+            assert!(
+                registered_client_conn(&conn, FIRST_PARTY_NATIVE_CLIENT_ID, rejected)
+                    .unwrap()
+                    .is_none(),
+                "accepted {rejected:?}"
+            );
+        }
+        assert!(
+            registered_client_conn(&conn, CLIENT, "http://127.0.0.1:49152/oauth/callback")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn registration_validation_bounds_and_canonicalizes() {
         let (_, uris) = validated_registration(RegisterBody {
             client_name: Some("  Client  ".into()),
@@ -2015,6 +2297,42 @@ mod tests {
         .unwrap();
         assert!(matches!(result, ClientRegistration::AtCapacity));
         assert!(!changed);
+    }
+
+    #[test]
+    fn registration_cap_excludes_and_preserves_fixed_first_party_clients() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_name TEXT, redirect_uris TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))); \
+             CREATE TABLE oauth_consents (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE oauth_authorization_codes (client_id TEXT NOT NULL, expires_at TEXT NOT NULL); \
+             CREATE TABLE refresh_tokens (client_id TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); \
+             INSERT INTO oauth_clients (client_id, redirect_uris, created_at) VALUES \
+                ('{FIRST_PARTY_NATIVE_CLIENT_ID}', '[]', '2000-01-01T00:00:00.000Z'), \
+                ('{FIRST_PARTY_WEB_CLIENT_ID}', '[\"https://kiokuu.com/app/apple-callback\"]', '2000-01-01T00:00:00.000Z'); \
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 256) \
+             INSERT INTO oauth_clients (client_id, redirect_uris) \
+             SELECT printf('client-%d', x), printf('[\"https://client-%d.example/cb\"]', x) FROM n;"
+        ))
+        .unwrap();
+
+        let (result, changed) = register_client_conn(
+            &conn,
+            CLIENT,
+            Some("Overflow"),
+            "[\"https://overflow.example/cb\"]",
+        )
+        .unwrap();
+        assert!(matches!(result, ClientRegistration::AtCapacity));
+        assert!(!changed);
+        let fixed_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM oauth_clients WHERE client_id IN (?1, ?2)",
+                rusqlite::params![FIRST_PARTY_NATIVE_CLIENT_ID, FIRST_PARTY_WEB_CLIENT_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fixed_count, 2);
     }
 
     #[test]
@@ -2183,6 +2501,7 @@ mod tests {
     #[tokio::test]
     async fn consent_page_escapes_client_metadata_and_is_not_cacheable() {
         let response = consent_page(
+            false,
             Some("<script>alert(1)</script>"),
             "https://client.example",
             "token\" autofocus onfocus=alert(1)",
@@ -2207,6 +2526,56 @@ mod tests {
         assert!(body.contains("Protected by Kioku’s confidential cloud"));
         assert!(body.contains("name=\"decision\" value=\"approve\""));
         assert!(body.contains("name=\"decision\" value=\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn owned_web_consent_page_uses_sign_in_copy_without_mcp_warning() {
+        let response = consent_page(
+            true,
+            Some("Kioku Web"),
+            "https://kiokuu.com",
+            "first-party-token",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["Cache-Control"], "no-store");
+        assert!(response.headers()["Content-Security-Policy"]
+            .to_str()
+            .unwrap()
+            .contains("form-action 'self' https://kiokuu.com;"));
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<title>Sign in to Kioku · Kioku</title>"));
+        assert!(body.contains("Kioku sign-in"));
+        assert!(body.contains("Finish signing in to Kioku"));
+        assert!(body.contains("Continue to Kioku"));
+        assert!(body.contains("Protected by Kioku’s confidential cloud"));
+        assert!(!body.contains("MCP connection request"));
+        assert!(!body.contains("Full archive access"));
+        assert!(!body.contains("trust the redirect destination"));
+        assert!(body.contains("name=\"decision\" value=\"approve\""));
+        assert!(body.contains("name=\"decision\" value=\"deny\""));
+    }
+
+    #[tokio::test]
+    async fn public_native_client_keeps_archive_access_disclosure() {
+        assert!(uses_owned_web_sign_in_copy(FIRST_PARTY_WEB_CLIENT_ID));
+        assert!(!uses_owned_web_sign_in_copy(FIRST_PARTY_NATIVE_CLIENT_ID));
+        assert!(!uses_owned_web_sign_in_copy("third-party-client"));
+
+        let response = consent_page(
+            uses_owned_web_sign_in_copy(FIRST_PARTY_NATIVE_CLIENT_ID),
+            Some("Kioku Native Apps"),
+            "http://127.0.0.1:49152",
+            "native-client-token",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("MCP connection request"));
+        assert!(body.contains("Full archive access"));
+        assert!(body.contains("trust the redirect destination"));
+        assert!(!body.contains("Official app"));
+        assert!(!body.contains("verified Kioku destination"));
     }
 
     #[tokio::test]

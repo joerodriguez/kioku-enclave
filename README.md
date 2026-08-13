@@ -16,12 +16,13 @@ for the signed source-tag, provenance, SBOM, image-digest, and deployment proced
 
 Kioku's privacy claim is:
 
-> Raw audio and full-resolution screenshot originals stay on your Mac. If you enable
-> Cloud Screenshot Evidence, Kioku uploads a small set of selected, downscaled,
-> compressed screenshots from meaningful episodes to the hardware-attested Kioku Cloud
-> Core. They are encrypted per user, are never sent to the episode-summary model, and are
-> included in export and deletion. Text and metadata that sync are handled by sealed
-> hardware running the open-source code you can inspect.
+> Kioku's macOS and iOS clients are capture-only: bounded audio snippets, screenshots,
+> authoritative timestamps, foreground-app state, and available browser URLs are sent to
+> the hardware-attested Kioku Cloud Core as the product's standard processing path. Raw
+> objects are encrypted per user, processed by Vertex Gemini from inside the enclave,
+> retained for a bounded retry/voice-learning window, and then deleted. Derived records,
+> evidence, and voice profiles remain in the encrypted user archive and are covered by
+> export and deletion. The server code handling that plaintext is open source.
 
 The exact deployed image digest is public. A Confidential Space attestation token reports
 the running container digest; a signed GitHub build attestation connects that digest to a
@@ -36,23 +37,62 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
 
 - Terminates public TLS inside Confidential Space and obtains/renews its certificate with
   ACME without exporting the private key.
-- Verifies Google identity, runs OAuth 2.1-style authorization with PKCE, and issues Kioku
-  access and refresh tokens.
-- Receives pre-transcribed utterances, OCR text, and opted-in compressed screenshot
-  evidence from Kioku clients.
+- Verifies Google and native/browser Apple identity, runs OAuth 2.1-style authorization
+  with PKCE, and issues Kioku access and refresh tokens.
+- Receives raw bounded audio/canonical screenshots plus timestamped application, window,
+  display, and browser metadata from pure-Swift Kioku clients. Deterministically validated
+  metadata-only screen references retain repeated observations without another encrypted
+  image object or inference job.
+- Runs Gemini 3.5 Flash transcription, timestamped speaker-turn extraction, screenshot
+  understanding, evidence-backed person learning, and independent WeSpeaker voiceprint
+  matching in the cloud; no Python runtime is present. Voice samples use append-only
+  active assignments and profile revisions so calibrated merge/split proposals can be
+  applied and reversed without deleting source observations or prior derivations.
+- Publishes the ADR-0016 voice evaluation reducer, objective production-model
+  similarity measurement, and schemas. Release CI recomputes
+  overlap-aware diarization and identity/fact/export/delete metrics from hash-bound,
+  content-free schema-v3 evidence bound to a schema-v2 multi-artifact source and
+  authorized physical-route manifest. Identity decisions include denominator-visible
+  precision, wrong-binding, cross-meeting, after-three-sample, and abstention metrics
+  for every corpus slice. Each claimed identity is bound to the predicted speaker chosen
+  by the same deterministic global mapping used for diarization error; synthetic or
+  hand-authored legacy aggregates cannot authorize a quality release. Its offline
+  derivation command independently verifies licensed media/label artifacts and produces
+  canonical fixed-point WAV slices, opaque timing labels, and receipts outside Git. Its
+  private similarity command verifies the exact production WeSpeaker model and media
+  hashes, then emits only opaque integer pair scores to select the hardest different-
+  speaker slice without exposing vectors or content.
+- Classifies every signed image as either `owner_only_unvalidated` or
+  `validated_real_corpus`. The former permits owner-only production evaluation but
+  explicitly authorizes no speaker-quality claim and no external users.
 - Serves device sync, search, timeline, episode, feed, MCP, export, and deletion APIs.
+- Enforces monthly wall-clock recording allowances through server-timed, idempotent
+  60-second leases. A restarted client reattaches to an unexpired paid interval when more
+  than the 20-second renewal headroom remains; otherwise the enclave reserves one fresh
+  minute instead of trapping the client in a lease-conflict loop. A durable pending
+  reservation is reconciled with its original billing idempotency key before any new
+  reservation, so a crash or failed local commit neither double-charges nor blocks that
+  user indefinitely. The enclave knows only the provider-neutral allowance snapshot and
+  reservation decision. Catalog, pricing, payment, and subscription implementations live
+  behind the external control-plane port and are not part of this repository.
 - Stores user and control data as KMS-wrapped, context-bound AES-256-GCM blobs in GCS.
 - Runs episode summarisation and evidence verification, including calls to Vertex Gemini
   from inside the service. Synced OCR, app/window/URL and browser-tab metadata,
   deterministic visual statistics, transcript context, and derived text are sent together
   for holistic episode analysis once an episode is settled; raw audio and screenshot
   pixels are never included.
+- Enforces cost safety before every inference: 8,192-token text and 4,096-token media
+  response ceilings, a persistent 524,288 maximum-output-token reservation per user per
+  UTC day, bounded sweep sizes, and terminal retry limits. Timeouts retain their
+  reservation because Vertex may have completed billable work after the client stopped
+  waiting. Automatic workers never regenerate already-completed historical episodes.
 - Optionally emits signed CloudEvents to user-configured HTTPS webhook destinations.
 
 Within Kioku-operated compute and storage, plaintext exists only in this process and in
-the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Selected
-text leaves the TEE only through the documented Vertex and explicit, user-configured
-webhook paths.
+the SEV-protected `/tmp` tmpfs; it is not written to the VM's persistent disk. Audio,
+screenshots, and selected text leave the TEE through the documented Vertex boundary.
+Content-free pseudonymous usage/accounting events leave through the billing boundary;
+explicitly configured webhook paths are a separate egress boundary.
 
 ## Security and trust model
 
@@ -70,11 +110,23 @@ AND "STABLE" in submods.confidential_space.support_attributes
 AND attribute.image_digest == <approved release digest>
 ```
 
-No human or service-account principal should have KMS decrypt permission. KMS calls use a
-short-lived access token derived from a Confidential Space token and Google STS; there is
-no VM metadata-service credential fallback for KMS. The VM service account is used for
-ciphertext-only GCS I/O, runtime Secret Manager access, and Vertex; it has no KMS decrypt
-path.
+The deployment must pair an authoritative, digest-scoped KEK binding with an audit of
+every project, key-ring, and key IAM binding. Standing operator and deployer roles must
+contain neither direct nor delegated KMS decrypt permission; broad inherited roles such
+as project Owner otherwise remain effective even when the KEK's local binding looks
+exclusive. This standalone project cannot administer an organization-level IAM deny
+policy, so the rollout guard detects standing decrypt grants but is not itself an
+independent authorization boundary. KMS calls use a short-lived access token derived from
+a Confidential Space token and Google STS; there is no VM metadata-service credential
+fallback for KMS. The VM service account is used for ciphertext-only GCS I/O, runtime
+Secret Manager access, and Vertex; it has no standing KMS decrypt path.
+
+Removing those grants closes the standing human/service-account data-plane decrypt path,
+but it does not make a cloud-project control-plane administrator cryptographically unable
+to change IAM, KMS, or compute policy later. An operator-independent "only you can read"
+guarantee still requires user-held keys or an independently controlled authorization
+boundary. See
+[`SECURITY.md`](SECURITY.md#t1--malicious-operator-or-cloud-project-insider).
 
 ### Context-bound blob encryption
 
@@ -82,7 +134,7 @@ Version 2 blobs are prefixed with `KIOKU-BLOB\x02` and encrypted with AES-256-GC
 authenticated data binds each ciphertext to its logical purpose and location:
 
 - user databases bind to `indexes/{user_id}.db.enc`;
-- screenshot evidence binds to both the authenticated user and opaque media object key;
+- raw capture and screenshot evidence bind to both the authenticated user and opaque media object key; new selected screenshot evidence is under the validated owner prefix `raw/{user_id}/evidence/{opaque_key}.enc` (legacy keys remain compatible);
 - the control database and ACME state use separate fixed contexts.
 
 Copying ciphertext and its wrapped DEK to another user or object therefore fails
@@ -91,21 +143,28 @@ authentication. All production images enforce context-bound v2 encryption uncond
 
 ### Authentication and control plane
 
-The public OAuth flow validates Google tokens against the baked desktop and web client
-audiences, enforces a non-wildcard account allow-list, and issues Kioku tokens for sync,
-query, MCP, and account routes. OAuth authorization uses PKCE, explicit consent,
-persisted single-use authorization codes, and client-bound refresh-token rotation.
+The public OAuth flow validates Google tokens against the baked desktop/iOS/web clients
+and Sign in with Apple tokens against distinct iPhone App ID, Mac App ID, and web Services
+ID audiences. Native Apple requests require SHA-256 nonces; browser requests use Apple's
+server-returned raw nonce. All paths enforce a non-wildcard account allow-list and issue
+Kioku tokens for sync, query, MCP, and account routes. OAuth authorization uses PKCE,
+explicit consent, persisted single-use authorization codes, and client-bound refresh-token
+rotation. Provider subjects are namespaced and accounts are never linked by email.
 
 The published authorization endpoint is the operator's
-`WEB_ORIGIN/app/login`. Its normal path forwards to Google OAuth. An optional
+`WEB_ORIGIN/app/login`. Its normal paths forward to Google or Apple and return through the
+same consent/code machinery. The Kioku dashboard uses one fixed first-party PKCE client;
+third-party MCP clients retain bounded Dynamic Client Registration. An optional
 reviewer-only path accepts a short-lived Google Identity Platform token for one exact
 image-baked UID/email pair, creates only a namespaced synthetic account, and seeds that
 account with non-sensitive fixture data. Reviewer passwords are verified by Google and
 never reach this service, its source tree, or its image.
 
-Legacy `/v1/*` compatibility routes retain Google-signed service-identity-token
-authentication. The expected service-account email and token audience are baked into the
-image. There is no shared-secret bypass or flag that disables authentication.
+Legacy `/v1/*` data routes retain Google-signed service-identity-token authentication,
+then return `410 Gone` without reading or mutating user data. The expected
+service-account email and token audience are baked into the image. There is no
+shared-secret bypass or flag that disables authentication. `/v1/attestation` remains a
+separate public, active endpoint.
 
 ### Production TLS is fail-closed
 
@@ -138,8 +197,9 @@ digest; decoding a JWT without verification is insufficient.
 
 ### External processing caveats
 
-Episode summarisation and evidence verification send selected text outside the TEE to
-Google Vertex Gemini. The request originates inside this service, but Vertex processes it
+Audio transcription/diarization, screenshot understanding, episode summarisation, and
+evidence verification send selected content outside the TEE to Google Vertex Gemini. The
+request originates inside this service, but Vertex processes it
 under Google's
 [no-data-retention terms](https://cloud.google.com/vertex-ai/docs/generative-ai/data-governance).
 This is an explicit external trust boundary, not an enclave-only inference claim.
@@ -168,44 +228,187 @@ The same binary serves all of these surfaces:
 | Surface | Representative paths | Authentication |
 |---|---|---|
 | Health and attestation | `/health`, `/v1/attestation` | Public |
-| OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/token` | Protocol-specific validation |
-| Device and account API | `/api/sync/*`, `/api/export`, `/api/account` | Kioku access token or accepted Google ID token |
+| OAuth discovery and flow | `/.well-known/*`, `/register`, `/authorize`, `/oauth/reviewer`, `/oauth/google/callback`, `/oauth/apple/authorize`, `/oauth/apple/callback`, `/token` | Protocol-specific validation |
+| Apple identity/linking | `/oauth/apple/native`, `/api/auth/session`, `/api/auth/apple/link`, `/api/auth/apple/web-link` | Apple authorization or an existing authenticated account |
+| Device and account API | `/api/sync/*`, `/api/export`, `/api/account`, `/api/account/deletion` | Kioku access token or accepted Google ID token |
+| Cloud Capture v2 | `/api/v2/capture/*`, `/api/v2/people*` | Kioku access token or accepted Google ID token |
 | Query and MCP API | `/api/search`, `/api/episodes*`, `/api/feed`, `/mcp` | Kioku access token or accepted Google ID token |
 | Screenshot evidence | `/api/screenshot-images*` | Kioku access token or accepted Google ID token |
 | Webhook automation | `/api/webhooks*` | Kioku access token or accepted Google ID token |
-| Legacy data plane | `/v1/*` below | Google service identity token |
+| Retired local sync | `/api/sync/batch` | Kioku access token or accepted Google ID token, then `410 Gone` |
+| Retired legacy data plane | `/v1/*` below | Google service identity token, then `410 Gone` |
 
-Legacy compatibility routes are:
+Retired compatibility tombstones are:
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/ingest` | Ingest utterances and screenshot metadata |
-| `POST` | `/v1/search` | FTS5 and optional vector/hybrid search |
-| `POST` | `/v1/context` | Rows around a center timestamp |
-| `POST` | `/v1/range` | Raw rows in a half-open time range |
-| `POST` | `/v1/episodes/upsert` | Upsert episodes |
-| `POST` | `/v1/episodes/list` | List episodes in a time range |
-| `POST` | `/v1/episodes/members` | Read episode members |
-| `POST` | `/v1/episodes/delete_range` | Delete episodes in a time range |
-| `POST` | `/v1/stats` | Per-user row counts and latest timestamps |
-| `GET` | `/v1/export?user_id=…` | Full authenticated user export |
-| `DELETE` | `/v1/user` | Idempotent hard deletion |
+| `POST` | `/api/sync/batch` | Authenticated `410 Gone`; no batch mutation |
+| `ANY` | `/v1/ingest` | Authenticated `410 Gone`; no ingest mutation |
+| `ANY` | `/v1/search`, `/v1/context`, `/v1/range`, `/v1/stats` | Authenticated `410 Gone`; no data read |
+| `ANY` | `/v1/episodes/*` | Authenticated `410 Gone`; no episode mutation or read |
+| `ANY` | `/v1/export`, `/v1/user` | Authenticated `410 Gone`; no export or deletion |
+
+The authenticated control-plane `DELETE /api/account` returns `200` when physical
+deletion and identity cleanup are complete, or `202` with a stable opaque
+`operation_id`, machine-readable `status`/`reason`, `retry_after_seconds`, and the GCS
+`hard_delete_time` when provider retention still applies. `GET /api/account/deletion`
+polls the same content-free operation. Status is `pending`, `failed_retryable`, or
+`physical_complete`; `deleted` is true only for `physical_complete`. Deleting/deleted credentials are accepted only on
+those two routes; every other account route remains denied. A bounded server-side
+reconciler retries eligible pending operations—including an interrupted attempt—after
+restart. A legacy generation that vanished before inventory, or a generation above the
+temporary 512 MiB compatibility cap, instead reports `failed_retryable` and requires
+explicit remediation rather than being declared complete from a later empty listing.
 
 ## Build
 
 Prerequisites are Rust 1.96+, the pinned toolchain in `rust-toolchain.toml`, and Cargo.
 
 ```sh
-cargo build
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo fmt --all -- --check
+# Default local feedback: formatting plus a locked type-check.
+./scripts/agent-verify.sh quick
+
+# Add the smallest relevant test selection while developing.
+./scripts/agent-verify.sh focused -- module::tests::affected_case
+
+# Required GitHub CI is the exhaustive merge gate. This is available locally
+# for broad or security-sensitive changes and CI diagnosis.
+./scripts/agent-verify.sh full
 ```
+
+The helper checks free disk space before compiling and uses `sccache` only when
+it is already installed, with a bounded cache and a 15-GiB default free-space
+floor. It also holds a crash-safe per-worktree artifact lock while its locked Cargo
+compilation/test commands run; a separate local `cargo build` is unnecessary.
+Do not race worktree artifact retirement with raw Cargo outside this helper.
+
+## Archive capacity fixtures and observability
+
+Before legacy noncurrent-generation lifecycle rules may be promoted, startup also runs a
+bounded serial reconciliation of pre-existing `indexes/*.db.enc` objects. It lists only
+current GCS objects, then resolves each name through an explicit live-object read,
+and create-verifies the current UTC day's generation-pinned recovery checkpoint. Checkpoint
+copy shares the per-user content-write barrier with raw capture, so account deletion closes
+new admission and waits for any admitted copy or raw PUT to settle before inventory. A retry
+after a lost copy response or restart converges on the immutable named checkpoint; no user,
+archive, object, or generation identifier is logged. Aggregate readiness remains false
+until a complete error-free scan, and the runtime never activates bucket lifecycle itself.
+Successful scans run at most hourly; failures retry with bounded 5-second-to-5-minute
+backoff.
+
+ADR-0022 Phase-0a instruments the existing whole-encrypted-SQLite snapshot path with
+process-local, unlabeled counters and fixed-bucket histograms. Once per active minute the
+service emits one cumulative `archive_snapshot_v1` structured event through its existing
+logging pipeline; it does not expose a metrics endpoint or add another network service.
+The event contains logical database byte observations, the pre-checkpoint WAL-file byte
+length as a changed-page proxy, successful and attempted encrypted upload bytes, encrypted
+download bytes, save attempts/completed/failed/skipped, end-to-end save latency, and
+encrypted-durable/WAL-proxy ratio in parts per million. It never contains user/archive
+IDs, object names or paths, query/content fields, keys, URLs, or per-user labels.
+
+The ratio is exactly
+`successful encrypted snapshot bytes / pre-checkpoint SQLite -wal file bytes` for each
+completed save. A zero-byte or absent WAL denominator records `u64::MAX` in the `+Inf`
+bucket, exposing a full-database rewrite with no observed changed frames. WAL length is
+only a proxy: it includes WAL framing and can diverge from changed-page bytes after
+SQLite auto-checkpointing or WAL reuse, so this is not a claim of exact dirty-byte
+amplification. Logical database size remains a separate histogram. The dirty-generation
+guard records a proven-clean save or eviction in `save_skipped_total` and skips
+checkpointing, KMS, encryption, plaintext file reads, and GCS upload work. Failed
+uploads contribute to attempted-upload bytes and
+failed/latency counters, but only durable successes contribute to upload and ratio
+histograms. Upload/download byte values measure the encrypted object payload, excluding
+HTTP metadata and multipart framing. All counters reset on process restart.
+
+The deterministic, content-free capacity contract is
+[`eval/capacity/archive-fixtures-v1.json`](eval/capacity/archive-fixtures-v1.json). Inspect
+and validate its exact three-year 480/960/1,200-hour distributions without generating
+records:
+
+```sh
+python3 scripts/generate_capacity_fixture.py check
+```
+
+`scripts/run_archive_capacity_harness.py` is an offline, deterministic SQLite **smoke**
+harness. CI smoke runs create a small real SQLite database, verify exact fixture counts,
+SQLite/FTS integrity, and a deterministic logical-export digest. Its report permanently
+sets both `release_evidence` and `sqlite_local_evidence` to `false`; full mode fails
+closed. The harness cannot bind its execution to a release image/VM or exercise the v3
+VFS, backend, witness, fault, lifecycle, production cache, concurrency, or query-mix
+gates required by ADR-0022. A later signed production release suite must supply that
+evidence rather than reclassifying this report.
+
+The optional generator streams numeric synthetic records to ignored `target/` output (or
+outside the checkout), so it does not allocate every record in memory. Its bounded smoke
+mode is exercised in unit tests. The explicit `power-user-c-1200-32gib` plus
+`--create-sparse-shape` path creates a 32-GiB logical sparse file, not 32 GiB of written
+blocks; that file is not SQLite and is not query-performance evidence. See
+[`eval/capacity/README.md`](eval/capacity/README.md) for commands and release-evidence
+limitations.
+
+The separate `scripts/run_archive_capacity_gate.py` consumes the v2 12-month 40/80/100
+hours-per-month fixture only after an operator has reviewed its no-I/O `plan`, supplied an
+empty safe output directory, passed the free-space preflight, and explicitly acknowledged
+the production-shaped and sparse-extent paths. It measures local SQLite DB/WAL/checkpoint
+behavior using bounded zero-filled per-kind payload and vector-shape BLOBs, plus 32-GiB
+page/extent assumptions, but is still non-authority local evidence:
+it never materializes, downloads, or encrypts a 32-GiB snapshot and cannot satisfy the
+archive-v3 release gate.
+
+### Inactive signed 32-GiB release-evidence contract
+
+`eval/capacity/archive-v3-capacity-evidence-v2.schema.json` and
+`eval/capacity/archive-v3-capacity-policy-v2.template.json` define a restricted-JCS,
+preauthorization-only Phase-1 contract. The verifier itself fixes 32 GiB, exact three-year
+workloads/screen ratios, every ADR metric context and workload/fault/test scenario,
+paired 1-GiB/32-GiB raw write traces with derived amplification, ANN coverage, and
+conditional provider-recovery deletion.
+A policy can only tighten numeric limits and freshness maxima. The checked-in template has
+deliberately unusable anchors and is not evidence.
+
+When a separately reviewed release policy contains real out-of-band anchors, an operator
+may check the restricted canonical JSON report with its detached digest, DER-validated P-256
+public-key metadata, and hash-bound request, replay, time, and artifact wrappers. Those
+wrappers do not authenticate their claims. The command requires an absolute `openssl`
+path whose regular-file bytes match the policy-pinned SHA-256; the verifier then executes
+a private copy with a restricted environment:
+
+```sh
+python3 scripts/verify_archive_v3_capacity_report.py \
+  --report /secure/evidence/report.json \
+  --report-digest /secure/evidence/report.sha256 \
+  --signature /secure/evidence/report.sig.b64 \
+  --public-key-metadata /secure/evidence/pinned-public-key.json \
+  --policy /secure/release-policy.json \
+  --verification-request /secure/evidence/request.json \
+  --replay-ledger /secure/evidence/replay-ledger.json \
+  --time-assertion /secure/evidence/time-assertion.json \
+  --release-manifest /secure/evidence/release-manifest.json \
+  --provenance /secure/evidence/provenance.json \
+  --sbom /secure/evidence/sbom.json \
+  --fixture-manifest /secure/evidence/fixture.json \
+  --test-plan /secure/evidence/test-plan.json \
+  --test-config /secure/evidence/test-config.json \
+  --environment-attestation /secure/evidence/environment.json \
+  --openssl /secure/toolchain/openssl
+```
+
+The verifier emits `preauthorization_only: true`, `authority: false`, and six unsatisfied
+activation blockers. It does not establish a rollback-protected challenge or ledger,
+authenticated time, cryptographic provider/SLSA provenance or environment attestation, or
+independent measurement authenticity. A future separately reviewed deployment controller
+must satisfy those blockers and transactionally consume the receipt before authority.
 
 The production Docker build has no permissive configuration defaults. Supply every
 deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` or
 `WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the
 build.
+
+The four `ARCHIVE_WITNESS_*` Docker arguments below are low-level image inputs. Public
+CI never accepts them from repository variables or manual dispatch: both build selection
+and release verification derive them through one strict parser from the reviewed
+[`config/archive-witness-probe.json`](config/archive-witness-probe.json). The checked-in
+file is exact `off` with an empty namespace.
 
 ```sh
 docker build --platform linux/amd64 \
@@ -215,10 +418,17 @@ docker build --platform linux/amd64 \
   --build-arg KMS_KEY_RING=my-keyring \
   --build-arg KMS_KEY=my-kek \
   --build-arg GCS_BUCKET=my-enclave-indexes \
+  --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
+  --build-arg GCS_LEGACY_MEDIA_BUCKET=my-enclave-indexes \
+  --build-arg ARCHIVE_WITNESS_SHADOW_MODE=off \
+  --build-arg ARCHIVE_WITNESS_PROJECT_ID= \
+  --build-arg ARCHIVE_WITNESS_PROJECT_NUMBER= \
+  --build-arg ARCHIVE_WITNESS_DATABASE_ID= \
   --build-arg RUN_SA_EMAIL=legacy-caller@my-project.iam.gserviceaccount.com \
   --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
   --build-arg ATTEST_STS_AUDIENCE='//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/confidential-space' \
   --build-arg GOOGLE_DESKTOP_CLIENT_ID=desktop-id.apps.googleusercontent.com \
+  --build-arg GOOGLE_IOS_CLIENT_ID=ios-id.apps.googleusercontent.com \
   --build-arg GOOGLE_WEB_CLIENT_ID=web-id.apps.googleusercontent.com \
   --build-arg ALLOWED_EMAILS=owner@example.com \
   --build-arg BASE_URL=https://api.example.com \
@@ -228,7 +438,7 @@ docker build --platform linux/amd64 \
   --build-arg REVIEWER_AUTH_EMAIL=reviewer@example.com \
   --build-arg VERTEX_PROJECT=my-project \
   --build-arg VERTEX_LOCATION=us-central1 \
-  --build-arg VERTEX_MODEL=gemini-2.5-flash \
+  --build-arg VERTEX_MODEL=gemini-3.5-flash \
   --build-arg ENCLAVE_ACME=1 \
   --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
   --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
@@ -248,22 +458,36 @@ binding.
 | Variable | Purpose |
 |---|---|
 | `KMS_PROJECT`, `KMS_LOCATION`, `KMS_KEY_RING`, `KMS_KEY` | KMS KEK coordinates |
-| `GCS_BUCKET` | Encrypted database and default media bucket |
+| `GCS_BUCKET` | Encrypted database bucket |
+| `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
+| `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
+| `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, repository variables/dispatch cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
-| `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
+| `GOOGLE_DESKTOP_CLIENT_ID`, `GOOGLE_IOS_CLIENT_ID`, `GOOGLE_WEB_CLIENT_ID` | End-user Google OAuth audiences |
+| `APPLE_TEAM_ID`, `APPLE_KEY_ID` | Optional Apple developer team/key identifiers; atomic with every Apple client ID |
+| `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` | Exact Apple audiences `com.kioku.ios`, `com.kiokuu.app`, and `com.kiokuu.web`; all five Apple values are set together or Apple auth stays off |
+| `APNS_TEAM_ID`, `APNS_PRODUCTION_KEY_ID`, `APNS_SANDBOX_KEY_ID` | Required production ready-alert provider identifiers; production and sandbox keys remain separated and are fetched from Secret Manager |
 | `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
+| `ADMIN_USER_IDS` | Nonempty comma-separated stable owner UUIDs for margin reporting; separate from the email allow-list |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
+| `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE` | Exact matching HTTPS billing-service origin and Google OIDC audience |
+| `BILLING_ENFORCEMENT_MODE` | Image-baked recording rollout mode: `shadow` observes without blocking, while `enforce` rejects new capture without an active allowance lease |
 | `REVIEWER_AUTH_API_KEY`, `REVIEWER_AUTH_UID`, `REVIEWER_AUTH_EMAIL` | Optional Google Identity Platform reviewer account; set all three or none. Values are image-baked and exact matched; never supply the password |
-| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration |
+| `VERTEX_PROJECT`, `VERTEX_LOCATION`, `VERTEX_MODEL` | Vertex episode inference configuration; the model is a 1–128 byte billing-safe name using only ASCII letters, digits, `.`, `_`, `:`, or `-` |
+| `QUOTA_VERTEX_OUTPUT_TOKENS_PER_DAY` | Optional per-user UTC-day maximum-output reservation ceiling; defaults to `524288`. Each request reserves its full configured output maximum before Vertex is called and fails closed when exhausted |
 | `ENCLAVE_ACME`, `ENCLAVE_ACME_DIRECTORY`, `ENCLAVE_ACME_CONTACT` | Required in-enclave production TLS configuration |
 | `ENCLAVE_ALLOW_LEGACY_BLOBS` | Strict `0` normally; temporary `1` only in a reviewed migration image |
 | `ENCLAVE_KMS_VIA_ATTESTATION` | Hardcoded to `1`; not operator-configurable |
 | `PORT` | The only launch-time override; application TLS listen port, default `8080` |
 
-The web OAuth client secret is fetched at runtime from Secret Manager. The reviewer
+The Google web OAuth secret, optional Apple login `.p8` key, and environment-separated
+APNs provider `.p8` keys are fetched at runtime from Secret Manager. Production startup
+fails closed if the APNs identifiers or either provider key are unavailable; evaluation
+may explicitly omit the complete APNs group. Apple refresh authorization is stored per issuing Apple client in the
+encrypted control database so deletion can revoke every retained platform grant. The reviewer
 password remains only in Google Identity Platform, the review portal, and the operator's
 versioned `kioku-openai-reviewer-password` secret in project `kioku-joerodriguez`. JWT
 signing secrets are generated and stored in the KMS-protected control database; neither
@@ -286,7 +510,24 @@ operation. For `main` and tags the workflow then:
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>`;
 5. generates an SPDX JSON SBOM and scans it for fixed high-severity vulnerabilities;
 6. creates GitHub-signed image provenance and a signed SBOM attestation; and
-7. uploads release metadata, provenance, SBOM, and attestation bundles.
+7. uploads a schema-v6 release manifest (including the attested billing mode, index,
+   current-media, and legacy-media bucket claims), that manifest's GitHub-signed provenance bundle, image
+   provenance, SBOM, and attestation bundles.
+
+The build workflow has read-only repository-content permission and never publishes a
+GitHub Release. `scripts/release.sh`, after enforcing the separately authenticated
+`RELEASE_SIGNER_FINGERPRINT`, is the sole publisher. A tag that GitHub generically marks
+verified can produce CI artifacts, but those artifacts cannot qualify or publish a release
+when the signer fingerprint is wrong.
+
+Production is the sole active owner evaluation environment. Signed releases either carry
+the exact `eval/voice/owner-only-production.json` declaration and record
+`voice_quality_gate: owner_only_unvalidated`, or carry a complete passing real-corpus trio
+and record `validated_real_corpus`. The owner-only declaration permits neither external
+users nor a voice-quality claim. The former manual `evaluation` build profile remains
+available only to reproduce and audit historical isolated images; its runtime is retired,
+it cannot become a GitHub Release or production rollout, and it must not be deployed.
+Ordinary `main` and signed `v*` tag pushes always select the production profile.
 
 All third-party Actions are pinned to reviewed commit SHAs. A separate security workflow
 runs CodeQL on pull requests, `main`, and a weekly schedule, plus dependency review on
@@ -339,7 +580,11 @@ published trusted fingerprint; a valid signature from an unknown key is not suff
 
 The release contains:
 
-- `enclave-release.json` — source ref/commit, image URI/digest, and build URL;
+- `enclave-release.json` — production build profile, source ref/commit, image URI/digest,
+  build URL, explicit voice-quality gate classification, and exact Phase-0 index/current/
+  legacy media bucket claims (legacy equals index; current may differ);
+- `enclave-release-metadata-provenance.jsonl` — GitHub-signed provenance for the exact
+  release-manifest bytes; the JSON manifest is not evidence on its own;
 - `enclave-provenance.jsonl` — GitHub-signed image provenance;
 - `enclave-sbom.spdx.json` — SPDX SBOM; and
 - `enclave-sbom-attestation.jsonl` — signed SBOM attestation.
@@ -347,6 +592,12 @@ The release contains:
 Verify the provenance against the digest-qualified image, source repository, workflow,
 tag, and commit. `scripts/release.sh` performs these checks with `gh attestation verify`
 before it publishes a new release or requests a roll.
+
+The workflow records the selected build profile as an output of the trusted image-build
+step before clearing the sensitive build environment. The schema-v5 manifest and job
+summary must consume that output, and the release wrapper requires its attested value to
+be exactly `production`. A missing or cleared profile makes the image non-deployable even
+when its image scan and provenance attestations succeeded.
 
 ### 3. Match all anchors
 
@@ -376,7 +627,7 @@ delivery therefore remains. Do not describe releases as independently reproducib
 
 ### Vertex and user-configured webhooks leave Confidential Space
 
-Selected text is sent to Vertex Gemini. Attestation covers the Kioku service and its
+Bounded audio, screenshots, and selected text are sent to Vertex Gemini. Attestation covers the Kioku service and its
 storage/retrieval behavior, not Vertex's internal execution. A webhook destination is
 also outside the attested boundary. Finalized-episode webhooks are content-free unless
 the user explicitly enables full brief content for that destination.

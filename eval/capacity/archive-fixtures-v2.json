@@ -1,0 +1,129 @@
+{
+  "schema": "kioku-archive-capacity-fixture-v2",
+  "seed": 220022,
+  "horizon_months": 12,
+  "screen_observation_interval_seconds": 2,
+  "canonical_screen_ratio": {"numerator": 1, "denominator": 10},
+  "rates_per_recording_hour": {
+    "audio_segments": 60,
+    "utterances": 180,
+    "evidence": 24,
+    "voice_samples": 12
+  },
+  "people_per_recording_hours": 40,
+  "vector_dimensions": 384,
+  "temporal_payload_shape": {
+    "recording_days_per_month": 20,
+    "sessions_per_active_day": 2,
+    "retention_months": 12,
+    "payload_bytes_by_kind": {
+      "audio_segments": 96,
+      "utterances": 128,
+      "fts_entries": 64,
+      "vectors": 1536,
+      "screen_references": 64,
+      "canonical_screens": 96,
+      "jobs": 48,
+      "evidence": 96,
+      "people": 64,
+      "voice_samples": 128
+    },
+    "embedding": {
+      "dimensions": 384,
+      "element_bytes": 4,
+      "logical_bytes": 1536
+    }
+  },
+  "core_archive_sizing": {
+    "low_bytes_per_recording_hour": 1468006,
+    "high_bytes_per_recording_hour": 8283750,
+    "basis": "ADR-0022 rounded byte equivalents of the measured 1.4-7.9 MiB/hour transcript/OCR/FTS/vector core; Cloud Capture tables are additional"
+  },
+  "profiles": [
+    {
+      "id": "power-user-a-40h-month-12m",
+      "recording_hours_per_month": 40,
+      "expected": {
+        "recording_hours": 480,
+        "records": {
+          "audio_segments": 28800,
+          "utterances": 86400,
+          "fts_entries": 950400,
+          "vectors": 172800,
+          "screen_references": 777600,
+          "canonical_screens": 86400,
+          "jobs": 115200,
+          "evidence": 11520,
+          "people": 12,
+          "voice_samples": 5760
+        },
+        "core_archive_bytes_low": 704642880,
+        "core_archive_bytes_high": 3976200000
+      }
+    },
+    {
+      "id": "power-user-b-80h-month-12m",
+      "recording_hours_per_month": 80,
+      "expected": {
+        "recording_hours": 960,
+        "records": {
+          "audio_segments": 57600,
+          "utterances": 172800,
+          "fts_entries": 1900800,
+          "vectors": 345600,
+          "screen_references": 1555200,
+          "canonical_screens": 172800,
+          "jobs": 230400,
+          "evidence": 23040,
+          "people": 24,
+          "voice_samples": 11520
+        },
+        "core_archive_bytes_low": 1409285760,
+        "core_archive_bytes_high": 7952400000
+      }
+    },
+    {
+      "id": "power-user-c-100h-month-12m",
+      "recording_hours_per_month": 100,
+      "expected": {
+        "recording_hours": 1200,
+        "records": {
+          "audio_segments": 72000,
+          "utterances": 216000,
+          "fts_entries": 2376000,
+          "vectors": 432000,
+          "screen_references": 1944000,
+          "canonical_screens": 216000,
+          "jobs": 288000,
+          "evidence": 28800,
+          "people": 30,
+          "voice_samples": 14400
+        },
+        "core_archive_bytes_low": 1761607200,
+        "core_archive_bytes_high": 9940500000
+      }
+    },
+    {
+      "id": "power-user-c-100h-month-12m-32gib",
+      "recording_hours_per_month": 100,
+      "sparse_archive_bytes": 34359738368,
+      "expected": {
+        "recording_hours": 1200,
+        "records": {
+          "audio_segments": 72000,
+          "utterances": 216000,
+          "fts_entries": 2376000,
+          "vectors": 432000,
+          "screen_references": 1944000,
+          "canonical_screens": 216000,
+          "jobs": 288000,
+          "evidence": 28800,
+          "people": 30,
+          "voice_samples": 14400
+        },
+        "core_archive_bytes_low": 1761607200,
+        "core_archive_bytes_high": 9940500000
+      }
+    }
+  ]
+}

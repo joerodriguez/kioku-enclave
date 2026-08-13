@@ -25,22 +25,46 @@ get a `map.md` linked from their parent. Treat a stale `map.md` like stale docs.
   auth, crypto, attestation, or key handling.
 - `CONTRIBUTING.md` — contribution + PR rules (summarized below).
 - **Product + security ground truth: `README.md` and `SECURITY.md` in this repo.** Preserve
-  the security invariants they document: raw media stays local by default; plaintext only
-  enters this attested process; data is encrypted per user; key access is bound to the
-  attested digest; no new plaintext sink is introduced; and export/delete remain complete.
+  the security invariants they document: bounded raw media follows the authenticated
+  Cloud Capture path by default; persistent objects are encrypted per user; plaintext
+  stays in the attested process except for the documented Vertex inference boundary;
+  key access is bound to the attested digest; no undocumented plaintext sink is
+  introduced; and export/delete remain complete.
   A change that weakens an invariant is wrong by default.
 - Client applications, capture pipelines, and deployment automation are downstream
   consumers of the public interfaces documented in this repository. Coordinate breaking
   compatibility changes without relying on an unpublished repository layout.
 
-## Before you commit — all four must pass
+## Verification
+
+GitHub's required CI is the exhaustive, authoritative merge gate. It runs the
+locked full test suite, all-target Clippy with warnings denied, formatting, and
+the repository's other required checks. Do not merge around it.
+
+For normal local work, start with the quick verification and run a focused test
+for the code you changed:
 
 ```bash
-cargo build --locked                              # native build for local testing
-cargo test --locked                               # no network; in-memory fakes for KMS/GCS
-cargo clippy --locked --all-targets -- -D warnings # warnings are errors
-cargo fmt --all -- --check                        # must be clean
+./scripts/agent-verify.sh quick
+./scripts/agent-verify.sh focused -- module::tests::affected_case
 ```
+
+Run the local full suite when a change is broad, security-sensitive, touches
+shared behavior, or CI diagnosis needs local reproduction:
+
+```bash
+./scripts/agent-verify.sh full
+```
+
+The helper uses locked Cargo compilation/test invocations, refuses a heavy build
+when the worktree's disk has less than its 15-GiB default free-space floor, holds
+a crash-safe per-worktree artifact lock for the entire Cargo sequence, and uses
+a 10-GiB-bounded `sccache` only when it is already installed. A separate
+`cargo build` is not required: `cargo check`, tests, and Clippy compile the
+code they need. See `./scripts/agent-verify.sh --help` for modes and options.
+Use this helper for agent-run Cargo validation rather than launching raw Cargo:
+its crash-safe lock prevents a completed worktree's generated artifacts from
+being retired during compilation.
 
 The Docker image targets `x86_64-unknown-linux-musl` for the Confidential Space VM
 (see `Dockerfile` / `README.md`). Keep build inputs pinned and provenance auditable.
@@ -58,7 +82,8 @@ rollout remain traceable.
 Match git history: short scoped subjects like `feat(episodes): …`, `ci: …`, `Docs: …`.
 Per CONTRIBUTING.md: include a clear description of what changed and why, and for
 security-sensitive changes (auth, crypto, attestation) explain the **threat-model
-impact**. Run the four checks above first.
+impact**. Run the appropriate local verification above before opening a PR; required
+GitHub CI remains the exhaustive merge gate.
 
 Only commit/push when the user asks. Default branch is `main`.
 

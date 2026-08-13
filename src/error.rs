@@ -6,6 +6,46 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionPendingReason {
+    SoftDeleteRetention,
+    LegacySnapshotTooLarge,
+    LegacyGenerationUnavailable,
+    LegacyInventoryIncomplete,
+    LegacyWriteIntentUnsettled,
+}
+
+impl DeletionPendingReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SoftDeleteRetention => "soft_delete_retention",
+            Self::LegacySnapshotTooLarge => "legacy_snapshot_too_large",
+            Self::LegacyGenerationUnavailable => "legacy_generation_unavailable",
+            Self::LegacyInventoryIncomplete => "legacy_inventory_incomplete",
+            Self::LegacyWriteIntentUnsettled => "legacy_write_intent_unsettled",
+        }
+    }
+}
+
+impl std::fmt::Display for DeletionPendingReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionPending {
+    pub reason: DeletionPendingReason,
+    pub retry_after_seconds: Option<u64>,
+    pub hard_delete_time: Option<String>,
+}
+
+impl std::fmt::Display for DeletionPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "account deletion pending: {}", self.reason)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum EnclaveError {
     #[error("crypto error: {0}")]
@@ -52,6 +92,9 @@ pub enum EnclaveError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    #[error("{0}")]
+    DeletionPending(DeletionPending),
 }
 
 impl IntoResponse for EnclaveError {
@@ -59,7 +102,9 @@ impl IntoResponse for EnclaveError {
         let (status, message) = match &self {
             EnclaveError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             EnclaveError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
-            EnclaveError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
+            EnclaveError::Conflict(_) | EnclaveError::DeletionPending(_) => {
+                (StatusCode::CONFLICT, self.to_string())
+            }
             // Intentionally vague externally — log internally
             _ => {
                 tracing::error!(error = %self, "internal enclave error");

@@ -20,8 +20,8 @@
 # compiles natively with:
 #   rustup target add x86_64-unknown-linux-musl
 #   cargo build --release --locked --target x86_64-unknown-linux-musl
-# The local `cargo build` (darwin) is for development only; the Dockerfile
-# assumes it runs on a Linux x86-64 builder (GitHub Actions Ubuntu 24.04).
+# The Dockerfile assumes a Linux x86-64 builder (GitHub Actions Ubuntu 24.04);
+# ordinary macOS development uses the repository's lightweight verifier.
 #
 # Operator build instructions
 # ---------------------------
@@ -35,6 +35,12 @@
 #   KMS_KEY_RING         KMS key ring name
 #   KMS_KEY              KMS crypto key name
 #   GCS_BUCKET           GCS bucket holding encrypted index blobs
+#   GCS_MEDIA_BUCKET     Current encrypted bounded-retention media bucket
+#   GCS_LEGACY_MEDIA_BUCKET  Migration-only legacy media bucket; must equal
+#                        GCS_BUCKET during Phase-0 cleanup
+#   ARCHIVE_WITNESS_SHADOW_MODE  off or probe-v1; checked-in profiles use off
+#   ARCHIVE_WITNESS_PROJECT_ID / ARCHIVE_WITNESS_PROJECT_NUMBER /
+#   ARCHIVE_WITNESS_DATABASE_ID  empty when off, complete named DB when probe-v1
 #   RUN_SA_EMAIL         Service account email the control plane presents in its
 #                        Google ID token (format: name@project.iam.gserviceaccount.com)
 #   ENCLAVE_AUDIENCE     The enclave's own URL, used to validate the 'aud' claim
@@ -43,9 +49,21 @@
 #                        exchange (format:
 #                        //iam.googleapis.com/projects/<NUM>/locations/global/
 #                        workloadIdentityPools/<POOL>/providers/<PROVIDER>)
-#   GOOGLE_DESKTOP_CLIENT_ID / GOOGLE_WEB_CLIENT_ID  Google OAuth audiences
+#   GOOGLE_DESKTOP_CLIENT_ID / GOOGLE_IOS_CLIENT_ID / GOOGLE_WEB_CLIENT_ID
+#                                                 Google OAuth audiences
+#   APPLE_TEAM_ID / APPLE_KEY_ID / APPLE_IOS_CLIENT_ID /
+#   APPLE_MACOS_CLIENT_ID / APPLE_WEB_CLIENT_ID
+#                        Optional Sign in with Apple identifiers; set all five
+#                        or none. The private key is fetched from Secret Manager.
+#   APNS_TEAM_ID / APNS_PRODUCTION_KEY_ID / APNS_SANDBOX_KEY_ID
+#                        Required together for production memory-ready alerts.
+#                        Environment-separated private keys are fetched from
+#                        Secret Manager and never enter the image.
 #   ALLOWED_EMAILS       Comma-separated account allow-list
+#   ADMIN_USER_IDS       Comma-separated stable owner IDs (separate from email access)
 #   BASE_URL / WEB_ORIGIN  Public API issuer and browser application origin
+#   BILLING_SERVICE_URL / BILLING_SERVICE_AUDIENCE  Exact billing HTTPS origin/audience
+#   BILLING_ENFORCEMENT_MODE  shadow or enforce
 #   REVIEWER_AUTH_API_KEY / REVIEWER_AUTH_UID / REVIEWER_AUTH_EMAIL
 #                        Optional exact Google Identity Platform review account;
 #                        set all three or none. The password is never built in.
@@ -61,17 +79,33 @@
 #     --build-arg KMS_KEY_RING=my-keyring \
 #     --build-arg KMS_KEY=my-kek \
 #     --build-arg GCS_BUCKET=my-enclave-indexes \
+#     --build-arg GCS_MEDIA_BUCKET=my-enclave-media \
+#     --build-arg GCS_LEGACY_MEDIA_BUCKET=my-enclave-indexes \
+#     --build-arg ARCHIVE_WITNESS_SHADOW_MODE=off \
+#     --build-arg ARCHIVE_WITNESS_PROJECT_ID= \
+#     --build-arg ARCHIVE_WITNESS_PROJECT_NUMBER= \
+#     --build-arg ARCHIVE_WITNESS_DATABASE_ID= \
 #     --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
 #     --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
 #     --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/123.../... \
 #     --build-arg GOOGLE_DESKTOP_CLIENT_ID=...apps.googleusercontent.com \
+#     --build-arg GOOGLE_IOS_CLIENT_ID=...apps.googleusercontent.com \
 #     --build-arg GOOGLE_WEB_CLIENT_ID=...apps.googleusercontent.com \
+#     --build-arg APPLE_TEAM_ID=ABCDE12345 \
+#     --build-arg APPLE_KEY_ID=FGHIJ67890 \
+#     --build-arg APPLE_IOS_CLIENT_ID=com.kioku.ios \
+#     --build-arg APPLE_MACOS_CLIENT_ID=com.kiokuu.app \
+#     --build-arg APPLE_WEB_CLIENT_ID=com.kiokuu.web \
 #     --build-arg ALLOWED_EMAILS=owner@example.com \
+#     --build-arg ADMIN_USER_IDS=12345678-1234-1234-1234-123456789abc \
 #     --build-arg BASE_URL=https://api.example.com \
 #     --build-arg WEB_ORIGIN=https://app.example.com \
+#     --build-arg BILLING_SERVICE_URL=https://billing.example.com \
+#     --build-arg BILLING_SERVICE_AUDIENCE=https://billing.example.com \
+#     --build-arg BILLING_ENFORCEMENT_MODE=enforce \
 #     --build-arg VERTEX_PROJECT=my-project \
 #     --build-arg VERTEX_LOCATION=us-central1 \
-#     --build-arg VERTEX_MODEL=gemini-2.5-flash \
+#     --build-arg VERTEX_MODEL=gemini-3.5-flash \
 #     --build-arg ENCLAVE_ACME=1 \
 #     --build-arg ENCLAVE_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory \
 #     --build-arg ENCLAVE_ACME_CONTACT=mailto:operator@example.com \
@@ -81,6 +115,7 @@
 FROM rust:1.97.1-slim@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS builder
 
 ARG SOURCE_DATE_EPOCH
+ARG KIOKU_BUILD_PROFILE
 WORKDIR /build
 
 # Declare and validate production configuration in a runnable stage. A bare
@@ -90,14 +125,33 @@ ARG KMS_LOCATION
 ARG KMS_KEY_RING
 ARG KMS_KEY
 ARG GCS_BUCKET
+ARG GCS_MEDIA_BUCKET
+ARG GCS_LEGACY_MEDIA_BUCKET
+ARG ARCHIVE_WITNESS_SHADOW_MODE
+ARG ARCHIVE_WITNESS_PROJECT_ID
+ARG ARCHIVE_WITNESS_PROJECT_NUMBER
+ARG ARCHIVE_WITNESS_DATABASE_ID
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
 ARG GOOGLE_DESKTOP_CLIENT_ID
+ARG GOOGLE_IOS_CLIENT_ID
 ARG GOOGLE_WEB_CLIENT_ID
+ARG APPLE_TEAM_ID
+ARG APPLE_KEY_ID
+ARG APPLE_IOS_CLIENT_ID
+ARG APPLE_MACOS_CLIENT_ID
+ARG APPLE_WEB_CLIENT_ID
+ARG APNS_TEAM_ID
+ARG APNS_PRODUCTION_KEY_ID
+ARG APNS_SANDBOX_KEY_ID
 ARG ALLOWED_EMAILS
+ARG ADMIN_USER_IDS
 ARG BASE_URL
 ARG WEB_ORIGIN
+ARG BILLING_SERVICE_URL
+ARG BILLING_SERVICE_AUDIENCE
+ARG BILLING_ENFORCEMENT_MODE
 ARG REVIEWER_AUTH_API_KEY
 ARG REVIEWER_AUTH_UID
 ARG REVIEWER_AUTH_EMAIL
@@ -108,22 +162,41 @@ ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
 
+# Phase-0 writes bounded-retention media to GCS_MEDIA_BUCKET and retains the
+# previous index bucket as the exact legacy-media read/delete source. The
+# equality check binds that migration source without constraining the current
+# media bucket.
 RUN set -eu \
     && case "${SOURCE_DATE_EPOCH}" in ''|*[!0-9]*) false;; *) true;; esac \
+    && case "${KIOKU_BUILD_PROFILE}" in production|evaluation) true;; *) false;; esac \
     && for value in \
         "${KMS_PROJECT}" "${KMS_LOCATION}" "${KMS_KEY_RING}" "${KMS_KEY}" \
-        "${GCS_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
-        "${ATTEST_STS_AUDIENCE}" "${GOOGLE_DESKTOP_CLIENT_ID}" \
-        "${GOOGLE_WEB_CLIENT_ID}" "${ALLOWED_EMAILS}" "${BASE_URL}" "${WEB_ORIGIN}" \
+        "${GCS_BUCKET}" "${GCS_MEDIA_BUCKET}" "${GCS_LEGACY_MEDIA_BUCKET}" "${RUN_SA_EMAIL}" "${ENCLAVE_AUDIENCE}" \
+        "${ATTEST_STS_AUDIENCE}" "${GOOGLE_DESKTOP_CLIENT_ID}" "${GOOGLE_IOS_CLIENT_ID}" \
+        "${GOOGLE_WEB_CLIENT_ID}" "${ALLOWED_EMAILS}" "${ADMIN_USER_IDS}" "${BASE_URL}" "${WEB_ORIGIN}" \
+        "${BILLING_SERVICE_URL}" "${BILLING_SERVICE_AUDIENCE}" "${BILLING_ENFORCEMENT_MODE}" \
         "${VERTEX_PROJECT}" "${VERTEX_LOCATION}" "${VERTEX_MODEL}" \
         "${ENCLAVE_ACME_DIRECTORY}" "${ENCLAVE_ACME_CONTACT}"; \
        do [ -n "${value}" ]; done \
+    && [ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ] \
+    && case "${ARCHIVE_WITNESS_SHADOW_MODE}" in \
+         off) [ -z "${ARCHIVE_WITNESS_PROJECT_ID}${ARCHIVE_WITNESS_PROJECT_NUMBER}${ARCHIVE_WITNESS_DATABASE_ID}" ];; \
+         probe-v1) \
+           printf '%s\n' "${ARCHIVE_WITNESS_PROJECT_ID}" | grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' \
+           && printf '%s\n' "${ARCHIVE_WITNESS_PROJECT_NUMBER}" | grep -Eq '^[1-9][0-9]{0,19}$' \
+           && printf '%s\n' "${ARCHIVE_WITNESS_DATABASE_ID}" | grep -Eq '^[a-z][a-z0-9-]{2,61}[a-z0-9]$';; \
+         *) false;; \
+       esac \
     && [ "${ENCLAVE_ACME}" = "1" ] \
     && [ "${ALLOWED_EMAILS}" != "*" ] \
-
+    && case "${ADMIN_USER_IDS}" in *[!0-9A-Fa-f,-]*) false;; *) true;; esac \
     && case "${ENCLAVE_AUDIENCE}" in https://*) true;; *) false;; esac \
     && case "${BASE_URL}" in https://*) true;; *) false;; esac \
     && case "${WEB_ORIGIN}" in https://*) true;; *) false;; esac \
+    && case "${BILLING_SERVICE_URL}" in https://*) true;; *) false;; esac \
+    && [ "${BILLING_SERVICE_AUDIENCE%/}" = "${BILLING_SERVICE_URL%/}" ] \
+    && case "${BILLING_ENFORCEMENT_MODE}" in shadow|enforce) true;; *) false;; esac \
+    && printf '%s\n' "${VERTEX_MODEL}" | grep -Eq '^[A-Za-z0-9._:-]{1,128}$' \
     && case "${ATTEST_STS_AUDIENCE}" in //iam.googleapis.com/*/workloadIdentityPools/*/providers/*) true;; *) false;; esac
 RUN set -eu \
     && if [ -n "${REVIEWER_AUTH_API_KEY}${REVIEWER_AUTH_UID}${REVIEWER_AUTH_EMAIL}" ]; then \
@@ -131,6 +204,27 @@ RUN set -eu \
          && [ -n "${REVIEWER_AUTH_UID}" ] \
          && [ -n "${REVIEWER_AUTH_EMAIL}" ]; \
        fi
+RUN set -eu \
+    && if [ -n "${APPLE_TEAM_ID}${APPLE_KEY_ID}${APPLE_IOS_CLIENT_ID}${APPLE_MACOS_CLIENT_ID}${APPLE_WEB_CLIENT_ID}" ]; then \
+         [ -n "${APPLE_TEAM_ID}" ] \
+         && [ -n "${APPLE_KEY_ID}" ] \
+         && [ "${APPLE_IOS_CLIENT_ID}" = "com.kioku.ios" ] \
+         && [ "${APPLE_MACOS_CLIENT_ID}" = "com.kiokuu.app" ] \
+         && [ "${APPLE_WEB_CLIENT_ID}" = "com.kiokuu.web" ]; \
+       fi
+RUN set -eu \
+    && case "${KIOKU_BUILD_PROFILE}" in \
+         production) \
+           [ -n "${APNS_TEAM_ID}" ] \
+           && [ -n "${APNS_PRODUCTION_KEY_ID}" ] \
+           && [ -n "${APNS_SANDBOX_KEY_ID}" ] ;; \
+         evaluation) \
+           if [ -n "${APNS_TEAM_ID}${APNS_PRODUCTION_KEY_ID}${APNS_SANDBOX_KEY_ID}" ]; then \
+             [ -n "${APNS_TEAM_ID}" ] \
+             && [ -n "${APNS_PRODUCTION_KEY_ID}" ] \
+             && [ -n "${APNS_SANDBOX_KEY_ID}" ]; \
+           fi ;; \
+       esac
 
 # Install musl toolchain (+ curl for the embedding-model download below)
 RUN rustup target add x86_64-unknown-linux-musl \
@@ -143,7 +237,7 @@ RUN rustup target add x86_64-unknown-linux-musl \
 # tool's own lockfile are pinned; this is build tooling, not runtime content.
 RUN cargo install cargo-auditable --version 0.7.4 --locked
 
-# ── Embedding model (hybrid search) ────────────────────────────────────────────
+# ── Embedding models (hybrid search + persistent voice memory) ────────────────
 #
 # paraphrase-multilingual-MiniLM-L12-v2 — the pinned query/document embedding
 # model (see src/embedding.rs MODEL_ID; the Mac client MUST ship the same
@@ -169,6 +263,14 @@ RUN mkdir -p /models \
     && echo "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8  /models/tokenizer.json" | sha256sum -c - \
     && echo "eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b  /models/model.safetensors" | sha256sum -c - \
     && echo "1e98ea05b0de579fcaad3d625b62ea55647142ed674d5f5ebf1440e4bbbb6f23  /models/MODEL_CARD.md" | sha256sum -c -
+
+# WeSpeaker ResNet34-LM (VoxCeleb) for independent server-side voiceprints.
+# The Rust binary supplies decoding, Kaldi fbank, inference, and matching; no
+# Python, sherpa process, or dynamic ONNX runtime is present in the image.
+RUN mkdir -p /models/voice \
+    && curl -fsSL -o /models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx \
+       "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx" \
+    && echo "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012  /models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx" | sha256sum -c -
 
 # musl does not define the BSD-style u_int*_t aliases that sqlite-vec.c's
 # bundled C uses (typedef u_int8_t uint8_t; ...). glibc/macOS provide them, musl
@@ -242,6 +344,12 @@ ARG KMS_LOCATION
 ARG KMS_KEY_RING
 ARG KMS_KEY
 ARG GCS_BUCKET
+ARG GCS_MEDIA_BUCKET
+ARG GCS_LEGACY_MEDIA_BUCKET
+ARG ARCHIVE_WITNESS_SHADOW_MODE
+ARG ARCHIVE_WITNESS_PROJECT_ID
+ARG ARCHIVE_WITNESS_PROJECT_NUMBER
+ARG ARCHIVE_WITNESS_DATABASE_ID
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -257,6 +365,12 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
     KMS_KEY_RING=${KMS_KEY_RING} \
     KMS_KEY=${KMS_KEY} \
     GCS_BUCKET=${GCS_BUCKET} \
+    GCS_MEDIA_BUCKET=${GCS_MEDIA_BUCKET} \
+    GCS_LEGACY_MEDIA_BUCKET=${GCS_LEGACY_MEDIA_BUCKET} \
+    ARCHIVE_WITNESS_SHADOW_MODE=${ARCHIVE_WITNESS_SHADOW_MODE} \
+    ARCHIVE_WITNESS_PROJECT_ID=${ARCHIVE_WITNESS_PROJECT_ID} \
+    ARCHIVE_WITNESS_PROJECT_NUMBER=${ARCHIVE_WITNESS_PROJECT_NUMBER} \
+    ARCHIVE_WITNESS_DATABASE_ID=${ARCHIVE_WITNESS_DATABASE_ID} \
     RUN_SA_EMAIL=${RUN_SA_EMAIL} \
     ENCLAVE_AUDIENCE=${ENCLAVE_AUDIENCE} \
     ATTEST_STS_AUDIENCE=${ATTEST_STS_AUDIENCE}
@@ -278,11 +392,25 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
 # the old baked ENCLAVE_TLS_*_PEM_B64 args leaked the key to operator-visible
 # logs. Those env vars remain honored at runtime only as a bootstrap fallback
 # and for local testing; do not reintroduce them as build args.
+ARG KIOKU_BUILD_PROFILE
 ARG GOOGLE_DESKTOP_CLIENT_ID
+ARG GOOGLE_IOS_CLIENT_ID
 ARG GOOGLE_WEB_CLIENT_ID
+ARG APPLE_TEAM_ID
+ARG APPLE_KEY_ID
+ARG APPLE_IOS_CLIENT_ID
+ARG APPLE_MACOS_CLIENT_ID
+ARG APPLE_WEB_CLIENT_ID
+ARG APNS_TEAM_ID
+ARG APNS_PRODUCTION_KEY_ID
+ARG APNS_SANDBOX_KEY_ID
 ARG ALLOWED_EMAILS
+ARG ADMIN_USER_IDS
 ARG BASE_URL
 ARG WEB_ORIGIN
+ARG BILLING_SERVICE_URL
+ARG BILLING_SERVICE_AUDIENCE
+ARG BILLING_ENFORCEMENT_MODE
 ARG REVIEWER_AUTH_API_KEY
 ARG REVIEWER_AUTH_UID
 ARG REVIEWER_AUTH_EMAIL
@@ -292,12 +420,25 @@ ARG VERTEX_MODEL
 ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
-ENV GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
-
+ENV KIOKU_BUILD_PROFILE=${KIOKU_BUILD_PROFILE} \
+    GOOGLE_DESKTOP_CLIENT_ID=${GOOGLE_DESKTOP_CLIENT_ID} \
+    GOOGLE_IOS_CLIENT_ID=${GOOGLE_IOS_CLIENT_ID} \
     GOOGLE_WEB_CLIENT_ID=${GOOGLE_WEB_CLIENT_ID} \
+    APPLE_TEAM_ID=${APPLE_TEAM_ID} \
+    APPLE_KEY_ID=${APPLE_KEY_ID} \
+    APPLE_IOS_CLIENT_ID=${APPLE_IOS_CLIENT_ID} \
+    APPLE_MACOS_CLIENT_ID=${APPLE_MACOS_CLIENT_ID} \
+    APPLE_WEB_CLIENT_ID=${APPLE_WEB_CLIENT_ID} \
+    APNS_TEAM_ID=${APNS_TEAM_ID} \
+    APNS_PRODUCTION_KEY_ID=${APNS_PRODUCTION_KEY_ID} \
+    APNS_SANDBOX_KEY_ID=${APNS_SANDBOX_KEY_ID} \
     ALLOWED_EMAILS=${ALLOWED_EMAILS} \
+    ADMIN_USER_IDS=${ADMIN_USER_IDS} \
     BASE_URL=${BASE_URL} \
     WEB_ORIGIN=${WEB_ORIGIN} \
+    BILLING_SERVICE_URL=${BILLING_SERVICE_URL} \
+    BILLING_SERVICE_AUDIENCE=${BILLING_SERVICE_AUDIENCE} \
+    BILLING_ENFORCEMENT_MODE=${BILLING_ENFORCEMENT_MODE} \
     REVIEWER_AUTH_API_KEY=${REVIEWER_AUTH_API_KEY} \
     REVIEWER_AUTH_UID=${REVIEWER_AUTH_UID} \
     REVIEWER_AUTH_EMAIL=${REVIEWER_AUTH_EMAIL} \
@@ -328,6 +469,7 @@ COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/kioku-enclav
 # if the model fails to load the enclave serves FTS-only (never fatal).
 COPY --from=builder /models /models
 ENV EMBED_MODEL_DIR=/models
+ENV VOICE_MODEL_PATH=/models/voice/wespeaker_en_voxceleb_resnet34_LM.onnx
 
 # Root, deliberately: the Confidential Space launcher mounts the /tmp tmpfs
 # root-owned with no mode/uid knobs in the tee-mount spec, and a FROM-scratch

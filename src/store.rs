@@ -6,27 +6,32 @@
 //!    an empty one on first use), decrypt it to a temporary file, open rusqlite,
 //!    run schema migrations, cache the handle.
 //!
-//! 2. Callers write rows via the open [`rusqlite::Connection`].
+//! 2. Callers query or write through a tracked [`rusqlite::Connection`]
+//!    closure. SQLite row changes (including triggers), schema changes, and
+//!    persistent header versions advance a process-local mutation generation.
 //!
-//! 3. **save(user_id)** — WAL checkpoint → read temp file → AES-GCM encrypt →
-//!    PUT back to GCS with `ifGenerationMatch` for optimistic concurrency.
+//! 3. **save(user_id)** — if dirty: WAL checkpoint → read temp file → AES-GCM
+//!    encrypt → PUT back to GCS with `ifGenerationMatch`. A proven-clean save
+//!    returns without KMS, encryption, file read, or GCS work.
 //!
 //! # Optimistic concurrency / conflict story
 //!
 //! GCS object versioning provides `generation` numbers.  On every PUT we pass
 //! `ifGenerationMatch=<generation-we-read>`.  If another enclave instance wrote
-//! between our read and write GCS returns 412 Precondition Failed, which we
-//! surface as [`crate::error::EnclaveError::Conflict`].  The caller (handler)
-//! should reload, re-apply changes, and retry.  In the current single-node MIG
+//! between our read and write GCS returns 412 Precondition Failed. A retry after
+//! a lost successful PUT reconciles only when the current object has the exact
+//! wrapped DEK and authenticated plaintext we intended to persist; every other
+//! 412 surfaces as [`crate::error::EnclaveError::Conflict`]. The caller (handler)
+//! should then reload, re-apply changes, and retry. In the current single-node
 //! topology conflicts are rare; this is future-proofing for horizontal scale-out.
 //!
 //! # LRU cache
 //!
-//! A simple `HashMap<UserId, UserHandle>` with last-used timestamps and a
-//! configurable cap (`STORE_MAX_OPEN`, default 16).  On eviction the handle is
-//! saved and closed.  All access is behind a `tokio::sync::Mutex` (coarse but
-//! correct for the current single-node topology — revisit with per-user locks
-//! if contention shows up).
+//! A brief registry lock tracks actor identity, deletion fences, LRU order, and
+//! the configurable open-handle cap (`STORE_MAX_OPEN`, default 16). Each user
+//! actor owns its SQLite connection behind a separate async mutex. On eviction
+//! the victim is saved and closed under only that user's lock; another user's
+//! GCS, KMS, SQLite, or filesystem work never holds the registry lock.
 //!
 //! # user_id validation
 //!
@@ -39,24 +44,39 @@
 //! path is derived (defense in depth).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{Arc, Once},
+    sync::{
+        atomic::{AtomicI64, Ordering as AtomicOrdering},
+        Arc, Once, RwLock as StdRwLock, Weak,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{ffi::sqlite3_auto_extension, Connection, OptionalExtension};
-use serde::Deserialize;
+#[cfg(test)]
+use std::collections::VecDeque;
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use hmac::{Hmac, Mac};
+use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlite_vec::sqlite3_vec_init;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
         decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient,
     },
-    error::{EnclaveError, Result},
+    error::{DeletionPending, DeletionPendingReason, EnclaveError, Result},
+    storage_observability::{
+        StorageMetrics, StorageMetricsSnapshot, AMPLIFICATION_PPM_BUCKET_UPPER_BOUNDS,
+        BYTE_BUCKET_UPPER_BOUNDS, LATENCY_US_BUCKET_UPPER_BOUNDS,
+    },
 };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -66,6 +86,22 @@ pub type UserId = String;
 /// Maximum accepted `user_id` length. Real ids are UUIDs (36 chars); 128
 /// leaves generous headroom without allowing pathological inputs.
 pub const MAX_USER_ID_LEN: usize = 128;
+
+/// Selected screenshot evidence is always written below this owner-scoped raw
+/// media namespace.  Keep construction here rather than at individual writers:
+/// the object key is part of the AEAD context as well as the storage boundary.
+pub const SELECTED_EVIDENCE_MEDIA_SEGMENT: &str = "evidence";
+
+const LEGACY_WRITE_INTENT_FORMAT_VERSION: u8 = 1;
+const LEGACY_WRITE_INTENT_METADATA: &str = "kioku-legacy-write-intent-v1";
+const LEGACY_WRITE_INTENT_PREFIX: &str = "control/legacy-write-intents";
+const LEGACY_WRITE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(300);
+const LEGACY_WRITE_PROVIDER_SAFETY_MILLIS: i64 = 60_000;
+// Production GCS requests are bounded at five minutes. Takeover waits an
+// additional minute so an expired owner cannot still have a provider request
+// capable of committing after the replacement owner settles the intent.
+const LEGACY_WRITE_INTENT_LEASE_MILLIS: i64 = 360_000;
+const IDENTITY_REBIND_FENCE_METADATA: &str = "kioku-identity-rebind-fence-v1";
 
 /// Canonical brief schema/prompt version. Keeping it beside the persistence
 /// migration prevents a worker bump from forgetting to queue stored briefs.
@@ -93,6 +129,32 @@ pub fn validate_user_id(user_id: &str) -> Result<()> {
     }
 }
 
+/// Build the only object key used for newly selected screenshot evidence.
+///
+/// Existing database rows may still name legacy `media/{opaque_key}` objects;
+/// readers and deletion deliberately use those stored keys for compatibility.
+/// New writes must use this helper so no writer can accidentally create an
+/// unscoped media object. The opaque identifier is the 128-bit lowercase hex
+/// value generated by the evidence upload path.
+pub(crate) fn selected_evidence_media_object_key(
+    user_id: &str,
+    opaque_key: &str,
+) -> Result<String> {
+    validate_user_id(user_id)?;
+    let valid_opaque_key = opaque_key.len() == 32
+        && opaque_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    if !valid_opaque_key {
+        return Err(EnclaveError::InvalidRequest(
+            "invalid selected evidence media identifier".into(),
+        ));
+    }
+    Ok(format!(
+        "raw/{user_id}/{SELECTED_EVIDENCE_MEDIA_SEGMENT}/{opaque_key}.enc"
+    ))
+}
+
 /// GCS blob metadata we need to track between load and save.
 struct BlobMeta {
     /// GCS object `generation` at load time.  Used for `ifGenerationMatch`.
@@ -100,6 +162,13 @@ struct BlobMeta {
     generation: i64,
     /// Base64-encoded wrapped DEK stored alongside the blob (in GCS metadata).
     wrapped_dek_b64: String,
+    /// UTC epoch day whose named checkpoint this process has fully verified.
+    /// This is deliberately process-local; restart re-verifies once.
+    verified_legacy_recovery_day: Option<i64>,
+    /// A flush failed after local mutation but before authoritative remote
+    /// persistence. The next access must retry that pending save before a
+    /// caller can observe a duplicate and acknowledge without persisting it.
+    retry_save_before_access: bool,
 }
 
 struct UserHandle {
@@ -108,24 +177,767 @@ struct UserHandle {
     user_id: UserId,
     conn: Connection,
     blob_meta: BlobMeta,
+    /// Monotonic process-local generation advanced whenever SQLite reports a
+    /// possible persistent logical mutation. `dirty` remains the fail-closed
+    /// authority if this diagnostic counter ever saturates.
+    mutation_generation: u64,
+    persisted_mutation_generation: u64,
+    dirty: bool,
     temp_path: PathBuf,
-    last_used: Instant,
 }
 
 /// The shared store, wrapped in Arc so handlers can clone it cheaply.
 pub struct Store {
-    inner: Mutex<StoreInner>,
+    registry: Mutex<StoreRegistry>,
+    registry_changed: Arc<Notify>,
+    lifecycle_gates: Mutex<HashMap<UserId, Arc<Mutex<()>>>>,
+    /// Admission barrier for operations which can create a raw object outside
+    /// the SQLite actor.  It is deliberately separate from the async actor
+    /// mutex so a GCS PUT can remain in an owned task without holding a SQLite
+    /// connection, while deletion can still atomically close admission and
+    /// wait for every admitted writer to settle.
+    content_write_barrier: Arc<ContentWriteBarrier>,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
+    /// Current media write/read bucket. New capture objects are written here.
     pub media_gcs: Arc<dyn GcsClient>,
+    /// Migration-only source for media that predates the current media bucket.
+    /// Reads fall back here only after the current bucket returns NotFound;
+    /// cleanup scans both providers because bucket identity is not inferable
+    /// from a historical database key.
+    pub legacy_media_gcs: Arc<dyn GcsClient>,
     max_open: usize,
+    checkpoint_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    storage_metrics: StorageMetrics,
+    legacy_checkpoint_reconciliation: Mutex<LegacyCheckpointReconciliation>,
+    /// HMAC key for identity-unlinkable retained fence object names. In
+    /// production this is the KMS-unwrapped control-store DEK, installed only
+    /// after that exact encrypted control generation is durable.
+    legacy_fence_key: StdRwLock<Option<Zeroizing<[u8; 32]>>>,
 }
 
-struct StoreInner {
-    handles: HashMap<UserId, UserHandle>,
+/// Content-free startup reconciliation state. It deliberately has no archive,
+/// object, or account identifiers so it is safe to expose through aggregate
+/// logs and diagnostics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegacyCheckpointReconciliation {
+    pub ready: bool,
+    pub completed_scans: u64,
+    pub listed_live_objects: u64,
+    pub live_archives_checked: u64,
+    pub checkpoints_verified: u64,
+    pub failures: u64,
+}
+
+struct UserActor {
+    state: Arc<Mutex<UserActorState>>,
+}
+
+#[derive(Default)]
+struct UserActorState {
+    handle: Option<UserHandle>,
+    /// An eviction that raced a queued `save_user` already persisted the exact
+    /// handle that save intended to flush. The actor is weakly retained only
+    /// while such queued requests still exist.
+    cleanly_evicted: bool,
+}
+
+struct StoreRegistry {
+    /// Weak entries preserve one actor identity across concurrent cache misses
+    /// without retaining an unbounded number of idle actors forever.
+    actors: HashMap<UserId, Weak<UserActor>>,
+    /// Strong references for handles that are loading, open, or being evicted.
+    /// Its length is the strictly enforced `STORE_MAX_OPEN` reservation count.
+    open_users: HashMap<UserId, OpenUser>,
     /// Process-local deletion fence. Once set, in-flight requests that passed
     /// authentication cannot recreate or save this user's content.
     blocked_users: HashSet<UserId>,
+    /// Bounded completion markers make `with_user(...); save_user(...)`
+    /// idempotent when an unrelated cache miss evicts and flushes that handle
+    /// in between the two calls.
+    recent_clean_evictions: HashMap<UserId, u64>,
+    access_clock: u64,
+}
+
+#[derive(Default)]
+struct ContentWriteBarrierState {
+    blocked_users: HashSet<UserId>,
+    active_writes: HashMap<UserId, usize>,
+}
+
+struct ContentWriteBarrier {
+    state: std::sync::Mutex<ContentWriteBarrierState>,
+    changed: Notify,
+}
+
+impl Default for ContentWriteBarrier {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ContentWriteBarrierState::default()),
+            changed: Notify::new(),
+        }
+    }
+}
+
+/// Keeps an admitted raw-content operation visible to account deletion.  It
+/// can be moved into an owned GCS task, so request cancellation never lets
+/// deletion outrun a PUT whose provider outcome is still unknown.
+pub struct ContentWriteLease {
+    barrier: Arc<ContentWriteBarrier>,
+    user_id: UserId,
+}
+
+/// Content-free commitment to the exact latest acknowledged legacy actor
+/// snapshot. The plaintext never enters the control store; only this digest,
+/// its conditional source generation, and the opaque wrapped key metadata are
+/// carried through the rebind transition.
+pub(crate) struct IdentityRebindSource {
+    pub(crate) base_generation: i64,
+    pub(crate) source_generation: i64,
+    pub(crate) commitment: [u8; 32],
+    pub(crate) plaintext: Vec<u8>,
+    pub(crate) wrapped_dek_b64: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyWriteBackend {
+    Index,
+    Media,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyWriteKind {
+    IndexPut,
+    MediaPut,
+    RecoveryCopy,
+    StableCreate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyWriteIntentState {
+    Prepared,
+    Requesting,
+    Committed,
+    Conflict,
+    Fenced,
+}
+
+impl LegacyWriteIntentState {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Committed | Self::Conflict | Self::Fenced)
+    }
+}
+
+/// Durable provider-side authority for one exact legacy content mutation.
+/// Request bytes are already encrypted and are retained only while a crashed
+/// owner may need takeover; terminal tombstones erase them but preserve the
+/// precondition and digests through the archive-deletion lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyWriteIntent {
+    format_version: u8,
+    request_id: String,
+    user_id: String,
+    backend: LegacyWriteBackend,
+    kind: LegacyWriteKind,
+    object_name: String,
+    if_generation_match: Option<i64>,
+    source_object_name: Option<String>,
+    source_generation: Option<i64>,
+    ciphertext_sha256: String,
+    wrapped_dek_sha256: String,
+    ciphertext_b64: Option<String>,
+    wrapped_dek_b64: Option<String>,
+    state: LegacyWriteIntentState,
+    owner_token: Option<String>,
+    lease_expires_at_millis: Option<i64>,
+    outcome_generation: Option<i64>,
+}
+
+#[derive(Clone)]
+enum LegacyWriteRequest {
+    Put {
+        backend: LegacyWriteBackend,
+        kind: LegacyWriteKind,
+        object_name: String,
+        ciphertext: Vec<u8>,
+        wrapped_dek_b64: String,
+        if_generation_match: i64,
+    },
+    RecoveryCopy {
+        source_object_name: String,
+        source_generation: i64,
+        destination_object_name: String,
+    },
+}
+
+#[derive(Clone)]
+struct PersistedLegacyWriteIntent {
+    object_name: String,
+    generation: i64,
+    intent: LegacyWriteIntent,
+}
+
+/// Store-owned two-namespace transition. Both lifecycle gates, raw-content
+/// admissions, and actor states remain fenced until `complete` makes only the
+/// stable namespace available. Dropping a pending transition deliberately
+/// leaves both process-local fences installed; the durable control operation
+/// is the restart authority.
+pub(crate) struct IdentityRebindTransition {
+    store: Arc<Store>,
+    old_user_id: UserId,
+    stable_user_id: UserId,
+    _lifecycle_guards: Vec<OwnedMutexGuard<()>>,
+    old_actor: Arc<UserActor>,
+    stable_actor: Arc<UserActor>,
+    old_state: OwnedMutexGuard<UserActorState>,
+    _stable_state: OwnedMutexGuard<UserActorState>,
+}
+
+impl ContentWriteLease {
+    /// A child lease is intentionally allowed after the user is fenced: its
+    /// parent was admitted before the fence and deletion must wait for both.
+    pub fn child(&self) -> Self {
+        let mut state = self.barrier.state.lock().expect("content barrier poisoned");
+        let count = state.active_writes.entry(self.user_id.clone()).or_default();
+        *count = count.saturating_add(1);
+        Self {
+            barrier: Arc::clone(&self.barrier),
+            user_id: self.user_id.clone(),
+        }
+    }
+}
+
+impl Drop for ContentWriteLease {
+    fn drop(&mut self) {
+        let mut state = self.barrier.state.lock().expect("content barrier poisoned");
+        let remove = match state.active_writes.get_mut(&self.user_id) {
+            Some(count) => {
+                debug_assert!(*count > 0, "content-write lease underflow");
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if remove {
+            state.active_writes.remove(&self.user_id);
+            // Retain a permit if the deletion waiter has created its future
+            // but has not yet polled it. This closes the check-then-wait gap
+            // without making the barrier dependent on executor timing.
+            self.barrier.changed.notify_one();
+        }
+    }
+}
+
+struct OpenUser {
+    actor: Arc<UserActor>,
+    last_used: u64,
+    status: OpenStatus,
+    /// Weak liveness token for a cancellable Loading/Evicting transition. If
+    /// the owning future is dropped, the token expires and the next capacity
+    /// waiter can repair the process-local registry state.
+    transition: Option<Weak<RegistryTransition>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenStatus {
+    Loading,
+    Open,
+    Evicting,
+    /// An eviction future was cancelled. The handle may still be present, or
+    /// the flush may already have completed and removed it. Either case is
+    /// recoverable under the same actor lock.
+    RecoveredEviction,
+}
+
+struct EvictionCandidate {
+    user_id: UserId,
+    actor: Arc<UserActor>,
+    transition: Arc<RegistryTransition>,
+}
+
+enum CapacityAction {
+    Reserved(Arc<RegistryTransition>),
+    Evict(EvictionCandidate),
+    Wait,
+}
+
+/// A cancellable registry transition owns one strong token while the registry
+/// retains only a weak reference. Dropping the future expires the token and
+/// wakes a capacity waiter, which repairs the abandoned state without doing
+/// async work from `Drop`.
+struct RegistryTransition {
+    registry_changed: Arc<Notify>,
+}
+
+impl RegistryTransition {
+    fn new(registry_changed: &Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            registry_changed: Arc::clone(registry_changed),
+        })
+    }
+}
+
+impl Drop for RegistryTransition {
+    fn drop(&mut self) {
+        self.registry_changed.notify_one();
+    }
+}
+
+/// Own a freshly loaded handle until its registry reservation is committed.
+/// Cancellation while waiting for that final registry lock must close SQLite
+/// before removing its plaintext temp files.
+struct PendingUserHandle(Option<UserHandle>);
+
+impl PendingUserHandle {
+    fn new(handle: UserHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    fn take(mut self) -> UserHandle {
+        self.0.take().expect("pending user handle already consumed")
+    }
+}
+
+impl Drop for PendingUserHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let temp_path = handle.temp_path.clone();
+            drop(handle);
+            remove_temp_db_files(&temp_path);
+        }
+    }
+}
+
+enum SaveTarget {
+    Actor(Arc<UserActor>),
+    AlreadyFlushed,
+}
+
+fn legacy_write_intent_prefix(user_id: &str) -> String {
+    format!("{LEGACY_WRITE_INTENT_PREFIX}/{user_id}/")
+}
+
+fn legacy_write_intent_object_name(user_id: &str, request_id: &str) -> String {
+    format!("{}{request_id}", legacy_write_intent_prefix(user_id))
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+impl LegacyWriteIntent {
+    fn prepared(user_id: &str, request: &LegacyWriteRequest) -> Self {
+        let request_id = format!("intent_{}", crate::cp::tokens::random_token_hex());
+        match request {
+            LegacyWriteRequest::Put {
+                backend,
+                kind,
+                object_name,
+                ciphertext,
+                wrapped_dek_b64,
+                if_generation_match,
+            } => Self {
+                format_version: LEGACY_WRITE_INTENT_FORMAT_VERSION,
+                request_id,
+                user_id: user_id.to_string(),
+                backend: *backend,
+                kind: *kind,
+                object_name: object_name.clone(),
+                if_generation_match: Some(*if_generation_match),
+                source_object_name: None,
+                source_generation: None,
+                ciphertext_sha256: sha256_hex_bytes(ciphertext),
+                wrapped_dek_sha256: sha256_hex_bytes(wrapped_dek_b64.as_bytes()),
+                ciphertext_b64: Some(B64.encode(ciphertext)),
+                wrapped_dek_b64: Some(wrapped_dek_b64.clone()),
+                state: LegacyWriteIntentState::Prepared,
+                owner_token: None,
+                lease_expires_at_millis: None,
+                outcome_generation: None,
+            },
+            LegacyWriteRequest::RecoveryCopy {
+                source_object_name,
+                source_generation,
+                destination_object_name,
+            } => Self {
+                format_version: LEGACY_WRITE_INTENT_FORMAT_VERSION,
+                request_id,
+                user_id: user_id.to_string(),
+                backend: LegacyWriteBackend::Index,
+                kind: LegacyWriteKind::RecoveryCopy,
+                object_name: destination_object_name.clone(),
+                if_generation_match: Some(0),
+                source_object_name: Some(source_object_name.clone()),
+                source_generation: Some(*source_generation),
+                ciphertext_sha256: sha256_hex_bytes(&[]),
+                wrapped_dek_sha256: sha256_hex_bytes(&[]),
+                ciphertext_b64: None,
+                wrapped_dek_b64: None,
+                state: LegacyWriteIntentState::Prepared,
+                owner_token: None,
+                lease_expires_at_millis: None,
+                outcome_generation: None,
+            },
+        }
+    }
+
+    fn validate(&self, object_name: &str) -> Result<()> {
+        validate_user_id(&self.user_id)?;
+        if self.format_version != LEGACY_WRITE_INTENT_FORMAT_VERSION
+            || !self.request_id.starts_with("intent_")
+            || self.request_id.len() != 71
+            || legacy_write_intent_object_name(&self.user_id, &self.request_id) != object_name
+            || self.object_name.is_empty()
+            || self
+                .if_generation_match
+                .is_none_or(|generation| generation < 0)
+        {
+            return Err(EnclaveError::Store(
+                "invalid persisted legacy write intent authority".into(),
+            ));
+        }
+        if self.ciphertext_sha256.len() != 64
+            || self.wrapped_dek_sha256.len() != 64
+            || !self
+                .ciphertext_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || !self
+                .wrapped_dek_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(EnclaveError::Store(
+                "invalid legacy write intent commitment".into(),
+            ));
+        }
+        let valid_namespace = match self.kind {
+            LegacyWriteKind::IndexPut | LegacyWriteKind::StableCreate => {
+                self.backend == LegacyWriteBackend::Index
+                    && self.object_name == gcs_object_name(&self.user_id)
+            }
+            LegacyWriteKind::MediaPut => {
+                self.backend == LegacyWriteBackend::Media
+                    && self.object_name.starts_with(&media_prefix(&self.user_id))
+            }
+            LegacyWriteKind::RecoveryCopy => {
+                let expected_source = gcs_object_name(&self.user_id);
+                self.backend == LegacyWriteBackend::Index
+                    && self.source_object_name.as_deref() == Some(expected_source.as_str())
+                    && self
+                        .object_name
+                        .starts_with(&legacy_recovery_prefix(&self.user_id))
+            }
+        };
+        if !valid_namespace {
+            return Err(EnclaveError::Store(
+                "legacy write intent escaped its bound namespace".into(),
+            ));
+        }
+        let put_shape = !matches!(self.kind, LegacyWriteKind::RecoveryCopy)
+            && self.source_object_name.is_none()
+            && self.source_generation.is_none()
+            && (!self.state.is_terminal()
+                || (self.ciphertext_b64.is_none() && self.wrapped_dek_b64.is_none()));
+        let copy_shape = matches!(self.kind, LegacyWriteKind::RecoveryCopy)
+            && self.backend == LegacyWriteBackend::Index
+            && self.if_generation_match == Some(0)
+            && self
+                .source_object_name
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+            && self
+                .source_generation
+                .is_some_and(|generation| generation > 0)
+            && self.ciphertext_b64.is_none()
+            && self.wrapped_dek_b64.is_none();
+        if !put_shape && !copy_shape {
+            return Err(EnclaveError::Store(
+                "invalid persisted legacy write intent request".into(),
+            ));
+        }
+        match self.state {
+            LegacyWriteIntentState::Prepared => {
+                if self.owner_token.is_some()
+                    || self.lease_expires_at_millis.is_some()
+                    || self.outcome_generation.is_some()
+                    || (!matches!(self.kind, LegacyWriteKind::RecoveryCopy)
+                        && (self.ciphertext_b64.is_none() || self.wrapped_dek_b64.is_none()))
+                {
+                    return Err(EnclaveError::Store(
+                        "invalid prepared legacy write intent".into(),
+                    ));
+                }
+            }
+            LegacyWriteIntentState::Requesting => {
+                if self
+                    .owner_token
+                    .as_deref()
+                    .is_none_or(|owner| !owner.starts_with("owner_") || owner.len() != 70)
+                    || self
+                        .lease_expires_at_millis
+                        .is_none_or(|expiry| expiry <= 0)
+                    || self.outcome_generation.is_some()
+                    || (!matches!(self.kind, LegacyWriteKind::RecoveryCopy)
+                        && (self.ciphertext_b64.is_none() || self.wrapped_dek_b64.is_none()))
+                {
+                    return Err(EnclaveError::Store(
+                        "invalid requesting legacy write intent".into(),
+                    ));
+                }
+            }
+            LegacyWriteIntentState::Committed => {
+                if self.owner_token.is_some()
+                    || self.lease_expires_at_millis.is_some()
+                    || self
+                        .outcome_generation
+                        .is_none_or(|generation| generation <= 0)
+                    || self.ciphertext_b64.is_some()
+                    || self.wrapped_dek_b64.is_some()
+                {
+                    return Err(EnclaveError::Store(
+                        "invalid committed legacy write intent".into(),
+                    ));
+                }
+            }
+            LegacyWriteIntentState::Conflict | LegacyWriteIntentState::Fenced => {
+                if self.owner_token.is_some()
+                    || self.lease_expires_at_millis.is_some()
+                    || self.outcome_generation.is_some()
+                    || self.ciphertext_b64.is_some()
+                    || self.wrapped_dek_b64.is_some()
+                {
+                    return Err(EnclaveError::Store(
+                        "invalid terminal legacy write intent".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn request(&self) -> Result<LegacyWriteRequest> {
+        if self.state.is_terminal() {
+            return Err(EnclaveError::Store(
+                "terminal legacy write intent has no request payload".into(),
+            ));
+        }
+        if self.kind == LegacyWriteKind::RecoveryCopy {
+            return Ok(LegacyWriteRequest::RecoveryCopy {
+                source_object_name: self.source_object_name.clone().ok_or_else(|| {
+                    EnclaveError::Store("legacy recovery intent lost its source".into())
+                })?,
+                source_generation: self.source_generation.ok_or_else(|| {
+                    EnclaveError::Store("legacy recovery intent lost its generation".into())
+                })?,
+                destination_object_name: self.object_name.clone(),
+            });
+        }
+        let ciphertext = B64
+            .decode(self.ciphertext_b64.as_deref().ok_or_else(|| {
+                EnclaveError::Store("legacy write intent lost its ciphertext".into())
+            })?)
+            .map_err(|_| EnclaveError::Store("invalid legacy write intent ciphertext".into()))?;
+        let wrapped_dek_b64 = self.wrapped_dek_b64.clone().ok_or_else(|| {
+            EnclaveError::Store("legacy write intent lost its wrapped key".into())
+        })?;
+        if sha256_hex_bytes(&ciphertext) != self.ciphertext_sha256
+            || sha256_hex_bytes(wrapped_dek_b64.as_bytes()) != self.wrapped_dek_sha256
+        {
+            return Err(EnclaveError::Store(
+                "legacy write intent request commitment mismatch".into(),
+            ));
+        }
+        Ok(LegacyWriteRequest::Put {
+            backend: self.backend,
+            kind: self.kind,
+            object_name: self.object_name.clone(),
+            ciphertext,
+            wrapped_dek_b64,
+            if_generation_match: self.if_generation_match.ok_or_else(|| {
+                EnclaveError::Store("legacy write intent lost its precondition".into())
+            })?,
+        })
+    }
+
+    fn terminal(&self, state: LegacyWriteIntentState, outcome_generation: Option<i64>) -> Self {
+        debug_assert!(state.is_terminal());
+        let mut terminal = self.clone();
+        terminal.state = state;
+        terminal.owner_token = None;
+        terminal.lease_expires_at_millis = None;
+        terminal.outcome_generation = outcome_generation;
+        terminal.ciphertext_b64 = None;
+        terminal.wrapped_dek_b64 = None;
+        terminal
+    }
+}
+
+async fn load_persisted_legacy_write_intent(
+    gcs: &dyn GcsClient,
+    object_name: &str,
+) -> Result<PersistedLegacyWriteIntent> {
+    let current = gcs.get_object(object_name).await?;
+    if current.generation <= 0 || current.wrapped_dek_b64 != LEGACY_WRITE_INTENT_METADATA {
+        return Err(EnclaveError::Store(
+            "legacy write intent provider metadata is invalid".into(),
+        ));
+    }
+    let intent: LegacyWriteIntent = serde_json::from_slice(&current.ciphertext)?;
+    intent.validate(object_name)?;
+    Ok(PersistedLegacyWriteIntent {
+        object_name: object_name.to_string(),
+        generation: current.generation,
+        intent,
+    })
+}
+
+async fn verify_persisted_legacy_write_intent_owner(
+    gcs: &dyn GcsClient,
+    claimed: &PersistedLegacyWriteIntent,
+) -> Result<tokio::time::Instant> {
+    let current = load_persisted_legacy_write_intent(gcs, &claimed.object_name).await?;
+    // Anchor the request deadline before the provider-time read. Network
+    // latency and scheduler delay therefore consume, rather than extend, the
+    // lease budget returned by that authenticated response.
+    let monotonic_before_provider_read = tokio::time::Instant::now();
+    let trusted_now = gcs
+        .trusted_time_millis(&claimed.object_name, current.generation)
+        .await?;
+    let lease_expiry = current.intent.lease_expires_at_millis.ok_or_else(|| {
+        EnclaveError::Conflict("legacy write intent ownership lease disappeared".into())
+    })?;
+    if current.generation != claimed.generation
+        || current.intent.state != LegacyWriteIntentState::Requesting
+        || current.intent.owner_token != claimed.intent.owner_token
+        || current.intent.lease_expires_at_millis != claimed.intent.lease_expires_at_millis
+    {
+        return Err(EnclaveError::Conflict(
+            "legacy write intent ownership changed before provider request".into(),
+        ));
+    }
+    let remaining = lease_expiry.saturating_sub(trusted_now);
+    if remaining <= LEGACY_WRITE_PROVIDER_SAFETY_MILLIS {
+        return Err(EnclaveError::Conflict(
+            "legacy write intent lease is too near expiry for provider request".into(),
+        ));
+    }
+    let maximum_request_millis = i64::try_from(LEGACY_WRITE_PROVIDER_TIMEOUT.as_millis())
+        .map_err(|_| EnclaveError::Store("legacy write timeout exceeded i64".into()))?;
+    let request_millis =
+        maximum_request_millis.min(remaining.saturating_sub(LEGACY_WRITE_PROVIDER_SAFETY_MILLIS));
+    let request_millis = u64::try_from(request_millis).map_err(|_| {
+        EnclaveError::Conflict("legacy write intent request budget was not positive".into())
+    })?;
+    let deadline = monotonic_before_provider_read
+        .checked_add(Duration::from_millis(request_millis))
+        .ok_or_else(|| EnclaveError::Store("legacy write deadline overflowed".into()))?;
+    if deadline <= tokio::time::Instant::now() {
+        return Err(EnclaveError::Conflict(
+            "legacy write intent request deadline elapsed during ownership verification".into(),
+        ));
+    }
+    Ok(deadline)
+}
+
+impl StoreRegistry {
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn actor_for(&mut self, user_id: &str, max_open: usize) -> Arc<UserActor> {
+        if let Some(actor) = self.actors.get(user_id).and_then(Weak::upgrade) {
+            return actor;
+        }
+
+        // Failed loads leave only expired weak entries. Bound that bookkeeping
+        // without scanning the registry on every ordinary request.
+        let cleanup_threshold = max_open.saturating_mul(4).max(64);
+        if self.actors.len() >= cleanup_threshold {
+            self.actors.retain(|_, actor| actor.strong_count() != 0);
+        }
+
+        let actor = Arc::new(UserActor {
+            state: Arc::new(Mutex::new(UserActorState::default())),
+        });
+        self.actors
+            .insert(user_id.to_string(), Arc::downgrade(&actor));
+        actor
+    }
+
+    fn touch(&mut self, user_id: &str) {
+        let access = self.next_access();
+        if let Some(open) = self.open_users.get_mut(user_id) {
+            // Once eviction is selected, that ordering decision wins. A racing
+            // access keeps this same actor Arc, waits for eviction, then reloads;
+            // a racing save observes `cleanly_evicted` and succeeds because the
+            // eviction itself performed the requested flush.
+            if open.status != OpenStatus::Evicting {
+                open.last_used = access;
+            }
+        }
+    }
+
+    fn record_clean_eviction(&mut self, user_id: &str, max_open: usize) {
+        let access = self.next_access();
+        let limit = max_open.saturating_mul(4).max(64);
+        if self.recent_clean_evictions.len() >= limit
+            && !self.recent_clean_evictions.contains_key(user_id)
+        {
+            if let Some(oldest) = self
+                .recent_clean_evictions
+                .iter()
+                .min_by_key(|(_, access)| **access)
+                .map(|(user_id, _)| user_id.clone())
+            {
+                self.recent_clean_evictions.remove(&oldest);
+            }
+        }
+        self.recent_clean_evictions
+            .insert(user_id.to_string(), access);
+    }
+
+    /// Repair transitions whose owning request future was cancelled. Loading
+    /// handles are not installed until their reservation is committed, so an
+    /// abandoned Loading entry can be removed. An abandoned eviction may have
+    /// stopped before or after its flush; preserve the actor and let its next
+    /// holder resolve the handle state under the per-user lock.
+    fn recover_abandoned_transitions(&mut self) {
+        let abandoned_loads = self
+            .open_users
+            .iter()
+            .filter(|(_, open)| open.status == OpenStatus::Loading && transition_expired(open))
+            .map(|(user_id, _)| user_id.clone())
+            .collect::<Vec<_>>();
+        for user_id in abandoned_loads {
+            self.open_users.remove(&user_id);
+        }
+
+        for open in self.open_users.values_mut() {
+            if open.status == OpenStatus::Evicting && transition_expired(open) {
+                open.status = OpenStatus::RecoveredEviction;
+                open.transition = None;
+            }
+        }
+    }
+}
+
+fn transition_expired(open: &OpenUser) -> bool {
+    open.transition.as_ref().and_then(Weak::upgrade).is_none()
+}
+
+fn transition_matches(open: &OpenUser, transition: &Arc<RegistryTransition>) -> bool {
+    open.transition
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .is_some_and(|current| Arc::ptr_eq(&current, transition))
 }
 
 #[derive(Debug, Clone)]
@@ -144,10 +956,32 @@ pub struct EmailDeliveryRow {
     pub updated_at: String,
 }
 
+#[derive(Clone)]
+pub struct PushDeliveryRow {
+    pub episode_id: i64,
+    pub installation_id: String,
+    pub delivery_version: i32,
+    pub delivery_id: String,
+    pub handoff_handle: String,
+    pub collapse_id: String,
+    pub attempt_count: i32,
+}
+
+impl std::fmt::Debug for PushDeliveryRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PushDeliveryRow")
+            .field("episode_id", &self.episode_id)
+            .field("delivery_version", &self.delivery_version)
+            .field("attempt_count", &self.attempt_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Store {
     pub fn new(kms: Arc<dyn KmsClient>, gcs: Arc<dyn GcsClient>) -> Self {
         let media_gcs = Arc::clone(&gcs);
-        Self::new_internal(kms, gcs, media_gcs)
+        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs)
     }
 
     pub fn new_with_media(
@@ -155,54 +989,1363 @@ impl Store {
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
     ) -> Self {
-        Self::new_internal(kms, gcs, media_gcs)
+        Self::new_internal(kms, gcs, Arc::clone(&media_gcs), media_gcs)
+    }
+
+    /// Construct the Phase-0 split-media topology. The legacy client is
+    /// deliberately explicit: production startup must not silently point it
+    /// at another bucket when the baked migration evidence is absent.
+    pub fn new_with_media_and_legacy(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
+    ) -> Self {
+        Self::new_internal(kms, gcs, media_gcs, legacy_media_gcs)
     }
 
     fn new_internal(
         kms: Arc<dyn KmsClient>,
         gcs: Arc<dyn GcsClient>,
         media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
     ) -> Self {
         let max_open = std::env::var("STORE_MAX_OPEN")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16usize);
+            .unwrap_or(16usize)
+            .max(1);
+        Self::new_internal_with_max_open(kms, gcs, media_gcs, legacy_media_gcs, max_open)
+    }
+
+    fn new_internal_with_max_open(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
+        max_open: usize,
+    ) -> Self {
         Store {
-            inner: Mutex::new(StoreInner {
-                handles: HashMap::new(),
+            registry: Mutex::new(StoreRegistry {
+                actors: HashMap::new(),
+                open_users: HashMap::new(),
                 blocked_users: HashSet::new(),
+                recent_clean_evictions: HashMap::new(),
+                access_clock: 0,
             }),
+            registry_changed: Arc::new(Notify::new()),
+            lifecycle_gates: Mutex::new(HashMap::new()),
+            content_write_barrier: Arc::new(ContentWriteBarrier::default()),
             kms,
             gcs,
             media_gcs,
-            max_open,
+            legacy_media_gcs,
+            max_open: max_open.max(1),
+            checkpoint_clock: Arc::new(SystemTime::now),
+            storage_metrics: StorageMetrics::default(),
+            legacy_checkpoint_reconciliation: Mutex::new(LegacyCheckpointReconciliation::default()),
+            legacy_fence_key: StdRwLock::new(initial_legacy_fence_key()),
         }
     }
 
-    pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<()> {
+    /// Install the KMS-protected key that separates provider fence names from
+    /// identities retained in the decrypted control rows. A live process
+    /// never changes keys: disagreement means its control authority changed
+    /// underneath it and all marker operations fail closed until restart.
+    pub(crate) fn install_legacy_fence_key(&self, key: [u8; 32]) -> Result<()> {
+        #[cfg(test)]
+        {
+            let _ = key;
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            let mut current = self
+                .legacy_fence_key
+                .write()
+                .map_err(|_| EnclaveError::Store("legacy fence key lock poisoned".into()))?;
+            match current.as_deref() {
+                Some(existing) if existing == key.as_slice() => Ok(()),
+                Some(_) => Err(EnclaveError::Conflict(
+                    "durable control key changed while legacy fences were active".into(),
+                )),
+                None => {
+                    *current = Some(Zeroizing::new(key));
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub(crate) fn identity_rebind_fence_object_name(&self, user_id: &str) -> Result<String> {
+        validate_user_id(user_id)?;
+        let key = self
+            .legacy_fence_key
+            .read()
+            .map_err(|_| EnclaveError::Store("legacy fence key lock poisoned".into()))?;
+        let key = key.as_deref().ok_or_else(|| {
+            EnclaveError::Store("durable legacy fence key is not initialized".into())
+        })?;
+        Ok(identity_rebind_fence_object_name_with_key(key, user_id))
+    }
+
+    pub(crate) fn legacy_fence_key_initialized(&self) -> Result<bool> {
+        self.legacy_fence_key
+            .read()
+            .map(|key| key.is_some())
+            .map_err(|_| EnclaveError::Store("legacy fence key lock poisoned".into()))
+    }
+
+    /// Periodically emit one process-wide, unlabeled snapshot through the
+    /// existing structured tracing pipeline. No network metrics service is
+    /// introduced, and idle intervals are suppressed.
+    pub fn spawn_metrics_reporter(store: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            let mut last_snapshot = store.storage_metrics_snapshot();
+            loop {
+                interval.tick().await;
+                let snapshot = store.storage_metrics_snapshot();
+                if snapshot == last_snapshot {
+                    continue;
+                }
+                log_storage_metrics(&snapshot);
+                last_snapshot = snapshot;
+            }
+        });
+    }
+
+    pub(crate) fn storage_metrics_snapshot(&self) -> StorageMetricsSnapshot {
+        self.storage_metrics.snapshot()
+    }
+
+    /// Returns aggregate-only reconciliation progress. `ready` is false until
+    /// one complete, error-free pass has verified today's checkpoint for every
+    /// currently live legacy archive discovered through GCS listing.
+    pub async fn legacy_checkpoint_reconciliation(&self) -> LegacyCheckpointReconciliation {
+        self.legacy_checkpoint_reconciliation.lock().await.clone()
+    }
+
+    /// Reconcile legacy archives already present before the first new save.
+    /// This runs serially (one GCS operation chain at a time), retains only one
+    /// listing page, and retries later after failures. It never changes bucket
+    /// lifecycle policy or archive authority.
+    pub fn spawn_legacy_checkpoint_reconciler(store: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut retry_delay = Duration::from_secs(5);
+            loop {
+                match store.reconcile_legacy_recovery_checkpoints_once().await {
+                    Ok(progress) => {
+                        info!(
+                            target: "kioku::legacy_checkpoint_reconciliation",
+                            ready = progress.ready,
+                            completed_scans = progress.completed_scans,
+                            listed_live_objects = progress.listed_live_objects,
+                            live_archives_checked = progress.live_archives_checked,
+                            checkpoints_verified = progress.checkpoints_verified,
+                            failures = progress.failures,
+                            "legacy recovery checkpoint reconciliation completed"
+                        );
+                        retry_delay = Duration::from_secs(3600);
+                    }
+                    Err(()) => {
+                        let progress = store.legacy_checkpoint_reconciliation().await;
+                        warn!(
+                            target: "kioku::legacy_checkpoint_reconciliation",
+                            ready = false,
+                            listed_live_objects = progress.listed_live_objects,
+                            live_archives_checked = progress.live_archives_checked,
+                            checkpoints_verified = progress.checkpoints_verified,
+                            failures = progress.failures,
+                            retry_delay_seconds = retry_delay.as_secs(),
+                            "legacy recovery checkpoint reconciliation incomplete; retrying"
+                        );
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                    }
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+        });
+    }
+
+    /// One bounded-memory pass. Listing excludes noncurrent versions, and each
+    /// listed name is explicitly read without a generation to bind the
+    /// checkpoint to GCS's current live generation. Any listing/read mismatch
+    /// fails the pass closed so readiness cannot be asserted on an incomplete
+    /// view.
+    pub async fn reconcile_legacy_recovery_checkpoints_once(
+        &self,
+    ) -> std::result::Result<LegacyCheckpointReconciliation, ()> {
+        *self.legacy_checkpoint_reconciliation.lock().await =
+            LegacyCheckpointReconciliation::default();
+        let mut progress = LegacyCheckpointReconciliation::default();
+        let now = (self.checkpoint_clock)();
+        let mut page_token = None;
+        // Keep fixed-size fingerprints rather than retaining every opaque
+        // provider cursor. A repeated cursor always maps to the same bit and
+        // fails closed; a collision can only stop a pass early, never let an
+        // incomplete listing assert readiness.
+        let mut seen_cursor_fingerprints = [0_u64; GCS_CURSOR_FINGERPRINT_WORDS];
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = match self
+                .gcs
+                .list_live_objects("indexes/", page_token.as_deref())
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await
+                }
+            };
+            for listed in page.versions {
+                progress.listed_live_objects = progress.listed_live_objects.saturating_add(1);
+                let Some(user_id) = legacy_index_user_id(&listed.name) else {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await;
+                };
+                // This uses the same admission barrier as raw media writes.
+                // A concurrent account deletion either waits for this exact
+                // copy/verification or prevents it from starting before its
+                // recovery-prefix inventory becomes authoritative.
+                let lease = match self.acquire_content_write(&user_id).await {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await
+                    }
+                };
+                let live = match self.gcs.get_object(&listed.name).await {
+                    Ok(live) => live,
+                    Err(EnclaveError::NotFound) => {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await
+                    }
+                    Err(_) => {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await
+                    }
+                };
+                if live.generation <= 0 {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await;
+                }
+                progress.live_archives_checked = progress.live_archives_checked.saturating_add(1);
+                if self
+                    .ensure_legacy_recovery_checkpoint(
+                        &user_id,
+                        live.generation,
+                        now,
+                        lease.child(),
+                        None,
+                    )
+                    .await
+                    .is_err()
+                {
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, false)
+                        .await;
+                }
+                progress.checkpoints_verified = progress.checkpoints_verified.saturating_add(1);
+            }
+            match page.next_page_token {
+                Some(next) => {
+                    let mut hasher = DefaultHasher::new();
+                    next.hash(&mut hasher);
+                    let fingerprint = (hasher.finish() as usize) % GCS_CURSOR_FINGERPRINT_BITS;
+                    let word = fingerprint / u64::BITS as usize;
+                    let mask = 1_u64 << (fingerprint % u64::BITS as usize);
+                    if seen_cursor_fingerprints[word] & mask != 0 {
+                        return self
+                            .finish_legacy_checkpoint_reconciliation(progress, false)
+                            .await;
+                    }
+                    seen_cursor_fingerprints[word] |= mask;
+                    page_token = Some(next);
+                }
+                None => {
+                    progress.completed_scans = 1;
+                    return self
+                        .finish_legacy_checkpoint_reconciliation(progress, true)
+                        .await;
+                }
+            }
+        }
+        self.finish_legacy_checkpoint_reconciliation(progress, false)
+            .await
+    }
+
+    async fn finish_legacy_checkpoint_reconciliation(
+        &self,
+        mut progress: LegacyCheckpointReconciliation,
+        ready: bool,
+    ) -> std::result::Result<LegacyCheckpointReconciliation, ()> {
+        progress.ready = ready;
+        if !ready {
+            progress.failures = 1;
+        }
+        *self.legacy_checkpoint_reconciliation.lock().await = progress.clone();
+        if ready {
+            Ok(progress)
+        } else {
+            Err(())
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn put_media(&self, name: &str, data: &[u8], wrapped_dek_b64: &str) -> Result<i64> {
         self.put_media_at_generation(name, data, wrapped_dek_b64, 0)
             .await
     }
 
+    /// Put media owned by one authenticated account. The explicit owner is
+    /// required because historical object keys can be unscoped; deriving
+    /// authority from a provider name would silently exempt those objects from
+    /// the cross-instance identity-rebind fence.
+    pub async fn put_user_media(
+        &self,
+        user_id: &str,
+        name: &str,
+        data: &[u8],
+        wrapped_dek_b64: &str,
+    ) -> Result<i64> {
+        validate_user_id(user_id)?;
+        let provider_lease = self.acquire_content_write(user_id).await?;
+        self.execute_legacy_write_with_intent(
+            user_id,
+            LegacyWriteRequest::Put {
+                backend: LegacyWriteBackend::Media,
+                kind: LegacyWriteKind::MediaPut,
+                object_name: name.to_string(),
+                ciphertext: data.to_vec(),
+                wrapped_dek_b64: wrapped_dek_b64.to_string(),
+                if_generation_match: 0,
+            },
+            None,
+            Some(provider_lease),
+        )
+        .await
+    }
+
+    /// Persist a stable rebind create through the same cross-instance intent
+    /// protocol as ordinary legacy writes. The stable namespace has its own
+    /// retained marker, installed by deletion before it drains this intent.
+    pub(crate) async fn put_stable_rebind_index(
+        &self,
+        stable_user_id: &str,
+        object_name: &str,
+        ciphertext: &[u8],
+        wrapped_dek_b64: &str,
+    ) -> Result<i64> {
+        validate_user_id(stable_user_id)?;
+        self.reconcile_unfenced_legacy_write_intents(stable_user_id)
+            .await?;
+        self.execute_legacy_write_with_intent(
+            stable_user_id,
+            LegacyWriteRequest::Put {
+                backend: LegacyWriteBackend::Index,
+                kind: LegacyWriteKind::StableCreate,
+                object_name: object_name.to_string(),
+                ciphertext: ciphertext.to_vec(),
+                wrapped_dek_b64: wrapped_dek_b64.to_string(),
+                if_generation_match: 0,
+            },
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Settle a crash-left stable-create intent before the control state
+    /// decides whether a new create is required. This prevents a restart from
+    /// issuing a second randomized ciphertext after the first exact intent
+    /// already committed at the provider.
+    pub(crate) async fn reconcile_stable_rebind_intents(&self, stable_user_id: &str) -> Result<()> {
+        validate_user_id(stable_user_id)?;
+        self.reconcile_unfenced_legacy_write_intents(stable_user_id)
+            .await
+    }
+
+    async fn persist_legacy_write_intent(
+        &self,
+        object_name: &str,
+        intent: &LegacyWriteIntent,
+        if_generation_match: i64,
+    ) -> Result<i64> {
+        intent.validate(object_name)?;
+        let encoded = serde_json::to_vec(intent)?;
+        let put = self
+            .gcs
+            .put_object(
+                object_name,
+                &encoded,
+                LEGACY_WRITE_INTENT_METADATA,
+                if_generation_match,
+            )
+            .await;
+        match put {
+            Ok(generation) => Ok(generation),
+            Err(error) => match self.gcs.get_object(object_name).await {
+                Ok(current)
+                    if current.generation > if_generation_match
+                        && current.wrapped_dek_b64 == LEGACY_WRITE_INTENT_METADATA
+                        && current.ciphertext == encoded =>
+                {
+                    Ok(current.generation)
+                }
+                _ => Err(error),
+            },
+        }
+    }
+
+    async fn load_legacy_write_intent(
+        &self,
+        object_name: &str,
+    ) -> Result<PersistedLegacyWriteIntent> {
+        load_persisted_legacy_write_intent(self.gcs.as_ref(), object_name).await
+    }
+
+    async fn create_legacy_write_intent(
+        &self,
+        user_id: &str,
+        request: &LegacyWriteRequest,
+    ) -> Result<PersistedLegacyWriteIntent> {
+        let intent = LegacyWriteIntent::prepared(user_id, request);
+        let object_name = legacy_write_intent_object_name(user_id, &intent.request_id);
+        let generation = self
+            .persist_legacy_write_intent(&object_name, &intent, 0)
+            .await?;
+        Ok(PersistedLegacyWriteIntent {
+            object_name,
+            generation,
+            intent,
+        })
+    }
+
+    async fn identity_write_fence_authority(&self, user_id: &str) -> Result<Option<String>> {
+        let marker_name = self.identity_rebind_fence_object_name(user_id)?;
+        match self.gcs.get_object(&marker_name).await {
+            Err(EnclaveError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+            Ok(marker) => {
+                let authority = String::from_utf8(marker.ciphertext).map_err(|_| {
+                    EnclaveError::Store("legacy content fence authority is invalid".into())
+                })?;
+                let valid_authority = (authority.starts_with("rebind_")
+                    || authority.starts_with("delete_"))
+                    && authority.len() == 71;
+                if marker.generation <= 0
+                    || marker.wrapped_dek_b64 != IDENTITY_REBIND_FENCE_METADATA
+                    || !valid_authority
+                {
+                    return Err(EnclaveError::Store(
+                        "legacy content fence provider state is invalid".into(),
+                    ));
+                }
+                Ok(Some(authority))
+            }
+        }
+    }
+
+    async fn terminalize_legacy_write_intent(
+        &self,
+        persisted: &PersistedLegacyWriteIntent,
+        state: LegacyWriteIntentState,
+        outcome_generation: Option<i64>,
+    ) -> Result<PersistedLegacyWriteIntent> {
+        let terminal = persisted.intent.terminal(state, outcome_generation);
+        let terminalized = match self
+            .persist_legacy_write_intent(&persisted.object_name, &terminal, persisted.generation)
+            .await
+        {
+            Ok(generation) => Ok(PersistedLegacyWriteIntent {
+                object_name: persisted.object_name.clone(),
+                generation,
+                intent: terminal,
+            }),
+            Err(error) => {
+                let current = self
+                    .load_legacy_write_intent(&persisted.object_name)
+                    .await?;
+                if current.intent.state == state
+                    && current.intent.outcome_generation == outcome_generation
+                {
+                    Ok(current)
+                } else {
+                    Err(EnclaveError::Store(format!(
+                        "legacy write intent terminalization failed: {error}"
+                    )))
+                }
+            }
+        }?;
+        self.purge_legacy_write_intent_payload_generations(
+            &terminalized.object_name,
+            terminalized.generation,
+        )
+        .await?;
+        Ok(terminalized)
+    }
+
+    async fn purge_legacy_write_intent_payload_generations(
+        &self,
+        object_name: &str,
+        retained_terminal_generation: i64,
+    ) -> Result<()> {
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = self.gcs.list_object_versions(object_name, None).await?;
+            let stale = page.versions.into_iter().find(|version| {
+                version.name == object_name && version.generation != retained_terminal_generation
+            });
+            match stale {
+                Some(version) => {
+                    self.gcs
+                        .delete_object_generation(object_name, version.generation)
+                        .await?;
+                }
+                None if page.next_page_token.is_none() => return Ok(()),
+                None => {
+                    return Err(EnclaveError::Gcs(
+                        "legacy write intent retained generation was not in the first bounded page"
+                            .into(),
+                    ))
+                }
+            }
+        }
+        Err(EnclaveError::Gcs(
+            "legacy write intent version listing exceeded its page bound".into(),
+        ))
+    }
+
+    async fn claim_legacy_write_intent(
+        &self,
+        persisted: &PersistedLegacyWriteIntent,
+    ) -> Result<PersistedLegacyWriteIntent> {
+        if !matches!(
+            persisted.intent.state,
+            LegacyWriteIntentState::Prepared | LegacyWriteIntentState::Requesting
+        ) {
+            return Err(EnclaveError::Conflict(
+                "legacy write intent is already terminal".into(),
+            ));
+        }
+        let mut claimed = persisted.intent.clone();
+        claimed.state = LegacyWriteIntentState::Requesting;
+        claimed.owner_token = Some(format!("owner_{}", crate::cp::tokens::random_token_hex()));
+        claimed.lease_expires_at_millis = Some(
+            self.gcs
+                .trusted_time_millis(&persisted.object_name, persisted.generation)
+                .await?
+                .saturating_add(LEGACY_WRITE_INTENT_LEASE_MILLIS),
+        );
+        let generation = self
+            .persist_legacy_write_intent(&persisted.object_name, &claimed, persisted.generation)
+            .await?;
+        Ok(PersistedLegacyWriteIntent {
+            object_name: persisted.object_name.clone(),
+            generation,
+            intent: claimed,
+        })
+    }
+
+    async fn execute_claimed_legacy_write_intent(
+        &self,
+        claimed: PersistedLegacyWriteIntent,
+        provider_lease: Option<ContentWriteLease>,
+    ) -> Result<i64> {
+        // Keep both the write barrier lease and the provider request in this
+        // future. A caller cancellation therefore drops the provider future;
+        // there is no detached task that can outlive intent ownership.
+        let _provider_lease = provider_lease;
+        let request = claimed.intent.request()?;
+        match request {
+            LegacyWriteRequest::Put {
+                backend,
+                object_name,
+                ciphertext,
+                wrapped_dek_b64,
+                if_generation_match,
+                ..
+            } => {
+                let provider = match backend {
+                    LegacyWriteBackend::Index => Arc::clone(&self.gcs),
+                    LegacyWriteBackend::Media => Arc::clone(&self.media_gcs),
+                };
+                let request_object_name = object_name.clone();
+                let request_ciphertext = ciphertext.clone();
+                let request_wrapped_dek = wrapped_dek_b64.clone();
+                let intent_gcs = Arc::clone(&self.gcs);
+                let claim_authority = claimed.clone();
+                let request_deadline = verify_persisted_legacy_write_intent_owner(
+                    intent_gcs.as_ref(),
+                    &claim_authority,
+                )
+                .await?;
+                let outcome = tokio::time::timeout_at(request_deadline, async {
+                    let response = provider
+                        .put_object(
+                            &request_object_name,
+                            &request_ciphertext,
+                            &request_wrapped_dek,
+                            if_generation_match,
+                        )
+                        .await;
+                    match response {
+                        Ok(generation) => Ok(generation),
+                        Err(error) => match provider.get_object(&request_object_name).await {
+                            Ok(current)
+                                if current.generation > if_generation_match
+                                    && current.wrapped_dek_b64 == request_wrapped_dek
+                                    && current.ciphertext == request_ciphertext =>
+                            {
+                                Ok(current.generation)
+                            }
+                            _ if matches!(&error, EnclaveError::Conflict(_)) => Err(error),
+                            _ => Err(error),
+                        },
+                    }
+                })
+                .await
+                .map_err(|_| EnclaveError::Gcs("legacy write provider timeout".into()))?;
+                match outcome {
+                    Ok(generation) => {
+                        self.terminalize_legacy_write_intent(
+                            &claimed,
+                            LegacyWriteIntentState::Committed,
+                            Some(generation),
+                        )
+                        .await?;
+                        Ok(generation)
+                    }
+                    Err(error) => {
+                        self.terminalize_legacy_write_intent(
+                            &claimed,
+                            LegacyWriteIntentState::Conflict,
+                            None,
+                        )
+                        .await?;
+                        Err(error)
+                    }
+                }
+            }
+            LegacyWriteRequest::RecoveryCopy {
+                source_object_name,
+                source_generation,
+                destination_object_name,
+            } => {
+                let copy_gcs = Arc::clone(&self.gcs);
+                let copy_source = source_object_name.clone();
+                let copy_destination = destination_object_name.clone();
+                let intent_gcs = Arc::clone(&self.gcs);
+                let claim_authority = claimed.clone();
+                let request_deadline = verify_persisted_legacy_write_intent_owner(
+                    intent_gcs.as_ref(),
+                    &claim_authority,
+                )
+                .await?;
+                let generation = tokio::time::timeout_at(request_deadline, async {
+                    let copied = match copy_gcs
+                        .copy_generation_if_absent(
+                            &copy_source,
+                            source_generation,
+                            &copy_destination,
+                        )
+                        .await
+                    {
+                        Ok(copied) => copied,
+                        Err(first_error) => {
+                            // The create-only copy is idempotent: a second
+                            // exact attempt either adopts the already-created
+                            // bound destination or repeats the same source
+                            // generation. Both attempts share this one owned
+                            // timeout, so ambiguity handling cannot outlive
+                            // the intent lease.
+                            match copy_gcs
+                                .copy_generation_if_absent(
+                                    &copy_source,
+                                    source_generation,
+                                    &copy_destination,
+                                )
+                                .await
+                            {
+                                Ok(copied) => copied,
+                                Err(_) => return Err(first_error),
+                            }
+                        }
+                    };
+                    if copied.source.generation != source_generation {
+                        return Err(EnclaveError::Gcs(
+                            "legacy recovery source generation did not match requested generation"
+                                .into(),
+                        ));
+                    }
+                    verify_legacy_recovery_copy(
+                        &copy_source,
+                        source_generation,
+                        &copied.source,
+                        &copied.destination,
+                        copied.created,
+                    )?;
+                    Ok(copied.destination.generation)
+                })
+                .await
+                .map_err(|_| EnclaveError::Gcs("legacy recovery provider timeout".into()))??;
+                self.terminalize_legacy_write_intent(
+                    &claimed,
+                    LegacyWriteIntentState::Committed,
+                    Some(generation),
+                )
+                .await?;
+                Ok(generation)
+            }
+        }
+    }
+
+    async fn execute_legacy_write_with_intent(
+        &self,
+        user_id: &str,
+        request: LegacyWriteRequest,
+        allowed_marker_authority: Option<&str>,
+        provider_lease: Option<ContentWriteLease>,
+    ) -> Result<i64> {
+        validate_user_id(user_id)?;
+        let prepared = self.create_legacy_write_intent(user_id, &request).await?;
+        let marker = self.identity_write_fence_authority(user_id).await?;
+        if marker.as_deref() != allowed_marker_authority {
+            self.terminalize_legacy_write_intent(&prepared, LegacyWriteIntentState::Fenced, None)
+                .await?;
+            return Err(EnclaveError::Auth(
+                "retained provider marker fenced the legacy write".into(),
+            ));
+        }
+        let claimed = self.claim_legacy_write_intent(&prepared).await?;
+        self.execute_claimed_legacy_write_intent(claimed, provider_lease)
+            .await
+    }
+
+    async fn drain_one_legacy_write_intent(
+        &self,
+        mut persisted: PersistedLegacyWriteIntent,
+        fence_prepared: bool,
+    ) -> Result<bool> {
+        loop {
+            match persisted.intent.state {
+                state if state.is_terminal() => {
+                    self.purge_legacy_write_intent_payload_generations(
+                        &persisted.object_name,
+                        persisted.generation,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                LegacyWriteIntentState::Prepared => {
+                    if !fence_prepared {
+                        let claimed = match self.claim_legacy_write_intent(&persisted).await {
+                            Ok(claimed) => claimed,
+                            Err(EnclaveError::Conflict(_)) => {
+                                persisted = self
+                                    .load_legacy_write_intent(&persisted.object_name)
+                                    .await?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        self.execute_claimed_legacy_write_intent(claimed, None)
+                            .await?;
+                        return Ok(true);
+                    }
+                    match self
+                        .terminalize_legacy_write_intent(
+                            &persisted,
+                            LegacyWriteIntentState::Fenced,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => return Ok(true),
+                        Err(EnclaveError::Conflict(_)) => {
+                            persisted = self
+                                .load_legacy_write_intent(&persisted.object_name)
+                                .await?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                LegacyWriteIntentState::Requesting => {
+                    let now = self
+                        .gcs
+                        .trusted_time_millis(&persisted.object_name, persisted.generation)
+                        .await?;
+                    if persisted
+                        .intent
+                        .lease_expires_at_millis
+                        .is_some_and(|expiry| expiry > now)
+                    {
+                        return Ok(false);
+                    }
+                    let claimed = match self.claim_legacy_write_intent(&persisted).await {
+                        Ok(claimed) => claimed,
+                        Err(EnclaveError::Conflict(_)) => {
+                            persisted = self
+                                .load_legacy_write_intent(&persisted.object_name)
+                                .await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    self.execute_claimed_legacy_write_intent(claimed, None)
+                        .await?;
+                    return Ok(true);
+                }
+                _ => unreachable!("terminal legacy write intent handled above"),
+            }
+        }
+    }
+
+    /// Strongly consistently inventory every durable pre-marker request. The
+    /// marker is already live before this scan: intents created later must see
+    /// it and terminalize without destination I/O. Prepared intents are
+    /// fenced here; requesting intents are either awaited or taken over after
+    /// a lease longer than the bounded provider request timeout.
+    async fn drain_legacy_write_intents(&self, user_id: &str) -> Result<()> {
+        let prefix = legacy_write_intent_prefix(user_id);
+        let mut page_token = None;
+        let mut unsettled = false;
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = self
+                .gcs
+                .list_live_objects(&prefix, page_token.as_deref())
+                .await?;
+            for listed in page.versions {
+                if !listed.name.starts_with(&prefix) {
+                    return Err(EnclaveError::Store(
+                        "legacy write intent listing escaped its exact prefix".into(),
+                    ));
+                }
+                let persisted = self.load_legacy_write_intent(&listed.name).await?;
+                unsettled |= !self.drain_one_legacy_write_intent(persisted, true).await?;
+            }
+            match page.next_page_token {
+                None => {
+                    let soft_deleted =
+                        matching_soft_deleted_inventory(self.gcs.as_ref(), &prefix, false).await?;
+                    if soft_deleted.found {
+                        return Err(soft_deleted_account_objects_error(soft_deleted));
+                    }
+                    if unsettled {
+                        return Err(legacy_write_intent_unsettled_error());
+                    }
+                    return Ok(());
+                }
+                Some(next) if page_token.as_deref() != Some(next.as_str()) => {
+                    page_token = Some(next)
+                }
+                Some(_) => {
+                    return Err(EnclaveError::Gcs(
+                        "legacy write intent listing repeated a page cursor".into(),
+                    ))
+                }
+            }
+        }
+        Err(EnclaveError::Gcs(
+            "legacy write intent listing exceeded its page bound".into(),
+        ))
+    }
+
+    /// Resume crash-left intents while no retained marker exists. Prepared
+    /// requests are claimed and sent from their encrypted exact payload;
+    /// expired Requesting leases are taken over by the shared drain helper.
+    /// If a marker appeared first, switch to the fencing drain instead.
+    async fn reconcile_unfenced_legacy_write_intents(&self, user_id: &str) -> Result<()> {
+        if self
+            .identity_write_fence_authority(user_id)
+            .await?
+            .is_some()
+        {
+            return self.drain_legacy_write_intents(user_id).await;
+        }
+        let prefix = legacy_write_intent_prefix(user_id);
+        let mut page_token = None;
+        let mut unsettled = false;
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = self
+                .gcs
+                .list_live_objects(&prefix, page_token.as_deref())
+                .await?;
+            for listed in page.versions {
+                if !listed.name.starts_with(&prefix) {
+                    return Err(EnclaveError::Store(
+                        "legacy write intent listing escaped its exact prefix".into(),
+                    ));
+                }
+                let persisted = self.load_legacy_write_intent(&listed.name).await?;
+                unsettled |= !self.drain_one_legacy_write_intent(persisted, false).await?;
+            }
+            match page.next_page_token {
+                None => {
+                    if unsettled {
+                        return Err(legacy_write_intent_unsettled_error());
+                    }
+                    return Ok(());
+                }
+                Some(next) if page_token.as_deref() != Some(next.as_str()) => {
+                    page_token = Some(next)
+                }
+                Some(_) => {
+                    return Err(EnclaveError::Gcs(
+                        "legacy write intent listing repeated a page cursor".into(),
+                    ))
+                }
+            }
+        }
+        Err(EnclaveError::Gcs(
+            "legacy write intent listing exceeded its page bound".into(),
+        ))
+    }
+
+    /// Create or adopt the retained provider marker, then drain the bounded,
+    /// strongly consistent intent inventory. The returned exact authority is
+    /// required only by rebind/deletion-owned writes that intentionally settle
+    /// state after the marker; ordinary writers accept only marker absence.
+    pub(crate) async fn fence_and_drain_legacy_writes(
+        &self,
+        user_id: &str,
+        proposed_authority: &str,
+    ) -> Result<String> {
+        validate_user_id(user_id)?;
+        if !(proposed_authority.starts_with("rebind_") || proposed_authority.starts_with("delete_"))
+            || proposed_authority.len() != 71
+        {
+            return Err(EnclaveError::Store(
+                "invalid proposed legacy write fence authority".into(),
+            ));
+        }
+        let marker_name = self.identity_rebind_fence_object_name(user_id)?;
+        let put = self
+            .gcs
+            .put_object(
+                &marker_name,
+                proposed_authority.as_bytes(),
+                IDENTITY_REBIND_FENCE_METADATA,
+                0,
+            )
+            .await;
+        if let Err(error) = put {
+            let observed = self.identity_write_fence_authority(user_id).await?;
+            if observed.is_none() {
+                return Err(error);
+            }
+        }
+        let authority = self
+            .identity_write_fence_authority(user_id)
+            .await?
+            .ok_or_else(|| EnclaveError::Store("legacy write fence disappeared".into()))?;
+        self.drain_legacy_write_intents(user_id).await?;
+        Ok(authority)
+    }
+
+    #[cfg(test)]
     pub async fn put_media_at_generation(
         &self,
         name: &str,
         data: &[u8],
         wrapped_dek_b64: &str,
         generation: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.media_gcs
             .put_object(name, data, wrapped_dek_b64, generation)
-            .await?;
-        Ok(())
+            .await
+    }
+
+    /// Admit a raw-content write before it performs its first preflight, KMS,
+    /// or GCS operation. The returned lease must remain alive through the
+    /// durable database save; move a child into an owned provider task when a
+    /// request cancellation must not abandon an in-flight PUT.
+    pub async fn acquire_content_write(&self, user_id: &str) -> Result<ContentWriteLease> {
+        self.acquire_content_write_inner(user_id, false)
+    }
+
+    /// The deletion path has already closed admission before it reaches its
+    /// forced local flush.  It still needs a lease for any cancellation-safe
+    /// provider work it starts, but must be allowed to obtain that lease after
+    /// installing its own fence.
+    fn acquire_content_write_for_deletion(&self, user_id: &str) -> Result<ContentWriteLease> {
+        self.acquire_content_write_inner(user_id, true)
+    }
+
+    fn acquire_content_write_inner(
+        &self,
+        user_id: &str,
+        allow_already_blocked: bool,
+    ) -> Result<ContentWriteLease> {
+        validate_user_id(user_id)?;
+        let mut state = self
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        if state.blocked_users.contains(user_id) && !allow_already_blocked {
+            return Err(deleted_user_error());
+        }
+        let count = state.active_writes.entry(user_id.to_string()).or_default();
+        *count = count.saturating_add(1);
+        Ok(ContentWriteLease {
+            barrier: Arc::clone(&self.content_write_barrier),
+            user_id: user_id.to_string(),
+        })
+    }
+
+    /// Atomically prohibit future content writes and wait for every writer
+    /// admitted before the fence to settle. This is intentionally invoked
+    /// before the actor deletion fence so a request cannot pass a preflight,
+    /// start a raw PUT, and then recreate content after deletion inventory.
+    async fn block_content_writes_for_deletion(&self, user_id: &str) {
+        loop {
+            let notified = self.content_write_barrier.changed.notified();
+            let pending = {
+                let mut state = self
+                    .content_write_barrier
+                    .state
+                    .lock()
+                    .expect("content barrier poisoned");
+                state.blocked_users.insert(user_id.to_string());
+                state.active_writes.get(user_id).copied().unwrap_or(0)
+            };
+            if pending == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub async fn get_media(&self, name: &str) -> Result<crate::store::GcsGetResponse> {
-        self.media_gcs.get_object(name).await
+        match self.media_gcs.get_object(name).await {
+            Ok(object) => Ok(object),
+            Err(EnclaveError::NotFound) => self.legacy_media_gcs.get_object(name).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    fn unique_media_providers(&self) -> impl Iterator<Item = &Arc<dyn GcsClient>> {
+        std::iter::once(&self.media_gcs).chain(
+            (!Arc::ptr_eq(&self.media_gcs, &self.legacy_media_gcs))
+                .then_some(&self.legacy_media_gcs),
+        )
     }
 
     pub async fn delete_media(&self, name: &str) -> Result<()> {
-        self.media_gcs.delete_object(name).await
+        self.delete_media_on_both(name, None).await
+    }
+
+    /// Delete one retained logical media object without assuming provider
+    /// generations are comparable. New rows name the current backend and use
+    /// their exact recorded generation there. Legacy migration shadows (and
+    /// pre-provenance rows) are deleted only after their independently returned
+    /// generation decrypts under the exact owner/key context and matches the
+    /// row's persisted plaintext SHA-256.
+    pub async fn delete_retained_media(
+        &self,
+        user_id: &str,
+        name: &str,
+        generation: Option<i64>,
+        object_backend: Option<&str>,
+        expected_sha256: &str,
+    ) -> Result<()> {
+        validate_user_id(user_id)?;
+        if generation.is_some_and(|value| value <= 0)
+            || expected_sha256.len() != 64
+            || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || (object_backend == Some("current") && generation.is_none())
+        {
+            return Err(EnclaveError::Store(
+                "invalid retained media deletion identity".into(),
+            ));
+        }
+        if !matches!(object_backend, None | Some("current")) {
+            return Err(EnclaveError::Store(
+                "invalid retained media backend provenance".into(),
+            ));
+        }
+
+        let current_exact = if let Some(generation) = generation {
+            match self.media_gcs.get_object_generation(name, generation).await {
+                Ok(object) => Some(object),
+                Err(EnclaveError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let legacy_exact = if let (None, Some(generation)) = (object_backend, generation) {
+            match self
+                .legacy_media_gcs
+                .get_object_generation(name, generation)
+                .await
+            {
+                Ok(object) => Some(object),
+                Err(EnclaveError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let current_live = if object_backend.is_none() {
+            match self.media_gcs.get_object(name).await {
+                Ok(object) => Some(object),
+                Err(EnclaveError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let legacy_live = match self.legacy_media_gcs.get_object(name).await {
+            Ok(object) => Some(object),
+            Err(EnclaveError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+
+        let mut current_generations = HashSet::new();
+        let mut legacy_generations = HashSet::new();
+        if let Some(object) = current_exact {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                current_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "current media candidate does not match its retained identity".into(),
+                ));
+            }
+        }
+        if let Some(object) = current_live {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                current_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "current media key has an unverified live generation".into(),
+                ));
+            }
+        }
+        if let Some(object) = legacy_exact {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                legacy_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "legacy media candidate does not match its retained identity".into(),
+                ));
+            }
+        }
+        if let Some(object) = legacy_live {
+            if self
+                .retained_media_identity_matches(user_id, name, &object, expected_sha256)
+                .await?
+            {
+                legacy_generations.insert(object.generation);
+            } else {
+                return Err(EnclaveError::Store(
+                    "legacy media key has an unverified live generation".into(),
+                ));
+            }
+        }
+
+        // Delete migration shadows first. If that provider fails, the exact
+        // current generation remains available as authenticated retry evidence.
+        for candidate_generation in legacy_generations {
+            match self
+                .legacy_media_gcs
+                .delete_object_generation(name, candidate_generation)
+                .await
+            {
+                Ok(()) | Err(EnclaveError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for candidate_generation in current_generations {
+            match self
+                .media_gcs
+                .delete_object_generation(name, candidate_generation)
+                .await
+            {
+                Ok(()) | Err(EnclaveError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn retained_media_identity_matches(
+        &self,
+        user_id: &str,
+        name: &str,
+        object: &GcsGetResponse,
+        expected_sha256: &str,
+    ) -> Result<bool> {
+        let dek = load_dek(self.kms.as_ref(), &object.wrapped_dek_b64).await?;
+        let opened =
+            decrypt_bound_blob(&dek, &object.ciphertext, &media_blob_context(user_id, name))?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(&opened.plaintext));
+        Ok(actual_sha256.eq_ignore_ascii_case(expected_sha256))
+    }
+
+    /// Remove a media object from both migration providers. A missing object
+    /// on one provider is expected when the key belongs to the other bucket;
+    /// any other error is retained so callers cannot mark physical cleanup
+    /// complete after a partial provider failure.
+    async fn delete_media_on_both(&self, name: &str, generation: Option<i64>) -> Result<()> {
+        let current = match generation {
+            Some(generation) => {
+                self.media_gcs
+                    .delete_object_generation(name, generation)
+                    .await
+            }
+            None => self.media_gcs.delete_object(name).await,
+        };
+        let legacy = match generation {
+            Some(generation) => {
+                self.legacy_media_gcs
+                    .delete_object_generation(name, generation)
+                    .await
+            }
+            None => self.legacy_media_gcs.delete_object(name).await,
+        };
+        match (current, legacy) {
+            (Ok(()), Ok(()))
+            | (Ok(()), Err(EnclaveError::NotFound))
+            | (Err(EnclaveError::NotFound), Ok(())) => Ok(()),
+            (Err(EnclaveError::NotFound), Err(EnclaveError::NotFound)) => {
+                Err(EnclaveError::NotFound)
+            }
+            (Err(error), Ok(())) | (Err(error), Err(EnclaveError::NotFound)) => Err(error),
+            (Ok(()), Err(error)) | (Err(EnclaveError::NotFound), Err(error)) => Err(error),
+            (Err(error), Err(_)) => Err(error),
+        }
+    }
+
+    /// Serialize one account's cloud-write lifecycle with deletion. The gate
+    /// is process-local and contains no customer data.
+    pub async fn lock_user_lifecycle(&self, user_id: &str) -> Result<OwnedMutexGuard<()>> {
+        validate_user_id(user_id)?;
+        let gate = {
+            let mut gates = self.lifecycle_gates.lock().await;
+            Arc::clone(
+                gates
+                    .entry(user_id.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        Ok(gate.lock_owned().await)
+    }
+
+    async fn lock_user_lifecycles(
+        &self,
+        first_user_id: &str,
+        second_user_id: &str,
+    ) -> Result<Vec<OwnedMutexGuard<()>>> {
+        let (first, second) = if first_user_id <= second_user_id {
+            (first_user_id, second_user_id)
+        } else {
+            (second_user_id, first_user_id)
+        };
+        let mut guards = vec![self.lock_user_lifecycle(first).await?];
+        if first != second {
+            guards.push(self.lock_user_lifecycle(second).await?);
+        }
+        Ok(guards)
+    }
+
+    async fn block_content_writes_for_users(&self, user_ids: [&str; 2]) {
+        loop {
+            let notified = self.content_write_barrier.changed.notified();
+            let pending = {
+                let mut state = self
+                    .content_write_barrier
+                    .state
+                    .lock()
+                    .expect("content barrier poisoned");
+                for user_id in user_ids {
+                    state.blocked_users.insert(user_id.to_string());
+                }
+                user_ids
+                    .iter()
+                    .map(|user_id| state.active_writes.get(*user_id).copied().unwrap_or(0))
+                    .sum::<usize>()
+            };
+            if pending == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Begin a two-namespace identity transition. This performs no provider
+    /// writes: it serializes both lifecycle names, atomically closes and drains
+    /// raw-content admission, blocks actor recreation, and owns both actor
+    /// states. The caller must durably prepare the control operation before
+    /// asking the returned transition to flush the old actor.
+    pub(crate) async fn begin_identity_rebind(
+        self: &Arc<Self>,
+        old_user_id: &str,
+        stable_user_id: &str,
+    ) -> Result<IdentityRebindTransition> {
+        validate_user_id(old_user_id)?;
+        validate_user_id(stable_user_id)?;
+        if old_user_id == stable_user_id {
+            return Err(EnclaveError::Conflict(
+                "identity rebind requires two distinct user ids".into(),
+            ));
+        }
+        let lifecycle_guards = self
+            .lock_user_lifecycles(old_user_id, stable_user_id)
+            .await?;
+        self.block_content_writes_for_users([old_user_id, stable_user_id])
+            .await;
+        let (old_actor, stable_actor) = {
+            let mut registry = self.registry.lock().await;
+            registry.blocked_users.insert(old_user_id.to_string());
+            registry.blocked_users.insert(stable_user_id.to_string());
+            registry.recent_clean_evictions.remove(old_user_id);
+            registry.recent_clean_evictions.remove(stable_user_id);
+            let old_actor = registry.actor_for(old_user_id, self.max_open);
+            let stable_actor = registry.actor_for(stable_user_id, self.max_open);
+            (old_actor, stable_actor)
+        };
+        let (old_state, stable_state) = if old_user_id <= stable_user_id {
+            let old_state = Arc::clone(&old_actor.state).lock_owned().await;
+            let stable_state = Arc::clone(&stable_actor.state).lock_owned().await;
+            (old_state, stable_state)
+        } else {
+            let stable_state = Arc::clone(&stable_actor.state).lock_owned().await;
+            let old_state = Arc::clone(&old_actor.state).lock_owned().await;
+            (old_state, stable_state)
+        };
+        if stable_state.handle.is_some() {
+            return Err(EnclaveError::Conflict(
+                "stable identity target already has a local actor".into(),
+            ));
+        }
+        Ok(IdentityRebindTransition {
+            store: Arc::clone(self),
+            old_user_id: old_user_id.to_string(),
+            stable_user_id: stable_user_id.to_string(),
+            _lifecycle_guards: lifecycle_guards,
+            old_actor,
+            stable_actor,
+            old_state,
+            _stable_state: stable_state,
+        })
     }
 
     /// Run an operation with a user's open SQLite connection.
@@ -211,34 +2354,126 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        let mut inner = self.inner.lock().await;
-        if inner.blocked_users.contains(user_id) {
-            return Err(EnclaveError::Auth("user account is deleted".into()));
+        let actor = self.actor_for_access(user_id).await?;
+        let mut state = actor.state.lock().await;
+
+        // Deletion may have installed its fence after this request found the
+        // actor but before it won the per-user lock.
+        self.reject_if_blocked(user_id).await?;
+        if state.handle.is_none() {
+            self.ensure_loaded(user_id, &actor, &mut state).await?;
+            // A load can block on GCS/KMS. Never expose a freshly loaded
+            // connection if deletion fenced the user during that await.
+            self.reject_if_blocked(user_id).await?;
         }
-        // Evict LRU if needed before potentially adding a new entry
-        if !inner.handles.contains_key(user_id) && inner.handles.len() >= self.max_open {
-            self.evict_lru_locked(&mut inner).await?;
+        let handle = state.handle.as_mut().ok_or_else(|| {
+            EnclaveError::Store("open-user registry lost its SQLite handle".into())
+        })?;
+        if handle.blob_meta.retry_save_before_access {
+            self.flush_handle(handle).await?;
         }
-        if !inner.handles.contains_key(user_id) {
-            let handle = self.load_user(user_id).await?;
-            inner.handles.insert(user_id.to_string(), handle);
+        let before = database_mutation_fingerprint(&handle.conn)?;
+        let result = f(&handle.conn);
+        match database_mutation_fingerprint(&handle.conn) {
+            Ok(after) if after != before => handle.mark_dirty(),
+            Ok(_) => {}
+            Err(error) => {
+                // The closure may already have committed. If we cannot prove
+                // the post-state, retain the handle as dirty and fail closed.
+                handle.mark_dirty();
+                return Err(error);
+            }
         }
-        let handle = inner.handles.get_mut(user_id).unwrap();
-        handle.last_used = Instant::now();
+        result
+    }
+
+    /// Run a closure under SQLite's connection-level query-only guard.
+    ///
+    /// This is the explicit API for operations claimed to be read-only. Any
+    /// attempted SQL mutation fails in SQLite, and the guard is restored even
+    /// when the caller returns an error.
+    pub async fn with_user_read<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        self.with_user(user_id, move |conn| {
+            conn.pragma_update(None, "query_only", true)?;
+            let result = f(conn);
+            let restore = conn.pragma_update(None, "query_only", false);
+            if let Err(error) = restore {
+                return Err(error.into());
+            }
+            result
+        })
+        .await
+    }
+
+    /// Conservatively declare an operation mutating before invoking it.
+    ///
+    /// Use this for extension or FFI work whose effects cannot be represented
+    /// by SQLite's row/schema/header mutation fingerprint. Ordinary SQL can use
+    /// [`Store::with_user`], which detects direct, trigger, and schema changes.
+    pub async fn with_user_mut<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let actor = self.actor_for_access(user_id).await?;
+        let mut state = actor.state.lock().await;
+
+        self.reject_if_blocked(user_id).await?;
+        if state.handle.is_none() {
+            self.ensure_loaded(user_id, &actor, &mut state).await?;
+            self.reject_if_blocked(user_id).await?;
+        }
+
+        let handle = state.handle.as_mut().ok_or_else(|| {
+            EnclaveError::Store("open-user registry lost its SQLite handle".into())
+        })?;
+        if handle.blob_meta.retry_save_before_access {
+            self.flush_handle(handle).await?;
+        }
+        handle.mark_dirty();
         f(&handle.conn)
+    }
+
+    /// Run a proven read-only operation without making a clean cache entry
+    /// eligible for a write on eviction.
+    pub async fn read_user<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        self.with_user_read(user_id, f).await
+    }
+
+    /// Run an operation whose closure reports whether it actually changed the
+    /// database. This keeps periodic no-op reconciliation scans read-only.
+    pub async fn with_user_if_changed<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<(T, bool)>,
+    {
+        self.with_user(user_id, move |conn| f(conn).map(|(value, _changed)| value))
+            .await
     }
 
     /// Persist a user's index back to GCS.
     pub async fn save_user(&self, user_id: &str) -> Result<()> {
-        let mut inner = self.inner.lock().await;
-        if inner.blocked_users.contains(user_id) {
-            return Err(EnclaveError::Auth("user account is deleted".into()));
+        let actor = match self.actor_for_existing(user_id).await? {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => return Ok(()),
+        };
+        let mut state = actor.state.lock().await;
+        self.reject_if_blocked(user_id).await?;
+        if let Some(handle) = state.handle.as_mut() {
+            self.flush_handle(handle).await
+        } else if state.cleanly_evicted {
+            // Eviction serialized ahead of this save and flushed the same
+            // connection successfully. Treat it as an idempotent save success.
+            Ok(())
+        } else if self.was_recently_cleanly_evicted(user_id).await {
+            Ok(())
+        } else {
+            Err(EnclaveError::NotFound)
         }
-        let handle = inner
-            .handles
-            .get_mut(user_id)
-            .ok_or(EnclaveError::NotFound)?;
-        self.flush_handle(handle).await
     }
 
     /// Hard-delete all user data: evict from cache and delete the GCS object.
@@ -247,51 +2482,298 @@ impl Store {
     /// this returns `Ok(())`.
     pub async fn delete_user(&self, user_id: &str) -> Result<()> {
         validate_user_id(user_id)?;
+        let _lifecycle_guard = self.lock_user_lifecycle(user_id).await?;
 
-        // 1. Query for GCS media keys to clean up
-        let keys_to_delete = {
-            let mut inner = self.inner.lock().await;
-            let keys = if !inner.handles.contains_key(user_id) {
-                if inner.blocked_users.contains(user_id) {
-                    Vec::new()
-                } else {
-                    let handle = self.load_user(user_id).await?;
-                    inner.handles.insert(user_id.to_string(), handle);
-                    media_keys(&inner.handles.get(user_id).unwrap().conn)?
-                }
-            } else {
-                media_keys(&inner.handles.get(user_id).unwrap().conn)?
-            };
-            inner.blocked_users.insert(user_id.to_string());
-            keys
-        };
+        let proposed_authority = format!("delete_{}", crate::cp::tokens::random_token_hex());
+        let marker_authority = self
+            .fence_and_drain_legacy_writes(user_id, &proposed_authority)
+            .await?;
 
-        // Delete media first and propagate failures. Keeping the database until
-        // every referenced object is gone makes the operation safely retryable.
-        for key in &keys_to_delete {
-            info!(user_id, "deleting associated GCS media object");
-            self.delete_media(key).await?;
+        // Raw media PUTs do not hold the SQLite actor while they await GCS.
+        // Close that independent admission path first, then wait for every
+        // already-admitted request (including an owned, cancellation-safe PUT)
+        // to settle before inventory can become authoritative.
+        self.block_content_writes_for_deletion(user_id).await;
+
+        self.delete_user_fenced(user_id, &marker_authority).await
+    }
+
+    /// Delete both exact namespaces retained by a durable identity-rebind
+    /// operation. Both lifecycle gates and both raw-content admission fences
+    /// are acquired together before either inventory is observed, so neither
+    /// side can be recreated between the two physical purges.
+    pub(crate) async fn delete_identity_rebind_users(
+        &self,
+        old_user_id: &str,
+        stable_user_id: &str,
+    ) -> Result<()> {
+        validate_user_id(old_user_id)?;
+        validate_user_id(stable_user_id)?;
+        if old_user_id == stable_user_id {
+            return Err(EnclaveError::Conflict(
+                "identity rebind deletion requires distinct user ids".into(),
+            ));
         }
+        let _lifecycle_guards = self
+            .lock_user_lifecycles(old_user_id, stable_user_id)
+            .await?;
+        let old_proposed = format!("delete_{}", crate::cp::tokens::random_token_hex());
+        let stable_proposed = format!("delete_{}", crate::cp::tokens::random_token_hex());
+        let old_authority = self
+            .fence_and_drain_legacy_writes(old_user_id, &old_proposed)
+            .await?;
+        let stable_authority = self
+            .fence_and_drain_legacy_writes(stable_user_id, &stable_proposed)
+            .await?;
+        self.block_content_writes_for_users([old_user_id, stable_user_id])
+            .await;
+        self.delete_user_fenced(old_user_id, &old_authority).await?;
+        self.delete_user_fenced(stable_user_id, &stable_authority)
+            .await
+    }
 
-        // 2. Evict the cached handle (and temp file) without flushing —
-        //    we are deleting the data, not saving it.
-        {
-            let mut inner = self.inner.lock().await;
-            if let Some(handle) = inner.handles.remove(user_id) {
-                info!(user_id, "evicting user handle for deletion");
-                let temp_path = handle.temp_path.clone();
-                drop(handle);
-                remove_temp_db_files(&temp_path);
+    /// Delete one namespace whose lifecycle and raw-content gates are already
+    /// owned by the caller.
+    async fn delete_user_fenced(&self, user_id: &str, marker_authority: &str) -> Result<()> {
+        // Install the fence before waiting for any in-flight same-user work.
+        // Existing work may finish; later work re-checks after winning the
+        // actor lock and fails without recreating or saving the account.
+        let actor = self.actor_for_deletion(user_id).await;
+        let mut state = actor.state.lock().await;
+
+        // 1. Make the exact deletion inventory durable before any remote
+        // delete. A failed delete can then evict this handle without losing a
+        // locally committed media reference across restart: the still-present
+        // authoritative user DB is sufficient to rebuild the inventory.
+        if state.handle.is_none() {
+            self.ensure_loaded(user_id, &actor, &mut state).await?;
+        }
+        let handle = state
+            .handle
+            .as_mut()
+            .ok_or_else(|| EnclaveError::Store("delete load lost its handle".into()))?;
+        if handle.dirty || handle.blob_meta.retry_save_before_access {
+            self.flush_handle_for_deletion(handle, marker_authority)
+                .await?;
+        }
+        let keys_to_delete: Arc<[String]> = media_keys(&handle.conn)?.into();
+
+        // The exact inventory is now independent of the live Connection, so
+        // release its max-open slot before any slow remote deletion. The GCS
+        // database remains authoritative until every referenced object is gone.
+        self.discard_handle_for_deletion(user_id, &actor, &mut state)
+            .await;
+
+        // `versions=true` excludes soft-deleted objects. Record pre-existing
+        // residue, but continue removing anything still live/noncurrent. Final
+        // verification below remains fail-closed.
+        let mut soft_deleted = self
+            .soft_deleted_account_inventory(user_id, &keys_to_delete)
+            .await?;
+
+        // Delete every historical raw-media generation, including objects no
+        // longer represented by the current SQLite blob. The prefix includes
+        // its trailing slash, so another user's similarly named prefix cannot
+        // be selected.
+        for media_gcs in self.unique_media_providers() {
+            self.delete_all_versions_under(media_gcs, &media_prefix(user_id))
+                .await?;
+            self.delete_all_versions_under(media_gcs, &legacy_media_prefix(user_id))
+                .await?;
+        }
+        for key in keys_to_delete.iter() {
+            for media_gcs in self.unique_media_providers() {
+                self.delete_all_versions_for_name(media_gcs, key).await?;
             }
         }
 
-        // 3. Delete the GCS database object. 404 is treated as success by the GCS
-        //    implementations, so this call is idempotent.
-        let object_name = gcs_object_name(user_id);
-        info!(user_id, object = %object_name, "deleting GCS object");
-        self.gcs.delete_object(&object_name).await?;
+        // Every retained legacy DB/checkpoint generation can name unscoped
+        // evidence that the live DB no longer references. Inventory one exact
+        // generation at a time, delete its media, and only then erase that DB
+        // generation. Any unreadable generation leaves deletion incomplete.
+        self.inventory_and_delete_legacy_databases(
+            user_id,
+            &gcs_object_name(user_id),
+            true,
+            &mut soft_deleted,
+        )
+        .await?;
+        self.inventory_and_delete_legacy_databases(
+            user_id,
+            &legacy_recovery_prefix(user_id),
+            false,
+            &mut soft_deleted,
+        )
+        .await?;
+
+        soft_deleted.merge(
+            self.soft_deleted_account_inventory(user_id, &keys_to_delete)
+                .await?,
+        );
+        if soft_deleted.found {
+            return Err(soft_deleted_account_objects_error(soft_deleted));
+        }
+
+        // A second strongly consistent drain closes the interval between the
+        // pre-inventory marker scan and physical deletion. An intent created
+        // after the marker is fenced without data I/O; an accepted request
+        // remains nonterminal and prevents finalization until reconciled.
+        self.drain_legacy_write_intents(user_id).await?;
 
         Ok(())
+    }
+
+    async fn soft_deleted_account_inventory(
+        &self,
+        user_id: &str,
+        referenced_media_keys: &[String],
+    ) -> Result<SoftDeletedInventory> {
+        let mut inventory = SoftDeletedInventory::default();
+        for (gcs, selector, exact_name) in [
+            (&self.gcs, gcs_object_name(user_id), true),
+            (&self.gcs, legacy_recovery_prefix(user_id), false),
+        ] {
+            inventory
+                .merge(matching_soft_deleted_inventory(gcs.as_ref(), &selector, exact_name).await?);
+        }
+        for media_gcs in self.unique_media_providers() {
+            for selector in [media_prefix(user_id), legacy_media_prefix(user_id)] {
+                inventory.merge(
+                    matching_soft_deleted_inventory(media_gcs.as_ref(), &selector, false).await?,
+                );
+            }
+        }
+        for name in referenced_media_keys {
+            for media_gcs in self.unique_media_providers() {
+                inventory
+                    .merge(matching_soft_deleted_inventory(media_gcs.as_ref(), name, true).await?);
+            }
+        }
+        Ok(inventory)
+    }
+
+    async fn delete_all_versions_for_name(
+        &self,
+        gcs: &Arc<dyn GcsClient>,
+        name: &str,
+    ) -> Result<()> {
+        delete_matching_object_versions(gcs.as_ref(), name, true).await
+    }
+
+    async fn delete_all_versions_under(
+        &self,
+        gcs: &Arc<dyn GcsClient>,
+        prefix: &str,
+    ) -> Result<()> {
+        delete_matching_object_versions(gcs.as_ref(), prefix, false).await
+    }
+
+    async fn inventory_and_delete_legacy_databases(
+        &self,
+        user_id: &str,
+        selector: &str,
+        exact_name: bool,
+        soft_deleted: &mut SoftDeletedInventory,
+    ) -> Result<()> {
+        let mut page_token = None;
+        for _ in 0..MAX_GCS_LIST_PAGES {
+            let page = self
+                .gcs
+                .list_object_versions(selector, page_token.as_deref())
+                .await?;
+            let matching = page
+                .versions
+                .into_iter()
+                .filter(|version| {
+                    if exact_name {
+                        version.name == selector
+                    } else {
+                        version.name.starts_with(selector)
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !matching.is_empty() {
+                for version in matching {
+                    let keys = match self
+                        .media_keys_from_legacy_generation(user_id, &version)
+                        .await
+                    {
+                        Ok(keys) => keys,
+                        Err(EnclaveError::NotFound) => {
+                            return Err(legacy_generation_unavailable_error())
+                        }
+                        Err(error @ EnclaveError::DeletionPending(_)) => return Err(error),
+                        Err(_) => return Err(legacy_inventory_incomplete_error()),
+                    };
+                    let mut blocked_media = SoftDeletedInventory::default();
+                    for key in keys {
+                        for media_gcs in self.unique_media_providers() {
+                            self.delete_all_versions_for_name(media_gcs, &key).await?;
+                            blocked_media.merge(
+                                matching_soft_deleted_inventory(media_gcs.as_ref(), &key, true)
+                                    .await?,
+                            );
+                        }
+                    }
+                    if blocked_media.found {
+                        soft_deleted.merge(blocked_media);
+                        // Retain this exact legacy generation as the durable
+                        // inventory for unscoped media until provider retention
+                        // expires. The process-local inventory alone is not
+                        // sufficient across a restart.
+                        return Err(soft_deleted_account_objects_error(soft_deleted.clone()));
+                    }
+                    self.gcs
+                        .delete_object_generation(&version.name, version.generation)
+                        .await?;
+                }
+                page_token = None;
+                continue;
+            }
+            match page.next_page_token {
+                Some(next) if page_token.as_deref() != Some(next.as_str()) => {
+                    page_token = Some(next)
+                }
+                Some(_) => {
+                    return Err(EnclaveError::Gcs(
+                        "GCS legacy database listing repeated a page cursor".into(),
+                    ))
+                }
+                None => return Ok(()),
+            }
+        }
+        Err(EnclaveError::Gcs(
+            "GCS legacy database listing exceeded the bounded page limit".into(),
+        ))
+    }
+
+    async fn media_keys_from_legacy_generation(
+        &self,
+        user_id: &str,
+        version: &GcsObjectVersion,
+    ) -> Result<Vec<String>> {
+        if version.size > MAX_LEGACY_DELETION_SNAPSHOT_BYTES {
+            return Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacySnapshotTooLarge,
+                retry_after_seconds: None,
+                hard_delete_time: None,
+            }));
+        }
+        let response = self
+            .gcs
+            .get_object_generation(&version.name, version.generation)
+            .await?;
+        let dek = load_dek(self.kms.as_ref(), &response.wrapped_dek_b64).await?;
+        let opened = decrypt_bound_blob(&dek, &response.ciphertext, &user_blob_context(user_id))?;
+        let temp_path = write_private_temp_db(user_id, &opened.plaintext).await?;
+        let result = (|| {
+            init_vec_extension();
+            let conn = Connection::open_with_flags(&temp_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            conn.execute_batch("PRAGMA query_only=ON;")?;
+            media_keys(&conn)
+        })();
+        remove_temp_db_files(&temp_path);
+        result
     }
 
     // ── Email Outbox ───────────────────────────────────────────────────────────
@@ -475,7 +2957,411 @@ impl Store {
         self.save_user(user_id).await
     }
 
+    // ── Push Outbox ────────────────────────────────────────────────────────────
+
+    pub async fn next_push_delivery(&self, user_id: &str) -> Result<Option<PushDeliveryRow>> {
+        let user = user_id.to_string();
+        let now = crate::cp::isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+        self.with_user(&user, move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT episode_id,installation_id,delivery_version,delivery_id, \
+                            handoff_handle,collapse_id,attempt_count \
+                     FROM push_deliveries WHERE state IN ('pending','retry') \
+                       AND next_attempt_at<=?1 ORDER BY created_at,episode_id LIMIT 1",
+                    [&now],
+                    |row| {
+                        Ok(PushDeliveryRow {
+                            episode_id: row.get(0)?,
+                            installation_id: row.get(1)?,
+                            delivery_version: row.get(2)?,
+                            delivery_id: row.get(3)?,
+                            handoff_handle: row.get(4)?,
+                            collapse_id: row.get(5)?,
+                            attempt_count: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_push_delivery_state(
+        &self,
+        user_id: &str,
+        episode_id: i64,
+        installation_id: &str,
+        delivery_version: i32,
+        state: &str,
+        attempt_count: i32,
+        response_status: Option<u16>,
+        error_code: Option<&str>,
+        retry_after_seconds: Option<i64>,
+    ) -> Result<()> {
+        let user = user_id.to_string();
+        let installation_id = installation_id.to_string();
+        let state = state.to_string();
+        let error_code = error_code.map(str::to_string);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let now = crate::cp::isotime::format_epoch_millis(now_ms);
+        let next = crate::cp::isotime::format_epoch_millis(
+            now_ms + retry_after_seconds.unwrap_or(0).max(0) * 1_000,
+        );
+        self.with_user(&user, move |conn| {
+            conn.execute(
+                "UPDATE push_deliveries SET state=?1,attempt_count=?2,response_status=?3, \
+                   error_code=?4,next_attempt_at=?5,updated_at=?6 \
+                 WHERE episode_id=?7 AND installation_id=?8 AND delivery_version=?9",
+                rusqlite::params![
+                    state,
+                    attempt_count,
+                    response_status.map(i64::from),
+                    error_code,
+                    next,
+                    now,
+                    episode_id,
+                    installation_id,
+                    delivery_version,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?;
+        self.save_user(user_id).await
+    }
+
+    pub async fn resolve_push_handoff(
+        &self,
+        user_id: &str,
+        handoff_handle: &str,
+    ) -> Result<Option<i64>> {
+        let user = user_id.to_string();
+        let handoff = handoff_handle.to_string();
+        self.with_user(&user, move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT d.episode_id FROM push_deliveries d JOIN episodes e ON e.id=d.episode_id \
+                     WHERE d.handoff_handle=?1 AND d.state IN ('pending','retry','accepted') \
+                       AND e.finalization_status='complete'",
+                    [handoff],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
     // ── Private helpers ────────────────────────────────────────────────────────
+
+    async fn actor_for_access(&self, user_id: &str) -> Result<Arc<UserActor>> {
+        validate_user_id(user_id)?;
+        let mut registry = self.registry.lock().await;
+        if registry.blocked_users.contains(user_id) {
+            return Err(deleted_user_error());
+        }
+        let actor = registry.actor_for(user_id, self.max_open);
+        registry.touch(user_id);
+        Ok(actor)
+    }
+
+    async fn actor_for_existing(&self, user_id: &str) -> Result<SaveTarget> {
+        validate_user_id(user_id)?;
+        let mut registry = self.registry.lock().await;
+        if registry.blocked_users.contains(user_id) {
+            return Err(deleted_user_error());
+        }
+        if let Some(actor) = registry.actors.get(user_id).and_then(Weak::upgrade) {
+            registry.touch(user_id);
+            Ok(SaveTarget::Actor(actor))
+        } else if registry.recent_clean_evictions.contains_key(user_id) {
+            Ok(SaveTarget::AlreadyFlushed)
+        } else {
+            Err(EnclaveError::NotFound)
+        }
+    }
+
+    async fn actor_for_deletion(&self, user_id: &str) -> Arc<UserActor> {
+        let mut registry = self.registry.lock().await;
+        registry.blocked_users.insert(user_id.to_string());
+        registry.recent_clean_evictions.remove(user_id);
+        let actor = registry.actor_for(user_id, self.max_open);
+        registry.touch(user_id);
+        actor
+    }
+
+    async fn reject_if_blocked(&self, user_id: &str) -> Result<()> {
+        if self.registry.lock().await.blocked_users.contains(user_id) {
+            Err(deleted_user_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn was_recently_cleanly_evicted(&self, user_id: &str) -> bool {
+        self.registry
+            .lock()
+            .await
+            .recent_clean_evictions
+            .contains_key(user_id)
+    }
+
+    /// Reserve one of the bounded open-handle slots. Full-cache eviction is
+    /// performed without the registry lock; loading/evicting reservations keep
+    /// concurrent cache misses from exceeding `max_open`.
+    async fn reserve_open_slot(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+    ) -> Result<Arc<RegistryTransition>> {
+        loop {
+            // `notify_one` retains a permit if a state transition lands between
+            // the registry check and this await, avoiding a lost wakeup.
+            let changed = self.registry_changed.notified();
+            let action = {
+                let mut registry = self.registry.lock().await;
+                registry.recover_abandoned_transitions();
+
+                let recovered_same_actor = registry.open_users.get(user_id).is_some_and(|open| {
+                    open.status == OpenStatus::RecoveredEviction && Arc::ptr_eq(&open.actor, actor)
+                });
+                if recovered_same_actor {
+                    // This method is called only while the actor state has no
+                    // handle. A cancelled eviction already removed it, so its
+                    // stale capacity registration can be released and reloaded.
+                    registry.open_users.remove(user_id);
+                } else if registry.open_users.contains_key(user_id) {
+                    return Err(EnclaveError::Store(
+                        "duplicate open-handle reservation for one user".into(),
+                    ));
+                }
+
+                if registry.open_users.len() < self.max_open {
+                    let transition = RegistryTransition::new(&self.registry_changed);
+                    let access = registry.next_access();
+                    registry.open_users.insert(
+                        user_id.to_string(),
+                        OpenUser {
+                            actor: Arc::clone(actor),
+                            last_used: access,
+                            status: OpenStatus::Loading,
+                            transition: Some(Arc::downgrade(&transition)),
+                        },
+                    );
+                    CapacityAction::Reserved(transition)
+                } else {
+                    let candidate_id = registry
+                        .open_users
+                        .iter()
+                        .filter(|(candidate_id, open)| {
+                            candidate_id.as_str() != user_id
+                                && matches!(
+                                    open.status,
+                                    OpenStatus::Open | OpenStatus::RecoveredEviction
+                                )
+                                && !registry.blocked_users.contains(candidate_id.as_str())
+                        })
+                        .min_by_key(|(_, open)| open.last_used)
+                        .map(|(candidate_id, _)| candidate_id.clone());
+
+                    if let Some(candidate_id) = candidate_id {
+                        let transition = RegistryTransition::new(&self.registry_changed);
+                        let Some(open) = registry.open_users.get_mut(&candidate_id) else {
+                            return Err(EnclaveError::Store(
+                                "LRU candidate disappeared under registry lock".into(),
+                            ));
+                        };
+                        open.status = OpenStatus::Evicting;
+                        open.transition = Some(Arc::downgrade(&transition));
+                        CapacityAction::Evict(EvictionCandidate {
+                            user_id: candidate_id,
+                            actor: Arc::clone(&open.actor),
+                            transition,
+                        })
+                    } else {
+                        CapacityAction::Wait
+                    }
+                }
+            };
+
+            match action {
+                CapacityAction::Reserved(transition) => return Ok(transition),
+                CapacityAction::Evict(candidate) => self.evict_candidate(candidate).await?,
+                CapacityAction::Wait => changed.await,
+            }
+        }
+    }
+
+    async fn finish_load_registration(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        transition: &Arc<RegistryTransition>,
+        loaded: bool,
+    ) -> Result<()> {
+        let mut registry = self.registry.lock().await;
+        let valid = registry.open_users.get(user_id).is_some_and(|open| {
+            open.status == OpenStatus::Loading
+                && Arc::ptr_eq(&open.actor, actor)
+                && transition_matches(open, transition)
+        });
+        if !valid {
+            return Err(EnclaveError::Store(
+                "open-handle reservation changed during load".into(),
+            ));
+        }
+
+        if loaded {
+            let access = registry.next_access();
+            let open = registry.open_users.get_mut(user_id).ok_or_else(|| {
+                EnclaveError::Store("validated load reservation disappeared".into())
+            })?;
+            open.status = OpenStatus::Open;
+            open.last_used = access;
+            open.transition = None;
+            registry.recent_clean_evictions.remove(user_id);
+        } else {
+            registry.open_users.remove(user_id);
+        }
+        drop(registry);
+        self.registry_changed.notify_one();
+        Ok(())
+    }
+
+    async fn ensure_loaded(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        state: &mut UserActorState,
+    ) -> Result<()> {
+        if state.handle.is_some() {
+            return Ok(());
+        }
+
+        let transition = self.reserve_open_slot(user_id, actor).await?;
+        match self.load_user(user_id).await {
+            Ok(handle) => {
+                let pending = PendingUserHandle::new(handle);
+                self.finish_load_registration(user_id, actor, &transition, true)
+                    .await?;
+                state.handle = Some(pending.take());
+                state.cleanly_evicted = false;
+                Ok(())
+            }
+            Err(load_error) => {
+                self.finish_load_registration(user_id, actor, &transition, false)
+                    .await?;
+                Err(load_error)
+            }
+        }
+    }
+
+    async fn release_open_registration(&self, user_id: &str, actor: &Arc<UserActor>) {
+        let mut registry = self.registry.lock().await;
+        let matches = registry
+            .open_users
+            .get(user_id)
+            .is_some_and(|open| Arc::ptr_eq(&open.actor, actor));
+        if matches {
+            registry.open_users.remove(user_id);
+        }
+        drop(registry);
+        self.registry_changed.notify_one();
+    }
+
+    async fn complete_clean_eviction_registration(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        transition: &Arc<RegistryTransition>,
+    ) {
+        let mut registry = self.registry.lock().await;
+        let matches = registry.open_users.get(user_id).is_some_and(|open| {
+            open.status == OpenStatus::Evicting
+                && Arc::ptr_eq(&open.actor, actor)
+                && transition_matches(open, transition)
+        });
+        if matches {
+            registry.open_users.remove(user_id);
+        }
+        if !registry.blocked_users.contains(user_id) {
+            registry.record_clean_eviction(user_id, self.max_open);
+        }
+        drop(registry);
+        self.registry_changed.notify_one();
+    }
+
+    async fn discard_handle_for_deletion(
+        &self,
+        user_id: &str,
+        actor: &Arc<UserActor>,
+        state: &mut UserActorState,
+    ) {
+        if let Some(handle) = state.handle.take() {
+            info!("evicting deleted user handle");
+            let temp_path = handle.temp_path.clone();
+            drop(handle);
+            remove_temp_db_files(&temp_path);
+        }
+        state.cleanly_evicted = false;
+        self.release_open_registration(user_id, actor).await;
+    }
+
+    async fn evict_candidate(&self, candidate: EvictionCandidate) -> Result<()> {
+        let mut state = candidate.actor.state.lock().await;
+        warn!("LRU user-handle eviction");
+        let had_handle = state.handle.is_some();
+
+        if let Some(handle) = state.handle.as_mut() {
+            // A failed flush leaves the connection, generation, and plaintext
+            // temp files attached to the same actor. The waiting cache miss
+            // fails rather than discarding unpersisted mutations.
+            if let Err(error) = self.flush_handle(handle).await {
+                tracing::error!("user-handle eviction flush failed");
+                let mut registry = self.registry.lock().await;
+                if let Some(open) = registry.open_users.get_mut(&candidate.user_id) {
+                    if open.status == OpenStatus::Evicting
+                        && Arc::ptr_eq(&open.actor, &candidate.actor)
+                        && transition_matches(open, &candidate.transition)
+                    {
+                        open.status = OpenStatus::Open;
+                        open.transition = None;
+                    }
+                }
+                drop(registry);
+                self.registry_changed.notify_one();
+                return Err(error);
+            }
+        }
+
+        if let Some(handle) = state.handle.take() {
+            let temp_path = handle.temp_path.clone();
+            drop(handle);
+            remove_temp_db_files(&temp_path);
+        }
+        state.cleanly_evicted = had_handle;
+        if had_handle {
+            self.complete_clean_eviction_registration(
+                &candidate.user_id,
+                &candidate.actor,
+                &candidate.transition,
+            )
+            .await;
+        } else {
+            self.release_open_registration(&candidate.user_id, &candidate.actor)
+                .await;
+        }
+        Ok(())
+    }
 
     async fn load_user(&self, user_id: &str) -> Result<UserHandle> {
         // Defense in depth: handlers validate at the API boundary, but no
@@ -485,8 +3371,10 @@ impl Store {
 
         // Try to fetch existing blob from GCS
         let fetch_result = self.gcs.get_object(&object_name).await;
-        let (plaintext_db, blob_meta) = match fetch_result {
+        let (plaintext_db, blob_meta, envelope_rewrite_dirty) = match fetch_result {
             Ok(resp) => {
+                self.storage_metrics
+                    .record_encrypted_download(resp.ciphertext.len() as u64);
                 // Unwrap the DEK from KMS
                 let dek = load_dek(self.kms.as_ref(), &resp.wrapped_dek_b64).await?;
                 let context = user_blob_context(user_id);
@@ -496,12 +3384,15 @@ impl Store {
                     BlobMeta {
                         generation: resp.generation,
                         wrapped_dek_b64: resp.wrapped_dek_b64,
+                        verified_legacy_recovery_day: None,
+                        retry_save_before_access: false,
                     },
+                    opened.requires_rewrite,
                 )
             }
             Err(EnclaveError::NotFound) => {
                 // New user — generate a fresh DEK and an empty database
-                info!(user_id, "creating new user index");
+                info!("creating new user index");
                 let (dek, wrapped) = generate_and_wrap_dek(self.kms.as_ref()).await?;
                 let empty_db = create_empty_db(&dek)?;
                 (
@@ -509,16 +3400,21 @@ impl Store {
                     BlobMeta {
                         generation: 0,
                         wrapped_dek_b64: wrapped,
+                        verified_legacy_recovery_day: None,
+                        retry_save_before_access: false,
                     },
+                    false,
                 )
             }
             Err(e) => return Err(e),
         };
+        self.storage_metrics
+            .record_logical_db_bytes(plaintext_db.len() as u64);
 
         // Write plaintext to a temp file and open it with rusqlite
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
-        let conn = match open_db(&temp_path) {
-            Ok(conn) => conn,
+        let (conn, migration_dirty) = match open_db(&temp_path) {
+            Ok(opened) => opened,
             Err(e) => {
                 remove_temp_db_files(&temp_path);
                 return Err(e);
@@ -529,12 +3425,112 @@ impl Store {
             user_id: user_id.to_string(),
             conn,
             blob_meta,
+            mutation_generation: u64::from(migration_dirty || envelope_rewrite_dirty),
+            persisted_mutation_generation: 0,
+            dirty: migration_dirty || envelope_rewrite_dirty,
             temp_path,
-            last_used: Instant::now(),
         })
     }
 
     async fn flush_handle(&self, handle: &mut UserHandle) -> Result<()> {
+        self.flush_handle_with_admission(handle, false, None).await
+    }
+
+    /// Deletion closes normal admission before making its final local state
+    /// durable. Its own provider work remains visible to the barrier, while
+    /// ordinary writers remain rejected.
+    async fn flush_handle_for_deletion(
+        &self,
+        handle: &mut UserHandle,
+        marker_authority: &str,
+    ) -> Result<()> {
+        self.flush_handle_with_admission(handle, true, Some(marker_authority))
+            .await
+    }
+
+    async fn flush_handle_for_rebind(
+        &self,
+        handle: &mut UserHandle,
+        marker_authority: &str,
+    ) -> Result<()> {
+        self.flush_handle_with_admission(handle, true, Some(marker_authority))
+            .await
+    }
+
+    async fn flush_handle_with_admission(
+        &self,
+        handle: &mut UserHandle,
+        deletion_owned: bool,
+        allowed_marker_authority: Option<&str>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        self.storage_metrics.record_save_attempt();
+        if !handle.dirty {
+            debug!(
+                mutation_generation = handle.mutation_generation,
+                persisted_mutation_generation = handle.persisted_mutation_generation,
+                "skipped clean user index save"
+            );
+            let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.storage_metrics.record_save_completed(None, latency_us);
+            return Ok(());
+        }
+
+        // From this point until the generation-checked PUT succeeds, the local
+        // handle may contain state a request intends to acknowledge. Any
+        // failure must make the next access retry persistence before its
+        // closure can observe an idempotency duplicate and return success.
+        handle.blob_meta.retry_save_before_access = true;
+
+        // A flush can issue the authoritative index PUT and, on the first
+        // overwrite of a UTC day, a recovery-copy rewrite. Keep this parent
+        // lease for the whole transition; each provider operation receives an
+        // owned child below, so cancellation cannot make deletion outrun a
+        // request whose provider outcome remains unknown.
+        let content_write = if deletion_owned {
+            self.acquire_content_write_for_deletion(&handle.user_id)?
+        } else {
+            self.acquire_content_write_inner(&handle.user_id, false)?
+        };
+        let result = self
+            .flush_handle_inner(handle, &content_write, allowed_marker_authority)
+            .await;
+        let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        match &result {
+            Ok((logical_db_bytes, changed_wal_bytes_proxy, encrypted_bytes)) => {
+                self.storage_metrics.record_save_completed(
+                    Some((
+                        *logical_db_bytes,
+                        *changed_wal_bytes_proxy,
+                        *encrypted_bytes,
+                    )),
+                    latency_us,
+                )
+            }
+            Err(_) => self.storage_metrics.record_save_failed(latency_us),
+        }
+        result.map(|_| ())
+    }
+
+    async fn flush_handle_inner(
+        &self,
+        handle: &mut UserHandle,
+        content_write: &ContentWriteLease,
+        allowed_marker_authority: Option<&str>,
+    ) -> Result<(u64, u64, u64)> {
+        // The WAL length before checkpoint is the best available Phase-0 proxy
+        // for bytes changed since the previous flush. It is not exact dirty
+        // page bytes: it includes WAL headers/frame metadata and SQLite may
+        // auto-checkpoint frames before this observation.
+        let wal_path = sqlite_sidecar_path(&handle.temp_path, "-wal");
+        let changed_wal_bytes_proxy = match tokio::fs::metadata(&wal_path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        self.storage_metrics
+            .record_changed_wal_bytes_proxy(changed_wal_bytes_proxy);
+
         // WAL checkpoint: make sure all WAL pages are in the main DB file
         handle
             .conn
@@ -544,57 +3540,306 @@ impl Store {
         let db_bytes = tokio::fs::read(&handle.temp_path).await?;
 
         // Unwrap DEK from KMS then re-encrypt the DB file
-        let dek = load_dek(
-            // We call KMS here, but the lock is held — acceptable for now.
-            // TODO: drop lock before KMS call in a future pass.
-            self.kms.as_ref(),
-            &handle.blob_meta.wrapped_dek_b64,
-        )
-        .await?;
+        let dek = load_dek(self.kms.as_ref(), &handle.blob_meta.wrapped_dek_b64).await?;
         let object_name = gcs_object_name(&handle.user_id);
         let context = user_blob_context(&handle.user_id);
         let ciphertext = encrypt_bound_blob(&dek, &db_bytes, &context)?;
-        let new_generation = self
-            .gcs
-            .put_object(
-                &object_name,
-                &ciphertext,
-                &handle.blob_meta.wrapped_dek_b64,
+
+        // Before the first overwrite of each UTC day, preserve the exact
+        // currently authoritative generation. A generation-zero object has no
+        // prior remote state at risk, so its initial create needs no copy; its
+        // next overwrite will establish the checkpoint. Cache only a fully
+        // verified day, and re-verify once after process restart.
+        let checkpoint_now = (self.checkpoint_clock)();
+        let checkpoint_day = utc_epoch_day(checkpoint_now);
+        if handle.blob_meta.generation > 0
+            && handle.blob_meta.verified_legacy_recovery_day != Some(checkpoint_day)
+        {
+            self.ensure_legacy_recovery_checkpoint(
+                &handle.user_id,
                 handle.blob_meta.generation,
+                checkpoint_now,
+                content_write.child(),
+                allowed_marker_authority,
             )
             .await?;
+            handle.blob_meta.verified_legacy_recovery_day = Some(checkpoint_day);
+        }
+
+        let logical_db_bytes = db_bytes.len() as u64;
+        let encrypted_bytes = ciphertext.len() as u64;
+        self.storage_metrics
+            .record_encrypted_upload_attempt(encrypted_bytes);
+        let put_generation = handle.blob_meta.generation;
+        let put_lease = content_write.child();
+        let put_result = self
+            .execute_legacy_write_with_intent(
+                &handle.user_id,
+                LegacyWriteRequest::Put {
+                    backend: LegacyWriteBackend::Index,
+                    kind: LegacyWriteKind::IndexPut,
+                    object_name: object_name.clone(),
+                    ciphertext,
+                    wrapped_dek_b64: handle.blob_meta.wrapped_dek_b64.clone(),
+                    if_generation_match: put_generation,
+                },
+                allowed_marker_authority,
+                Some(put_lease),
+            )
+            .await;
+        let new_generation = match put_result {
+            Ok(generation) => generation,
+            Err(conflict @ EnclaveError::Conflict(_)) => {
+                // A generation mismatch can be the retry of a PUT that GCS
+                // committed before its response was lost or the caller was
+                // cancelled. Reconcile only against the current immutable
+                // snapshot: the wrapped DEK metadata must be byte-for-byte the
+                // same, that DEK must authenticate the current envelope, and
+                // the plaintext SQLite image must exactly equal this pending
+                // save. Any genuine concurrent write remains a conflict.
+                match self
+                    .reconcile_committed_snapshot(
+                        &object_name,
+                        &handle.blob_meta.wrapped_dek_b64,
+                        &dek,
+                        &context,
+                        &db_bytes,
+                    )
+                    .await
+                {
+                    Some(generation) => generation,
+                    None => return Err(conflict),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         // Invariant: record the post-write generation, or the NEXT save's
         // `ifGenerationMatch` conflicts against our own previous write.
         handle.blob_meta.generation = new_generation;
+        handle.blob_meta.retry_save_before_access = false;
+        handle.persisted_mutation_generation = handle.mutation_generation;
+        handle.dirty = false;
 
         debug!("flushed user index to GCS");
-        Ok(())
+        Ok((logical_db_bytes, changed_wal_bytes_proxy, encrypted_bytes))
     }
 
-    async fn evict_lru_locked(&self, inner: &mut StoreInner) -> Result<()> {
-        let oldest_id = inner
-            .handles
-            .iter()
-            .min_by_key(|(_, h)| h.last_used)
-            .map(|(id, _)| id.clone());
-
-        if let Some(id) = oldest_id {
-            if let Some(mut handle) = inner.handles.remove(&id) {
-                warn!(evicted_user = %id, "LRU eviction");
-                // A failed flush must keep the live handle and plaintext temp
-                // file available; dropping either here would lose writes.
-                if let Err(e) = self.flush_handle(&mut handle).await {
-                    tracing::error!(user_id = %id, error = %e, "eviction flush failed");
-                    inner.handles.insert(id, handle);
-                    return Err(e);
-                }
-                let temp_path = handle.temp_path.clone();
-                drop(handle);
-                remove_temp_db_files(&temp_path);
-            }
+    async fn reconcile_committed_snapshot(
+        &self,
+        object_name: &str,
+        expected_wrapped_dek_b64: &str,
+        expected_dek: &Dek,
+        context: &[u8],
+        expected_plaintext: &[u8],
+    ) -> Option<i64> {
+        let current = self.gcs.get_object(object_name).await.ok()?;
+        self.storage_metrics
+            .record_encrypted_download(current.ciphertext.len() as u64);
+        if current.generation <= 0 || current.wrapped_dek_b64 != expected_wrapped_dek_b64 {
+            return None;
         }
-        Ok(())
+        let opened = decrypt_bound_blob(expected_dek, &current.ciphertext, context).ok()?;
+        if opened.requires_rewrite || opened.plaintext != expected_plaintext {
+            return None;
+        }
+        Some(current.generation)
     }
+
+    async fn ensure_legacy_recovery_checkpoint(
+        &self,
+        user_id: &str,
+        source_generation: i64,
+        now: SystemTime,
+        content_write: ContentWriteLease,
+        allowed_marker_authority: Option<&str>,
+    ) -> Result<()> {
+        self.reconcile_unfenced_legacy_write_intents(user_id)
+            .await?;
+        let destination = legacy_recovery_checkpoint_name(user_id, now);
+        let source = gcs_object_name(user_id);
+        self.execute_legacy_write_with_intent(
+            user_id,
+            LegacyWriteRequest::RecoveryCopy {
+                source_object_name: source,
+                source_generation,
+                destination_object_name: destination,
+            },
+            allowed_marker_authority,
+            Some(content_write),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+impl IdentityRebindTransition {
+    async fn snapshot_handle(handle: &mut UserHandle) -> Result<IdentityRebindSource> {
+        handle
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let plaintext = tokio::fs::read(&handle.temp_path).await?;
+        let commitment: [u8; 32] = Sha256::digest(&plaintext).into();
+        Ok(IdentityRebindSource {
+            base_generation: handle.blob_meta.generation,
+            source_generation: handle.blob_meta.generation,
+            commitment,
+            plaintext,
+            wrapped_dek_b64: handle.blob_meta.wrapped_dek_b64.clone(),
+        })
+    }
+
+    /// Read the exact latest actor image while both actor states and all raw
+    /// admissions are fenced. This performs provider reads when the actor was
+    /// cold, but no provider writes.
+    pub(crate) async fn source_snapshot(&mut self) -> Result<IdentityRebindSource> {
+        self.store
+            .ensure_loaded(&self.old_user_id, &self.old_actor, &mut self.old_state)
+            .await?;
+        let handle = self
+            .old_state
+            .handle
+            .as_mut()
+            .ok_or_else(|| EnclaveError::Store("rebind source actor disappeared".into()))?;
+        Self::snapshot_handle(handle).await
+    }
+
+    /// After the encrypted control operation is durable, conditionally flush
+    /// the exact snapshotted actor and return its authoritative generation.
+    pub(crate) async fn freeze_source(
+        &mut self,
+        expected_base_generation: i64,
+        expected_commitment: &[u8; 32],
+        marker_authority: &str,
+    ) -> Result<IdentityRebindSource> {
+        let before = self.source_snapshot().await?;
+        if before.base_generation < expected_base_generation
+            || &before.commitment != expected_commitment
+        {
+            return Err(EnclaveError::Conflict(
+                "legacy rebind source changed after durable prepare".into(),
+            ));
+        }
+        let handle = self
+            .old_state
+            .handle
+            .as_mut()
+            .ok_or_else(|| EnclaveError::Store("rebind source actor disappeared".into()))?;
+        let had_local_changes = handle.dirty || handle.blob_meta.retry_save_before_access;
+        if !had_local_changes {
+            // Always perform a same-plaintext generation-CAS bump after the
+            // durable provider fence appears. A remote writer that checked
+            // before the marker and is already in flight must race this exact
+            // bump: one succeeds and the other receives a generation conflict.
+            handle.mark_dirty();
+        }
+        if let Err(error) = self
+            .store
+            .flush_handle_for_rebind(handle, marker_authority)
+            .await
+        {
+            if !had_local_changes && matches!(&error, EnclaveError::Conflict(_)) {
+                // The remote writer won the one permissible pre-fence CAS.
+                // This actor was clean, so no local mutation is discarded:
+                // reload the new authoritative source and let the control
+                // state machine durably rebase its commitment before retrying
+                // the forced bump.
+                let stale =
+                    self.old_state.handle.take().ok_or_else(|| {
+                        EnclaveError::Store("rebind source actor disappeared".into())
+                    })?;
+                let stale_path = stale.temp_path.clone();
+                drop(stale);
+                remove_temp_db_files(&stale_path);
+                let fresh = self.store.load_user(&self.old_user_id).await?;
+                self.old_state.handle = Some(fresh);
+            }
+            return Err(error);
+        }
+        let frozen = Self::snapshot_handle(handle).await?;
+        if frozen.source_generation <= 0 || &frozen.commitment != expected_commitment {
+            return Err(EnclaveError::Conflict(
+                "legacy rebind flush did not preserve its source commitment".into(),
+            ));
+        }
+        Ok(frozen)
+    }
+
+    /// Complete the process-local transition after the durable control record
+    /// reaches `committed`: discard the old actor permanently while reopening
+    /// only the stable namespace. The old namespace remains fenced.
+    pub(crate) async fn complete(mut self) {
+        self.store
+            .discard_handle_for_deletion(&self.old_user_id, &self.old_actor, &mut self.old_state)
+            .await;
+        self.store
+            .release_open_registration(&self.stable_user_id, &self.stable_actor)
+            .await;
+        {
+            let mut registry = self.store.registry.lock().await;
+            registry.blocked_users.remove(&self.stable_user_id);
+        }
+        {
+            let mut barrier = self
+                .store
+                .content_write_barrier
+                .state
+                .lock()
+                .expect("content barrier poisoned");
+            barrier.blocked_users.remove(&self.stable_user_id);
+        }
+        self.store.content_write_barrier.changed.notify_waiters();
+    }
+}
+
+fn deleted_user_error() -> EnclaveError {
+    EnclaveError::Auth("user account is deleted".into())
+}
+
+impl UserHandle {
+    fn mark_dirty(&mut self) {
+        self.mutation_generation = self.mutation_generation.saturating_add(1);
+        self.dirty = true;
+    }
+}
+
+fn log_storage_metrics(snapshot: &StorageMetricsSnapshot) {
+    info!(
+        target: "kioku::storage_metrics",
+        metric_schema = "archive_snapshot_v1",
+        logical_db_bytes_count = snapshot.logical_db_bytes.count,
+        logical_db_bytes_sum = snapshot.logical_db_bytes.sum,
+        logical_db_bytes_max = snapshot.logical_db_bytes.max,
+        byte_bucket_upper_bounds = ?BYTE_BUCKET_UPPER_BOUNDS,
+        logical_db_bytes_cumulative_buckets = ?snapshot.logical_db_bytes.cumulative_buckets,
+        changed_wal_bytes_proxy_count = snapshot.changed_wal_bytes_proxy.count,
+        changed_wal_bytes_proxy_sum = snapshot.changed_wal_bytes_proxy.sum,
+        changed_wal_bytes_proxy_max = snapshot.changed_wal_bytes_proxy.max,
+        changed_wal_bytes_proxy_cumulative_buckets = ?snapshot.changed_wal_bytes_proxy.cumulative_buckets,
+        encrypted_upload_bytes_count = snapshot.encrypted_upload_bytes.count,
+        encrypted_upload_bytes_total = snapshot.encrypted_upload_bytes.sum,
+        encrypted_upload_bytes_max = snapshot.encrypted_upload_bytes.max,
+        encrypted_upload_bytes_cumulative_buckets = ?snapshot.encrypted_upload_bytes.cumulative_buckets,
+        encrypted_upload_attempted_bytes_total = snapshot.encrypted_upload_attempted_bytes_total,
+        encrypted_download_bytes_count = snapshot.encrypted_download_bytes.count,
+        encrypted_download_bytes_total = snapshot.encrypted_download_bytes.sum,
+        encrypted_download_bytes_max = snapshot.encrypted_download_bytes.max,
+        encrypted_download_bytes_cumulative_buckets = ?snapshot.encrypted_download_bytes.cumulative_buckets,
+        save_attempts_total = snapshot.save_attempts_total,
+        save_completed_total = snapshot.save_completed_total,
+        save_failed_total = snapshot.save_failed_total,
+        save_skipped_total = snapshot.save_skipped_total,
+        save_latency_us_count = snapshot.save_latency_us.count,
+        save_latency_us_sum = snapshot.save_latency_us.sum,
+        save_latency_us_max = snapshot.save_latency_us.max,
+        save_latency_us_bucket_upper_bounds = ?LATENCY_US_BUCKET_UPPER_BOUNDS,
+        save_latency_us_cumulative_buckets = ?snapshot.save_latency_us.cumulative_buckets,
+        write_amplification_ppm_count = snapshot.write_amplification_ppm.count,
+        write_amplification_ppm_sum = snapshot.write_amplification_ppm.sum,
+        write_amplification_ppm_max = snapshot.write_amplification_ppm.max,
+        write_amplification_ppm_bucket_upper_bounds = ?AMPLIFICATION_PPM_BUCKET_UPPER_BOUNDS,
+        write_amplification_ppm_cumulative_buckets = ?snapshot.write_amplification_ppm.cumulative_buckets,
+        "aggregate archive storage metrics"
+    );
 }
 
 // ── sqlite-vec auto-extension registration ─────────────────────────────────────
@@ -820,7 +4065,9 @@ CREATE TABLE IF NOT EXISTS episodes (
     finalization_version INTEGER,
     finalization_status TEXT NOT NULL DEFAULT 'pending_horizon',
     finalization_error TEXT,
-    finalization_attempted_at TEXT
+    finalization_attempted_at TEXT,
+    finalization_attempt_count INTEGER NOT NULL DEFAULT 0,
+    finalization_next_attempt_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_started_at ON episodes(started_at);
 
@@ -830,6 +4077,48 @@ CREATE TABLE IF NOT EXISTS app_metadata (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
     updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Privacy-minimized Vertex cost attribution. One row is created before an
+-- outbound invocation and completed in place. It contains no prompt, output,
+-- response id, episode id, Google identity, or provider account identifier.
+CREATE TABLE IF NOT EXISTS vertex_usage_events (
+    event_id                TEXT PRIMARY KEY,
+    operation               TEXT NOT NULL CHECK (operation IN (
+        'audio_understanding','screen_understanding','episode_summarization',
+        'episode_finalization')),
+    requested_model         TEXT NOT NULL,
+    returned_model          TEXT,
+    location                TEXT NOT NULL,
+    traffic_type            TEXT NOT NULL DEFAULT 'on_demand' CHECK (traffic_type IN (
+        'on_demand','batch','provisioned_throughput')),
+    http_status             INTEGER,
+    prompt_tokens           INTEGER,
+    input_text_tokens       INTEGER,
+    input_audio_tokens      INTEGER,
+    input_image_tokens      INTEGER,
+    cached_input_tokens     INTEGER,
+    cached_input_text_tokens INTEGER,
+    cached_input_audio_tokens INTEGER,
+    cached_input_image_tokens INTEGER,
+    output_text_tokens      INTEGER,
+    thought_tokens          INTEGER,
+    total_tokens            INTEGER,
+    outcome                 TEXT NOT NULL CHECK (outcome IN ('started','metered','usage_missing','ambiguous','not_billed')),
+    delivery_state          TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+    delivery_attempt_count  INTEGER NOT NULL DEFAULT 0,
+    observed_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS vertex_usage_events_outbox_idx
+    ON vertex_usage_events(delivery_state, observed_at);
+CREATE TABLE IF NOT EXISTS vertex_usage_coverage (
+    period          TEXT PRIMARY KEY,
+    sequence        INTEGER NOT NULL CHECK (sequence > 0),
+    pending_events  INTEGER NOT NULL CHECK (pending_events >= 0),
+    lost_events     INTEGER NOT NULL DEFAULT 0 CHECK (lost_events >= 0),
+    delivery_state  TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- Explicit episode membership (FK join). record_type ∈ {utterance, screenshot};
@@ -996,6 +4285,27 @@ CREATE TABLE IF NOT EXISTS email_deliveries (
 CREATE INDEX IF NOT EXISTS email_deliveries_due_idx
     ON email_deliveries(state, next_attempt_at);
 
+-- Per-installation finalized-memory notification outbox. The raw handoff is
+-- opaque, random, and encrypted with the rest of the user's content DB.
+CREATE TABLE IF NOT EXISTS push_deliveries (
+    episode_id        INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    installation_id   TEXT NOT NULL,
+    delivery_version  INTEGER NOT NULL,
+    delivery_id       TEXT NOT NULL UNIQUE,
+    handoff_handle    TEXT NOT NULL UNIQUE,
+    collapse_id       TEXT NOT NULL,
+    state             TEXT NOT NULL CHECK (state IN ('pending','retry','accepted','cancelled','failed')),
+    attempt_count     INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at   TEXT NOT NULL,
+    response_status   INTEGER,
+    error_code        TEXT,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (episode_id, installation_id, delivery_version)
+);
+CREATE INDEX IF NOT EXISTS push_deliveries_due_idx
+    ON push_deliveries(state, next_attempt_at);
+
 -- Device sync watermarks per modality
 CREATE TABLE IF NOT EXISTS device_watermarks (
     device_id    TEXT NOT NULL,
@@ -1015,6 +4325,7 @@ CREATE TABLE IF NOT EXISTS device_watermarks (
 /// `CREATE UNIQUE INDEX IF NOT EXISTS` is truly idempotent.
 fn run_migrations(conn: &Connection) -> Result<()> {
     crate::cp::mcp_projection::init_projection_schema(conn)?;
+    crate::cp::media::init_schema(conn)?;
     // utterances.source_key (sync idempotency key)
     if let Err(e) = conn.execute_batch("ALTER TABLE utterances ADD COLUMN source_key TEXT;") {
         // SQLite returns "duplicate column name: source_key" — ignore it.
@@ -1238,6 +4549,46 @@ fn run_migrations(conn: &Connection) -> Result<()> {
              updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          );",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vertex_usage_events (
+             event_id TEXT PRIMARY KEY,
+             operation TEXT NOT NULL CHECK (operation IN (
+                'audio_understanding','screen_understanding','episode_summarization',
+                'episode_finalization')),
+             requested_model TEXT NOT NULL,
+             returned_model TEXT,
+             location TEXT NOT NULL,
+             traffic_type TEXT NOT NULL DEFAULT 'on_demand' CHECK (traffic_type IN (
+                'on_demand','batch','provisioned_throughput')),
+             http_status INTEGER,
+             prompt_tokens INTEGER,
+             input_text_tokens INTEGER,
+             input_audio_tokens INTEGER,
+             input_image_tokens INTEGER,
+             cached_input_tokens INTEGER,
+             cached_input_text_tokens INTEGER,
+             cached_input_audio_tokens INTEGER,
+             cached_input_image_tokens INTEGER,
+             output_text_tokens INTEGER,
+             thought_tokens INTEGER,
+             total_tokens INTEGER,
+             outcome TEXT NOT NULL CHECK (outcome IN ('started','metered','usage_missing','ambiguous','not_billed')),
+             delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+             delivery_attempt_count INTEGER NOT NULL DEFAULT 0,
+             observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );
+         CREATE INDEX IF NOT EXISTS vertex_usage_events_outbox_idx
+             ON vertex_usage_events(delivery_state, observed_at);
+         CREATE TABLE IF NOT EXISTS vertex_usage_coverage (
+             period TEXT PRIMARY KEY,
+             sequence INTEGER NOT NULL CHECK (sequence > 0),
+             pending_events INTEGER NOT NULL CHECK (pending_events >= 0),
+             lost_events INTEGER NOT NULL DEFAULT 0 CHECK (lost_events >= 0),
+             delivery_state TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_state IN ('pending','delivered')),
+             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         );",
+    )?;
 
     // ── ADR-0004 §G.3: episodes_fts rebuild to index minutes_text ──────────────
     //
@@ -1441,6 +4792,8 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         "ALTER TABLE episodes ADD COLUMN finalization_status TEXT NOT NULL DEFAULT 'pending_horizon';",
         "ALTER TABLE episodes ADD COLUMN finalization_error TEXT;",
         "ALTER TABLE episodes ADD COLUMN finalization_attempted_at TEXT;",
+        "ALTER TABLE episodes ADD COLUMN finalization_attempt_count INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE episodes ADD COLUMN finalization_next_attempt_at TEXT;",
     ] {
         if let Err(e) = conn.execute_batch(col_def) {
             let msg = e.to_string();
@@ -1449,26 +4802,33 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             }
         }
     }
-    // Version 3 introduces OCR salience and deictic entity retention. Existing
-    // briefs remain readable while their status makes the queued regeneration
-    // visible. Unfinalized rows retain the horizon default.
-    conn.execute(
-        "UPDATE episodes
-         SET finalization_status = 'regeneration_queued',
-             finalization_error = NULL
-         WHERE finalized_at IS NOT NULL
-           AND COALESCE(finalization_version, 1) < ?1
-           AND finalization_status IN ('complete', 'pending_horizon')",
-        [EPISODE_FINALIZATION_VERSION],
-    )?;
+    // Historical briefs remain readable but are never automatically sent back
+    // to a paid model merely because the analysis schema changed. A scoped
+    // user/operator action can still request regeneration explicitly.
     conn.execute(
         "UPDATE episodes
          SET finalization_status = 'complete',
-             finalization_error = NULL
+             finalization_error = NULL,
+             finalization_attempt_count = 0,
+             finalization_next_attempt_at = NULL
          WHERE finalized_at IS NOT NULL
-           AND COALESCE(finalization_version, 1) >= ?1
-           AND finalization_status != 'complete'",
-        [EPISODE_FINALIZATION_VERSION],
+           AND (finalization_status IS NOT 'complete'
+                OR finalization_error IS NOT NULL
+                OR finalization_attempt_count <> 0
+                OR finalization_next_attempt_at IS NOT NULL)",
+        [],
+    )?;
+    // Quarantine the pre-guard retry loop. Its attempt count was not persisted,
+    // so treating it as fresh would immediately repeat the production incident.
+    conn.execute(
+        "UPDATE episodes
+         SET finalization_status = 'failed_terminal',
+             finalization_error = 'legacy unbounded retry quarantined; retry explicitly',
+             finalization_attempt_count = 3,
+             finalization_next_attempt_at = NULL
+         WHERE finalized_at IS NULL
+           AND finalization_status IN ('retry_model', 'processing')",
+        [],
     )?;
 
     // ADR-0011/0012: canonical briefs, generic webhook outbox, and watermarks.
@@ -1519,6 +4879,24 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS email_deliveries_due_idx
             ON email_deliveries(state, next_attempt_at);
+        CREATE TABLE IF NOT EXISTS push_deliveries (
+            episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            installation_id TEXT NOT NULL,
+            delivery_version INTEGER NOT NULL,
+            delivery_id TEXT NOT NULL UNIQUE,
+            handoff_handle TEXT NOT NULL UNIQUE,
+            collapse_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending','retry','accepted','cancelled','failed')),
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL,
+            response_status INTEGER,
+            error_code TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (episode_id, installation_id, delivery_version)
+        );
+        CREATE INDEX IF NOT EXISTS push_deliveries_due_idx
+            ON push_deliveries(state, next_attempt_at);
         CREATE TABLE IF NOT EXISTS device_watermarks (
             device_id    TEXT NOT NULL,
             modality     TEXT NOT NULL CHECK (modality IN ('audio','screen')),
@@ -1582,14 +4960,34 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn open_db(path: &PathBuf) -> Result<Connection> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DatabaseMutationFingerprint {
+    total_changes: u64,
+    schema_version: i64,
+    user_version: i64,
+    application_id: i64,
+}
+
+fn database_mutation_fingerprint(conn: &Connection) -> Result<DatabaseMutationFingerprint> {
+    Ok(DatabaseMutationFingerprint {
+        // SQLite total_changes includes row changes performed by triggers.
+        total_changes: conn.total_changes(),
+        schema_version: conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?,
+        user_version: conn.query_row("PRAGMA user_version", [], |row| row.get(0))?,
+        application_id: conn.query_row("PRAGMA application_id", [], |row| row.get(0))?,
+    })
+}
+
+fn open_db(path: &PathBuf) -> Result<(Connection, bool)> {
     // Register the sqlite-vec extension globally before any connection opens.
     // This is idempotent (Once guard) and thread-safe.
     init_vec_extension();
     let conn = Connection::open(path)?;
+    let before = database_mutation_fingerprint(&conn)?;
     conn.execute_batch(SCHEMA_SQL)?;
     run_migrations(&conn)?;
-    Ok(conn)
+    let migrated = database_mutation_fingerprint(&conn)? != before;
+    Ok((conn, migrated))
 }
 
 /// Build a fresh empty SQLite database in memory, serialize it, encrypt it,
@@ -1613,6 +5011,29 @@ fn create_empty_db(dek: &Dek) -> Result<Vec<u8>> {
 
 // ── GCS trait (seam for testing) ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcsObjectMetadata {
+    pub generation: i64,
+    pub size: u64,
+    /// Provider-calculated CRC32C in GCS's base64 representation.
+    pub crc32c: String,
+    pub md5_hash: Option<String>,
+    pub wrapped_dek_b64: String,
+    pub legacy_recovery: Option<LegacyRecoveryBinding>,
+}
+
+/// Provider-stored protocol marker written atomically with a daily recovery
+/// rewrite. Its source identity and integrity fields describe the immutable
+/// generation from which the destination bytes were copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRecoveryBinding {
+    pub format_version: u8,
+    pub source_object: String,
+    pub source_generation: i64,
+    pub source_size: u64,
+    pub source_crc32c: String,
+}
+
 #[derive(Debug)]
 pub struct GcsGetResponse {
     pub ciphertext: Vec<u8>,
@@ -1620,10 +5041,56 @@ pub struct GcsGetResponse {
     pub generation: i64,
 }
 
+/// One concrete GCS object generation.  Names and generations are routing
+/// metadata only; callers must never log them because names can carry user data.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GcsObjectVersion {
+    pub name: String,
+    pub generation: i64,
+    pub size: u64,
+    /// Present only for provider soft-deleted inventory. GCS owns this
+    /// immutable deadline; callers preserve it for deletion-status reporting.
+    pub hard_delete_time: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct GcsListVersionsResponse {
+    pub versions: Vec<GcsObjectVersion>,
+    pub next_page_token: Option<String>,
+}
+
+/// Result of a generation-pinned, create-only recovery copy.  The metadata is
+/// intentionally content-free and is sufficient for export/deletion inventory
+/// code to identify an exact checkpoint generation without reading ciphertext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcsGenerationCopy {
+    pub source: GcsObjectMetadata,
+    pub destination: GcsObjectMetadata,
+    /// False means this UTC day's immutable destination already existed.
+    pub created: bool,
+}
+
 /// Abstraction over GCS so unit tests can inject an in-memory fake.
 #[async_trait::async_trait]
 pub trait GcsClient: Send + Sync {
+    /// Return provider time from a read-only authenticated metadata response
+    /// for this exact existing authority generation. Implementations must not
+    /// use the caller's process wall clock or create clock objects. Provider
+    /// request futures must be cancellation-owned: dropping a timed-out future
+    /// cannot leave a detached request that may commit after lease expiry.
+    async fn trusted_time_millis(
+        &self,
+        authority_object_name: &str,
+        authority_generation: i64,
+    ) -> Result<i64>;
     async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse>;
+    /// Fetches one exact live/noncurrent generation, including its historical
+    /// wrapped-DEK metadata.
+    async fn get_object_generation(
+        &self,
+        object_name: &str,
+        generation: i64,
+    ) -> Result<GcsGetResponse>;
     /// Returns the object's NEW generation on success. Callers must record it
     /// for the next `if_generation_match` — forgetting to do so makes every
     /// save after the first 409 against the caller's own previous write.
@@ -1634,43 +5101,547 @@ pub trait GcsClient: Send + Sync {
         wrapped_dek_b64: &str,
         if_generation_match: i64,
     ) -> Result<i64>;
+    /// Copy exactly `source_generation` to a destination that must not already
+    /// exist. If a prior attempt may have succeeded, implementations must read
+    /// and return that destination instead of copying a newer source version.
+    async fn copy_generation_if_absent(
+        &self,
+        source_name: &str,
+        source_generation: i64,
+        destination_name: &str,
+    ) -> Result<GcsGenerationCopy>;
     async fn delete_object(&self, object_name: &str) -> Result<()>;
+    /// Lists live and noncurrent generations under an exact caller-owned
+    /// prefix/name. `page_token` is an opaque GCS cursor.
+    async fn list_object_versions(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse>;
+    /// Lists only the currently live objects under `prefix` (`versions=false`).
+    /// Reconciliation uses this instead of deriving liveness from a historical
+    /// version listing.
+    async fn list_live_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse>;
+    /// Deletes exactly one generation. Not-found is success so deletion
+    /// inventories can be retried after partial completion.
+    async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()>;
+    /// Lists soft-deleted objects separately from live/noncurrent versions.
+    /// Callers must not try to delete these: GCS retains them until its
+    /// immutable `hardDeleteTime`.
+    async fn list_soft_deleted_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse>;
+}
+
+async fn list_all_object_versions(
+    gcs: &dyn GcsClient,
+    prefix: &str,
+) -> Result<Vec<GcsObjectVersion>> {
+    let mut versions = Vec::new();
+    let mut page_token: Option<String> = None;
+    for _ in 0..MAX_GCS_LIST_PAGES {
+        let page = gcs
+            .list_object_versions(prefix, page_token.as_deref())
+            .await?;
+        versions.extend(page.versions);
+        match page.next_page_token {
+            None => return Ok(versions),
+            Some(next) if page_token.as_deref() != Some(next.as_str()) => page_token = Some(next),
+            Some(_) => {
+                return Err(EnclaveError::Gcs(
+                    "GCS version listing repeated a page cursor".into(),
+                ))
+            }
+        }
+    }
+    Err(EnclaveError::Gcs(
+        "GCS version listing exceeded its page bound".into(),
+    ))
+}
+
+pub(crate) async fn delete_all_object_generations(
+    gcs: &dyn GcsClient,
+    object_name: &str,
+) -> Result<()> {
+    for version in list_all_object_versions(gcs, object_name)
+        .await?
+        .into_iter()
+        .filter(|version| version.name == object_name)
+    {
+        gcs.delete_object_generation(&version.name, version.generation)
+            .await?;
+    }
+    if list_all_object_versions(gcs, object_name)
+        .await?
+        .iter()
+        .any(|version| version.name == object_name)
+    {
+        return Err(EnclaveError::Gcs(
+            "GCS object generations remain after deletion".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_object_generations_except(
+    gcs: &dyn GcsClient,
+    object_name: &str,
+    keep_generation: i64,
+) -> Result<()> {
+    let versions = list_all_object_versions(gcs, object_name).await?;
+    if !versions
+        .iter()
+        .any(|version| version.name == object_name && version.generation == keep_generation)
+    {
+        return Err(EnclaveError::Gcs(
+            "required current GCS generation is missing during privacy purge".into(),
+        ));
+    }
+    for version in versions
+        .into_iter()
+        .filter(|version| version.name == object_name && version.generation != keep_generation)
+    {
+        gcs.delete_object_generation(&version.name, version.generation)
+            .await?;
+    }
+    if list_all_object_versions(gcs, object_name)
+        .await?
+        .iter()
+        .any(|version| version.name == object_name && version.generation != keep_generation)
+    {
+        return Err(EnclaveError::Gcs(
+            "superseded GCS generations remain after privacy purge".into(),
+        ));
+    }
+    Ok(())
+}
+
+const GCS_LIST_PAGE_SIZE: usize = 1_000;
+const MAX_GCS_LIST_PAGES: usize = 1_000_000;
+const GCS_CURSOR_FINGERPRINT_BITS: usize = 1 << 18;
+const GCS_CURSOR_FINGERPRINT_WORDS: usize = GCS_CURSOR_FINGERPRINT_BITS / u64::BITS as usize;
+/// Historical Phase-0 inventory still decrypts one whole legacy SQLite
+/// snapshot. Reject larger generations before download until the streaming
+/// archive converter replaces this compatibility path.
+const MAX_LEGACY_DELETION_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SoftDeletedInventory {
+    found: bool,
+    latest_hard_delete_time: Option<String>,
+}
+
+impl SoftDeletedInventory {
+    fn include(&mut self, version: GcsObjectVersion) {
+        self.found = true;
+        self.include_deadline(version.hard_delete_time);
+    }
+
+    fn include_deadline(&mut self, hard_delete_time: Option<String>) {
+        let Some(candidate) = hard_delete_time else {
+            return;
+        };
+        let replace = match self.latest_hard_delete_time.as_deref() {
+            None => true,
+            Some(current) => match (
+                crate::cp::isotime::parse_epoch_millis(current),
+                crate::cp::isotime::parse_epoch_millis(&candidate),
+            ) {
+                (Some(current), Some(candidate)) => candidate > current,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => candidate.as_str() > current,
+            },
+        };
+        if replace {
+            self.latest_hard_delete_time = Some(candidate);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if !other.found {
+            return;
+        }
+        self.found = true;
+        self.include_deadline(other.latest_hard_delete_time);
+    }
+}
+
+fn soft_deleted_account_objects_error(inventory: SoftDeletedInventory) -> EnclaveError {
+    let retry_after_seconds = inventory
+        .latest_hard_delete_time
+        .as_deref()
+        .and_then(crate::cp::isotime::parse_epoch_millis)
+        .and_then(|deadline_ms| {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .try_into()
+                .ok()?;
+            let remaining_ms = deadline_ms.saturating_sub(now_ms).max(1);
+            u64::try_from(remaining_ms.saturating_add(999) / 1_000).ok()
+        });
+    EnclaveError::DeletionPending(DeletionPending {
+        reason: DeletionPendingReason::SoftDeleteRetention,
+        retry_after_seconds,
+        hard_delete_time: inventory.latest_hard_delete_time,
+    })
+}
+
+fn legacy_inventory_incomplete_error() -> EnclaveError {
+    EnclaveError::DeletionPending(DeletionPending {
+        reason: DeletionPendingReason::LegacyInventoryIncomplete,
+        retry_after_seconds: None,
+        hard_delete_time: None,
+    })
+}
+
+fn legacy_write_intent_unsettled_error() -> EnclaveError {
+    EnclaveError::DeletionPending(DeletionPending {
+        reason: DeletionPendingReason::LegacyWriteIntentUnsettled,
+        retry_after_seconds: Some(5),
+        hard_delete_time: None,
+    })
+}
+
+fn legacy_generation_unavailable_error() -> EnclaveError {
+    EnclaveError::DeletionPending(DeletionPending {
+        reason: DeletionPendingReason::LegacyGenerationUnavailable,
+        retry_after_seconds: None,
+        hard_delete_time: None,
+    })
+}
+
+/// Deletes at most one provider page at a time, then restarts at the first
+/// page. Restarting avoids skipped generations when deleting changes the
+/// meaning of a continuation token, while keeping memory bounded by one page.
+async fn delete_matching_object_versions(
+    gcs: &dyn GcsClient,
+    selector: &str,
+    exact_name: bool,
+) -> Result<()> {
+    let mut page_token = None;
+    for _ in 0..MAX_GCS_LIST_PAGES {
+        let page = gcs
+            .list_object_versions(selector, page_token.as_deref())
+            .await?;
+        let matching = page
+            .versions
+            .into_iter()
+            .filter(|version| {
+                if exact_name {
+                    version.name == selector
+                } else {
+                    version.name.starts_with(selector)
+                }
+            })
+            .collect::<Vec<_>>();
+        if !matching.is_empty() {
+            for version in matching {
+                gcs.delete_object_generation(&version.name, version.generation)
+                    .await?;
+            }
+            page_token = None;
+            continue;
+        }
+        match page.next_page_token {
+            Some(next) if page_token.as_deref() != Some(next.as_str()) => page_token = Some(next),
+            Some(_) => {
+                return Err(EnclaveError::Gcs(
+                    "GCS version listing repeated a page cursor".into(),
+                ))
+            }
+            None => return Ok(()),
+        }
+    }
+    Err(EnclaveError::Gcs(
+        "GCS version listing exceeded the bounded page limit".into(),
+    ))
+}
+
+/// Streams one selector's soft-deleted inventory and preserves only the latest
+/// provider hard-delete deadline. No content inventory is accumulated.
+async fn matching_soft_deleted_inventory(
+    gcs: &dyn GcsClient,
+    selector: &str,
+    exact_name: bool,
+) -> Result<SoftDeletedInventory> {
+    let mut page_token = None;
+    let mut inventory = SoftDeletedInventory::default();
+    for _ in 0..MAX_GCS_LIST_PAGES {
+        let page = gcs
+            .list_soft_deleted_objects(selector, page_token.as_deref())
+            .await?;
+        for version in page.versions.into_iter().filter(|version| {
+            if exact_name {
+                version.name == selector
+            } else {
+                version.name.starts_with(selector)
+            }
+        }) {
+            inventory.include(version);
+        }
+        match page.next_page_token {
+            Some(next) if page_token.as_deref() != Some(next.as_str()) => page_token = Some(next),
+            Some(_) => {
+                return Err(EnclaveError::Gcs(
+                    "GCS soft-delete listing repeated a page cursor".into(),
+                ))
+            }
+            None => return Ok(inventory),
+        }
+    }
+    Err(EnclaveError::Gcs(
+        "GCS soft-delete listing exceeded the bounded page limit".into(),
+    ))
 }
 
 // ── Production GCS client ──────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct GcsObjectMetadata {
+#[derive(Debug, Deserialize)]
+struct GcsApiObjectMetadata {
     generation: String,
+    size: String,
+    #[serde(rename = "crc32c")]
+    crc32c: Option<String>,
+    #[serde(rename = "md5Hash")]
+    md5_hash: Option<String>,
     metadata: Option<GcsCustomMetadata>,
 }
 
 #[derive(Deserialize)]
+struct GcsListVersionsPage {
+    #[serde(default)]
+    items: Vec<GcsVersionMetadata>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GcsErrorEnvelope {
+    error: GcsErrorBody,
+}
+
+#[derive(Deserialize)]
+struct GcsErrorBody {
+    code: u16,
+    #[serde(default)]
+    errors: Vec<GcsErrorDetail>,
+}
+
+#[derive(Deserialize)]
+struct GcsErrorDetail {
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct GcsVersionMetadata {
+    name: String,
+    generation: String,
+    size: String,
+    #[serde(rename = "hardDeleteTime")]
+    hard_delete_time: Option<String>,
+}
+
+fn decode_gcs_versions_page(
+    body: &[u8],
+    generation_label: &str,
+) -> Result<GcsListVersionsResponse> {
+    let page: GcsListVersionsPage = serde_json::from_slice(body)?;
+    let versions = page
+        .items
+        .into_iter()
+        .map(|item| {
+            Ok(GcsObjectVersion {
+                name: item.name,
+                generation: item.generation.parse().map_err(|_| {
+                    EnclaveError::Gcs(format!("invalid {generation_label} generation"))
+                })?,
+                size: item
+                    .size
+                    .parse()
+                    .map_err(|_| EnclaveError::Gcs("invalid listed object size".into()))?,
+                hard_delete_time: item.hard_delete_time,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GcsListVersionsResponse {
+        versions,
+        next_page_token: page.next_page_token,
+    })
+}
+
+fn decode_soft_deleted_list_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    first_page: bool,
+) -> Result<GcsListVersionsResponse> {
+    if status.is_success() {
+        return decode_gcs_versions_page(body, "soft-deleted");
+    }
+    // With this fixed request shape, the JSON API documents first-page
+    // invalidArgument as the response when the bucket has no soft-delete
+    // policy. Never apply the exception to continuation requests or any other
+    // status/reason, since those may indicate a bad cursor or request bug.
+    let policy_disabled = status == reqwest::StatusCode::BAD_REQUEST
+        && first_page
+        && serde_json::from_slice::<GcsErrorEnvelope>(body).is_ok_and(|envelope| {
+            envelope.error.code == 400
+                && !envelope.error.errors.is_empty()
+                && envelope
+                    .error
+                    .errors
+                    .iter()
+                    .all(|detail| detail.reason == "invalidArgument")
+        });
+    if policy_disabled {
+        return Ok(GcsListVersionsResponse::default());
+    }
+    Err(EnclaveError::Gcs(format!(
+        "GCS soft-delete listing failed with HTTP {}",
+        status.as_u16()
+    )))
+}
+
+impl GcsApiObjectMetadata {
+    fn into_public(self) -> Result<GcsObjectMetadata> {
+        let custom = self
+            .metadata
+            .ok_or_else(|| EnclaveError::Gcs("missing GCS custom metadata".into()))?;
+        let wrapped_dek_b64 = custom
+            .wrapped_dek
+            .clone()
+            .ok_or_else(|| EnclaveError::Gcs("missing wrapped DEK in object metadata".into()))?;
+        let legacy_recovery = custom.legacy_recovery_binding()?;
+        Ok(GcsObjectMetadata {
+            generation: self
+                .generation
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid generation".into()))?,
+            size: self
+                .size
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid GCS object size".into()))?,
+            crc32c: self
+                .crc32c
+                .ok_or_else(|| EnclaveError::Gcs("missing GCS CRC32C".into()))?,
+            md5_hash: self.md5_hash,
+            wrapped_dek_b64,
+            legacy_recovery,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct GcsCustomMetadata {
     #[serde(rename = "x-kioku-wrapped-dek")]
     wrapped_dek: Option<String>,
+    #[serde(rename = "x-kioku-legacy-recovery-format")]
+    legacy_recovery_format: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-object")]
+    legacy_source_object: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-generation")]
+    legacy_source_generation: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-size")]
+    legacy_source_size: Option<String>,
+    #[serde(rename = "x-kioku-legacy-source-crc32c")]
+    legacy_source_crc32c: Option<String>,
+}
+
+impl GcsCustomMetadata {
+    fn legacy_recovery_binding(&self) -> Result<Option<LegacyRecoveryBinding>> {
+        let fields_present = [
+            self.legacy_recovery_format.is_some(),
+            self.legacy_source_object.is_some(),
+            self.legacy_source_generation.is_some(),
+            self.legacy_source_size.is_some(),
+            self.legacy_source_crc32c.is_some(),
+        ];
+        if fields_present.iter().all(|present| !present) {
+            return Ok(None);
+        }
+        if !fields_present.iter().all(|present| *present) {
+            return Err(EnclaveError::Gcs(
+                "incomplete legacy recovery checkpoint metadata".into(),
+            ));
+        }
+        Ok(Some(LegacyRecoveryBinding {
+            format_version: self
+                .legacy_recovery_format
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid legacy recovery format".into()))?,
+            source_object: self.legacy_source_object.clone().unwrap_or_default(),
+            source_generation: self
+                .legacy_source_generation
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|_| {
+                    EnclaveError::Gcs("invalid legacy recovery source generation".into())
+                })?,
+            source_size: self
+                .legacy_source_size
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|_| EnclaveError::Gcs("invalid legacy recovery source size".into()))?,
+            source_crc32c: self.legacy_source_crc32c.clone().unwrap_or_default(),
+        }))
+    }
 }
 
 pub struct GcpGcsClient {
     http: reqwest::Client,
     bucket: String,
+    /// Kept as explicit client configuration so the exact-generation HTTP
+    /// sequence can be exercised against a local server. Production always
+    /// uses Google's canonical API origin.
+    api_base: String,
+    metadata_token_url: String,
+    trusted_time_floor_millis: AtomicI64,
 }
 
 impl GcpGcsClient {
     pub fn from_env() -> Result<Self> {
         let bucket = std::env::var("GCS_BUCKET")
             .map_err(|_| EnclaveError::Gcs("GCS_BUCKET not set".into()))?;
-        Ok(Self {
-            http: gcs_http_client(),
-            bucket,
-        })
+        Ok(Self::from_parts(bucket, "https://storage.googleapis.com".into(), "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token".into()))
     }
 
     pub fn from_bucket(bucket: String) -> Self {
+        Self::from_parts(
+            bucket,
+            "https://storage.googleapis.com".into(),
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token".into(),
+        )
+    }
+
+    fn from_parts(bucket: String, api_base: String, metadata_token_url: String) -> Self {
         Self {
             http: gcs_http_client(),
             bucket,
+            api_base,
+            metadata_token_url,
+            trusted_time_floor_millis: AtomicI64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn for_test_endpoint(bucket: String, endpoint: String) -> Self {
+        Self::from_parts(
+            bucket,
+            endpoint.clone(),
+            format!("{endpoint}/computeMetadata/v1/instance/service-accounts/default/token"),
+        )
     }
 
     async fn access_token(&self) -> Result<String> {
@@ -1680,7 +5651,7 @@ impl GcpGcsClient {
         }
         let tok: Tok = self
             .http
-            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .get(&self.metadata_token_url)
             .header("Metadata-Flavor", "Google")
             .timeout(Duration::from_secs(3))
             .send()
@@ -1689,6 +5660,64 @@ impl GcpGcsClient {
             .json()
             .await?;
         Ok(tok.access_token)
+    }
+    async fn object_metadata(
+        &self,
+        object_name: &str,
+        generation: Option<i64>,
+    ) -> Result<GcsObjectMetadata> {
+        let token = self.access_token().await?;
+        let encoded = urlencoding::encode(object_name);
+        let generation_query = generation
+            .map(|g| format!("?generation={g}"))
+            .unwrap_or_default();
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}{}",
+            self.api_base, self.bucket, encoded, generation_query
+        );
+        let response = self.http.get(url).bearer_auth(token).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(EnclaveError::NotFound);
+        }
+        response
+            .error_for_status()?
+            .json::<GcsApiObjectMetadata>()
+            .await?
+            .into_public()
+    }
+
+    async fn get_object_at_generation(
+        &self,
+        object_name: &str,
+        requested_generation: Option<i64>,
+    ) -> Result<GcsGetResponse> {
+        let metadata = self
+            .object_metadata(object_name, requested_generation)
+            .await?;
+        let generation = metadata.generation;
+        let token = self.access_token().await?;
+        let encoded = urlencoding::encode(object_name);
+
+        let data_url = format!(
+            "{}/download/storage/v1/b/{}/o/{}?alt=media&generation={}",
+            self.api_base, self.bucket, encoded, generation
+        );
+        let response = self.http.get(&data_url).bearer_auth(&token).send().await?;
+        exact_generation_download_status(response.status())?;
+        let bytes = response.error_for_status()?.bytes().await?;
+        Ok(GcsGetResponse {
+            ciphertext: bytes.to_vec(),
+            wrapped_dek_b64: metadata.wrapped_dek_b64,
+            generation,
+        })
+    }
+}
+
+fn exact_generation_download_status(status: reqwest::StatusCode) -> Result<()> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        Err(EnclaveError::NotFound)
+    } else {
+        Ok(())
     }
 }
 
@@ -1700,52 +5729,101 @@ fn gcs_http_client() -> reqwest::Client {
         .expect("static GCS HTTP client configuration is valid")
 }
 
+fn provider_date_millis(headers: &reqwest::header::HeaderMap) -> Result<i64> {
+    let mut values = headers.get_all(reqwest::header::DATE).iter();
+    let raw = values
+        .next()
+        .ok_or_else(|| EnclaveError::Gcs("GCS response omitted provider Date".into()))?;
+    if values.next().is_some() {
+        return Err(EnclaveError::Gcs(
+            "GCS response contained multiple provider Date values".into(),
+        ));
+    }
+    let raw = raw
+        .to_str()
+        .map_err(|_| EnclaveError::Gcs("GCS provider Date was not ASCII".into()))?;
+    let provider_time = httpdate::parse_http_date(raw)
+        .map_err(|_| EnclaveError::Gcs("GCS provider Date was malformed".into()))?;
+    let millis = provider_time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| EnclaveError::Gcs("GCS provider Date preceded the Unix epoch".into()))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| EnclaveError::Gcs("GCS provider Date exceeded the supported range".into()))
+}
+
 #[async_trait::async_trait]
 impl GcsClient for GcpGcsClient {
-    async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse> {
+    async fn trusted_time_millis(
+        &self,
+        authority_object_name: &str,
+        authority_generation: i64,
+    ) -> Result<i64> {
+        if !self.api_base.starts_with("https://") && !cfg!(test) {
+            return Err(EnclaveError::Gcs(
+                "GCS trusted-time endpoint was not authenticated TLS".into(),
+            ));
+        }
         let token = self.access_token().await?;
-        let encoded = urlencoding::encode(object_name);
-
-        // Fetch metadata to get generation and wrapped DEK
-        let meta_url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
-            self.bucket, encoded
+        let encoded = urlencoding::encode(authority_object_name);
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}?fields=name,generation",
+            self.api_base, self.bucket, encoded
         );
-        let meta_resp = self.http.get(&meta_url).bearer_auth(&token).send().await?;
-
-        if meta_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let response = self.http.get(url).bearer_auth(token).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(EnclaveError::NotFound);
         }
-        let meta: GcsObjectMetadata = meta_resp.error_for_status()?.json().await?;
-        let generation: i64 = meta
-            .generation
-            .parse()
-            .map_err(|_| EnclaveError::Gcs("invalid generation".into()))?;
-        let wrapped_dek_b64 = meta
-            .metadata
-            .and_then(|m| m.wrapped_dek)
-            .ok_or_else(|| EnclaveError::Gcs("missing wrapped DEK in object metadata".into()))?;
-
-        // Fetch body (media download)
-        let data_url = format!(
-            "https://storage.googleapis.com/download/storage/v1/b/{}/o/{}?alt=media&generation={}",
-            self.bucket, encoded, generation
-        );
-        let bytes = self
-            .http
-            .get(&data_url)
-            .bearer_auth(&token)
-            .send()
+        let response = response.error_for_status()?;
+        let observed = provider_date_millis(response.headers())?;
+        #[derive(Deserialize)]
+        struct AuthorityMetadata {
+            generation: String,
+        }
+        let observed_generation = response
+            .json::<AuthorityMetadata>()
             .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+            .generation
+            .parse::<i64>()
+            .map_err(|_| EnclaveError::Gcs("invalid trusted-time authority generation".into()))?;
+        if observed_generation != authority_generation {
+            return Err(EnclaveError::Conflict(
+                "trusted-time authority generation changed".into(),
+            ));
+        }
+        loop {
+            let floor = self.trusted_time_floor_millis.load(AtomicOrdering::Acquire);
+            if observed < floor {
+                return Err(EnclaveError::Gcs(
+                    "GCS provider Date regressed during legacy-write protocol".into(),
+                ));
+            }
+            if self
+                .trusted_time_floor_millis
+                .compare_exchange(
+                    floor,
+                    observed,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(observed);
+            }
+        }
+    }
 
-        Ok(GcsGetResponse {
-            ciphertext: bytes.to_vec(),
-            wrapped_dek_b64,
-            generation,
-        })
+    async fn get_object(&self, object_name: &str) -> Result<GcsGetResponse> {
+        self.get_object_at_generation(object_name, None).await
+    }
+
+    async fn get_object_generation(
+        &self,
+        object_name: &str,
+        generation: i64,
+    ) -> Result<GcsGetResponse> {
+        self.get_object_at_generation(object_name, Some(generation))
+            .await
     }
 
     async fn put_object(
@@ -1760,8 +5838,8 @@ impl GcsClient for GcpGcsClient {
 
         // Multipart upload with metadata
         let upload_url = format!(
-            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=multipart&name={}&ifGenerationMatch={}",
-            self.bucket, encoded, if_generation_match
+            "{}/upload/storage/v1/b/{}/o?uploadType=multipart&name={}&ifGenerationMatch={}",
+            self.api_base, self.bucket, encoded, if_generation_match
         );
 
         // Build multipart body (metadata JSON + binary data)
@@ -1819,7 +5897,7 @@ impl GcsClient for GcpGcsClient {
         let resp = resp.error_for_status()?;
         // The upload response carries the object's new generation (as a JSON
         // string) — return it so the caller can match against it next save.
-        let meta: GcsObjectMetadata = resp.json().await?;
+        let meta: GcsApiObjectMetadata = resp.json().await?;
         let new_gen = meta
             .generation
             .parse::<i64>()
@@ -1827,12 +5905,102 @@ impl GcsClient for GcpGcsClient {
         Ok(new_gen)
     }
 
+    async fn copy_generation_if_absent(
+        &self,
+        source_name: &str,
+        source_generation: i64,
+        destination_name: &str,
+    ) -> Result<GcsGenerationCopy> {
+        let source = self
+            .object_metadata(source_name, Some(source_generation))
+            .await?;
+        if source.generation != source_generation {
+            return Err(EnclaveError::Gcs(
+                "GCS returned an unexpected source generation".into(),
+            ));
+        }
+        let token = self.access_token().await?;
+        let source_encoded = urlencoding::encode(source_name);
+        let destination_encoded = urlencoding::encode(destination_name);
+        // Supplying the complete custom metadata in the Rewrite request makes
+        // the protocol marker and wrapped DEK part of the same create-only
+        // destination operation as the copied bytes.
+        let destination_resource = serde_json::json!({
+            "metadata": {
+                "x-kioku-wrapped-dek": source.wrapped_dek_b64.clone(),
+                "x-kioku-legacy-recovery-format": "1",
+                "x-kioku-legacy-source-object": source_name,
+                "x-kioku-legacy-source-generation": source_generation.to_string(),
+                "x-kioku-legacy-source-size": source.size.to_string(),
+                "x-kioku-legacy-source-crc32c": source.crc32c.clone(),
+            }
+        });
+        let mut url = format!(
+            "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0",
+            self.api_base, self.bucket,
+            source_encoded,
+            self.bucket,
+            destination_encoded,
+            source_generation,
+            source_generation
+        );
+        loop {
+            let response = self
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&destination_resource)
+                .send()
+                .await?;
+            if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+                // A lost success or another writer can only converge by checking
+                // the named destination; never retry against a latest source.
+                let destination = self.object_metadata(destination_name, None).await?;
+                return Ok(GcsGenerationCopy {
+                    source,
+                    destination,
+                    created: false,
+                });
+            }
+            #[derive(Deserialize)]
+            struct RewriteResponse {
+                done: Option<bool>,
+                #[serde(rename = "rewriteToken")]
+                rewrite_token: Option<String>,
+                resource: Option<GcsApiObjectMetadata>,
+            }
+            let rewritten: RewriteResponse = response.error_for_status()?.json().await?;
+            if rewritten.done == Some(true) {
+                let destination = rewritten
+                    .resource
+                    .ok_or_else(|| {
+                        EnclaveError::Gcs("GCS rewrite completed without metadata".into())
+                    })?
+                    .into_public()?;
+                return Ok(GcsGenerationCopy {
+                    source,
+                    destination,
+                    created: true,
+                });
+            }
+            let token = rewritten
+                .rewrite_token
+                .ok_or_else(|| EnclaveError::Gcs("GCS rewrite incomplete without token".into()))?;
+            url = format!(
+                "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}?sourceGeneration={}&ifSourceGenerationMatch={}&ifGenerationMatch=0&rewriteToken={}",
+                self.api_base, self.bucket, source_encoded, self.bucket, destination_encoded,
+                source_generation, source_generation,
+                urlencoding::encode(&token)
+            );
+        }
+    }
+
     async fn delete_object(&self, object_name: &str) -> Result<()> {
         let token = self.access_token().await?;
         let encoded = urlencoding::encode(object_name);
         let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
-            self.bucket, encoded
+            "{}/storage/v1/b/{}/o/{}",
+            self.api_base, self.bucket, encoded
         );
         let resp = self.http.delete(&url).bearer_auth(&token).send().await?;
         // 404 means already gone — treat as success for idempotency.
@@ -1840,6 +6008,90 @@ impl GcsClient for GcpGcsClient {
             return Ok(());
         }
         resp.error_for_status()?;
+        Ok(())
+    }
+
+    async fn list_object_versions(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        let token = self.access_token().await?;
+        let mut url = format!(
+            "{}/storage/v1/b/{}/o?versions=true&maxResults={}&prefix={}",
+            self.api_base,
+            self.bucket,
+            GCS_LIST_PAGE_SIZE,
+            urlencoding::encode(prefix)
+        );
+        if let Some(page_token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencoding::encode(page_token));
+        }
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
+        let response = response.error_for_status()?;
+        decode_gcs_versions_page(&response.bytes().await?, "listed")
+    }
+
+    async fn list_live_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        let token = self.access_token().await?;
+        let mut url = format!(
+            "{}/storage/v1/b/{}/o?maxResults={}&prefix={}",
+            self.api_base,
+            self.bucket,
+            GCS_LIST_PAGE_SIZE,
+            urlencoding::encode(prefix)
+        );
+        if let Some(page_token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencoding::encode(page_token));
+        }
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
+        let response = response.error_for_status()?;
+        decode_gcs_versions_page(&response.bytes().await?, "live")
+    }
+
+    async fn list_soft_deleted_objects(
+        &self,
+        prefix: &str,
+        page_token: Option<&str>,
+    ) -> Result<GcsListVersionsResponse> {
+        let token = self.access_token().await?;
+        let mut url = format!(
+            "{}/storage/v1/b/{}/o?softDeleted=true&maxResults={}&prefix={}",
+            self.api_base,
+            self.bucket,
+            GCS_LIST_PAGE_SIZE,
+            urlencoding::encode(prefix)
+        );
+        if let Some(page_token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencoding::encode(page_token));
+        }
+        let response = self.http.get(&url).bearer_auth(&token).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        decode_soft_deleted_list_response(status, &body, page_token.is_none())
+    }
+
+    async fn delete_object_generation(&self, object_name: &str, generation: i64) -> Result<()> {
+        let token = self.access_token().await?;
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}?generation={}",
+            self.api_base,
+            self.bucket,
+            urlencoding::encode(object_name),
+            generation
+        );
+        let response = self.http.delete(&url).bearer_auth(&token).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        response.error_for_status()?;
         Ok(())
     }
 }
@@ -1850,21 +6102,173 @@ fn gcs_object_name(user_id: &str) -> String {
     format!("indexes/{user_id}.db.enc")
 }
 
-fn media_keys(conn: &Connection) -> Result<Vec<String>> {
-    let table_exists: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
-        [],
-        |row| row.get(0),
-    )?;
-    if table_exists == 0 {
-        return Ok(Vec::new());
+fn identity_rebind_fence_object_name_with_key(key: &[u8], user_id: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .expect("HMAC-SHA256 accepts every fixed-size control key");
+    mac.update(b"kioku.legacy-rebind-fence.v3\0");
+    mac.update(user_id.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("control/identity-rebind-fences/fence_{}", digest_hex)
+}
+
+#[cfg(test)]
+const TEST_LEGACY_FENCE_KEY: [u8; 32] = [0x5a; 32];
+
+#[cfg(test)]
+fn initial_legacy_fence_key() -> Option<Zeroizing<[u8; 32]>> {
+    Some(Zeroizing::new(TEST_LEGACY_FENCE_KEY))
+}
+
+#[cfg(not(test))]
+fn initial_legacy_fence_key() -> Option<Zeroizing<[u8; 32]>> {
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn test_identity_rebind_fence_object_name(user_id: &str) -> String {
+    identity_rebind_fence_object_name_with_key(&TEST_LEGACY_FENCE_KEY, user_id)
+}
+
+pub(crate) fn is_canonical_identity_rebind_fence_object_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix("control/identity-rebind-fences/fence_") else {
+        return false;
+    };
+    suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn media_prefix(user_id: &str) -> String {
+    format!("raw/{user_id}/")
+}
+
+fn legacy_media_prefix(user_id: &str) -> String {
+    format!("media/{user_id}/")
+}
+
+fn legacy_recovery_prefix(user_id: &str) -> String {
+    format!("legacy-recovery/{user_id}/")
+}
+
+/// Stable named checkpoint for the UTC day containing `now`. This name is an
+/// inventory boundary: export/delete can list `legacy-recovery/{user_id}/`
+/// without interpreting ciphertext or user content.
+pub fn legacy_recovery_checkpoint_name(user_id: &str, now: SystemTime) -> String {
+    let (year, month, day) = civil_from_unix_days(utc_epoch_day(now));
+    format!("legacy-recovery/{user_id}/{year:04}-{month:02}-{day:02}.db.enc")
+}
+
+/// Accept only an exact legacy archive object name. Listing is not trusted to
+/// supply a source generation: callers must subsequently use `get_object` to
+/// resolve GCS's live generation explicitly.
+fn legacy_index_user_id(object_name: &str) -> Option<String> {
+    let user_id = object_name
+        .strip_prefix("indexes/")?
+        .strip_suffix(".db.enc")?;
+    if user_id.is_empty() || user_id.contains('/') || validate_user_id(user_id).is_err() {
+        return None;
     }
-    let mut stmt = conn.prepare("SELECT object_key FROM screenshot_images")?;
-    let keys = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into);
-    keys
+    Some(user_id.to_owned())
+}
+
+fn utc_epoch_day(now: SystemTime) -> i64 {
+    now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 / 86_400
+}
+
+// Gregorian civil date from Unix epoch day, adapted from the public-domain
+// Hinnant calendar algorithm. It avoids a runtime timezone dependency; UTC is
+// the sole permitted checkpoint boundary.
+fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    (
+        year + if month <= 2 { 1 } else { 0 },
+        month as u32,
+        day as u32,
+    )
+}
+
+fn verify_legacy_recovery_copy(
+    expected_source_object: &str,
+    requested_source_generation: i64,
+    source: &GcsObjectMetadata,
+    destination: &GcsObjectMetadata,
+    created: bool,
+) -> Result<()> {
+    let binding = destination.legacy_recovery.as_ref().ok_or_else(|| {
+        EnclaveError::Gcs("missing legacy recovery checkpoint protocol metadata".into())
+    })?;
+    let common_valid = source.generation == requested_source_generation
+        && requested_source_generation > 0
+        && destination.generation > 0
+        && !destination.wrapped_dek_b64.is_empty()
+        && !destination.crc32c.is_empty()
+        && source.wrapped_dek_b64 == destination.wrapped_dek_b64
+        && binding.format_version == 1
+        && binding.source_object == expected_source_object
+        && binding.source_generation > 0
+        && binding.source_generation <= requested_source_generation
+        && binding.source_size == destination.size
+        && !binding.source_crc32c.is_empty()
+        && binding.source_crc32c == destination.crc32c;
+    let created_valid = !created
+        || (binding.source_generation == requested_source_generation
+            && source.size == destination.size
+            && source.crc32c == destination.crc32c
+            && source.md5_hash == destination.md5_hash);
+    if !common_valid || !created_valid {
+        return Err(EnclaveError::Gcs(
+            "legacy recovery checkpoint metadata verification failed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn media_keys(conn: &Connection) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    for (table, state_filter) in [
+        ("screenshot_images", ""),
+        (
+            "media_objects",
+            " WHERE deleted_at IS NULL AND processing_state != 'pruned'",
+        ),
+    ] {
+        let table_exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if table_exists == 0 {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!("SELECT object_key FROM {table}{state_filter}"))?;
+        keys.extend(
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+#[cfg(test)]
+fn historical_media_keys(conn: &Connection, user_id: &str) -> Result<Vec<String>> {
+    let raw_prefix = format!("raw/{user_id}/");
+    let media_prefix = format!("media/{user_id}/");
+    Ok(media_keys(conn)?
+        .into_iter()
+        .filter(|key| !key.starts_with(&raw_prefix) && !key.starts_with(&media_prefix))
+        .collect())
 }
 
 pub(crate) fn user_blob_context(user_id: &str) -> Vec<u8> {
@@ -1898,10 +6302,14 @@ async fn write_private_temp_db(user_id: &str, plaintext: &[u8]) -> Result<PathBu
 fn remove_temp_db_files(path: &Path) {
     let _ = std::fs::remove_file(path);
     for suffix in ["-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
     }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1909,8 +6317,11 @@ fn remove_temp_db_files(path: &Path) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Mutex as StdMutex,
+    };
+    use tokio::sync::Semaphore;
 
     // ── v1 → v2 episodes migration ────────────────────────────────────────────
 
@@ -2026,7 +6437,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn finalization_v5_migration_queues_stale_briefs_and_keeps_current_complete() {
+    fn finalization_migration_never_auto_queues_historical_briefs() {
         init_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
@@ -2059,8 +6470,18 @@ pub(crate) mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(stale, ("regeneration_queued".into(), None));
+        assert_eq!(stale, ("complete".into(), None));
         assert_eq!(current, ("complete".into(), None));
+
+        let retry_columns: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT finalization_attempt_count, finalization_next_attempt_at \
+                 FROM episodes WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retry_columns, (0, None));
     }
 
     #[test]
@@ -2279,31 +6700,300 @@ pub(crate) mod tests {
 
     // ── Fake GCS ──────────────────────────────────────────────────────────────
 
-    /// (ciphertext, wrapped_dek, generation)
-    type FakeObject = (Vec<u8>, String, i64);
+    #[derive(Clone)]
+    struct FakeObject {
+        ciphertext: Vec<u8>,
+        wrapped_dek_b64: String,
+        generation: i64,
+        live: bool,
+        soft_deleted: bool,
+        hard_delete_time: Option<String>,
+        crc32c: String,
+        md5_hash: Option<String>,
+        legacy_recovery: Option<LegacyRecoveryBinding>,
+    }
 
     pub struct FakeGcs {
-        objects: StdMutex<HashMap<String, FakeObject>>,
+        objects: StdMutex<HashMap<String, Vec<FakeObject>>>,
+        fail_copy: StdMutex<VecDeque<EnclaveError>>,
+        fail_copy_after_create: StdMutex<Option<EnclaveError>>,
+        fail_get: StdMutex<Option<EnclaveError>>,
+        fail_put: StdMutex<Option<EnclaveError>>,
+        fail_put_after_commit: StdMutex<Option<EnclaveError>>,
+        corrupt_wrapped_dek_after_commit_failure: StdMutex<Option<String>>,
+        fail_generation_delete: StdMutex<Option<(String, i64)>>,
+        vanish_generation_on_get: StdMutex<Option<(String, i64)>>,
+        soft_delete_enabled: StdMutex<bool>,
+        soft_delete_hard_delete_time: StdMutex<Option<String>>,
+        repeat_version_cursor: StdMutex<bool>,
+        listed_size_overrides: StdMutex<HashMap<String, u64>>,
+        exact_generation_gets: StdMutex<usize>,
+        live_gets: StdMutex<Vec<String>>,
+        copy_calls: StdMutex<Vec<(String, i64, String)>>,
+        put_calls: StdMutex<Vec<(String, i64)>>,
+        provider_clock_millis: AtomicU64,
+        list_calls: AtomicUsize,
+        delete_generation_calls: AtomicUsize,
     }
 
     impl FakeGcs {
         pub fn new() -> Self {
             Self {
                 objects: StdMutex::new(HashMap::new()),
+                fail_copy: StdMutex::new(VecDeque::new()),
+                fail_copy_after_create: StdMutex::new(None),
+                fail_get: StdMutex::new(None),
+                fail_put: StdMutex::new(None),
+                fail_put_after_commit: StdMutex::new(None),
+                corrupt_wrapped_dek_after_commit_failure: StdMutex::new(None),
+                fail_generation_delete: StdMutex::new(None),
+                vanish_generation_on_get: StdMutex::new(None),
+                soft_delete_enabled: StdMutex::new(false),
+                soft_delete_hard_delete_time: StdMutex::new(Some(
+                    "2099-01-01T00:00:00.000Z".into(),
+                )),
+                repeat_version_cursor: StdMutex::new(false),
+                listed_size_overrides: StdMutex::new(HashMap::new()),
+                exact_generation_gets: StdMutex::new(0),
+                live_gets: StdMutex::new(Vec::new()),
+                copy_calls: StdMutex::new(Vec::new()),
+                put_calls: StdMutex::new(Vec::new()),
+                provider_clock_millis: AtomicU64::new(1_800_000_000_000),
+                list_calls: AtomicUsize::new(0),
+                delete_generation_calls: AtomicUsize::new(0),
             }
+        }
+
+        pub fn exact_generation_count(&self, object_name: &str) -> usize {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(object_name)
+                .map_or(0, Vec::len)
+        }
+
+        pub fn reset_operation_counts(&self) {
+            self.list_calls.store(0, Ordering::SeqCst);
+            self.delete_generation_calls.store(0, Ordering::SeqCst);
+        }
+
+        pub fn operation_counts(&self) -> (usize, usize) {
+            (
+                self.list_calls.load(Ordering::SeqCst),
+                self.delete_generation_calls.load(Ordering::SeqCst),
+            )
+        }
+
+        fn metadata(object: &FakeObject) -> GcsObjectMetadata {
+            GcsObjectMetadata {
+                generation: object.generation,
+                size: object.ciphertext.len() as u64,
+                crc32c: object.crc32c.clone(),
+                md5_hash: object.md5_hash.clone(),
+                wrapped_dek_b64: object.wrapped_dek_b64.clone(),
+                legacy_recovery: object.legacy_recovery.clone(),
+            }
+        }
+
+        pub(crate) fn set_soft_delete_enabled(&self, enabled: bool) {
+            *self.soft_delete_enabled.lock().unwrap() = enabled;
+        }
+
+        fn set_soft_delete_hard_delete_time(&self, hard_delete_time: Option<&str>) {
+            *self.soft_delete_hard_delete_time.lock().unwrap() =
+                hard_delete_time.map(str::to_string);
+        }
+
+        fn set_repeat_version_cursor(&self, enabled: bool) {
+            *self.repeat_version_cursor.lock().unwrap() = enabled;
+        }
+
+        fn set_listed_size(&self, object_name: &str, size: u64) {
+            self.listed_size_overrides
+                .lock()
+                .unwrap()
+                .insert(object_name.into(), size);
+        }
+
+        fn exact_generation_get_count(&self) -> usize {
+            *self.exact_generation_gets.lock().unwrap()
+        }
+
+        fn live_get_count(&self) -> usize {
+            self.live_gets.lock().unwrap().len()
+        }
+
+        pub(crate) fn version_count(&self, prefix: &str) -> usize {
+            self.objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .map(|(_, versions)| {
+                    versions
+                        .iter()
+                        .filter(|version| !version.soft_deleted)
+                        .count()
+                })
+                .sum()
+        }
+
+        fn soft_deleted_count(&self, prefix: &str) -> usize {
+            self.objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .map(|(_, versions)| {
+                    versions
+                        .iter()
+                        .filter(|version| version.soft_deleted)
+                        .count()
+                })
+                .sum()
+        }
+
+        pub(crate) fn expire_soft_deleted(&self, prefix: &str) {
+            let mut objects = self.objects.lock().unwrap();
+            objects.retain(|name, versions| {
+                if name.starts_with(prefix) {
+                    versions.retain(|version| !version.soft_deleted);
+                }
+                !versions.is_empty()
+            });
+        }
+
+        pub(crate) fn purge_versions(&self, prefix: &str) {
+            self.objects
+                .lock()
+                .unwrap()
+                .retain(|name, _| !name.starts_with(prefix));
+        }
+
+        fn soft_delete_generation(&self, object_name: &str, generation: i64) {
+            let hard_delete_time = self.soft_delete_hard_delete_time.lock().unwrap().clone();
+            if let Some(versions) = self.objects.lock().unwrap().get_mut(object_name) {
+                if let Some(version) = versions
+                    .iter_mut()
+                    .find(|version| version.generation == generation)
+                {
+                    version.live = false;
+                    version.soft_deleted = true;
+                    version.hard_delete_time = hard_delete_time;
+                }
+            }
+        }
+
+        pub(crate) fn vanish_next_exact_generation_get(&self, object_name: &str, generation: i64) {
+            *self.vanish_generation_on_get.lock().unwrap() = Some((object_name.into(), generation));
+        }
+
+        pub(crate) fn fail_next_put_after_commit(&self, error: EnclaveError) {
+            *self.fail_put_after_commit.lock().unwrap() = Some(error);
+        }
+
+        fn fail_next_get(&self, error: EnclaveError) {
+            *self.fail_get.lock().unwrap() = Some(error);
+        }
+
+        pub(crate) fn fail_next_generation_delete(&self, object_name: &str, generation: i64) {
+            *self.fail_generation_delete.lock().unwrap() = Some((object_name.into(), generation));
+        }
+
+        fn generation(&self, object_name: &str) -> Option<i64> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(object_name)
+                .and_then(|versions| versions.iter().rev().find(|v| v.live))
+                .map(|v| v.generation)
+        }
+
+        fn put_attempts(&self) -> usize {
+            self.put_calls.lock().unwrap().len()
+        }
+
+        pub(crate) fn set_provider_clock_millis(&self, millis: i64) {
+            self.provider_clock_millis.store(
+                u64::try_from(millis).expect("test provider time must be nonnegative"),
+                Ordering::SeqCst,
+            );
         }
     }
 
     #[async_trait::async_trait]
     impl GcsClient for FakeGcs {
+        async fn trusted_time_millis(
+            &self,
+            authority_object_name: &str,
+            authority_generation: i64,
+        ) -> crate::error::Result<i64> {
+            match self.generation(authority_object_name) {
+                Some(generation) if generation == authority_generation => {}
+                Some(_) => {
+                    return Err(crate::error::EnclaveError::Conflict(
+                        "trusted-time authority generation changed".into(),
+                    ))
+                }
+                None => return Err(crate::error::EnclaveError::NotFound),
+            }
+            Ok(self
+                .provider_clock_millis
+                .fetch_add(1_000, Ordering::SeqCst) as i64)
+        }
+
         async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.live_gets.lock().unwrap().push(object_name.into());
+            if let Some(error) = self.fail_get.lock().unwrap().take() {
+                return Err(error);
+            }
             let store = self.objects.lock().unwrap();
             store
                 .get(object_name)
-                .map(|(ct, dek, gen)| GcsGetResponse {
-                    ciphertext: ct.clone(),
-                    wrapped_dek_b64: dek.clone(),
-                    generation: *gen,
+                .and_then(|versions| versions.iter().rev().find(|version| version.live))
+                .map(|version| GcsGetResponse {
+                    ciphertext: version.ciphertext.clone(),
+                    wrapped_dek_b64: version.wrapped_dek_b64.clone(),
+                    generation: version.generation,
+                })
+                .ok_or(crate::error::EnclaveError::NotFound)
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            *self.exact_generation_gets.lock().unwrap() += 1;
+            let mut vanish = self.vanish_generation_on_get.lock().unwrap();
+            let should_vanish = vanish
+                .as_ref()
+                .is_some_and(|target| target.0 == object_name && target.1 == generation);
+            if should_vanish {
+                *vanish = None;
+            }
+            drop(vanish);
+            let mut store = self.objects.lock().unwrap();
+            if should_vanish {
+                if let Some(versions) = store.get_mut(object_name) {
+                    versions.retain(|version| version.generation != generation);
+                    if versions.is_empty() {
+                        store.remove(object_name);
+                    }
+                }
+                return Err(crate::error::EnclaveError::NotFound);
+            }
+            store
+                .get(object_name)
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .find(|version| version.generation == generation && !version.soft_deleted)
+                })
+                .map(|version| GcsGetResponse {
+                    ciphertext: version.ciphertext.clone(),
+                    wrapped_dek_b64: version.wrapped_dek_b64.clone(),
+                    generation: version.generation,
                 })
                 .ok_or(crate::error::EnclaveError::NotFound)
         }
@@ -2315,24 +7005,1385 @@ pub(crate) mod tests {
             wrapped_dek_b64: &str,
             if_generation_match: i64,
         ) -> crate::error::Result<i64> {
+            let is_write_intent = object_name.starts_with(LEGACY_WRITE_INTENT_PREFIX);
+            if !is_write_intent {
+                self.put_calls
+                    .lock()
+                    .unwrap()
+                    .push((object_name.to_string(), if_generation_match));
+            }
+            if !is_write_intent {
+                if let Some(error) = self.fail_put.lock().unwrap().take() {
+                    return Err(error);
+                }
+            }
             let mut store = self.objects.lock().unwrap();
-            let current_gen = store.get(object_name).map(|(_, _, g)| *g).unwrap_or(0);
+            let current_gen = store
+                .get(object_name)
+                .and_then(|versions| versions.iter().rev().find(|version| version.live))
+                .map(|version| version.generation)
+                .unwrap_or(0);
             if current_gen != if_generation_match {
                 return Err(crate::error::EnclaveError::Conflict(
                     "generation mismatch".into(),
                 ));
             }
             let new_gen = current_gen + 1;
-            store.insert(
-                object_name.to_string(),
-                (ciphertext.to_vec(), wrapped_dek_b64.to_string(), new_gen),
-            );
+            let new_obj = FakeObject {
+                ciphertext: ciphertext.to_vec(),
+                wrapped_dek_b64: wrapped_dek_b64.to_string(),
+                generation: new_gen,
+                live: true,
+                soft_deleted: false,
+                hard_delete_time: None,
+                crc32c: format!("fake-crc32c-{}", ciphertext.len()),
+                md5_hash: Some(format!("fake-md5-{}", ciphertext.len())),
+                legacy_recovery: None,
+            };
+            if let Some(versions) = store.get_mut(object_name) {
+                for version in versions.iter_mut() {
+                    version.live = false;
+                }
+                versions.push(new_obj);
+            } else {
+                store.insert(object_name.to_string(), vec![new_obj]);
+            }
+            if !is_write_intent {
+                if let Some(error) = self.fail_put_after_commit.lock().unwrap().take() {
+                    if let Some(replacement) = self
+                        .corrupt_wrapped_dek_after_commit_failure
+                        .lock()
+                        .unwrap()
+                        .take()
+                    {
+                        if let Some(current) = store
+                            .get_mut(object_name)
+                            .and_then(|versions| versions.iter_mut().rev().find(|item| item.live))
+                        {
+                            current.wrapped_dek_b64 = replacement;
+                        }
+                    }
+                    return Err(error);
+                }
+            }
             Ok(new_gen)
         }
 
+        async fn copy_generation_if_absent(
+            &self,
+            source_name: &str,
+            source_generation: i64,
+            destination_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.copy_calls.lock().unwrap().push((
+                source_name.to_string(),
+                source_generation,
+                destination_name.to_string(),
+            ));
+            if let Some(error) = self.fail_copy.lock().unwrap().pop_front() {
+                return Err(error);
+            }
+            let mut store = self.objects.lock().unwrap();
+            let source = store
+                .get(source_name)
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .find(|v| v.generation == source_generation && !v.soft_deleted)
+                })
+                .cloned()
+                .ok_or(EnclaveError::NotFound)?;
+            if let Some(destination) = store
+                .get(destination_name)
+                .and_then(|versions| versions.iter().rev().find(|v| v.live))
+            {
+                return Ok(GcsGenerationCopy {
+                    source: Self::metadata(&source),
+                    destination: Self::metadata(destination),
+                    created: false,
+                });
+            }
+            let mut destination = source.clone();
+            destination.generation = 1;
+            destination.live = true;
+            destination.soft_deleted = false;
+            destination.hard_delete_time = None;
+            destination.legacy_recovery = Some(LegacyRecoveryBinding {
+                format_version: 1,
+                source_object: source_name.to_string(),
+                source_generation,
+                source_size: source.ciphertext.len() as u64,
+                source_crc32c: source.crc32c.clone(),
+            });
+            if let Some(versions) = store.get_mut(destination_name) {
+                for version in versions.iter_mut() {
+                    version.live = false;
+                }
+                versions.push(destination.clone());
+            } else {
+                store.insert(destination_name.to_string(), vec![destination.clone()]);
+            }
+            if let Some(error) = self.fail_copy_after_create.lock().unwrap().take() {
+                return Err(error);
+            }
+            Ok(GcsGenerationCopy {
+                source: Self::metadata(&source),
+                destination: Self::metadata(&destination),
+                created: true,
+            })
+        }
+
         async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
-            self.objects.lock().unwrap().remove(object_name);
+            if let Some(versions) = self.objects.lock().unwrap().get_mut(object_name) {
+                for version in versions.iter_mut() {
+                    version.live = false;
+                }
+            }
             Ok(())
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            const PAGE_SIZE: usize = 2;
+            let start = page_token
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| EnclaveError::Gcs("invalid fake GCS page cursor".into()))?
+                .unwrap_or(0);
+            let store = self.objects.lock().unwrap();
+            let size_overrides = self.listed_size_overrides.lock().unwrap().clone();
+            let mut versions = store
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .flat_map(|(name, objects)| {
+                    let size_override = size_overrides.get(name).copied();
+                    objects
+                        .iter()
+                        .filter(|object| !object.soft_deleted)
+                        .map(move |object| GcsObjectVersion {
+                            name: name.clone(),
+                            generation: object.generation,
+                            size: size_override.unwrap_or(object.ciphertext.len() as u64),
+                            hard_delete_time: None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            versions.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.generation.cmp(&right.generation))
+            });
+            let end = (start + PAGE_SIZE).min(versions.len());
+            let next_page_token =
+                if *self.repeat_version_cursor.lock().unwrap() && page_token.is_some() {
+                    page_token.map(str::to_string)
+                } else {
+                    (end < versions.len()).then(|| end.to_string())
+                };
+            Ok(GcsListVersionsResponse {
+                versions: versions[start..end].to_vec(),
+                next_page_token,
+            })
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            const PAGE_SIZE: usize = 2;
+            let start = page_token
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| EnclaveError::Gcs("invalid fake GCS page cursor".into()))?
+                .unwrap_or(0);
+            let store = self.objects.lock().unwrap();
+            let mut versions = store
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .filter_map(|(name, objects)| {
+                    objects
+                        .iter()
+                        .rev()
+                        .find(|object| object.live)
+                        .map(|object| GcsObjectVersion {
+                            name: name.clone(),
+                            generation: object.generation,
+                            size: object.ciphertext.len() as u64,
+                            hard_delete_time: None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            versions.sort_by(|left, right| left.name.cmp(&right.name));
+            let end = (start + PAGE_SIZE).min(versions.len());
+            let next_page_token =
+                if *self.repeat_version_cursor.lock().unwrap() && page_token.is_some() {
+                    page_token.map(str::to_owned)
+                } else {
+                    (end < versions.len()).then(|| end.to_string())
+                };
+            Ok(GcsListVersionsResponse {
+                versions: versions[start..end].to_vec(),
+                next_page_token,
+            })
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.delete_generation_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_generation_delete
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|failure| failure.0 == object_name && failure.1 == generation)
+            {
+                *self.fail_generation_delete.lock().unwrap() = None;
+                return Err(EnclaveError::Gcs(
+                    "injected generation-delete failure".into(),
+                ));
+            }
+            let soft_delete_enabled = *self.soft_delete_enabled.lock().unwrap();
+            let hard_delete_time = self.soft_delete_hard_delete_time.lock().unwrap().clone();
+            let mut store = self.objects.lock().unwrap();
+            if let Some(versions) = store.get_mut(object_name) {
+                if soft_delete_enabled {
+                    if let Some(version) = versions
+                        .iter_mut()
+                        .find(|version| version.generation == generation)
+                    {
+                        version.live = false;
+                        version.soft_deleted = true;
+                        version.hard_delete_time = hard_delete_time;
+                    }
+                } else {
+                    versions.retain(|version| version.generation != generation);
+                }
+                if versions.is_empty() {
+                    store.remove(object_name);
+                }
+            }
+            Ok(())
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            const PAGE_SIZE: usize = 2;
+            if !*self.soft_delete_enabled.lock().unwrap() {
+                return Ok(GcsListVersionsResponse::default());
+            }
+            let start = page_token
+                .map(str::parse::<usize>)
+                .transpose()
+                .map_err(|_| EnclaveError::Gcs("invalid fake GCS page cursor".into()))?
+                .unwrap_or(0);
+            let store = self.objects.lock().unwrap();
+            let size_overrides = self.listed_size_overrides.lock().unwrap().clone();
+            let mut versions = store
+                .iter()
+                .filter(|(name, _)| name.starts_with(prefix))
+                .flat_map(|(name, objects)| {
+                    let size_override = size_overrides.get(name).copied();
+                    objects
+                        .iter()
+                        .filter(|object| object.soft_deleted)
+                        .map(move |object| GcsObjectVersion {
+                            name: name.clone(),
+                            generation: object.generation,
+                            size: size_override.unwrap_or(object.ciphertext.len() as u64),
+                            hard_delete_time: object.hard_delete_time.clone(),
+                        })
+                })
+                .collect::<Vec<_>>();
+            versions.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.generation.cmp(&right.generation))
+            });
+            let end = (start + PAGE_SIZE).min(versions.len());
+            let next_page_token =
+                if *self.repeat_version_cursor.lock().unwrap() && page_token.is_some() {
+                    page_token.map(str::to_string)
+                } else {
+                    (end < versions.len()).then(|| end.to_string())
+                };
+            Ok(GcsListVersionsResponse {
+                versions: versions[start..end].to_vec(),
+                next_page_token,
+            })
+        }
+    }
+
+    struct BlockingPutGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        operation: BlockingGcsOperation,
+        block_once: AtomicBool,
+        started: Notify,
+        release: Semaphore,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BlockingGcsOperation {
+        Put,
+        Copy,
+    }
+
+    impl BlockingPutGcs {
+        fn new(inner: Arc<FakeGcs>, target: String) -> Self {
+            Self {
+                inner,
+                target,
+                operation: BlockingGcsOperation::Put,
+                block_once: AtomicBool::new(true),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+            }
+        }
+
+        fn copy_to(inner: Arc<FakeGcs>, target: String) -> Self {
+            Self {
+                inner,
+                target,
+                operation: BlockingGcsOperation::Copy,
+                block_once: AtomicBool::new(true),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+            }
+        }
+
+        async fn wait_until_blocked(&self) {
+            self.started.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for BlockingPutGcs {
+        async fn trusted_time_millis(
+            &self,
+            authority_object_name: &str,
+            authority_generation: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .trusted_time_millis(authority_object_name, authority_generation)
+                .await
+        }
+
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            if self.operation == BlockingGcsOperation::Put
+                && object_name == self.target
+                && self.block_once.swap(false, Ordering::SeqCst)
+            {
+                self.started.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| EnclaveError::Store("test GCS gate closed".into()))?
+                    .forget();
+            }
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            if self.operation == BlockingGcsOperation::Copy
+                && destination_object_name == self.target
+                && self.block_once.swap(false, Ordering::SeqCst)
+            {
+                self.started.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| EnclaveError::Store("test GCS gate closed".into()))?
+                    .forget();
+            }
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
+    fn test_rebind_authority(byte: u8) -> String {
+        format!("rebind_{byte:064x}")
+    }
+
+    fn sole_requesting_intent_expiry(gcs: &FakeGcs, user_id: &str) -> i64 {
+        let prefix = legacy_write_intent_prefix(user_id);
+        let expiries = gcs
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .filter_map(|(_, versions)| versions.iter().rev().find(|item| item.live))
+            .filter_map(|object| {
+                serde_json::from_slice::<LegacyWriteIntent>(&object.ciphertext).ok()
+            })
+            .filter(|intent| intent.state == LegacyWriteIntentState::Requesting)
+            .filter_map(|intent| intent.lease_expires_at_millis)
+            .collect::<Vec<_>>();
+        assert_eq!(expiries.len(), 1, "expected one active requesting intent");
+        expiries[0]
+    }
+
+    #[tokio::test]
+    async fn two_store_absent_index_generation_zero_intent_blocks_purge_until_outcome() {
+        let user_id = "intent-index-generation-zero";
+        let object_name = gcs_object_name(user_id);
+        let inner = Arc::new(FakeGcs::new());
+        let blocking = Arc::new(BlockingPutGcs::new(inner.clone(), object_name.clone()));
+        let provider: Arc<dyn GcsClient> = blocking.clone();
+        let writer = Arc::new(Store::new(Arc::new(FakeKms), provider.clone()));
+        let deleter = Store::new(Arc::new(FakeKms), provider);
+
+        writer
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata (key, value) VALUES ('intent', 'generation-zero')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let write = {
+            let writer = writer.clone();
+            tokio::spawn(async move { writer.save_user(user_id).await })
+        };
+        blocking.wait_until_blocked().await;
+
+        let authority = test_rebind_authority(1);
+        assert!(matches!(
+            deleter
+                .fence_and_drain_legacy_writes(user_id, &authority)
+                .await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyWriteIntentUnsettled,
+                ..
+            }))
+        ));
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+
+        blocking.release();
+        write.await.unwrap().unwrap();
+        deleter
+            .fence_and_drain_legacy_writes(user_id, &authority)
+            .await
+            .unwrap();
+        deleter.delete_user(user_id).await.unwrap();
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+    }
+
+    #[tokio::test]
+    async fn two_store_raw_intent_survives_first_deletion_inventory_and_cannot_resurrect() {
+        let user_id = "intent-raw-final-inventory";
+        let object_name = format!("raw/{user_id}/capture.enc");
+        let inner = Arc::new(FakeGcs::new());
+        let blocking = Arc::new(BlockingPutGcs::new(inner.clone(), object_name.clone()));
+        let provider: Arc<dyn GcsClient> = blocking.clone();
+        let writer = Arc::new(Store::new(Arc::new(FakeKms), provider.clone()));
+        let deleter = Store::new(Arc::new(FakeKms), provider);
+
+        let write = {
+            let writer = writer.clone();
+            let object_name = object_name.clone();
+            tokio::spawn(async move {
+                writer
+                    .put_user_media(user_id, &object_name, b"ciphertext", "wrapped")
+                    .await
+            })
+        };
+        blocking.wait_until_blocked().await;
+        let authority = test_rebind_authority(2);
+        assert!(matches!(
+            deleter
+                .fence_and_drain_legacy_writes(user_id, &authority)
+                .await,
+            Err(EnclaveError::DeletionPending(_))
+        ));
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+
+        blocking.release();
+        write.await.unwrap().unwrap();
+        deleter.delete_user(user_id).await.unwrap();
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+        deleter.drain_legacy_write_intents(user_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_store_checkpoint_intent_blocks_final_inventory_until_copy_reconciles() {
+        let user_id = "intent-checkpoint-final-inventory";
+        let day = UNIX_EPOCH + Duration::from_secs(1_767_268_800);
+        let destination = legacy_recovery_checkpoint_name(user_id, day);
+        let inner = Arc::new(FakeGcs::new());
+        let seed = Store::new(Arc::new(FakeKms), inner.clone());
+        write_and_save(&seed, user_id, "seed").await.unwrap();
+        let source_generation = inner.generation(&gcs_object_name(user_id)).unwrap();
+
+        let blocking = Arc::new(BlockingPutGcs::copy_to(inner.clone(), destination.clone()));
+        let provider: Arc<dyn GcsClient> = blocking.clone();
+        let writer = Arc::new(Store::new(Arc::new(FakeKms), provider.clone()));
+        let deleter = Store::new(Arc::new(FakeKms), provider);
+        let lease = writer.acquire_content_write(user_id).await.unwrap();
+        let copy = {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                writer
+                    .ensure_legacy_recovery_checkpoint(user_id, source_generation, day, lease, None)
+                    .await
+            })
+        };
+        blocking.wait_until_blocked().await;
+        let authority = test_rebind_authority(3);
+        assert!(matches!(
+            deleter
+                .fence_and_drain_legacy_writes(user_id, &authority)
+                .await,
+            Err(EnclaveError::DeletionPending(_))
+        ));
+        assert_eq!(inner.exact_generation_count(&destination), 0);
+
+        blocking.release();
+        copy.await.unwrap().unwrap();
+        deleter.delete_user(user_id).await.unwrap();
+        assert_eq!(inner.exact_generation_count(&destination), 0);
+    }
+
+    #[tokio::test]
+    async fn two_store_delayed_stable_create_remains_visible_until_terminal_tombstone() {
+        let user_id = "intent-stable-create";
+        let object_name = gcs_object_name(user_id);
+        let inner = Arc::new(FakeGcs::new());
+        let blocking = Arc::new(BlockingPutGcs::new(inner.clone(), object_name.clone()));
+        let provider: Arc<dyn GcsClient> = blocking.clone();
+        let kms: Arc<dyn KmsClient> = Arc::new(FakeKms);
+        let writer = Arc::new(Store::new(kms.clone(), provider.clone()));
+        let deleter = Store::new(kms.clone(), provider);
+        let (dek, wrapped) = generate_and_wrap_dek(kms.as_ref()).await.unwrap();
+        let plaintext = create_empty_db(&dek).unwrap();
+        let ciphertext = encrypt_bound_blob(&dek, &plaintext, &user_blob_context(user_id)).unwrap();
+
+        let create = {
+            let writer = writer.clone();
+            let object_name = object_name.clone();
+            tokio::spawn(async move {
+                writer
+                    .put_stable_rebind_index(user_id, &object_name, &ciphertext, &wrapped)
+                    .await
+            })
+        };
+        blocking.wait_until_blocked().await;
+        let authority = test_rebind_authority(4);
+        assert!(matches!(
+            deleter
+                .fence_and_drain_legacy_writes(user_id, &authority)
+                .await,
+            Err(EnclaveError::DeletionPending(_))
+        ));
+
+        blocking.release();
+        create.await.unwrap().unwrap();
+        deleter.delete_user(user_id).await.unwrap();
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+        let intents = inner
+            .list_live_objects(&legacy_write_intent_prefix(user_id), None)
+            .await
+            .unwrap();
+        assert!(intents.versions.iter().all(|listed| {
+            let object = inner.objects.lock().unwrap()[&listed.name]
+                .iter()
+                .rev()
+                .find(|object| object.live)
+                .unwrap()
+                .clone();
+            let intent: LegacyWriteIntent = serde_json::from_slice(&object.ciphertext).unwrap();
+            intent.state.is_terminal()
+                && intent.ciphertext_b64.is_none()
+                && intent.wrapped_dek_b64.is_none()
+        }));
+    }
+
+    #[tokio::test]
+    async fn expired_requesting_intent_is_taken_over_after_owner_crash() {
+        let user_id = "intent-requesting-takeover";
+        let object_name = format!("raw/{user_id}/takeover.enc");
+        let inner = Arc::new(FakeGcs::new());
+        let first = Store::new(Arc::new(FakeKms), inner.clone());
+        let restarted = Store::new(Arc::new(FakeKms), inner.clone());
+        let request = LegacyWriteRequest::Put {
+            backend: LegacyWriteBackend::Media,
+            kind: LegacyWriteKind::MediaPut,
+            object_name: object_name.clone(),
+            ciphertext: b"encrypted-takeover".to_vec(),
+            wrapped_dek_b64: "wrapped-takeover".into(),
+            if_generation_match: 0,
+        };
+        let prepared = first
+            .create_legacy_write_intent(user_id, &request)
+            .await
+            .unwrap();
+        let mut requesting = first.claim_legacy_write_intent(&prepared).await.unwrap();
+        requesting.intent.lease_expires_at_millis = Some(1);
+        requesting.generation = first
+            .persist_legacy_write_intent(
+                &requesting.object_name,
+                &requesting.intent,
+                requesting.generation,
+            )
+            .await
+            .unwrap();
+
+        let authority = test_rebind_authority(5);
+        restarted
+            .fence_and_drain_legacy_writes(user_id, &authority)
+            .await
+            .unwrap();
+        assert_eq!(inner.exact_generation_count(&object_name), 1);
+        let terminal = restarted
+            .load_legacy_write_intent(&requesting.object_name)
+            .await
+            .unwrap();
+        assert_eq!(terminal.intent.state, LegacyWriteIntentState::Committed);
+        assert!(terminal.intent.ciphertext_b64.is_none());
+        assert_eq!(inner.exact_generation_count(&requesting.object_name), 1);
+    }
+
+    struct BlockingTrustedTimeGcs {
+        inner: Arc<FakeGcs>,
+        armed: AtomicBool,
+        response_ready: Notify,
+        release_response: Semaphore,
+    }
+
+    impl BlockingTrustedTimeGcs {
+        fn new(inner: Arc<FakeGcs>) -> Self {
+            Self {
+                inner,
+                armed: AtomicBool::new(false),
+                response_ready: Notify::new(),
+                release_response: Semaphore::new(0),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_until_response_ready(&self) {
+            self.response_ready.notified().await;
+        }
+
+        fn release(&self) {
+            self.release_response.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for BlockingTrustedTimeGcs {
+        async fn trusted_time_millis(
+            &self,
+            authority_object_name: &str,
+            authority_generation: i64,
+        ) -> crate::error::Result<i64> {
+            let time = self
+                .inner
+                .trusted_time_millis(authority_object_name, authority_generation)
+                .await?;
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.response_ready.notify_one();
+                self.release_response
+                    .acquire()
+                    .await
+                    .map_err(|_| EnclaveError::Store("test trusted-time gate closed".into()))?
+                    .forget();
+            }
+            Ok(time)
+        }
+
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_name: &str,
+            source_generation: i64,
+            destination_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(source_name, source_generation, destination_name)
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_deadline_fences_delayed_verified_owner_after_takeover_and_deletion() {
+        let user_id = "intent-absolute-deadline";
+        let object_name = format!("raw/{user_id}/must-not-resurrect.enc");
+        let inner = Arc::new(FakeGcs::new());
+        let delayed_provider = Arc::new(BlockingTrustedTimeGcs::new(inner.clone()));
+        let original = Arc::new(Store::new(Arc::new(FakeKms), delayed_provider.clone()));
+        let takeover = Store::new(Arc::new(FakeKms), inner.clone());
+        let request = LegacyWriteRequest::Put {
+            backend: LegacyWriteBackend::Media,
+            kind: LegacyWriteKind::MediaPut,
+            object_name: object_name.clone(),
+            ciphertext: b"encrypted-absolute-deadline".to_vec(),
+            wrapped_dek_b64: "wrapped-absolute-deadline".into(),
+            if_generation_match: 0,
+        };
+        let prepared = original
+            .create_legacy_write_intent(user_id, &request)
+            .await
+            .unwrap();
+        let claimed = original.claim_legacy_write_intent(&prepared).await.unwrap();
+        let lease_expiry = claimed.intent.lease_expires_at_millis.unwrap();
+
+        delayed_provider.arm();
+        let late_claim = claimed.clone();
+        let late_store = Arc::clone(&original);
+        let delayed = tokio::spawn(async move {
+            late_store
+                .execute_claimed_legacy_write_intent(late_claim, None)
+                .await
+        });
+        delayed_provider.wait_until_response_ready().await;
+
+        // The authenticated Date response exists, but delivery of it to the
+        // executor is scheduler-delayed. A different instance observes the
+        // expired provider lease, takes over, commits once, and deletion then
+        // removes that exact destination generation.
+        inner.set_provider_clock_millis(lease_expiry + 1_000);
+        assert!(takeover
+            .drain_one_legacy_write_intent(claimed, false)
+            .await
+            .unwrap());
+        let committed_generation = inner.generation(&object_name).unwrap();
+        inner
+            .delete_object_generation(&object_name, committed_generation)
+            .await
+            .unwrap();
+
+        tokio::time::advance(LEGACY_WRITE_PROVIDER_TIMEOUT + Duration::from_secs(1)).await;
+        delayed_provider.release();
+        assert!(matches!(
+            delayed.await.unwrap(),
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(inner.put_attempts(), 1);
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_intent_owner_cannot_issue_or_resurrect_after_lease_margin_and_takeover() {
+        let user_id = "intent-stale-owner";
+        let object_name = format!("raw/{user_id}/must-not-resurrect.enc");
+        let inner = Arc::new(FakeGcs::new());
+        let original = Store::new(Arc::new(FakeKms), inner.clone());
+        let takeover = Store::new(Arc::new(FakeKms), inner.clone());
+        let request = LegacyWriteRequest::Put {
+            backend: LegacyWriteBackend::Media,
+            kind: LegacyWriteKind::MediaPut,
+            object_name: object_name.clone(),
+            ciphertext: b"encrypted-stale-owner".to_vec(),
+            wrapped_dek_b64: "wrapped-stale-owner".into(),
+            if_generation_match: 0,
+        };
+        let prepared = original
+            .create_legacy_write_intent(user_id, &request)
+            .await
+            .unwrap();
+        let claimed = original.claim_legacy_write_intent(&prepared).await.unwrap();
+        let lease_expiry = claimed.intent.lease_expires_at_millis.unwrap();
+
+        // A fresh trusted-time read caps the provider timeout to the lease's
+        // remaining budget less the safety margin.
+        inner
+            .set_provider_clock_millis(lease_expiry - LEGACY_WRITE_PROVIDER_SAFETY_MILLIS - 12_345);
+        let deadline = verify_persisted_legacy_write_intent_owner(inner.as_ref(), &claimed)
+            .await
+            .unwrap();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(remaining <= Duration::from_millis(12_345));
+        assert!(!remaining.is_zero());
+
+        // Once the safety window begins, the original owner performs no
+        // destination I/O even though its durable claim has not yet expired.
+        inner.set_provider_clock_millis(lease_expiry - 30_000);
+        assert!(matches!(
+            original
+                .execute_claimed_legacy_write_intent(claimed.clone(), None)
+                .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(inner.put_attempts(), 0);
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+
+        // After expiry another instance takes over the encrypted exact
+        // request, commits it once, and replaces the ownership generation.
+        inner.set_provider_clock_millis(lease_expiry + 1_000);
+        assert!(takeover
+            .drain_one_legacy_write_intent(claimed.clone(), false)
+            .await
+            .unwrap());
+        assert_eq!(inner.put_attempts(), 1);
+        let committed_generation = inner.generation(&object_name).unwrap();
+
+        // Simulate deletion after takeover. A late future holding the stale
+        // claim cannot issue the provider request or recreate the object.
+        inner
+            .delete_object_generation(&object_name, committed_generation)
+            .await
+            .unwrap();
+        assert!(matches!(
+            original
+                .execute_claimed_legacy_write_intent(claimed, None)
+                .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(inner.put_attempts(), 1);
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+    }
+
+    #[tokio::test]
+    async fn two_store_intent_created_after_retained_marker_performs_no_data_io() {
+        let user_id = "intent-after-marker";
+        let object_name = format!("raw/{user_id}/must-not-exist.enc");
+        let inner = Arc::new(FakeGcs::new());
+        let marker_store = Store::new(Arc::new(FakeKms), inner.clone());
+        let writer_store = Store::new(Arc::new(FakeKms), inner.clone());
+        marker_store
+            .fence_and_drain_legacy_writes(user_id, &test_rebind_authority(6))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            writer_store
+                .put_user_media(user_id, &object_name, b"ciphertext", "wrapped")
+                .await,
+            Err(EnclaveError::Auth(_))
+        ));
+        assert_eq!(inner.exact_generation_count(&object_name), 0);
+        marker_store
+            .drain_legacy_write_intents(user_id)
+            .await
+            .unwrap();
+    }
+
+    struct BlockingGetGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        block_once: AtomicBool,
+        started: Notify,
+        release: Semaphore,
+    }
+
+    impl BlockingGetGcs {
+        fn new(inner: Arc<FakeGcs>, target: String) -> Self {
+            Self {
+                inner,
+                target,
+                block_once: AtomicBool::new(true),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+            }
+        }
+
+        async fn wait_until_blocked(&self) {
+            self.started.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for BlockingGetGcs {
+        async fn trusted_time_millis(
+            &self,
+            authority_object_name: &str,
+            authority_generation: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .trusted_time_millis(authority_object_name, authority_generation)
+                .await
+        }
+
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            if object_name == self.target && self.block_once.swap(false, Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| EnclaveError::Store("test GCS gate closed".into()))?
+                    .forget();
+            }
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
+    struct FailPutOnceGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        fail_once: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for FailPutOnceGcs {
+        async fn trusted_time_millis(
+            &self,
+            authority_object_name: &str,
+            authority_generation: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .trusted_time_millis(authority_object_name, authority_generation)
+                .await
+        }
+
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            if object_name == self.target && self.fail_once.swap(false, Ordering::SeqCst) {
+                return Err(EnclaveError::Gcs("injected PUT failure".into()));
+            }
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
+        }
+    }
+
+    struct FailDeleteOnceGcs {
+        inner: Arc<FakeGcs>,
+        target: String,
+        fail_once: AtomicBool,
+        delete_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GcsClient for FailDeleteOnceGcs {
+        async fn trusted_time_millis(
+            &self,
+            authority_object_name: &str,
+            authority_generation: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .trusted_time_millis(authority_object_name, authority_generation)
+                .await
+        }
+
+        async fn get_object(&self, object_name: &str) -> crate::error::Result<GcsGetResponse> {
+            self.inner.get_object(object_name).await
+        }
+
+        async fn put_object(
+            &self,
+            object_name: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            if_generation_match: i64,
+        ) -> crate::error::Result<i64> {
+            self.inner
+                .put_object(
+                    object_name,
+                    ciphertext,
+                    wrapped_dek_b64,
+                    if_generation_match,
+                )
+                .await
+        }
+
+        async fn delete_object(&self, object_name: &str) -> crate::error::Result<()> {
+            if object_name == self.target {
+                self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_once.swap(false, Ordering::SeqCst) {
+                    return Err(EnclaveError::Gcs("injected DELETE failure".into()));
+                }
+            }
+            self.inner.delete_object(object_name).await
+        }
+
+        async fn get_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<GcsGetResponse> {
+            self.inner
+                .get_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn copy_generation_if_absent(
+            &self,
+            source_object_name: &str,
+            source_generation: i64,
+            destination_object_name: &str,
+        ) -> crate::error::Result<GcsGenerationCopy> {
+            self.inner
+                .copy_generation_if_absent(
+                    source_object_name,
+                    source_generation,
+                    destination_object_name,
+                )
+                .await
+        }
+
+        async fn list_object_versions(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_object_versions(prefix, page_token).await
+        }
+
+        async fn list_live_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner.list_live_objects(prefix, page_token).await
+        }
+
+        async fn delete_object_generation(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) -> crate::error::Result<()> {
+            if object_name == self.target {
+                self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_once.swap(false, Ordering::SeqCst) {
+                    return Err(EnclaveError::Gcs("injected DELETE failure".into()));
+                }
+            }
+            self.inner
+                .delete_object_generation(object_name, generation)
+                .await
+        }
+
+        async fn list_soft_deleted_objects(
+            &self,
+            prefix: &str,
+            page_token: Option<&str>,
+        ) -> crate::error::Result<GcsListVersionsResponse> {
+            self.inner
+                .list_soft_deleted_objects(prefix, page_token)
+                .await
         }
     }
 
@@ -2340,6 +8391,1841 @@ pub(crate) mod tests {
 
     fn make_store() -> Store {
         Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()))
+    }
+
+    pub(crate) fn insert_screenshot_evidence(conn: &Connection, object_key: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO screenshots(id,captured_at) VALUES (1,'2026-01-01T00:00:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO episodes(id,started_at,ended_at) \
+             VALUES (1,'2026-01-01T00:00:00Z','2026-01-01T00:01:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO screenshot_images \
+             (id,screenshot_id,episode_id,source_key,captured_at,object_key,mime_type,width,height,byte_length,sha256) \
+             VALUES ('image-1',1,1,'source-1','2026-01-01T00:00:00Z',?1,'image/jpeg',1,1,1,?2)",
+            rusqlite::params![object_key, "a".repeat(64)],
+        )?;
+        Ok(())
+    }
+
+    fn store_with_checkpoint_time(gcs: Arc<FakeGcs>, unix_seconds: u64) -> Store {
+        let mut store = Store::new(Arc::new(FakeKms), gcs);
+        store.checkpoint_clock = Arc::new(move || UNIX_EPOCH + Duration::from_secs(unix_seconds));
+        store
+    }
+
+    fn store_with_mutable_checkpoint_time(
+        gcs: Arc<FakeGcs>,
+        unix_seconds: u64,
+    ) -> (Store, Arc<AtomicU64>) {
+        let clock = Arc::new(AtomicU64::new(unix_seconds));
+        let clock_for_store = Arc::clone(&clock);
+        let mut store = Store::new(Arc::new(FakeKms), gcs);
+        store.checkpoint_clock = Arc::new(move || {
+            UNIX_EPOCH + Duration::from_secs(clock_for_store.load(Ordering::SeqCst))
+        });
+        (store, clock)
+    }
+
+    async fn write_and_save(store: &Store, user_id: &str, marker: &str) -> Result<()> {
+        let marker = marker.to_string();
+        store
+            .with_user(user_id, move |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-01-01T00:00:00Z', ?1)",
+                    [&marker],
+                )?;
+                Ok(())
+            })
+            .await?;
+        store.save_user(user_id).await
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_is_once_per_utc_day_and_pins_first_save() {
+        let gcs = Arc::new(FakeGcs::new());
+        // 2026-01-01T12:00:00Z
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "checkpoint-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&store, "checkpoint-user", "second")
+            .await
+            .unwrap();
+        write_and_save(&store, "checkpoint-user", "third")
+            .await
+            .unwrap();
+
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "checkpoint-user",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        let objects = gcs.objects.lock().unwrap();
+        assert_eq!(
+            objects
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/checkpoint-user/"))
+                .count(),
+            1
+        );
+        let checkpoint = objects.get(&checkpoint).unwrap().last().unwrap();
+        assert_eq!(checkpoint.generation, 1);
+        assert_eq!(
+            checkpoint
+                .legacy_recovery
+                .as_ref()
+                .unwrap()
+                .source_generation,
+            1,
+            "checkpoint must bind the pre-overwrite authoritative generation"
+        );
+        drop(objects);
+        let calls = gcs.copy_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "same-day saves must hit the process cache");
+        assert_eq!(calls[0].1, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_checkpoints_only_the_current_live_generation_and_is_idempotent()
+    {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        let archive = gcs_object_name("backfill-user");
+        gcs.put_object(&archive, b"old", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.put_object(&archive, b"current", "wrapped", 1)
+            .await
+            .unwrap();
+        let gone = gcs_object_name("deleted-user");
+        gcs.put_object(&gone, b"gone", "wrapped", 0).await.unwrap();
+        gcs.delete_object(&gone).await.unwrap();
+        let gets_before = gcs.live_get_count();
+
+        let first = store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .unwrap();
+        assert!(first.ready);
+        assert_eq!(first.live_archives_checked, 1);
+        assert_eq!(
+            gcs.live_gets.lock().unwrap()[gets_before..]
+                .iter()
+                .filter(|name| *name == &archive)
+                .count(),
+            1,
+            "intent and fence reads must not duplicate the archive read"
+        );
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "backfill-user",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        assert_eq!(gcs.version_count(&checkpoint), 1);
+        let binding = gcs.objects.lock().unwrap()[&checkpoint]
+            .last()
+            .unwrap()
+            .legacy_recovery
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(binding.source_generation, 2);
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+
+        let second = store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .unwrap();
+        assert!(second.ready);
+        assert_eq!(
+            gcs.version_count(&checkpoint),
+            1,
+            "retry must not overwrite the immutable checkpoint"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_waits_for_reconciliation_copy_before_recovery_inventory() {
+        let inner = Arc::new(FakeGcs::new());
+        // Seed a valid encrypted database and a day-one checkpoint. Reconcile
+        // on day two so it must create a new immutable recovery copy.
+        let seed = store_with_checkpoint_time(Arc::clone(&inner), 1_767_268_800);
+        write_and_save(&seed, "checkpoint-delete-race", "seed")
+            .await
+            .expect("seed encrypted user database");
+        drop(seed);
+
+        let checkpoint_time = 1_767_355_200;
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "checkpoint-delete-race",
+            UNIX_EPOCH + Duration::from_secs(checkpoint_time),
+        );
+        let blocked = Arc::new(BlockingPutGcs::copy_to(
+            Arc::clone(&inner),
+            checkpoint.clone(),
+        ));
+        let mut raw_store =
+            make_store_with_limit(Arc::new(FakeKms), blocked.clone(), inner.clone(), 1);
+        raw_store.checkpoint_clock =
+            Arc::new(move || UNIX_EPOCH + Duration::from_secs(checkpoint_time));
+        let store = Arc::new(raw_store);
+
+        let reconcile_store = Arc::clone(&store);
+        let reconcile = tokio::spawn(async move {
+            reconcile_store
+                .reconcile_legacy_recovery_checkpoints_once()
+                .await
+        });
+        blocked.wait_until_blocked().await;
+
+        let delete_store = Arc::clone(&store);
+        let deletion =
+            tokio::spawn(async move { delete_store.delete_user("checkpoint-delete-race").await });
+        let pending = tokio::time::timeout(Duration::from_millis(100), deletion)
+            .await
+            .expect("deletion must promptly expose its durable pending state")
+            .expect("deletion task panicked");
+        assert!(matches!(
+            pending,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyWriteIntentUnsettled,
+                ..
+            }))
+        ));
+        assert_eq!(inner.version_count(&checkpoint), 0);
+        assert_eq!(
+            inner.version_count(&gcs_object_name("checkpoint-delete-race")),
+            1
+        );
+
+        blocked.release();
+        reconcile
+            .await
+            .expect("reconciler task panicked")
+            .expect("reconciler failed after copy release");
+        store
+            .delete_user("checkpoint-delete-race")
+            .await
+            .expect("deletion retry failed after reconciliation settled");
+        assert_eq!(inner.version_count(&checkpoint), 0);
+        assert!(inner
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|name| !name.starts_with("legacy-recovery/checkpoint-delete-race/")));
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_fails_closed_for_malformed_governed_index_name() {
+        let gcs = Arc::new(FakeGcs::new());
+        gcs.put_object("indexes/not/a.db.enc", b"bad", "wrapped", 0)
+            .await
+            .unwrap();
+        let store = store_with_checkpoint_time(gcs, 1_767_268_800);
+        assert!(store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .is_err());
+        assert!(!store.legacy_checkpoint_reconciliation().await.ready);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_rejects_repeated_live_listing_cursor() {
+        let gcs = Arc::new(FakeGcs::new());
+        for user in ["cursor-a", "cursor-b", "cursor-c"] {
+            gcs.put_object(&gcs_object_name(user), b"current", "wrapped", 0)
+                .await
+                .unwrap();
+        }
+        gcs.set_repeat_version_cursor(true);
+        let store = store_with_checkpoint_time(gcs, 1_767_268_800);
+        assert!(store
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .is_err());
+        assert!(!store.legacy_checkpoint_reconciliation().await.ready);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_is_not_ready_after_partial_failure_and_recovers_after_restart()
+    {
+        let gcs = Arc::new(FakeGcs::new());
+        let archive = gcs_object_name("retry-backfill");
+        gcs.put_object(&archive, b"current", "wrapped", 0)
+            .await
+            .unwrap();
+        *gcs.fail_copy.lock().unwrap() = VecDeque::from([
+            EnclaveError::Gcs("temporary copy failure 1".into()),
+            EnclaveError::Gcs("temporary copy failure 2".into()),
+        ]);
+        let first = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        assert!(first
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .is_err());
+        let failed = first.legacy_checkpoint_reconciliation().await;
+        assert!(!failed.ready);
+        assert_eq!(failed.failures, 1);
+
+        let expiry = sole_requesting_intent_expiry(&gcs, "retry-backfill");
+        gcs.set_provider_clock_millis(expiry + 1_000);
+        let restarted = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        let recovered = restarted
+            .reconcile_legacy_recovery_checkpoints_once()
+            .await
+            .unwrap();
+        assert!(recovered.ready);
+        assert_eq!(recovered.completed_scans, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_converges_after_copy_precondition_race() {
+        let gcs = Arc::new(FakeGcs::new());
+        let archive = gcs_object_name("race-backfill");
+        gcs.put_object(&archive, b"current", "wrapped", 0)
+            .await
+            .unwrap();
+        *gcs.fail_copy_after_create.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost copy response".into()));
+        let first = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        assert!(
+            first
+                .reconcile_legacy_recovery_checkpoints_once()
+                .await
+                .unwrap()
+                .ready,
+            "the owned retry must exact-adopt a copy whose response was lost"
+        );
+
+        let restarted = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        assert!(
+            restarted
+                .reconcile_legacy_recovery_checkpoints_once()
+                .await
+                .unwrap()
+                .ready
+        );
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "race-backfill",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        assert_eq!(gcs.version_count(&checkpoint), 1);
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn legacy_recovery_checkpoint_uses_utc_not_local_day() {
+        assert_eq!(
+            legacy_recovery_checkpoint_name(
+                "alice",
+                UNIX_EPOCH + Duration::from_secs(1_767_225_599)
+            ),
+            "legacy-recovery/alice/2025-12-31.db.enc"
+        );
+        assert_eq!(
+            legacy_recovery_checkpoint_name(
+                "alice",
+                UNIX_EPOCH + Duration::from_secs(1_767_225_600)
+            ),
+            "legacy-recovery/alice/2026-01-01.db.enc"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_survives_process_restart() {
+        let gcs = Arc::new(FakeGcs::new());
+        let time = 1_767_268_800;
+        let first = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&first, "restart-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&first, "restart-user", "second")
+            .await
+            .unwrap();
+        let second = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&second, "restart-user", "third")
+            .await
+            .unwrap();
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/restart-user/"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            gcs.copy_calls.lock().unwrap().len(),
+            2,
+            "restart re-verifies the existing destination exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_lost_success_converges_on_retry() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "retry-user", "first").await.unwrap();
+        *gcs.fail_copy_after_create.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost response".into()));
+        write_and_save(&store, "retry-user", "second")
+            .await
+            .unwrap();
+        assert_eq!(
+            gcs.put_calls.lock().unwrap().len(),
+            2,
+            "an exact retry resolves the lost checkpoint response before overwrite"
+        );
+        let count: i64 = store
+            .with_user("retry-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/retry-user/"))
+                .count(),
+            1
+        );
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 2);
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_put_is_persisted_before_handler_style_retry_observes_duplicate() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "put-retry-user", "first")
+            .await
+            .unwrap();
+        *gcs.fail_put.lock().unwrap() = Some(EnclaveError::Gcs("transient PUT failure".into()));
+
+        assert!(matches!(
+            write_and_save(&store, "put-retry-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .get(&gcs_object_name("put-retry-user"))
+                .unwrap()
+                .last()
+                .unwrap()
+                .generation,
+            1,
+            "failed PUT must leave remote authority unchanged"
+        );
+
+        // This models an idempotency retry: before the handler closure can see
+        // the locally inserted row and call it a duplicate, with_user retries
+        // the pending authoritative PUT.
+        let local_count: i64 = store
+            .with_user("put-retry-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(local_count, 2);
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 3);
+
+        let restarted = Store::new(Arc::new(FakeKms), gcs);
+        let durable_count: i64 = restarted
+            .with_user("put-retry-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(durable_count, 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_failure_withholds_save_success() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "failure-user", "first")
+            .await
+            .unwrap();
+        *gcs.fail_copy.lock().unwrap() = VecDeque::from([
+            EnclaveError::Gcs("copy unavailable 1".into()),
+            EnclaveError::Gcs("copy unavailable 2".into()),
+        ]);
+        assert!(matches!(
+            write_and_save(&store, "failure-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(
+            gcs.put_calls.lock().unwrap().len(),
+            1,
+            "checkpoint failure must prevent the authoritative overwrite"
+        );
+        assert!(matches!(
+            store.save_user("failure-user").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyWriteIntentUnsettled,
+                ..
+            }))
+        ));
+        let expiry = sole_requesting_intent_expiry(&gcs, "failure-user");
+        gcs.set_provider_clock_millis(expiry + 1_000);
+        store.save_user("failure-user").await.unwrap();
+        assert_eq!(
+            gcs.copy_calls.lock().unwrap().len(),
+            4,
+            "takeover plus the caller's exact destination verification are bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_rejects_existing_integrity_mismatch() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = store_with_checkpoint_time(gcs.clone(), 1_767_268_800);
+        write_and_save(&store, "mismatch-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&store, "mismatch-user", "second")
+            .await
+            .unwrap();
+        let checkpoint = legacy_recovery_checkpoint_name(
+            "mismatch-user",
+            UNIX_EPOCH + Duration::from_secs(1_767_268_800),
+        );
+        gcs.objects
+            .lock()
+            .unwrap()
+            .get_mut(&checkpoint)
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .crc32c
+            .clear();
+        let restarted = store_with_checkpoint_time(gcs, 1_767_268_800);
+        assert!(matches!(
+            write_and_save(&restarted, "mismatch-user", "third").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_rejects_unmarked_preexisting_destination() {
+        let gcs = Arc::new(FakeGcs::new());
+        let time = 1_767_268_800;
+        let store = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&store, "unmarked-user", "first")
+            .await
+            .unwrap();
+        let source_name = gcs_object_name("unmarked-user");
+        let destination_name = legacy_recovery_checkpoint_name(
+            "unmarked-user",
+            UNIX_EPOCH + Duration::from_secs(time),
+        );
+        {
+            let mut objects = gcs.objects.lock().unwrap();
+            let mut malicious = objects.get(&source_name).unwrap().last().unwrap().clone();
+            malicious.generation = 7;
+            malicious.legacy_recovery = None;
+            objects.insert(destination_name, vec![malicious]);
+        }
+
+        assert!(matches!(
+            write_and_save(&store, "unmarked-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_checkpoint_rejects_mismatched_protocol_marker() {
+        let gcs = Arc::new(FakeGcs::new());
+        let time = 1_767_268_800;
+        let store = store_with_checkpoint_time(gcs.clone(), time);
+        write_and_save(&store, "marker-user", "first")
+            .await
+            .unwrap();
+        let source_name = gcs_object_name("marker-user");
+        let destination_name =
+            legacy_recovery_checkpoint_name("marker-user", UNIX_EPOCH + Duration::from_secs(time));
+        {
+            let mut objects = gcs.objects.lock().unwrap();
+            let mut malicious = objects.get(&source_name).unwrap().last().unwrap().clone();
+            malicious.generation = 9;
+            malicious.legacy_recovery = Some(LegacyRecoveryBinding {
+                format_version: 1,
+                source_object: "indexes/a-different-user.db.enc".into(),
+                source_generation: 1,
+                source_size: malicious.ciphertext.len() as u64,
+                source_crc32c: malicious.crc32c.clone(),
+            });
+            objects.insert(destination_name, vec![malicious]);
+        }
+
+        assert!(matches!(
+            write_and_save(&store, "marker-user", "second").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn utc_rollover_requires_a_new_checkpoint_and_failure_does_not_cache() {
+        let gcs = Arc::new(FakeGcs::new());
+        let day_one = 1_767_268_800;
+        let (store, clock) = store_with_mutable_checkpoint_time(gcs.clone(), day_one);
+        write_and_save(&store, "rollover-user", "first")
+            .await
+            .unwrap();
+        write_and_save(&store, "rollover-user", "second")
+            .await
+            .unwrap();
+        assert_eq!(gcs.copy_calls.lock().unwrap().len(), 1);
+
+        clock.store(day_one + 86_400, Ordering::SeqCst);
+        *gcs.fail_copy.lock().unwrap() = VecDeque::from([
+            EnclaveError::Gcs("rollover failure 1".into()),
+            EnclaveError::Gcs("rollover failure 2".into()),
+        ]);
+        assert!(write_and_save(&store, "rollover-user", "third")
+            .await
+            .is_err());
+        assert_eq!(gcs.put_calls.lock().unwrap().len(), 2);
+
+        let expiry = sole_requesting_intent_expiry(&gcs, "rollover-user");
+        gcs.set_provider_clock_millis(expiry + 1_000);
+        store.save_user("rollover-user").await.unwrap();
+        write_and_save(&store, "rollover-user", "fourth")
+            .await
+            .unwrap();
+        assert_eq!(
+            gcs.copy_calls.lock().unwrap().len(),
+            5,
+            "failed day-two copy is retried twice, then taken over and exact-verified"
+        );
+        assert_eq!(
+            gcs.objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|name| name.starts_with("legacy-recovery/rollover-user/"))
+                .count(),
+            2
+        );
+    }
+
+    fn seed_user_object_with_missing_schema(gcs: &FakeGcs, user_id: &str) {
+        let dek = Dek([7_u8; 32]);
+        let current = create_empty_db(&dek).unwrap();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), current).unwrap();
+        let conn = Connection::open(temp.path()).unwrap();
+        conn.execute_batch(
+            "DROP TABLE email_deliveries;
+             DROP TABLE push_deliveries;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+        drop(conn);
+        let old_bytes = std::fs::read(temp.path()).unwrap();
+        let ciphertext = encrypt_bound_blob(&dek, &old_bytes, &user_blob_context(user_id)).unwrap();
+        gcs.objects.lock().unwrap().insert(
+            gcs_object_name(user_id),
+            vec![FakeObject {
+                ciphertext,
+                wrapped_dek_b64: B64.encode(dek.0),
+                generation: 1,
+                live: true,
+                soft_deleted: false,
+                hard_delete_time: None,
+                crc32c: "fake-crc32c".into(),
+                md5_hash: None,
+                legacy_recovery: None,
+            }],
+        );
+    }
+
+    fn seed_user_object_with_legacy_envelope(gcs: &FakeGcs, user_id: &str) {
+        let dek = Dek([9_u8; 32]);
+        let plaintext = create_empty_db(&dek).unwrap();
+        let legacy =
+            crate::crypto::encrypt_blob_with_aad(&dek, &plaintext, &user_blob_context(user_id))
+                .unwrap();
+        gcs.objects.lock().unwrap().insert(
+            gcs_object_name(user_id),
+            vec![FakeObject {
+                ciphertext: legacy,
+                wrapped_dek_b64: B64.encode(dek.0),
+                generation: 1,
+                live: true,
+                soft_deleted: false,
+                hard_delete_time: None,
+                crc32c: "fake-crc32c".into(),
+                md5_hash: None,
+                legacy_recovery: None,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_access_and_save_do_not_create_or_rewrite_an_object() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = Store::new(kms.clone(), gcs.clone());
+
+        let count: i64 = store
+            .with_user_read("read-only-new", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let metrics_before_clean_save = store.storage_metrics_snapshot();
+        store.save_user("read-only-new").await.unwrap();
+        let metrics_after_clean_save = store.storage_metrics_snapshot();
+        assert_eq!(gcs.put_attempts(), 0);
+        assert_eq!(gcs.generation(&gcs_object_name("read-only-new")), None);
+        assert_eq!(
+            metrics_after_clean_save.save_attempts_total,
+            metrics_before_clean_save.save_attempts_total + 1
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_skipped_total,
+            metrics_before_clean_save.save_skipped_total + 1
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_completed_total,
+            metrics_before_clean_save.save_completed_total
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_failed_total,
+            metrics_before_clean_save.save_failed_total
+        );
+        assert_eq!(
+            metrics_after_clean_save.save_latency_us.count,
+            metrics_before_clean_save.save_latency_us.count + 1
+        );
+
+        store
+            .with_user("read-only-existing", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-01-01T00:00:00Z', 'durable')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("read-only-existing").await.unwrap();
+        let attempts_after_write = gcs.put_attempts();
+        let generation_after_write = gcs
+            .generation(&gcs_object_name("read-only-existing"))
+            .unwrap();
+
+        store
+            .with_user_read("read-only-existing", |conn| {
+                let _: i64 =
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("read-only-existing").await.unwrap();
+        assert_eq!(gcs.put_attempts(), attempts_after_write);
+        assert_eq!(
+            gcs.generation(&gcs_object_name("read-only-existing")),
+            Some(generation_after_write)
+        );
+
+        // Process restart must not make idempotent schema setup look dirty.
+        let reopened = Store::new(kms, gcs.clone());
+        reopened
+            .with_user_read("read-only-existing", |conn| {
+                Ok(
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        reopened.save_user("read-only-existing").await.unwrap();
+        assert_eq!(gcs.put_attempts(), attempts_after_write);
+        assert_eq!(
+            gcs.generation(&gcs_object_name("read-only-existing")),
+            Some(generation_after_write)
+        );
+    }
+
+    #[tokio::test]
+    async fn query_only_api_rejects_sql_mutation_and_restores_guard_after_error() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let result = store
+            .with_user_read("guarded-reader", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(result, Err(EnclaveError::Db(_))));
+        store
+            .with_user("guarded-reader", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("query_only must be restored after the read closure error");
+        store.save_user("guarded-reader").await.unwrap();
+        assert_eq!(gcs.put_attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_schema_and_trigger_mutations_advance_dirty_generation_and_persist() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = Store::new(kms.clone(), gcs.clone());
+
+        store
+            .with_user("tracked-mutations", |conn| {
+                conn.execute_batch(
+                    "CREATE TABLE dirty_save_probe(value TEXT NOT NULL);
+                     CREATE TRIGGER dirty_save_probe_mirror AFTER INSERT ON dirty_save_probe BEGIN
+                         INSERT INTO dirty_save_probe(value) VALUES ('triggered');
+                     END;",
+                )?;
+                conn.execute("INSERT INTO dirty_save_probe(value) VALUES ('direct')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("tracked-mutations").await.unwrap();
+        assert_eq!(
+            gcs.generation(&gcs_object_name("tracked-mutations")),
+            Some(1)
+        );
+
+        let restarted = Store::new(kms, gcs);
+        let values: Vec<String> = restarted
+            .with_user_read("tracked-mutations", |conn| {
+                let mut statement =
+                    conn.prepare("SELECT value FROM dirty_save_probe ORDER BY rowid")?;
+                let values = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(values)
+            })
+            .await
+            .unwrap();
+        assert_eq!(values, vec!["direct", "triggered"]);
+    }
+
+    #[tokio::test]
+    async fn clean_eviction_skips_put_but_dirty_eviction_and_migration_flush() {
+        let gcs = Arc::new(FakeGcs::new());
+        let mut store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.max_open = 1;
+
+        store
+            .with_user("clean-eviction", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("clean-eviction").await.unwrap();
+        let after_initial_save = gcs.put_attempts();
+        store
+            .with_user_read("other-reader", |conn| {
+                Ok(
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(gcs.put_attempts(), after_initial_save);
+
+        store
+            .with_user("dirty-eviction", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-02T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before_dirty_evict = gcs.put_attempts();
+        store
+            .with_user_read("dirty-eviction-next", |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(gcs.put_attempts(), before_dirty_evict + 1);
+        assert_eq!(gcs.generation(&gcs_object_name("dirty-eviction")), Some(1));
+
+        seed_user_object_with_missing_schema(&gcs, "migration-eviction");
+        store
+            .with_user_read("migration-eviction", |conn| {
+                let present: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='email_deliveries'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(present, 1);
+                let push_present: i64 = conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='push_deliveries'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(push_present, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before_migration_evict = gcs.put_attempts();
+        store
+            .with_user_read("post-migration-reader", |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(gcs.put_attempts(), before_migration_evict + 1);
+        assert_eq!(
+            gcs.generation(&gcs_object_name("migration-eviction")),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_put_retains_dirty_generation_for_retry() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .with_user("dirty-retry", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        *gcs.fail_put.lock().unwrap() = Some(EnclaveError::Gcs("injected PUT failure".into()));
+        assert!(matches!(
+            store.save_user("dirty-retry").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        assert_eq!(gcs.generation(&gcs_object_name("dirty-retry")), None);
+        store.save_user("dirty-retry").await.unwrap();
+        assert_eq!(gcs.generation(&gcs_object_name("dirty-retry")), Some(1));
+    }
+
+    #[tokio::test]
+    async fn lost_put_success_reconciles_exact_snapshot_before_access() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = Store::new(kms.clone(), gcs.clone());
+        store
+            .with_user("lost-put-success", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-01-01T00:00:00Z', 'durable despite lost response')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        *gcs.fail_put_after_commit.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost PUT response".into()));
+
+        store.save_user("lost-put-success").await.unwrap();
+        let object_name = gcs_object_name("lost-put-success");
+        assert_eq!(gcs.generation(&object_name), Some(1));
+
+        // The same owned attempt accepts the committed generation only after
+        // exact ciphertext and wrapped-key reconciliation.
+        let count: i64 = store
+            .with_user_read("lost-put-success", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(gcs.version_count(&object_name), 1);
+        assert_eq!(
+            gcs.put_calls.lock().unwrap().as_slice(),
+            &[(object_name.clone(), 0)]
+        );
+
+        let restarted = Store::new(kms, gcs);
+        let durable_count: i64 = restarted
+            .with_user_read("lost-put-success", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(durable_count, 1);
+    }
+
+    #[tokio::test]
+    async fn generation_conflict_with_different_snapshot_remains_conflict() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let local = Store::new(kms.clone(), gcs.clone());
+        write_and_save(&local, "real-conflict", "baseline")
+            .await
+            .unwrap();
+        local
+            .with_user("real-conflict", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-01-02T00:00:00Z', 'local pending state')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let concurrent = Store::new(kms, gcs.clone());
+        write_and_save(&concurrent, "real-conflict", "different remote state")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            local.save_user("real-conflict").await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert_eq!(gcs.generation(&gcs_object_name("real-conflict")), Some(2));
+    }
+
+    #[tokio::test]
+    async fn lost_put_success_with_changed_wrapped_dek_remains_conflict() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .with_user("lost-put-dek-mismatch", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES ('2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        *gcs.fail_put_after_commit.lock().unwrap() =
+            Some(EnclaveError::Gcs("lost PUT response".into()));
+        *gcs.corrupt_wrapped_dek_after_commit_failure.lock().unwrap() =
+            Some(B64.encode([9_u8; 32]));
+        assert!(store.save_user("lost-put-dek-mismatch").await.is_err());
+
+        assert!(matches!(
+            store.save_user("lost-put-dek-mismatch").await,
+            Err(EnclaveError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_envelope_read_remains_dirty_until_v2_rewrite_succeeds() {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_user_object_with_legacy_envelope(&gcs, "legacy-envelope");
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .with_user_read("legacy-envelope", |conn| {
+                Ok(
+                    conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        store.save_user("legacy-envelope").await.unwrap();
+        assert_eq!(gcs.generation(&gcs_object_name("legacy-envelope")), Some(2));
+    }
+
+    fn make_store_with_limit(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        max_open: usize,
+    ) -> Store {
+        Store::new_internal_with_max_open(kms, gcs, Arc::clone(&media_gcs), media_gcs, max_open)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_user_gcs_save_does_not_block_another_users_read_write_or_save() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("slow-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            2,
+        ));
+
+        for user_id in ["slow-user", "fast-user"] {
+            store
+                .with_user(user_id, |_| Ok(()))
+                .await
+                .expect("preload user");
+        }
+        store
+            .with_user("slow-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'slow')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate slow user");
+
+        let slow_store = Arc::clone(&store);
+        let slow_save = tokio::spawn(async move { slow_store.save_user("slow-user").await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            blocked.wait_until_blocked(),
+        )
+        .await
+        .expect("slow user's GCS PUT never reached the gate");
+
+        let fast_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let counts = store
+                .with_user("fast-user", |conn| {
+                    let before: i64 =
+                        conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?;
+                    conn.execute(
+                        "INSERT INTO screenshots (captured_at, ocr_text) \
+                         VALUES ('2026-08-01T00:00:01Z', 'fast')",
+                        [],
+                    )?;
+                    let after: i64 =
+                        conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?;
+                    Ok((before, after))
+                })
+                .await?;
+            store.save_user("fast-user").await?;
+            Result::<_>::Ok(counts)
+        })
+        .await
+        .expect("unrelated user was blocked by slow user's GCS PUT")
+        .expect("unrelated user operation failed");
+        assert_eq!(fast_result, (0, 1));
+
+        blocked.release();
+        slow_save
+            .await
+            .expect("slow save task panicked")
+            .expect("slow save failed after release");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_user_connection_operations_remain_strictly_serialized() {
+        let store = Arc::new(make_store());
+        store
+            .with_user("ordered-user", |_| Ok(()))
+            .await
+            .expect("preload user");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_store = Arc::clone(&store);
+        let first = tokio::spawn(async move {
+            first_store
+                .with_user("ordered-user", move |conn| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().map_err(|_| {
+                        EnclaveError::Store("same-user test release dropped".into())
+                    })?;
+                    conn.execute(
+                        "INSERT INTO screenshots (captured_at, ocr_text) \
+                         VALUES ('2026-08-01T00:00:00Z', 'first')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("first operation did not enter");
+
+        let second_entered = Arc::new(Notify::new());
+        let second_signal = Arc::clone(&second_entered);
+        let second_store = Arc::clone(&store);
+        let second = tokio::spawn(async move {
+            second_store
+                .with_user("ordered-user", move |conn| {
+                    second_signal.notify_one();
+                    Ok(
+                        conn.query_row("SELECT count(*) FROM screenshots", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?,
+                    )
+                })
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                second_entered.notified(),
+            )
+            .await
+            .is_err(),
+            "second same-user operation entered while the first still held the actor"
+        );
+
+        release_tx.send(()).expect("release first operation");
+        first
+            .await
+            .expect("first operation task panicked")
+            .expect("first operation failed");
+        let observed = second
+            .await
+            .expect("second operation task panicked")
+            .expect("second operation failed");
+        assert_eq!(observed, 1, "second operation must observe the first");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_first_load_releases_its_capacity_reservation() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingGetGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("cancelled-load-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+
+        let load_store = Arc::clone(&store);
+        let load = tokio::spawn(async move {
+            load_store
+                .with_user("cancelled-load-user", |_| Ok(()))
+                .await
+        });
+        blocked.wait_until_blocked().await;
+        load.abort();
+        assert!(load
+            .await
+            .expect_err("load task was not cancelled")
+            .is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            store.with_user("post-cancel-user", |_| Ok(())).await
+        })
+        .await
+        .expect("cancelled Loading reservation permanently consumed STORE_MAX_OPEN")
+        .expect("cold load after cancelled reservation failed");
+
+        let registry = store.registry.lock().await;
+        assert!(!registry.open_users.contains_key("cancelled-load-user"));
+        assert!(registry.open_users.contains_key("post-cancel-user"));
+        assert_eq!(registry.open_users.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_eviction_restores_the_victim_and_capacity() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("cancelled-eviction-user"),
+        ));
+        let kms = Arc::new(FakeKms);
+        let store = Arc::new(make_store_with_limit(
+            kms.clone(),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+        store
+            .with_user("cancelled-eviction-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'survives cancellation')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate eviction victim");
+
+        let newcomer_store = Arc::clone(&store);
+        let newcomer = tokio::spawn(async move {
+            newcomer_store
+                .with_user("cancelled-new-user", |_| Ok(()))
+                .await
+        });
+        blocked.wait_until_blocked().await;
+        newcomer.abort();
+        assert!(newcomer
+            .await
+            .expect_err("eviction task was not cancelled")
+            .is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            store.with_user("post-eviction-cancel", |_| Ok(())).await
+        })
+        .await
+        .expect("cancelled Evicting transition permanently consumed STORE_MAX_OPEN")
+        .expect("cold load after cancelled eviction failed");
+
+        let fresh = Store::new(kms, inner);
+        let persisted: i64 = fresh
+            .with_user("cancelled-eviction-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("reload cancelled eviction victim");
+        assert_eq!(persisted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_media_cancelled_put_keeps_both_deletion_scans_behind_provider_settlement() {
+        let database_gcs = Arc::new(FakeGcs::new());
+        let current_inner = Arc::new(FakeGcs::new());
+        let legacy_media = Arc::new(FakeGcs::new());
+        let media_name = "raw/content-lease-user/late.enc";
+        let blocked_media = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&current_inner),
+            media_name.to_string(),
+        ));
+        let store = Arc::new(Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            database_gcs,
+            blocked_media.clone(),
+            legacy_media.clone(),
+        ));
+        let legacy_name = "raw/content-lease-user/legacy.enc";
+        legacy_media
+            .put_object(legacy_name, b"legacy", "wrapped", 0)
+            .await
+            .unwrap();
+        current_inner.reset_operation_counts();
+        legacy_media.reset_operation_counts();
+
+        let request_lease = store
+            .acquire_content_write("content-lease-user")
+            .await
+            .expect("admit content write");
+        let put_lease = request_lease.child();
+        let put_store = Arc::clone(&store);
+        let put = tokio::spawn(async move {
+            let _put_lease = put_lease;
+            put_store
+                .put_media(media_name, b"ciphertext", "wrapped")
+                .await
+        });
+        blocked_media.wait_until_blocked().await;
+
+        // Model an aborted HTTP request: its owned provider task continues.
+        drop(request_lease);
+        let delete_store = Arc::clone(&store);
+        let mut deletion =
+            tokio::spawn(async move { delete_store.delete_user("content-lease-user").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait for an admitted provider PUT"
+        );
+        assert_eq!(current_inner.operation_counts().0, 0);
+        assert_eq!(legacy_media.operation_counts().0, 0);
+        assert!(legacy_media.get_object(legacy_name).await.is_ok());
+
+        blocked_media.release();
+        put.await
+            .expect("owned provider PUT panicked")
+            .expect("owned provider PUT failed");
+        deletion
+            .await
+            .expect("deletion task panicked")
+            .expect("deletion failed after provider settlement");
+        assert!(matches!(
+            current_inner.get_object(media_name).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(matches!(
+            legacy_media.get_object(legacy_name).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(current_inner.operation_counts().0 > 0);
+        assert!(legacy_media.operation_counts().0 > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_authoritative_index_put_keeps_deletion_behind_provider_settlement() {
+        let database_inner = Arc::new(FakeGcs::new());
+        let user_id = "cancelled-index-save-user";
+        let blocked_database = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&database_inner),
+            gcs_object_name(user_id),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked_database.clone(),
+            database_inner.clone(),
+            1,
+        ));
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'must not survive deletion')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("dirty first-write user");
+
+        let save_store = Arc::clone(&store);
+        let save = tokio::spawn(async move { save_store.save_user(user_id).await });
+        blocked_database.wait_until_blocked().await;
+
+        // The outer save future models a cancelled HTTP request or worker.
+        // Cancellation drops the directly-owned provider future; only the
+        // durable Requesting intent remains for bounded takeover.
+        save.abort();
+        assert!(save
+            .await
+            .expect_err("save was not cancelled")
+            .is_cancelled());
+
+        blocked_database.release();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            database_inner.get_object(&gcs_object_name(user_id)).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(matches!(
+            store.delete_user(user_id).await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyWriteIntentUnsettled,
+                ..
+            }))
+        ));
+        let expiry = sole_requesting_intent_expiry(&database_inner, user_id);
+        database_inner.set_provider_clock_millis(expiry + 1_000);
+        store
+            .delete_user(user_id)
+            .await
+            .expect("deletion failed after expired-intent takeover");
+        assert!(matches!(
+            database_inner.get_object(&gcs_object_name(user_id)).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_checkpoint_copy_keeps_deletion_behind_provider_settlement() {
+        let inner = Arc::new(FakeGcs::new());
+        let user_id = "cancelled-checkpoint-save-user";
+        let day_one = 1_767_268_800;
+        let day_two = 1_767_355_200;
+        let seed = store_with_checkpoint_time(Arc::clone(&inner), day_one);
+        write_and_save(&seed, user_id, "day one")
+            .await
+            .expect("seed user");
+        drop(seed);
+
+        let checkpoint =
+            legacy_recovery_checkpoint_name(user_id, UNIX_EPOCH + Duration::from_secs(day_two));
+        let blocked_database = Arc::new(BlockingPutGcs::copy_to(
+            Arc::clone(&inner),
+            checkpoint.clone(),
+        ));
+        let mut raw_store = make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked_database.clone(),
+            inner.clone(),
+            1,
+        );
+        raw_store.checkpoint_clock = Arc::new(move || UNIX_EPOCH + Duration::from_secs(day_two));
+        let store = Arc::new(raw_store);
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-02T00:00:00Z', 'checkpoint race')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("dirty checkpoint user");
+
+        let save_store = Arc::clone(&store);
+        let save = tokio::spawn(async move { save_store.save_user(user_id).await });
+        blocked_database.wait_until_blocked().await;
+        save.abort();
+        assert!(save
+            .await
+            .expect_err("save was not cancelled")
+            .is_cancelled());
+
+        blocked_database.release();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            inner.get_object(&checkpoint).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(matches!(
+            store.delete_user(user_id).await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyWriteIntentUnsettled,
+                ..
+            }))
+        ));
+        let expiry = sole_requesting_intent_expiry(&inner, user_id);
+        inner.set_provider_clock_millis(expiry + 1_000);
+        store
+            .delete_user(user_id)
+            .await
+            .expect("deletion failed after expired checkpoint-intent takeover");
+        assert!(matches!(
+            inner.get_object(&checkpoint).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(matches!(
+            inner.get_object(&gcs_object_name(user_id)).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletion_fence_wins_against_an_inflight_first_load() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingGetGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("load-race-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+
+        let load_store = Arc::clone(&store);
+        let load =
+            tokio::spawn(async move { load_store.with_user("load-race-user", |_| Ok(())).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            blocked.wait_until_blocked(),
+        )
+        .await
+        .expect("first load never reached GCS");
+
+        let delete_store = Arc::clone(&store);
+        let deletion =
+            tokio::spawn(async move { delete_store.delete_user("load-race-user").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store
+                    .registry
+                    .lock()
+                    .await
+                    .blocked_users
+                    .contains("load-race-user")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deletion fence was not installed");
+
+        blocked.release();
+        assert!(matches!(
+            load.await.expect("load task panicked"),
+            Err(EnclaveError::Auth(_))
+        ));
+        deletion
+            .await
+            .expect("deletion task panicked")
+            .expect("deletion failed");
+        let registry = store.registry.lock().await;
+        assert!(registry.blocked_users.contains("load-race-user"));
+        assert!(registry.open_users.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_eviction_preserves_the_live_handle_and_unsaved_changes() {
+        let inner = Arc::new(FakeGcs::new());
+        let failing = Arc::new(FailPutOnceGcs {
+            inner: Arc::clone(&inner),
+            target: gcs_object_name("eviction-user"),
+            fail_once: AtomicBool::new(true),
+        });
+        let kms = Arc::new(FakeKms);
+        let store = make_store_with_limit(kms.clone(), failing.clone(), failing, 1);
+
+        store
+            .with_user("eviction-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'must survive')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate eviction victim");
+
+        assert!(matches!(
+            store.with_user("new-user", |_| Ok(())).await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        let count: i64 = store
+            .with_user("eviction-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("victim handle was discarded after failed eviction");
+        assert_eq!(count, 1);
+
+        store
+            .save_user("eviction-user")
+            .await
+            .expect("retry save should succeed");
+        let fresh = Store::new(kms, inner);
+        let persisted: i64 = fresh
+            .with_user("eviction-user", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("reload saved eviction victim");
+        assert_eq!(persisted, 1);
+    }
+
+    #[tokio::test]
+    async fn save_after_completed_intervening_eviction_is_idempotent_success() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let store = make_store_with_limit(kms.clone(), gcs.clone(), gcs.clone(), 1);
+
+        store
+            .with_user("evicted-before-save", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'already flushed')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate first user");
+
+        // With one slot, this cannot complete without flushing and dropping
+        // the first user's last strong actor reference.
+        store
+            .with_user("evicting-user", |_| Ok(()))
+            .await
+            .expect("evict first user");
+        assert!(store
+            .registry
+            .lock()
+            .await
+            .actors
+            .get("evicted-before-save")
+            .is_some_and(|actor| actor.upgrade().is_none()));
+
+        store
+            .save_user("evicted-before-save")
+            .await
+            .expect("intervening eviction already performed this save");
+        assert!(matches!(
+            store.save_user("never-opened-user").await,
+            Err(EnclaveError::NotFound)
+        ));
+
+        let fresh = Store::new(kms, gcs);
+        let persisted: i64 = fresh
+            .with_user("evicted-before-save", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .expect("reload eviction-flushed data");
+        assert_eq!(persisted, 1);
+    }
+
+    #[tokio::test]
+    async fn save_queued_behind_an_inflight_eviction_observes_its_flush() {
+        let inner = Arc::new(FakeGcs::new());
+        let blocked = Arc::new(BlockingPutGcs::new(
+            Arc::clone(&inner),
+            gcs_object_name("queued-save-user"),
+        ));
+        let store = Arc::new(make_store_with_limit(
+            Arc::new(FakeKms),
+            blocked.clone(),
+            blocked.clone(),
+            1,
+        ));
+        store
+            .with_user("queued-save-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-08-01T00:00:00Z', 'queued save')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mutate eviction victim");
+
+        let newcomer_store = Arc::clone(&store);
+        let newcomer = tokio::spawn(async move {
+            newcomer_store
+                .with_user("queued-new-user", |_| Ok(()))
+                .await
+        });
+        blocked.wait_until_blocked().await;
+
+        let save_store = Arc::clone(&store);
+        let queued_save =
+            tokio::spawn(async move { save_store.save_user("queued-save-user").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let save_has_actor = store
+                    .registry
+                    .lock()
+                    .await
+                    .actors
+                    .get("queued-save-user")
+                    .is_some_and(|actor| actor.strong_count() >= 3);
+                if save_has_actor {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("save never queued behind the evicting actor");
+
+        blocked.release();
+        newcomer
+            .await
+            .expect("newcomer task panicked")
+            .expect("newcomer load failed");
+        queued_save
+            .await
+            .expect("queued save task panicked")
+            .expect("eviction flush should satisfy queued save");
+    }
+
+    #[test]
+    fn clean_eviction_completion_registry_is_bounded() {
+        let mut registry = StoreRegistry {
+            actors: HashMap::new(),
+            open_users: HashMap::new(),
+            blocked_users: HashSet::new(),
+            recent_clean_evictions: HashMap::new(),
+            access_clock: 0,
+        };
+        for index in 0..100 {
+            registry.record_clean_eviction(&format!("user-{index}"), 1);
+        }
+        assert_eq!(registry.recent_clean_evictions.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn failed_deletion_durably_flushes_local_media_inventory_for_restart_retry() {
+        let database_gcs = Arc::new(FakeGcs::new());
+        let media_inner = Arc::new(FakeGcs::new());
+        let media_key = "media/local-only";
+        let failing_media = Arc::new(FailDeleteOnceGcs {
+            inner: Arc::clone(&media_inner),
+            target: media_key.to_string(),
+            fail_once: AtomicBool::new(true),
+            delete_calls: AtomicUsize::new(0),
+        });
+        failing_media
+            .put_object(media_key, b"ciphertext", "wrapped", 0)
+            .await
+            .expect("seed media object");
+
+        let store = make_store_with_limit(
+            Arc::new(FakeKms),
+            database_gcs.clone(),
+            failing_media.clone(),
+            1,
+        );
+        store
+            .with_user("delete-user", |conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+                conn.execute(
+                    "INSERT INTO media_objects \
+                     (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256) \
+                     VALUES ('local-asset','local-event','media/local-only', \
+                             'image/jpeg','jpeg',1,'local-sha')",
+                    [],
+                )?;
+                conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+                Ok(())
+            })
+            .await
+            .expect("record locally-only media key");
+
+        assert!(matches!(
+            store.delete_user("delete-user").await,
+            Err(EnclaveError::Gcs(_))
+        ));
+        {
+            let registry = store.registry.lock().await;
+            assert!(
+                registry.open_users.is_empty(),
+                "failed delete pinned capacity"
+            );
+        }
+
+        // The forced pre-delete snapshot is the durable inventory. A new Store
+        // must rederive and delete the locally-created key without relying on
+        // any process-local deletion state.
+        assert!(database_gcs
+            .get_object(&gcs_object_name("delete-user"))
+            .await
+            .is_ok());
+        drop(store);
+        let restarted =
+            make_store_with_limit(Arc::new(FakeKms), database_gcs, failing_media.clone(), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            restarted.delete_user("delete-user").await
+        })
+        .await
+        .expect("restart retry stalled")
+        .expect("restart retry lost local media inventory");
+        assert_eq!(failing_media.delete_calls.load(Ordering::SeqCst), 2);
+        assert!(!media_inner.objects.lock().unwrap().contains_key(media_key));
     }
 
     #[tokio::test]
@@ -2393,6 +10279,102 @@ pub(crate) mod tests {
             .await
             .expect("reload");
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn snapshot_metrics_use_pre_checkpoint_wal_as_changed_byte_proxy() {
+        let store = make_store();
+
+        // Establish a checkpointed baseline so schema creation/migration WAL
+        // frames do not become part of the changed-write assertion.
+        store
+            .with_user("metric-user", |_| Ok(()))
+            .await
+            .expect("load");
+        store.save_user("metric-user").await.expect("baseline save");
+
+        store
+            .with_user("metric-user", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) \
+                     VALUES ('2026-01-01T00:00:00Z', 'synthetic')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("write");
+
+        let wal_bytes_before_save = {
+            let actor = store.actor_for_access("metric-user").await.unwrap();
+            let state = actor.state.lock().await;
+            let handle = state.handle.as_ref().expect("open handle");
+            std::fs::metadata(sqlite_sidecar_path(&handle.temp_path, "-wal"))
+                .expect("WAL metadata")
+                .len()
+        };
+        assert!(wal_bytes_before_save > 0, "mutation must create WAL frames");
+
+        let before_changed = store.storage_metrics_snapshot();
+        store.save_user("metric-user").await.expect("changed save");
+        let after_changed = store.storage_metrics_snapshot();
+        assert_eq!(
+            after_changed.changed_wal_bytes_proxy.count,
+            before_changed.changed_wal_bytes_proxy.count + 1
+        );
+        assert_eq!(
+            after_changed
+                .changed_wal_bytes_proxy
+                .sum
+                .saturating_sub(before_changed.changed_wal_bytes_proxy.sum),
+            wal_bytes_before_save
+        );
+        assert_eq!(
+            after_changed.write_amplification_ppm.count,
+            before_changed.write_amplification_ppm.count + 1
+        );
+
+        // A second save with forced dirty marking (e.g. with_user_mut without
+        // SQL changes) still rewrites the complete encrypted database. Its
+        // observed WAL denominator is zero, so the amplification sample must
+        // be +Inf (the final bucket only).
+        store
+            .with_user_mut("metric-user", |_| Ok(()))
+            .await
+            .expect("mut access without sql");
+
+        let wal_bytes_before_noop = {
+            let actor = store.actor_for_access("metric-user").await.unwrap();
+            let state = actor.state.lock().await;
+            let handle = state.handle.as_ref().expect("open handle");
+            std::fs::metadata(sqlite_sidecar_path(&handle.temp_path, "-wal"))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(wal_bytes_before_noop, 0);
+
+        let before_noop = store.storage_metrics_snapshot();
+        store.save_user("metric-user").await.expect("no-op save");
+        let after_noop = store.storage_metrics_snapshot();
+        assert_eq!(
+            after_noop.changed_wal_bytes_proxy.count,
+            before_noop.changed_wal_bytes_proxy.count + 1
+        );
+        assert_eq!(
+            after_noop.changed_wal_bytes_proxy.sum,
+            before_noop.changed_wal_bytes_proxy.sum
+        );
+        assert_eq!(after_noop.write_amplification_ppm.max, u64::MAX);
+        for index in 0..AMPLIFICATION_PPM_BUCKET_UPPER_BOUNDS.len() - 1 {
+            assert_eq!(
+                after_noop.write_amplification_ppm.cumulative_buckets[index],
+                before_noop.write_amplification_ppm.cumulative_buckets[index]
+            );
+        }
+        assert_eq!(
+            after_noop.write_amplification_ppm.cumulative_buckets[9],
+            before_noop.write_amplification_ppm.cumulative_buckets[9] + 1
+        );
     }
 
     #[tokio::test]
@@ -2518,6 +10500,312 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn delete_user_removes_every_exact_index_generation() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store.with_user("alice", |_| Ok(())).await.unwrap();
+        store.save_user("alice").await.unwrap();
+        store
+            .with_user("alice", |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata (key,value) VALUES ('second','generation')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+
+        let exact = gcs_object_name("alice");
+        // Current save policy prunes older versions. Retain one explicit
+        // noncurrent generation so this test covers exact-version deletion.
+        let live = gcs.get_object(&exact).await.unwrap();
+        gcs.put_object(
+            &exact,
+            &live.ciphertext,
+            &live.wrapped_dek_b64,
+            live.generation,
+        )
+        .await
+        .unwrap();
+        let similarly_prefixed = format!("{exact}-other");
+        gcs.put_object(&similarly_prefixed, b"keep", "wrapped", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            list_all_object_versions(gcs.as_ref(), &exact)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|version| version.name == exact)
+                .count(),
+            2
+        );
+
+        store.delete_user("alice").await.unwrap();
+
+        assert!(list_all_object_versions(gcs.as_ref(), &exact)
+            .await
+            .unwrap()
+            .iter()
+            .all(|version| version.name != exact));
+        assert!(gcs.get_object(&similarly_prefixed).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_only_lru_churn_never_writes_clean_user_indexes() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(FakeKms);
+        let mut writer = Store::new(kms.clone(), gcs.clone());
+        writer.max_open = 2;
+        let users = (0..20)
+            .map(|index| format!("idle-{index}"))
+            .collect::<Vec<_>>();
+
+        for user_id in &users {
+            writer
+                .with_user(user_id, |conn| {
+                    conn.execute(
+                        "INSERT INTO app_metadata (key,value) VALUES ('created','yes')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            writer.save_user(user_id).await.unwrap();
+        }
+        for user_id in &users {
+            assert_eq!(gcs.exact_generation_count(&gcs_object_name(user_id)), 1);
+        }
+
+        let mut scanner = Store::new(kms, gcs.clone());
+        scanner.max_open = 2;
+        for _ in 0..3 {
+            for user_id in &users {
+                let value: String = scanner
+                    .read_user(user_id, |conn| {
+                        Ok(conn.query_row(
+                            "SELECT value FROM app_metadata WHERE key='created'",
+                            [],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(value, "yes");
+            }
+        }
+        for user_id in &users {
+            assert_eq!(gcs.exact_generation_count(&gcs_object_name(user_id)), 1);
+        }
+
+        scanner
+            .with_user(&users[0], |conn| {
+                conn.execute(
+                    "UPDATE app_metadata SET value='changed' WHERE key='created'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        scanner.save_user(&users[0]).await.unwrap();
+        assert_eq!(gcs.exact_generation_count(&gcs_object_name(&users[0])), 2);
+        for user_id in &users[1..] {
+            assert_eq!(gcs.exact_generation_count(&gcs_object_name(user_id)), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_waits_for_inflight_upload_and_sweeps_unreferenced_media_prefix() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
+        let user_id = "capture-delete-race-user";
+        store.with_user(user_id, |_| Ok(())).await.unwrap();
+        store.save_user(user_id).await.unwrap();
+
+        // Model an upload that passed preflight and placed the encrypted object
+        // but has not yet recorded its database row. Deletion must wait at the
+        // same lifecycle fence, then remove the whole namespaced prefix even
+        // though this object is absent from the DB snapshot.
+        let upload_guard = store.lock_user_lifecycle(user_id).await.unwrap();
+        let object_key = format!("raw/{user_id}/asset.enc");
+        store
+            .put_media(&object_key, b"encrypted-media", "wrapped")
+            .await
+            .unwrap();
+        let deleting_store = Arc::clone(&store);
+        let deletion = tokio::spawn(async move { deleting_store.delete_user(user_id).await });
+        tokio::task::yield_now().await;
+        assert!(!deletion.is_finished());
+
+        drop(upload_guard);
+        deletion.await.unwrap().unwrap();
+
+        assert!(
+            list_all_object_versions(gcs.as_ref(), &format!("raw/{user_id}/"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_deletion_scans_both_media_buckets_without_cross_user_deletion() {
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            indexes,
+            current.clone(),
+            legacy.clone(),
+        );
+        write_and_save(&store, "alice", "init").await.unwrap();
+        for (gcs, name) in [
+            (&current, "raw/alice/current.enc"),
+            (&current, "media/alice/current-legacy-name.enc"),
+            (&legacy, "raw/alice/legacy-name.enc"),
+            (&legacy, "media/alice/legacy.enc"),
+        ] {
+            gcs.put_object(name, b"ciphertext", "wrapped", 0)
+                .await
+                .unwrap();
+        }
+        legacy
+            .put_object("raw/bob/keep.enc", b"other-user", "wrapped", 0)
+            .await
+            .unwrap();
+        current
+            .put_object("raw/bob/current-keep.enc", b"other-user", "wrapped", 0)
+            .await
+            .unwrap();
+
+        store.delete_user("alice").await.unwrap();
+        for (gcs, prefix) in [
+            (&current, "raw/alice/"),
+            (&current, "media/alice/"),
+            (&legacy, "raw/alice/"),
+            (&legacy, "media/alice/"),
+        ] {
+            assert!(list_all_object_versions(gcs.as_ref(), prefix)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert!(legacy.get_object("raw/bob/keep.enc").await.is_ok());
+        assert!(current.get_object("raw/bob/current-keep.enc").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_media_soft_delete_blocks_physical_account_completion() {
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store =
+            Store::new_with_media_and_legacy(Arc::new(FakeKms), indexes, current, legacy.clone());
+        write_and_save(&store, "alice", "init").await.unwrap();
+        legacy
+            .put_object("raw/alice/retained.enc", b"ciphertext", "wrapped", 0)
+            .await
+            .unwrap();
+        legacy.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                ..
+            }))
+        ));
+        assert!(legacy.soft_deleted_count("raw/alice/") > 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_cost_tracks_live_generations_not_pruned_media_ledger_rows() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let user_id = "large-pruned-ledger-user";
+        store
+            .with_user(user_id, |conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+                let tx = conn.unchecked_transaction()?;
+                for index in 0..2_000 {
+                    tx.execute(
+                        "INSERT INTO media_objects
+                         (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256,
+                          processing_state,deleted_at)
+                         VALUES (?1,?2,?3,'audio/m4a','aac',1,?4,'pruned',
+                                 '2026-08-09T12:00:00.000Z')",
+                        rusqlite::params![
+                            format!("pruned-asset-{index}"),
+                            format!("pruned-event-{index}"),
+                            format!("raw/{user_id}/pruned-{index}.enc"),
+                            format!("{index:064x}"),
+                        ],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO media_objects
+                     (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256,
+                      processing_state)
+                     VALUES ('legacy-asset','legacy-event','legacy/object.enc',
+                             'audio/m4a','aac',1,?1,'ready')",
+                    ["f".repeat(64)],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(user_id).await.unwrap();
+
+        for (name, generations) in [
+            (format!("raw/{user_id}/live.enc"), 2),
+            (format!("media/{user_id}/screen.enc"), 1),
+            ("legacy/object.enc".to_string(), 2),
+        ] {
+            for generation in 0..generations {
+                store
+                    .put_media_at_generation(&name, b"ciphertext", "wrapped", generation)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        gcs.reset_operation_counts();
+        store.delete_user(user_id).await.unwrap();
+        let (list_calls, delete_calls) = gcs.operation_counts();
+        assert!(
+            list_calls <= 12,
+            "pruned ledger rows caused {list_calls} GCS listings"
+        );
+        assert_eq!(delete_calls, 6);
+        for prefix in [
+            format!("raw/{user_id}/"),
+            format!("media/{user_id}/"),
+            "legacy/object.enc".to_string(),
+            gcs_object_name(user_id),
+        ] {
+            assert!(
+                list_all_object_versions(gcs.as_ref(), &prefix)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "deletion left generations under {prefix}"
+            );
+        }
+
+        gcs.reset_operation_counts();
+        store.delete_user(user_id).await.unwrap();
+        let (retry_lists, retry_deletes) = gcs.operation_counts();
+        assert!(retry_lists <= 6);
+        assert_eq!(retry_deletes, 0);
+    }
+
     /// Deleting a user that was never seen must succeed without error (idempotent).
     #[tokio::test]
     async fn delete_user_never_seen_is_ok() {
@@ -2527,6 +10815,713 @@ pub(crate) mod tests {
             result.is_ok(),
             "delete_user on never-seen user should be Ok, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn account_deletion_paginates_and_removes_all_user_generations_only() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        write_and_save(&store, "alice", "init").await.unwrap();
+        let index = gcs_object_name("alice");
+        let live = gcs.get_object(&index).await.unwrap();
+        gcs.put_object(
+            &index,
+            &live.ciphertext,
+            &live.wrapped_dek_b64,
+            live.generation,
+        )
+        .await
+        .unwrap();
+        for name in ["raw/alice/a.enc", "raw/alice/b.enc"] {
+            let first = gcs
+                .put_object(name, b"ciphertext", "wrapped", 0)
+                .await
+                .unwrap();
+            gcs.put_object(name, b"ciphertext-2", "wrapped", first)
+                .await
+                .unwrap();
+        }
+        let checkpoint_source = gcs.get_object(&index).await.unwrap();
+        let checkpoint = "legacy-recovery/alice/day-1.db.enc";
+        gcs.put_object(
+            checkpoint,
+            &checkpoint_source.ciphertext,
+            &checkpoint_source.wrapped_dek_b64,
+            0,
+        )
+        .await
+        .unwrap();
+        gcs.put_object("raw/alice-other/keep.enc", b"other", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.put_object("raw/bob/keep.enc", b"other", "wrapped", 0)
+            .await
+            .unwrap();
+
+        store.delete_user("alice").await.unwrap();
+
+        assert_eq!(gcs.version_count(&index), 0);
+        assert_eq!(gcs.version_count("raw/alice/"), 0);
+        assert_eq!(gcs.version_count("legacy-recovery/alice/"), 0);
+        assert_eq!(gcs.version_count("raw/bob/"), 1);
+        assert_eq!(gcs.version_count("raw/alice-other/"), 1);
+    }
+
+    #[tokio::test]
+    async fn account_deletion_retries_after_exact_generation_failure_and_not_found() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        write_and_save(&store, "alice", "init").await.unwrap();
+        let media = "raw/alice/retry.enc";
+        let first = gcs.put_object(media, b"one", "wrapped", 0).await.unwrap();
+        let second = gcs
+            .put_object(media, b"two", "wrapped", first)
+            .await
+            .unwrap();
+        gcs.fail_next_generation_delete(media, second);
+
+        assert!(store.delete_user("alice").await.is_err());
+        // The first generation may already be gone; retry must tolerate it.
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(gcs.version_count(media), 0);
+    }
+
+    #[tokio::test]
+    async fn preexisting_soft_residue_does_not_block_live_version_cleanup() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        write_and_save(&store, "alice", "v1").await.unwrap();
+        let index = gcs_object_name("alice");
+        let old_generation = gcs.get_object(&index).await.unwrap().generation;
+        write_and_save(&store, "alice", "v2").await.unwrap();
+        gcs.soft_delete_generation(&index, old_generation);
+        gcs.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                hard_delete_time: Some(ref deadline),
+                ..
+            })) if deadline == "2099-01-01T00:00:00.000Z"
+        ));
+        assert_eq!(gcs.version_count(&index), 0);
+        assert_eq!(gcs.soft_deleted_count(&index), 2);
+    }
+
+    #[tokio::test]
+    async fn post_delete_soft_inventory_prevents_success_when_policy_is_enabled() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        write_and_save(&store, "alice", "init").await.unwrap();
+        gcs.put_object("raw/alice/capture.enc", b"media", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                hard_delete_time: Some(ref deadline),
+                ..
+            })) if deadline == "2099-01-01T00:00:00.000Z"
+        ));
+        assert!(gcs.soft_deleted_count(&gcs_object_name("alice")) > 0);
+        assert_eq!(gcs.soft_deleted_count("raw/alice/"), 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_retry_keeps_live_db_inventory_for_unscoped_media() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let media = "media/opaque-evidence-key";
+        store
+            .with_user("alice", |conn| insert_screenshot_evidence(conn, media))
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        let first = gcs.put_object(media, b"one", "wrapped", 0).await.unwrap();
+        let second = gcs
+            .put_object(media, b"two", "wrapped", first)
+            .await
+            .unwrap();
+        gcs.fail_next_generation_delete(media, second);
+
+        assert!(store.delete_user("alice").await.is_err());
+        assert_eq!(gcs.version_count(media), 1);
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(gcs.version_count(media), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_database_generation_inventories_removed_unscoped_evidence() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let media = "media/historical-only-evidence";
+        store
+            .with_user("alice", |conn| insert_screenshot_evidence(conn, media))
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        store
+            .with_user("alice", |conn| {
+                conn.execute("DELETE FROM screenshot_images", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        gcs.put_object(media, b"historical", "wrapped", 0)
+            .await
+            .unwrap();
+
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(gcs.version_count(media), 0);
+        assert_eq!(gcs.version_count(&gcs_object_name("alice")), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_unscoped_inventory_tracks_soft_delete_retention_in_both_media_buckets() {
+        let indexes = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            indexes.clone(),
+            current.clone(),
+            legacy.clone(),
+        );
+        let current_key = "unscoped/current-evidence.enc";
+        let legacy_key = "unscoped/legacy-evidence.enc";
+        store
+            .with_user("alice", |conn| {
+                insert_screenshot_evidence(conn, current_key)?;
+                conn.execute(
+                    "INSERT INTO screenshots(id,captured_at) VALUES (2,'2026-01-01T00:00:01Z')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO screenshot_images \
+                     (id,screenshot_id,episode_id,source_key,captured_at,object_key,mime_type,width,height,byte_length,sha256) \
+                     VALUES ('image-2',2,1,'source-2','2026-01-01T00:00:01Z',?1,'image/jpeg',1,1,1,?2)",
+                    rusqlite::params![legacy_key, "b".repeat(64)],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        store
+            .with_user("alice", |conn| {
+                conn.execute("DELETE FROM screenshot_images", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        current
+            .put_object(current_key, b"current", "wrapped", 0)
+            .await
+            .unwrap();
+        legacy
+            .put_object(legacy_key, b"legacy", "wrapped", 0)
+            .await
+            .unwrap();
+        current.set_soft_delete_enabled(true);
+        legacy.set_soft_delete_enabled(true);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::SoftDeleteRetention,
+                ..
+            }))
+        ));
+        assert_eq!(current.soft_deleted_count(current_key), 1);
+        assert_eq!(legacy.soft_deleted_count(legacy_key), 1);
+        assert!(indexes.version_count(&legacy_recovery_prefix("alice")) > 0);
+
+        current.expire_soft_deleted(current_key);
+        legacy.expire_soft_deleted(legacy_key);
+        store.delete_user("alice").await.unwrap();
+        assert_eq!(indexes.version_count(&gcs_object_name("alice")), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_generation_disappearing_after_inventory_fails_closed() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let media = "media/historical-race-evidence";
+        store
+            .with_user("alice", |conn| insert_screenshot_evidence(conn, media))
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        let index = gcs_object_name("alice");
+        let historical_generation = gcs.get_object(&index).await.unwrap().generation;
+        store
+            .with_user("alice", |conn| {
+                conn.execute("DELETE FROM screenshot_images", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("alice").await.unwrap();
+        gcs.put_object(media, b"historical", "wrapped", 0)
+            .await
+            .unwrap();
+        gcs.vanish_next_exact_generation_get(&index, historical_generation);
+
+        let deletion = store.delete_user("alice").await;
+        assert!(matches!(
+            deletion,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacyGenerationUnavailable,
+                ..
+            }))
+        ));
+        assert_eq!(gcs.version_count(media), 1);
+        assert_eq!(gcs.version_count(&index), 1);
+    }
+
+    #[tokio::test]
+    async fn unreadable_recovery_generation_keeps_deletion_incomplete() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        write_and_save(&store, "alice", "init").await.unwrap();
+        let recovery = "legacy-recovery/alice/unreadable.db.enc";
+        gcs.put_object(
+            recovery,
+            b"not-an-encrypted-database",
+            "not-a-wrapped-key",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let deletion = store.delete_user("alice").await;
+        assert!(
+            matches!(
+                deletion,
+                Err(EnclaveError::DeletionPending(DeletionPending {
+                    reason: DeletionPendingReason::LegacyInventoryIncomplete,
+                    ..
+                }))
+            ),
+            "unexpected deletion result: {deletion:?}"
+        );
+        assert_eq!(gcs.version_count(recovery), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_legacy_generation_fails_before_snapshot_download() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        write_and_save(&store, "alice", "init").await.unwrap();
+        let index = gcs_object_name("alice");
+        gcs.set_listed_size(&index, MAX_LEGACY_DELETION_SNAPSHOT_BYTES + 1);
+
+        assert!(matches!(
+            store.delete_user("alice").await,
+            Err(EnclaveError::DeletionPending(DeletionPending {
+                reason: DeletionPendingReason::LegacySnapshotTooLarge,
+                ..
+            }))
+        ));
+        assert_eq!(gcs.exact_generation_get_count(), 0);
+        assert_eq!(gcs.version_count(&index), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_version_cursor_fails_closed() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        for suffix in ["-a", "-b", "-c"] {
+            gcs.put_object(
+                &format!("indexes/alice.db.enc{suffix}"),
+                b"other",
+                "wrapped",
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        gcs.set_repeat_version_cursor(true);
+        assert!(matches!(
+            store
+                .delete_all_versions_for_name(&store.gcs, "indexes/alice.db.enc")
+                .await,
+            Err(EnclaveError::Gcs(message)) if message.contains("repeated")
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_soft_delete_cursor_fails_closed() {
+        let gcs = Arc::new(FakeGcs::new());
+        for suffix in ["-a", "-b", "-c"] {
+            let name = format!("indexes/alice.db.enc{suffix}");
+            let generation = gcs.put_object(&name, b"other", "wrapped", 0).await.unwrap();
+            gcs.soft_delete_generation(&name, generation);
+        }
+        gcs.set_soft_delete_enabled(true);
+        gcs.set_repeat_version_cursor(true);
+        assert!(matches!(
+            matching_soft_deleted_inventory(gcs.as_ref(), "indexes/alice.db.enc", true).await,
+            Err(EnclaveError::Gcs(message)) if message.contains("repeated")
+        ));
+    }
+
+    #[tokio::test]
+    async fn soft_deleted_inventory_preserves_latest_provider_deadline_across_pages() {
+        let gcs = Arc::new(FakeGcs::new());
+        gcs.set_soft_delete_enabled(true);
+        for (suffix, deadline) in [
+            ("a", "2026-08-12T00:00:00.000Z"),
+            ("b", "2026-08-14T00:00:00Z"),
+            ("c", "2026-08-13T00:00:00.000Z"),
+        ] {
+            let name = format!("raw/alice/{suffix}.enc");
+            let generation = gcs.put_object(&name, b"data", "wrapped", 0).await.unwrap();
+            gcs.set_soft_delete_hard_delete_time(Some(deadline));
+            gcs.soft_delete_generation(&name, generation);
+        }
+
+        let inventory = matching_soft_deleted_inventory(gcs.as_ref(), "raw/alice/", false)
+            .await
+            .unwrap();
+        assert!(inventory.found);
+        assert_eq!(
+            inventory.latest_hard_delete_time.as_deref(),
+            Some("2026-08-14T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn soft_delete_policy_disabled_400_is_empty_only_on_first_page() {
+        let body = br#"{"error":{"code":400,"errors":[{"reason":"invalidArgument"}]}}"#;
+        let first = decode_soft_deleted_list_response(reqwest::StatusCode::BAD_REQUEST, body, true)
+            .unwrap();
+        assert!(first.versions.is_empty());
+        assert!(
+            decode_soft_deleted_list_response(reqwest::StatusCode::BAD_REQUEST, body, false,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn soft_delete_listing_decodes_provider_hard_delete_time() {
+        let body = br#"{"items":[{"name":"raw/alice/a.enc","generation":"7","size":"12","hardDeleteTime":"2026-08-14T00:00:00.000Z"}]}"#;
+        let page = decode_soft_deleted_list_response(reqwest::StatusCode::OK, body, true).unwrap();
+        assert_eq!(
+            page.versions[0].hard_delete_time.as_deref(),
+            Some("2026-08-14T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn production_exact_generation_download_maps_second_window_404_to_not_found() {
+        assert!(matches!(
+            exact_generation_download_status(reqwest::StatusCode::NOT_FOUND),
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(exact_generation_download_status(reqwest::StatusCode::OK).is_ok());
+        assert!(exact_generation_download_status(reqwest::StatusCode::BAD_GATEWAY).is_ok());
+    }
+
+    #[test]
+    fn provider_date_parser_fails_closed_on_missing_malformed_or_duplicate_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(provider_date_millis(&headers).is_err());
+        headers.insert(
+            reqwest::header::DATE,
+            reqwest::header::HeaderValue::from_static("not-a-date"),
+        );
+        assert!(provider_date_millis(&headers).is_err());
+        headers.insert(
+            reqwest::header::DATE,
+            reqwest::header::HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        headers.append(
+            reqwest::header::DATE,
+            reqwest::header::HeaderValue::from_static("Sun, 06 Nov 1994 08:49:38 GMT"),
+        );
+        assert!(provider_date_millis(&headers).is_err());
+    }
+
+    #[test]
+    fn identity_rebind_fence_name_is_canonical_deterministic_and_opaque() {
+        let user_id = "legacy-visible-user-id";
+        let name = test_identity_rebind_fence_object_name(user_id);
+        assert_eq!(name, test_identity_rebind_fence_object_name(user_id));
+        assert_ne!(
+            name,
+            test_identity_rebind_fence_object_name("different-user-id")
+        );
+        assert_ne!(
+            name,
+            identity_rebind_fence_object_name_with_key(&[0xa5; 32], user_id)
+        );
+        assert!(is_canonical_identity_rebind_fence_object_name(&name));
+        assert!(!name.contains(user_id));
+        assert!(!is_canonical_identity_rebind_fence_object_name(
+            "control/identity-rebind-fences/legacy-visible-user-id"
+        ));
+        assert!(!is_canonical_identity_rebind_fence_object_name(
+            "control/identity-rebind-fences/fence_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
+    }
+
+    #[tokio::test]
+    async fn production_live_listing_uses_configured_endpoint_and_exact_shape() {
+        use axum::{
+            extract::Request,
+            http::{header, Method, StatusCode},
+            response::IntoResponse,
+            routing::any,
+            Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let listing_hits = Arc::new(AtomicUsize::new(0));
+        let unexpected_hits = Arc::new(AtomicUsize::new(0));
+        let listing_hits_for_app = Arc::clone(&listing_hits);
+        let unexpected_hits_for_app = Arc::clone(&unexpected_hits);
+        let app = Router::new().fallback(any(move |request: Request| {
+            let listing_hits = Arc::clone(&listing_hits_for_app);
+            let unexpected_hits = Arc::clone(&unexpected_hits_for_app);
+            async move {
+                match request.uri().path() {
+                    "/computeMetadata/v1/instance/service-accounts/default/token" => {
+                        Json(json!({"access_token": "test-token"})).into_response()
+                    }
+                    "/storage/v1/b/test-bucket/o" => {
+                        assert_eq!(request.method(), Method::GET);
+                        assert_eq!(
+                            request.headers().get(header::AUTHORIZATION).unwrap(),
+                            "Bearer test-token"
+                        );
+                        let query = request.uri().query().unwrap();
+                        assert!(query.contains("maxResults=1000"));
+                        assert!(query.contains("prefix=control%2Flegacy%20write%2F"));
+                        assert!(query.contains("pageToken=cursor%2F2"));
+                        assert!(!query.contains("versions="));
+                        listing_hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "items": [{
+                                "name": "control/legacy write/intent_1",
+                                "generation": "7",
+                                "size": "12"
+                            }]
+                        }))
+                        .into_response()
+                    }
+                    _ => {
+                        unexpected_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = GcpGcsClient::for_test_endpoint("test-bucket".into(), endpoint);
+        let page = client
+            .list_live_objects("control/legacy write/", Some("cursor/2"))
+            .await
+            .unwrap();
+        assert_eq!(page.versions.len(), 1);
+        assert_eq!(page.versions[0].generation, 7);
+        assert_eq!(listing_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(unexpected_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn production_trusted_time_is_read_only_and_rejects_provider_regression() {
+        use axum::{
+            extract::Request,
+            http::{header, HeaderValue, Method, StatusCode},
+            response::IntoResponse,
+            routing::any,
+            Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let metadata_hits = Arc::new(AtomicUsize::new(0));
+        let mutation_hits = Arc::new(AtomicUsize::new(0));
+        let metadata_hits_for_app = Arc::clone(&metadata_hits);
+        let mutation_hits_for_app = Arc::clone(&mutation_hits);
+        let app = Router::new().fallback(any(move |request: Request| {
+            let metadata_hits = Arc::clone(&metadata_hits_for_app);
+            let mutation_hits = Arc::clone(&mutation_hits_for_app);
+            async move {
+                match request.uri().path() {
+                    "/computeMetadata/v1/instance/service-accounts/default/token" => {
+                        Json(json!({"access_token": "test-token"})).into_response()
+                    }
+                    path if path.starts_with("/storage/v1/b/test-bucket/o/") => {
+                        assert_eq!(request.method(), Method::GET);
+                        assert_eq!(
+                            request.headers().get(header::AUTHORIZATION).unwrap(),
+                            "Bearer test-token"
+                        );
+                        let hit = metadata_hits.fetch_add(1, Ordering::SeqCst);
+                        let date = if hit == 0 {
+                            "Sun, 06 Nov 1994 08:49:37 GMT"
+                        } else {
+                            "Sun, 06 Nov 1994 08:49:36 GMT"
+                        };
+                        let mut response = Json(json!({"generation": "7"})).into_response();
+                        response
+                            .headers_mut()
+                            .insert(header::DATE, HeaderValue::from_static(date));
+                        response
+                    }
+                    _ => {
+                        mutation_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = GcpGcsClient::for_test_endpoint("test-bucket".into(), endpoint);
+        let authority = "control/legacy-write-intents/alice/intent_authority";
+        assert_eq!(
+            client.trusted_time_millis(authority, 7).await.unwrap(),
+            784_111_777_000
+        );
+        assert!(matches!(
+            client.trusted_time_millis(authority, 7).await,
+            Err(EnclaveError::Gcs(message)) if message.contains("regressed")
+        ));
+        assert_eq!(metadata_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(mutation_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn production_exact_generation_media_404_after_metadata_is_not_found() {
+        use axum::{
+            extract::Request, http::StatusCode, response::IntoResponse, routing::any, Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let metadata_hits = Arc::new(AtomicUsize::new(0));
+        let media_hits = Arc::new(AtomicUsize::new(0));
+        let metadata_hits_for_app = Arc::clone(&metadata_hits);
+        let media_hits_for_app = Arc::clone(&media_hits);
+        let app = Router::new().fallback(any(move |request: Request| {
+            let metadata_hits = Arc::clone(&metadata_hits_for_app);
+            let media_hits = Arc::clone(&media_hits_for_app);
+            async move {
+                match request.uri().path() {
+                    "/computeMetadata/v1/instance/service-accounts/default/token" => {
+                        Json(json!({"access_token": "test-token"})).into_response()
+                    }
+                    path if path.starts_with("/storage/v1/b/test-bucket/o/") => {
+                        metadata_hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "generation": "7",
+                            "size": "12",
+                            "updated": "2026-08-11T00:00:00.000Z",
+                            "crc32c": "test-crc32c",
+                            "metadata": {"x-kioku-wrapped-dek": "test-wrapped-dek"}
+                        }))
+                        .into_response()
+                    }
+                    path if path.starts_with("/download/storage/v1/b/test-bucket/o/") => {
+                        media_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = GcpGcsClient::for_test_endpoint("test-bucket".into(), endpoint);
+        let result = client
+            .get_object_generation("indexes/opaque.db.enc", 7)
+            .await;
+
+        assert!(matches!(result, Err(EnclaveError::NotFound)));
+        assert_eq!(metadata_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(media_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn production_exact_generation_metadata_404_is_not_found_without_download() {
+        use axum::{
+            extract::Request, http::StatusCode, response::IntoResponse, routing::any, Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let media_hits = Arc::new(AtomicUsize::new(0));
+        let media_hits_for_app = Arc::clone(&media_hits);
+        let app = Router::new().fallback(any(move |request: Request| {
+            let media_hits = Arc::clone(&media_hits_for_app);
+            async move {
+                match request.uri().path() {
+                    "/computeMetadata/v1/instance/service-accounts/default/token" => {
+                        Json(json!({"access_token": "test-token"})).into_response()
+                    }
+                    path if path.starts_with("/storage/v1/b/test-bucket/o/") => {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                    path if path.starts_with("/download/storage/v1/b/test-bucket/o/") => {
+                        media_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = GcpGcsClient::for_test_endpoint("test-bucket".into(), endpoint);
+        let result = client
+            .get_object_generation("indexes/opaque.db.enc", 7)
+            .await;
+
+        assert!(matches!(result, Err(EnclaveError::NotFound)));
+        assert_eq!(media_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn soft_delete_listing_does_not_mask_other_bad_requests() {
+        for body in [
+            br#"{"error":{"code":400,"errors":[{"reason":"badRequest"}]}}"#.as_slice(),
+            br#"{"error":{"code":400,"errors":[]}}"#.as_slice(),
+            br#"not-json"#.as_slice(),
+        ] {
+            assert!(decode_soft_deleted_list_response(
+                reqwest::StatusCode::BAD_REQUEST,
+                body,
+                true,
+            )
+            .is_err());
+        }
     }
 
     #[tokio::test]
@@ -2591,6 +11586,354 @@ pub(crate) mod tests {
         assert!(validate_user_id(&"a".repeat(MAX_USER_ID_LEN + 1)).is_err());
     }
 
+    #[test]
+    fn selected_evidence_media_key_is_validated_and_owner_scoped() {
+        let opaque_key = "0123456789abcdef0123456789abcdef";
+        let alice = selected_evidence_media_object_key("alice-1", opaque_key).unwrap();
+        let bob = selected_evidence_media_object_key("bob-2", opaque_key).unwrap();
+        assert_eq!(
+            alice,
+            "raw/alice-1/evidence/0123456789abcdef0123456789abcdef.enc"
+        );
+        assert_eq!(
+            bob,
+            "raw/bob-2/evidence/0123456789abcdef0123456789abcdef.enc"
+        );
+        assert_ne!(alice, bob, "owners must never share an evidence prefix");
+
+        for invalid in [
+            "",
+            "0123456789abcdef0123456789abcde",   // short
+            "0123456789abcdef0123456789abcdef0", // long
+            "0123456789ABCDEF0123456789ABCDEF",  // uppercase
+            "0123456789abcdef0123456789abcde/",  // path separator
+        ] {
+            assert!(
+                selected_evidence_media_object_key("alice-1", invalid).is_err(),
+                "opaque key {invalid:?} should be rejected"
+            );
+        }
+        assert!(selected_evidence_media_object_key("alice/../bob", opaque_key).is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_evidence_media_key_writes_reads_and_deletes_with_bound_context() {
+        let user_id = "selected-evidence-owner";
+        let object_key =
+            selected_evidence_media_object_key(user_id, "0123456789abcdef0123456789abcdef")
+                .unwrap();
+        let store = make_store();
+        let (dek, wrapped_dek) = generate_and_wrap_dek(store.kms.as_ref()).await.unwrap();
+        let ciphertext = encrypt_bound_blob(
+            &dek,
+            b"selected screenshot evidence",
+            &media_blob_context(user_id, &object_key),
+        )
+        .unwrap();
+
+        store
+            .put_media(&object_key, &ciphertext, &wrapped_dek)
+            .await
+            .unwrap();
+        let stored = store.get_media(&object_key).await.unwrap();
+        let opened = decrypt_bound_blob(
+            &dek,
+            &stored.ciphertext,
+            &media_blob_context(user_id, &object_key),
+        )
+        .unwrap();
+        assert_eq!(opened.plaintext, b"selected screenshot evidence");
+        assert!(decrypt_bound_blob(
+            &dek,
+            &stored.ciphertext,
+            &media_blob_context("other-owner", &object_key),
+        )
+        .is_err());
+
+        store.delete_media(&object_key).await.unwrap();
+        assert!(matches!(
+            store.get_media(&object_key).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_media_uses_current_writes_then_exact_legacy_read_and_dual_delete() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let key = "raw/split-media-owner/asset.enc";
+
+        legacy
+            .put_object(key, b"legacy", "legacy-wrapped", 0)
+            .await
+            .unwrap();
+        let fallback = store.get_media(key).await.unwrap();
+        assert_eq!(fallback.ciphertext, b"legacy");
+
+        store
+            .put_media(key, b"current", "current-wrapped")
+            .await
+            .unwrap();
+        let preferred = store.get_media(key).await.unwrap();
+        assert_eq!(preferred.ciphertext, b"current");
+        assert_eq!(
+            current.get_object(key).await.unwrap().ciphertext,
+            b"current"
+        );
+        assert_eq!(legacy.get_object(key).await.unwrap().ciphertext, b"legacy");
+
+        store.delete_media(key).await.unwrap();
+        assert!(matches!(
+            current.get_object(key).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(matches!(
+            legacy.get_object(key).await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_media_does_not_fallback_after_current_provider_error() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let key = "raw/split-media-owner/provider-error.enc";
+        legacy
+            .put_object(key, b"legacy", "legacy-wrapped", 0)
+            .await
+            .unwrap();
+        current.fail_next_get(EnclaveError::Gcs("current media unavailable".into()));
+
+        assert!(matches!(
+            store.get_media(key).await,
+            Err(EnclaveError::Gcs(message)) if message == "current media unavailable"
+        ));
+        assert_eq!(
+            legacy.live_get_count(),
+            0,
+            "legacy must not mask current errors"
+        );
+    }
+
+    async fn retained_media_ciphertext(
+        store: &Store,
+        user_id: &str,
+        object_key: &str,
+        plaintext: &[u8],
+    ) -> (Vec<u8>, String, String) {
+        let (dek, wrapped_dek) = generate_and_wrap_dek(store.kms.as_ref()).await.unwrap();
+        let ciphertext =
+            encrypt_bound_blob(&dek, plaintext, &media_blob_context(user_id, object_key)).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(plaintext));
+        (ciphertext, wrapped_dek, sha256)
+    }
+
+    #[tokio::test]
+    async fn retained_media_deletes_each_providers_own_unequal_generation() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let user_id = "retention-legacy-higher";
+        let key = format!("raw/{user_id}/asset.enc");
+        let (ciphertext, wrapped_dek, sha256) =
+            retained_media_ciphertext(&store, user_id, &key, b"same logical media").await;
+        let current_generation = current
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let legacy_seed = legacy
+            .put_object(&key, b"older unrelated", "wrapped", 0)
+            .await
+            .unwrap();
+        let legacy_generation = legacy
+            .put_object(&key, &ciphertext, &wrapped_dek, legacy_seed)
+            .await
+            .unwrap();
+        assert!(legacy_generation > current_generation);
+
+        store
+            .delete_retained_media(
+                user_id,
+                &key,
+                Some(current_generation),
+                Some("current"),
+                &sha256,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(current.version_count(&key), 0);
+        assert_eq!(
+            legacy.version_count(&key),
+            1,
+            "unrelated legacy history remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrated_retention_row_without_provenance_authenticates_each_live_generation() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let user_id = "retention-migrated-row";
+        let key = format!("raw/{user_id}/asset.enc");
+        let (ciphertext, wrapped_dek, sha256) =
+            retained_media_ciphertext(&store, user_id, &key, b"migrated logical media").await;
+        let seed_generation = current
+            .put_object(&key, b"older unrelated", "wrapped", 0)
+            .await
+            .unwrap();
+        let current_generation = current
+            .put_object(&key, &ciphertext, &wrapped_dek, seed_generation)
+            .await
+            .unwrap();
+        let legacy_generation = legacy
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        assert_ne!(current_generation, legacy_generation);
+
+        store
+            .delete_retained_media(user_id, &key, None, None, &sha256)
+            .await
+            .unwrap();
+
+        assert_eq!(current.version_count(&key), 1);
+        assert_eq!(legacy.version_count(&key), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_media_never_deletes_newer_unverified_legacy_generation() {
+        let index = Arc::new(FakeGcs::new());
+        let current = Arc::new(FakeGcs::new());
+        let legacy = Arc::new(FakeGcs::new());
+        let store = Store::new_with_media_and_legacy(
+            Arc::new(FakeKms),
+            index,
+            current.clone(),
+            legacy.clone(),
+        );
+        let user_id = "retention-newer-legacy";
+        let key = format!("raw/{user_id}/asset.enc");
+        let (ciphertext, wrapped_dek, sha256) =
+            retained_media_ciphertext(&store, user_id, &key, b"retained logical media").await;
+        let current_generation = current
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let legacy_generation = legacy
+            .put_object(&key, &ciphertext, &wrapped_dek, 0)
+            .await
+            .unwrap();
+        let (newer_ciphertext, newer_wrapped_dek, _) =
+            retained_media_ciphertext(&store, user_id, &key, b"newer independent media").await;
+        let newer_generation = legacy
+            .put_object(
+                &key,
+                &newer_ciphertext,
+                &newer_wrapped_dek,
+                legacy_generation,
+            )
+            .await
+            .unwrap();
+
+        assert!(store
+            .delete_retained_media(
+                user_id,
+                &key,
+                Some(current_generation),
+                Some("current"),
+                &sha256,
+            )
+            .await
+            .is_err());
+        assert_eq!(current.version_count(&key), 1);
+        assert_eq!(legacy.version_count(&key), 2);
+        assert_eq!(legacy.generation(&key), Some(newer_generation));
+    }
+
+    #[test]
+    fn migrations_install_cloud_capture_schema_and_media_cleanup_finds_every_object() {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let media_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_objects'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(media_table, 1);
+
+        conn.execute(
+            "INSERT INTO capture_sessions \
+             (id,device_id,install_id,started_at,last_event_at,schema_version) \
+             VALUES ('session','device','install','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z',2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_streams (id,capture_session_id,device_id,stream_kind) \
+             VALUES ('stream','session','device','mic')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_events \
+             (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
+              source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes, \
+              clock_uncertainty_ms,asset_id,manifest_digest) \
+             VALUES ('event','device','install','session','stream','mic',0, \
+                     '2026-01-01T00:00:00Z','1','2026-01-01T00:00:00Z', \
+                     '2026-01-01T00:00:01Z','UTC',0,1,'asset', \
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_objects \
+             (asset_id,event_id,object_key,mime_type,codec,byte_length,sha256) \
+             VALUES ('asset','event','raw/cloud','audio/m4a','aac',1, \
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            historical_media_keys(&conn, "owner").unwrap(),
+            vec!["raw/cloud".to_string()]
+        );
+    }
+
     /// A traversal-style user_id must be rejected by the store itself before
     /// any temp file or GCS object name is derived (defense in depth).
     #[tokio::test]
@@ -2631,6 +11974,19 @@ pub(crate) mod tests {
             .await
             .expect("write");
         store.save_user(user_id).await.expect("save");
+        // The initial create has no previous generation to protect. Its first
+        // overwrite establishes the daily recovery copy.
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES ('2026-01-01T00:00:01Z', 'y')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("second write");
+        store.save_user(user_id).await.expect("second save");
 
         let objects = gcs.objects.lock().unwrap();
         let expected = format!("indexes/{user_id}.db.enc");
@@ -2639,7 +11995,24 @@ pub(crate) mod tests {
             "expected GCS object {expected:?}, found keys: {:?}",
             objects.keys().collect::<Vec<_>>()
         );
-        assert_eq!(objects.len(), 1, "no stray objects should be written");
+        assert_eq!(
+            objects.len(),
+            5,
+            "index, checkpoint, and three retained terminal intents should be written"
+        );
+        assert_eq!(
+            objects
+                .keys()
+                .filter(|name| name.starts_with(&legacy_write_intent_prefix(user_id)))
+                .count(),
+            3
+        );
+        assert!(
+            objects
+                .keys()
+                .any(|name| name.starts_with(&format!("legacy-recovery/{user_id}/"))),
+            "expected named daily recovery checkpoint"
+        );
     }
 
     #[tokio::test]
