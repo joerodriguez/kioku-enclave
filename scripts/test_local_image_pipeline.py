@@ -97,7 +97,12 @@ class LocalImagePipelineTests(unittest.TestCase):
         calls: list[list[str]] = []
         digest = "sha256:" + "a" * 64
 
-        def fake_run(command: list[str], *, capture: bool = False):
+        def fake_run(
+            command: list[str],
+            *,
+            capture: bool = False,
+            environment: dict[str, str] | None = None,
+        ):
             calls.append(command)
             if command[:2] == ["git", "status"]:
                 return SimpleNamespace(stdout="", stderr="")
@@ -111,6 +116,8 @@ class LocalImagePipelineTests(unittest.TestCase):
                 return SimpleNamespace(stdout="docker buildx v0.17.0\n")
             if command[:3] == ["docker", "buildx", "inspect"]:
                 return SimpleNamespace(stdout="Platforms: linux/amd64, linux/amd64/v2\n")
+            if command[:3] == ["docker", "context", "inspect"]:
+                return SimpleNamespace(stdout="unix:///private/tmp/kioku-docker.sock\n")
             if command[:2] == ["syft", "--version"]:
                 return SimpleNamespace(stdout="syft 1.49.0\n")
             if command[:2] == ["grype", "--version"]:
@@ -118,6 +125,8 @@ class LocalImagePipelineTests(unittest.TestCase):
             if command[:2] == ["gcloud", "version"]:
                 return SimpleNamespace(stdout="Google Cloud SDK 580.0.0\n")
             if command[0] == "syft":
+                self.assertEqual(environment, {"DOCKER_HOST": "unix:///private/tmp/kioku-docker.sock"})
+                self.assertTrue(command[1].startswith("docker:"))
                 output = next(value for value in command if value.startswith("spdx-json="))
                 Path(output.removeprefix("spdx-json=")).write_text(
                     json.dumps(
