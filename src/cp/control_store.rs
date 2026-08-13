@@ -23,7 +23,18 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::{
-    archive_v3::ArchiveId,
+    archive_v3::{
+        ArchiveId, KeyKind, KeyRegistryContext, LogicalLocation, ObjectContext, ObjectId,
+        ObjectRole,
+    },
+    archive_v3_lifecycle::{
+        ActiveCreateAdmission, ArtifactCreateState, BootstrapPlan, DeletionInventorySeal,
+        DurableBootstrapReservation, DurableInventoryPage, DurablePhysicalCompletion,
+        ErasedInventoryPages, InventoryPageReference, LifecycleCreateOutcome, LifecycleError,
+        PhysicalDeletionReceipt, PlannedArtifact, PreparedBootstrap, RecoveredBootstrap,
+        RecoveredDeletionLifecycle, LIFECYCLE_FORMAT_VERSION, MAX_BOOTSTRAP_WITNESS_BYTES,
+        MAX_LIFECYCLE_PAGES,
+    },
     cp::isotime,
     crypto::{decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, KmsClient},
     error::{EnclaveError, Result},
@@ -37,6 +48,9 @@ const MAX_RECORDING_LEASE_DENIALS_PER_USER: i64 = 100;
 const RECORDING_LEASE_DURATION_MS: i64 = 60_000;
 const MAX_ARCHIVE_DELETION_CURSOR_BYTES: usize = 4 * 1024;
 const MAX_ARCHIVE_ID_CANDIDATES: usize = 8;
+const LIFECYCLE_REGISTRY_ORDINAL: u32 = 0;
+const LIFECYCLE_ROOT_ORDINAL: u32 = 1;
+const LIFECYCLE_WITNESS_ORDINAL: u32 = 2;
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -236,6 +250,93 @@ CREATE TABLE IF NOT EXISTS archive_deletion_ledgers (
          AND length(deletion_fence_id) = 16 AND deletion_fence_id != zeroblob(16)
          AND tombstoned_at IS NOT NULL)
     )
+);
+-- Inactive archive-v3 create-ahead authority. This extends the existing
+-- archive binding/deletion ledger rather than inventing a second identity or
+-- tombstone source. Exact bootstrap payloads remain control-DEK encrypted and
+-- bounded until physical deletion makes erasure safe.
+CREATE TABLE IF NOT EXISTS archive_lifecycle_anchors (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_deletion_ledgers(archive_id),
+    format_version INTEGER NOT NULL CHECK (format_version = 1),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    state TEXT NOT NULL CHECK (state IN (
+        'reserved', 'objects_prepared', 'witness_prepared', 'witnessed',
+        'deletion_frozen', 'inventory_sealed', 'physical_complete'
+    )),
+    bootstrap_attempt_id BLOB NOT NULL CHECK (length(bootstrap_attempt_id) = 16 AND bootstrap_attempt_id != zeroblob(16)),
+    database_epoch BLOB NOT NULL CHECK (length(database_epoch) = 16 AND database_epoch != zeroblob(16)),
+    key_epoch BLOB NOT NULL CHECK (length(key_epoch) = 16 AND key_epoch != zeroblob(16)),
+    registry_object_id BLOB NOT NULL CHECK (length(registry_object_id) = 16 AND registry_object_id != zeroblob(16)),
+    root_object_id BLOB NOT NULL CHECK (length(root_object_id) = 16 AND root_object_id != zeroblob(16)),
+    wrapped_registry_hash BLOB CHECK (wrapped_registry_hash IS NULL OR length(wrapped_registry_hash) = 32),
+    wrapped_registry_len INTEGER CHECK (wrapped_registry_len IS NULL OR wrapped_registry_len > 0),
+    wrapped_registry_bytes BLOB,
+    root_envelope_hash BLOB CHECK (root_envelope_hash IS NULL OR length(root_envelope_hash) = 32),
+    root_envelope_len INTEGER CHECK (root_envelope_len IS NULL OR root_envelope_len > 0),
+    root_envelope_bytes BLOB,
+    witness_record_hash BLOB CHECK (witness_record_hash IS NULL OR length(witness_record_hash) = 32),
+    witness_record_len INTEGER CHECK (witness_record_len IS NULL OR witness_record_len > 0),
+    witness_record_bytes BLOB,
+    witness_create_state TEXT CHECK (witness_create_state IS NULL OR witness_create_state IN ('planned','outcome_unknown','created','confirmed_absent')),
+    witness_admission_revision INTEGER,
+    deletion_fence BLOB CHECK (deletion_fence IS NULL OR (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16))),
+    inventory_page_count INTEGER CHECK (inventory_page_count IS NULL OR inventory_page_count > 0),
+    inventory_artifact_count INTEGER CHECK (inventory_artifact_count IS NULL OR inventory_artifact_count > 0),
+    inventory_terminal_hash BLOB CHECK (inventory_terminal_hash IS NULL OR length(inventory_terminal_hash) = 32),
+    inventory_commitment BLOB CHECK (inventory_commitment IS NULL OR length(inventory_commitment) = 32),
+    inventory_seal_revision INTEGER CHECK (inventory_seal_revision IS NULL OR inventory_seal_revision > 0),
+    physical_provider_drain_commitment BLOB CHECK (physical_provider_drain_commitment IS NULL OR length(physical_provider_drain_commitment) = 32),
+    payload_erased INTEGER NOT NULL DEFAULT 0 CHECK (payload_erased IN (0, 1)),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (
+        (state = 'reserved' AND wrapped_registry_bytes IS NULL AND root_envelope_bytes IS NULL)
+        OR
+        (state IN ('objects_prepared','witness_prepared','witnessed')
+         AND length(wrapped_registry_bytes) = wrapped_registry_len
+         AND length(root_envelope_bytes) = root_envelope_len)
+        OR
+        (state IN ('deletion_frozen','inventory_sealed','physical_complete')
+         AND ((wrapped_registry_bytes IS NULL AND root_envelope_bytes IS NULL)
+              OR (length(wrapped_registry_bytes) = wrapped_registry_len
+                  AND length(root_envelope_bytes) = root_envelope_len)))
+    ),
+    CHECK (
+        (state IN ('reserved','objects_prepared') AND witness_record_bytes IS NULL)
+        OR
+        (state IN ('witness_prepared','witnessed')
+         AND length(witness_record_bytes) = witness_record_len
+         AND witness_create_state IS NOT NULL)
+        OR
+        (state IN ('deletion_frozen','inventory_sealed','physical_complete')
+         AND ((witness_record_bytes IS NULL AND witness_create_state IS NULL)
+              OR (length(witness_record_bytes) = witness_record_len
+                  AND witness_create_state IS NOT NULL)))
+    )
+);
+CREATE TABLE IF NOT EXISTS archive_lifecycle_bootstrap_creates (
+    archive_id BLOB NOT NULL REFERENCES archive_lifecycle_anchors(archive_id),
+    bootstrap_attempt_id BLOB NOT NULL CHECK (length(bootstrap_attempt_id) = 16),
+    artifact_ordinal INTEGER NOT NULL CHECK (artifact_ordinal IN (0, 1)),
+    canonical_key TEXT NOT NULL CHECK (length(canonical_key) > 0 AND length(canonical_key) <= 1024),
+    object_id BLOB NOT NULL CHECK (length(object_id) = 16 AND object_id != zeroblob(16)),
+    object_role INTEGER NOT NULL CHECK (object_role BETWEEN 1 AND 9),
+    ciphertext_hash BLOB NOT NULL CHECK (length(ciphertext_hash) = 32),
+    encoded_len INTEGER NOT NULL CHECK (encoded_len > 0),
+    create_state TEXT NOT NULL CHECK (create_state IN ('planned','outcome_unknown','created','confirmed_absent')),
+    admission_revision INTEGER,
+    PRIMARY KEY (archive_id, bootstrap_attempt_id, artifact_ordinal),
+    UNIQUE (archive_id, object_id)
+);
+CREATE TABLE IF NOT EXISTS archive_lifecycle_inventory_pages (
+    archive_id BLOB NOT NULL REFERENCES archive_lifecycle_anchors(archive_id),
+    page_ordinal INTEGER NOT NULL CHECK (page_ordinal >= 0),
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16 AND page_id != zeroblob(16)),
+    previous_hash BLOB NOT NULL CHECK (length(previous_hash) = 32),
+    page_hash BLOB NOT NULL CHECK (length(page_hash) = 32),
+    encoded_len INTEGER NOT NULL CHECK (encoded_len > 0 AND encoded_len <= 65536),
+    PRIMARY KEY (archive_id, page_ordinal),
+    UNIQUE (archive_id, page_id),
+    UNIQUE (archive_id, page_hash)
 );
 -- Durable authority for the legacy identity -> stable-ID transition. This row
 -- is encrypted inside the control blob and precedes every provider mutation.
@@ -815,6 +916,1471 @@ fn checked_archive_deletion_cursor(value: Option<Vec<u8>>) -> Result<Option<Vec<
         ));
     }
     Ok(value)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveLifecycleState {
+    Reserved,
+    ObjectsPrepared,
+    WitnessPrepared,
+    Witnessed,
+    DeletionFrozen,
+    InventorySealed,
+    PhysicalComplete,
+}
+
+/// Unforgeable outside this producer module. Archive lifecycle receipt
+/// factories require this witness that state was just validated in the
+/// encrypted control-store transaction/read snapshot.
+pub(crate) struct LifecyclePersistenceContext(());
+
+impl LifecyclePersistenceContext {
+    fn validated() -> Self {
+        Self(())
+    }
+}
+
+impl ArchiveLifecycleState {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "objects_prepared" => Ok(Self::ObjectsPrepared),
+            "witness_prepared" => Ok(Self::WitnessPrepared),
+            "witnessed" => Ok(Self::Witnessed),
+            "deletion_frozen" => Ok(Self::DeletionFrozen),
+            "inventory_sealed" => Ok(Self::InventorySealed),
+            "physical_complete" => Ok(Self::PhysicalComplete),
+            _ => Err(EnclaveError::Store(
+                "invalid archive lifecycle state".into(),
+            )),
+        }
+    }
+
+    const fn admits_creates(self) -> bool {
+        matches!(
+            self,
+            Self::ObjectsPrepared | Self::WitnessPrepared | Self::Witnessed
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ArchiveLifecycleAnchor {
+    plan: BootstrapPlan,
+    revision: u64,
+    state: ArchiveLifecycleState,
+}
+
+impl std::fmt::Debug for ArchiveLifecycleAnchor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ArchiveLifecycleAnchor(<opaque>)")
+    }
+}
+
+fn lifecycle_store_error(_error: LifecycleError) -> EnclaveError {
+    EnclaveError::Store("archive lifecycle ledger rejected durable state".into())
+}
+
+fn fixed_16(value: Vec<u8>) -> Result<[u8; 16]> {
+    let bytes: [u8; 16] = value
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("invalid archive lifecycle identifier".into()))?;
+    if bytes == [0; 16] {
+        return Err(EnclaveError::Store(
+            "invalid zero archive lifecycle identifier".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn fixed_32(value: Vec<u8>) -> Result<[u8; 32]> {
+    let bytes = fixed_32_allow_zero(value)?;
+    if bytes == [0; 32] {
+        return Err(EnclaveError::Store(
+            "invalid zero archive lifecycle commitment".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn fixed_32_allow_zero(value: Vec<u8>) -> Result<[u8; 32]> {
+    value
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("invalid archive lifecycle commitment".into()))
+}
+
+fn lifecycle_anchor_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<ArchiveLifecycleAnchor>> {
+    let row = conn
+        .query_row(
+            "SELECT format_version, revision, state, bootstrap_attempt_id,
+                    database_epoch, key_epoch, registry_object_id, root_object_id
+             FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            format_version,
+            revision,
+            state,
+            attempt,
+            database_epoch,
+            key_epoch,
+            registry_object_id,
+            root_object_id,
+        )| {
+            if format_version != i64::from(LIFECYCLE_FORMAT_VERSION) {
+                return Err(EnclaveError::Store(
+                    "unsupported archive lifecycle format".into(),
+                ));
+            }
+            let revision = u64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("invalid archive lifecycle revision".into()))?;
+            let plan = BootstrapPlan::new(
+                archive_id,
+                crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes(fixed_16(attempt)?)
+                    .map_err(lifecycle_store_error)?,
+                crate::archive_v3::DatabaseEpoch::from_bytes(fixed_16(database_epoch)?),
+                crate::archive_v3::KeyEpoch::from_bytes(fixed_16(key_epoch)?),
+                ObjectId::from_bytes(fixed_16(registry_object_id)?),
+                ObjectId::from_bytes(fixed_16(root_object_id)?),
+            )
+            .map_err(lifecycle_store_error)?;
+            Ok(ArchiveLifecycleAnchor {
+                plan,
+                revision,
+                state: ArchiveLifecycleState::from_db(&state)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn lifecycle_binding_for_plan_conn(conn: &Connection, plan: BootstrapPlan) -> Result<()> {
+    let row = conn
+        .query_row(
+            "SELECT b.state, l.state
+             FROM archive_bindings b
+             JOIN archive_deletion_ledgers l ON l.archive_id = b.archive_id
+             WHERE b.archive_id = ?1",
+            [plan.archive_id().as_bytes().as_slice()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((binding, ledger)) if binding == "active_legacy" && ledger == "active_legacy" => {
+            Ok(())
+        }
+        _ => Err(EnclaveError::Conflict(
+            "archive lifecycle plan is not bound to an active archive".into(),
+        )),
+    }
+}
+
+fn lifecycle_archive_active_conn(conn: &Connection, archive_id: ArchiveId) -> Result<()> {
+    let active: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_lifecycle_anchors a
+             JOIN archive_deletion_ledgers d ON d.archive_id = a.archive_id
+             JOIN archive_bindings b ON b.archive_id = a.archive_id
+             WHERE a.archive_id = ?1 AND b.state = 'active_legacy'
+               AND d.state = 'active_legacy' AND d.deletion_fence_id IS NULL
+         )",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if active == 1 {
+        Ok(())
+    } else {
+        Err(EnclaveError::Conflict(
+            "archive lifecycle deletion has begun".into(),
+        ))
+    }
+}
+
+fn active_lifecycle_revision_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<(u64, ArchiveLifecycleState)> {
+    let (revision, state) = conn
+        .query_row(
+            "SELECT a.revision, a.state
+             FROM archive_lifecycle_anchors a
+             JOIN archive_deletion_ledgers d ON d.archive_id = a.archive_id
+             JOIN archive_bindings b ON b.archive_id = a.archive_id
+             WHERE a.archive_id = ?1 AND b.state = 'active_legacy'
+               AND d.state = 'active_legacy' AND d.deletion_fence_id IS NULL",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EnclaveError::Conflict("archive lifecycle deletion has begun".into()))?;
+    Ok((
+        u64::try_from(revision)
+            .map_err(|_| EnclaveError::Store("archive lifecycle revision is invalid".into()))?,
+        ArchiveLifecycleState::from_db(&state)?,
+    ))
+}
+
+fn reserve_archive_bootstrap_conn(
+    conn: &Connection,
+    plan: BootstrapPlan,
+) -> Result<DurableBootstrapReservation> {
+    lifecycle_binding_for_plan_conn(conn, plan)?;
+    if let Some(existing) = lifecycle_anchor_conn(conn, plan.archive_id())? {
+        if existing.plan != plan {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle bootstrap reservation conflicts".into(),
+            ));
+        }
+        // The reservation CAS is always revision 1. Later revisions describe
+        // prepared/admitted work and must not turn a recovered reservation
+        // into a different authority receipt.
+        return DurableBootstrapReservation::from_persisted(
+            &LifecyclePersistenceContext::validated(),
+            existing.plan,
+            1,
+        )
+        .map_err(lifecycle_store_error);
+    }
+    conn.execute(
+        "INSERT INTO archive_lifecycle_anchors
+         (archive_id, format_version, revision, state, bootstrap_attempt_id,
+          database_epoch, key_epoch, registry_object_id, root_object_id)
+         VALUES (?1, ?2, 1, 'reserved', ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            plan.archive_id().as_bytes().as_slice(),
+            i64::from(LIFECYCLE_FORMAT_VERSION),
+            plan.attempt_id().as_bytes().as_slice(),
+            plan.database_epoch().as_bytes().as_slice(),
+            plan.key_epoch().as_bytes().as_slice(),
+            plan.registry_object_id().as_bytes().as_slice(),
+            plan.root_object_id().as_bytes().as_slice(),
+        ],
+    )?;
+    DurableBootstrapReservation::from_persisted(&LifecyclePersistenceContext::validated(), plan, 1)
+        .map_err(lifecycle_store_error)
+}
+
+fn artifact_state_db(state: ArtifactCreateState) -> &'static str {
+    match state {
+        ArtifactCreateState::Planned => "planned",
+        ArtifactCreateState::OutcomeUnknown => "outcome_unknown",
+        ArtifactCreateState::Created => "created",
+        ArtifactCreateState::ConfirmedAbsent => "confirmed_absent",
+    }
+}
+
+fn prepare_archive_bootstrap_conn(
+    conn: &Connection,
+    reservation: DurableBootstrapReservation,
+    wrapped_registry: &[u8],
+    root_envelope: &[u8],
+) -> Result<PreparedBootstrap> {
+    let plan = reservation.plan();
+    let current = lifecycle_anchor_conn(conn, plan.archive_id())?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle reservation disappeared".into()))?;
+    if current.plan != plan || reservation.revision() != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle reservation is stale".into(),
+        ));
+    }
+    if current.state != ArchiveLifecycleState::Reserved {
+        if !matches!(
+            current.state,
+            ArchiveLifecycleState::ObjectsPrepared
+                | ArchiveLifecycleState::WitnessPrepared
+                | ArchiveLifecycleState::Witnessed
+        ) {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle bootstrap is frozen".into(),
+            ));
+        }
+        let (stored_registry, stored_root, registry_hash, root_hash) = conn.query_row(
+            "SELECT wrapped_registry_bytes, root_envelope_bytes,
+                    wrapped_registry_hash, root_envelope_hash
+             FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [plan.archive_id().as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )?;
+        return PreparedBootstrap::from_persisted(
+            &LifecyclePersistenceContext::validated(),
+            reservation,
+            current.revision,
+            stored_registry,
+            stored_root,
+            fixed_32(registry_hash)?,
+            fixed_32(root_hash)?,
+        )
+        .map_err(lifecycle_store_error);
+    }
+    if current.revision != reservation.revision() {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle reservation revision changed".into(),
+        ));
+    }
+    let registry_hash: [u8; 32] = Sha256::digest(wrapped_registry).into();
+    let root_hash: [u8; 32] = Sha256::digest(root_envelope).into();
+    let prepared = PreparedBootstrap::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        reservation,
+        reservation
+            .revision()
+            .checked_add(1)
+            .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?,
+        wrapped_registry.to_vec(),
+        root_envelope.to_vec(),
+        registry_hash,
+        root_hash,
+    )
+    .map_err(lifecycle_store_error)?;
+    let registry_context =
+        KeyRegistryContext::new(plan.archive_id(), KeyKind::Archive, plan.key_epoch());
+    let registry_key = registry_context.object_key(plan.registry_object_id());
+    let root_key = ObjectContext::new(
+        plan.archive_id(),
+        plan.database_epoch(),
+        plan.key_epoch(),
+        ObjectRole::RootV3,
+        LogicalLocation::Root { root_seq: 0 },
+        plan.root_object_id(),
+        None,
+    )
+    .map_err(|_| EnclaveError::Store("archive lifecycle root context is invalid".into()))?
+    .object_key();
+    let tx = conn.unchecked_transaction()?;
+    let updated = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'objects_prepared',
+             wrapped_registry_hash = ?3, wrapped_registry_len = ?4,
+             wrapped_registry_bytes = ?5, root_envelope_hash = ?6,
+             root_envelope_len = ?7, root_envelope_bytes = ?8,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'reserved'",
+        rusqlite::params![
+            plan.archive_id().as_bytes().as_slice(),
+            i64::try_from(reservation.revision())
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            registry_hash.as_slice(),
+            i64::try_from(wrapped_registry.len())
+                .map_err(|_| EnclaveError::Store("archive lifecycle payload too large".into()))?,
+            wrapped_registry,
+            root_hash.as_slice(),
+            i64::try_from(root_envelope.len())
+                .map_err(|_| EnclaveError::Store("archive lifecycle payload too large".into()))?,
+            root_envelope,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle prepare lost its compare-and-swap".into(),
+        ));
+    }
+    for (ordinal, key, role, hash, len) in [
+        (
+            LIFECYCLE_REGISTRY_ORDINAL,
+            registry_key,
+            ObjectRole::KeyRegistryV3,
+            registry_hash,
+            wrapped_registry.len(),
+        ),
+        (
+            LIFECYCLE_ROOT_ORDINAL,
+            root_key,
+            ObjectRole::RootV3,
+            root_hash,
+            root_envelope.len(),
+        ),
+    ] {
+        tx.execute(
+            "INSERT INTO archive_lifecycle_bootstrap_creates
+             (archive_id, bootstrap_attempt_id, artifact_ordinal, canonical_key,
+              object_id, object_role, ciphertext_hash, encoded_len, create_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'planned')",
+            rusqlite::params![
+                plan.archive_id().as_bytes().as_slice(),
+                plan.attempt_id().as_bytes().as_slice(),
+                i64::from(ordinal),
+                key.as_str(),
+                key.object_id().as_bytes().as_slice(),
+                i64::from(role as u8),
+                hash.as_slice(),
+                i64::try_from(len).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle payload too large".into()
+                ))?,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(prepared)
+}
+
+fn recover_archive_bootstrap_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<RecoveredBootstrap> {
+    lifecycle_archive_active_conn(conn, archive_id)?;
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let reservation = DurableBootstrapReservation::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        anchor.plan,
+        1,
+    )
+    .map_err(lifecycle_store_error)?;
+    if anchor.state == ArchiveLifecycleState::Reserved {
+        if anchor.revision != 1 {
+            return Err(EnclaveError::Store(
+                "reserved archive lifecycle revision changed".into(),
+            ));
+        }
+        return Ok(RecoveredBootstrap::Reserved(reservation));
+    }
+    if !matches!(
+        anchor.state,
+        ArchiveLifecycleState::ObjectsPrepared
+            | ArchiveLifecycleState::WitnessPrepared
+            | ArchiveLifecycleState::Witnessed
+    ) {
+        return Err(EnclaveError::Conflict(
+            "archive bootstrap recovery is frozen for deletion".into(),
+        ));
+    }
+    let (wrapped, root, wrapped_hash, root_hash, wrapped_len, root_len) = conn.query_row(
+        "SELECT wrapped_registry_bytes, root_envelope_bytes,
+                wrapped_registry_hash, root_envelope_hash,
+                wrapped_registry_len, root_envelope_len
+         FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    if usize::try_from(wrapped_len).ok() != Some(wrapped.len())
+        || usize::try_from(root_len).ok() != Some(root.len())
+    {
+        return Err(EnclaveError::Store(
+            "archive lifecycle prepared byte lengths changed".into(),
+        ));
+    }
+    PreparedBootstrap::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        reservation,
+        anchor.revision,
+        wrapped,
+        root,
+        fixed_32(wrapped_hash)?,
+        fixed_32(root_hash)?,
+    )
+    .map(RecoveredBootstrap::Prepared)
+    .map_err(lifecycle_store_error)
+}
+
+fn prepare_archive_witness_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    expected_revision: u64,
+    encoded_witness: &[u8],
+) -> Result<u64> {
+    if encoded_witness.is_empty() || encoded_witness.len() > MAX_BOOTSTRAP_WITNESS_BYTES {
+        return Err(EnclaveError::Store(
+            "archive lifecycle witness candidate is invalid".into(),
+        ));
+    }
+    let hash: [u8; 32] = Sha256::digest(encoded_witness).into();
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    if matches!(
+        anchor.state,
+        ArchiveLifecycleState::WitnessPrepared | ArchiveLifecycleState::Witnessed
+    ) {
+        let (stored, stored_hash): (Vec<u8>, Vec<u8>) = conn.query_row(
+            "SELECT witness_record_bytes, witness_record_hash
+             FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if anchor.revision != expected_revision
+            || stored != encoded_witness
+            || fixed_32(stored_hash)? != hash
+        {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle witness preparation changed".into(),
+            ));
+        }
+        return Ok(anchor.revision);
+    }
+    let unresolved: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_lifecycle_bootstrap_creates
+         WHERE archive_id = ?1 AND create_state != 'created'",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if unresolved != 0 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle witness cannot precede exact object reconciliation".into(),
+        ));
+    }
+    let updated = conn.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'witness_prepared',
+             witness_record_hash = ?3, witness_record_len = ?4,
+             witness_record_bytes = ?5, witness_create_state = 'planned',
+             witness_admission_revision = NULL,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'objects_prepared'",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(expected_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            hash.as_slice(),
+            i64::try_from(encoded_witness.len())
+                .map_err(|_| EnclaveError::Store("archive lifecycle witness too large".into()))?,
+            encoded_witness,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle witness prepare lost its compare-and-swap".into(),
+        ));
+    }
+    expected_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))
+}
+
+fn admit_archive_create_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    expected_revision: u64,
+    artifact_ordinal: u32,
+) -> Result<ActiveCreateAdmission> {
+    let tx = conn.unchecked_transaction()?;
+    lifecycle_archive_active_conn(&tx, archive_id)?;
+    let anchor = lifecycle_anchor_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    if anchor.revision != expected_revision || !anchor.state.admits_creates() {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle create admission is stale or frozen".into(),
+        ));
+    }
+    let in_flight: i64 = tx.query_row(
+        "SELECT
+            (SELECT count(*) FROM archive_lifecycle_bootstrap_creates
+             WHERE archive_id = ?1 AND admission_revision IS NOT NULL)
+            +
+            (SELECT count(*) FROM archive_lifecycle_anchors
+             WHERE archive_id = ?1 AND witness_admission_revision IS NOT NULL)",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let (artifact_hash, existing_admission) = if artifact_ordinal == LIFECYCLE_WITNESS_ORDINAL {
+        tx.query_row(
+            "SELECT witness_record_hash, witness_admission_revision
+             FROM archive_lifecycle_anchors
+             WHERE archive_id = ?1 AND state IN ('witness_prepared','witnessed')",
+            [archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EnclaveError::Conflict("archive witness is not prepared".into()))?
+    } else {
+        tx.query_row(
+            "SELECT ciphertext_hash, admission_revision
+             FROM archive_lifecycle_bootstrap_creates
+             WHERE archive_id = ?1 AND artifact_ordinal = ?2",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                i64::from(artifact_ordinal)
+            ],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EnclaveError::Conflict("archive artifact is not planned".into()))?
+    };
+    if let Some(existing_admission) = existing_admission {
+        if in_flight != 1 || u64::try_from(existing_admission).ok() != Some(expected_revision) {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle has a different unreconciled create".into(),
+            ));
+        }
+        let receipt = ActiveCreateAdmission::from_fresh_cas(
+            &LifecyclePersistenceContext::validated(),
+            archive_id,
+            anchor.plan.attempt_id(),
+            expected_revision,
+            artifact_ordinal,
+            fixed_32(artifact_hash)?,
+        )
+        .map_err(lifecycle_store_error)?;
+        tx.commit()?;
+        return Ok(receipt);
+    }
+    if in_flight != 0 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle has a different unreconciled create".into(),
+        ));
+    }
+    let admission_revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let updated = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1,
+             witness_admission_revision = CASE WHEN ?3 = 2 THEN revision + 1 ELSE witness_admission_revision END,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2
+           AND state IN ('objects_prepared','witness_prepared','witnessed')",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(expected_revision).map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            i64::from(artifact_ordinal),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle create admission lost its compare-and-swap".into(),
+        ));
+    }
+    if artifact_ordinal != LIFECYCLE_WITNESS_ORDINAL {
+        let changed = tx.execute(
+            "UPDATE archive_lifecycle_bootstrap_creates SET admission_revision = ?3
+             WHERE archive_id = ?1 AND artifact_ordinal = ?2 AND admission_revision IS NULL",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                i64::from(artifact_ordinal),
+                i64::try_from(admission_revision).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle create admission conflicts".into(),
+            ));
+        }
+    }
+    tx.commit()?;
+    ActiveCreateAdmission::from_fresh_cas(
+        &LifecyclePersistenceContext::validated(),
+        archive_id,
+        anchor.plan.attempt_id(),
+        admission_revision,
+        artifact_ordinal,
+        fixed_32(artifact_hash)?,
+    )
+    .map_err(lifecycle_store_error)
+}
+
+fn reconcile_archive_create_conn(
+    conn: &Connection,
+    admission: &ActiveCreateAdmission,
+    outcome: LifecycleCreateOutcome,
+) -> Result<u64> {
+    let state = match outcome {
+        LifecycleCreateOutcome::Created | LifecycleCreateOutcome::AlreadyPresentExact => {
+            ArtifactCreateState::Created
+        }
+        LifecycleCreateOutcome::OutcomeUnknown => ArtifactCreateState::OutcomeUnknown,
+        LifecycleCreateOutcome::ConfirmedAbsent => ArtifactCreateState::ConfirmedAbsent,
+    };
+    let tx = conn.unchecked_transaction()?;
+    let anchor = lifecycle_anchor_conn(&tx, admission.archive_id())?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let frozen_offset = u64::from(anchor.state == ArchiveLifecycleState::DeletionFrozen);
+    if anchor.plan.attempt_id() != admission.attempt_id()
+        || anchor.revision != admission.revision().saturating_add(frozen_offset)
+        || !matches!(
+            anchor.state,
+            ArchiveLifecycleState::ObjectsPrepared
+                | ArchiveLifecycleState::WitnessPrepared
+                | ArchiveLifecycleState::Witnessed
+                | ArchiveLifecycleState::DeletionFrozen
+        )
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle reconciliation is stale".into(),
+        ));
+    }
+    if outcome == LifecycleCreateOutcome::OutcomeUnknown {
+        let changed = if admission.artifact_ordinal() == LIFECYCLE_WITNESS_ORDINAL {
+            tx.execute(
+                "UPDATE archive_lifecycle_anchors SET witness_create_state = 'outcome_unknown'
+                 WHERE archive_id = ?1 AND witness_admission_revision = ?2
+                   AND witness_record_hash = ?3",
+                rusqlite::params![
+                    admission.archive_id().as_bytes().as_slice(),
+                    i64::try_from(admission.revision()).map_err(|_| EnclaveError::Store(
+                        "archive lifecycle revision overflow".into()
+                    ))?,
+                    admission.artifact_hash().as_slice(),
+                ],
+            )?
+        } else {
+            tx.execute(
+                "UPDATE archive_lifecycle_bootstrap_creates SET create_state = 'outcome_unknown'
+                 WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+                   AND artifact_ordinal = ?3 AND admission_revision = ?4
+                   AND ciphertext_hash = ?5",
+                rusqlite::params![
+                    admission.archive_id().as_bytes().as_slice(),
+                    admission.attempt_id().as_bytes().as_slice(),
+                    i64::from(admission.artifact_ordinal()),
+                    i64::try_from(admission.revision()).map_err(|_| EnclaveError::Store(
+                        "archive lifecycle revision overflow".into()
+                    ))?,
+                    admission.artifact_hash().as_slice(),
+                ],
+            )?
+        };
+        if changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle ambiguous outcome conflicts".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok(anchor.revision);
+    }
+    let next_revision = anchor
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let changed = if admission.artifact_ordinal() == LIFECYCLE_WITNESS_ORDINAL {
+        tx.execute(
+            "UPDATE archive_lifecycle_anchors
+             SET revision = revision + 1,
+                 state = CASE
+                     WHEN state = 'deletion_frozen' THEN state
+                     WHEN ?3 = 'created' THEN 'witnessed'
+                     ELSE state
+                 END,
+                 witness_create_state = ?3, witness_admission_revision = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id = ?1 AND revision = ?5
+               AND witness_admission_revision = ?2 AND witness_record_hash = ?4
+               AND state IN ('witness_prepared','witnessed','deletion_frozen')",
+            rusqlite::params![
+                admission.archive_id().as_bytes().as_slice(),
+                i64::try_from(admission.revision()).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+                artifact_state_db(state),
+                admission.artifact_hash().as_slice(),
+                i64::try_from(anchor.revision).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+            ],
+        )?
+    } else {
+        let create_changed = tx.execute(
+            "UPDATE archive_lifecycle_bootstrap_creates
+             SET create_state = ?4, admission_revision = NULL
+             WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+               AND artifact_ordinal = ?3 AND admission_revision = ?5
+               AND ciphertext_hash = ?6",
+            rusqlite::params![
+                admission.archive_id().as_bytes().as_slice(),
+                admission.attempt_id().as_bytes().as_slice(),
+                i64::from(admission.artifact_ordinal()),
+                artifact_state_db(state),
+                i64::try_from(admission.revision()).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+                admission.artifact_hash().as_slice(),
+            ],
+        )?;
+        if create_changed != 1 {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle artifact reconciliation conflicts".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE archive_lifecycle_anchors
+             SET revision = revision + 1,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id = ?1 AND revision = ?2",
+            rusqlite::params![
+                admission.archive_id().as_bytes().as_slice(),
+                i64::try_from(anchor.revision).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle revision overflow".into()
+                ))?,
+            ],
+        )?
+    };
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle reconciliation lost its compare-and-swap".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(next_revision)
+}
+
+fn freeze_archive_lifecycle_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    expected_revision: u64,
+    deletion_fence: ObjectId,
+) -> Result<u64> {
+    if deletion_fence.as_bytes() == &[0; 16] {
+        return Err(EnclaveError::Store(
+            "archive lifecycle deletion fence is invalid".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let durable_fence = tx
+        .query_row(
+            "SELECT deletion_fence_id FROM archive_deletion_ledgers
+             WHERE archive_id = ?1 AND state = 'tombstoned'",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            EnclaveError::Conflict("archive lifecycle deletion is not tombstoned".into())
+        })?;
+    if fixed_16(durable_fence)? != *deletion_fence.as_bytes() {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle deletion fence changed".into(),
+        ));
+    }
+    let updated = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'deletion_frozen', deletion_fence = ?3,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2
+           AND state IN ('reserved','objects_prepared','witness_prepared','witnessed')",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(expected_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            deletion_fence.as_bytes().as_slice(),
+        ],
+    )?;
+    if updated != 1 {
+        let existing = tx
+            .query_row(
+                "SELECT revision, deletion_fence FROM archive_lifecycle_anchors
+                 WHERE archive_id = ?1 AND state = 'deletion_frozen'",
+                [archive_id.as_bytes().as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        if let Some((revision, existing_fence)) = existing {
+            if fixed_16(existing_fence)? == *deletion_fence.as_bytes() {
+                let revision = u64::try_from(revision).map_err(|_| {
+                    EnclaveError::Store("archive lifecycle revision is invalid".into())
+                })?;
+                tx.commit()?;
+                return Ok(revision);
+            }
+        }
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle freeze lost its compare-and-swap".into(),
+        ));
+    }
+    let revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    tx.commit()?;
+    Ok(revision)
+}
+
+fn lifecycle_role(value: i64) -> Result<ObjectRole> {
+    match value {
+        1 => Ok(ObjectRole::CheckpointChunkV3),
+        2 => Ok(ObjectRole::WalSegmentV3),
+        3 => Ok(ObjectRole::ExtentV3),
+        4 => Ok(ObjectRole::MerkleNodeV3),
+        5 => Ok(ObjectRole::RootV3),
+        6 => Ok(ObjectRole::KeyRegistryV3),
+        7 => Ok(ObjectRole::StagingV3),
+        8 => Ok(ObjectRole::CheckpointManifestV3),
+        9 => Ok(ObjectRole::WalCommitDescriptorV3),
+        _ => Err(EnclaveError::Store(
+            "archive lifecycle object role is invalid".into(),
+        )),
+    }
+}
+
+fn lifecycle_artifact_state(value: &str) -> Result<ArtifactCreateState> {
+    match value {
+        "planned" => Ok(ArtifactCreateState::Planned),
+        "outcome_unknown" => Ok(ArtifactCreateState::OutcomeUnknown),
+        "created" => Ok(ArtifactCreateState::Created),
+        "confirmed_absent" => Ok(ArtifactCreateState::ConfirmedAbsent),
+        _ => Err(EnclaveError::Store(
+            "archive lifecycle create state is invalid".into(),
+        )),
+    }
+}
+
+fn lifecycle_create_ahead_conn(
+    conn: &Connection,
+    plan: BootstrapPlan,
+) -> Result<Vec<PlannedArtifact>> {
+    let mut statement = conn.prepare(
+        "SELECT bootstrap_attempt_id, artifact_ordinal, canonical_key, object_id,
+                object_role, ciphertext_hash, encoded_len, create_state,
+                admission_revision
+         FROM archive_lifecycle_bootstrap_creates
+         WHERE archive_id = ?1
+         ORDER BY bootstrap_attempt_id, artifact_ordinal, canonical_key",
+    )?;
+    let rows = statement.query_map([plan.archive_id().as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            attempt,
+            ordinal,
+            canonical_key,
+            object_id,
+            role,
+            hash,
+            encoded_len,
+            state,
+            admission_revision,
+        ) = row?;
+        if admission_revision.is_some() || state == "outcome_unknown" {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle has unresolved create work".into(),
+            ));
+        }
+        let attempt =
+            crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes(fixed_16(attempt)?)
+                .map_err(lifecycle_store_error)?;
+        let object_id = ObjectId::from_bytes(fixed_16(object_id)?);
+        PlannedArtifact::new(
+            plan.archive_id(),
+            attempt,
+            u32::try_from(ordinal)
+                .map_err(|_| EnclaveError::Store("archive lifecycle ordinal is invalid".into()))?,
+            crate::archive_v3::ObjectKey::from_validated_canonical(canonical_key, object_id),
+            lifecycle_role(role)?,
+            fixed_32(hash)?,
+            usize::try_from(encoded_len).map_err(|_| {
+                EnclaveError::Store("archive lifecycle encoded length is invalid".into())
+            })?,
+            lifecycle_artifact_state(&state)?,
+        )
+        .map_err(lifecycle_store_error)
+    })
+    .collect()
+}
+
+fn seal_archive_inventory_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    expected_revision: u64,
+    deletion_fence: ObjectId,
+    durable_pages: &[DurableInventoryPage],
+) -> Result<DeletionInventorySeal> {
+    let pages = durable_pages
+        .iter()
+        .map(DurableInventoryPage::page)
+        .collect::<Vec<_>>();
+    let anchor = lifecycle_anchor_conn(conn, archive_id)?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    if anchor.state != ArchiveLifecycleState::DeletionFrozen || anchor.revision != expected_revision
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory seal is stale".into(),
+        ));
+    }
+    let persisted_fence = conn.query_row(
+        "SELECT deletion_fence FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    if fixed_16(persisted_fence)? != *deletion_fence.as_bytes() {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory fence changed".into(),
+        ));
+    }
+    if pages.is_empty() || pages.len() > MAX_LIFECYCLE_PAGES {
+        return Err(EnclaveError::Store(
+            "archive lifecycle inventory page count is invalid".into(),
+        ));
+    }
+    let witness_unresolved: i64 = conn.query_row(
+        "SELECT CASE
+             WHEN witness_admission_revision IS NOT NULL THEN 1
+             WHEN witness_create_state = 'outcome_unknown' THEN 1
+             ELSE 0
+         END
+         FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if witness_unresolved != 0 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle witness create is unresolved".into(),
+        ));
+    }
+    let create_ahead = lifecycle_create_ahead_conn(conn, anchor.plan)?;
+    for planned in &create_ahead {
+        let included = pages.iter().flat_map(|page| page.entries()).any(|entry| {
+            entry.attempt_id() == planned.attempt_id()
+                && entry.ordinal() == planned.ordinal()
+                && entry.key() == planned.key()
+                && entry.role() == planned.role()
+                && entry.ciphertext_hash() == planned.ciphertext_hash()
+                && entry.encoded_len() == planned.encoded_len()
+                && entry.create_state() == planned.create_state()
+        });
+        if !included {
+            return Err(EnclaveError::Store(
+                "archive lifecycle inventory omitted create-ahead work".into(),
+            ));
+        }
+    }
+    let next_revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle revision exhausted".into()))?;
+    let seal = DeletionInventorySeal::from_durable_pages(
+        &LifecyclePersistenceContext::validated(),
+        archive_id,
+        deletion_fence,
+        next_revision,
+        durable_pages,
+    )
+    .map_err(lifecycle_store_error)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM archive_lifecycle_inventory_pages WHERE archive_id = ?1",
+        [archive_id.as_bytes().as_slice()],
+    )?;
+    for page in pages {
+        tx.execute(
+            "INSERT INTO archive_lifecycle_inventory_pages
+             (archive_id, page_ordinal, page_id, previous_hash, page_hash, encoded_len)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                i64::from(page.page_ordinal()),
+                page.page_id().as_bytes().as_slice(),
+                page.previous_hash().as_slice(),
+                page.page_hash().as_slice(),
+                i64::try_from(page.encoded().len()).map_err(|_| EnclaveError::Store(
+                    "archive lifecycle page length overflow".into()
+                ))?,
+            ],
+        )?;
+    }
+    let updated = tx.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'inventory_sealed',
+             inventory_page_count = ?3, inventory_artifact_count = ?4,
+             inventory_terminal_hash = ?5, inventory_commitment = ?6,
+             inventory_seal_revision = revision + 1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND revision = ?2 AND state = 'deletion_frozen'",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            i64::try_from(expected_revision)
+                .map_err(|_| EnclaveError::Store("archive lifecycle revision overflow".into()))?,
+            i64::from(seal.page_count()),
+            i64::from(seal.artifact_count()),
+            seal.terminal_page_hash().as_slice(),
+            seal.inventory_commitment().as_slice(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle inventory seal lost its compare-and-swap".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(seal)
+}
+
+fn load_sealed_archive_inventory_references_conn(
+    conn: &Connection,
+    expected: &DeletionInventorySeal,
+) -> Result<Vec<InventoryPageReference>> {
+    let row = conn
+        .query_row(
+            "SELECT inventory_seal_revision, state, deletion_fence, inventory_page_count,
+                    inventory_artifact_count, inventory_terminal_hash,
+                    inventory_commitment
+             FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [expected.archive_id().as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            EnclaveError::Store("sealed archive lifecycle inventory disappeared".into())
+        })?;
+    let (revision, state, fence, page_count, artifact_count, terminal, commitment) = row;
+    if !matches!(
+        ArchiveLifecycleState::from_db(&state)?,
+        ArchiveLifecycleState::InventorySealed | ArchiveLifecycleState::PhysicalComplete
+    ) || u64::try_from(revision).ok() != Some(expected.revision())
+        || fixed_16(fence)? != *expected.deletion_fence().as_bytes()
+        || u32::try_from(page_count).ok() != Some(expected.page_count())
+        || u32::try_from(artifact_count).ok() != Some(expected.artifact_count())
+        || fixed_32(terminal)? != expected.terminal_page_hash()
+        || fixed_32(commitment)? != expected.inventory_commitment()
+    {
+        return Err(EnclaveError::Conflict(
+            "sealed archive lifecycle inventory commitment changed".into(),
+        ));
+    }
+    let mut statement = conn.prepare(
+        "SELECT page_ordinal, page_id, previous_hash, page_hash, encoded_len
+         FROM archive_lifecycle_inventory_pages
+         WHERE archive_id = ?1 ORDER BY page_ordinal",
+    )?;
+    let rows = statement.query_map([expected.archive_id().as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut references = Vec::new();
+    let mut expected_previous = [0; 32];
+    for row in rows {
+        let (ordinal, page_id, previous_hash, page_hash, encoded_len) = row?;
+        let reference = InventoryPageReference::from_persisted(
+            &LifecyclePersistenceContext::validated(),
+            expected.archive_id(),
+            u32::try_from(ordinal).map_err(|_| {
+                EnclaveError::Store("archive lifecycle page ordinal is invalid".into())
+            })?,
+            ObjectId::from_bytes(fixed_16(page_id)?),
+            fixed_32_allow_zero(previous_hash)?,
+            fixed_32(page_hash)?,
+            u32::try_from(encoded_len).map_err(|_| {
+                EnclaveError::Store("archive lifecycle page length is invalid".into())
+            })?,
+        )
+        .map_err(lifecycle_store_error)?;
+        if usize::try_from(reference.page_ordinal()).ok() != Some(references.len())
+            || reference.previous_hash() != expected_previous
+        {
+            return Err(EnclaveError::Store(
+                "sealed archive lifecycle page reference was tampered".into(),
+            ));
+        }
+        expected_previous = reference.page_hash();
+        references.push(reference);
+    }
+    if u32::try_from(references.len()).ok() != Some(expected.page_count())
+        || expected_previous != expected.terminal_page_hash()
+    {
+        return Err(EnclaveError::Conflict(
+            "sealed archive lifecycle inventory does not match its anchor".into(),
+        ));
+    }
+    Ok(references)
+}
+
+fn recover_archive_deletion_lifecycle_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+) -> Result<RecoveredDeletionLifecycle> {
+    let tx = conn.unchecked_transaction()?;
+    let row = tx
+        .query_row(
+            "SELECT state, revision, inventory_seal_revision, deletion_fence,
+                    inventory_page_count, inventory_artifact_count,
+                    inventory_terminal_hash, inventory_commitment,
+                    physical_provider_drain_commitment
+             FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| EnclaveError::Store("archive lifecycle anchor disappeared".into()))?;
+    let (
+        state,
+        anchor_revision,
+        seal_revision,
+        persisted_fence,
+        page_count,
+        artifact_count,
+        terminal_hash,
+        inventory_hash,
+        drain_hash,
+    ) = row;
+    let state = ArchiveLifecycleState::from_db(&state)?;
+    if !matches!(
+        state,
+        ArchiveLifecycleState::InventorySealed | ArchiveLifecycleState::PhysicalComplete
+    ) || fixed_16(persisted_fence)? != *deletion_fence.as_bytes()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle sealed recovery authority changed".into(),
+        ));
+    }
+    let seal_revision = u64::try_from(seal_revision)
+        .map_err(|_| EnclaveError::Store("archive lifecycle seal revision is invalid".into()))?;
+    let anchor_revision = u64::try_from(anchor_revision)
+        .map_err(|_| EnclaveError::Store("archive lifecycle revision is invalid".into()))?;
+    let seal = DeletionInventorySeal::from_persisted_anchor(
+        &LifecyclePersistenceContext::validated(),
+        archive_id,
+        deletion_fence,
+        seal_revision,
+        u32::try_from(page_count)
+            .map_err(|_| EnclaveError::Store("archive lifecycle page count is invalid".into()))?,
+        u32::try_from(artifact_count).map_err(|_| {
+            EnclaveError::Store("archive lifecycle artifact count is invalid".into())
+        })?,
+        fixed_32(terminal_hash)?,
+        fixed_32(inventory_hash)?,
+    )
+    .map_err(lifecycle_store_error)?;
+    // Validate the retained exact-name reference chain in the same SQLite
+    // snapshot that minted the recovered seal.
+    load_sealed_archive_inventory_references_conn(&tx, &seal)?;
+    let physical_completion = match state {
+        ArchiveLifecycleState::InventorySealed => {
+            if anchor_revision != seal_revision || drain_hash.is_some() {
+                return Err(EnclaveError::Store(
+                    "sealed archive lifecycle revision changed".into(),
+                ));
+            }
+            None
+        }
+        ArchiveLifecycleState::PhysicalComplete => {
+            if Some(anchor_revision) != seal_revision.checked_add(1) {
+                return Err(EnclaveError::Store(
+                    "physical archive lifecycle revision changed".into(),
+                ));
+            }
+            let drain = fixed_32(drain_hash.ok_or_else(|| {
+                EnclaveError::Store("physical provider drain commitment disappeared".into())
+            })?)?;
+            let physical = PhysicalDeletionReceipt::from_persisted_control(
+                &LifecyclePersistenceContext::validated(),
+                seal,
+                drain,
+            )
+            .map_err(lifecycle_store_error)?;
+            Some(
+                DurablePhysicalCompletion::from_persisted(
+                    &LifecyclePersistenceContext::validated(),
+                    physical,
+                    anchor_revision,
+                )
+                .map_err(lifecycle_store_error)?,
+            )
+        }
+        _ => unreachable!("state was checked above"),
+    };
+    let recovered = RecoveredDeletionLifecycle::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        seal,
+        physical_completion,
+    )
+    .map_err(lifecycle_store_error)?;
+    tx.commit()?;
+    Ok(recovered)
+}
+
+fn mark_archive_physical_complete_conn(
+    conn: &Connection,
+    completion: &PhysicalDeletionReceipt,
+) -> Result<DurablePhysicalCompletion> {
+    let seal = completion.seal();
+    let updated = conn.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'physical_complete',
+             physical_provider_drain_commitment = ?3,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND state = 'inventory_sealed'
+           AND inventory_seal_revision = ?2 AND deletion_fence = ?4
+           AND inventory_commitment = ?5 AND inventory_page_count = ?6
+           AND inventory_terminal_hash = ?7",
+        rusqlite::params![
+            seal.archive_id().as_bytes().as_slice(),
+            i64::try_from(seal.revision()).map_err(|_| {
+                EnclaveError::Store("archive lifecycle revision overflow".into())
+            })?,
+            completion.provider_drain_commitment().as_slice(),
+            seal.deletion_fence().as_bytes().as_slice(),
+            seal.inventory_commitment().as_slice(),
+            i64::from(seal.page_count()),
+            seal.terminal_page_hash().as_slice(),
+        ],
+    )?;
+    if updated > 1 {
+        return Err(EnclaveError::Store(
+            "archive lifecycle physical completion affected multiple rows".into(),
+        ));
+    }
+    let exact_revision: Option<i64> = conn
+        .query_row(
+            "SELECT revision FROM archive_lifecycle_anchors
+         WHERE archive_id = ?1 AND state = 'physical_complete'
+           AND inventory_seal_revision = ?2
+           AND physical_provider_drain_commitment = ?3
+           AND deletion_fence = ?4 AND inventory_commitment = ?5
+           AND inventory_page_count = ?6 AND inventory_terminal_hash = ?7",
+            rusqlite::params![
+                seal.archive_id().as_bytes().as_slice(),
+                i64::try_from(seal.revision()).map_err(|_| {
+                    EnclaveError::Store("archive lifecycle revision overflow".into())
+                })?,
+                completion.provider_drain_commitment().as_slice(),
+                seal.deletion_fence().as_bytes().as_slice(),
+                seal.inventory_commitment().as_slice(),
+                i64::from(seal.page_count()),
+                seal.terminal_page_hash().as_slice(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let control_revision = exact_revision.ok_or_else(|| {
+        EnclaveError::Conflict("archive lifecycle physical completion changed".into())
+    })?;
+    DurablePhysicalCompletion::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        *completion,
+        u64::try_from(control_revision)
+            .map_err(|_| EnclaveError::Store("archive lifecycle revision is invalid".into()))?,
+    )
+    .map_err(lifecycle_store_error)
+}
+
+/// Erase only retry payloads after both the witness/provider physical receipt
+/// and the page-store's exact absence receipt match the retained seal. The
+/// content-free anchor, seal, page IDs/hashes, and deletion fence remain as a
+/// permanent no-resurrection tombstone.
+fn erase_archive_lifecycle_payload_conn(
+    conn: &Connection,
+    completion: &DurablePhysicalCompletion,
+    erased_pages: ErasedInventoryPages,
+) -> Result<()> {
+    if !erased_pages.matches(*completion) {
+        return Err(EnclaveError::Conflict(
+            "archive lifecycle erased-page receipt changed".into(),
+        ));
+    }
+    let physical = completion.physical_receipt();
+    let seal = physical.seal();
+    let updated = conn.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET wrapped_registry_bytes = NULL, root_envelope_bytes = NULL,
+             witness_record_bytes = NULL, witness_create_state = NULL,
+             witness_admission_revision = NULL, payload_erased = 1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1 AND state = 'physical_complete'
+           AND inventory_seal_revision = ?2
+           AND physical_provider_drain_commitment = ?3
+           AND deletion_fence = ?4 AND inventory_commitment = ?5
+           AND payload_erased = 0",
+        rusqlite::params![
+            seal.archive_id().as_bytes().as_slice(),
+            i64::try_from(seal.revision()).map_err(|_| {
+                EnclaveError::Store("archive lifecycle revision overflow".into())
+            })?,
+            physical.provider_drain_commitment().as_slice(),
+            seal.deletion_fence().as_bytes().as_slice(),
+            seal.inventory_commitment().as_slice(),
+        ],
+    )?;
+    if updated == 1 {
+        return Ok(());
+    }
+    let exact: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_lifecycle_anchors
+             WHERE archive_id = ?1 AND state = 'physical_complete'
+               AND inventory_seal_revision = ?2
+               AND physical_provider_drain_commitment = ?3
+               AND deletion_fence = ?4 AND inventory_commitment = ?5
+               AND payload_erased = 1
+               AND wrapped_registry_bytes IS NULL
+               AND root_envelope_bytes IS NULL AND witness_record_bytes IS NULL
+         )",
+        rusqlite::params![
+            seal.archive_id().as_bytes().as_slice(),
+            i64::try_from(seal.revision()).map_err(|_| {
+                EnclaveError::Store("archive lifecycle revision overflow".into())
+            })?,
+            physical.provider_drain_commitment().as_slice(),
+            seal.deletion_fence().as_bytes().as_slice(),
+            seal.inventory_commitment().as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    if exact == 1 {
+        Ok(())
+    } else {
+        Err(EnclaveError::Conflict(
+            "archive lifecycle payload erasure changed".into(),
+        ))
+    }
 }
 
 fn archive_binding_conn(conn: &Connection, user_id: &str) -> Result<Option<ArchiveBinding>> {
@@ -1489,6 +3055,45 @@ fn tombstone_archive_deletion_ledger_conn(
         return Err(EnclaveError::Store(
             "archive deletion tombstone is inconsistent".into(),
         ));
+    }
+    let fence = ledger
+        .deletion_fence_id
+        .ok_or_else(|| EnclaveError::Store("archive deletion fence disappeared".into()))?;
+    // If this archive has opted into the inactive lifecycle ledger, close its
+    // create-admission state in this same control-store transaction as the
+    // account/binding tombstone. In-flight admissions remain reconcilable, but
+    // no concurrent or restarted caller can obtain a new provider admission.
+    conn.execute(
+        "UPDATE archive_lifecycle_anchors
+         SET revision = revision + 1, state = 'deletion_frozen', deletion_fence = ?2,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id = ?1
+           AND state IN ('reserved','objects_prepared','witness_prepared','witnessed')",
+        rusqlite::params![
+            binding.archive_id.as_bytes().as_slice(),
+            fence.as_bytes().as_slice(),
+        ],
+    )?;
+    let lifecycle: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT state, deletion_fence FROM archive_lifecycle_anchors
+             WHERE archive_id = ?1",
+            [binding.archive_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((state, lifecycle_fence)) = lifecycle {
+        if !matches!(
+            ArchiveLifecycleState::from_db(&state)?,
+            ArchiveLifecycleState::DeletionFrozen
+                | ArchiveLifecycleState::InventorySealed
+                | ArchiveLifecycleState::PhysicalComplete
+        ) || fixed_16(lifecycle_fence)? != *fence.as_bytes()
+        {
+            return Err(EnclaveError::Conflict(
+                "archive lifecycle freeze conflicts with deletion tombstone".into(),
+            ));
+        }
     }
     Ok(ledger)
 }
@@ -2263,6 +3868,11 @@ impl ControlStore {
                 Err(error) => return Err(error.into()),
             }
         }
+        schema_migrations += conn.execute(
+            "INSERT OR IGNORE INTO config (key, value)
+             VALUES ('archive_lifecycle_schema', '1')",
+            [],
+        )?;
         schema_migrations += backfill_archive_bindings_conn(&conn)?;
         // Historical builds retained raw search text in the central accounting
         // DB. Remove it during load so the migration is automatic and durable.
@@ -4094,6 +5704,216 @@ impl ControlStore {
             .await
     }
 
+    /// Inactive archive-v3 lifecycle methods. They mutate only the encrypted
+    /// control ledger and are intentionally not called by startup, Store,
+    /// routes, or any provider adapter. Account deletion only atomically
+    /// freezes an already-existing inactive anchor; it constructs no runtime.
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn reserve_archive_bootstrap(
+        &self,
+        plan: BootstrapPlan,
+    ) -> Result<DurableBootstrapReservation> {
+        self.write_if_changed(move |conn| {
+            reserve_archive_bootstrap_conn(conn, plan).map(|receipt| (receipt, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn prepare_archive_bootstrap(
+        &self,
+        reservation: DurableBootstrapReservation,
+        wrapped_registry: Vec<u8>,
+        root_envelope: Vec<u8>,
+    ) -> Result<PreparedBootstrap> {
+        self.write_if_changed(move |conn| {
+            prepare_archive_bootstrap_conn(conn, reservation, &wrapped_registry, &root_envelope)
+                .map(|receipt| (receipt, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn recover_archive_bootstrap(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<RecoveredBootstrap> {
+        self.read(move |conn| recover_archive_bootstrap_conn(conn, archive_id))
+            .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn prepare_archive_witness(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        encoded_witness: Vec<u8>,
+    ) -> Result<u64> {
+        self.write_if_changed(move |conn| {
+            prepare_archive_witness_conn(conn, archive_id, expected_revision, &encoded_witness)
+                .map(|revision| (revision, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn admit_archive_create(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        artifact_ordinal: u32,
+    ) -> Result<ActiveCreateAdmission> {
+        self.write_if_changed(move |conn| {
+            admit_archive_create_conn(conn, archive_id, expected_revision, artifact_ordinal)
+                .map(|admission| (admission, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn reconcile_archive_create(
+        &self,
+        admission: ActiveCreateAdmission,
+        outcome: LifecycleCreateOutcome,
+    ) -> Result<u64> {
+        self.write_if_changed(move |conn| {
+            reconcile_archive_create_conn(conn, &admission, outcome)
+                .map(|revision| (revision, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn freeze_archive_lifecycle(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        deletion_fence: ObjectId,
+    ) -> Result<u64> {
+        self.write_if_changed(move |conn| {
+            freeze_archive_lifecycle_conn(conn, archive_id, expected_revision, deletion_fence)
+                .map(|revision| (revision, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn seal_archive_inventory(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+        deletion_fence: ObjectId,
+        pages: Vec<DurableInventoryPage>,
+    ) -> Result<DeletionInventorySeal> {
+        self.write_if_changed(move |conn| {
+            seal_archive_inventory_conn(conn, archive_id, expected_revision, deletion_fence, &pages)
+                .map(|seal| (seal, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn load_sealed_archive_inventory_references(
+        &self,
+        seal: DeletionInventorySeal,
+    ) -> Result<Vec<InventoryPageReference>> {
+        self.read(move |conn| load_sealed_archive_inventory_references_conn(conn, &seal))
+            .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn recover_archive_deletion_lifecycle(
+        &self,
+        archive_id: ArchiveId,
+        deletion_fence: ObjectId,
+    ) -> Result<RecoveredDeletionLifecycle> {
+        self.read(move |conn| {
+            recover_archive_deletion_lifecycle_conn(conn, archive_id, deletion_fence)
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn mark_archive_physical_complete(
+        &self,
+        completion: PhysicalDeletionReceipt,
+    ) -> Result<DurablePhysicalCompletion> {
+        self.write_if_changed(move |conn| {
+            mark_archive_physical_complete_conn(conn, &completion).map(|receipt| (receipt, true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn erase_archive_lifecycle_payload(
+        &self,
+        completion: DurablePhysicalCompletion,
+        erased_pages: ErasedInventoryPages,
+    ) -> Result<()> {
+        self.write_if_changed(move |conn| {
+            erase_archive_lifecycle_payload_conn(conn, &completion, erased_pages)
+                .map(|()| ((), true))
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for reviewed archive-v3 authority wiring"
+    )]
+    pub(crate) async fn revalidate_active_archive_lifecycle(
+        &self,
+        archive_id: ArchiveId,
+        expected_revision: u64,
+    ) -> Result<u64> {
+        self.read(move |conn| {
+            let (revision, state) = active_lifecycle_revision_conn(conn, archive_id)?;
+            if revision < expected_revision || !state.admits_creates() {
+                return Err(EnclaveError::Conflict(
+                    "archive lifecycle is stale or frozen".into(),
+                ));
+            }
+            Ok(revision)
+        })
+        .await
+    }
+
     pub async fn account_deletion_operation(
         &self,
         user_id: &str,
@@ -4754,6 +6574,7 @@ impl ControlStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive_v3_lifecycle::InventoryPage;
     use crate::store::{GcsGetResponse, GcsListVersionsResponse};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Notify;
@@ -5022,6 +6843,458 @@ mod tests {
         .unwrap();
         create_active_archive_binding_conn(&conn, USER_ID).unwrap();
         conn
+    }
+
+    fn lifecycle_file_conn(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+                [USER_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if exists == 0 {
+            conn.execute(
+                "INSERT INTO users (id, google_sub, email)
+                 VALUES (?1, ?2, 'owner@example.com')",
+                rusqlite::params![USER_ID, GOOGLE_SUB],
+            )
+            .unwrap();
+            create_active_archive_binding_conn(&conn, USER_ID).unwrap();
+        }
+        conn
+    }
+
+    fn lifecycle_plan(conn: &Connection) -> BootstrapPlan {
+        let binding = create_active_archive_binding_conn(conn, USER_ID).unwrap();
+        BootstrapPlan::new(
+            binding.archive_id(),
+            crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes([41; 16]).unwrap(),
+            crate::archive_v3::DatabaseEpoch::from_bytes([42; 16]),
+            crate::archive_v3::KeyEpoch::from_bytes([43; 16]),
+            ObjectId::from_bytes([44; 16]),
+            ObjectId::from_bytes([45; 16]),
+        )
+        .unwrap()
+    }
+
+    fn durable_inventory_page(page: InventoryPage) -> DurableInventoryPage {
+        let encoded = page.encoded().to_vec();
+        DurableInventoryPage::from_exact_readback(page, &encoded).unwrap()
+    }
+
+    #[test]
+    fn bootstrap_recovery_needs_only_archive_authority_after_close_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let plan = lifecycle_plan(&conn);
+        let archive_id = plan.archive_id();
+        reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_archive_bootstrap_conn(&conn, archive_id).unwrap();
+        assert_eq!(recovered.reservation().plan(), plan);
+        assert!(recovered.prepared().is_none());
+        let reservation = recovered.reservation();
+        prepare_archive_bootstrap_conn(&conn, reservation, b"wrapped-restart", b"root-restart")
+            .unwrap();
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_archive_bootstrap_conn(&conn, archive_id).unwrap();
+        let prepared = recovered.prepared().unwrap();
+        assert_eq!(prepared.reservation().plan(), plan);
+        assert_eq!(prepared.wrapped_registry(), b"wrapped-restart");
+        assert_eq!(prepared.root_envelope(), b"root-restart");
+    }
+
+    #[test]
+    fn lifecycle_bootstrap_is_create_ahead_restart_stable_and_freezes_admission() {
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        assert_eq!(reserved.revision(), 1);
+        let recovered = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        assert_eq!(recovered, reserved);
+        let conflicting = BootstrapPlan::new(
+            plan.archive_id(),
+            crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes([99; 16]).unwrap(),
+            plan.database_epoch(),
+            plan.key_epoch(),
+            plan.registry_object_id(),
+            plan.root_object_id(),
+        )
+        .unwrap();
+        assert!(reserve_archive_bootstrap_conn(&conn, conflicting).is_err());
+
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let recovered_reservation = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        assert_eq!(recovered_reservation, reserved);
+        let recovered_prepared =
+            prepare_archive_bootstrap_conn(&conn, recovered_reservation, b"replacement", b"bytes")
+                .unwrap();
+        assert_eq!(recovered_prepared.wrapped_registry(), b"wrapped");
+        assert_eq!(recovered_prepared.root_envelope(), b"root");
+        assert_eq!(recovered_prepared.revision(), prepared.revision());
+        let exact_bytes: (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT wrapped_registry_bytes, root_envelope_bytes
+                 FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(exact_bytes, (b"wrapped".to_vec(), b"root".to_vec()));
+        assert!(prepare_archive_witness_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            b"witness"
+        )
+        .is_err());
+
+        let registry = admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        assert!(admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            registry.revision(),
+            LIFECYCLE_ROOT_ORDINAL,
+        )
+        .is_err());
+        assert_eq!(
+            reconcile_archive_create_conn(&conn, &registry, LifecycleCreateOutcome::OutcomeUnknown)
+                .unwrap(),
+            registry.revision()
+        );
+        let revision = reconcile_archive_create_conn(
+            &conn,
+            &registry,
+            LifecycleCreateOutcome::AlreadyPresentExact,
+        )
+        .unwrap();
+        let root =
+            admit_archive_create_conn(&conn, plan.archive_id(), revision, LIFECYCLE_ROOT_ORDINAL)
+                .unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        let revision = prepare_archive_witness_conn(
+            &conn,
+            plan.archive_id(),
+            revision,
+            b"exact-witness-record",
+        )
+        .unwrap();
+        assert_eq!(
+            prepare_archive_witness_conn(
+                &conn,
+                plan.archive_id(),
+                revision,
+                b"exact-witness-record",
+            )
+            .unwrap(),
+            revision
+        );
+        assert!(prepare_archive_witness_conn(
+            &conn,
+            plan.archive_id(),
+            revision,
+            b"different-witness-record",
+        )
+        .is_err());
+        let witness = admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            revision,
+            LIFECYCLE_WITNESS_ORDINAL,
+        )
+        .unwrap();
+        reconcile_archive_create_conn(&conn, &witness, LifecycleCreateOutcome::OutcomeUnknown)
+            .unwrap();
+
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        assert!(admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            witness.revision(),
+            LIFECYCLE_ROOT_ORDINAL,
+        )
+        .is_err());
+        assert!(active_lifecycle_revision_conn(&conn, plan.archive_id()).is_err());
+        assert_eq!(
+            lifecycle_anchor_conn(&conn, plan.archive_id())
+                .unwrap()
+                .unwrap()
+                .revision,
+            witness.revision() + 1
+        );
+        let frozen_revision =
+            freeze_archive_lifecycle_conn(&conn, plan.archive_id(), witness.revision(), fence)
+                .unwrap();
+        assert_eq!(frozen_revision, witness.revision() + 1);
+        assert_eq!(
+            freeze_archive_lifecycle_conn(&conn, plan.archive_id(), witness.revision(), fence)
+                .unwrap(),
+            frozen_revision
+        );
+        assert!(admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            frozen_revision,
+            LIFECYCLE_ROOT_ORDINAL,
+        )
+        .is_err());
+        let reconciled =
+            reconcile_archive_create_conn(&conn, &witness, LifecycleCreateOutcome::ConfirmedAbsent)
+                .unwrap();
+        assert_eq!(reconciled, frozen_revision + 1);
+    }
+
+    #[test]
+    fn lifecycle_inventory_seal_detects_omission_tamper_and_rollback() {
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let registry = admit_archive_create_conn(
+            &conn,
+            plan.archive_id(),
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        let revision = reconcile_archive_create_conn(
+            &conn,
+            &registry,
+            LifecycleCreateOutcome::ConfirmedAbsent,
+        )
+        .unwrap();
+        let root =
+            admit_archive_create_conn(&conn, plan.archive_id(), revision, LIFECYCLE_ROOT_ORDINAL)
+                .unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        let revision =
+            freeze_archive_lifecycle_conn(&conn, plan.archive_id(), revision, fence).unwrap();
+        let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
+        assert!(seal_archive_inventory_conn(
+            &conn,
+            plan.archive_id(),
+            revision,
+            fence,
+            &[durable_inventory_page(
+                InventoryPage::build(plan.archive_id(), 0, [0; 32], vec![entries[0].clone()])
+                    .unwrap(),
+            )],
+        )
+        .is_err());
+        let page = InventoryPage::build(plan.archive_id(), 0, [0; 32], entries).unwrap();
+        let pages = vec![durable_inventory_page(page)];
+        let seal =
+            seal_archive_inventory_conn(&conn, plan.archive_id(), revision, fence, &pages).unwrap();
+        let references = load_sealed_archive_inventory_references_conn(&conn, &seal).unwrap();
+        assert_eq!(references.len(), 1);
+        let stale = DeletionInventorySeal::for_test(
+            plan.archive_id(),
+            ObjectId::from_bytes([77; 16]),
+            seal.revision(),
+            &pages,
+        )
+        .unwrap();
+        assert!(load_sealed_archive_inventory_references_conn(&conn, &stale).is_err());
+        let completion = PhysicalDeletionReceipt::for_test(seal, [88; 32]).unwrap();
+        // A witness/provider receipt remains insufficient after a crash until
+        // the control anchor durably records the same commitment. The CAS is
+        // exactly recoverable and idempotent after restart.
+        let durable_completion = mark_archive_physical_complete_conn(&conn, &completion).unwrap();
+        assert_eq!(
+            mark_archive_physical_complete_conn(&conn, &completion).unwrap(),
+            durable_completion
+        );
+        let erased_pages =
+            ErasedInventoryPages::from_exact_absence(&durable_completion, &references).unwrap();
+        assert_eq!(
+            load_sealed_archive_inventory_references_conn(&conn, &seal).unwrap(),
+            references
+        );
+        erase_archive_lifecycle_payload_conn(&conn, &durable_completion, erased_pages).unwrap();
+        let erased: (Option<Vec<u8>>, Option<Vec<u8>>, i64, i64) = conn
+            .query_row(
+                "SELECT wrapped_registry_bytes, root_envelope_bytes, payload_erased,
+                        (SELECT count(*) FROM archive_lifecycle_inventory_pages
+                         WHERE archive_id = ?1)
+                 FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(erased, (None, None, 1, 1));
+        conn.execute(
+            "UPDATE archive_lifecycle_inventory_pages
+             SET page_hash = zeroblob(32)
+             WHERE archive_id = ?1 AND page_ordinal = 0",
+            [plan.archive_id().as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(load_sealed_archive_inventory_references_conn(&conn, &seal).is_err());
+    }
+
+    #[test]
+    fn deletion_recovery_survives_close_after_seal_control_mark_and_page_erasure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let plan = lifecycle_plan(&conn);
+        let archive_id = plan.archive_id();
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        let prepared =
+            prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let registry = admit_archive_create_conn(
+            &conn,
+            archive_id,
+            prepared.revision(),
+            LIFECYCLE_REGISTRY_ORDINAL,
+        )
+        .unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &registry, LifecycleCreateOutcome::Created)
+                .unwrap();
+        let root =
+            admit_archive_create_conn(&conn, archive_id, revision, LIFECYCLE_ROOT_ORDINAL).unwrap();
+        let revision =
+            reconcile_archive_create_conn(&conn, &root, LifecycleCreateOutcome::Created).unwrap();
+        let fence_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let ledger = tombstone_archive_deletion_ledger_conn(&conn, USER_ID, &fence_name).unwrap();
+        let fence = ObjectId::from_bytes(*ledger.deletion_fence_id.unwrap().as_bytes());
+        let frozen_revision =
+            freeze_archive_lifecycle_conn(&conn, archive_id, revision, fence).unwrap();
+        let entries = lifecycle_create_ahead_conn(&conn, plan).unwrap();
+        let page = InventoryPage::build(archive_id, 0, [0; 32], entries).unwrap();
+        let pages = vec![durable_inventory_page(page)];
+        seal_archive_inventory_conn(&conn, archive_id, frozen_revision, fence, &pages).unwrap();
+        drop(pages);
+        drop(conn);
+
+        // No caller-retained seal survives this restart. The encrypted anchor
+        // and exact page-reference chain reconstruct it in one snapshot.
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_archive_deletion_lifecycle_conn(&conn, archive_id, fence).unwrap();
+        assert!(recovered.physical_completion().is_none());
+        let seal = recovered.seal();
+        let physical = PhysicalDeletionReceipt::for_test(seal, [88; 32]).unwrap();
+        mark_archive_physical_complete_conn(&conn, &physical).unwrap();
+        let references = load_sealed_archive_inventory_references_conn(&conn, &seal).unwrap();
+        let durable = recover_archive_deletion_lifecycle_conn(&conn, archive_id, fence)
+            .unwrap()
+            .physical_completion()
+            .unwrap();
+        // Model exact page-store erasure, then lose both the absence receipt
+        // and every old seal/completion value in a process crash.
+        ErasedInventoryPages::from_exact_absence(&durable, &references).unwrap();
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_archive_deletion_lifecycle_conn(&conn, archive_id, fence).unwrap();
+        let durable = recovered.physical_completion().unwrap();
+        let references =
+            load_sealed_archive_inventory_references_conn(&conn, &recovered.seal()).unwrap();
+        let erased = ErasedInventoryPages::from_exact_absence(&durable, &references).unwrap();
+        erase_archive_lifecycle_payload_conn(&conn, &durable, erased).unwrap();
+        let payload_erased: i64 = conn
+            .query_row(
+                "SELECT payload_erased FROM archive_lifecycle_anchors WHERE archive_id = ?1",
+                [archive_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload_erased, 1);
+    }
+
+    #[test]
+    fn lifecycle_control_codec_round_trips_wal_v3_roles_and_rejects_relabeling() {
+        let conn = account_conn();
+        let plan = lifecycle_plan(&conn);
+        let reserved = reserve_archive_bootstrap_conn(&conn, plan).unwrap();
+        prepare_archive_bootstrap_conn(&conn, reserved, b"wrapped", b"root").unwrap();
+        let wal = ObjectContext::new(
+            plan.archive_id(),
+            plan.database_epoch(),
+            plan.key_epoch(),
+            ObjectRole::WalSegmentV3,
+            LogicalLocation::Wal {
+                root_seq: 1,
+                wal_generation: 1,
+                segment_index: 0,
+            },
+            ObjectId::from_bytes([81; 16]),
+            None,
+        )
+        .unwrap()
+        .object_key();
+        let commit = ObjectContext::new(
+            plan.archive_id(),
+            plan.database_epoch(),
+            plan.key_epoch(),
+            ObjectRole::WalCommitDescriptorV3,
+            LogicalLocation::WalCommitDescriptor { root_seq: 1 },
+            ObjectId::from_bytes([82; 16]),
+            None,
+        )
+        .unwrap()
+        .object_key();
+        for (ordinal, key, role) in [
+            (LIFECYCLE_REGISTRY_ORDINAL, &wal, ObjectRole::WalSegmentV3),
+            (
+                LIFECYCLE_ROOT_ORDINAL,
+                &commit,
+                ObjectRole::WalCommitDescriptorV3,
+            ),
+        ] {
+            conn.execute(
+                "UPDATE archive_lifecycle_bootstrap_creates
+                 SET canonical_key = ?4, object_id = ?5, object_role = ?6
+                 WHERE archive_id = ?1 AND bootstrap_attempt_id = ?2
+                   AND artifact_ordinal = ?3",
+                rusqlite::params![
+                    plan.archive_id().as_bytes().as_slice(),
+                    plan.attempt_id().as_bytes().as_slice(),
+                    i64::from(ordinal),
+                    key.as_str(),
+                    key.object_id().as_bytes().as_slice(),
+                    i64::from(role as u8),
+                ],
+            )
+            .unwrap();
+        }
+        let decoded = lifecycle_create_ahead_conn(&conn, plan).unwrap();
+        assert_eq!(decoded[0].role(), ObjectRole::WalSegmentV3);
+        assert_eq!(decoded[1].role(), ObjectRole::WalCommitDescriptorV3);
+        conn.execute(
+            "UPDATE archive_lifecycle_bootstrap_creates SET object_role = 6
+             WHERE archive_id = ?1 AND artifact_ordinal = ?2",
+            rusqlite::params![
+                plan.archive_id().as_bytes().as_slice(),
+                i64::from(LIFECYCLE_ROOT_ORDINAL),
+            ],
+        )
+        .unwrap();
+        assert!(lifecycle_create_ahead_conn(&conn, plan).is_err());
     }
 
     #[test]

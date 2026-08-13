@@ -13,8 +13,8 @@ use crate::{
     archive_v3::{
         ArchivePrefix, ArchiveV3Error, CiphertextEnvelope, CreateIfAbsent,
         ExactKeyRegistryProvider, ImmutableObjectBackend, KeyRegistryContext, ObjectContext,
-        ObjectId, ObjectKey, Result, KEY_REGISTRY_PLAINTEXT_BYTES, MAX_ENCODED_ENVELOPE_BYTES,
-        MAX_WRAPPED_KEY_REGISTRY_BYTES,
+        ObjectId, ObjectKey, ObjectRole, Result, KEY_REGISTRY_PLAINTEXT_BYTES,
+        MAX_ENCODED_ENVELOPE_BYTES, MAX_WRAPPED_KEY_REGISTRY_BYTES,
     },
     archive_v3_witness::{ExactRootProvider, WitnessError},
 };
@@ -640,7 +640,11 @@ pub(super) fn valid_archive_prefix(prefix: &str) -> bool {
 
 /// Validate every canonical form emitted by `ObjectContext::object_key` and
 /// recover the unique immutable ID from its terminal component.
-pub(super) fn canonical_object_id(key: &str) -> Option<ObjectId> {
+pub(crate) fn canonical_object_id(key: &str) -> Option<ObjectId> {
+    canonical_object_identity(key).map(|(object_id, _)| object_id)
+}
+
+pub(crate) fn canonical_object_identity(key: &str) -> Option<(ObjectId, ObjectRole)> {
     if key.len() > MAX_CANONICAL_OBJECT_KEY_BYTES
         || !key.starts_with("archive/v3/")
         || key.contains("//")
@@ -658,55 +662,78 @@ pub(super) fn canonical_object_id(key: &str) -> Option<ObjectId> {
         return None;
     }
     let role = components.next()?;
-    let id_hex = match role {
+    let (id_hex, object_role) = match role {
         "extents" => {
             let (epoch, extent, terminal) =
                 (components.next()?, components.next()?, components.next()?);
-            (is_lower_hex_len(epoch, 32)
-                && canonical_decimal(extent)
-                && components.next().is_none())
-            .then(|| terminal_id(terminal, ".extx"))
-            .flatten()
+            (
+                (is_lower_hex_len(epoch, 32)
+                    && canonical_decimal(extent)
+                    && components.next().is_none())
+                .then(|| terminal_id(terminal, ".extx"))
+                .flatten(),
+                ObjectRole::ExtentV3,
+            )
         }
         "wal" => {
             let (epoch, terminal) = (components.next()?, components.next()?);
-            (is_lower_hex_len(epoch, 32) && components.next().is_none())
-                .then(|| hyphenated_terminal_id(terminal, ".walx"))
-                .flatten()
+            (
+                (is_lower_hex_len(epoch, 32) && components.next().is_none())
+                    .then(|| hyphenated_terminal_id(terminal, ".walx"))
+                    .flatten(),
+                ObjectRole::WalSegmentV3,
+            )
         }
         "wal-commits" => {
             let (epoch, terminal) = (components.next()?, components.next()?);
-            (is_lower_hex_len(epoch, 32) && components.next().is_none())
-                .then(|| hyphenated_terminal_id(terminal, ".wcdx"))
-                .flatten()
+            (
+                (is_lower_hex_len(epoch, 32) && components.next().is_none())
+                    .then(|| hyphenated_terminal_id(terminal, ".wcdx"))
+                    .flatten(),
+                ObjectRole::WalCommitDescriptorV3,
+            )
         }
         "nodes" => {
             let (epoch, level, terminal) =
                 (components.next()?, components.next()?, components.next()?);
-            (is_lower_hex_len(epoch, 32) && canonical_decimal(level) && components.next().is_none())
+            (
+                (is_lower_hex_len(epoch, 32)
+                    && canonical_decimal(level)
+                    && components.next().is_none())
                 .then(|| terminal_id(terminal, ".nodex"))
-                .flatten()
+                .flatten(),
+                ObjectRole::MerkleNodeV3,
+            )
         }
         "root-candidates" => {
             let (epoch, terminal) = (components.next()?, components.next()?);
-            (is_lower_hex_len(epoch, 32) && components.next().is_none())
-                .then(|| hyphenated_terminal_id(terminal, ".rootx"))
-                .flatten()
+            (
+                (is_lower_hex_len(epoch, 32) && components.next().is_none())
+                    .then(|| hyphenated_terminal_id(terminal, ".rootx"))
+                    .flatten(),
+                ObjectRole::RootV3,
+            )
         }
         "keys" => {
             let (kind, epoch, terminal) =
                 (components.next()?, components.next()?, components.next()?);
-            (matches!(kind, "archive" | "media")
-                && is_lower_hex_len(epoch, 32)
-                && components.next().is_none())
-            .then(|| terminal_id(terminal, ".keyx"))
-            .flatten()
+            (
+                (matches!(kind, "archive" | "media")
+                    && is_lower_hex_len(epoch, 32)
+                    && components.next().is_none())
+                .then(|| terminal_id(terminal, ".keyx"))
+                .flatten(),
+                ObjectRole::KeyRegistryV3,
+            )
         }
         "staging" => {
             let (operation, terminal) = (components.next()?, components.next()?);
-            (is_lower_hex_len(operation, 32) && components.next().is_none())
-                .then(|| terminal_id(terminal, ""))
-                .flatten()
+            (
+                (is_lower_hex_len(operation, 32) && components.next().is_none())
+                    .then(|| terminal_id(terminal, ""))
+                    .flatten(),
+                ObjectRole::StagingV3,
+            )
         }
         "checkpoints" => {
             let (epoch, checkpoint, kind, terminal) = (
@@ -719,17 +746,24 @@ pub(super) fn canonical_object_id(key: &str) -> Option<ObjectId> {
                 || !is_lower_hex_len(checkpoint, 32)
                 || components.next().is_some()
             {
-                None
+                (None, ObjectRole::CheckpointChunkV3)
             } else {
                 match kind {
-                    "chunks" => hyphenated_terminal_id(terminal, ".chkx"),
-                    "manifest" => manifest_terminal_id(terminal),
-                    _ => None,
+                    "chunks" => (
+                        hyphenated_terminal_id(terminal, ".chkx"),
+                        ObjectRole::CheckpointChunkV3,
+                    ),
+                    "manifest" => (
+                        manifest_terminal_id(terminal),
+                        ObjectRole::CheckpointManifestV3,
+                    ),
+                    _ => (None, ObjectRole::CheckpointChunkV3),
                 }
             }
         }
-        _ => None,
-    }?;
+        _ => (None, ObjectRole::CheckpointChunkV3),
+    };
+    let id_hex = id_hex?;
     if !is_lower_hex_len(id_hex, 32) {
         return None;
     }
@@ -737,7 +771,7 @@ pub(super) fn canonical_object_id(key: &str) -> Option<ObjectId> {
     for (index, pair) in id_hex.as_bytes().chunks_exact(2).enumerate() {
         raw[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
-    Some(ObjectId::from_bytes(raw))
+    Some((ObjectId::from_bytes(raw), object_role))
 }
 
 fn terminal_id<'a>(terminal: &'a str, suffix: &str) -> Option<&'a str> {
