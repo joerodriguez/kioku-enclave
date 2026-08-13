@@ -18,7 +18,7 @@
 ## Firestore transport-probe release boundary
 
 - [x] Made one exact checked-in, non-secret probe profile the sole input to both build
-  selection and schema-v6 release verification; it starts `off` with an empty namespace.
+  selection and schema-v7 release verification; it starts `off` with an empty namespace.
 - [x] Removed repository-variable and manual-dispatch witness inputs, forced evaluation
   and ordinary `main` images off, and limited `probe-v1` to exact
   `vX.Y.Z-witness-probe.N` prereleases that cannot use `release.sh --roll`.
@@ -28,6 +28,21 @@
 
 These release and runtime boundaries do not create a Firestore database, grant provider
 IAM, publish a probe release, deploy an image, or activate archive-v3 authority.
+
+## Construction-only shadow-runtime release boundary
+
+- [x] Composed fixed archive-GCS, exact registry-KMS-version, and named-Firestore
+  providers synchronously behind one non-cloneable private-field bundle with an
+  always-deny hard-delete gate and no callable runtime handle.
+- [x] Added one exact checked-in `off`/empty profile as the sole build and schema-v7
+  release claim; repository variables, dispatch, tags, and process environment cannot
+  select provider fragments or an active mode.
+- [x] Kept startup, Store/VFS, lifecycle, routes, health, admission, tasks, provider I/O,
+  deployment, and every archive/root/deletion authority path disconnected.
+
+This code-only boundary does not make schema-v7 images deployable. The deployment
+repository must first merge an independently reviewed schema-v7 compatibility update;
+until then no release from this source may be promoted or rolled.
 
 ## Capacity fixture and local gate
 

@@ -18,6 +18,7 @@ DOCKERFILE = ROOT / "Dockerfile"
 RELEASE_SCRIPT = ROOT / "scripts" / "release.sh"
 METADATA_VERIFIER = ROOT / "scripts" / "verify_release_metadata.py"
 PROBE_PARSER = ROOT / "scripts" / "archive_witness_probe_config.py"
+SHADOW_RUNTIME_PARSER = ROOT / "scripts" / "archive_v3_shadow_runtime_config.py"
 MAIN = ROOT / "src" / "main.rs"
 
 CONFIGURATION = {
@@ -101,6 +102,7 @@ class SelectorTests(unittest.TestCase):
         *,
         source_ref: str = "main",
         probe_config: dict[str, object] | None = None,
+        shadow_runtime_config: dict[str, object] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         with tempfile.TemporaryDirectory() as directory:
             github_env = Path(directory) / "github-env"
@@ -109,6 +111,16 @@ class SelectorTests(unittest.TestCase):
                 probe_config_path = ROOT / "config" / "archive-witness-probe.json"
             else:
                 probe_config_path.write_text(json.dumps(probe_config), encoding="utf-8")
+            shadow_runtime_config_path = (
+                ROOT / "config" / "archive-v3-shadow-runtime.json"
+            )
+            if shadow_runtime_config is not None:
+                shadow_runtime_config_path = (
+                    Path(directory) / "archive-v3-shadow-runtime.json"
+                )
+                shadow_runtime_config_path.write_text(
+                    json.dumps(shadow_runtime_config), encoding="utf-8"
+                )
             completed = subprocess.run(
                 [
                     "python3",
@@ -119,6 +131,8 @@ class SelectorTests(unittest.TestCase):
                     source_ref,
                     "--archive-witness-probe-config",
                     str(probe_config_path),
+                    "--archive-v3-shadow-runtime-config",
+                    str(shadow_runtime_config_path),
                     "--github-env",
                     str(github_env),
                 ],
@@ -361,7 +375,7 @@ class SelectorTests(unittest.TestCase):
             workflow.count("python3 scripts/check_voice_release_gate.py"), 2
         )
         self.assertNotIn("test -s eval/voice/release-manifest.json", workflow)
-        self.assertIn('"schema_version": 6', workflow)
+        self.assertIn('"schema_version": 7', workflow)
         self.assertIn('"voice_quality_gate": voice_quality_gate', workflow)
         self.assertIn('"billing_enforcement_mode": billing_enforcement_mode', workflow)
         self.assertIn('"gcs_media_bucket": gcs_media_bucket', workflow)
@@ -369,7 +383,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("Attest release metadata manifest", workflow)
         self.assertIn("subject-path: enclave-release.json", workflow)
 
-    def test_selector_docker_and_schema_v5_manifest_bind_the_same_three_buckets(self) -> None:
+    def test_selector_docker_and_schema_v7_manifest_bind_the_same_three_buckets(self) -> None:
         completed, selected = self.run_selector("production", environment())
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("ENCLAVE_GCS_BUCKET=kioku-production-indexes\n", selected)
@@ -397,8 +411,8 @@ class SelectorTests(unittest.TestCase):
             self.assertIn(f'"{manifest_field}"', verifier)
         self.assertIn('[ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
         self.assertNotIn('[ "${GCS_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
-        self.assertIn('"schema_version": 6', workflow)
-        self.assertIn("schema_version must be 6", verifier)
+        self.assertIn('"schema_version": 7', workflow)
+        self.assertIn("schema_version must be 7", verifier)
 
     def test_operator_release_uses_shared_voice_gate_and_verifies_metadata(self) -> None:
         release_script = RELEASE_SCRIPT.read_text()
@@ -408,7 +422,7 @@ class SelectorTests(unittest.TestCase):
             release_script,
         )
         self.assertIn('"voice_quality_gate"', metadata_verifier)
-        self.assertIn("schema_version must be 6", metadata_verifier)
+        self.assertIn("schema_version must be 7", metadata_verifier)
         self.assertIn('"billing_enforcement_mode"', metadata_verifier)
         self.assertIn("owner_only_unvalidated", metadata_verifier)
         self.assertIn("validated_real_corpus", metadata_verifier)
@@ -517,6 +531,63 @@ class SelectorTests(unittest.TestCase):
         self.assertLess(probe, gcs)
         self.assertLess(probe, store)
         self.assertIn(".await\n    .expect", main[probe:kms])
+
+    def test_shadow_runtime_is_exact_off_baked_and_has_no_override_or_startup_call(self) -> None:
+        completed, selected = self.run_selector("production", environment())
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        for name in (
+            "ARCHIVE_V3_ARCHIVE_BUCKET",
+            "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER",
+            "ARCHIVE_V3_REGISTRY_KMS_VERSION",
+            "ARCHIVE_V3_WITNESS_PROJECT_ID",
+            "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
+            "ARCHIVE_V3_WITNESS_DATABASE_ID",
+        ):
+            self.assertIn(f"{name}=\n", selected)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
+
+        hostile = {
+            "schema_version": 1,
+            "mode": "shadow-v1",
+            "archive_bucket": "archive-bucket",
+            "archive_gcs_project_number": "123456789",
+            "registry_kms_version": "7",
+            "witness_project_id": "project-1",
+            "witness_project_number": "987654321",
+            "witness_database_id": "witness-db",
+        }
+        completed, selected = self.run_selector(
+            "production", environment(), shadow_runtime_config=hostile
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(selected, "")
+        self.assertIn("must be exact off", completed.stderr)
+
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        verifier = METADATA_VERIFIER.read_text(encoding="utf-8")
+        parser = SHADOW_RUNTIME_PARSER.read_text(encoding="utf-8")
+        for source in (SELECTOR.read_text(encoding="utf-8"), verifier):
+            self.assertIn("from archive_v3_shadow_runtime_config import", source)
+            self.assertIn("load_shadow_runtime_config", source)
+        self.assertNotIn("shadow-v1", parser)
+        self.assertNotIn("inputs.archive_v3", workflow.lower())
+        for name in (
+            "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
+            "ARCHIVE_V3_ARCHIVE_BUCKET",
+            "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER",
+            "ARCHIVE_V3_REGISTRY_KMS_VERSION",
+            "ARCHIVE_V3_WITNESS_PROJECT_ID",
+            "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
+            "ARCHIVE_V3_WITNESS_DATABASE_ID",
+        ):
+            self.assertIn(f'--build-arg {name}="${{{name}}}"', workflow)
+            self.assertIn(f"ARG {name}", dockerfile)
+            self.assertIn(f"{name}=${{{name}}}", dockerfile)
+            self.assertNotIn(f"PRODUCTION_{name}:", workflow)
+            self.assertNotIn(f"EVALUATION_{name}:", workflow)
+        main = MAIN.read_text(encoding="utf-8")
+        self.assertNotIn("ArchiveV3ShadowRuntimeBundle::new", main)
 
 
 if __name__ == "__main__":

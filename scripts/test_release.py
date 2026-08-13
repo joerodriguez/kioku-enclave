@@ -86,7 +86,7 @@ class ReleasePublicationRaceTests(unittest.TestCase):
         self.assertLess(upload, reverified)
         self.assertLess(immutable, edit)
 
-    def test_release_requires_signed_schema_v6_manifest_before_promotion(self) -> None:
+    def test_release_requires_signed_schema_v7_manifest_before_promotion(self) -> None:
         manifest_verification = self.source.index("Verifying signed release metadata manifest")
         parser = self.source.index("scripts/verify_release_metadata.py")
         image_provenance = self.source.index("Verifying signed GitHub build provenance")
@@ -103,6 +103,19 @@ class ReleasePublicationRaceTests(unittest.TestCase):
             'if data["build_profile"] != "production":',
             self.metadata_verifier,
         )
+
+    def test_verified_empty_claims_are_json_and_never_whitespace_ifs_parsed(self) -> None:
+        verification = self.source.index(
+            'RELEASE_METADATA="$(python3 scripts/verify_release_metadata.py'
+        )
+        registry = self.source.index("gcloud artifacts docker images describe", verification)
+        parser = self.source[verification:registry]
+        self.assertIn("json.load(sys.stdin)", parser)
+        self.assertIn("IFS=$'\\x1f' read -r", parser)
+        self.assertNotIn("IFS=$'\\t' read -r", parser)
+        self.assertNotIn("ARCHIVE_WITNESS_PROJECT_ID", parser)
+        self.assertNotIn("ARCHIVE_V3_ARCHIVE_BUCKET", parser)
+        self.assertIn("gcs_legacy_media_bucket", parser)
 
     def test_probe_release_is_exact_prerelease_and_cannot_roll(self) -> None:
         parser = self.source.index("scripts.archive_witness_probe_config")

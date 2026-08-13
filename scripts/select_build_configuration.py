@@ -14,6 +14,10 @@ from archive_witness_probe_config import (
     load_probe_config,
     select_probe_config,
 )
+from archive_v3_shadow_runtime_config import (
+    ShadowRuntimeConfigError,
+    load_shadow_runtime_config,
+)
 
 
 SHARED_KEYS = (
@@ -242,6 +246,7 @@ def selected_configuration(
     *,
     source_ref: str,
     probe_config_path: Path,
+    shadow_runtime_config_path: Path,
 ) -> dict[str, str]:
     prefix = profile.upper()
     configuration = {
@@ -259,6 +264,11 @@ def selected_configuration(
     except ProbeConfigError as error:
         raise SystemExit(str(error)) from error
     configuration.update(probe_config.as_environment())
+    try:
+        shadow_runtime_config = load_shadow_runtime_config(shadow_runtime_config_path)
+    except ShadowRuntimeConfigError as error:
+        raise SystemExit(str(error)) from error
+    configuration.update(shadow_runtime_config.as_environment())
     for group in OPTIONAL_PROFILE_GROUPS:
         values = {
             name: environment.get(f"{prefix}_{name}", "") for name in group
@@ -317,6 +327,11 @@ def main() -> None:
         type=Path,
         default=Path("config/archive-witness-probe.json"),
     )
+    parser.add_argument(
+        "--archive-v3-shadow-runtime-config",
+        type=Path,
+        default=Path("config/archive-v3-shadow-runtime.json"),
+    )
     parser.add_argument("--github-env", type=Path, required=True)
     arguments = parser.parse_args()
 
@@ -326,6 +341,7 @@ def main() -> None:
         environment,
         source_ref=arguments.source_ref,
         probe_config_path=arguments.archive_witness_probe_config,
+        shadow_runtime_config_path=arguments.archive_v3_shadow_runtime_config,
     )
     validate_authentication(environment)
     write_github_environment(arguments.github_env, arguments.profile, configuration)

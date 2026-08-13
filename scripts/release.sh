@@ -492,7 +492,24 @@ RELEASE_METADATA="$(python3 scripts/verify_release_metadata.py \
   --expected-gcs-bucket "$EXPECTED_GCS_BUCKET" \
   --expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET" \
   --expected-gcs-legacy-media-bucket "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET")"
-IFS=$'\t' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE GCS_BUCKET GCS_MEDIA_BUCKET GCS_LEGACY_MEDIA_BUCKET ARCHIVE_WITNESS_SHADOW_MODE ARCHIVE_WITNESS_PROJECT_ID ARCHIVE_WITNESS_PROJECT_NUMBER ARCHIVE_WITNESS_DATABASE_ID <<< "$RELEASE_METADATA"
+# The verifier emits exact JSON because the signed manifest intentionally has
+# consecutive empty exact-off claims. Extract only fields consumed below; each
+# is verifier-required and nonempty. ASCII unit separator is non-whitespace and
+# cannot occur because metadata validation rejects every control character.
+RELEASE_METADATA_FIELDS="$(printf '%s' "$RELEASE_METADATA" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+keys = (
+    "schema_version", "source_repository", "source_ref", "source_commit",
+    "image_uri", "image_digest_uri", "image_digest", "build_url",
+    "build_profile", "voice_quality_gate", "billing_enforcement_mode",
+    "gcs_bucket", "gcs_media_bucket", "gcs_legacy_media_bucket",
+)
+print("\x1f".join(str(data[key]) for key in keys))
+')"
+IFS=$'\x1f' read -r SCHEMA_VERSION SOURCE_REPOSITORY BUILT_REF BUILT_COMMIT IMAGE_URI DIGEST_URI DIGEST BUILD_URL BUILD_PROFILE VOICE_QUALITY_GATE BILLING_ENFORCEMENT_MODE GCS_BUCKET GCS_MEDIA_BUCKET GCS_LEGACY_MEDIA_BUCKET <<< "$RELEASE_METADATA_FIELDS"
 
 if [[ -n "$EXPECTED_VOICE_QUALITY_GATE" && "$VOICE_QUALITY_GATE" != "$EXPECTED_VOICE_QUALITY_GATE" ]]; then
   echo "Error: build metadata voice-quality classification does not match the checked source." >&2

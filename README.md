@@ -415,6 +415,11 @@ and release verification derive them through one strict parser from the reviewed
 [`config/archive-witness-probe.json`](config/archive-witness-probe.json). The checked-in
 file is exact `off` with an empty namespace.
 
+The seven `ARCHIVE_V3_*` shadow-runtime arguments are likewise derived only from
+[`config/archive-v3-shadow-runtime.json`](config/archive-v3-shadow-runtime.json). This
+slice accepts exactly `off` with all six provider fragments empty. It has no active/tag
+variant, repository-variable or dispatch override, startup constructor, or provider I/O.
+
 ```sh
 docker build --platform linux/amd64 \
   --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
@@ -429,6 +434,13 @@ docker build --platform linux/amd64 \
   --build-arg ARCHIVE_WITNESS_PROJECT_ID= \
   --build-arg ARCHIVE_WITNESS_PROJECT_NUMBER= \
   --build-arg ARCHIVE_WITNESS_DATABASE_ID= \
+  --build-arg ARCHIVE_V3_SHADOW_RUNTIME_MODE=off \
+  --build-arg ARCHIVE_V3_ARCHIVE_BUCKET= \
+  --build-arg ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER= \
+  --build-arg ARCHIVE_V3_REGISTRY_KMS_VERSION= \
+  --build-arg ARCHIVE_V3_WITNESS_PROJECT_ID= \
+  --build-arg ARCHIVE_V3_WITNESS_PROJECT_NUMBER= \
+  --build-arg ARCHIVE_V3_WITNESS_DATABASE_ID= \
   --build-arg RUN_SA_EMAIL=legacy-caller@my-project.iam.gserviceaccount.com \
   --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
   --build-arg ATTEST_STS_AUDIENCE='//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/confidential-space' \
@@ -467,6 +479,7 @@ binding.
 | `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
 | `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
 | `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, repository variables/dispatch cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
+| `ARCHIVE_V3_SHADOW_RUNTIME_MODE`, `ARCHIVE_V3_ARCHIVE_BUCKET`, `ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER`, `ARCHIVE_V3_REGISTRY_KMS_VERSION`, `ARCHIVE_V3_WITNESS_PROJECT_ID`, `ARCHIVE_V3_WITNESS_PROJECT_NUMBER`, `ARCHIVE_V3_WITNESS_DATABASE_ID` | Construction-only ADR-0022 provider bundle claim derived only from checked-in `config/archive-v3-shadow-runtime.json`. The only accepted profile is exact `off` with every provider fragment empty; no startup code constructs the bundle and no provider, Store, route, health, deletion, or archive authority is activated |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
@@ -515,7 +528,7 @@ operation. For `main` and tags the workflow then:
    `<region>-docker.pkg.dev/<project>/<repository>/<image>:<tag>`;
 5. generates an SPDX JSON SBOM and scans it for fixed high-severity vulnerabilities;
 6. creates GitHub-signed image provenance and a signed SBOM attestation; and
-7. uploads a schema-v6 release manifest (including the attested billing mode, index,
+7. uploads a schema-v7 release manifest (including the attested billing mode, index,
    current-media, and legacy-media bucket claims), that manifest's GitHub-signed provenance bundle, image
    provenance, SBOM, and attestation bundles.
 
@@ -599,7 +612,7 @@ tag, and commit. `scripts/release.sh` performs these checks with `gh attestation
 before it publishes a new release or requests a roll.
 
 The workflow records the selected build profile as an output of the trusted image-build
-step before clearing the sensitive build environment. The schema-v5 manifest and job
+step before clearing the sensitive build environment. The schema-v7 manifest and job
 summary must consume that output, and the release wrapper requires its attested value to
 be exactly `production`. A missing or cleared profile makes the image non-deployable even
 when its image scan and provenance attestations succeeded.
