@@ -559,10 +559,13 @@ pub(crate) async fn recover_owned_private_staging(
 }
 
 #[cfg(test)]
-type RecoveryPathObserver = tokio::sync::oneshot::Sender<PathBuf>;
+struct RecoveryObserver {
+    path_sender: tokio::sync::oneshot::Sender<PathBuf>,
+    cleanup_sender: tokio::sync::oneshot::Sender<()>,
+}
 
 #[cfg(not(test))]
-struct RecoveryPathObserver;
+struct RecoveryObserver;
 
 #[cfg(test)]
 async fn recover_owned_private_staging_observed(
@@ -570,9 +573,20 @@ async fn recover_owned_private_staging_observed(
     backend: Arc<dyn ImmutableObjectBackend>,
     cipher: Arc<VerifiedArchiveCipher>,
     archive_id: ArchiveId,
-    observer: RecoveryPathObserver,
+    path_sender: tokio::sync::oneshot::Sender<PathBuf>,
+    cleanup_sender: tokio::sync::oneshot::Sender<()>,
 ) -> Result<OwnedPrivateStagedSqliteCopy> {
-    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, Some(observer)).await
+    recover_owned_private_staging_inner(
+        recovery,
+        backend,
+        cipher,
+        archive_id,
+        Some(RecoveryObserver {
+            path_sender,
+            cleanup_sender,
+        }),
+    )
+    .await
 }
 
 async fn recover_owned_private_staging_inner(
@@ -580,12 +594,12 @@ async fn recover_owned_private_staging_inner(
     backend: Arc<dyn ImmutableObjectBackend>,
     cipher: Arc<VerifiedArchiveCipher>,
     archive_id: ArchiveId,
-    observer: Option<RecoveryPathObserver>,
+    observer: Option<RecoveryObserver>,
 ) -> Result<OwnedPrivateStagedSqliteCopy> {
     tokio::spawn(async move {
         let path = fresh_recovery_path()?;
-        observe_recovery_path(observer, &path);
         let mut cleanup = CompositeRecoveryCleanup::new(path.clone());
+        observe_recovery(observer, &path, &mut cleanup);
         let mut checkpoint =
             TmpfsCheckpointSink::create(&path).map_err(|_| ShadowWalError::CompositeRecovery)?;
         recover_checkpoint_from_recovery_root(
@@ -610,6 +624,10 @@ async fn recover_owned_private_staging_inner(
         let owned =
             OwnedPrivateStagedSqliteCopy::from_recovery_proof(CompositeRecoveryProof::new(path))
                 .map_err(|_| ShadowWalError::CompositeRecovery)?;
+        #[cfg(test)]
+        let mut owned = owned;
+        #[cfg(test)]
+        owned.observe_cleanup_for_test(cleanup.cleanup_sender.take());
         cleanup.disarm();
         Ok(owned)
     })
@@ -617,23 +635,35 @@ async fn recover_owned_private_staging_inner(
     .map_err(|_| ShadowWalError::CompositeRecovery)?
 }
 
-fn observe_recovery_path(observer: Option<RecoveryPathObserver>, path: &Path) {
+fn observe_recovery(
+    observer: Option<RecoveryObserver>,
+    path: &Path,
+    cleanup: &mut CompositeRecoveryCleanup,
+) {
     #[cfg(test)]
     if let Some(observer) = observer {
-        let _ = observer.send(path.to_path_buf());
+        let _ = observer.path_sender.send(path.to_path_buf());
+        cleanup.cleanup_sender = Some(observer.cleanup_sender);
     }
     #[cfg(not(test))]
-    let _ = (observer, path);
+    let _ = (observer, path, cleanup);
 }
 
 struct CompositeRecoveryCleanup {
     path: PathBuf,
     armed: bool,
+    #[cfg(test)]
+    cleanup_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl CompositeRecoveryCleanup {
     fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+        Self {
+            path,
+            armed: true,
+            #[cfg(test)]
+            cleanup_sender: None,
+        }
     }
 
     fn disarm(&mut self) {
@@ -645,6 +675,10 @@ impl Drop for CompositeRecoveryCleanup {
     fn drop(&mut self) {
         if self.armed {
             remove_private_sqlite_family(&self.path);
+            #[cfg(test)]
+            if let Some(cleanup_sender) = self.cleanup_sender.take() {
+                let _ = cleanup_sender.send(());
+            }
         }
     }
 }
@@ -2851,12 +2885,14 @@ mod tests {
         let cipher = fixture.cipher.clone();
         let archive = fixture.archive;
         let (path_sender, path_receiver) = tokio::sync::oneshot::channel();
+        let (cleanup_sender, cleanup_receiver) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn(recover_owned_private_staging_observed(
             fixture.recovery,
             backend,
             cipher,
             archive,
             path_sender,
+            cleanup_sender,
         ));
         let created = path_receiver.await.unwrap();
         fixture.backend.stall_started.notified().await;
@@ -2864,13 +2900,8 @@ mod tests {
         caller.abort();
         let _ = caller.await;
         assert!(created.exists());
-        fixture.backend.stall_release.notify_waiters();
-        for _ in 0..1_024 {
-            if !created.exists() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        fixture.backend.stall_release.notify_one();
+        cleanup_receiver.await.unwrap();
         assert!(!created.exists());
         assert!(!sqlite_sidecar_path(&created, "-wal").exists());
         assert!(!sqlite_sidecar_path(&created, "-shm").exists());
