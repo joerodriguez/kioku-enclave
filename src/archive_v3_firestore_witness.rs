@@ -2306,6 +2306,7 @@ impl FirestoreWitness {
         })
         .await
     }
+    #[cfg(test)]
     pub(crate) async fn tombstone_async(
         &self,
         advance: RootAdvance,
@@ -2317,6 +2318,17 @@ impl FirestoreWitness {
         })
         .await
     }
+    pub(crate) async fn tombstone_current_async(
+        &self,
+        advance: crate::archive_v3_witness::TombstoneAdvance,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> std::result::Result<TombstoneReceipt, WitnessError> {
+        self.update(advance.archive_id(), |local| {
+            local.tombstone_current(advance.clone(), credential, proof)
+        })
+        .await
+    }
     pub(crate) async fn resume_deletion_async(
         &self,
         archive_id: ArchiveId,
@@ -2324,6 +2336,17 @@ impl FirestoreWitness {
     ) -> std::result::Result<DeletionRecovery, WitnessError> {
         self.update(archive_id, |local| {
             local.resume_deletion(archive_id, credential)
+        })
+        .await
+    }
+    pub(crate) async fn verify_physical_completion_async(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> std::result::Result<DeletionRecovery, WitnessError> {
+        self.update(archive_id, |local| {
+            local.verify_physical_completion(archive_id, credential, proof)
         })
         .await
     }
@@ -2451,6 +2474,7 @@ impl Witness for FirestoreWitness {
     ) -> std::result::Result<WitnessReceipt, WitnessError> {
         self.blocking(self.cut_over_database_epoch_async(advance, next))
     }
+    #[cfg(test)]
     fn tombstone(
         &self,
         advance: RootAdvance,
@@ -2459,12 +2483,28 @@ impl Witness for FirestoreWitness {
     ) -> std::result::Result<TombstoneReceipt, WitnessError> {
         self.blocking(self.tombstone_async(advance, credential, proof))
     }
+    fn tombstone_current(
+        &self,
+        advance: crate::archive_v3_witness::TombstoneAdvance,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> std::result::Result<TombstoneReceipt, WitnessError> {
+        self.blocking(self.tombstone_current_async(advance, credential, proof))
+    }
     fn resume_deletion(
         &self,
         archive_id: ArchiveId,
         credential: &DeletionWorkerCredential,
     ) -> std::result::Result<DeletionRecovery, WitnessError> {
         self.blocking(self.resume_deletion_async(archive_id, credential))
+    }
+    fn verify_physical_completion(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> std::result::Result<DeletionRecovery, WitnessError> {
+        self.blocking(self.verify_physical_completion_async(archive_id, credential, proof))
     }
     fn advance_deletion(
         &self,

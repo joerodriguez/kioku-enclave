@@ -119,6 +119,21 @@ impl DeletionStageProof {
         })
     }
 
+    pub(crate) fn bind_inventory_only(&self, inventory_commitment: [u8; 32]) -> Result<Self> {
+        if self.provider_assertion.is_empty() || !nonzero_hash(&inventory_commitment) {
+            return Err(WitnessError::Malformed);
+        }
+        Ok(Self {
+            provider_assertion: Zeroizing::new(self.provider_assertion.to_vec()),
+            inventory_commitment: Some(inventory_commitment),
+            provider_drain_commitment: None,
+        })
+    }
+
+    pub(crate) const fn inventory_binding(&self) -> Option<[u8; 32]> {
+        self.inventory_commitment
+    }
+
     pub(crate) fn drain_binding(&self) -> Option<([u8; 32], [u8; 32])> {
         self.inventory_commitment
             .zip(self.provider_drain_commitment)
@@ -237,6 +252,12 @@ impl DeletionWorkerAuthenticator for DeletionDriverTestAuthenticator {
             return Err(WitnessError::Unauthorized);
         }
         match context.target {
+            DeletionState::CryptographicallyErased
+                if context
+                    .inventory_commitment
+                    .is_some_and(|value| nonzero_hash(&value))
+                    && context.provider_drain_commitment.is_none() => {}
+            DeletionState::CryptographicallyErased => return Err(WitnessError::Unauthorized),
             DeletionState::PhysicalComplete
                 if context
                     .inventory_commitment
@@ -1011,6 +1032,13 @@ impl WitnessBootstrap {
             registry,
         })
     }
+
+    pub(crate) fn expected_initial_record_bytes(&self) -> Result<[u8; WITNESS_RECORD_BYTES]> {
+        let witness = InMemoryWitness::with_clock(Arc::new(SystemClock));
+        witness
+            .bootstrap(self.clone())
+            .map(|record| record.encode())
+    }
 }
 impl fmt::Debug for WitnessBootstrap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1195,6 +1223,58 @@ pub struct DeletionAdvance {
     expected_root: RootCommitment,
     expected_registry: KeyRegistryReference,
 }
+
+/// Exact-current deletion transition. Unlike the legacy tombstone seam this
+/// does not require a writer lease and cannot publish a new root as a side
+/// effect of deletion. The complete mutable witness snapshot is captured from
+/// one authenticated read and compared transactionally before the owner is
+/// revoked and the deletion fence is installed.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TombstoneAdvance {
+    archive_id: ArchiveId,
+    database_epoch: DatabaseEpoch,
+    expected_root: RootCommitment,
+    expected_registry: KeyRegistryReference,
+    expected_current_fencing_epoch: u64,
+    expected_next_fencing_epoch: u64,
+}
+
+impl TombstoneAdvance {
+    pub(crate) fn from_current(record: &WitnessRecord) -> Result<Self> {
+        if record.deletion != DeletionState::Active
+            || record.next_fencing_epoch == 0
+            || record.next_fencing_epoch <= record.current_fencing_epoch
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(Self {
+            archive_id: record.archive_id,
+            database_epoch: record.database_epoch,
+            expected_root: record.root,
+            expected_registry: record.registry,
+            expected_current_fencing_epoch: record.current_fencing_epoch,
+            expected_next_fencing_epoch: record.next_fencing_epoch,
+        })
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_root_for_test(self, expected_root: RootCommitment) -> Self {
+        Self {
+            expected_root,
+            ..self
+        }
+    }
+}
+
+impl fmt::Debug for TombstoneAdvance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TombstoneAdvance(<opaque>)")
+    }
+}
 impl DeletionAdvance {
     pub(crate) fn archive_id(&self) -> ArchiveId {
         self.authorization.archive_id
@@ -1259,7 +1339,6 @@ impl DeletionRecovery {
         let worker_id = record.deletion_worker_id.ok_or(WitnessError::Corrupt)?;
         let operation_id = record.deletion_operation_id.ok_or(WitnessError::Corrupt)?;
         if record.deletion == DeletionState::Active
-            || record.deletion == DeletionState::PhysicalComplete
             || self.authorization.archive_id != record.archive_id
             || self.authorization.database_epoch != record.database_epoch
             || self.authorization.fencing_epoch != deletion_fencing_epoch
@@ -1359,9 +1438,16 @@ pub trait Witness: Send + Sync {
         advance: RootAdvance,
         next: DatabaseEpoch,
     ) -> Result<WitnessReceipt>;
+    #[cfg(test)]
     fn tombstone(
         &self,
         advance: RootAdvance,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<TombstoneReceipt>;
+    fn tombstone_current(
+        &self,
+        advance: TombstoneAdvance,
         credential: &DeletionWorkerCredential,
         proof: &DeletionStageProof,
     ) -> Result<TombstoneReceipt>;
@@ -1373,6 +1459,16 @@ pub trait Witness: Send + Sync {
         &self,
         archive_id: ArchiveId,
         credential: &DeletionWorkerCredential,
+    ) -> Result<DeletionRecovery>;
+    /// Re-authenticate an already-complete deletion and verify that the raw
+    /// inventory/drain tuple still hashes to the retained final evidence. This
+    /// closes the crash window between witness completion and lifecycle-ledger
+    /// payload cleanup without changing the witness encoding.
+    fn verify_physical_completion(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
     ) -> Result<DeletionRecovery>;
     fn advance_deletion(
         &self,
@@ -1794,6 +1890,7 @@ impl Witness for InMemoryWitness {
     fn cut_over_database_epoch(&self, a: RootAdvance, x: DatabaseEpoch) -> Result<WitnessReceipt> {
         self.normal(a, Normal::Epoch(x))
     }
+    #[cfg(test)]
     fn tombstone(
         &self,
         a: RootAdvance,
@@ -1845,6 +1942,69 @@ impl Witness for InMemoryWitness {
             },
         })
     }
+    fn tombstone_current(
+        &self,
+        advance: TombstoneAdvance,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<TombstoneReceipt> {
+        let identity = self.authenticate_deletion_worker(advance.archive_id, credential)?;
+        let mut state = self.lock()?;
+        available(&state)?;
+        let record = state
+            .records
+            .get_mut(&advance.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        let _trusted_tick = self.now(record)?;
+        if record.deletion != DeletionState::Active
+            || record.archive_id != advance.archive_id
+            || record.database_epoch != advance.database_epoch
+            || record.root != advance.expected_root
+            || record.registry != advance.expected_registry
+            || record.current_fencing_epoch != advance.expected_current_fencing_epoch
+            || record.next_fencing_epoch != advance.expected_next_fencing_epoch
+        {
+            return Err(WitnessError::CompareFailed);
+        }
+        let deletion_fencing_epoch = advance.expected_next_fencing_epoch;
+        let next_fencing_epoch = deletion_fencing_epoch
+            .checked_add(1)
+            .ok_or(WitnessError::Malformed)?;
+        let evidence = self.verified_deletion_evidence(
+            record,
+            DeletionStageContext {
+                archive_id: record.archive_id,
+                identity,
+                deletion_fencing_epoch,
+                target: DeletionState::Tombstoned,
+                root: record.root,
+                registry: record.registry,
+                inventory_commitment: None,
+                provider_drain_commitment: None,
+            },
+            credential,
+            proof,
+        )?;
+        record.next_fencing_epoch = next_fencing_epoch;
+        record.deletion = DeletionState::Tombstoned;
+        record.migration = MigrationState::Deleting;
+        record.deletion_evidence[0] = Some(evidence);
+        record.owner_id = None;
+        record.lease_expires_at_tick = 0;
+        record.deletion_fencing_epoch = Some(deletion_fencing_epoch);
+        record.deletion_worker_id = Some(identity.worker_id);
+        record.deletion_operation_id = Some(identity.operation_id);
+        Ok(TombstoneReceipt {
+            receipt: WitnessReceipt {
+                record: record.clone(),
+            },
+            authorization: DeletionAuthorization {
+                archive_id: record.archive_id,
+                database_epoch: record.database_epoch,
+                fencing_epoch: deletion_fencing_epoch,
+            },
+        })
+    }
     fn resume_deletion(
         &self,
         archive_id: ArchiveId,
@@ -1857,10 +2017,7 @@ impl Witness for InMemoryWitness {
             .records
             .get(&archive_id)
             .ok_or(WitnessError::MissingArchive)?;
-        if matches!(
-            r.deletion,
-            DeletionState::Active | DeletionState::PhysicalComplete
-        ) {
+        if r.deletion == DeletionState::Active {
             return Err(WitnessError::InvalidTransition);
         }
         if r.deletion_worker_id != Some(identity.worker_id)
@@ -1875,6 +2032,63 @@ impl Witness for InMemoryWitness {
                 archive_id: r.archive_id,
                 database_epoch: r.database_epoch,
                 fencing_epoch,
+            },
+        })
+    }
+    fn verify_physical_completion(
+        &self,
+        archive_id: ArchiveId,
+        credential: &DeletionWorkerCredential,
+        proof: &DeletionStageProof,
+    ) -> Result<DeletionRecovery> {
+        let identity = self.authenticate_deletion_worker(archive_id, credential)?;
+        let s = self.lock()?;
+        available(&s)?;
+        let r = s
+            .records
+            .get(&archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        if r.deletion != DeletionState::PhysicalComplete
+            || r.deletion_worker_id != Some(identity.worker_id)
+            || r.deletion_operation_id != Some(identity.operation_id)
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let deletion_fencing_epoch = r.deletion_fencing_epoch.ok_or(WitnessError::Corrupt)?;
+        let (inventory_commitment, provider_drain_commitment) =
+            proof.drain_binding().ok_or(WitnessError::Malformed)?;
+        // Reconstruct the exact pre-final evidence chain that was hashed by
+        // `advance_deletion`. The retained PhysicalComplete slot contains the
+        // hash being verified and must not recursively become its own input.
+        // Every identity/fence/root/registry/prior-stage field remains exact.
+        let mut pre_final = r.clone();
+        pre_final.deletion_evidence[DeletionState::PhysicalComplete.evidence_count() - 1] = None;
+        let expected = self.verified_deletion_evidence(
+            &pre_final,
+            DeletionStageContext {
+                archive_id,
+                identity,
+                deletion_fencing_epoch,
+                target: DeletionState::PhysicalComplete,
+                root: r.root,
+                registry: r.registry,
+                inventory_commitment: Some(inventory_commitment),
+                provider_drain_commitment: Some(provider_drain_commitment),
+            },
+            credential,
+            proof,
+        )?;
+        if r.deletion_evidence[DeletionState::PhysicalComplete.evidence_count() - 1]
+            != Some(expected)
+        {
+            return Err(WitnessError::CompareFailed);
+        }
+        Ok(DeletionRecovery {
+            receipt: WitnessReceipt { record: r.clone() },
+            authorization: DeletionAuthorization {
+                archive_id,
+                database_epoch: r.database_epoch,
+                fencing_epoch: deletion_fencing_epoch,
             },
         })
     }
@@ -1895,15 +2109,21 @@ impl Witness for InMemoryWitness {
         let _ = self.now(r)?;
         deletion_ok(r, &a, next, identity)?;
         let deletion_fencing_epoch = r.deletion_fencing_epoch.ok_or(WitnessError::Corrupt)?;
-        let (inventory_commitment, provider_drain_commitment) = match (next, proof.drain_binding())
-        {
-            (DeletionState::PhysicalComplete, Some((inventory, drain))) => {
-                (Some(inventory), Some(drain))
-            }
-            (DeletionState::PhysicalComplete, None) => return Err(WitnessError::Malformed),
-            (_, None) => (None, None),
-            (_, Some(_)) => return Err(WitnessError::Malformed),
-        };
+        let (inventory_commitment, provider_drain_commitment) =
+            match (next, proof.inventory_binding(), proof.drain_binding()) {
+                (DeletionState::CryptographicallyErased, Some(inventory), None) => {
+                    (Some(inventory), None)
+                }
+                (DeletionState::CryptographicallyErased, _, _) => {
+                    return Err(WitnessError::Malformed)
+                }
+                (DeletionState::PhysicalComplete, _, Some((inventory, drain))) => {
+                    (Some(inventory), Some(drain))
+                }
+                (DeletionState::PhysicalComplete, _, None) => return Err(WitnessError::Malformed),
+                (_, None, None) => (None, None),
+                (_, _, _) => return Err(WitnessError::Malformed),
+            };
         let evidence = self.verified_deletion_evidence(
             r,
             DeletionStageContext {
@@ -2143,6 +2363,9 @@ fn deletion_evidence_from_verified_stage(
         context.inventory_commitment,
         context.provider_drain_commitment,
     ) {
+        (DeletionState::CryptographicallyErased, Some(inventory), None)
+            if nonzero_hash(&inventory) => {}
+        (DeletionState::CryptographicallyErased, _, _) => return Err(WitnessError::Malformed),
         (DeletionState::PhysicalComplete, Some(inventory), Some(drain))
             if nonzero_hash(&inventory) && nonzero_hash(&drain) => {}
         (DeletionState::PhysicalComplete, _, _) => return Err(WitnessError::Malformed),
@@ -2408,6 +2631,12 @@ mod tests {
                 return Err(WitnessError::Unauthorized);
             }
             match context.target {
+                DeletionState::CryptographicallyErased
+                    if context
+                        .inventory_commitment
+                        .is_some_and(|value| nonzero_hash(&value))
+                        && context.provider_drain_commitment.is_none() => {}
+                DeletionState::CryptographicallyErased => return Err(WitnessError::Unauthorized),
                 DeletionState::PhysicalComplete
                     if context
                         .inventory_commitment
@@ -2444,10 +2673,12 @@ mod tests {
             DeletionState::PhysicalComplete => b"provider-proof-retention".as_slice(),
         };
         let proof = DeletionStageProof::new(assertion).unwrap();
-        if state == DeletionState::PhysicalComplete {
-            proof.bind_inventory_drain(hash(81), hash(82)).unwrap()
-        } else {
-            proof
+        match state {
+            DeletionState::CryptographicallyErased => proof.bind_inventory_only(hash(81)).unwrap(),
+            DeletionState::PhysicalComplete => {
+                proof.bind_inventory_drain(hash(81), hash(82)).unwrap()
+            }
+            _ => proof,
         }
     }
     fn wrapped_registry_hash() -> [u8; 32] {
@@ -3002,14 +3233,47 @@ mod tests {
             Err(WitnessError::InvalidTransition)
         );
         assert_eq!(w.renew_lease(l, 1), Err(WitnessError::Fenced));
+        let unauthorized_erasure = deletion_proof(DeletionState::LogicalObjectsAbsent)
+            .bind_inventory_only(hash(81))
+            .unwrap();
         assert_eq!(
             w.advance_deletion(
                 del(&x, t.authorization),
                 DeletionState::CryptographicallyErased,
                 &deletion_credential(),
-                &deletion_proof(DeletionState::LogicalObjectsAbsent),
+                &unauthorized_erasure,
             ),
             Err(WitnessError::Unauthorized)
+        );
+    }
+    #[test]
+    fn exact_current_tombstone_never_publishes_a_root_and_rejects_stale_snapshots() {
+        let (w, _, initial, lease) = setup();
+        let current = w.read_current(initial.archive_id).unwrap().unwrap();
+        let exact = TombstoneAdvance::from_current(&current).unwrap();
+        let next = adv(&current, lease, 9);
+        let advanced = w.compare_and_advance_root(next).unwrap();
+        assert!(matches!(
+            w.tombstone_current(
+                exact,
+                &deletion_credential(),
+                &deletion_proof(DeletionState::Tombstoned),
+            ),
+            Err(WitnessError::CompareFailed)
+        ));
+        let exact = TombstoneAdvance::from_current(advanced.record()).unwrap();
+        let root_before = advanced.record().root();
+        let tombstone = w
+            .tombstone_current(
+                exact,
+                &deletion_credential(),
+                &deletion_proof(DeletionState::Tombstoned),
+            )
+            .unwrap();
+        assert_eq!(tombstone.receipt().record().root(), root_before);
+        assert_eq!(
+            tombstone.receipt().record().deletion(),
+            DeletionState::Tombstoned
         );
     }
     #[test]
@@ -3168,10 +3432,29 @@ mod tests {
             .all(|(index, commitment)| commitments[..index]
                 .iter()
                 .all(|prior| prior != commitment)));
-        assert!(matches!(
-            after_inventory_restart.resume_deletion(r.archive_id, &deletion_credential()),
-            Err(WitnessError::InvalidTransition)
-        ));
+        assert_eq!(
+            after_inventory_restart
+                .resume_deletion(r.archive_id, &deletion_credential())
+                .unwrap()
+                .receipt()
+                .record()
+                .deletion(),
+            DeletionState::PhysicalComplete
+        );
+        after_inventory_restart
+            .verify_physical_completion(
+                r.archive_id,
+                &deletion_credential(),
+                &deletion_proof(DeletionState::PhysicalComplete),
+            )
+            .unwrap();
+        assert!(after_inventory_restart
+            .verify_physical_completion(
+                r.archive_id,
+                &deletion_credential(),
+                &DeletionStageProof::new(b"different-final-proof").unwrap(),
+            )
+            .is_err());
     }
     #[test]
     fn deletion_evidence_direct_extent_and_epoch_cutover() {

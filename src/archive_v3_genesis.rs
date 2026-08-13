@@ -5,18 +5,19 @@
 
 //! Restart-safe, inactive archive-v3 genesis coordination.
 //!
-//! This module deliberately owns no provider construction.  A control-plane
-//! binding supplies the opaque archive ID and a caller supplies already-made
-//! immutable candidate bytes.  Construction is synchronous and performs no
+//! This module deliberately owns no provider construction. A control-plane
+//! lifecycle ledger supplies a durable reservation and the exact already-
+//! prepared immutable bytes. Construction is synchronous and performs no
 //! provider I/O; the injected backend is used only by [`ArchiveGenesis::resolve`].
 //! In particular, this is not a Store, VFS, route, credential, or feature-flag
 //! integration.
 //!
-//! Before the first call to `resolve`, future runtime wiring must durably retain
-//! the binding, every [`GenesisIds`] value, the exact wrapped registry bytes,
-//! and the exact root envelope. Partial pre-witness creates must remain in the
-//! account-deletion inventory. This inactive seam cannot establish either
-//! prerequisite because it deliberately owns no persistence or deletion path.
+//! `resolve` requires a fresh revision-bound create admission before each
+//! registry, root, or witness provider request. It persists the exact witness
+//! bytes before witness create, reconciles ambiguity through exact readback,
+//! and performs a final active-ledger reread. Partial pre-witness creates stay
+//! in the lifecycle deletion inventory. No production ledger/backend composite
+//! is constructed here, so the seam remains inactive.
 
 use crate::{
     archive_v3::{
@@ -24,6 +25,10 @@ use crate::{
         ExactKeyRegistryProvider, KeyEpoch, KeyKind, KeyRegistryContext, LogicalLocation,
         ObjectContext, ObjectId, ObjectRole, ParentReference, MAX_ENCODED_ENVELOPE_BYTES,
         MAX_WRAPPED_KEY_REGISTRY_BYTES,
+    },
+    archive_v3_lifecycle::{
+        ActiveCreateAdmission, ArchiveLifecycleLedger, BootstrapAttemptId,
+        DurableBootstrapReservation, LifecycleCreateOutcome, LifecycleError, PreparedBootstrap,
     },
     archive_v3_witness::{
         DeletionState, ExactRootProvider, KeyRegistryReference, RootCommitment, RootReference,
@@ -44,11 +49,18 @@ pub(crate) struct ArchiveBinding {
 }
 
 impl ArchiveBinding {
+    #[cfg(test)]
     pub(crate) fn new(archive_id: ArchiveId) -> Result<Self, BootstrapError> {
         if archive_id.as_bytes().iter().all(|byte| *byte == 0) {
             return Err(BootstrapError::MalformedCandidate);
         }
         Ok(Self { archive_id })
+    }
+
+    fn from_reservation(reservation: DurableBootstrapReservation) -> Self {
+        Self {
+            archive_id: reservation.plan().archive_id(),
+        }
     }
 
     pub(crate) const fn archive_id(self) -> ArchiveId {
@@ -83,22 +95,52 @@ impl fmt::Debug for GenesisIds {
 /// archive-encrypted; the root envelope uses the existing archive-v3 AAD.
 pub(crate) struct GenesisCandidate {
     binding: ArchiveBinding,
+    attempt_id: BootstrapAttemptId,
     ids: GenesisIds,
     registry_context: KeyRegistryContext,
     registry: KeyRegistryReference,
     root_context: ObjectContext,
     root_envelope: CiphertextEnvelope,
     wrapped_registry: Zeroizing<Vec<u8>>,
+    lifecycle_revision: u64,
 }
 
 impl GenesisCandidate {
+    fn from_prepared(prepared: PreparedBootstrap) -> Result<Self, BootstrapError> {
+        let reservation = prepared.reservation();
+        let plan = reservation.plan();
+        let root_envelope = CiphertextEnvelope::decode(prepared.root_envelope())
+            .map_err(BootstrapError::Archive)?;
+        let registry_hash: [u8; 32] = Sha256::digest(prepared.wrapped_registry()).into();
+        if root_envelope.hash() != prepared.root_envelope_hash()
+            || registry_hash != prepared.wrapped_registry_hash()
+        {
+            return Err(BootstrapError::MalformedCandidate);
+        }
+        Self::new(
+            ArchiveBinding::from_reservation(reservation),
+            plan.attempt_id(),
+            GenesisIds {
+                database_epoch: plan.database_epoch(),
+                key_epoch: plan.key_epoch(),
+                registry_object_id: plan.registry_object_id(),
+                root_object_id: plan.root_object_id(),
+            },
+            prepared.wrapped_registry(),
+            root_envelope,
+            prepared.revision(),
+        )
+    }
+
     /// Performs only bounded local validation.  It never reads, writes, or
     /// constructs a provider, KMS client, credential, or network authority.
     pub(crate) fn new(
         binding: ArchiveBinding,
+        attempt_id: BootstrapAttemptId,
         ids: GenesisIds,
         wrapped_registry: &[u8],
         root_envelope: CiphertextEnvelope,
+        lifecycle_revision: u64,
     ) -> Result<Self, BootstrapError> {
         if ids.database_epoch.as_bytes().iter().all(|byte| *byte == 0)
             || ids.key_epoch.as_bytes().iter().all(|byte| *byte == 0)
@@ -112,6 +154,7 @@ impl GenesisCandidate {
             || wrapped_registry.is_empty()
             || wrapped_registry.len() > MAX_WRAPPED_KEY_REGISTRY_BYTES
             || root_envelope.encode().len() > MAX_ENCODED_ENVELOPE_BYTES
+            || lifecycle_revision == 0
         {
             return Err(BootstrapError::MalformedCandidate);
         }
@@ -135,13 +178,37 @@ impl GenesisCandidate {
         .map_err(BootstrapError::Archive)?;
         Ok(Self {
             binding,
+            attempt_id,
             ids,
             registry_context,
             registry,
             root_context,
             root_envelope,
             wrapped_registry: Zeroizing::new(wrapped_registry.to_vec()),
+            lifecycle_revision,
         })
+    }
+
+    fn validate_admission(
+        &self,
+        admission: &ActiveCreateAdmission,
+        expected_revision: u64,
+        artifact_ordinal: u32,
+        artifact_hash: [u8; 32],
+    ) -> Result<(), BootstrapError> {
+        // A fresh admission advances the anchor once. An exact retry of the
+        // one still-unreconciled provider request replays that same receipt at
+        // the current anchor revision; no older or future receipt is valid.
+        if admission.revision() != expected_revision
+            && Some(admission.revision()) != expected_revision.checked_add(1)
+            || admission.archive_id() != self.binding.archive_id()
+            || admission.attempt_id() != self.attempt_id
+            || admission.artifact_ordinal() != artifact_ordinal
+            || admission.artifact_hash() != artifact_hash
+        {
+            return Err(BootstrapError::Lifecycle(LifecycleError::InvalidState));
+        }
+        Ok(())
     }
 
     fn expected_root(&self) -> RootCommitment {
@@ -206,13 +273,15 @@ pub(crate) enum BootstrapError {
     Archive(ArchiveV3Error),
     #[error("archive genesis witness data is invalid")]
     Witness(WitnessError),
+    #[error("archive genesis durable lifecycle admission failed")]
+    Lifecycle(LifecycleError),
 }
 
 /// Narrow injected provider boundary.  Implementations must use immutable,
 /// create-if-absent semantics.  No implementation is constructed here.
 #[async_trait]
 pub(crate) trait ArchiveGenesisBackend:
-    ExactRootProvider + ExactKeyRegistryProvider
+    ExactRootProvider + ExactKeyRegistryProvider + ArchiveLifecycleLedger
 {
     async fn read_witness(
         &self,
@@ -221,6 +290,7 @@ pub(crate) trait ArchiveGenesisBackend:
 
     async fn create_registry_if_absent(
         &self,
+        admission: &ActiveCreateAdmission,
         context: &KeyRegistryContext,
         object_id: ObjectId,
         wrapped_registry: &[u8],
@@ -228,12 +298,14 @@ pub(crate) trait ArchiveGenesisBackend:
 
     async fn create_root_if_absent(
         &self,
+        admission: &ActiveCreateAdmission,
         context: &ObjectContext,
         envelope: &CiphertextEnvelope,
     ) -> Result<BootstrapCreate, BootstrapError>;
 
     async fn create_witness_if_absent(
         &self,
+        admission: &ActiveCreateAdmission,
         bootstrap: WitnessBootstrap,
     ) -> Result<BootstrapCreate, BootstrapError>;
 }
@@ -253,7 +325,14 @@ pub(crate) struct ArchiveGenesis {
 }
 
 impl ArchiveGenesis {
-    pub(crate) const fn new(candidate: GenesisCandidate) -> Self {
+    pub(crate) fn new(prepared: PreparedBootstrap) -> Result<Self, BootstrapError> {
+        Ok(Self {
+            candidate: GenesisCandidate::from_prepared(prepared)?,
+        })
+    }
+
+    #[cfg(test)]
+    const fn from_candidate_for_test(candidate: GenesisCandidate) -> Self {
         Self { candidate }
     }
 
@@ -261,18 +340,65 @@ impl ArchiveGenesis {
         &self,
         backend: &dyn ArchiveGenesisBackend,
     ) -> Result<GenesisResolution, BootstrapError> {
+        let lifecycle_revision = backend
+            .revalidate_active(
+                self.candidate.binding.archive_id(),
+                self.candidate.lifecycle_revision,
+            )
+            .await
+            .map_err(BootstrapError::Lifecycle)?;
         if let Some(record) = backend
             .read_witness(self.candidate.binding.archive_id())
             .await?
         {
             self.authenticate_stable_record(backend, &record).await?;
+            let fresh_revision = backend
+                .revalidate_active(self.candidate.binding.archive_id(), lifecycle_revision)
+                .await
+                .map_err(BootstrapError::Lifecycle)?;
+            if fresh_revision != lifecycle_revision {
+                return Err(BootstrapError::Lifecycle(LifecycleError::StaleRevision));
+            }
             return Ok(GenesisResolution::Existing);
         }
 
-        self.create_or_compare_registry(backend).await?;
-        self.create_or_compare_root(backend).await?;
+        let revision = self
+            .create_or_compare_registry(backend, lifecycle_revision)
+            .await?;
+        let revision = self.create_or_compare_root(backend, revision).await?;
         let bootstrap = self.candidate.authenticated_bootstrap(backend).await?;
-        match backend.create_witness_if_absent(bootstrap).await {
+        let expected_record = bootstrap
+            .expected_initial_record_bytes()
+            .map_err(BootstrapError::Witness)?;
+        let revision = backend
+            .prepare_witness(
+                self.candidate.binding.archive_id(),
+                revision,
+                &expected_record,
+            )
+            .await
+            .map_err(BootstrapError::Lifecycle)?;
+        let admission = backend
+            .admit_exact_create(self.candidate.binding.archive_id(), revision, 2)
+            .await
+            .map_err(BootstrapError::Lifecycle)?;
+        self.candidate.validate_admission(
+            &admission,
+            revision,
+            2,
+            Sha256::digest(expected_record).into(),
+        )?;
+        let outcome = backend
+            .create_witness_if_absent(&admission, bootstrap)
+            .await;
+        let reconciliation = match &outcome {
+            Ok(BootstrapCreate::Created) => Some(LifecycleCreateOutcome::Created),
+            Ok(BootstrapCreate::AlreadyPresent) | Err(BootstrapError::OutcomeUnknown) => {
+                Some(LifecycleCreateOutcome::AlreadyPresentExact)
+            }
+            Err(_) => None,
+        };
+        match outcome {
             Ok(BootstrapCreate::Created)
             | Ok(BootstrapCreate::AlreadyPresent)
             | Err(BootstrapError::OutcomeUnknown) => {
@@ -285,7 +411,21 @@ impl ArchiveGenesis {
                 {
                     return Err(BootstrapError::Conflict);
                 }
+                let revision = backend
+                    .reconcile_create(
+                        &admission,
+                        reconciliation.expect("matched exact witness create outcomes"),
+                    )
+                    .await
+                    .map_err(BootstrapError::Lifecycle)?;
                 self.authenticate_stable_record(backend, &record).await?;
+                let fresh_revision = backend
+                    .revalidate_active(self.candidate.binding.archive_id(), revision)
+                    .await
+                    .map_err(BootstrapError::Lifecycle)?;
+                if fresh_revision != revision {
+                    return Err(BootstrapError::Lifecycle(LifecycleError::StaleRevision));
+                }
                 Ok(GenesisResolution::Created)
             }
             Err(error) => Err(error),
@@ -295,15 +435,34 @@ impl ArchiveGenesis {
     async fn create_or_compare_registry(
         &self,
         backend: &dyn ArchiveGenesisBackend,
-    ) -> Result<(), BootstrapError> {
-        match backend
+        expected_revision: u64,
+    ) -> Result<u64, BootstrapError> {
+        let admission = backend
+            .admit_exact_create(self.candidate.binding.archive_id(), expected_revision, 0)
+            .await
+            .map_err(BootstrapError::Lifecycle)?;
+        self.candidate.validate_admission(
+            &admission,
+            expected_revision,
+            0,
+            self.candidate.registry.ciphertext_hash(),
+        )?;
+        let outcome = backend
             .create_registry_if_absent(
+                &admission,
                 &self.candidate.registry_context,
                 self.candidate.ids.registry_object_id,
                 &self.candidate.wrapped_registry,
             )
-            .await
-        {
+            .await;
+        let reconciliation = match &outcome {
+            Ok(BootstrapCreate::Created) => Some(LifecycleCreateOutcome::Created),
+            Ok(BootstrapCreate::AlreadyPresent) | Err(BootstrapError::OutcomeUnknown) => {
+                Some(LifecycleCreateOutcome::AlreadyPresentExact)
+            }
+            Err(_) => None,
+        };
+        match outcome {
             Ok(BootstrapCreate::Created)
             | Ok(BootstrapCreate::AlreadyPresent)
             | Err(BootstrapError::OutcomeUnknown) => {
@@ -324,7 +483,13 @@ impl ArchiveGenesis {
                 if actual[..len] != *self.candidate.wrapped_registry {
                     return Err(BootstrapError::Conflict);
                 }
-                Ok(())
+                backend
+                    .reconcile_create(
+                        &admission,
+                        reconciliation.expect("matched exact registry create outcomes"),
+                    )
+                    .await
+                    .map_err(BootstrapError::Lifecycle)
             }
             Err(error) => Err(error),
         }
@@ -333,11 +498,33 @@ impl ArchiveGenesis {
     async fn create_or_compare_root(
         &self,
         backend: &dyn ArchiveGenesisBackend,
-    ) -> Result<(), BootstrapError> {
-        match backend
-            .create_root_if_absent(&self.candidate.root_context, &self.candidate.root_envelope)
+        expected_revision: u64,
+    ) -> Result<u64, BootstrapError> {
+        let admission = backend
+            .admit_exact_create(self.candidate.binding.archive_id(), expected_revision, 1)
             .await
-        {
+            .map_err(BootstrapError::Lifecycle)?;
+        self.candidate.validate_admission(
+            &admission,
+            expected_revision,
+            1,
+            self.candidate.root_envelope.hash(),
+        )?;
+        let outcome = backend
+            .create_root_if_absent(
+                &admission,
+                &self.candidate.root_context,
+                &self.candidate.root_envelope,
+            )
+            .await;
+        let reconciliation = match &outcome {
+            Ok(BootstrapCreate::Created) => Some(LifecycleCreateOutcome::Created),
+            Ok(BootstrapCreate::AlreadyPresent) | Err(BootstrapError::OutcomeUnknown) => {
+                Some(LifecycleCreateOutcome::AlreadyPresentExact)
+            }
+            Err(_) => None,
+        };
+        match outcome {
             Ok(BootstrapCreate::Created)
             | Ok(BootstrapCreate::AlreadyPresent)
             | Err(BootstrapError::OutcomeUnknown) => {
@@ -348,7 +535,13 @@ impl ArchiveGenesis {
                 if actual != self.candidate.root_envelope {
                     return Err(BootstrapError::Conflict);
                 }
-                Ok(())
+                backend
+                    .reconcile_create(
+                        &admission,
+                        reconciliation.expect("matched exact root create outcomes"),
+                    )
+                    .await
+                    .map_err(BootstrapError::Lifecycle)
             }
             Err(error) => Err(error),
         }
@@ -467,6 +660,16 @@ mod tests {
         RegistryAdvance,
     }
 
+    #[derive(Clone, Copy)]
+    enum AdmissionFault {
+        Archive,
+        Attempt,
+        StaleRevision,
+        FutureRevision,
+        Ordinal,
+        Hash,
+    }
+
     struct FakeBackend {
         witness: InMemoryWitness,
         forced_record: Mutex<Option<WitnessRecord>>,
@@ -478,10 +681,18 @@ mod tests {
         witness_mode: WriteMode,
         interleave: Mutex<Option<WitnessInterleave>>,
         io: Mutex<usize>,
+        events: Mutex<Vec<&'static str>>,
+        lifecycle_revision: Mutex<u64>,
+        revalidate_calls: Mutex<usize>,
+        freeze_on_revalidate_call: Mutex<Option<usize>>,
+        expected_registry_hash: [u8; 32],
+        expected_root_hash: [u8; 32],
+        prepared_witness_hash: Mutex<Option<[u8; 32]>>,
+        admission_fault: Mutex<Option<(u32, AdmissionFault)>>,
     }
 
     impl FakeBackend {
-        fn new(plaintext: Vec<u8>) -> Self {
+        fn new(genesis: &ArchiveGenesis, plaintext: Vec<u8>) -> Self {
             Self {
                 witness: InMemoryWitness::new(),
                 forced_record: Mutex::new(None),
@@ -493,13 +704,32 @@ mod tests {
                 witness_mode: WriteMode::Normal,
                 interleave: Mutex::new(None),
                 io: Mutex::new(0),
+                events: Mutex::new(Vec::new()),
+                lifecycle_revision: Mutex::new(2),
+                revalidate_calls: Mutex::new(0),
+                freeze_on_revalidate_call: Mutex::new(None),
+                expected_registry_hash: genesis.candidate.registry.ciphertext_hash(),
+                expected_root_hash: genesis.candidate.root_envelope.hash(),
+                prepared_witness_hash: Mutex::new(None),
+                admission_fault: Mutex::new(None),
             }
+        }
+
+        fn fault_admission(&self, ordinal: u32, fault: AdmissionFault) {
+            *self.admission_fault.lock().unwrap() = Some((ordinal, fault));
         }
         fn io_count(&self) -> usize {
             *self.io.lock().unwrap()
         }
         fn hit(&self) {
             *self.io.lock().unwrap() += 1;
+        }
+        fn event(&self, event: &'static str) {
+            self.events.lock().unwrap().push(event);
+        }
+        fn freeze_on_final_revalidate(&self) {
+            let calls = *self.revalidate_calls.lock().unwrap();
+            *self.freeze_on_revalidate_call.lock().unwrap() = Some(calls + 2);
         }
         fn result_for(mode: WriteMode, inserted: bool) -> Result<BootstrapCreate, BootstrapError> {
             if matches!(
@@ -613,6 +843,186 @@ mod tests {
         }
     }
     #[async_trait]
+    impl ArchiveLifecycleLedger for FakeBackend {
+        async fn reserve_bootstrap(
+            &self,
+            _plan: crate::archive_v3_lifecycle::BootstrapPlan,
+        ) -> std::result::Result<DurableBootstrapReservation, LifecycleError> {
+            Err(LifecycleError::InvalidState)
+        }
+
+        async fn prepare_bootstrap(
+            &self,
+            _reservation: DurableBootstrapReservation,
+            _exact_wrapped_registry: &[u8],
+            _exact_root_envelope: &[u8],
+        ) -> std::result::Result<PreparedBootstrap, LifecycleError> {
+            Err(LifecycleError::InvalidState)
+        }
+
+        async fn prepare_witness(
+            &self,
+            archive_id: ArchiveId,
+            expected_revision: u64,
+            expected_encoded_record: &[u8],
+        ) -> std::result::Result<u64, LifecycleError> {
+            self.event("prepare_witness");
+            if archive_id != ArchiveId::from_bytes([1; 16]) || expected_encoded_record.is_empty() {
+                return Err(LifecycleError::Malformed);
+            }
+            *self.prepared_witness_hash.lock().unwrap() =
+                Some(Sha256::digest(expected_encoded_record).into());
+            let mut revision = self.lifecycle_revision.lock().unwrap();
+            if *revision != expected_revision {
+                return Err(LifecycleError::StaleRevision);
+            }
+            *revision += 1;
+            Ok(*revision)
+        }
+
+        async fn admit_exact_create(
+            &self,
+            archive_id: ArchiveId,
+            expected_revision: u64,
+            artifact_ordinal: u32,
+        ) -> std::result::Result<ActiveCreateAdmission, LifecycleError> {
+            if archive_id != ArchiveId::from_bytes([1; 16]) {
+                return Err(LifecycleError::InvalidState);
+            }
+            self.event(match artifact_ordinal {
+                0 => "admit_registry",
+                1 => "admit_root",
+                2 => "admit_witness",
+                _ => "admit_invalid",
+            });
+            let mut revision = self.lifecycle_revision.lock().unwrap();
+            if *revision != expected_revision {
+                return Err(LifecycleError::StaleRevision);
+            }
+            *revision += 1;
+            let artifact_hash = match artifact_ordinal {
+                0 => self.expected_registry_hash,
+                1 => self.expected_root_hash,
+                2 => self
+                    .prepared_witness_hash
+                    .lock()
+                    .unwrap()
+                    .ok_or(LifecycleError::InvalidState)?,
+                _ => return Err(LifecycleError::Malformed),
+            };
+            let mut receipt_archive = ArchiveId::from_bytes([1; 16]);
+            let mut receipt_attempt = BootstrapAttemptId::from_bytes([20; 16])?;
+            let mut receipt_revision = *revision;
+            let mut receipt_ordinal = artifact_ordinal;
+            let mut receipt_hash = artifact_hash;
+            let admission_fault = { self.admission_fault.lock().unwrap().take() };
+            if let Some((target, fault)) = admission_fault {
+                if target == artifact_ordinal {
+                    match fault {
+                        AdmissionFault::Archive => {
+                            receipt_archive = ArchiveId::from_bytes([99; 16])
+                        }
+                        AdmissionFault::Attempt => {
+                            receipt_attempt = BootstrapAttemptId::from_bytes([98; 16])?
+                        }
+                        AdmissionFault::StaleRevision => {
+                            receipt_revision = expected_revision.saturating_sub(1)
+                        }
+                        AdmissionFault::FutureRevision => {
+                            receipt_revision = expected_revision
+                                .checked_add(2)
+                                .ok_or(LifecycleError::Malformed)?
+                        }
+                        AdmissionFault::Ordinal => receipt_ordinal = (artifact_ordinal + 1) % 3,
+                        AdmissionFault::Hash => receipt_hash[0] ^= 0xff,
+                    }
+                } else {
+                    *self.admission_fault.lock().unwrap() = Some((target, fault));
+                }
+            }
+            ActiveCreateAdmission::for_test(
+                receipt_archive,
+                receipt_attempt,
+                receipt_revision,
+                receipt_ordinal,
+                receipt_hash,
+            )
+        }
+
+        async fn plan_exact_artifact(
+            &self,
+            _archive_id: ArchiveId,
+            _expected_revision: u64,
+            _artifact: crate::archive_v3_lifecycle::PlannedArtifact,
+        ) -> std::result::Result<u64, LifecycleError> {
+            Err(LifecycleError::InvalidState)
+        }
+
+        async fn reconcile_create(
+            &self,
+            admission: &ActiveCreateAdmission,
+            _outcome: LifecycleCreateOutcome,
+        ) -> std::result::Result<u64, LifecycleError> {
+            let mut revision = self.lifecycle_revision.lock().unwrap();
+            if *revision != admission.revision()
+                || admission.archive_id() != ArchiveId::from_bytes([1; 16])
+            {
+                return Err(LifecycleError::StaleRevision);
+            }
+            *revision += 1;
+            Ok(*revision)
+        }
+
+        async fn freeze_for_deletion(
+            &self,
+            _archive_id: ArchiveId,
+            _expected_revision: u64,
+            _deletion_fence: ObjectId,
+        ) -> std::result::Result<u64, LifecycleError> {
+            Err(LifecycleError::InvalidState)
+        }
+
+        async fn seal_inventory(
+            &self,
+            _archive_id: ArchiveId,
+            _expected_revision: u64,
+            _deletion_fence: ObjectId,
+            _pages: &[crate::archive_v3_lifecycle::DurableInventoryPage],
+        ) -> std::result::Result<crate::archive_v3_lifecycle::DeletionInventorySeal, LifecycleError>
+        {
+            Err(LifecycleError::InvalidState)
+        }
+
+        async fn load_sealed_inventory(
+            &self,
+            _seal: &crate::archive_v3_lifecycle::DeletionInventorySeal,
+        ) -> std::result::Result<Vec<crate::archive_v3_lifecycle::InventoryPage>, LifecycleError>
+        {
+            Err(LifecycleError::InvalidState)
+        }
+
+        async fn revalidate_active(
+            &self,
+            archive_id: ArchiveId,
+            expected_revision: u64,
+        ) -> std::result::Result<u64, LifecycleError> {
+            let call = {
+                let mut calls = self.revalidate_calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if *self.freeze_on_revalidate_call.lock().unwrap() == Some(call) {
+                return Err(LifecycleError::InvalidState);
+            }
+            let revision = *self.lifecycle_revision.lock().unwrap();
+            if archive_id != ArchiveId::from_bytes([1; 16]) || revision < expected_revision {
+                return Err(LifecycleError::StaleRevision);
+            }
+            Ok(revision)
+        }
+    }
+
+    #[async_trait]
     impl ArchiveGenesisBackend for FakeBackend {
         async fn read_witness(
             &self,
@@ -628,10 +1038,15 @@ mod tests {
         }
         async fn create_registry_if_absent(
             &self,
+            admission: &ActiveCreateAdmission,
             _context: &KeyRegistryContext,
             id: ObjectId,
             bytes: &[u8],
         ) -> Result<BootstrapCreate, BootstrapError> {
+            if admission.artifact_ordinal() != 0 {
+                return Err(BootstrapError::Lifecycle(LifecycleError::InvalidState));
+            }
+            self.event("create_registry");
             self.hit();
             let mut values = self.registries.lock().unwrap();
             if let Some(existing) = values.get(&id) {
@@ -653,9 +1068,14 @@ mod tests {
         }
         async fn create_root_if_absent(
             &self,
+            admission: &ActiveCreateAdmission,
             context: &ObjectContext,
             envelope: &CiphertextEnvelope,
         ) -> Result<BootstrapCreate, BootstrapError> {
+            if admission.artifact_ordinal() != 1 {
+                return Err(BootstrapError::Lifecycle(LifecycleError::InvalidState));
+            }
+            self.event("create_root");
             self.hit();
             let mut values = self.roots.lock().unwrap();
             let id = context.object_id();
@@ -681,8 +1101,13 @@ mod tests {
         }
         async fn create_witness_if_absent(
             &self,
+            admission: &ActiveCreateAdmission,
             bootstrap: WitnessBootstrap,
         ) -> Result<BootstrapCreate, BootstrapError> {
+            if admission.artifact_ordinal() != 2 {
+                return Err(BootstrapError::Lifecycle(LifecycleError::InvalidState));
+            }
+            self.event("create_witness");
             self.hit();
             let result = self
                 .witness
@@ -744,8 +1169,16 @@ mod tests {
         };
         let envelope = cipher.seal(&root_context, &root.encode().unwrap()).unwrap();
         (
-            ArchiveGenesis::new(
-                GenesisCandidate::new(binding, ids, b"wrapped-registry", envelope).unwrap(),
+            ArchiveGenesis::from_candidate_for_test(
+                GenesisCandidate::new(
+                    binding,
+                    BootstrapAttemptId::from_bytes([20; 16]).unwrap(),
+                    ids,
+                    b"wrapped-registry",
+                    envelope,
+                    2,
+                )
+                .unwrap(),
             ),
             plaintext,
         )
@@ -754,18 +1187,93 @@ mod tests {
     #[tokio::test]
     async fn first_genesis_is_authenticated_and_constructor_does_no_io() {
         let (genesis, plaintext) = candidate();
-        let backend = FakeBackend::new(plaintext);
+        let backend = FakeBackend::new(&genesis, plaintext);
         assert_eq!(backend.io_count(), 0);
         assert_eq!(
             genesis.resolve(&backend).await.unwrap(),
             GenesisResolution::Created
         );
         assert!(backend.io_count() > 0);
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            [
+                "admit_registry",
+                "create_registry",
+                "admit_root",
+                "create_root",
+                "prepare_witness",
+                "admit_witness",
+                "create_witness",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_create_rejects_unbound_admission_before_its_provider_io() {
+        for ordinal in 0..=2 {
+            for fault in [
+                AdmissionFault::Archive,
+                AdmissionFault::Attempt,
+                AdmissionFault::StaleRevision,
+                AdmissionFault::FutureRevision,
+                AdmissionFault::Ordinal,
+                AdmissionFault::Hash,
+            ] {
+                let (genesis, plaintext) = candidate();
+                let backend = FakeBackend::new(&genesis, plaintext);
+                backend.fault_admission(ordinal, fault);
+                assert_eq!(
+                    genesis.resolve(&backend).await,
+                    Err(BootstrapError::Lifecycle(LifecycleError::InvalidState))
+                );
+                let forbidden = match ordinal {
+                    0 => "create_registry",
+                    1 => "create_root",
+                    2 => "create_witness",
+                    _ => unreachable!(),
+                };
+                assert!(!backend.events.lock().unwrap().contains(&forbidden));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn production_constructor_consumes_exact_durable_prepared_bytes() {
+        let (candidate, plaintext) = candidate();
+        let plan = crate::archive_v3_lifecycle::BootstrapPlan::new(
+            candidate.candidate.binding.archive_id(),
+            crate::archive_v3_lifecycle::BootstrapAttemptId::from_bytes([20; 16]).unwrap(),
+            candidate.candidate.ids.database_epoch,
+            candidate.candidate.ids.key_epoch,
+            candidate.candidate.ids.registry_object_id,
+            candidate.candidate.ids.root_object_id,
+        )
+        .unwrap();
+        let reservation = DurableBootstrapReservation::for_test(plan, 1).unwrap();
+        let registry = candidate.candidate.wrapped_registry.to_vec();
+        let root = candidate.candidate.root_envelope.encode();
+        let prepared = PreparedBootstrap::for_test(
+            reservation,
+            2,
+            registry.clone(),
+            root.clone(),
+            Sha256::digest(&registry).into(),
+            Sha256::digest(&root).into(),
+        )
+        .unwrap();
+        let genesis = ArchiveGenesis::new(prepared).unwrap();
+        assert_eq!(
+            genesis
+                .resolve(&FakeBackend::new(&genesis, plaintext))
+                .await
+                .unwrap(),
+            GenesisResolution::Created
+        );
     }
     #[tokio::test]
     async fn restart_reads_existing_exact_state() {
         let (genesis, plaintext) = candidate();
-        let backend = FakeBackend::new(plaintext);
+        let backend = FakeBackend::new(&genesis, plaintext);
         assert_eq!(
             genesis.resolve(&backend).await.unwrap(),
             GenesisResolution::Created
@@ -776,9 +1284,20 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn existing_path_rejects_freeze_before_final_lifecycle_reread() {
+        let (genesis, plaintext) = candidate();
+        let backend = FakeBackend::new(&genesis, plaintext);
+        genesis.resolve(&backend).await.unwrap();
+        backend.freeze_on_final_revalidate();
+        assert_eq!(
+            genesis.resolve(&backend).await,
+            Err(BootstrapError::Lifecycle(LifecycleError::InvalidState))
+        );
+    }
+    #[tokio::test]
     async fn existing_path_rejects_tombstone_during_authentication() {
         let (genesis, plaintext) = candidate();
-        let backend = FakeBackend::new(plaintext);
+        let backend = FakeBackend::new(&genesis, plaintext);
         genesis.resolve(&backend).await.unwrap();
         backend.set_interleave(WitnessInterleave::Tombstone);
         assert_eq!(
@@ -793,7 +1312,7 @@ mod tests {
             WitnessInterleave::RegistryAdvance,
         ] {
             let (genesis, plaintext) = candidate();
-            let backend = FakeBackend::new(plaintext);
+            let backend = FakeBackend::new(&genesis, plaintext);
             genesis.resolve(&backend).await.unwrap();
             backend.set_interleave(action);
             assert_eq!(
@@ -805,7 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn create_path_rejects_finalization_interleave() {
         let (genesis, plaintext) = candidate();
-        let backend = FakeBackend::new(plaintext);
+        let backend = FakeBackend::new(&genesis, plaintext);
         backend.set_interleave(WitnessInterleave::Tombstone);
         assert_eq!(
             genesis.resolve(&backend).await,
@@ -819,7 +1338,7 @@ mod tests {
             registry_mode: WriteMode::LostResponse,
             root_mode: WriteMode::LostResponse,
             witness_mode: WriteMode::LostResponse,
-            ..FakeBackend::new(plaintext)
+            ..FakeBackend::new(&genesis, plaintext)
         };
         assert_eq!(
             genesis.resolve(&backend).await.unwrap(),
@@ -828,7 +1347,7 @@ mod tests {
         let (genesis, plaintext) = candidate();
         let backend = FakeBackend {
             registry_mode: WriteMode::Collision,
-            ..FakeBackend::new(plaintext)
+            ..FakeBackend::new(&genesis, plaintext)
         };
         assert_eq!(
             genesis.resolve(&backend).await,
@@ -837,14 +1356,14 @@ mod tests {
         let (genesis, plaintext) = candidate();
         let backend = FakeBackend {
             root_mode: WriteMode::LostResponseMismatch,
-            ..FakeBackend::new(plaintext)
+            ..FakeBackend::new(&genesis, plaintext)
         };
         assert_eq!(
             genesis.resolve(&backend).await,
             Err(BootstrapError::Conflict)
         );
         let (genesis, plaintext) = candidate();
-        let backend = FakeBackend::new(plaintext);
+        let backend = FakeBackend::new(&genesis, plaintext);
         backend.roots.lock().unwrap().insert(
             genesis.candidate.root_context.object_id(),
             genesis.candidate.root_envelope.clone(),
@@ -856,7 +1375,7 @@ mod tests {
         let (genesis, plaintext) = candidate();
         let backend = FakeBackend {
             registry_mode: WriteMode::LostResponseMismatch,
-            ..FakeBackend::new(plaintext)
+            ..FakeBackend::new(&genesis, plaintext)
         };
         assert_eq!(
             genesis.resolve(&backend).await,
@@ -867,13 +1386,13 @@ mod tests {
     async fn malformed_provider_data_and_tombstones_fail_closed() {
         let (genesis, mut plaintext) = candidate();
         plaintext.push(1);
-        let backend = FakeBackend::new(plaintext);
+        let backend = FakeBackend::new(&genesis, plaintext);
         assert!(matches!(
             genesis.resolve(&backend).await,
             Err(BootstrapError::Archive(_))
         ));
         let (genesis, plaintext) = candidate();
-        let backend = FakeBackend::new(plaintext);
+        let backend = FakeBackend::new(&genesis, plaintext);
         assert_eq!(
             genesis.resolve(&backend).await.unwrap(),
             GenesisResolution::Created
@@ -888,7 +1407,7 @@ mod tests {
             Err(BootstrapError::Tombstoned)
         );
         let (genesis, _) = candidate();
-        let backend = FakeBackend::new(vec![0; MAX_WRAPPED_KEY_REGISTRY_BYTES + 1]);
+        let backend = FakeBackend::new(&genesis, vec![0; MAX_WRAPPED_KEY_REGISTRY_BYTES + 1]);
         assert!(matches!(
             genesis.resolve(&backend).await,
             Err(BootstrapError::Archive(ArchiveV3Error::TooLarge(_)))

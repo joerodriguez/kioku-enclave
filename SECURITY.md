@@ -324,6 +324,25 @@ does not send a provider request, and has no cryptographic, logical, or physical
 state. Finalization erases the identity-to-archive binding while retaining only the
 archive-keyed tombstone, so a deleted identity cannot reconnect old ciphertext. Archive
 IDs, fences, and cursors are neither logged nor exposed through API/export models.
+The same encrypted control authority now has an inactive, bounded archive-v3 lifecycle
+anchor. It commits an opaque bootstrap attempt and every immutable identifier before KMS
+wrap or encryption, then retains the exact wrapped registry, root-envelope, and initial
+witness bytes so cancellation or ambiguous creates can retry only the same bytes. A
+monotonic revision admits one exact create at a time; deletion atomically freezes new
+admissions and cannot seal while an admitted or outcome-unknown request remains. Registry
+and root bootstrap rows are bounded in SQLite. The full exact artifact inventory instead
+lives in separately control-key-encrypted, canonical hash-chained pages; the whole control
+blob stores only bounded page IDs/hashes/lengths and one terminal commitment. Planned and
+confirmed-absent rows remain deletion work. Canonical object-name parsing also binds every
+stored role, including the v3 WAL segment and WAL commit-descriptor roles, so relabeling an
+object cannot bypass registry-first erasure. Page reordering, truncation, cross-archive use,
+commitment rollback, or conflicting reuse of an object ID fails closed before destructive
+I/O. Existing account-deletion transactions atomically freeze an anchor if this inactive
+schema has one, but do not construct an archive provider or invoke archive-v3 I/O. No startup,
+Store, route, provider construction, or deployment configuration activates the lifecycle.
+Producer-authorized recovery reads need only the opaque archive authority: after close/reopen
+they reconstruct the original reservation or exact prepared bytes from the anchor, never from
+caller-retained random IDs or ciphertext.
 Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
 rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
 source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the
@@ -395,8 +414,8 @@ remaining zero; there is no adapter retry or detached task. No startup, Store, p
 construction, route, flag, release, or persistence authority is wired.
 
 `src/archive_v3_deletion.rs` is a compiled-but-inactive deletion-driver seam. It accepts
-only a witness-issued tombstone/restart authorization and the opaque archive context
-authenticated by that witness; no caller can provide an account ID, object key, prefix, or
+only an exact-current witness-issued tombstone/restart authorization, the opaque archive context
+authenticated by that witness, and the matching durable lifecycle inventory seal; no caller can provide an account ID, object key, prefix, or
 list-all selector. It advances the existing key-erasure, inventory, and retention evidence
 stages only after exact all-generation content and permanent-claim deletion, and it reconciles
 a lost mutation response only by an exact absence read/list. GCS soft-delete residue remains a
@@ -413,6 +432,23 @@ commitment; the driver derives that stage proof from the drain result rather tha
 unrelated retention assertion. The root/manifest formats do not yet
 carry all descendant location fields, so full activation is compile-time blocked: the inventory
 trait/builder/result are module-private and the full-reachability seal has no non-test constructor.
+The intended lifecycle order is fixed: freeze and drain admitted/ambiguous creates; tombstone the
+exact unchanged current root (or use a separately reviewed exact-absence coordinator for a bootstrap
+that never established a witness); authenticate the root graph and union all create-ahead rows;
+durably seal the page chain; freshly revalidate fence/worker/operation/commitment; erase and exactly
+verify every registry epoch before advancing `CryptographicallyErased`; then delete exact content
+and claims, drain provider generations/soft-delete state, and advance `PhysicalComplete` with the
+same inventory commitment. Restarts after registry erasure read only the control-key lifecycle pages,
+never archive metadata or a prefix listing. The returned opaque witness/provider physical receipt must
+first be durably CAS-recorded in the encrypted control anchor; only that stronger control receipt can
+authorize page-store cleanup. Its same-seal exact-absence receipt is then required before retry payloads
+can be erased. Crashes before the control CAS, after the control CAS, or during ambiguous page erasure
+therefore retain enough exact-name inventory for restart. The content-free anchor, deletion fence, seal,
+and page references remain permanently. A one-snapshot control recovery read keyed by the opaque archive
+and exact deletion fence revalidates those references and reconstructs the sealed-inventory receipt; after
+physical completion it additionally reconstructs the durable-control receipt from the retained provider-drain
+commitment. Restart therefore never depends on a process retaining either receipt. The pre-witness exact-absence
+coordinator is not implemented in this slice and therefore remains an explicit activation blocker.
 Admitting an authenticated canonical metadata walker requires an explicit reviewed source change;
 that walker must enforce fixed global count/byte/depth/page bounds and cycle/duplicate rejection,
 and must not infer paths or discover objects by prefix. The driver has no Store, route, runtime,
@@ -433,7 +469,10 @@ object/hash/parent/database/key/fence commitment.
 Fixed-size records durably retain the owner, current/next fencing epoch, server-derived
 lease expiry, full predecessor root and key-registry reference, and an append-only
 four-stage deletion-evidence chain. Its trusted-clock API never accepts caller-selected
-time; tombstoning invalidates ordinary recovery/ownership, while a deletion-only restart
+time. Production tombstoning is a transactionally exact CAS over the current archive,
+database epoch, root, registry, and fencing snapshot: it revokes ownership and binds the
+deletion worker/operation/fence without publishing a candidate or changing the root.
+Tombstoning invalidates ordinary recovery/ownership, while a deletion-only restart
 path requires provider authentication on every step, matches the exact durable
 worker/operation identity derived from that opaque credential (never from persisted IDs),
 and accepts only provider-verified stage proofs whose canonical commitments bind the
@@ -502,24 +541,25 @@ mechanism. The compiled inactive SQLite VFS shim observes the exact `xSync` boun
 authority still requires reviewed runtime integration plus independent crash and conformance gates.
 
 `src/archive_v3_genesis.rs` is a separately compiled but inactive restart-safe
-bootstrap seam. Its constructor accepts only a control-plane-supplied opaque
-archive binding and a retained candidate with bounded registry/root bytes; it
+bootstrap seam. Its production constructor accepts only a durable control-plane
+reservation containing the exact bounded registry/root bytes; it
 does not construct credentials or providers and cannot issue I/O. Resolution
 first authenticates an exact existing active witness, registry, and root using
 the canonical KMS AAD and archive object context. If absent, it attempts
 immutable create-if-absent for the exact registry and root candidates, then
 creates the witness only after exact read-back authentication. A collision or a
 lost response is resolved solely by a bounded exact read and byte/commitment
-equality; it is never blindly retried. Tombstoned or deleting witness states
+equality; it is never blindly retried. Every registry, root, and witness request
+requires a fresh revision-bound create admission; exact initial witness bytes are
+committed before its create. Tombstoned, frozen, or deleting states
 reject bootstrap. After authenticating root and registry, both the existing and
 create paths reread the exact witness immediately before success and require the
-entire authenticated snapshot to remain byte-for-byte equal and active; a
+entire authenticated snapshot plus a final active-ledger reread to remain equal; a
 concurrent tombstone is a distinct failure and any root/registry advance fails
-closed. Before any provider create, future runtime wiring must durably retain
-the opaque archive binding, all genesis IDs, and the exact registry/root
-candidate bytes, and its account-deletion inventory must cover partial objects
-created before the witness exists. This seam deliberately cannot satisfy that
-prerequisite because it owns no persistence or deletion path. It also has no
+closed. An ambiguous or cancelled request leaves the same planned row unresolved
+and cannot authorize replacement IDs or ciphertext. Partial objects created before
+the witness remain in the lifecycle deletion inventory. No production ledger/backend
+composite is constructed. It also has no
 Store, VFS, route, runtime flag, Firestore/GCS construction,
 environment/default credential path, logging, or production authority.
 

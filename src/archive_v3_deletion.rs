@@ -6,16 +6,19 @@
 //! Inactive, witness-fenced archive-v3 deletion driver.
 //!
 //! This is deliberately a narrow coordinator, not a control-plane deletion
-//! route.  It accepts a deletion session only after the witness has issued a
-//! tombstone/restart authorization; it has no account/user identifiers, raw
+//! route. It accepts a deletion session only after an exact-current witness
+//! tombstone/restart authorization and a durable lifecycle inventory seal; it
+//! has no account/user identifiers, raw
 //! prefix selector, list-all operation, Store connection, credentials, or
-//! constructor I/O.  A future authenticated metadata walker supplies a
-//! bounded, canonical immutable-object inventory.  The driver then deletes
+//! constructor I/O. A future authenticated metadata walker supplies a
+//! bounded, canonical immutable-object inventory and the lifecycle ledger
+//! unions every create-ahead row before sealing it. The driver then deletes
 //! each exact object and its permanent ID claim through all generations using
 //! only opaque per-entry capabilities minted from that sealed inventory,
 //! reconciling an ambiguous mutation only by an exact absence read/list.
 //! Physical completion binds witness evidence to both the inventory commitment
-//! and a fresh exact provider-drain commitment.
+//! and a fresh exact provider-drain commitment, returning an opaque receipt
+//! that is required before lifecycle page/bootstrap payload erasure.
 //!
 //! The current root/manifest formats contain immutable references but do not
 //! carry enough location fields to derive every descendant `ObjectContext`
@@ -25,6 +28,7 @@
 //! canonical metadata walker that feeds `InventoryBuilder`; until then this
 //! driver remains compiled-but-inactive and fails closed.
 
+use crate::archive_v3_gcs::canonical_object_identity;
 use crate::{
     archive_v3::{
         ArchiveId, ArchivePrefix, KeyKind, KeyRegistryContext, LogicalLocation, ObjectContext,
@@ -32,6 +36,7 @@ use crate::{
         MAX_WRAPPED_KEY_REGISTRY_BYTES,
     },
     archive_v3_gcs::{ArchiveV3GcsTransport, GcsArchiveV3DeleteResult, GcsArchiveV3TransportError},
+    archive_v3_lifecycle::{DeletionInventorySeal, PhysicalDeletionReceipt},
     archive_v3_witness::{
         DeletionAdvance, DeletionAuthorization, DeletionExecutionBinding, DeletionRecovery,
         DeletionStageProof, DeletionState, DeletionWorkerCredential, KeyRegistryReference,
@@ -110,6 +115,28 @@ struct InventoryDrainProof {
     inventory_commitment: [u8; 32],
     provider_drain_commitment: [u8; 32],
     retention_stage: DeletionStageProof,
+}
+
+pub(crate) struct VerifiedPhysicalTransition {
+    seal: DeletionInventorySeal,
+    provider_drain_commitment: [u8; 32],
+}
+
+impl VerifiedPhysicalTransition {
+    fn new(seal: DeletionInventorySeal, provider_drain_commitment: [u8; 32]) -> Self {
+        Self {
+            seal,
+            provider_drain_commitment,
+        }
+    }
+
+    pub(crate) const fn seal(&self) -> DeletionInventorySeal {
+        self.seal
+    }
+
+    pub(crate) const fn provider_drain_commitment(&self) -> [u8; 32] {
+        self.provider_drain_commitment
+    }
 }
 
 impl InventoryDrainProof {
@@ -311,11 +338,12 @@ fn validate_entry<'a>(
     {
         return Err(ExactDeletionProviderError::Mismatch);
     }
-    let key = authorized
+    let object = authorized
         .inventory
         .objects
         .get(entry.index)
         .ok_or(ExactDeletionProviderError::Mismatch)?;
+    let key = &object.key;
     let prefix = ArchivePrefix::for_archive(authorized.execution.binding.archive_id());
     if key != &entry.key || !key.as_str().starts_with(prefix.as_str()) {
         return Err(ExactDeletionProviderError::Mismatch);
@@ -411,14 +439,17 @@ impl fmt::Debug for AuthenticatedDeletionContext {
     }
 }
 
-/// Future metadata walkers must authenticate/decrypt canonical archive
-/// metadata before constructing this inventory.  They receive no user ID or
-/// raw discovery selector, only the exact witness-nominated context.
+/// Loads only a previously durable, authenticated inventory. The pre-erasure
+/// coordinator authenticates the witness root graph, unions every create-ahead
+/// row, persists canonical pages, and mints the supplied seal. After registry
+/// erasure this method may read those sealed pages only; it must never decrypt
+/// archive metadata or rediscover by prefix.
 #[async_trait::async_trait]
-trait AuthenticatedArchiveInventoryProvider: Send + Sync {
-    async fn enumerate_authenticated(
+trait SealedArchiveInventoryLedger: Send + Sync {
+    async fn load_exact(
         &self,
         context: &AuthenticatedDeletionContext,
+        seal: &DeletionInventorySeal,
     ) -> Result<CompleteDeletionInventory>;
 }
 
@@ -441,7 +472,7 @@ impl FullReachabilitySeal {
 /// metadata or a cycle.
 struct InventoryBuilder {
     archive_prefix: ArchivePrefix,
-    objects: Vec<ObjectKey>,
+    objects: Vec<InventoryObject>,
     object_ids: BTreeSet<ObjectId>,
     pages: usize,
     metadata_bytes: usize,
@@ -460,6 +491,7 @@ impl InventoryBuilder {
         };
         builder.push_mandatory(
             root_key(context.archive_id, context.root)?,
+            ObjectRole::RootV3,
             MAX_ENCODED_ENVELOPE_BYTES,
         )?;
         if let Some(parent) = context.root.parent() {
@@ -474,17 +506,20 @@ impl InventoryBuilder {
                         context.root.key_epoch(),
                         parent,
                     )?,
+                    ObjectRole::RootV3,
                     MAX_ENCODED_ENVELOPE_BYTES,
                 )?;
             }
         }
         builder.push_mandatory(
             registry_key(context.archive_id, context.registry),
+            ObjectRole::KeyRegistryV3,
             MAX_WRAPPED_KEY_REGISTRY_BYTES,
         )?;
         if let Some(root) = context.predecessor_root {
             builder.push_mandatory(
                 root_key(context.archive_id, root)?,
+                ObjectRole::RootV3,
                 MAX_ENCODED_ENVELOPE_BYTES,
             )?;
             if let Some(parent) = root.parent() {
@@ -495,6 +530,7 @@ impl InventoryBuilder {
                         root.key_epoch(),
                         parent,
                     )?,
+                    ObjectRole::RootV3,
                     MAX_ENCODED_ENVELOPE_BYTES,
                 )?;
             }
@@ -502,6 +538,7 @@ impl InventoryBuilder {
         if let Some(registry) = context.predecessor_registry {
             builder.push_mandatory(
                 registry_key(context.archive_id, registry),
+                ObjectRole::KeyRegistryV3,
                 MAX_WRAPPED_KEY_REGISTRY_BYTES,
             )?;
         }
@@ -521,6 +558,7 @@ impl InventoryBuilder {
     fn push_authenticated_object(
         &mut self,
         key: ObjectKey,
+        role: ObjectRole,
         metadata_bytes: usize,
         depth: u8,
         ancestors: &[ObjectId],
@@ -528,30 +566,42 @@ impl InventoryBuilder {
         if self.pages == 0
             || depth > MAX_DELETION_INVENTORY_DEPTH
             || !key.as_str().starts_with(self.archive_prefix.as_str())
+            || canonical_object_identity(key.as_str()) != Some((key.object_id(), role))
             || ancestors
                 .iter()
                 .any(|ancestor| *ancestor == key.object_id())
         {
             return Err(ArchiveDeletionError::InvalidInventory);
         }
-        self.push_counted(key, metadata_bytes)
+        self.push_counted(key, role, metadata_bytes)
     }
 
-    fn push_mandatory(&mut self, key: ObjectKey, metadata_bytes: usize) -> Result<()> {
+    fn push_mandatory(
+        &mut self,
+        key: ObjectKey,
+        role: ObjectRole,
+        metadata_bytes: usize,
+    ) -> Result<()> {
         if let Some(existing) = self
             .objects
             .iter()
-            .find(|existing| existing.object_id() == key.object_id())
+            .find(|existing| existing.key.object_id() == key.object_id())
         {
-            return (existing == &key)
+            return (existing.key == key && existing.role == role)
                 .then_some(())
                 .ok_or(ArchiveDeletionError::InvalidInventory);
         }
-        self.push_counted(key, metadata_bytes)
+        self.push_counted(key, role, metadata_bytes)
     }
 
-    fn push_counted(&mut self, key: ObjectKey, metadata_bytes: usize) -> Result<()> {
+    fn push_counted(
+        &mut self,
+        key: ObjectKey,
+        role: ObjectRole,
+        metadata_bytes: usize,
+    ) -> Result<()> {
         if !key.as_str().starts_with(self.archive_prefix.as_str())
+            || canonical_object_identity(key.as_str()) != Some((key.object_id(), role))
             || !self.object_ids.insert(key.object_id())
         {
             return Err(ArchiveDeletionError::InvalidInventory);
@@ -570,7 +620,7 @@ impl InventoryBuilder {
         {
             return Err(ArchiveDeletionError::InventoryLimit);
         }
-        self.objects.push(key);
+        self.objects.push(InventoryObject { key, role });
         Ok(())
     }
 
@@ -590,10 +640,16 @@ impl InventoryBuilder {
 }
 
 struct CompleteDeletionInventory {
-    objects: Vec<ObjectKey>,
+    objects: Vec<InventoryObject>,
     commitment: [u8; 32],
     metadata_bytes: usize,
     pages: usize,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InventoryObject {
+    key: ObjectKey,
+    role: ObjectRole,
 }
 
 impl CompleteDeletionInventory {
@@ -616,7 +672,7 @@ impl AuthorizedDeletionInventory<'_> {
         &'entry self,
         index: usize,
     ) -> std::result::Result<DeletionEntryCapability<'entry>, ExactDeletionProviderError> {
-        let key = self
+        let object = self
             .inventory
             .objects
             .get(index)
@@ -625,7 +681,7 @@ impl AuthorizedDeletionInventory<'_> {
             binding: self.execution.binding,
             inventory_commitment: self.inventory.commitment,
             index,
-            key: key.clone(),
+            key: object.key.clone(),
             inventory_lifetime: PhantomData,
         })
     }
@@ -650,13 +706,19 @@ impl fmt::Debug for CompleteDeletionInventory {
     }
 }
 
-fn inventory_commitment(objects: &[ObjectKey], metadata_bytes: usize, pages: usize) -> [u8; 32] {
+fn inventory_commitment(
+    objects: &[InventoryObject],
+    metadata_bytes: usize,
+    pages: usize,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(INVENTORY_COMMITMENT_DOMAIN);
     hasher.update((objects.len() as u64).to_be_bytes());
     hasher.update((metadata_bytes as u64).to_be_bytes());
     hasher.update((pages as u64).to_be_bytes());
-    for key in objects {
+    for object in objects {
+        let key = &object.key;
+        hasher.update([object.role as u8]);
         hasher.update(key.object_id().as_bytes());
         hasher.update((key.as_str().len() as u64).to_be_bytes());
         hasher.update(key.as_str().as_bytes());
@@ -690,6 +752,7 @@ impl DeletionSession {
             DeletionState::Tombstoned
                 | DeletionState::CryptographicallyErased
                 | DeletionState::LogicalObjectsAbsent
+                | DeletionState::PhysicalComplete
         )
         .then_some(Self {
             record,
@@ -712,16 +775,16 @@ struct DeletionStageProofs<'a> {
     retention_assertion: &'a DeletionStageProof,
 }
 
-/// Constructs dependencies only.  It performs no storage, witness, KMS, or
-/// provider I/O, so a future runtime can create it during startup safely.
+/// Constructs dependencies only. It performs no storage, witness, KMS, or
+/// provider I/O. No production caller constructs this inactive coordinator.
 struct ArchiveV3DeletionDriver {
-    metadata: Arc<dyn AuthenticatedArchiveInventoryProvider>,
+    metadata: Arc<dyn SealedArchiveInventoryLedger>,
     provider: Arc<dyn ArchiveV3ExactDeletionProvider>,
 }
 
 impl ArchiveV3DeletionDriver {
     fn new(
-        metadata: Arc<dyn AuthenticatedArchiveInventoryProvider>,
+        metadata: Arc<dyn SealedArchiveInventoryLedger>,
         provider: Arc<dyn ArchiveV3ExactDeletionProvider>,
     ) -> Self {
         Self { metadata, provider }
@@ -738,25 +801,47 @@ impl ArchiveV3DeletionDriver {
         mut session: DeletionSession,
         credential: &DeletionWorkerCredential,
         proofs: DeletionStageProofs<'_>,
-    ) -> Result<DeletionState> {
+        seal: &DeletionInventorySeal,
+    ) -> Result<PhysicalDeletionReceipt> {
+        if seal.archive_id() != session.record.archive_id() {
+            return Err(ArchiveDeletionError::ProviderMismatch);
+        }
         loop {
             match session.record.deletion() {
                 DeletionState::Tombstoned => {
+                    let context = AuthenticatedDeletionContext::from_record(&session.record);
+                    let inventory = self.metadata.load_exact(&context, seal).await?;
+                    if inventory.commitment != seal.inventory_commitment() {
+                        return Err(ArchiveDeletionError::ProviderMismatch);
+                    }
+                    let execution =
+                        fresh_execution_context(witness, &session, credential, &inventory)?;
+                    let authorized = inventory.authorize(execution)?;
+                    self.reconcile_registry_inventory(&context, &authorized)
+                        .await?;
+                    let key_erasure = proofs
+                        .key_erasure
+                        .bind_inventory_only(seal.inventory_commitment())
+                        .map_err(map_witness_error)?;
                     session.record = advance(
                         witness,
                         &session,
                         DeletionState::CryptographicallyErased,
                         credential,
-                        proofs.key_erasure,
+                        &key_erasure,
                     )?;
                 }
                 DeletionState::CryptographicallyErased => {
                     let inventory = self
                         .metadata
-                        .enumerate_authenticated(&AuthenticatedDeletionContext::from_record(
-                            &session.record,
-                        ))
+                        .load_exact(
+                            &AuthenticatedDeletionContext::from_record(&session.record),
+                            seal,
+                        )
                         .await?;
+                    if inventory.commitment != seal.inventory_commitment() {
+                        return Err(ArchiveDeletionError::ProviderMismatch);
+                    }
                     let execution =
                         fresh_execution_context(witness, &session, credential, &inventory)?;
                     let authorized = inventory.authorize(execution)?;
@@ -772,10 +857,14 @@ impl ArchiveV3DeletionDriver {
                 DeletionState::LogicalObjectsAbsent => {
                     let inventory = self
                         .metadata
-                        .enumerate_authenticated(&AuthenticatedDeletionContext::from_record(
-                            &session.record,
-                        ))
+                        .load_exact(
+                            &AuthenticatedDeletionContext::from_record(&session.record),
+                            seal,
+                        )
                         .await?;
+                    if inventory.commitment != seal.inventory_commitment() {
+                        return Err(ArchiveDeletionError::ProviderMismatch);
+                    }
                     let execution =
                         fresh_execution_context(witness, &session, credential, &inventory)?;
                     let authorized = inventory.authorize(execution)?;
@@ -787,22 +876,71 @@ impl ArchiveV3DeletionDriver {
                         .verify_complete_inventory_drained(&authorized, proofs.retention_assertion)
                         .await
                         .map_err(map_provider_error)?;
+                    let drain_commitment = drain.provider_drain_commitment;
                     if drain.binding != authorized.execution.binding
                         || drain.inventory_commitment != inventory.commitment
-                        || drain.provider_drain_commitment != provider_drain_commitment(&authorized)
+                        || drain_commitment != provider_drain_commitment(&authorized)
                     {
                         return Err(ArchiveDeletionError::ProviderMismatch);
                     }
                     let retention = drain.into_retention_stage(&authorized)?;
-                    session.record = advance(
+                    let record = advance(
                         witness,
                         &session,
                         DeletionState::PhysicalComplete,
                         credential,
                         &retention,
                     )?;
+                    if record.deletion() != DeletionState::PhysicalComplete {
+                        return Err(ArchiveDeletionError::Witness);
+                    }
+                    return PhysicalDeletionReceipt::from_verified_transition(
+                        VerifiedPhysicalTransition::new(*seal, drain_commitment),
+                    )
+                    .map_err(|_| ArchiveDeletionError::ProviderMismatch);
                 }
-                DeletionState::PhysicalComplete => return Ok(DeletionState::PhysicalComplete),
+                DeletionState::PhysicalComplete => {
+                    let inventory = self
+                        .metadata
+                        .load_exact(
+                            &AuthenticatedDeletionContext::from_record(&session.record),
+                            seal,
+                        )
+                        .await?;
+                    if inventory.commitment != seal.inventory_commitment() {
+                        return Err(ArchiveDeletionError::ProviderMismatch);
+                    }
+                    let execution =
+                        fresh_execution_context(witness, &session, credential, &inventory)?;
+                    let authorized = inventory.authorize(execution)?;
+                    let drain = self
+                        .provider
+                        .verify_complete_inventory_drained(&authorized, proofs.retention_assertion)
+                        .await
+                        .map_err(map_provider_error)?;
+                    let drain_commitment = drain.provider_drain_commitment;
+                    if drain.binding != authorized.execution.binding
+                        || drain.inventory_commitment != inventory.commitment
+                        || drain_commitment != provider_drain_commitment(&authorized)
+                    {
+                        return Err(ArchiveDeletionError::ProviderMismatch);
+                    }
+                    let retention = drain.into_retention_stage(&authorized)?;
+                    let verified = witness
+                        .verify_physical_completion(
+                            session.record.archive_id(),
+                            credential,
+                            &retention,
+                        )
+                        .map_err(map_witness_error)?;
+                    if verified.receipt().record() != &session.record {
+                        return Err(ArchiveDeletionError::StaleSession);
+                    }
+                    return PhysicalDeletionReceipt::from_verified_transition(
+                        VerifiedPhysicalTransition::new(*seal, drain_commitment),
+                    )
+                    .map_err(|_| ArchiveDeletionError::ProviderMismatch);
+                }
                 DeletionState::Active => return Err(ArchiveDeletionError::InvalidDeletionState),
             }
         }
@@ -816,9 +954,64 @@ impl ArchiveV3DeletionDriver {
             return Err(ArchiveDeletionError::ProviderMismatch);
         }
         for index in 0..authorized.inventory.objects.len() {
+            if authorized.inventory.objects[index].role == ObjectRole::KeyRegistryV3 {
+                continue;
+            }
             let entry = authorized.entry(index).map_err(map_provider_error)?;
             self.delete_content_reconcile(authorized, &entry).await?;
             self.delete_claim_reconcile(authorized, &entry).await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_registry_inventory(
+        &self,
+        context: &AuthenticatedDeletionContext,
+        authorized: &AuthorizedDeletionInventory<'_>,
+    ) -> Result<()> {
+        let mut registry_keys = vec![registry_key(context.archive_id, context.registry)];
+        if let Some(registry) = context.predecessor_registry {
+            registry_keys.push(registry_key(context.archive_id, registry));
+        }
+        for required in registry_keys {
+            if !authorized
+                .inventory
+                .objects
+                .iter()
+                .any(|object| object.role == ObjectRole::KeyRegistryV3 && object.key == required)
+            {
+                return Err(ArchiveDeletionError::InvalidInventory);
+            }
+        }
+        let registry_indices = authorized
+            .inventory
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, object)| {
+                (object.role == ObjectRole::KeyRegistryV3).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if registry_indices.is_empty() {
+            return Err(ArchiveDeletionError::InvalidInventory);
+        }
+        for index in registry_indices {
+            let entry = authorized.entry(index).map_err(map_provider_error)?;
+            self.delete_content_reconcile(authorized, &entry).await?;
+            self.delete_claim_reconcile(authorized, &entry).await?;
+            if !self
+                .provider
+                .verify_content_absent(authorized, &entry)
+                .await
+                .map_err(map_provider_error)?
+                || !self
+                    .provider
+                    .verify_claim_absent(authorized, &entry)
+                    .await
+                    .map_err(map_provider_error)?
+            {
+                return Err(ArchiveDeletionError::ProviderDrainPending);
+            }
         }
         Ok(())
     }
@@ -982,6 +1175,10 @@ mod tests {
     use crate::archive_v3_gcs::{
         GcsArchiveV3ClaimResult, GcsArchiveV3CreateResult, GcsArchiveV3Page,
     };
+    use crate::archive_v3_lifecycle::{
+        ArtifactCreateState, BootstrapAttemptId, DurableInventoryPage, InventoryPage,
+        PlannedArtifact,
+    };
     use crate::archive_v3_witness::{deletion_driver_test_fixture, Witness};
     use std::sync::Mutex;
 
@@ -1025,22 +1222,134 @@ mod tests {
         .object_key()
     }
 
+    fn deletion_seal() -> DeletionInventorySeal {
+        deletion_seal_for(context().archive_id)
+    }
+
+    fn deletion_seal_for(archive_id: ArchiveId) -> DeletionInventorySeal {
+        let object_id = ObjectId::from_bytes([90; 16]);
+        let object_key = ObjectContext::new(
+            archive_id,
+            DatabaseEpoch::from_bytes([2; 16]),
+            KeyEpoch::from_bytes([3; 16]),
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: 0 },
+            object_id,
+            None,
+        )
+        .unwrap()
+        .object_key();
+        let artifact = PlannedArtifact::new(
+            archive_id,
+            BootstrapAttemptId::from_bytes([89; 16]).unwrap(),
+            0,
+            object_key,
+            ObjectRole::RootV3,
+            [88; 32],
+            128,
+            ArtifactCreateState::Created,
+        )
+        .unwrap();
+        let page = InventoryPage::build(archive_id, 0, [0; 32], vec![artifact]).unwrap();
+        let encoded = page.encoded().to_vec();
+        let durable = DurableInventoryPage::from_exact_readback(page, &encoded).unwrap();
+        DeletionInventorySeal::for_test(archive_id, ObjectId::from_bytes([91; 16]), 1, &[durable])
+            .unwrap()
+    }
+
+    fn historical_registry_keys(context: &AuthenticatedDeletionContext) -> [ObjectKey; 2] {
+        [
+            KeyRegistryContext::with_rotation_generation(
+                context.archive_id,
+                KeyKind::Archive,
+                KeyEpoch::from_bytes([60; 16]),
+                7,
+            )
+            .object_key(ObjectId::from_bytes([62; 16])),
+            KeyRegistryContext::with_rotation_generation(
+                context.archive_id,
+                KeyKind::Archive,
+                KeyEpoch::from_bytes([61; 16]),
+                8,
+            )
+            .object_key(ObjectId::from_bytes([63; 16])),
+        ]
+    }
+
+    fn wal_inventory_keys(context: &AuthenticatedDeletionContext) -> [(ObjectKey, ObjectRole); 2] {
+        [
+            (
+                ObjectContext::new(
+                    context.archive_id,
+                    context.root.database_epoch(),
+                    context.root.key_epoch(),
+                    ObjectRole::WalSegmentV3,
+                    LogicalLocation::Wal {
+                        root_seq: 1,
+                        wal_generation: 1,
+                        segment_index: 0,
+                    },
+                    ObjectId::from_bytes([70; 16]),
+                    None,
+                )
+                .unwrap()
+                .object_key(),
+                ObjectRole::WalSegmentV3,
+            ),
+            (
+                ObjectContext::new(
+                    context.archive_id,
+                    context.root.database_epoch(),
+                    context.root.key_epoch(),
+                    ObjectRole::WalCommitDescriptorV3,
+                    LogicalLocation::WalCommitDescriptor { root_seq: 1 },
+                    ObjectId::from_bytes([71; 16]),
+                    None,
+                )
+                .unwrap()
+                .object_key(),
+                ObjectRole::WalCommitDescriptorV3,
+            ),
+        ]
+    }
+
     struct FakeMetadata {
         key: ObjectKey,
         calls: Mutex<usize>,
     }
 
     #[async_trait::async_trait]
-    impl AuthenticatedArchiveInventoryProvider for FakeMetadata {
-        async fn enumerate_authenticated(
+    impl SealedArchiveInventoryLedger for FakeMetadata {
+        async fn load_exact(
             &self,
             context: &AuthenticatedDeletionContext,
+            seal: &DeletionInventorySeal,
         ) -> Result<CompleteDeletionInventory> {
             *self.calls.lock().unwrap() += 1;
             let mut builder = InventoryBuilder::new(context)?;
             builder.begin_page()?;
-            builder.push_authenticated_object(self.key.clone(), 12, 0, &[])?;
-            builder.finish(FullReachabilitySeal::for_test())
+            builder.push_authenticated_object(
+                self.key.clone(),
+                ObjectRole::ExtentV3,
+                12,
+                0,
+                &[],
+            )?;
+            for registry in historical_registry_keys(context) {
+                builder.push_authenticated_object(
+                    registry,
+                    ObjectRole::KeyRegistryV3,
+                    MAX_WRAPPED_KEY_REGISTRY_BYTES,
+                    0,
+                    &[],
+                )?;
+            }
+            for (wal_key, role) in wal_inventory_keys(context) {
+                builder.push_authenticated_object(wal_key, role, 512, 0, &[])?;
+            }
+            let mut inventory = builder.finish(FullReachabilitySeal::for_test())?;
+            inventory.commitment = seal.inventory_commitment();
+            Ok(inventory)
         }
     }
 
@@ -1051,6 +1360,7 @@ mod tests {
         Present,
         Mismatch,
         UnavailableOnce,
+        UnavailableAfterOne,
     }
 
     struct FakeProvider {
@@ -1061,6 +1371,7 @@ mod tests {
         verify_claim_calls: Mutex<usize>,
         drain_calls: Mutex<usize>,
         drain: Mutex<bool>,
+        content_ids: Mutex<Vec<ObjectId>>,
         constructor_calls: Mutex<usize>,
     }
 
@@ -1074,6 +1385,7 @@ mod tests {
                 verify_claim_calls: Mutex::new(0),
                 drain_calls: Mutex::new(0),
                 drain: Mutex::new(true),
+                content_ids: Mutex::new(Vec::new()),
                 constructor_calls: Mutex::new(0),
             }
         }
@@ -1187,9 +1499,14 @@ mod tests {
         async fn delete_content_all_generations(
             &self,
             _authorized: &AuthorizedDeletionInventory<'_>,
-            _entry: &DeletionEntryCapability<'_>,
+            entry: &DeletionEntryCapability<'_>,
         ) -> std::result::Result<ExactDeleteOutcome, ExactDeletionProviderError> {
-            *self.content_calls.lock().unwrap() += 1;
+            let content_call = {
+                let mut calls = self.content_calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            self.content_ids.lock().unwrap().push(entry.key.object_id());
             let mut lost = self.lost.lock().unwrap();
             match *lost {
                 LostResponse::None => Ok(ExactDeleteOutcome::DeletedAllGenerations),
@@ -1199,6 +1516,17 @@ mod tests {
                 LostResponse::UnavailableOnce => {
                     *lost = LostResponse::None;
                     Err(ExactDeletionProviderError::Unavailable)
+                }
+                LostResponse::UnavailableAfterOne => {
+                    if content_call == 2 {
+                        // The first registry-role object was deleted and its
+                        // exact absence verified. Fail the second exact name,
+                        // then allow a restarted Tombstoned worker to retry it.
+                        *lost = LostResponse::None;
+                        Err(ExactDeletionProviderError::Unavailable)
+                    } else {
+                        Ok(ExactDeleteOutcome::DeletedAllGenerations)
+                    }
                 }
             }
         }
@@ -1215,6 +1543,7 @@ mod tests {
                 LostResponse::Mismatch => Err(ExactDeletionProviderError::Mismatch),
                 LostResponse::None => Ok(true),
                 LostResponse::UnavailableOnce => Err(ExactDeletionProviderError::Unavailable),
+                LostResponse::UnavailableAfterOne => Ok(true),
             }
         }
 
@@ -1273,17 +1602,35 @@ mod tests {
         let mut duplicate = InventoryBuilder::new(&context).unwrap();
         duplicate.begin_page().unwrap();
         duplicate
-            .push_authenticated_object(first.clone(), 1, 0, &[])
+            .push_authenticated_object(first.clone(), ObjectRole::ExtentV3, 1, 0, &[])
             .unwrap();
         assert_eq!(
-            duplicate.push_authenticated_object(first.clone(), 1, 1, &[]),
+            duplicate.push_authenticated_object(first.clone(), ObjectRole::ExtentV3, 1, 1, &[],),
+            Err(ArchiveDeletionError::InvalidInventory)
+        );
+        let mut relabeled = InventoryBuilder::new(&context).unwrap();
+        relabeled.begin_page().unwrap();
+        assert_eq!(
+            relabeled.push_authenticated_object(
+                first.clone(),
+                ObjectRole::KeyRegistryV3,
+                1,
+                0,
+                &[],
+            ),
             Err(ArchiveDeletionError::InvalidInventory)
         );
 
         let mut cycle = InventoryBuilder::new(&context).unwrap();
         cycle.begin_page().unwrap();
         assert_eq!(
-            cycle.push_authenticated_object(first.clone(), 1, 1, &[first.object_id()]),
+            cycle.push_authenticated_object(
+                first.clone(),
+                ObjectRole::ExtentV3,
+                1,
+                1,
+                &[first.object_id()],
+            ),
             Err(ArchiveDeletionError::InvalidInventory)
         );
 
@@ -1292,14 +1639,26 @@ mod tests {
         let mut cross_archive = InventoryBuilder::new(&context).unwrap();
         cross_archive.begin_page().unwrap();
         assert_eq!(
-            cross_archive.push_authenticated_object(key(&foreign_context, 13), 1, 0, &[]),
+            cross_archive.push_authenticated_object(
+                key(&foreign_context, 13),
+                ObjectRole::ExtentV3,
+                1,
+                0,
+                &[],
+            ),
             Err(ArchiveDeletionError::InvalidInventory)
         );
 
         let mut deep = InventoryBuilder::new(&context).unwrap();
         deep.begin_page().unwrap();
         assert_eq!(
-            deep.push_authenticated_object(first, 1, MAX_DELETION_INVENTORY_DEPTH + 1, &[]),
+            deep.push_authenticated_object(
+                first,
+                ObjectRole::ExtentV3,
+                1,
+                MAX_DELETION_INVENTORY_DEPTH + 1,
+                &[],
+            ),
             Err(ArchiveDeletionError::InvalidInventory)
         );
 
@@ -1308,6 +1667,7 @@ mod tests {
         assert_eq!(
             bytes.push_authenticated_object(
                 key(&context, 12),
+                ObjectRole::ExtentV3,
                 MAX_DELETION_INVENTORY_METADATA_BYTES,
                 0,
                 &[],
@@ -1331,7 +1691,7 @@ mod tests {
         let mut builder = InventoryBuilder::new(&context).unwrap();
         builder.begin_page().unwrap();
         builder
-            .push_authenticated_object(key(&context, 8), 8, 0, &[])
+            .push_authenticated_object(key(&context, 8), ObjectRole::ExtentV3, 8, 0, &[])
             .unwrap();
         let inventory = builder.finish(FullReachabilitySeal::for_test()).unwrap();
         assert_eq!(inventory.objects.len(), 3);
@@ -1343,7 +1703,7 @@ mod tests {
         assert!(inventory
             .objects
             .iter()
-            .all(|object| object.as_str().starts_with("archive/v3/")));
+            .all(|object| object.key.as_str().starts_with("archive/v3/")));
     }
 
     #[tokio::test]
@@ -1355,8 +1715,9 @@ mod tests {
             key: key(&context, 8),
             calls: Mutex::new(0),
         });
-        let provider = Arc::new(FakeProvider::new(LostResponse::UnavailableOnce));
+        let provider = Arc::new(FakeProvider::new(LostResponse::UnavailableAfterOne));
         let driver = ArchiveV3DeletionDriver::new(metadata.clone(), provider.clone());
+        let seal = deletion_seal();
         let proofs = DeletionStageProofs {
             key_erasure: &fixture.key_erasure,
             inventory: &fixture.inventory,
@@ -1364,7 +1725,13 @@ mod tests {
         };
         assert_eq!(
             driver
-                .run(&fixture.witness, session, &fixture.credential, proofs)
+                .run(
+                    &fixture.witness,
+                    session,
+                    &fixture.credential,
+                    proofs,
+                    &seal,
+                )
                 .await,
             Err(ArchiveDeletionError::Unavailable)
         );
@@ -1373,45 +1740,63 @@ mod tests {
             .resume_deletion(context.archive_id, &fixture.credential)
             .unwrap();
         let restarted = DeletionSession::from_recovery(&recovery).unwrap();
-        assert_eq!(
-            restarted.record.deletion(),
-            DeletionState::CryptographicallyErased
-        );
-        assert_eq!(
-            driver
-                .run(
-                    &fixture.witness,
-                    restarted,
-                    &fixture.credential,
-                    DeletionStageProofs {
-                        key_erasure: &fixture.key_erasure,
-                        inventory: &fixture.inventory,
-                        retention_assertion: &fixture.retention,
-                    },
-                )
-                .await,
-            Ok(DeletionState::PhysicalComplete)
-        );
-        // One descendant plus mandatory current/parent roots and registry. The
-        // first failed call and complete restart replay are safe and exact.
-        assert_eq!(*provider.content_calls.lock().unwrap(), 5);
-        assert_eq!(*provider.claim_calls.lock().unwrap(), 4);
-        assert_eq!(*provider.verify_content_calls.lock().unwrap(), 4);
-        assert_eq!(*provider.verify_claim_calls.lock().unwrap(), 4);
-        assert_eq!(*metadata.calls.lock().unwrap(), 3);
+        assert_eq!(restarted.record.deletion(), DeletionState::Tombstoned);
+        let completion = driver
+            .run(
+                &fixture.witness,
+                restarted,
+                &fixture.credential,
+                DeletionStageProofs {
+                    key_erasure: &fixture.key_erasure,
+                    inventory: &fixture.inventory,
+                    retention_assertion: &fixture.retention,
+                },
+                &seal,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion.seal().archive_id(), context.archive_id);
+        // Current plus two historical registry epochs are all retried and
+        // verified before roots/content. The first run deleted one registry
+        // then failed on the next; restart safely repeats that exact name.
+        // Five non-registry objects (current + predecessor roots, extent,
+        // WAL segment, and WAL commit descriptor) follow the three registry
+        // entries. One registry succeeds and the next fails on the first run;
+        // restart repeats all three exact registry names before those five.
+        assert_eq!(*provider.content_calls.lock().unwrap(), 10);
+        assert_eq!(*provider.claim_calls.lock().unwrap(), 9);
+        assert_eq!(*provider.verify_content_calls.lock().unwrap(), 12);
+        assert_eq!(*provider.verify_claim_calls.lock().unwrap(), 12);
+        let registry_ids = [
+            context.registry.object_id(),
+            ObjectId::from_bytes([62; 16]),
+            ObjectId::from_bytes([63; 16]),
+        ];
+        let content_ids = provider.content_ids.lock().unwrap();
+        assert!(content_ids[..5]
+            .iter()
+            .all(|object_id| registry_ids.contains(object_id)));
+        assert!(content_ids[5..]
+            .iter()
+            .all(|object_id| !registry_ids.contains(object_id)));
+        assert!(content_ids.contains(&ObjectId::from_bytes([70; 16])));
+        assert!(content_ids.contains(&ObjectId::from_bytes([71; 16])));
+        // Initial Tombstoned attempt plus Tombstoned, CryptoErased, and
+        // LogicalObjectsAbsent restart stages each reload the same exact seal.
+        assert_eq!(*metadata.calls.lock().unwrap(), 4);
     }
 
     #[tokio::test]
     async fn lost_delete_response_is_reconciled_only_by_exact_absence() {
-        for (lost, expected) in [
-            (LostResponse::Absent, Ok(DeletionState::PhysicalComplete)),
+        for (lost, expected_error) in [
+            (LostResponse::Absent, None),
             (
                 LostResponse::Present,
-                Err(ArchiveDeletionError::OutcomeUnknown),
+                Some(ArchiveDeletionError::OutcomeUnknown),
             ),
             (
                 LostResponse::Mismatch,
-                Err(ArchiveDeletionError::ProviderMismatch),
+                Some(ArchiveDeletionError::ProviderMismatch),
             ),
         ] {
             let fixture = deletion_driver_test_fixture();
@@ -1423,21 +1808,20 @@ mod tests {
             });
             let provider = Arc::new(FakeProvider::new(lost));
             let driver = ArchiveV3DeletionDriver::new(metadata, provider);
-            assert_eq!(
-                driver
-                    .run(
-                        &fixture.witness,
-                        session,
-                        &fixture.credential,
-                        DeletionStageProofs {
-                            key_erasure: &fixture.key_erasure,
-                            inventory: &fixture.inventory,
-                            retention_assertion: &fixture.retention,
-                        },
-                    )
-                    .await,
-                expected
-            );
+            let result = driver
+                .run(
+                    &fixture.witness,
+                    session,
+                    &fixture.credential,
+                    DeletionStageProofs {
+                        key_erasure: &fixture.key_erasure,
+                        inventory: &fixture.inventory,
+                        retention_assertion: &fixture.retention,
+                    },
+                    &deletion_seal(),
+                )
+                .await;
+            assert_eq!(result.err(), expected_error);
         }
     }
 
@@ -1452,21 +1836,21 @@ mod tests {
         });
         let provider = Arc::new(FakeProvider::new(LostResponse::None));
         let driver = ArchiveV3DeletionDriver::new(metadata, provider.clone());
-        assert_eq!(
-            driver
-                .run(
-                    &fixture.witness,
-                    session,
-                    &fixture.credential,
-                    DeletionStageProofs {
-                        key_erasure: &fixture.key_erasure,
-                        inventory: &fixture.inventory,
-                        retention_assertion: &fixture.retention,
-                    },
-                )
-                .await,
-            Ok(DeletionState::PhysicalComplete)
-        );
+        let seal = deletion_seal();
+        let first_completion = driver
+            .run(
+                &fixture.witness,
+                session,
+                &fixture.credential,
+                DeletionStageProofs {
+                    key_erasure: &fixture.key_erasure,
+                    inventory: &fixture.inventory,
+                    retention_assertion: &fixture.retention,
+                },
+                &seal,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             fixture
                 .witness
@@ -1475,6 +1859,36 @@ mod tests {
                 .unwrap()
                 .deletion(),
             DeletionState::PhysicalComplete
+        );
+        assert_eq!(
+            provider.content_ids.lock().unwrap().first().copied(),
+            Some(context.registry.object_id())
+        );
+        let recovery = fixture
+            .witness
+            .resume_deletion(context.archive_id, &fixture.credential)
+            .unwrap();
+        let restarted_completion = driver
+            .run(
+                &fixture.witness,
+                DeletionSession::from_recovery(&recovery).unwrap(),
+                &fixture.credential,
+                DeletionStageProofs {
+                    key_erasure: &fixture.key_erasure,
+                    inventory: &fixture.inventory,
+                    retention_assertion: &fixture.retention,
+                },
+                &seal,
+            )
+            .await
+            .unwrap();
+        // A process that has lost the original receipt must re-verify the
+        // retained PhysicalComplete evidence without hashing that evidence
+        // recursively. Recovery mints the exact same seal/drain binding.
+        assert_eq!(restarted_completion.seal(), first_completion.seal());
+        assert_eq!(
+            restarted_completion.provider_drain_commitment(),
+            first_completion.provider_drain_commitment()
         );
         assert!(*provider.drain.lock().unwrap());
     }
@@ -1502,6 +1916,7 @@ mod tests {
                         inventory: &fixture.inventory,
                         retention_assertion: &fixture.retention,
                     },
+                    &deletion_seal(),
                 )
                 .await,
             Err(ArchiveDeletionError::ProviderDrainPending)
@@ -1518,6 +1933,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_archive_seal_is_rejected_before_metadata_or_provider_io() {
+        let fixture = deletion_driver_test_fixture();
+        let session = DeletionSession::from_tombstone(&fixture.tombstone).unwrap();
+        let context = AuthenticatedDeletionContext::from_record(&session.record);
+        let metadata = Arc::new(FakeMetadata {
+            key: key(&context, 8),
+            calls: Mutex::new(0),
+        });
+        let provider = Arc::new(FakeProvider::new(LostResponse::None));
+        let driver = ArchiveV3DeletionDriver::new(metadata.clone(), provider.clone());
+        assert!(driver
+            .run(
+                &fixture.witness,
+                session,
+                &fixture.credential,
+                DeletionStageProofs {
+                    key_erasure: &fixture.key_erasure,
+                    inventory: &fixture.inventory,
+                    retention_assertion: &fixture.retention,
+                },
+                &deletion_seal_for(ArchiveId::from_bytes([99; 16])),
+            )
+            .await
+            .is_err());
+        assert_eq!(*metadata.calls.lock().unwrap(), 0);
+        assert_eq!(*provider.content_calls.lock().unwrap(), 0);
+        assert_eq!(*provider.claim_calls.lock().unwrap(), 0);
+        assert_eq!(*provider.drain_calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn wrong_worker_cannot_reach_destructive_provider_calls() {
         let fixture = deletion_driver_test_fixture();
         let tombstone_record = fixture.tombstone.receipt().record();
@@ -1531,7 +1977,10 @@ mod tests {
                 ),
                 DeletionState::CryptographicallyErased,
                 &fixture.credential,
-                &fixture.key_erasure,
+                &fixture
+                    .key_erasure
+                    .bind_inventory_only(deletion_seal().inventory_commitment())
+                    .unwrap(),
             )
             .unwrap();
         let recovery = fixture
@@ -1557,6 +2006,7 @@ mod tests {
                         inventory: &fixture.inventory,
                         retention_assertion: &fixture.retention,
                     },
+                    &deletion_seal(),
                 )
                 .await,
             Err(ArchiveDeletionError::Witness)
@@ -1582,7 +2032,10 @@ mod tests {
                 ),
                 DeletionState::CryptographicallyErased,
                 &fixture.credential,
-                &fixture.key_erasure,
+                &fixture
+                    .key_erasure
+                    .bind_inventory_only(deletion_seal().inventory_commitment())
+                    .unwrap(),
             )
             .unwrap();
         let recovery = fixture
@@ -1621,6 +2074,7 @@ mod tests {
                         inventory: &fixture.inventory,
                         retention_assertion: &fixture.retention,
                     },
+                    &deletion_seal(),
                 )
                 .await,
             Err(ArchiveDeletionError::StaleSession)
@@ -1646,7 +2100,10 @@ mod tests {
                 ),
                 DeletionState::CryptographicallyErased,
                 &fixture.credential,
-                &fixture.key_erasure,
+                &fixture
+                    .key_erasure
+                    .bind_inventory_only(deletion_seal().inventory_commitment())
+                    .unwrap(),
             )
             .unwrap();
         let recovery = fixture
@@ -1673,6 +2130,7 @@ mod tests {
                         inventory: &fixture.inventory,
                         retention_assertion: &fixture.retention,
                     },
+                    &deletion_seal(),
                 )
                 .await,
             Err(ArchiveDeletionError::StaleSession)
@@ -1692,7 +2150,7 @@ mod tests {
         let mut builder = InventoryBuilder::new(&context).unwrap();
         builder.begin_page().unwrap();
         builder
-            .push_authenticated_object(key(&context, 8), 12, 0, &[])
+            .push_authenticated_object(key(&context, 8), ObjectRole::ExtentV3, 12, 0, &[])
             .unwrap();
         let inventory = builder.finish(FullReachabilitySeal::for_test()).unwrap();
         let execution =
