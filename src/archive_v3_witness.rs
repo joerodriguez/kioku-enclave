@@ -754,6 +754,85 @@ impl WitnessRecord {
                 .is_some()
     }
 
+    /// Authenticate either the byte-exact retained terminal record or the
+    /// sole witness-owned successor produced by releasing that record's
+    /// maintenance lease. The release clears owner/expiry and monotonically
+    /// advances the trusted provider tick. Every graph, database-generation,
+    /// predecessor, registry, fencing, migration, and deletion/evidence field
+    /// remains exact. A higher-fence released record cannot prove who held the
+    /// intervening lease and is therefore rejected.
+    pub(crate) fn exact_maintenance_terminal_or_release_from(
+        &self,
+        retained: &Self,
+        owner: ObjectId,
+    ) -> Result<bool> {
+        retained.exact_active_lease_for_owner(owner)?;
+        if !retained.valid()
+            || retained.migration != MigrationState::WalAuthoritative
+            || retained.deletion != DeletionState::Active
+        {
+            return Err(WitnessError::Fenced);
+        }
+        if self == retained
+            || self.exact_maintenance_terminal_active_at_provider_tick(retained, owner)
+        {
+            return Ok(true);
+        }
+        if !self.valid()
+            || self.archive_id != retained.archive_id
+            || self.database_epoch != retained.database_epoch
+            || self.database_epoch_generation != retained.database_epoch_generation
+            || self.predecessor != retained.predecessor
+            || self.root != retained.root
+            || self.registry != retained.registry
+            || retained.owner_id != Some(owner)
+            || self.owner_id.is_some()
+            || self.current_fencing_epoch != retained.current_fencing_epoch
+            || self.next_fencing_epoch != retained.next_fencing_epoch
+            || self.lease_expires_at_tick != 0
+            || self.last_server_tick < retained.last_server_tick
+            || self.migration != MigrationState::WalAuthoritative
+            || self.deletion != DeletionState::Active
+            || self.deletion_fencing_epoch != retained.deletion_fencing_epoch
+            || self.deletion_worker_id != retained.deletion_worker_id
+            || self.deletion_operation_id != retained.deletion_operation_id
+            || self.deletion_evidence != retained.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(false)
+    }
+
+    fn exact_maintenance_terminal_active_at_provider_tick(
+        &self,
+        retained: &Self,
+        owner: ObjectId,
+    ) -> bool {
+        let same_fence_owner = self.current_fencing_epoch == retained.current_fencing_epoch
+            && self.next_fencing_epoch == retained.next_fencing_epoch
+            && self.lease_expires_at_tick == retained.lease_expires_at_tick;
+        self.valid()
+            && retained.valid()
+            && self.archive_id == retained.archive_id
+            && self.database_epoch == retained.database_epoch
+            && self.database_epoch_generation == retained.database_epoch_generation
+            && self.predecessor == retained.predecessor
+            && self.root == retained.root
+            && self.registry == retained.registry
+            && self.owner_id == Some(owner)
+            && retained.owner_id == Some(owner)
+            && same_fence_owner
+            && self.last_server_tick >= retained.last_server_tick
+            && self.migration == MigrationState::WalAuthoritative
+            && retained.migration == MigrationState::WalAuthoritative
+            && self.deletion == DeletionState::Active
+            && retained.deletion == DeletionState::Active
+            && self.deletion_fencing_epoch == retained.deletion_fencing_epoch
+            && self.deletion_worker_id == retained.deletion_worker_id
+            && self.deletion_operation_id == retained.deletion_operation_id
+            && self.deletion_evidence == retained.deletion_evidence
+    }
+
     fn same_maintenance_lease_subject(&self, previous: &Self, owner: ObjectId) -> bool {
         self.valid()
             && previous.valid()
@@ -2098,6 +2177,41 @@ impl InMemoryWitness {
         }
         Self::from_records(Arc::new(FixedClock(tick)), record.into_iter().collect())
     }
+
+    /// Terminal-only maintenance release. Unlike generic lease revocation,
+    /// this exact retained-R2 transition may clear the importer owner after
+    /// the lease has just expired without advancing its fence. It cannot
+    /// adopt any reacquired owner or change any nonlease witness field.
+    pub(crate) fn release_exact_maintenance_terminal(
+        &self,
+        retained: &WitnessRecord,
+        owner: ObjectId,
+    ) -> Result<WitnessRecord> {
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&retained.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        let _now = self.now(current)?;
+        if current
+            .exact_maintenance_terminal_or_release_from(retained, owner)
+            .is_ok()
+            && current.owner_id.is_none()
+        {
+            return Ok(current.clone());
+        }
+        if !current.exact_maintenance_terminal_active_at_provider_tick(retained, owner) {
+            return Err(WitnessError::Fenced);
+        }
+        current.owner_id = None;
+        current.lease_expires_at_tick = 0;
+        if !current.valid() {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(current.clone())
+    }
+
     fn with_clock_and_authenticator(
         clock: Arc<dyn TrustedClock>,
         deletion_authenticator: Arc<dyn DeletionWorkerAuthenticator>,
@@ -4335,6 +4449,153 @@ mod tests {
                 owner,
                 MigrationState::Legacy,
             ));
+    }
+    #[test]
+    fn maintenance_terminal_release_binds_every_nonlease_field() {
+        let (witness, _, bootstrap, lease) = setup();
+        let owner = ObjectId::from_bytes(id(8));
+        let mut retained = witness.read_current(bootstrap.archive_id).unwrap().unwrap();
+        retained.migration = MigrationState::WalAuthoritative;
+        assert!(retained
+            .exact_maintenance_terminal_or_release_from(&retained, owner)
+            .is_ok());
+
+        let mut released_records = Vec::new();
+        for tick in [
+            retained.last_server_tick + 1,
+            retained.lease_expires_at_tick,
+            retained.lease_expires_at_tick + 1,
+        ] {
+            let local =
+                InMemoryWitness::from_provider_record_at_tick(Some(retained.encode()), tick)
+                    .unwrap();
+            let released = local
+                .release_exact_maintenance_terminal(&retained, owner)
+                .unwrap();
+            assert_eq!(released.last_server_tick, tick);
+            assert!(released
+                .exact_maintenance_terminal_or_release_from(&retained, owner)
+                .is_ok());
+            released_records.push(released);
+        }
+        let released = released_records.remove(0);
+        assert!(released
+            .exact_maintenance_terminal_or_release_from(&retained, owner)
+            .is_ok());
+        let reacquired = retained.reacquired_maintenance_lease_for_test();
+        let competing = InMemoryWitness::from_provider_record_at_tick(
+            Some(reacquired.encode()),
+            reacquired.last_server_tick,
+        )
+        .unwrap();
+        assert!(competing
+            .release_exact_maintenance_terminal(&retained, owner)
+            .is_err());
+
+        let competing_owner = ObjectId::from_bytes(id(49));
+        let competing = InMemoryWitness::from_provider_record_at_tick(
+            Some(retained.encode()),
+            retained.lease_expires_at_tick,
+        )
+        .unwrap();
+        let competing_lease = competing
+            .acquire_lease(
+                retained.archive_id,
+                retained.database_epoch,
+                retained.registry.key_epoch,
+                competing_owner,
+                60,
+            )
+            .unwrap();
+        competing.revoke_lease(competing_lease).unwrap();
+        let competing_released = competing
+            .read_current(retained.archive_id)
+            .unwrap()
+            .unwrap();
+        assert!(competing_released.owner_id.is_none());
+        assert_ne!(
+            competing_released.current_fencing_epoch,
+            retained.current_fencing_epoch
+        );
+        assert!(competing_released
+            .exact_maintenance_terminal_or_release_from(&retained, owner)
+            .is_err());
+        let retry = InMemoryWitness::from_provider_record_at_tick(
+            Some(competing_released.encode()),
+            competing_released.last_server_tick + 1,
+        )
+        .unwrap();
+        assert!(retry
+            .release_exact_maintenance_terminal(&retained, owner)
+            .is_err());
+
+        let mut altered = Vec::new();
+        let mut value = released.clone();
+        value.archive_id = ArchiveId::from_bytes(id(40));
+        altered.push(value);
+        let mut value = released.clone();
+        value.database_epoch = DatabaseEpoch::from_bytes(id(41));
+        altered.push(value);
+        let mut value = released.clone();
+        value.database_epoch_generation = 1;
+        altered.push(value);
+        let mut value = released.clone();
+        value.predecessor = Some(Predecessor {
+            root: retained.root,
+            registry: retained.registry,
+        });
+        altered.push(value);
+        let mut value = released.clone();
+        value.root = cand(&retained, lease.fencing_epoch, 42);
+        altered.push(value);
+        let mut value = released.clone();
+        value.registry = KeyRegistryReference::new(
+            retained.registry.key_epoch,
+            1,
+            ObjectId::from_bytes(id(43)),
+            hash(44),
+        );
+        altered.push(value);
+        let mut value = released.clone();
+        value.owner_id = Some(ObjectId::from_bytes(id(45)));
+        value.lease_expires_at_tick = retained.lease_expires_at_tick;
+        altered.push(value);
+        let mut value = released.clone();
+        value.current_fencing_epoch = 0;
+        altered.push(value);
+        let mut value = released.clone();
+        value.next_fencing_epoch += 1;
+        altered.push(value);
+        let mut value = released.clone();
+        value.lease_expires_at_tick = 1;
+        altered.push(value);
+        let mut value = released.clone();
+        value.last_server_tick = retained.last_server_tick.saturating_sub(1);
+        altered.push(value);
+        let mut value = released.clone();
+        value.migration = MigrationState::ShadowWal;
+        altered.push(value);
+        let mut value = released.clone();
+        value.deletion = DeletionState::Tombstoned;
+        altered.push(value);
+        let mut value = released.clone();
+        value.deletion_fencing_epoch = Some(retained.next_fencing_epoch + 1);
+        altered.push(value);
+        let mut value = released.clone();
+        value.deletion_worker_id = Some(ObjectId::from_bytes(id(46)));
+        altered.push(value);
+        let mut value = released.clone();
+        value.deletion_operation_id = Some(ObjectId::from_bytes(id(47)));
+        altered.push(value);
+        let mut value = released.clone();
+        value.deletion_evidence[0] = Some(DeletionEvidence {
+            kind: DeletionEvidenceKind::Tombstone,
+            commitment: hash(48),
+        });
+        altered.push(value);
+        assert!(altered.iter().all(|record| record
+            .exact_maintenance_terminal_or_release_from(&retained, owner)
+            .is_err()));
     }
     #[test]
     fn unavailable_and_debug_are_content_free() {

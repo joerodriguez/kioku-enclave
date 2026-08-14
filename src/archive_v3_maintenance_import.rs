@@ -750,7 +750,11 @@ pub(crate) trait MaintenanceImportWitnessProvider: Send + Sync {
         duration_ticks: u64,
     ) -> Result<WitnessLease, WitnessError>;
 
-    async fn revoke_lease_best_effort(&self, lease: WitnessLease);
+    async fn release_terminal_lease_unresolved(
+        &self,
+        retained: WitnessRecord,
+        owner: ObjectId,
+    ) -> Result<(), MaintenanceWitnessCommitError>;
 
     async fn advance_migration_unresolved(
         &self,
@@ -870,10 +874,10 @@ pub(crate) trait MaintenanceImportPersistence: ShadowObjectInventory + Send + Sy
 /// sealed runtime is its only producer and no method is reachable from main.
 pub(crate) struct SingleArchiveMaintenanceImporter {
     archive_id: ArchiveId,
-    objects: Arc<dyn ImmutableObjectBackend>,
-    registries: Arc<dyn ExactKeyRegistryProvider>,
-    witness: Arc<dyn MaintenanceImportWitnessProvider>,
-    persistence: Arc<dyn MaintenanceImportPersistence>,
+    archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+    runtime_token: crate::archive_v3_shadow_runtime::MaintenanceRuntimeContext,
+    control: Arc<crate::cp::control_store::ControlStore>,
     store: Arc<crate::store::Store>,
     plan: AuthenticatedMaintenanceImportPlan,
 }
@@ -884,25 +888,23 @@ impl SingleArchiveMaintenanceImporter {
         reason = "explicit authenticated maintenance tuple; grouping would obscure exact binding"
     )]
     pub(crate) fn from_sealed_runtime(
-        _token: crate::archive_v3_shadow_runtime::MaintenanceRuntimeContext,
+        token: crate::archive_v3_shadow_runtime::MaintenanceRuntimeContext,
         archive_id: ArchiveId,
-        objects: Arc<dyn ImmutableObjectBackend>,
-        registries: Arc<dyn ExactKeyRegistryProvider>,
-        witness: Arc<dyn MaintenanceImportWitnessProvider>,
-        persistence: Arc<crate::cp::control_store::ControlStore>,
+        archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+        runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+        control: Arc<crate::cp::control_store::ControlStore>,
         store: Arc<crate::store::Store>,
         plan: AuthenticatedMaintenanceImportPlan,
     ) -> Result<Self, MaintenanceImportError> {
-        if plan.archive_id != archive_id {
+        if plan.archive_id != archive_id || runtime.maintenance_witness(&token).is_none() {
             return Err(MaintenanceImportError::Conflict);
         }
-        let persistence: Arc<dyn MaintenanceImportPersistence> = persistence;
         Ok(Self {
             archive_id,
-            objects,
-            registries,
-            witness,
-            persistence,
+            archive_binding,
+            runtime,
+            runtime_token: token,
+            control,
             store,
             plan,
         })
@@ -914,19 +916,28 @@ impl SingleArchiveMaintenanceImporter {
         objects: Arc<dyn ImmutableObjectBackend>,
         registries: Arc<dyn ExactKeyRegistryProvider>,
         witness: Arc<dyn MaintenanceImportWitnessProvider>,
-        persistence: Arc<dyn MaintenanceImportPersistence>,
+        control: Arc<crate::cp::control_store::ControlStore>,
         store: Arc<crate::store::Store>,
         plan: AuthenticatedMaintenanceImportPlan,
     ) -> Result<Self, MaintenanceImportError> {
         if plan.archive_id != archive_id {
             return Err(MaintenanceImportError::Conflict);
         }
+        let runtime =
+            crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle::from_maintenance_test_components(
+                objects,
+                registries,
+                witness,
+            );
         Ok(Self {
             archive_id,
-            objects,
-            registries,
-            witness,
-            persistence,
+            archive_binding:
+                crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding::from_control_store(
+                    crate::cp::control_store::ArchiveBinding::for_runtime_test(archive_id),
+                ),
+            runtime,
+            runtime_token: crate::archive_v3_shadow_runtime::MaintenanceRuntimeContext::for_test(),
+            control,
             store,
             plan,
         })
@@ -935,31 +946,38 @@ impl SingleArchiveMaintenanceImporter {
     /// Run the complete offline import in one owned task. Dropping the caller
     /// does not detach a witness send or plaintext scratch owner; the task
     /// retains both until a durable stage or cleanup.
-    pub(crate) async fn run(self) -> Result<MaintenanceImportCompletion, MaintenanceImportError> {
+    pub(crate) async fn run(
+        self,
+    ) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
         tokio::spawn(self.run_owned())
             .await
             .map_err(|_| MaintenanceImportError::Unavailable)?
     }
 
-    async fn run_owned(self) -> Result<MaintenanceImportCompletion, MaintenanceImportError> {
+    async fn run_owned(self) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
         let Self {
             archive_id,
-            objects,
-            registries,
-            witness,
-            persistence,
+            archive_binding,
+            runtime,
+            runtime_token,
+            control,
             store,
             plan,
         } = self;
+        let objects = runtime.maintenance_objects_owned(&runtime_token);
+        let registries = runtime.maintenance_registries(&runtime_token);
+        let witness = Arc::clone(
+            runtime
+                .maintenance_witness(&runtime_token)
+                .ok_or(MaintenanceImportError::Unavailable)?,
+        );
+        let persistence: Arc<dyn MaintenanceImportPersistence> = control.clone();
         let operation_id = plan.operation_id;
         let owner_id = plan.owner_id;
         let request_fingerprint = plan.operation_commitment;
         let session_id = ShadowSessionId::for_operation(*operation_id.as_bytes())
             .map_err(|_| MaintenanceImportError::Corrupt)?;
         let mut record = persistence.load_exact(operation_id).await?;
-        if record.stage == MaintenanceImportStage::WalAuthoritative {
-            return finish_offline_import(&record, witness.as_ref(), owner_id, archive_id).await;
-        }
         if record.stage == MaintenanceImportStage::ManualRequired {
             return Err(MaintenanceImportError::Conflict);
         }
@@ -1032,8 +1050,7 @@ impl SingleArchiveMaintenanceImporter {
                     .await
                     .map_err(|_| MaintenanceImportError::Unavailable)?;
                 require_active_migration(&current, archive_id, MigrationState::Legacy)?;
-                let cipher =
-                    resolve_witness_cipher(&current, archive_id, registries.as_ref()).await?;
+                let cipher = resolve_witness_cipher(&current, archive_id, registries).await?;
                 authenticate_current_root(objects.as_ref(), cipher.as_ref(), &current).await?;
                 let lease = witness
                     .acquire_lease_exact(&current, owner_id, MAINTENANCE_LEASE_TICKS)
@@ -1077,7 +1094,7 @@ impl SingleArchiveMaintenanceImporter {
             .await?;
             current = renewed;
             record = renewed_record;
-            let cipher = resolve_witness_cipher(&current, archive_id, registries.as_ref()).await?;
+            let cipher = resolve_witness_cipher(&current, archive_id, registries).await?;
             authenticate_current_root(objects.as_ref(), cipher.as_ref(), &current).await?;
             let lease = current
                 .exact_active_lease_for_owner(owner_id)
@@ -1189,7 +1206,19 @@ impl SingleArchiveMaintenanceImporter {
             .await?;
         }
         if record.stage == MaintenanceImportStage::WalAuthoritative {
-            return finish_offline_import(&record, witness.as_ref(), owner_id, archive_id).await;
+            return finish_offline_import(
+                &record,
+                persistence.as_ref(),
+                witness.as_ref(),
+                owner_id,
+                archive_id,
+                source,
+                pinned,
+                runtime,
+                archive_binding,
+                control,
+            )
+            .await;
         }
 
         current = witness
@@ -1218,7 +1247,7 @@ impl SingleArchiveMaintenanceImporter {
         .await?;
         current = renewed;
         record = renewed_record;
-        let cipher = resolve_witness_cipher(&current, archive_id, registries.as_ref()).await?;
+        let cipher = resolve_witness_cipher(&current, archive_id, registries).await?;
         let recovery = RecoveryRoot::from_exact_active_record(&current)
             .map_err(|_| MaintenanceImportError::Corrupt)?;
         let recovered = recover_owned_maintenance_staging(
@@ -1353,15 +1382,68 @@ impl SingleArchiveMaintenanceImporter {
         if record.stage != MaintenanceImportStage::WalAuthoritative {
             return Err(MaintenanceImportError::OutcomeUnknown);
         }
-        finish_offline_import(&record, witness.as_ref(), owner_id, archive_id).await
+        finish_offline_import(
+            &record,
+            persistence.as_ref(),
+            witness.as_ref(),
+            owner_id,
+            archive_id,
+            source,
+            pinned,
+            runtime,
+            archive_binding,
+            control,
+        )
+        .await
     }
 }
 
-pub(crate) struct MaintenanceImportCompletion(());
+/// Non-cloneable offline handoff. Each value exposes one consuming view and
+/// retains the complete sealed provider owner, exact terminal witness,
+/// encrypted Control handle, and Store's long-lived admission fence. Terminal
+/// restart may mint another value; durable global owner serialization belongs
+/// to the WAL worker. There are no field getters; only the WAL-owner module can
+/// obtain the view by presenting its private Store-owner token.
+pub(crate) struct CompletedMaintenanceWalHandoff {
+    runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+    terminal_witness: WitnessRecord,
+    archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    operation_id: MaintenanceImportOperationId,
+    source: MaintenanceSourceBinding,
+    control: Arc<crate::cp::control_store::ControlStore>,
+    store_fence: crate::store::StoreWalAuthorityFence,
+}
 
-impl fmt::Debug for MaintenanceImportCompletion {
+pub(crate) struct CompletedMaintenanceWalHandoffView {
+    pub(crate) runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+    pub(crate) terminal_witness: WitnessRecord,
+    pub(crate) archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    pub(crate) operation_id: MaintenanceImportOperationId,
+    pub(crate) source: MaintenanceSourceBinding,
+    pub(crate) control: Arc<crate::cp::control_store::ControlStore>,
+    pub(crate) store_fence: crate::store::StoreWalAuthorityFence,
+}
+
+impl CompletedMaintenanceWalHandoff {
+    pub(crate) fn into_wal_owner(
+        self,
+        _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+    ) -> CompletedMaintenanceWalHandoffView {
+        CompletedMaintenanceWalHandoffView {
+            runtime: self.runtime,
+            terminal_witness: self.terminal_witness,
+            archive_binding: self.archive_binding,
+            operation_id: self.operation_id,
+            source: self.source,
+            control: self.control,
+            store_fence: self.store_fence,
+        }
+    }
+}
+
+impl fmt::Debug for CompletedMaintenanceWalHandoff {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MaintenanceImportCompletion(<offline>)")
+        formatter.write_str("CompletedMaintenanceWalHandoff(<offline>)")
     }
 }
 
@@ -1467,24 +1549,131 @@ async fn resume_retained_send(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit authenticated terminal handoff tuple; grouping would obscure exact binding"
+)]
 async fn finish_offline_import(
+    expected_durable: &MaintenanceImportRecord,
+    persistence: &dyn MaintenanceImportPersistence,
+    witness: &dyn MaintenanceImportWitnessProvider,
+    owner_id: ObjectId,
+    archive_id: ArchiveId,
+    source: MaintenanceSourceBinding,
+    pinned: crate::store::PinnedLegacySnapshot,
+    runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+    archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    control: Arc<crate::cp::control_store::ControlStore>,
+) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
+    let durable = persistence
+        .load_exact(expected_durable.operation_id)
+        .await?;
+    validate_exact_terminal_control(expected_durable, &durable, source)?;
+    let released =
+        authenticate_and_release_terminal_witness(&durable, witness, owner_id, archive_id).await?;
+    pinned
+        .exact_generation_revalidation()
+        .verify()
+        .await
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    let exact_durable = persistence
+        .load_exact(expected_durable.operation_id)
+        .await?;
+    validate_exact_terminal_control(&durable, &exact_durable, source)?;
+    let store_fence = pinned
+        .into_wal_authority_fence(MaintenanceCoordinatorContext(()), source)
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    Ok(CompletedMaintenanceWalHandoff {
+        runtime,
+        terminal_witness: released,
+        archive_binding,
+        operation_id: expected_durable.operation_id,
+        source,
+        control,
+        store_fence,
+    })
+}
+
+fn validate_exact_terminal_control(
+    expected: &MaintenanceImportRecord,
+    observed: &MaintenanceImportRecord,
+    source: MaintenanceSourceBinding,
+) -> Result<(), MaintenanceImportError> {
+    if observed != expected
+        || observed.stage() != MaintenanceImportStage::WalAuthoritative
+        || observed.source() != Some(source)
+    {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    Ok(())
+}
+
+async fn authenticate_and_release_terminal_witness(
     durable: &MaintenanceImportRecord,
     witness: &dyn MaintenanceImportWitnessProvider,
     owner_id: ObjectId,
     archive_id: ArchiveId,
-) -> Result<MaintenanceImportCompletion, MaintenanceImportError> {
+) -> Result<WitnessRecord, MaintenanceImportError> {
     if durable.stage() != MaintenanceImportStage::WalAuthoritative {
         return Err(MaintenanceImportError::Corrupt);
     }
+    let retained_terminal = durable
+        .witnessed_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    let retained_candidate = durable
+        .authoritative_candidate_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    let retained_root = RecoveryRoot::from_exact_wal_authoritative_record(&retained_candidate)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
     let terminal = witness
         .read_current_exact(archive_id)
         .await
         .map_err(|_| MaintenanceImportError::Unavailable)?;
     require_active_migration(&terminal, archive_id, MigrationState::WalAuthoritative)?;
-    if let Ok(lease) = terminal.exact_active_lease_for_owner(owner_id) {
-        witness.revoke_lease_best_effort(lease).await;
+    let terminal_requires_release = terminal
+        .exact_maintenance_terminal_or_release_from(&retained_terminal, owner_id)
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    let terminal_root = RecoveryRoot::from_exact_wal_authoritative_record(&terminal)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    if terminal_root != retained_root {
+        return Err(MaintenanceImportError::Conflict);
     }
-    Ok(MaintenanceImportCompletion(()))
+    let release_outcome = if terminal_requires_release {
+        Some(
+            witness
+                .release_terminal_lease_unresolved(retained_terminal.clone(), owner_id)
+                .await,
+        )
+    } else {
+        None
+    };
+    let released = witness
+        .read_current_exact(archive_id)
+        .await
+        .map_err(|_| MaintenanceImportError::Unavailable)?;
+    require_active_migration(&released, archive_id, MigrationState::WalAuthoritative)?;
+    let released_requires_release = released
+        .exact_maintenance_terminal_or_release_from(&retained_terminal, owner_id)
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    let released_root = RecoveryRoot::from_exact_wal_authoritative_record(&released)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    if released_root != retained_root {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    if released_requires_release {
+        return Err(match release_outcome {
+            Some(Err(MaintenanceWitnessCommitError::DefinitelyFailed)) => {
+                MaintenanceImportError::Unavailable
+            }
+            Some(Err(MaintenanceWitnessCommitError::OutcomeUnknown)) | Some(Ok(())) => {
+                MaintenanceImportError::OutcomeUnknown
+            }
+            Some(Err(MaintenanceWitnessCommitError::Rejected)) | None => {
+                MaintenanceImportError::Conflict
+            }
+        });
+    }
+    Ok(released)
 }
 
 async fn renew_exact_maintenance_lease(
@@ -1973,8 +2162,15 @@ mod tests {
             self.0.renew_lease(lease, duration_ticks)
         }
 
-        async fn revoke_lease_best_effort(&self, lease: WitnessLease) {
-            let _ = self.0.revoke_lease(lease);
+        async fn release_terminal_lease_unresolved(
+            &self,
+            retained: WitnessRecord,
+            owner: ObjectId,
+        ) -> Result<(), MaintenanceWitnessCommitError> {
+            self.0
+                .release_exact_maintenance_terminal(&retained, owner)
+                .map(|_| ())
+                .map_err(|_| MaintenanceWitnessCommitError::Rejected)
         }
 
         async fn advance_migration_unresolved(
@@ -2155,6 +2351,7 @@ mod tests {
         revokes: AtomicUsize,
         sends: AtomicUsize,
         behavior: SendBehavior,
+        revoke_succeeds: bool,
     }
 
     #[async_trait]
@@ -2196,9 +2393,26 @@ mod tests {
             Err(WitnessError::Unavailable)
         }
 
-        async fn revoke_lease_best_effort(&self, _lease: WitnessLease) {
+        async fn release_terminal_lease_unresolved(
+            &self,
+            retained: WitnessRecord,
+            owner: ObjectId,
+        ) -> Result<(), MaintenanceWitnessCommitError> {
             self.revokes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.revoke_succeeds {
+                let current = self.current.lock().unwrap().clone();
+                let local = InMemoryWitness::from_provider_record_at_tick(
+                    Some(current.encode()),
+                    retained.last_server_tick().saturating_add(1),
+                )
+                .unwrap();
+                *self.current.lock().unwrap() = local
+                    .release_exact_maintenance_terminal(&retained, owner)
+                    .unwrap();
+                return Err(MaintenanceWitnessCommitError::OutcomeUnknown);
+            }
+            Err(MaintenanceWitnessCommitError::DefinitelyFailed)
         }
 
         async fn advance_migration_unresolved(
@@ -2438,6 +2652,7 @@ mod tests {
             revokes: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
             behavior: SendBehavior::DefinitelyFailed,
+            revoke_succeeds: false,
         };
         let persistence = persistence(fixture);
         let (adopted, record) = renew_exact_maintenance_lease(
@@ -2481,6 +2696,7 @@ mod tests {
             revokes: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
             behavior: SendBehavior::DefinitelyFailed,
+            revoke_succeeds: false,
         });
         let persistence = persistence(fixture);
         let result = resume_retained_send(
@@ -2519,6 +2735,7 @@ mod tests {
             revokes: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
             behavior: SendBehavior::CommitThenUnknown,
+            revoke_succeeds: false,
         });
         let persistence = persistence(fixture);
         let result = resume_retained_send(
@@ -2554,6 +2771,7 @@ mod tests {
             revokes: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
             behavior: SendBehavior::DefinitelyFailed,
+            revoke_succeeds: false,
         });
         let persistence = persistence(fixture);
         assert_eq!(
@@ -2580,95 +2798,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_restart_freshly_revalidates_and_retries_lease_revoke() {
+    async fn terminal_handoff_requires_fresh_exact_release_and_accepts_lost_revoke_response() {
         let fixture = migration_fixture();
         let terminal = fixture
             .candidate
             .with_migration_for_test(MigrationState::WalAuthoritative);
         let durable = terminal_record(&fixture, &terminal);
-        let witness = Arc::new(FakeWitness {
+        let failed = FakeWitness {
             current: Mutex::new(terminal.clone()),
             reads: AtomicUsize::new(0),
             revokes: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
             behavior: SendBehavior::DefinitelyFailed,
-        });
-
-        let nonterminal = record(
-            &fixture,
-            MaintenanceImportStage::ShadowSendUnknown,
-            &fixture.current,
-        );
+            revoke_succeeds: false,
+        };
         assert!(matches!(
-            finish_offline_import(
-                &nonterminal,
-                witness.as_ref(),
+            authenticate_and_release_terminal_witness(
+                &durable,
+                &failed,
                 fixture.owner_id,
                 fixture.archive_id,
             )
             .await,
-            Err(MaintenanceImportError::Corrupt)
+            Err(MaintenanceImportError::Unavailable)
         ));
-        assert_eq!(witness.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(failed.revokes.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        finish_offline_import(
+        // A lost commit response is accepted only through the fresh exact
+        // no-active-lease read immediately afterward.
+        let lost_success = FakeWitness {
+            current: Mutex::new(terminal),
+            reads: AtomicUsize::new(0),
+            revokes: AtomicUsize::new(0),
+            sends: AtomicUsize::new(0),
+            behavior: SendBehavior::DefinitelyFailed,
+            revoke_succeeds: true,
+        };
+        let released = authenticate_and_release_terminal_witness(
             &durable,
-            witness.as_ref(),
+            &lost_success,
             fixture.owner_id,
             fixture.archive_id,
         )
         .await
         .unwrap();
-        assert_eq!(witness.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(witness.revokes.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        *witness.current.lock().unwrap() = terminal
-            .clone()
-            .with_archive_id_for_test(ArchiveId::from_bytes([0x99; 16]));
-        assert!(matches!(
-            finish_offline_import(
-                &durable,
-                witness.as_ref(),
-                fixture.owner_id,
-                fixture.archive_id
-            )
-            .await,
-            Err(MaintenanceImportError::Conflict)
-        ));
-        *witness.current.lock().unwrap() = terminal
-            .clone()
-            .with_deletion_for_test(crate::archive_v3_witness::DeletionState::Tombstoned);
-        assert!(matches!(
-            finish_offline_import(
-                &durable,
-                witness.as_ref(),
-                fixture.owner_id,
-                fixture.archive_id
-            )
-            .await,
-            Err(MaintenanceImportError::Conflict)
-        ));
+        assert!(!released.has_exact_active_wal_owner_lease());
         assert_eq!(
-            witness.revokes.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "invalid terminal state must not revoke authority"
+            lost_success
+                .revokes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
-
-        *witness.current.lock().unwrap() = terminal;
-        finish_offline_import(
+        let reads_before = lost_success.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let reopened = authenticate_and_release_terminal_witness(
             &durable,
-            witness.as_ref(),
+            &lost_success,
             fixture.owner_id,
             fixture.archive_id,
         )
         .await
         .unwrap();
-        assert_eq!(witness.reads.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(reopened == released);
         assert_eq!(
-            witness.revokes.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "terminal restart must retry best-effort revocation"
+            lost_success
+                .revokes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
+        assert_eq!(
+            lost_success.reads.load(std::sync::atomic::Ordering::SeqCst),
+            reads_before + 2
+        );
+
+        let alternate = released.with_archive_id_for_test(ArchiveId::from_bytes([0xee; 16]));
+        *lost_success.current.lock().unwrap() = alternate;
+        assert!(matches!(
+            authenticate_and_release_terminal_witness(
+                &durable,
+                &lost_success,
+                fixture.owner_id,
+                fixture.archive_id,
+            )
+            .await,
+            Err(MaintenanceImportError::Conflict)
+        ));
     }
 
     #[test]
@@ -2769,6 +2982,40 @@ mod tests {
             ),
             Err(MaintenanceImportError::Corrupt)
         );
+    }
+
+    #[test]
+    fn terminal_control_reload_rejects_stale_stage_source_or_full_row() {
+        let fixture = migration_fixture();
+        let terminal = fixture
+            .candidate
+            .with_migration_for_test(MigrationState::WalAuthoritative);
+        let exact = terminal_record(&fixture, &terminal);
+        assert!(validate_exact_terminal_control(&exact, &exact, fixture.source).is_ok());
+
+        let stale_stage = record(
+            &fixture,
+            MaintenanceImportStage::ShadowWal,
+            &fixture.candidate,
+        );
+        assert!(matches!(
+            validate_exact_terminal_control(&exact, &stale_stage, fixture.source),
+            Err(MaintenanceImportError::Conflict)
+        ));
+        let other_source = MaintenanceSourceBinding::from_pinned(
+            fixture.archive_id,
+            fixture.operation_id,
+            3,
+            [0x31; 32],
+            4096,
+            0,
+            [0x32; 32],
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_exact_terminal_control(&exact, &exact, other_source),
+            Err(MaintenanceImportError::Conflict)
+        ));
     }
 
     #[tokio::test]
@@ -2888,39 +3135,107 @@ mod tests {
             ))
             .unwrap();
         let witness = Arc::new(InMemoryMaintenanceWitness(witness));
-        let persistence: Arc<dyn MaintenanceImportPersistence> = control.clone();
         let objects: Arc<dyn ImmutableObjectBackend> = backend;
         let registry_provider: Arc<dyn ExactKeyRegistryProvider> = registries;
         let importer = SingleArchiveMaintenanceImporter::from_test_components(
             archive_id,
-            objects,
-            registry_provider,
+            Arc::clone(&objects),
+            Arc::clone(&registry_provider),
             witness.clone(),
-            persistence,
-            store,
+            Arc::clone(&control),
+            Arc::clone(&store),
             plan,
         )
         .unwrap();
+        let handoff = importer.run().await.unwrap();
         assert_eq!(
-            format!("{:?}", importer.run().await.unwrap()),
-            "MaintenanceImportCompletion(<offline>)"
+            format!("{handoff:?}"),
+            "CompletedMaintenanceWalHandoff(<offline>)"
         );
+        assert!(handoff.store_fence.scratch_family_absent_for_test());
         let terminal = witness.read_current_exact(archive_id).await.unwrap();
         assert_eq!(terminal.migration(), MigrationState::WalAuthoritative);
         assert_eq!(terminal.root().root().sequence(), 2);
         assert_eq!(terminal.root().parent().unwrap().sequence(), 1);
         assert_eq!(terminal.archive_id(), archive_id);
         assert!(terminal.exact_active_lease_for_owner(owner_id).is_err());
+
+        // The handoff, not the importer, now owns the process-local lifecycle
+        // and actor admission guards. A second transition cannot start while
+        // it is retained, even though its plaintext family is already gone.
+        let blocked_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let blocked = store
+            .begin_archive_maintenance(MaintenanceCoordinatorContext::for_test(), blocked_plan);
+        assert!(tokio::time::timeout(Duration::from_millis(25), blocked)
+            .await
+            .is_err());
+
+        // Dropping the unconsumed handoff releases only process-local guards;
+        // durable/provider fences remain closed. Terminal restart must still
+        // reacquire and authenticate the exact pinned source before reminting.
+        drop(handoff);
+        let restart_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let restart = SingleArchiveMaintenanceImporter::from_test_components(
+            archive_id,
+            objects,
+            registry_provider,
+            witness.clone(),
+            control,
+            store,
+            restart_plan,
+        )
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+        assert!(restart.store_fence.scratch_family_absent_for_test());
+        assert!(witness
+            .read_current_exact(archive_id)
+            .await
+            .unwrap()
+            .exact_active_lease_for_owner(owner_id)
+            .is_err());
+        let owner_view =
+            restart.into_wal_owner(crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test());
+        assert_eq!(
+            format!("{:?}", owner_view.runtime),
+            "ArchiveV3ShadowRuntimeBundle(<inactive>)"
+        );
+        assert_eq!(
+            format!("{:?}", owner_view.archive_binding),
+            "DurableSingleArchiveBinding(<opaque>)"
+        );
+        assert_eq!(
+            owner_view.terminal_witness.migration(),
+            MigrationState::WalAuthoritative
+        );
+        assert!(owner_view.store_fence.scratch_family_absent_for_test());
+        let _retained_authority = (
+            owner_view.operation_id,
+            owner_view.source,
+            owner_view.control,
+        );
     }
 
     #[test]
     fn maintenance_surface_is_inactive_redacted_and_has_no_delete_or_list() {
         let source = include_str!("archive_v3_maintenance_import.rs");
+        let runtime = include_str!("archive_v3_shadow_runtime.rs");
         let main = include_str!("main.rs");
         for forbidden in [
             concat!("impl Clone", " for AuthenticatedMaintenanceImportPlan"),
+            concat!("impl Clone", " for CompletedMaintenanceWalHandoff"),
+            concat!("impl Copy", " for CompletedMaintenanceWalHandoff"),
             concat!("pub(crate) fn user_", "id"),
             concat!("pub(crate) fn archive_", "id"),
+            concat!("pub(crate) fn terminal_", "witness"),
+            concat!("pub(crate) fn provider", "s"),
             concat!("delete_", "exact"),
             concat!("enumer", "ate("),
             concat!("list_", "objects"),
@@ -2939,12 +3254,28 @@ mod tests {
         ] {
             assert!(!main.contains(forbidden), "production wiring: {forbidden}");
         }
-        assert!(source.contains("tokio::spawn(self.run_owned())"));
-        assert!(source.contains(concat!(
-            "return finish_offline_",
-            "import(&record, witness.as_ref(), owner_id, archive_id).await;"
-        )));
-        assert!(source.contains("ShadowParityVerifier::compare_staged_copies"));
-        assert!(source.contains("MigrationState::WalAuthoritative"));
+        assert!(source.contains(concat!("tokio::spawn(self.run_", "owned())")));
+        assert!(source.contains(concat!("into_wal_", "owner(")));
+        assert!(source.contains(concat!("WalOwnerStore", "Context")));
+        assert_eq!(
+            source
+                .matches(concat!(
+                    "persistence\n        .load_exact(expected_durable.",
+                    "operation_id)\n        .await?"
+                ))
+                .count(),
+            2
+        );
+        assert!(source.contains(concat!("exact_maintenance_terminal_or_", "release_from")));
+        assert!(source.contains(concat!("release_terminal_lease_", "unresolved")));
+        assert!(source.contains(concat!("into_wal_authority_", "fence")));
+        assert!(source.contains(concat!("ShadowParityVerifier::compare_", "staged_copies")));
+        assert!(source.contains(concat!("MigrationState::Wal", "Authoritative")));
+        assert!(!runtime.contains(concat!("impl Clone for ArchiveV3ShadowRuntime", "Bundle")));
+        assert!(runtime.contains(concat!("_token: &MaintenanceRuntime", "Context")));
+        assert!(runtime.contains(concat!("fn maintenance_objects_", "owned(")));
+        assert!(!runtime.contains(concat!("pub(crate) fn ", "objects(")));
+        assert!(source.contains(concat!("Arc::clone(&", "objects)")));
+        assert_eq!(source.matches(concat!("fn into_wal_", "owner(")).count(), 1);
     }
 }

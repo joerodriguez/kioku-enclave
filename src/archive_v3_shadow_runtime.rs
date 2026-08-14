@@ -152,7 +152,7 @@ impl fmt::Debug for ArchiveV3ShadowRuntimeDeployment {
 }
 
 /// Private provider owner. It is never returned without exact durable binding.
-struct ArchiveV3ShadowRuntimeBundle {
+pub(crate) struct ArchiveV3ShadowRuntimeBundle {
     objects: Arc<dyn ImmutableObjectBackend>,
     _roots: Arc<dyn ExactRootProvider>,
     registries: Arc<dyn ExactKeyRegistryProvider>,
@@ -213,6 +213,42 @@ impl ArchiveV3ShadowRuntimeBundle {
             maintenance_witness: None,
         }
     }
+
+    pub(crate) fn maintenance_objects_owned(
+        &self,
+        _token: &MaintenanceRuntimeContext,
+    ) -> Arc<dyn ImmutableObjectBackend> {
+        Arc::clone(&self.objects)
+    }
+
+    pub(crate) fn maintenance_registries(
+        &self,
+        _token: &MaintenanceRuntimeContext,
+    ) -> &dyn ExactKeyRegistryProvider {
+        self.registries.as_ref()
+    }
+
+    pub(crate) fn maintenance_witness(
+        &self,
+        _token: &MaintenanceRuntimeContext,
+    ) -> Option<&Arc<dyn MaintenanceImportWitnessProvider>> {
+        self.maintenance_witness.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_maintenance_test_components(
+        objects: Arc<dyn ImmutableObjectBackend>,
+        registries: Arc<dyn ExactKeyRegistryProvider>,
+        witness: Arc<dyn MaintenanceImportWitnessProvider>,
+    ) -> Self {
+        Self {
+            objects,
+            _roots: Arc::new(UnavailableRootProvider),
+            registries,
+            _witness: Arc::new(UnavailableShadowWitnessProvider),
+            maintenance_witness: Some(witness),
+        }
+    }
 }
 
 /// Pending, non-cloneable single-archive runtime capability. It owns the
@@ -241,13 +277,13 @@ impl PendingSingleArchiveWalRuntime {
         self,
         binding: DurableSingleArchiveBinding,
     ) -> Result<SealedSingleArchiveWalRuntime, ArchiveV3ShadowRuntimeConstructionError> {
-        if ArchiveV3ArchiveBindingCommitment::for_archive(binding.archive_id)
+        if ArchiveV3ArchiveBindingCommitment::for_archive(binding.binding.archive_id())
             != self.expected_binding
         {
             return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
         }
         Ok(SealedSingleArchiveWalRuntime {
-            archive_id: binding.archive_id,
+            binding,
             bundle: self.bundle,
         })
     }
@@ -274,14 +310,12 @@ impl fmt::Debug for PendingSingleArchiveWalRuntime {
 /// the encrypted control store's private `ArchiveBinding`, never a user ID,
 /// account ID, string, or caller-supplied raw archive bytes.
 pub(crate) struct DurableSingleArchiveBinding {
-    archive_id: ArchiveId,
+    binding: ArchiveBinding,
 }
 
 impl DurableSingleArchiveBinding {
     pub(crate) fn from_control_store(binding: ArchiveBinding) -> Self {
-        Self {
-            archive_id: binding.archive_id(),
-        }
+        Self { binding }
     }
 }
 
@@ -295,13 +329,20 @@ impl fmt::Debug for DurableSingleArchiveBinding {
 /// providers remain private and it exposes no read, write, capture, witness,
 /// acknowledgement, task, callback, or deletion operation.
 pub(crate) struct SealedSingleArchiveWalRuntime {
-    archive_id: ArchiveId,
+    binding: DurableSingleArchiveBinding,
     bundle: ArchiveV3ShadowRuntimeBundle,
 }
 
 /// Private-field token proving that raw runtime providers were consumed by
 /// the sealed runtime rather than assembled by a sibling module.
 pub(crate) struct MaintenanceRuntimeContext(());
+
+#[cfg(test)]
+impl MaintenanceRuntimeContext {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
 
 impl SealedSingleArchiveWalRuntime {
     /// One-shot inactive composition. This has no startup caller and returns
@@ -312,16 +353,11 @@ impl SealedSingleArchiveWalRuntime {
         persistence: Arc<ControlStore>,
         store: Arc<crate::store::Store>,
     ) -> Result<SingleArchiveMaintenanceImporter, MaintenanceImportError> {
-        let witness = self
-            .bundle
-            .maintenance_witness
-            .ok_or(MaintenanceImportError::Unavailable)?;
         SingleArchiveMaintenanceImporter::from_sealed_runtime(
             MaintenanceRuntimeContext(()),
-            self.archive_id,
-            self.bundle.objects,
-            self.bundle.registries,
-            witness,
+            self.binding.binding.archive_id(),
+            self.binding,
+            self.bundle,
             persistence,
             store,
             plan,
@@ -346,6 +382,50 @@ struct ShadowRuntimeComponents {
     roots: Arc<dyn ExactRootProvider>,
     registries: Arc<dyn ExactKeyRegistryProvider>,
     witness: Arc<dyn ShadowCheckpointWitnessProvider>,
+}
+
+#[cfg(test)]
+struct UnavailableRootProvider;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ExactRootProvider for UnavailableRootProvider {
+    async fn read_exact(
+        &self,
+        _context: &crate::archive_v3::ObjectContext,
+    ) -> Result<crate::archive_v3::CiphertextEnvelope, crate::archive_v3_witness::WitnessError>
+    {
+        Err(crate::archive_v3_witness::WitnessError::Unavailable)
+    }
+}
+
+#[cfg(test)]
+struct UnavailableShadowWitnessProvider;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ShadowCheckpointWitnessProvider for UnavailableShadowWitnessProvider {
+    async fn read_current_exact(
+        &self,
+        _archive_id: ArchiveId,
+    ) -> Result<crate::archive_v3_witness::WitnessRecord, crate::archive_v3_witness::WitnessError>
+    {
+        Err(crate::archive_v3_witness::WitnessError::Unavailable)
+    }
+
+    async fn compare_and_advance_root(
+        &self,
+        _advance: crate::archive_v3_witness::RootAdvance,
+    ) -> Result<
+        crate::archive_v3_witness::WitnessReceipt,
+        crate::archive_v3_shadow_coordinator::ShadowWitnessCommitError,
+    > {
+        Err(
+            crate::archive_v3_shadow_coordinator::ShadowWitnessCommitError::Failed(
+                crate::archive_v3_witness::WitnessError::Unavailable,
+            ),
+        )
+    }
 }
 
 /// This is intentionally not configurable. A future deletion-capable runtime
