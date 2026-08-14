@@ -55,7 +55,7 @@ class LocalEvidenceTests(unittest.TestCase):
         metadata = directory / "enclave-release.json"
         image_repository = "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave"
         metadata.write_text(json.dumps({
-            "schema_version": 8,
+            "schema_version": 9,
             "source_repository": "https://github.com/owner/repository",
             "source_ref": "v1.2.3", "source_commit": COMMIT,
             "image_uri": image_repository + ":release",
@@ -70,7 +70,7 @@ class LocalEvidenceTests(unittest.TestCase):
             "archive_v3_shadow_runtime_mode": "off", "archive_v3_archive_bucket": "",
             "archive_v3_archive_gcs_project_number": "", "archive_v3_registry_kms_version": "",
             "archive_v3_witness_project_id": "", "archive_v3_witness_project_number": "",
-            "archive_v3_witness_database_id": "",
+            "archive_v3_witness_database_id": "", "archive_v3_archive_binding_commitment": "",
         }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
         evidence = directory / "enclave-local-build-evidence.json"
         subprocess.run(

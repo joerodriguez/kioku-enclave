@@ -1,10 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "mode": "off",
   "archive_bucket": "",
   "archive_gcs_project_number": "",
   "registry_kms_version": "",
   "witness_project_id": "",
   "witness_project_number": "",
-  "witness_database_id": ""
+  "witness_database_id": "",
+  "archive_binding_commitment": ""
 }

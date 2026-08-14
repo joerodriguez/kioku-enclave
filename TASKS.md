@@ -196,20 +196,31 @@ This gate does not activate WAL persistence or change any user-visible runtime b
 These release and runtime boundaries do not create a Firestore database, grant provider
 IAM, publish a probe release, deploy an image, or activate archive-v3 authority.
 
-## Construction-only shadow-runtime release boundary
+## Sealed single-archive WAL runtime release boundary
 
-- [x] Composed fixed archive-GCS, exact registry-KMS-version, and named-Firestore
-  providers synchronously behind one non-cloneable private-field bundle with an
-  always-deny hard-delete gate and no callable runtime handle.
-- [x] Added one exact checked-in `off`/empty profile as the sole build and schema-v7
-  release claim; repository variables, dispatch, tags, and process environment cannot
-  select provider fragments or an active mode.
-- [x] Kept startup, Store/VFS, lifecycle, routes, health, admission, tasks, provider I/O,
-  deployment, and every archive/root/deletion authority path disconnected.
+- [x] Added a domain-separated SHA-256 commitment over one opaque archive ID and
+  non-cloneable pending/durable/sealed capability types; binding consumes the
+  pending provider graph exactly once and accepts only the encrypted-control
+  `ArchiveBinding` whose commitment matches the image claim.
+- [x] Retained synchronous zero-I/O construction, private archive/provider fields,
+  no getters/callbacks/tasks/operations/acknowledgements/deletion methods, and an
+  always-false hard-delete drain gate.
+- [x] Versioned the sole checked runtime profile to schema 2. The checked file stays
+  exact off/empty; a complete canonical `single-archive-wal-v1` profile is selected
+  only for exact `vX.Y.Z-archive-v3-wal.N` production tags, while evaluation/main
+  pretag force off, WAL-tag-plus-off fails, and environment/operator/dispatch inputs
+  cannot override it.
+- [x] Bound the full eight-element claim into schema-9 release metadata and Docker's
+  independent exact off/complete provider grammar while leaving schema-7/8 evidence
+  ineligible.
+- [x] Quarantined active `release.sh --roll` before tag verification, cloud
+  authentication, publication, or deployment and kept startup, Store/VFS,
+  lifecycle, routes, health, WAL publication, provider I/O, and archive/root/
+  deletion authority disconnected.
 
-This code-only boundary does not make schema-v7 images deployable. The deployment
-repository must first merge an independently reviewed schema-v7 compatibility update;
-until then no release from this source may be promoted or rolled.
+Schema-9 active image evidence is not deployable. The deployment repository must first
+merge an independently reviewed compatibility PR; this enclave slice does not change that
+repository, construct the runtime at startup, or enable any user-visible behavior.
 
 ## Capacity fixture and local gate
 

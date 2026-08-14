@@ -49,6 +49,20 @@ class LocalReleaseContracts(unittest.TestCase):
         self.assertIn('Artifact Registry did not resolve the signed image digest', RELEASE)
         self.assertIn('isImmutable', RELEASE)
 
+    def test_active_archive_wal_roll_is_quarantined_before_authority_or_publication(self) -> None:
+        gate = RELEASE.index('active archive-v3 WAL images cannot roll')
+        fetch = RELEASE.index('git fetch origin main')
+        evidence = RELEASE.index('scripts/verify_local_evidence_bundle.py')
+        tag = RELEASE.index('verify_tag_signer()')
+        registry = RELEASE.index('artifacts docker images describe')
+        push = RELEASE.index('git push origin "$TAG"')
+        self.assertLess(gate, fetch)
+        self.assertLess(gate, evidence)
+        self.assertLess(gate, tag)
+        self.assertLess(gate, registry)
+        self.assertLess(gate, push)
+        self.assertIn('"ARCHIVE_V3_SHADOW_RUNTIME_MODE"', RELEASE)
+
     def test_evidence_has_only_hashes_for_local_build_inputs(self) -> None:
         for field in ("config_sha256", "dockerfile_sha256", "cargo_lock_sha256", "release_metadata_sha256", "sbom_sha256", "scan_sha256"):
             self.assertIn(field, EVIDENCE)

@@ -3,7 +3,7 @@
 
 This executable is deliberately suitable for ``KIOKU_ENCLAVE_EVIDENCE_VERIFY``:
 it uses an externally pinned Ed25519 key, checks the exact bytes named by the
-signed manifest, validates schema-8 release metadata, and emits the verified
+signed manifest, validates schema-9 release metadata, and emits the verified
 source and digest bindings as JSON.  It never reads cloud credentials or
 changes local or remote state.
 """

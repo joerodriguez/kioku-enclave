@@ -21,7 +21,7 @@ MEDIA_BUCKET = "kioku-production-media"
 
 def manifest() -> dict[str, object]:
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "source_repository": "https://github.com/owner/repository",
         "source_ref": "v1.2.3",
         "source_commit": COMMIT,
@@ -46,6 +46,7 @@ def manifest() -> dict[str, object]:
         "archive_v3_witness_project_id": "",
         "archive_v3_witness_project_number": "",
         "archive_v3_witness_database_id": "",
+        "archive_v3_archive_binding_commitment": "",
     }
 
 
@@ -65,6 +66,7 @@ def schema_v4_manifest() -> dict[str, object]:
         "archive_v3_witness_project_id",
         "archive_v3_witness_project_number",
         "archive_v3_witness_database_id",
+        "archive_v3_archive_binding_commitment",
     ):
         del data[key]
     return data
@@ -251,15 +253,16 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("does not match", completed.stderr)
 
-    def test_shadow_runtime_claim_is_exact_off_and_bound_to_shared_config(self) -> None:
+    def test_shadow_runtime_claim_is_exact_and_bound_to_shared_config(self) -> None:
         for field, value in (
-            ("archive_v3_shadow_runtime_mode", "shadow-v1"),
+            ("archive_v3_shadow_runtime_mode", "single-archive-wal-v1"),
             ("archive_v3_archive_bucket", "archive-bucket"),
             ("archive_v3_archive_gcs_project_number", "123456789"),
             ("archive_v3_registry_kms_version", "7"),
             ("archive_v3_witness_project_id", "project-1"),
             ("archive_v3_witness_project_number", "987654321"),
             ("archive_v3_witness_database_id", "witness-db"),
+            ("archive_v3_archive_binding_commitment", "1" * 64),
         ):
             with self.subTest(field=field):
                 data = manifest()
@@ -268,26 +271,68 @@ class ReleaseMetadataTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn("shadow-runtime claim does not match", completed.stderr)
 
-        hostile_config = {
-            "schema_version": 1,
-            "mode": "shadow-v1",
-            "archive_bucket": "archive-bucket",
+        active_config = {
+            "schema_version": 2,
+            "mode": "single-archive-wal-v1",
+            "archive_bucket": "archive-bucket-1",
             "archive_gcs_project_number": "123456789",
             "registry_kms_version": "7",
             "witness_project_id": "project-1",
             "witness_project_number": "987654321",
             "witness_database_id": "witness-db",
+            "archive_binding_commitment": "1" * 64,
         }
-        completed = self.verify(manifest(), shadow_runtime_config=hostile_config)
+        tag = "v1.2.3-archive-v3-wal.1"
+        data = manifest()
+        data["source_ref"] = tag
+        data["release_url"] = "https://github.com/owner/repository/releases/tag/" + tag
+        data.update(
+            {
+                "archive_v3_shadow_runtime_mode": "single-archive-wal-v1",
+                "archive_v3_archive_bucket": "archive-bucket-1",
+                "archive_v3_archive_gcs_project_number": "123456789",
+                "archive_v3_registry_kms_version": "7",
+                "archive_v3_witness_project_id": "project-1",
+                "archive_v3_witness_project_number": "987654321",
+                "archive_v3_witness_database_id": "witness-db",
+                "archive_v3_archive_binding_commitment": "1" * 64,
+            }
+        )
+        completed = self.verify(data, tag=tag, shadow_runtime_config=active_config)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        substituted = dict(data)
+        substituted["archive_v3_archive_binding_commitment"] = "2" * 64
+        completed = self.verify(
+            substituted, tag=tag, shadow_runtime_config=active_config
+        )
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("must be exact off", completed.stderr)
+        self.assertIn("shadow-runtime claim does not match", completed.stderr)
+
+        completed = self.verify(manifest(), shadow_runtime_config=active_config)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("exact vX.Y.Z-archive-v3-wal.N", completed.stderr)
 
     def test_schema_v7_manifest_is_ineligible_for_promotion(self) -> None:
         data = manifest()
         data["schema_version"] = 7
         completed = self.verify(data)
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("schema_version must be 8", completed.stderr)
+        self.assertIn("schema_version must be 9", completed.stderr)
+
+    def test_schema_v8_manifest_remains_ineligible_for_promotion(self) -> None:
+        data = manifest()
+        data["schema_version"] = 8
+        completed = self.verify(data)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("schema_version must be 9", completed.stderr)
+
+        exact_legacy = manifest()
+        exact_legacy["schema_version"] = 8
+        del exact_legacy["archive_v3_archive_binding_commitment"]
+        completed = self.verify(exact_legacy)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("missing or unexpected fields", completed.stderr)
 
 
 if __name__ == "__main__":

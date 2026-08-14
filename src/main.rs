@@ -146,9 +146,11 @@ mod archive_v3_shadow_session;
 // exact composite recovery seam can mint its owned production capability; it
 // has no Store, VFS, provider, route, scheduler, flag, or authority wiring.
 mod archive_v3_shadow_parity;
-// Construction-only ADR-0022 fixed-provider bundle. All capabilities remain
-// private; startup never constructs it and it has no Store/VFS/lifecycle,
-// route, health, admission, deletion, task, flag, or authority wiring.
+// Inactive ADR-0022 single-archive WAL runtime capability. Its provider bundle
+// remains private and can be sealed only by consuming an exact commitment-
+// matched durable control-store binding; startup never constructs it and it
+// has no Store/VFS/lifecycle, route, health, admission, deletion, task, flag,
+// callback, operation, or authority wiring.
 mod archive_v3_shadow_runtime;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
 // Store/VFS runtime connection, provider construction, flag, route, or authority.

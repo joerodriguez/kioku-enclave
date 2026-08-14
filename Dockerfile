@@ -41,11 +41,13 @@
 #   ARCHIVE_WITNESS_SHADOW_MODE  off or probe-v1; checked-in profiles use off
 #   ARCHIVE_WITNESS_PROJECT_ID / ARCHIVE_WITNESS_PROJECT_NUMBER /
 #   ARCHIVE_WITNESS_DATABASE_ID  empty when off, complete named DB when probe-v1
-#   ARCHIVE_V3_SHADOW_RUNTIME_MODE  exact off in this construction-only slice
+#   ARCHIVE_V3_SHADOW_RUNTIME_MODE  off or single-archive-wal-v1
 #   ARCHIVE_V3_ARCHIVE_BUCKET / ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER /
 #   ARCHIVE_V3_REGISTRY_KMS_VERSION / ARCHIVE_V3_WITNESS_PROJECT_ID /
-#   ARCHIVE_V3_WITNESS_PROJECT_NUMBER / ARCHIVE_V3_WITNESS_DATABASE_ID
-#                        exact empty strings while the runtime mode is off
+#   ARCHIVE_V3_WITNESS_PROJECT_NUMBER / ARCHIVE_V3_WITNESS_DATABASE_ID /
+#   ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT
+#                        exact empty strings while off; all complete in the
+#                        tag-bound sealed single-archive WAL image profile
 #   RUN_SA_EMAIL         Service account email the control plane presents in its
 #                        Google ID token (format: name@project.iam.gserviceaccount.com)
 #   ENCLAVE_AUDIENCE     The enclave's own URL, used to validate the 'aud' claim
@@ -97,6 +99,7 @@
 #     --build-arg ARCHIVE_V3_WITNESS_PROJECT_ID= \
 #     --build-arg ARCHIVE_V3_WITNESS_PROJECT_NUMBER= \
 #     --build-arg ARCHIVE_V3_WITNESS_DATABASE_ID= \
+#     --build-arg ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT= \
 #     --build-arg RUN_SA_EMAIL=control-plane@my-project.iam.gserviceaccount.com \
 #     --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
 #     --build-arg ATTEST_STS_AUDIENCE=//iam.googleapis.com/projects/123.../... \
@@ -150,6 +153,7 @@ ARG ARCHIVE_V3_REGISTRY_KMS_VERSION
 ARG ARCHIVE_V3_WITNESS_PROJECT_ID
 ARG ARCHIVE_V3_WITNESS_PROJECT_NUMBER
 ARG ARCHIVE_V3_WITNESS_DATABASE_ID
+ARG ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -181,6 +185,8 @@ ARG ENCLAVE_ACME
 ARG ENCLAVE_ACME_DIRECTORY
 ARG ENCLAVE_ACME_CONTACT
 
+COPY --chmod=0555 scripts/validate_archive_v3_shadow_runtime_environment.sh /build/validate_archive_v3_shadow_runtime_environment.sh
+
 # Phase-0 writes bounded-retention media to GCS_MEDIA_BUCKET and retains the
 # previous index bucket as the exact legacy-media read/delete source. The
 # equality check binds that migration source without constraining the current
@@ -206,8 +212,15 @@ RUN set -eu \
            && printf '%s\n' "${ARCHIVE_WITNESS_DATABASE_ID}" | grep -Eq '^[a-z][a-z0-9-]{2,61}[a-z0-9]$';; \
          *) false;; \
        esac \
-    && [ "${ARCHIVE_V3_SHADOW_RUNTIME_MODE}" = "off" ] \
-    && [ -z "${ARCHIVE_V3_ARCHIVE_BUCKET}${ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER}${ARCHIVE_V3_REGISTRY_KMS_VERSION}${ARCHIVE_V3_WITNESS_PROJECT_ID}${ARCHIVE_V3_WITNESS_PROJECT_NUMBER}${ARCHIVE_V3_WITNESS_DATABASE_ID}" ] \
+    && /build/validate_archive_v3_shadow_runtime_environment.sh \
+         "${ARCHIVE_V3_SHADOW_RUNTIME_MODE}" \
+         "${ARCHIVE_V3_ARCHIVE_BUCKET}" \
+         "${ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER}" \
+         "${ARCHIVE_V3_REGISTRY_KMS_VERSION}" \
+         "${ARCHIVE_V3_WITNESS_PROJECT_ID}" \
+         "${ARCHIVE_V3_WITNESS_PROJECT_NUMBER}" \
+         "${ARCHIVE_V3_WITNESS_DATABASE_ID}" \
+         "${ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT}" \
     && [ "${ENCLAVE_ACME}" = "1" ] \
     && [ "${ALLOWED_EMAILS}" != "*" ] \
     && case "${ADMIN_USER_IDS}" in *[!0-9A-Fa-f,-]*) false;; *) true;; esac \
@@ -378,6 +391,7 @@ ARG ARCHIVE_V3_REGISTRY_KMS_VERSION
 ARG ARCHIVE_V3_WITNESS_PROJECT_ID
 ARG ARCHIVE_V3_WITNESS_PROJECT_NUMBER
 ARG ARCHIVE_V3_WITNESS_DATABASE_ID
+ARG ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT
 ARG RUN_SA_EMAIL
 ARG ENCLAVE_AUDIENCE
 ARG ATTEST_STS_AUDIENCE
@@ -406,6 +420,7 @@ ENV KMS_PROJECT=${KMS_PROJECT} \
     ARCHIVE_V3_WITNESS_PROJECT_ID=${ARCHIVE_V3_WITNESS_PROJECT_ID} \
     ARCHIVE_V3_WITNESS_PROJECT_NUMBER=${ARCHIVE_V3_WITNESS_PROJECT_NUMBER} \
     ARCHIVE_V3_WITNESS_DATABASE_ID=${ARCHIVE_V3_WITNESS_DATABASE_ID} \
+    ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT=${ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT} \
     RUN_SA_EMAIL=${RUN_SA_EMAIL} \
     ENCLAVE_AUDIENCE=${ENCLAVE_AUDIENCE} \
     ATTEST_STS_AUDIENCE=${ATTEST_STS_AUDIENCE}

@@ -17,6 +17,7 @@ from archive_witness_probe_config import (
 from archive_v3_shadow_runtime_config import (
     ShadowRuntimeConfigError,
     load_shadow_runtime_config,
+    select_shadow_runtime_config,
 )
 
 
@@ -260,7 +261,11 @@ def selected_configuration(
         raise SystemExit(str(error)) from error
     configuration.update(probe_config.as_environment())
     try:
-        shadow_runtime_config = load_shadow_runtime_config(shadow_runtime_config_path)
+        shadow_runtime_config = select_shadow_runtime_config(
+            load_shadow_runtime_config(shadow_runtime_config_path),
+            profile=profile,
+            source_ref=source_ref,
+        )
     except ShadowRuntimeConfigError as error:
         raise SystemExit(str(error)) from error
     configuration.update(shadow_runtime_config.as_environment())

@@ -341,6 +341,7 @@ def docker_build_arguments(configuration: dict[str, str], profile: str, source_d
         ("ARCHIVE_V3_WITNESS_PROJECT_ID", configuration["ARCHIVE_V3_WITNESS_PROJECT_ID"]),
         ("ARCHIVE_V3_WITNESS_PROJECT_NUMBER", configuration["ARCHIVE_V3_WITNESS_PROJECT_NUMBER"]),
         ("ARCHIVE_V3_WITNESS_DATABASE_ID", configuration["ARCHIVE_V3_WITNESS_DATABASE_ID"]),
+        ("ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT", configuration["ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"]),
         ("RUN_SA_EMAIL", configuration["ENCLAVE_RUN_SA_EMAIL"]),
         ("ENCLAVE_AUDIENCE", configuration["ENCLAVE_AUDIENCE"]),
         ("ATTEST_STS_AUDIENCE", configuration["ENCLAVE_ATTEST_STS_AUDIENCE"]),
@@ -460,7 +461,7 @@ def create_release_evidence(
         [sys.executable, str(ROOT / "scripts/check_voice_release_gate.py")], capture=True
     ).stdout.strip()
     metadata = {
-        "schema_version": 8,
+        "schema_version": 9,
         "source_repository": repository,
         "source_ref": tag,
         "source_commit": source_commit,
@@ -485,6 +486,7 @@ def create_release_evidence(
         "archive_v3_witness_project_id": configuration["ARCHIVE_V3_WITNESS_PROJECT_ID"],
         "archive_v3_witness_project_number": configuration["ARCHIVE_V3_WITNESS_PROJECT_NUMBER"],
         "archive_v3_witness_database_id": configuration["ARCHIVE_V3_WITNESS_DATABASE_ID"],
+        "archive_v3_archive_binding_commitment": configuration["ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"],
     }
     if metadata_path.exists():
         raise PipelineError("refusing to overwrite release metadata")

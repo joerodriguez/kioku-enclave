@@ -17,6 +17,7 @@ from archive_witness_probe_config import (
 from archive_v3_shadow_runtime_config import (
     ShadowRuntimeConfigError,
     load_shadow_runtime_config,
+    select_shadow_runtime_config,
 )
 
 
@@ -51,6 +52,7 @@ FIELDS = (
     "archive_v3_witness_project_id",
     "archive_v3_witness_project_number",
     "archive_v3_witness_database_id",
+    "archive_v3_archive_binding_commitment",
 )
 
 EMPTY_ALLOWED_FIELDS = {
@@ -63,6 +65,7 @@ EMPTY_ALLOWED_FIELDS = {
     "archive_v3_witness_project_id",
     "archive_v3_witness_project_number",
     "archive_v3_witness_database_id",
+    "archive_v3_archive_binding_commitment",
 }
 
 
@@ -79,12 +82,7 @@ def required_string(data: dict[str, object], key: str) -> str:
     return value
 
 
-def parse_metadata(path: Path) -> dict[str, object]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError) as error:
-        reject(f"cannot parse JSON ({error})")
+def validate_shape(data: object) -> dict[str, object]:
     if not isinstance(data, dict):
         reject("document must be an object")
     if set(data) != set(FIELDS):
@@ -103,7 +101,17 @@ def parse_metadata(path: Path) -> dict[str, object]:
     return data
 
 
+def parse_metadata(path: Path) -> dict[str, object]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        reject(f"cannot parse JSON ({error})")
+    return validate_shape(data)
+
+
 def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
+    validate_shape(data)
     if not BUCKET_PATTERN.fullmatch(arguments.expected_gcs_bucket):
         reject("expected GCS bucket has an invalid format")
     if not BUCKET_PATTERN.fullmatch(arguments.expected_gcs_media_bucket):
@@ -112,8 +120,8 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         reject("expected legacy media GCS bucket has an invalid format")
     if arguments.expected_gcs_bucket != arguments.expected_gcs_legacy_media_bucket:
         reject("expected legacy media GCS bucket must equal the expected GCS bucket for Phase-0")
-    if data["schema_version"] != 8:
-        reject("schema_version must be 8; older manifests are ineligible for promotion")
+    if data["schema_version"] != 9:
+        reject("schema_version must be 9; older manifests are ineligible for promotion")
 
     expected_repository = f"https://github.com/{arguments.repository}"
     if data["source_repository"] != expected_repository:
@@ -201,10 +209,13 @@ def validate(arguments: argparse.Namespace, data: dict[str, object]) -> None:
         data["archive_v3_witness_project_id"],
         data["archive_v3_witness_project_number"],
         data["archive_v3_witness_database_id"],
+        data["archive_v3_archive_binding_commitment"],
     )
     try:
-        expected_shadow_runtime_claim = load_shadow_runtime_config(
-            arguments.archive_v3_shadow_runtime_config
+        expected_shadow_runtime_claim = select_shadow_runtime_config(
+            load_shadow_runtime_config(arguments.archive_v3_shadow_runtime_config),
+            profile="production",
+            source_ref=arguments.tag,
         ).as_claim()
     except ShadowRuntimeConfigError as error:
         reject(str(error))

@@ -805,6 +805,11 @@ impl ArchiveBinding {
     pub(crate) const fn archive_id(self) -> ArchiveId {
         self.archive_id
     }
+
+    #[cfg(test)]
+    pub(crate) const fn for_runtime_test(archive_id: ArchiveId) -> Self {
+        Self { archive_id }
+    }
 }
 
 /// The only transitions enabled in this prerequisite are
