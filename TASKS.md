@@ -179,8 +179,8 @@ separate activation blockers.
 - [x] Add the inactive one-owner local mutation/capture and durable publication
   protocol with a dedicated SQLite blocking lane, exact pending-send recovery,
   permanent authenticated current-staging replay, kind-scoped durable identity,
-  and deterministic bounded artifact topology. No production domain
-  implementation, runtime launcher, or acknowledgement is wired.
+  and deterministic bounded artifact topology. This owner slice introduced no
+  production domain implementation, runtime launcher, or acknowledgement.
 - [x] Add the inactive single-archive publisher/checkpoint worker behind the
   maintenance handoff: a shared adequate-lifetime/heartbeat/reacquire lease
   manager; owned blocking SQLite construction and cleanup-owning streamed
@@ -195,6 +195,16 @@ separate activation blockers.
 - [ ] Implement separately reviewed production A-domain codecs and launcher
   ownership; refactor B domains with stable attempt identity; keep C domains
   fail-closed before enabling the Store policy outside tests.
+  - [x] Add the first inactive production A-domain for capture-session finish:
+    a caller-session-derived opaque operation ID, closed versioned request and
+    exact finish-receipt codecs, and a distinct 65,536-row/128-MiB permanent
+    replay ledger that reserves capacity before domain SQL. Missing-session
+    preconditions and late ledger failures roll back without consuming the
+    identity; exact committed replay survives reopen. It has no launcher,
+    route, Store policy, provider, task, or acknowledgement wiring.
+  - [ ] Convert the remaining reviewed A domains, add the single-archive
+    launcher owner, refactor every B dependency around stable attempt identity,
+    and retain structural C rejection before activation review.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 
