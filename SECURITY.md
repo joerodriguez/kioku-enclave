@@ -921,12 +921,47 @@ retained lease is read. The authenticated current staging database then supplies
 bounded per-domain result row, so operation A can replay after settled operation B without
 replacing B's terminal Control row or creating a publication. The process-local capture-stream commitment is included only in the settlement
 context, never persisted or logged, so an old receipt cannot consume a fresh registration's drain.
-Settlement alone advances the owner binding and releases the drain. PR A intentionally provides
-only a `cfg(test)` publication authority and test domain;
-there is no production immutable-object uploader, checkpoint worker, witness transport adapter,
-runtime constructor, startup/route/config selector, serving or acknowledgement surface, list/delete
-operation, or Store policy activation. Production Store constructors remain LegacySnapshot and the
-test-only `WalLogicalOnly` gate remains unchanged.
+Settlement alone advances the owner binding and releases the drain. The inactive owner now has one
+private production publication implementation, constructed only by consuming the completed
+maintenance-import handoff. Encrypted Control first reserves a random owner and then binds the
+exact Active/WalAuthoritative witness lease. The shared owned lease manager reuses an exact lease
+while enough trusted lifetime remains, heartbeats a live same-fence lease, and only after trusted
+expiry reacquires the retained owner at a higher fence. A fresh process never renews an old
+unexpired lease. Checkpoint hashing, upload, and the final pre-CAS boundary all use that manager;
+same-fence heartbeats preserve the attempt, while a higher-fence pre-send reacquire durably
+supersedes the attempt and restarts from its retained source. SendStarted never renews, reacquires,
+or replaces its candidate, and a definitive provider rejection becomes durable ManualRequired.
+Before either lease successor advances the owner binding, the same Control transaction fully
+authenticates and consumes any exact terminal logical-publication comparison row; unresolved,
+manual, or send-sensitive work blocks without provider mutation. A terminal checkpoint comparison
+row is likewise authenticated and consumed before a later lease or logical-root transition.
+Logical replay is resolved before checkpoint admission. A new absent mutation must checkpoint
+before applying when the fixed commit, segment, or tail-byte threshold would be crossed. The
+blocking Store lane drains and truncates WAL, closes SQLite and its capture registration, requires
+WAL/SHM sidecars absent, and moves only the authenticated cleanup-owned database source to a
+dedicated cleanup-owning reader thread. Hashing and bounded reads stay on that thread; only
+zeroizing chunks and authenticated facts cross to the async publisher. Control persists a bounded, versioned
+Prepared/SourceReady/Uploading/CandidateReady/SendStarted/Witnessed protocol with at most 16
+attempts and 32,898 immutable exact-AAD artifacts per attempt. Every artifact is reserved before
+create and materialized only after exact readback. Reservation and every candidate/send/terminal
+reload recompute the exact 1-MiB-chunk, interleaved fixed-fanout manifest, terminal-root topology
+and its full commitment; no provider listing or replacement bytes select recovery. Candidate/send
+restart loads this durable topology before the old-head gate and accepts only the retained head or
+the exact authenticated checkpoint successor, so a committed lost response settles without a
+second send. Long source extraction rechecks the durable checkpoint stage before every heartbeat:
+CandidateReady, SendStarted, and ManualRequired permit no lease renewal or reacquire, while the
+candidate stages perform only an exact witness read that accepts the retained predecessor or exact
+candidate successor. Checkpoint settlement atomically authenticates and consumes the prior Witnessed
+logical-publication comparison row, advances the owner binding, and only then permits a fresh
+recovered staging owner to reset capture generation. The runtime gives this child only an
+exact-name immutable create/get capability; enumerate and delete authority never cross the handoff.
+
+This publisher remains unreachable: there is no production logical-operation codec, launcher,
+Store factory, startup/config/route/health call, acknowledgement surface, provider list/delete, or
+deployment path. It cannot serve the archive, acknowledge a domain result, delete objects, or
+create a second runtime. Production Store constructors remain LegacySnapshot and the test-only
+`WalLogicalOnly` gate remains unchanged. Activation still requires separately reviewed domain
+codecs and the single-archive maintenance launcher.
 
 Root objects are explicitly named as candidates. Crashes and CAS races may leave more
 than one immutable candidate for a sequence; none has authority unless the independent

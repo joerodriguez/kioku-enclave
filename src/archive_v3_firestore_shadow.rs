@@ -55,6 +55,89 @@ impl FirestoreShadowWitness {
         let witness = Arc::new(FirestoreWitness::new(config, bearer, transport)?);
         Ok(Self { witness })
     }
+
+    pub(crate) async fn wal_owner_read_current_exact(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        archive_id: ArchiveId,
+    ) -> Result<WitnessRecord, WitnessError> {
+        self.witness
+            .read_current_async(archive_id)
+            .await?
+            .ok_or(WitnessError::MissingArchive)
+    }
+
+    pub(crate) async fn wal_owner_acquire_unresolved(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        expected: WitnessRecord,
+        owner: crate::archive_v3::ObjectId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        self.witness
+            .acquire_exact_wal_owner_lease_unresolved_async(expected, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn wal_owner_renew_unresolved(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        retained: WitnessRecord,
+        lease: WitnessLease,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        if retained
+            .exact_active_lease_for_wal_owner_bytes(lease.owner().as_bytes())
+            .ok()
+            != Some(lease)
+        {
+            return Err(FirestoreWitnessCommitError::Rejected(WitnessError::Fenced));
+        }
+        self.witness
+            .renew_exact_wal_owner_lease_unresolved_async(retained, lease, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn wal_owner_reacquire_unresolved(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        previous: WitnessRecord,
+        owner: crate::archive_v3::ObjectId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        self.witness
+            .reacquire_exact_wal_owner_lease_unresolved_async(previous, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn wal_owner_maintain_unresolved(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        previous: WitnessRecord,
+        owner: crate::archive_v3::ObjectId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        self.witness
+            .maintain_exact_wal_owner_lease_unresolved_async(previous, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn wal_owner_advance_unresolved(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        expected: &WitnessRecord,
+        advance: RootAdvance,
+    ) -> Result<(), FirestoreWitnessCommitError> {
+        if expected.archive_id() != advance.archive_id() {
+            return Err(FirestoreWitnessCommitError::Rejected(
+                WitnessError::CompareFailed,
+            ));
+        }
+        self.witness
+            .compare_and_advance_exact_wal_owner_root_unresolved_async(expected.clone(), advance)
+            .await
+            .map(|_| ())
+    }
 }
 
 impl fmt::Debug for FirestoreShadowWitness {

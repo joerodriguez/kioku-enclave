@@ -7,9 +7,18 @@
 //! protocol. The owner accepts only a sealed domain plan, runs its exact
 //! domain row and mutation in one SQLite `BEGIN IMMEDIATE`, and retains the
 //! resulting capture until encrypted control durably authenticates witness
-//! settlement. This module has no production publication provider, runtime,
-//! route, startup, Store-registry, configuration, deletion, list, or cloud
-//! construction path.
+//! settlement. Its private child consumes the maintenance handoff to provide
+//! publication and mandatory checkpoint recovery, but there is no production
+//! domain codec, launcher, route, startup, Store-registry, configuration,
+//! acknowledgement, deletion, list, or cloud construction path.
+
+mod publisher;
+
+pub(crate) use publisher::{
+    checkpoint_artifact_set_commitment, AuthenticatedCheckpointSourcePlan, CheckpointAttempt,
+    CheckpointOperationId, CheckpointStage, LiveWalOwnerLease, OwnerLeaseStage,
+    ReservedWalOwnerLease, WalPublisherControl, MAX_CHECKPOINT_ARTIFACTS,
+};
 
 use std::{
     fmt,
@@ -53,6 +62,7 @@ const WAL_OWNER_CANDIDATE_DOMAIN: &[u8] = b"kioku/archive-v3/wal-owner-candidate
 const WAL_OWNER_SETTLEMENT_DOMAIN: &[u8] = b"kioku/archive-v3/wal-owner-settlement/v1\0";
 const WAL_OWNER_SESSION_DOMAIN: &[u8] = b"kioku/archive-v3/wal-owner-session/v1\0";
 const MAX_WAL_OWNER_COMMANDS: usize = 1;
+const CHECKPOINT_LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const MAX_WAL_OWNER_ATTEMPTS: u32 = 16;
 pub(crate) const MAX_WAL_OWNER_ARTIFACTS: u32 = MAX_WAL_SEGMENTS_PER_COMMIT + 2;
 
@@ -245,6 +255,31 @@ impl fmt::Debug for WalOwnerStoreBinding {
 #[derive(Clone, Copy)]
 pub(crate) struct WalOwnerStoreContext(());
 
+/// Producer token for consuming the B0 runtime bundle inside the private
+/// publisher child. It has no public or sibling constructor.
+#[derive(Clone, Copy)]
+pub(crate) struct WalPublisherRuntimeContext(());
+
+#[derive(Clone, Copy)]
+pub(crate) struct WalCheckpointSourceContext(());
+
+impl WalCheckpointSourceContext {
+    pub(crate) const fn for_store(_token: crate::store::StoreWalCheckpointContext) -> Self {
+        Self(())
+    }
+
+    pub(crate) const fn for_control(
+        _token: crate::cp::control_store::WalOwnerPersistenceContext,
+    ) -> Self {
+        Self(())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
 #[cfg(test)]
 impl WalOwnerStoreContext {
     pub(crate) const fn for_test() -> Self {
@@ -259,6 +294,10 @@ pub(crate) struct WalWitnessAdvanceContext(());
 
 impl WalWitnessAdvanceContext {
     const fn new() -> Self {
+        Self(())
+    }
+
+    pub(crate) const fn for_publisher() -> Self {
         Self(())
     }
 
@@ -1551,8 +1590,9 @@ mod sealed {
     pub(crate) trait PublicationAuthority {}
 }
 
-/// Sealed publication boundary. PR A has no production implementation; only
-/// deterministic test fakes may exercise ordering and recovery.
+/// Sealed publication boundary. The sole production implementation is the
+/// private maintenance-handoff-owned publisher child; deterministic fakes
+/// exercise the protocol without exposing provider authority.
 #[async_trait]
 pub(crate) trait WalPublicationAuthority:
     sealed::PublicationAuthority + Send + Sync + 'static
@@ -1561,6 +1601,32 @@ pub(crate) trait WalPublicationAuthority:
         &self,
         binding: &WalOwnerStoreBinding,
     ) -> Result<AuthenticatedWalOwnerHead>;
+
+    async fn checkpoint_pending(&self, binding: &WalOwnerStoreBinding) -> Result<bool>;
+
+    async fn refresh_live_binding(
+        &self,
+        binding: &WalOwnerStoreBinding,
+    ) -> Result<WalOwnerStoreBinding>;
+
+    /// Maintains a binding while the blocking Store lane is producing a
+    /// checkpoint source. Implementations must authenticate retained
+    /// checkpoint state before any provider lease mutation: a candidate or
+    /// send marker is reconciled by exact read only, never renewed/reacquired.
+    async fn refresh_checkpoint_source_binding(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        owner_instance_id: WalOwnerInstanceId,
+    ) -> Result<WalOwnerStoreBinding>;
+
+    async fn checkpoint_required(&self, binding: &WalOwnerStoreBinding) -> Result<bool>;
+
+    async fn checkpoint_and_recover(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        owner_instance_id: WalOwnerInstanceId,
+        source: crate::store::WalOwnerCheckpointSource,
+    ) -> Result<WalCheckpointSettlement>;
 
     async fn create_candidate(
         &self,
@@ -1582,6 +1648,28 @@ pub(crate) trait WalPublicationAuthority:
         attempt: &WalOwnerAttempt,
         candidate: &WalPublicationCandidate,
     ) -> Result<WitnessedWalCandidate>;
+}
+
+/// Opaque replacement Store owner minted only after a checkpoint candidate is
+/// durably witnessed, Control atomically advances the owner binding, and the
+/// exact new root is independently recovered into a fresh private staging
+/// copy. It carries no paths, provider handles, or acknowledgement result.
+pub(crate) struct WalCheckpointSettlement {
+    staged: crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging,
+    binding: WalOwnerStoreBinding,
+    capture: Arc<crate::store::StoreShadowCapture>,
+}
+
+impl WalCheckpointSettlement {
+    async fn into_lane<P: WalLogicalDomainPlan>(self) -> Result<WalStoreLane<P>> {
+        WalStoreLane::spawn_authenticated(self.staged, self.binding, self.capture).await
+    }
+}
+
+impl fmt::Debug for WalCheckpointSettlement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WalCheckpointSettlement(<opaque>)")
+    }
 }
 
 struct WalOwnerCommand<P: WalLogicalDomainPlan> {
@@ -1612,6 +1700,13 @@ enum WalStoreLaneCommand<P: WalLogicalDomainPlan> {
         next: Box<WalOwnerStoreBinding>,
         response: oneshot::Sender<Result<()>>,
     },
+    Refresh {
+        next: Box<WalOwnerStoreBinding>,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Checkpoint {
+        response: oneshot::Sender<Result<crate::store::WalOwnerCheckpointSource>>,
+    },
     Poison,
     #[cfg(test)]
     CheckpointedPlaintext {
@@ -1631,7 +1726,7 @@ struct WalStoreLane<P: WalLogicalDomainPlan> {
 }
 
 impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
-    fn spawn(mut store: crate::store::SingleArchiveWalStoreOwner) -> Result<Self> {
+    fn spawn(store: crate::store::SingleArchiveWalStoreOwner) -> Result<Self> {
         let binding = store.binding().clone();
         let instance_id = store.instance_id();
         let poisoned = Arc::new(AtomicBool::new(false));
@@ -1639,56 +1734,66 @@ impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
         let (sender, receiver) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("kioku-archive-v3-wal-store".into())
+            .spawn(move || run_wal_store_lane(store, receiver, thread_poisoned))
+            .map_err(|_| WalOwnerError::Persistence)?;
+        Ok(Self {
+            sender,
+            binding,
+            instance_id,
+            poisoned,
+            _thread: thread,
+        })
+    }
+
+    async fn spawn_authenticated(
+        staged: crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging,
+        binding: WalOwnerStoreBinding,
+        capture: Arc<crate::store::StoreShadowCapture>,
+    ) -> Result<Self> {
+        Self::spawn_with_builder(move || {
+            crate::store::SingleArchiveWalStoreOwner::from_authenticated_staging(
+                WalOwnerStoreContext(()),
+                staged,
+                binding,
+                capture,
+            )
+        })
+        .await
+    }
+
+    async fn spawn_with_builder<F>(builder: F) -> Result<Self>
+    where
+        F: FnOnce() -> Result<crate::store::SingleArchiveWalStoreOwner> + Send + 'static,
+    {
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let thread_poisoned = Arc::clone(&poisoned);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (ready, opened) = oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("kioku-archive-v3-wal-store".into())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
-                    match command {
-                        WalStoreLaneCommand::Lookup { prepared, response } => {
-                            let result = store.lookup_settled_replay(prepared);
-                            if store.is_poisoned() {
-                                thread_poisoned.store(true, Ordering::Release);
-                            }
-                            let _ = response.send(result);
-                        }
-                        WalStoreLaneCommand::Apply {
-                            prepared,
-                            attempt,
-                            response,
-                        } => {
-                            let result = store.apply_prepared(prepared, *attempt);
-                            if store.is_poisoned() {
-                                thread_poisoned.store(true, Ordering::Release);
-                            }
-                            let _ = response.send(result);
-                        }
-                        WalStoreLaneCommand::Advance {
-                            context,
-                            next,
-                            response,
-                        } => {
-                            let result = store.advance_binding(context.as_ref(), *next);
-                            if store.is_poisoned() {
-                                thread_poisoned.store(true, Ordering::Release);
-                            }
-                            let _ = response.send(result);
-                        }
-                        WalStoreLaneCommand::Poison => {
-                            store.poison();
-                            thread_poisoned.store(true, Ordering::Release);
-                            break;
-                        }
-                        #[cfg(test)]
-                        WalStoreLaneCommand::CheckpointedPlaintext { response } => {
-                            let result = store.checkpointed_plaintext_for_wal_owner_test();
-                            if store.is_poisoned() {
-                                thread_poisoned.store(true, Ordering::Release);
-                            }
-                            let _ = response.send(result);
-                        }
+                let mut store = match builder() {
+                    Ok(store) => store,
+                    Err(error) => {
+                        thread_poisoned.store(true, Ordering::Release);
+                        let _ = ready.send(Err(error));
+                        return;
                     }
+                };
+                let opened_binding = store.binding().clone();
+                let instance_id = store.instance_id();
+                if ready.send(Ok((opened_binding, instance_id))).is_err() {
+                    // Cancellation of the async constructor cannot detach a
+                    // writable SQLite owner. The lane retains cleanup
+                    // ownership, poisons it, and exits on this owned thread.
+                    store.poison();
+                    thread_poisoned.store(true, Ordering::Release);
+                    return;
                 }
-                thread_poisoned.store(true, Ordering::Release);
+                run_wal_store_lane(store, receiver, thread_poisoned);
             })
             .map_err(|_| WalOwnerError::Persistence)?;
+        let (binding, instance_id) = opened.await.map_err(|_| WalOwnerError::Persistence)??;
         Ok(Self {
             sender,
             binding,
@@ -1761,6 +1866,28 @@ impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
         Ok(())
     }
 
+    async fn checkpoint(&self) -> Result<crate::store::WalOwnerCheckpointSource> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(WalStoreLaneCommand::Checkpoint { response })
+            .map_err(|_| WalOwnerError::Poisoned)?;
+        result.await.map_err(|_| WalOwnerError::Poisoned)?
+    }
+
+    async fn refresh(&mut self, next: WalOwnerStoreBinding) -> Result<()> {
+        let retained = next.clone();
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(WalStoreLaneCommand::Refresh {
+                next: Box::new(next),
+                response,
+            })
+            .map_err(|_| WalOwnerError::Poisoned)?;
+        result.await.map_err(|_| WalOwnerError::Poisoned)??;
+        self.binding = retained;
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn checkpointed_plaintext(&self) -> Result<Vec<u8>> {
         let (response, result) = oneshot::channel();
@@ -1769,6 +1896,73 @@ impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
             .map_err(|_| WalOwnerError::Poisoned)?;
         result.await.map_err(|_| WalOwnerError::Poisoned)?
     }
+}
+
+fn run_wal_store_lane<P: WalLogicalDomainPlan>(
+    mut store: crate::store::SingleArchiveWalStoreOwner,
+    receiver: std::sync::mpsc::Receiver<WalStoreLaneCommand<P>>,
+    thread_poisoned: Arc<AtomicBool>,
+) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            WalStoreLaneCommand::Lookup { prepared, response } => {
+                let result = store.lookup_settled_replay(prepared);
+                if store.is_poisoned() {
+                    thread_poisoned.store(true, Ordering::Release);
+                }
+                let _ = response.send(result);
+            }
+            WalStoreLaneCommand::Apply {
+                prepared,
+                attempt,
+                response,
+            } => {
+                let result = store.apply_prepared(prepared, *attempt);
+                if store.is_poisoned() {
+                    thread_poisoned.store(true, Ordering::Release);
+                }
+                let _ = response.send(result);
+            }
+            WalStoreLaneCommand::Advance {
+                context,
+                next,
+                response,
+            } => {
+                let result = store.advance_binding(context.as_ref(), *next);
+                if store.is_poisoned() {
+                    thread_poisoned.store(true, Ordering::Release);
+                }
+                let _ = response.send(result);
+            }
+            WalStoreLaneCommand::Refresh { next, response } => {
+                let result = store.refresh_lease_binding(*next);
+                if store.is_poisoned() {
+                    thread_poisoned.store(true, Ordering::Release);
+                }
+                let _ = response.send(result);
+            }
+            WalStoreLaneCommand::Checkpoint { response } => {
+                let result = store.take_checkpoint_source();
+                thread_poisoned.store(true, Ordering::Release);
+                let _ = response.send(result);
+                break;
+            }
+            WalStoreLaneCommand::Poison => {
+                store.poison();
+                thread_poisoned.store(true, Ordering::Release);
+                break;
+            }
+            #[cfg(test)]
+            WalStoreLaneCommand::CheckpointedPlaintext { response } => {
+                let result = store.checkpointed_plaintext_for_wal_owner_test();
+                if store.is_poisoned() {
+                    thread_poisoned.store(true, Ordering::Release);
+                }
+                let _ = response.send(result);
+            }
+        }
+    }
+    thread_poisoned.store(true, Ordering::Release);
 }
 
 /// Non-cloneable handle owning the actor queue and task. A submitted plan is
@@ -1819,6 +2013,10 @@ where
     store: WalStoreLane<P>,
     control: Arc<dyn WalOwnerControl>,
     publication: Arc<A>,
+    // The maintenance handoff's SQLite-backed admission fence is Send but
+    // deliberately not Sync. The sole actor owns it for its entire lifetime;
+    // it never enters the shareable publication authority or crosses an API.
+    _store_fence: Option<crate::store::StoreWalAuthorityFence>,
     _plan: std::marker::PhantomData<P>,
 }
 
@@ -1827,31 +2025,66 @@ where
     P: WalLogicalDomainPlan,
     A: WalPublicationAuthority,
 {
+    async fn take_checkpoint_source_with_lease_maintenance(
+        &mut self,
+    ) -> Result<(WalOwnerStoreBinding, crate::store::WalOwnerCheckpointSource)> {
+        let original = self.store.binding().clone();
+        let mut current = original.clone();
+        let checkpoint = self.store.checkpoint();
+        tokio::pin!(checkpoint);
+        let mut heartbeat = tokio::time::interval(CHECKPOINT_LEASE_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut source = loop {
+            tokio::select! {
+                result = &mut checkpoint => break result?,
+                _ = heartbeat.tick() => {
+                    current = self
+                        .publication
+                        .refresh_checkpoint_source_binding(&current, self.store.instance_id())
+                        .await?;
+                }
+            }
+        };
+        if current != original {
+            source
+                .rebind_after_lease_maintenance(WalCheckpointSourceContext(()), current.clone())?;
+        }
+        Ok((current, source))
+    }
+
     pub(crate) fn spawn(
         store: crate::store::SingleArchiveWalStoreOwner,
         control: Arc<dyn WalOwnerControl>,
         publication: Arc<A>,
     ) -> WalOwnerHandle<P> {
+        match WalStoreLane::spawn(store) {
+            Ok(store) => Self::spawn_lane(store, control, publication),
+            Err(_) => Self::spawn_failed(),
+        }
+    }
+
+    fn spawn_lane(
+        store: WalStoreLane<P>,
+        control: Arc<dyn WalOwnerControl>,
+        publication: Arc<A>,
+    ) -> WalOwnerHandle<P> {
+        Self::spawn_lane_with_fence(store, control, publication, None)
+    }
+
+    fn spawn_lane_with_fence(
+        store: WalStoreLane<P>,
+        control: Arc<dyn WalOwnerControl>,
+        publication: Arc<A>,
+        store_fence: Option<crate::store::StoreWalAuthorityFence>,
+    ) -> WalOwnerHandle<P> {
         let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage<P>>(MAX_WAL_OWNER_COMMANDS);
         let task = tokio::spawn(async move {
-            let Ok(store) = WalStoreLane::spawn(store) else {
-                while let Some(command) = receiver.recv().await {
-                    match command {
-                        WalOwnerMessage::Apply(command) => {
-                            let _ = command.response.send(Err(WalOwnerError::Persistence));
-                        }
-                        #[cfg(test)]
-                        WalOwnerMessage::CheckpointedPlaintext { response } => {
-                            let _ = response.send(Err(WalOwnerError::Persistence));
-                        }
-                    }
-                }
-                return;
-            };
             let mut owner = Self {
                 store,
                 control,
                 publication,
+                _store_fence: store_fence,
                 _plan: std::marker::PhantomData,
             };
             while let Some(message) = receiver.recv().await {
@@ -1877,7 +2110,42 @@ where
         }
     }
 
+    fn spawn_failed() -> WalOwnerHandle<P> {
+        let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage<P>>(MAX_WAL_OWNER_COMMANDS);
+        let task = tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    WalOwnerMessage::Apply(command) => {
+                        let _ = command.response.send(Err(WalOwnerError::Persistence));
+                    }
+                    #[cfg(test)]
+                    WalOwnerMessage::CheckpointedPlaintext { response } => {
+                        let _ = response.send(Err(WalOwnerError::Persistence));
+                    }
+                }
+            }
+        });
+        WalOwnerHandle {
+            sender,
+            _task: task,
+        }
+    }
+
     async fn apply_one(&mut self, prepared: PreparedLogicalMutation<P>) -> Result<P::Output> {
+        if self
+            .publication
+            .checkpoint_pending(self.store.binding())
+            .await?
+        {
+            let owner_instance_id = self.store.instance_id();
+            let (binding, source) = self.take_checkpoint_source_with_lease_maintenance().await?;
+            let settlement = self
+                .publication
+                .checkpoint_and_recover(&binding, owner_instance_id, source)
+                .await?;
+            self.store = settlement.into_lane().await?;
+            self.require_fresh_head().await?;
+        }
         let identity = prepared.identity_for_owner();
         let admission = self
             .control
@@ -1918,6 +2186,46 @@ where
                 prepared
             }
         };
+        // A retained candidate or send marker was reconciled above against
+        // its immutable expected witness. Only a settled/replay-absent head
+        // may renew the live owner lease. Control atomically rebases any
+        // pre-candidate retained attempt to this successor before the actor
+        // can enter another SQLite transaction.
+        let refreshed = self
+            .publication
+            .refresh_live_binding(self.store.binding())
+            .await?;
+        self.store.refresh(refreshed).await?;
+        match self
+            .control
+            .inspect_operation(self.store.binding(), identity)
+            .await?
+        {
+            WalOwnerAdmission::SettledHead | WalOwnerAdmission::SettledExactOperation => {}
+            WalOwnerAdmission::Retained(attempt)
+                if matches!(
+                    attempt.stage(),
+                    WalPublicationStage::Prepared | WalPublicationStage::Captured
+                ) => {}
+            WalOwnerAdmission::Retained(_) => {
+                self.store.poison();
+                return Err(WalOwnerError::Conflict);
+            }
+        }
+        if self
+            .publication
+            .checkpoint_required(self.store.binding())
+            .await?
+        {
+            let owner_instance_id = self.store.instance_id();
+            let (binding, source) = self.take_checkpoint_source_with_lease_maintenance().await?;
+            let settlement = self
+                .publication
+                .checkpoint_and_recover(&binding, owner_instance_id, source)
+                .await?;
+            self.store = settlement.into_lane().await?;
+            self.require_fresh_head().await?;
+        }
         let attempt = self
             .control
             .prepare_operation(self.store.binding(), self.store.instance_id(), identity)
@@ -2441,6 +2749,91 @@ mod tests {
         (authoritative, next)
     }
 
+    fn sensitive_checkpoint_attempt(
+        stage: CheckpointStage,
+    ) -> (
+        WalOwnerStoreBinding,
+        WitnessRecord,
+        WitnessRecord,
+        CheckpointAttempt,
+    ) {
+        let (expected, successor) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&expected).unwrap();
+        let token = crate::cp::control_store::WalOwnerPersistenceContext::for_test();
+        let operation = CheckpointOperationId::from_control([0x81; 16]).unwrap();
+        let session = ShadowSessionId::for_operation(*operation.as_bytes()).unwrap();
+        let attempt = CheckpointAttempt::new_for_control(
+            token,
+            &binding,
+            operation,
+            session,
+            ShadowAttemptId::from_bytes([0x82; 16]),
+            WalOwnerInstanceId::from_control_bytes(token, [0x83; 16]).unwrap(),
+        )
+        .unwrap();
+        let source =
+            AuthenticatedCheckpointSourcePlan::for_test(&binding, 4096, [0x84; 32], 7).unwrap();
+        let source_ready = attempt
+            .with_source_for_control(token, &binding, &source)
+            .unwrap();
+        if stage == CheckpointStage::SourceReady {
+            return (binding, expected, successor, source_ready);
+        }
+        let uploading = source_ready.uploading_for_control(token, &binding).unwrap();
+        let candidate = uploading
+            .candidate_for_control(token, &binding, successor.root(), [0x85; 32])
+            .unwrap();
+        let attempt = if stage == CheckpointStage::CandidateReady {
+            candidate
+        } else if stage == CheckpointStage::SendStarted {
+            candidate.send_started_for_control(token, &binding).unwrap()
+        } else {
+            panic!("unsupported sensitive checkpoint fixture stage")
+        };
+        (binding, expected, successor, attempt)
+    }
+
+    #[test]
+    fn checkpoint_source_sensitive_maintenance_is_exact_read_only() {
+        for stage in [
+            CheckpointStage::CandidateReady,
+            CheckpointStage::SendStarted,
+        ] {
+            let (binding, expected, successor, retained) = sensitive_checkpoint_attempt(stage);
+            // Exact retained head includes the expired-but-unmodified case;
+            // exact candidate successor includes a committed/lost response.
+            assert!(
+                publisher::authenticate_checkpoint_source_sensitive_observation(
+                    &binding, &retained, &expected,
+                )
+                .is_ok()
+            );
+            assert!(
+                publisher::authenticate_checkpoint_source_sensitive_observation(
+                    &binding, &retained, &successor,
+                )
+                .is_ok()
+            );
+            let alternate = expected.renewed_maintenance_lease_for_test();
+            assert!(
+                publisher::authenticate_checkpoint_source_sensitive_observation(
+                    &binding, &retained, &alternate,
+                )
+                .is_err()
+            );
+        }
+        let (binding, expected, _, source_ready) =
+            sensitive_checkpoint_attempt(CheckpointStage::SourceReady);
+        assert!(
+            publisher::authenticate_checkpoint_source_sensitive_observation(
+                &binding,
+                &source_ready,
+                &expected,
+            )
+            .is_err()
+        );
+    }
+
     fn attempt(
         owner_instance_id: WalOwnerInstanceId,
         stage: WalPublicationStage,
@@ -2813,6 +3206,10 @@ mod tests {
     struct FakePublication {
         next: WitnessRecord,
         reject_fresh: AtomicBool,
+        generic_refreshes: AtomicUsize,
+        checkpoint_refreshes: AtomicUsize,
+        candidate_sends: AtomicUsize,
+        checkpoint_observation: Mutex<Option<(CheckpointAttempt, WitnessRecord)>>,
     }
 
     impl FakePublication {
@@ -2820,7 +3217,20 @@ mod tests {
             Self {
                 next,
                 reject_fresh: AtomicBool::new(false),
+                generic_refreshes: AtomicUsize::new(0),
+                checkpoint_refreshes: AtomicUsize::new(0),
+                candidate_sends: AtomicUsize::new(0),
+                checkpoint_observation: Mutex::new(None),
             }
+        }
+
+        fn with_checkpoint_observation(
+            self,
+            attempt: CheckpointAttempt,
+            observed: WitnessRecord,
+        ) -> Self {
+            *self.checkpoint_observation.lock().unwrap() = Some((attempt, observed));
+            self
         }
 
         fn reject_fresh(&self) {
@@ -2914,6 +3324,46 @@ mod tests {
             AuthenticatedWalOwnerHead::from_authority(binding, observed)
         }
 
+        async fn checkpoint_required(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn checkpoint_pending(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh_live_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+        ) -> Result<WalOwnerStoreBinding> {
+            self.generic_refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(binding.clone())
+        }
+
+        async fn refresh_checkpoint_source_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+        ) -> Result<WalOwnerStoreBinding> {
+            self.checkpoint_refreshes.fetch_add(1, Ordering::SeqCst);
+            if let Some((attempt, observed)) = self.checkpoint_observation.lock().unwrap().as_ref()
+            {
+                publisher::authenticate_checkpoint_source_sensitive_observation(
+                    binding, attempt, observed,
+                )?;
+            }
+            Ok(binding.clone())
+        }
+
+        async fn checkpoint_and_recover(
+            &self,
+            _binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+            _source: crate::store::WalOwnerCheckpointSource,
+        ) -> Result<WalCheckpointSettlement> {
+            Err(WalOwnerError::Conflict)
+        }
+
         async fn create_candidate(
             &self,
             context: &WalOwnerContext,
@@ -2928,6 +3378,7 @@ mod tests {
             _context: &WalOwnerContext,
             candidate: &WalPublicationCandidate,
         ) -> Result<WitnessedWalCandidate> {
+            self.candidate_sends.fetch_add(1, Ordering::SeqCst);
             WitnessedWalCandidate::from_authority(candidate.clone(), self.next.clone())
         }
 
@@ -2943,7 +3394,71 @@ mod tests {
             {
                 return Err(WalOwnerError::Conflict);
             }
+            self.candidate_sends.fetch_add(1, Ordering::SeqCst);
             WitnessedWalCandidate::from_authority(candidate.clone(), self.next.clone())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_checkpoint_source_uses_candidate_sensitive_read_only_maintenance() {
+        for case in 0..4 {
+            let stage = if case == 0 {
+                CheckpointStage::CandidateReady
+            } else {
+                CheckpointStage::SendStarted
+            };
+            let (binding, expected, successor, retained) = sensitive_checkpoint_attempt(stage);
+            let (observed, should_succeed) = match case {
+                // CandidateReady and SendStarted both adopt an exact
+                // committed/lost-success successor without another send.
+                0 | 1 => (successor.clone(), true),
+                // An exact old SendStarted head may be expired, but source
+                // extraction still performs no irreversible reacquire.
+                2 => (expected.clone(), true),
+                // Any other same-root witness transition fails closed.
+                _ => (expected.renewed_maintenance_lease_for_test(), false),
+            };
+            let stall = crate::store::WalCheckpointStall::new();
+            let mut store =
+                crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding.clone())
+                    .unwrap();
+            store.stall_checkpoint_for_wal_owner_test(Arc::clone(&stall));
+            let lane = WalStoreLane::<TestPlan>::spawn(store).unwrap();
+            let publication = Arc::new(
+                FakePublication::new(successor).with_checkpoint_observation(retained, observed),
+            );
+            let mut owner = SingleArchiveWalOwner {
+                store: lane,
+                control: Arc::new(FakeControl::new()),
+                publication: Arc::clone(&publication),
+                _store_fence: None,
+                _plan: std::marker::PhantomData,
+            };
+            let task = tokio::spawn(async move {
+                let result = owner.take_checkpoint_source_with_lease_maintenance().await;
+                (owner, result)
+            });
+            stall.wait_entered().await;
+            tokio::time::advance(
+                CHECKPOINT_LEASE_HEARTBEAT_INTERVAL + std::time::Duration::from_secs(1),
+            )
+            .await;
+            tokio::task::yield_now().await;
+            assert_eq!(publication.generic_refreshes.load(Ordering::SeqCst), 0);
+            assert!(publication.checkpoint_refreshes.load(Ordering::SeqCst) >= 1);
+            stall.release();
+            let (_owner, result) = task.await.unwrap();
+            if should_succeed {
+                let (retained_binding, source) = result.unwrap();
+                assert_eq!(retained_binding, binding);
+                drop(source);
+            } else {
+                assert!(matches!(result, Err(WalOwnerError::Conflict)));
+            }
+            // Neither renewal/reacquire nor candidate send is reachable from
+            // the sensitive source-maintenance method.
+            assert_eq!(publication.generic_refreshes.load(Ordering::SeqCst), 0);
+            assert_eq!(publication.candidate_sends.load(Ordering::SeqCst), 0);
         }
     }
 
@@ -2994,6 +3509,38 @@ mod tests {
                 binding,
                 self.state.lock().unwrap().current.clone(),
             )
+        }
+
+        async fn checkpoint_required(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn checkpoint_pending(&self, _binding: &WalOwnerStoreBinding) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh_live_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+        ) -> Result<WalOwnerStoreBinding> {
+            Ok(binding.clone())
+        }
+
+        async fn refresh_checkpoint_source_binding(
+            &self,
+            binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+        ) -> Result<WalOwnerStoreBinding> {
+            Ok(binding.clone())
+        }
+
+        async fn checkpoint_and_recover(
+            &self,
+            _binding: &WalOwnerStoreBinding,
+            _owner_instance_id: WalOwnerInstanceId,
+            _source: crate::store::WalOwnerCheckpointSource,
+        ) -> Result<WalCheckpointSettlement> {
+            Err(WalOwnerError::Conflict)
         }
 
         async fn create_candidate(
@@ -3140,6 +3687,46 @@ mod tests {
         assert!(progressed.load(Ordering::SeqCst));
         stall.release();
         assert_eq!(submission.await.unwrap().unwrap(), b"blocking-lane");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_stalled_lane_construction_never_blocks_tokio_and_scrubs_owner() {
+        let (current, _) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let scratch = store.scratch_path_for_wal_owner_test();
+        assert!(scratch.exists());
+        let (entered_sender, entered) = oneshot::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        let construction = tokio::spawn(async move {
+            WalStoreLane::<TestPlan>::spawn_with_builder(move || {
+                let _ = entered_sender.send(());
+                release_receiver
+                    .recv()
+                    .map_err(|_| WalOwnerError::Persistence)?;
+                Ok(store)
+            })
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::task::yield_now().await;
+        })
+        .await
+        .unwrap();
+        construction.abort();
+        let _ = construction.await;
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while scratch.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled lane retained its staging file");
     }
 
     #[tokio::test]
@@ -3725,8 +4312,50 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_source_consumes_store_owner_closes_sidecars_and_scrubs_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (current, _) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wal-owner-checkpoint-source.sqlite");
+        let schema_version = crate::store::initialize_wal_owner_store_for_test(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let staged = crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging::for_test(
+            path.clone(),
+            &binding,
+            schema_version,
+        )
+        .unwrap();
+        let mut owner = crate::store::SingleArchiveWalStoreOwner::from_authenticated_staging(
+            WalOwnerStoreContext::for_test(),
+            staged,
+            binding.clone(),
+            crate::store::StoreShadowCapture::shared_for_test(),
+        )
+        .unwrap();
+        let mut source = owner.take_checkpoint_source().unwrap();
+        assert!(owner.is_poisoned());
+        let token = WalCheckpointSourceContext::for_test();
+        let (length, hash, schema) = source.authenticated_facts(token, &binding).unwrap();
+        assert!(length > 0);
+        assert_ne!(hash, [0; 32]);
+        assert_eq!(schema, schema_version);
+        let mut header = [0_u8; 16];
+        source.read_checkpoint_exact(token, 0, &mut header).unwrap();
+        assert_eq!(&header, b"SQLite format 3\0");
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let shm = std::path::PathBuf::from(format!("{}-shm", path.display()));
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        drop(source);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn public_surface_stays_inactive_and_provider_sealed() {
         let source = include_str!("archive_v3_wal_owner.rs");
+        let publisher = include_str!("archive_v3_wal_owner/publisher.rs");
         for forbidden in [
             concat!("impl WalPublicationAuthority for Fire", "store"),
             concat!("impl WalPublicationAuthority for ", "Gcs"),
@@ -3740,5 +4369,21 @@ mod tests {
         ] {
             assert!(!source.contains(forbidden), "found forbidden {forbidden}");
         }
+        for forbidden in [
+            concat!("pub(crate) struct SingleArchive", "WalPublisher"),
+            concat!("pub fn start", "("),
+            concat!("Store::", "new"),
+            concat!("delete_", "exact"),
+            concat!("list_", "objects"),
+            concat!("crate::", "main"),
+            concat!("SingleArchiveWalStoreOwner::from_authenticated_", "staging"),
+        ] {
+            assert!(
+                !publisher.contains(forbidden),
+                "publisher exposed forbidden {forbidden}"
+            );
+        }
+        assert!(source.contains(concat!("spawn_", "authenticated")));
+        assert!(source.contains(concat!("settlement.into_", "lane().await")));
     }
 }

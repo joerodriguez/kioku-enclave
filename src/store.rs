@@ -572,6 +572,41 @@ impl StoreWalAuthorityFence {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct WalCheckpointStall {
+    entered: tokio::sync::Semaphore,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl WalCheckpointStall {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Semaphore::new(0),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        })
+    }
+
+    fn block(&self) {
+        self.entered.add_permits(1);
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release.wait(released).unwrap();
+        }
+    }
+
+    pub(crate) async fn wait_entered(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
 /// Dedicated writable owner for one authenticated recovered archive-v3
 /// SQLite copy. It is disjoint from the ordinary Store registry and legacy
 /// persistence policy: the only mutation input is a sealed logical-domain
@@ -590,6 +625,312 @@ pub(crate) struct SingleArchiveWalStoreOwner {
     binding: WalOwnerStoreBinding,
     instance_id: WalOwnerInstanceId,
     poisoned: bool,
+    #[cfg(test)]
+    checkpoint_stall: Option<Arc<WalCheckpointStall>>,
+}
+
+/// Cleanup-owning stable checkpoint source. It can only be produced by
+/// consuming the dedicated WAL Store owner after checkpoint/TRUNCATE, capture
+/// retirement, connection close, and exact sidecar absence checks.
+pub(crate) struct WalOwnerCheckpointSource {
+    _staged: AuthenticatedWalOwnerStaging,
+    file: std::fs::File,
+    logical_file_length: u64,
+    plaintext_hash: [u8; 32],
+    sqlite_schema_version: u32,
+    binding: WalOwnerStoreBinding,
+}
+
+/// Store-private producer token for source-worker validation. Its field is
+/// not visible to sibling modules.
+pub(crate) struct StoreWalCheckpointContext(());
+
+impl WalOwnerCheckpointSource {
+    pub(crate) fn rebind_after_lease_maintenance(
+        &mut self,
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+        next: WalOwnerStoreBinding,
+    ) -> std::result::Result<(), WalOwnerError> {
+        self.rebind_after_lease_maintenance_inner(next)
+    }
+
+    fn rebind_after_lease_maintenance_inner(
+        &mut self,
+        next: WalOwnerStoreBinding,
+    ) -> std::result::Result<(), WalOwnerError> {
+        let previous =
+            crate::archive_v3_witness::WitnessRecord::decode(self.binding.witness_bytes())
+                .map_err(|_| WalOwnerError::Corrupt)?;
+        let observed = crate::archive_v3_witness::WitnessRecord::decode(next.witness_bytes())
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        observed
+            .exact_wal_owner_checkpoint_lease_successor_from(
+                &previous,
+                crate::archive_v3_wal_owner::WalCheckpointSourceContext::for_store(
+                    StoreWalCheckpointContext(()),
+                ),
+            )
+            .map_err(|_| WalOwnerError::Conflict)?;
+        if next.archive_id() != self.binding.archive_id()
+            || next.database_epoch() != self.binding.database_epoch()
+            || next.key_epoch() != self.binding.key_epoch()
+            || next.root() != self.binding.root()
+        {
+            return Err(WalOwnerError::Conflict);
+        }
+        self.binding = next;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authenticated_facts(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+        binding: &WalOwnerStoreBinding,
+    ) -> std::result::Result<(u64, [u8; 32], u32), WalOwnerError> {
+        if binding != &self.binding
+            || self.logical_file_length == 0
+            || self.plaintext_hash == [0; 32]
+        {
+            return Err(WalOwnerError::Conflict);
+        }
+        Ok((
+            self.logical_file_length,
+            self.plaintext_hash,
+            self.sqlite_schema_version,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_checkpoint_exact(
+        &mut self,
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> std::result::Result<(), WalOwnerError> {
+        self.read_checkpoint_exact_inner(offset, destination)
+    }
+
+    fn read_checkpoint_exact_inner(
+        &mut self,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> std::result::Result<(), WalOwnerError> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let end = offset
+            .checked_add(destination.len() as u64)
+            .ok_or(WalOwnerError::Corrupt)?;
+        if destination.is_empty() || end > self.logical_file_length {
+            return Err(WalOwnerError::Corrupt);
+        }
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| self.file.read_exact(destination))
+            .map_err(|_| WalOwnerError::Corrupt)
+    }
+}
+
+impl std::fmt::Debug for WalOwnerCheckpointSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WalOwnerCheckpointSource(<opaque>)")
+    }
+}
+
+impl crate::archive_v3_shadow_checkpoint::CheckpointSource for WalOwnerCheckpointSource {
+    fn logical_file_length(&self) -> crate::archive_v3_shadow_checkpoint::Result<u64> {
+        Ok(self.logical_file_length)
+    }
+
+    fn read_exact(
+        &mut self,
+        logical_offset: u64,
+        destination: &mut [u8],
+    ) -> crate::archive_v3_shadow_checkpoint::Result<()> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let end = logical_offset
+            .checked_add(destination.len() as u64)
+            .ok_or(crate::archive_v3_shadow_checkpoint::ShadowCheckpointError::Source)?;
+        if destination.is_empty() || end > self.logical_file_length {
+            return Err(crate::archive_v3_shadow_checkpoint::ShadowCheckpointError::Source);
+        }
+        self.file
+            .seek(SeekFrom::Start(logical_offset))
+            .and_then(|_| self.file.read_exact(destination))
+            .map_err(|_| crate::archive_v3_shadow_checkpoint::ShadowCheckpointError::Source)
+    }
+}
+
+enum WalOwnerCheckpointReaderCommand {
+    Read {
+        offset: u64,
+        length: usize,
+        response:
+            tokio::sync::oneshot::Sender<std::result::Result<Zeroizing<Vec<u8>>, WalOwnerError>>,
+    },
+    Rebind {
+        next: Box<WalOwnerStoreBinding>,
+        response: tokio::sync::oneshot::Sender<std::result::Result<(), WalOwnerError>>,
+    },
+    Close {
+        response: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+/// Async-facing handle for the cleanup-owning checkpoint reader thread. No
+/// file or path crosses this boundary; every blocking seek/read remains on the
+/// dedicated thread, and dropping the handle closes the command channel so
+/// the worker drops and scrubs its authenticated staging owner.
+pub(crate) struct WalOwnerCheckpointReader {
+    sender: std::sync::mpsc::Sender<WalOwnerCheckpointReaderCommand>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    logical_file_length: u64,
+    plaintext_hash: [u8; 32],
+    sqlite_schema_version: u32,
+    binding: WalOwnerStoreBinding,
+}
+
+impl WalOwnerCheckpointReader {
+    pub(crate) fn spawn(
+        source: WalOwnerCheckpointSource,
+    ) -> std::result::Result<Self, WalOwnerError> {
+        let logical_file_length = source.logical_file_length;
+        let plaintext_hash = source.plaintext_hash;
+        let sqlite_schema_version = source.sqlite_schema_version;
+        let binding = source.binding.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("kioku-wal-checkpoint-source".to_owned())
+            .spawn(move || {
+                let mut source = source;
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        WalOwnerCheckpointReaderCommand::Read {
+                            offset,
+                            length,
+                            response,
+                        } => {
+                            let mut bytes = Zeroizing::new(vec![0; length]);
+                            let result = source
+                                .read_checkpoint_exact_inner(offset, bytes.as_mut_slice())
+                                .map(|()| bytes);
+                            let _ = response.send(result);
+                        }
+                        WalOwnerCheckpointReaderCommand::Rebind { next, response } => {
+                            let result = source.rebind_after_lease_maintenance_inner(*next);
+                            let _ = response.send(result);
+                        }
+                        WalOwnerCheckpointReaderCommand::Close { response } => {
+                            drop(source);
+                            let _ = response.send(());
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|_| WalOwnerError::Persistence)?;
+        Ok(Self {
+            sender,
+            thread: Some(thread),
+            logical_file_length,
+            plaintext_hash,
+            sqlite_schema_version,
+            binding,
+        })
+    }
+
+    pub(crate) fn authenticated_facts(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+        binding: &WalOwnerStoreBinding,
+    ) -> std::result::Result<(u64, [u8; 32], u32), WalOwnerError> {
+        if binding != &self.binding {
+            return Err(WalOwnerError::Conflict);
+        }
+        Ok((
+            self.logical_file_length,
+            self.plaintext_hash,
+            self.sqlite_schema_version,
+        ))
+    }
+
+    pub(crate) async fn read_exact_owned(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> std::result::Result<Zeroizing<Vec<u8>>, WalOwnerError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(WalOwnerCheckpointReaderCommand::Read {
+                offset,
+                length,
+                response,
+            })
+            .map_err(|_| WalOwnerError::Poisoned)?;
+        result.await.map_err(|_| WalOwnerError::Poisoned)?
+    }
+
+    pub(crate) async fn rebind(
+        &mut self,
+        next: WalOwnerStoreBinding,
+    ) -> std::result::Result<(), WalOwnerError> {
+        let retained = next.clone();
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(WalOwnerCheckpointReaderCommand::Rebind {
+                next: Box::new(next),
+                response,
+            })
+            .map_err(|_| WalOwnerError::Poisoned)?;
+        result.await.map_err(|_| WalOwnerError::Poisoned)??;
+        self.binding = retained;
+        Ok(())
+    }
+
+    pub(crate) async fn close(mut self) -> std::result::Result<(), WalOwnerError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(WalOwnerCheckpointReaderCommand::Close { response })
+            .map_err(|_| WalOwnerError::Poisoned)?;
+        result.await.map_err(|_| WalOwnerError::Poisoned)?;
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|_| WalOwnerError::Poisoned)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for WalOwnerCheckpointReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WalOwnerCheckpointReader(<opaque>)")
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::archive_v3_shadow_checkpoint::OwnedCheckpointSource for WalOwnerCheckpointReader {
+    fn authenticated_facts(
+        &self,
+    ) -> crate::archive_v3_shadow_checkpoint::Result<(u64, [u8; 32], u32)> {
+        if self.logical_file_length == 0 || self.plaintext_hash == [0; 32] {
+            return Err(crate::archive_v3_shadow_checkpoint::ShadowCheckpointError::Source);
+        }
+        Ok((
+            self.logical_file_length,
+            self.plaintext_hash,
+            self.sqlite_schema_version,
+        ))
+    }
+
+    async fn read_exact_owned(
+        &self,
+        logical_offset: u64,
+        length: usize,
+    ) -> crate::archive_v3_shadow_checkpoint::Result<Zeroizing<Vec<u8>>> {
+        WalOwnerCheckpointReader::read_exact_owned(self, logical_offset, length)
+            .await
+            .map_err(|_| crate::archive_v3_shadow_checkpoint::ShadowCheckpointError::Source)
+    }
 }
 
 pub(crate) enum WalStoreApply<P: WalLogicalDomainPlan> {
@@ -647,6 +988,8 @@ impl SingleArchiveWalStoreOwner {
             binding,
             instance_id,
             poisoned: false,
+            #[cfg(test)]
+            checkpoint_stall: None,
         })
     }
 
@@ -837,8 +1180,127 @@ impl SingleArchiveWalStoreOwner {
         Ok(())
     }
 
+    pub(crate) fn refresh_lease_binding(
+        &mut self,
+        next: WalOwnerStoreBinding,
+    ) -> std::result::Result<(), WalOwnerError> {
+        if self.poisoned
+            || next.archive_id() != self.binding.archive_id()
+            || next.database_epoch() != self.binding.database_epoch()
+            || next.key_epoch() != self.binding.key_epoch()
+            || next.root() != self.binding.root()
+            || self
+                .registration
+                .as_ref()
+                .ok_or(WalOwnerError::Poisoned)?
+                .completed_len()
+                != 0
+        {
+            self.poison();
+            return Err(WalOwnerError::Conflict);
+        }
+        self.binding = next;
+        Ok(())
+    }
+
+    pub(crate) fn take_checkpoint_source(
+        &mut self,
+    ) -> std::result::Result<WalOwnerCheckpointSource, WalOwnerError> {
+        #[cfg(test)]
+        if let Some(stall) = self.checkpoint_stall.as_ref() {
+            stall.block();
+        }
+        if self.poisoned
+            || self
+                .registration
+                .as_ref()
+                .ok_or(WalOwnerError::Poisoned)?
+                .completed_len()
+                != 0
+        {
+            self.poison();
+            return Err(WalOwnerError::Conflict);
+        }
+        let connection = self.connection.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        let (busy, remaining, checkpointed): (i64, i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        if (busy, remaining, checkpointed) != (0, 0, 0) {
+            self.poison();
+            return Err(WalOwnerError::Capture);
+        }
+        let sqlite_schema_version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        if self
+            .registration
+            .as_ref()
+            .ok_or(WalOwnerError::Poisoned)?
+            .completed_len()
+            != 0
+        {
+            self.poison();
+            return Err(WalOwnerError::Capture);
+        }
+        self.connection.take();
+        self.registration.take();
+        let wal = sqlite_sidecar_path(&self.path, "-wal");
+        let shm = sqlite_sidecar_path(&self.path, "-shm");
+        if wal.exists() || shm.exists() {
+            self.poison();
+            return Err(WalOwnerError::Corrupt);
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(&self.path)
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        let logical_file_length = file.metadata().map_err(|_| WalOwnerError::Corrupt)?.len();
+        let mut hash_source = file.try_clone().map_err(|_| WalOwnerError::Corrupt)?;
+        let mut hasher = Sha256::new();
+        let mut hashed_length = 0_u64;
+        let mut buffer = zeroize::Zeroizing::new(vec![0_u8; 1024 * 1024]);
+        loop {
+            use std::io::Read as _;
+            let count = hash_source
+                .read(buffer.as_mut_slice())
+                .map_err(|_| WalOwnerError::Corrupt)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            hashed_length = hashed_length
+                .checked_add(u64::try_from(count).map_err(|_| WalOwnerError::Corrupt)?)
+                .ok_or(WalOwnerError::Corrupt)?;
+        }
+        let plaintext_hash: [u8; 32] = hasher.finalize().into();
+        if logical_file_length == 0
+            || hashed_length != logical_file_length
+            || plaintext_hash == [0; 32]
+        {
+            return Err(WalOwnerError::Corrupt);
+        }
+        let staged = self.staged.take().ok_or(WalOwnerError::Poisoned)?;
+        self.poisoned = true;
+        Ok(WalOwnerCheckpointSource {
+            _staged: staged,
+            file,
+            logical_file_length,
+            plaintext_hash,
+            sqlite_schema_version,
+            binding: self.binding.clone(),
+        })
+    }
+
     pub(crate) const fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stall_checkpoint_for_wal_owner_test(&mut self, stall: Arc<WalCheckpointStall>) {
+        self.checkpoint_stall = Some(stall);
     }
 
     #[cfg(test)]
@@ -847,6 +1309,11 @@ impl SingleArchiveWalStoreOwner {
     ) -> std::result::Result<Self, WalOwnerError> {
         let plaintext = create_empty_db(&Dek([0x71; 32])).map_err(|_| WalOwnerError::Corrupt)?;
         Self::from_wal_owner_test_plaintext(binding, plaintext)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scratch_path_for_wal_owner_test(&self) -> PathBuf {
+        self.path.clone()
     }
 
     #[cfg(test)]
@@ -6149,6 +6616,17 @@ fn open_db(
     run_migrations(&conn)?;
     let migrated = database_mutation_fingerprint(&conn)? != before;
     Ok((conn, registration, migrated))
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_wal_owner_store_for_test(path: &Path) -> Result<u32> {
+    init_vec_extension();
+    let conn = Connection::open(path)?;
+    conn.execute_batch(SCHEMA_SQL)?;
+    run_migrations(&conn)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(Into::into)
 }
 
 fn ensure_no_sqlite_sidecars(path: &Path) -> Result<()> {

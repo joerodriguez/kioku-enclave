@@ -36,7 +36,7 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
     }
 )
 EXPECTED_POLICY_SITE_COUNT = 41
-EXPECTED_POLICY_SITE_SHA256 = "3ed87fa7d69ab7ce9bab59b18ab8e076eab2ce68e382daace80408ebe5011735"
+EXPECTED_POLICY_SITE_SHA256 = "3f01dfb0975431289a72111b4e23a77f527b1c7105d60f134de4742cf89f9e60"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 21
-EXPECTED_WORKER_SPAWN_SHA256 = "3d60d662ba453d29184688481a8601adfc8e9292b5770ae682b96e87e9f32276"
+EXPECTED_WORKER_SPAWN_COUNT = 24
+EXPECTED_WORKER_SPAWN_SHA256 = "1ed48491a1d6a5dd7fee31b5869c437df25bc5fb97f0955e91b007aac8d7fce4"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -904,7 +904,7 @@ impl X {
         for forbidden in (
             "archive_v3_wal_logical_operations",
             "crate::store::Store",
-            "std::env",
+            "std::env::",
             "tokio::spawn",
             "GcsClient",
             "Witness::advance",
@@ -912,26 +912,32 @@ impl X {
         ):
             self.assertNotIn(forbidden, gate)
 
-    def test_wal_owner_is_private_test_published_and_unwired(self) -> None:
+    def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
+        publisher = (ROOT / "src/archive_v3_wal_owner/publisher.rs").read_text(
+            encoding="utf-8"
+        )
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("mod archive_v3_wal_owner;", main)
         self.assertNotIn("archive_v3_wal_owner::", main)
         self.assertIn("struct SingleArchiveWalOwner", owner)
         self.assertNotIn("pub(crate) struct SingleArchiveWalOwner", owner)
         self.assertNotIn("pub struct SingleArchiveWalOwner", owner)
-        self.assertIn(
-            "#[cfg(test)]\n    #[async_trait]\n    impl WalPublicationAuthority", owner
-        )
+        self.assertIn("pub(super) struct SingleArchiveWalPublisher", publisher)
+        self.assertNotIn("pub(crate) struct SingleArchiveWalPublisher", publisher)
+        self.assertNotIn("pub struct SingleArchiveWalPublisher", publisher)
+        self.assertIn("impl WalPublicationAuthority for SingleArchiveWalPublisher", publisher)
+        self.assertIn("CompletedMaintenanceWalHandoff", publisher)
         for forbidden in (
             "GcsClient",
-            "FirestoreWitness",
+            "FirestoreWitness::",
             "Store::new",
             "list_objects",
             "delete_exact",
-            "std::env",
+            "std::env::",
         ):
             self.assertNotIn(forbidden, owner)
+            self.assertNotIn(forbidden, publisher)
 
 
 def classify_worker_spawn(site: CallSite) -> str:

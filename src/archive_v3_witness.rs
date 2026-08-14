@@ -754,6 +754,280 @@ impl WitnessRecord {
                 .is_some()
     }
 
+    pub(crate) fn exact_active_lease_for_wal_owner_bytes(
+        &self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        self.exact_active_lease_for_owner(ObjectId::from_bytes(*owner))
+    }
+
+    /// Validate the sole exact witness-owned transition from an unleased
+    /// WalAuthoritative maintenance handoff to the first durable WAL owner.
+    /// No graph, epoch, registry, migration, deletion, predecessor, or
+    /// evidence field may change; only trusted time and the canonical next
+    /// owner/fence/expiry tuple may advance.
+    pub(crate) fn exact_wal_owner_acquire_from(
+        &self,
+        expected: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !expected.valid()
+            || !self.valid()
+            || expected.deletion != DeletionState::Active
+            || expected.migration != MigrationState::WalAuthoritative
+            || expected.owner_id.is_some()
+            || expected.lease_expires_at_tick != 0
+            || self.archive_id != expected.archive_id
+            || self.database_epoch != expected.database_epoch
+            || self.database_epoch_generation != expected.database_epoch_generation
+            || self.predecessor != expected.predecessor
+            || self.root != expected.root
+            || self.registry != expected.registry
+            || self.owner_id != Some(owner)
+            || self.current_fencing_epoch != expected.next_fencing_epoch
+            || self.next_fencing_epoch
+                != self
+                    .current_fencing_epoch
+                    .checked_add(1)
+                    .ok_or(WitnessError::Fenced)?
+            || self.last_server_tick < expected.last_server_tick
+            || self.lease_expires_at_tick <= self.last_server_tick
+            || self.migration != expected.migration
+            || self.deletion != expected.deletion
+            || self.deletion_fencing_epoch != expected.deletion_fencing_epoch
+            || self.deletion_worker_id != expected.deletion_worker_id
+            || self.deletion_operation_id != expected.deletion_operation_id
+            || self.deletion_evidence != expected.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
+    /// Validate a fresh current ordinary-root descendant against the durable
+    /// owner acquisition. Root and trusted tick may advance; the complete
+    /// owner lease, archive/database/key lineage, predecessor, registry,
+    /// migration, deletion, and evidence tuple remains exact.
+    pub(crate) fn retains_exact_wal_owner_lease_from(
+        &self,
+        acquired: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let acquired_lease = acquired.exact_active_lease_for_owner(owner)?;
+        let current_lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.valid()
+            || !acquired.valid()
+            || current_lease != acquired_lease
+            || self.archive_id != acquired.archive_id
+            || self.database_epoch != acquired.database_epoch
+            || self.database_epoch_generation != acquired.database_epoch_generation
+            || self.predecessor != acquired.predecessor
+            || self.registry != acquired.registry
+            || self.current_fencing_epoch != acquired.current_fencing_epoch
+            || self.next_fencing_epoch != acquired.next_fencing_epoch
+            || self.last_server_tick < acquired.last_server_tick
+            || self.migration != MigrationState::WalAuthoritative
+            || acquired.migration != MigrationState::WalAuthoritative
+            || self.deletion != DeletionState::Active
+            || acquired.deletion != DeletionState::Active
+            || self.deletion_fencing_epoch != acquired.deletion_fencing_epoch
+            || self.deletion_worker_id != acquired.deletion_worker_id
+            || self.deletion_operation_id != acquired.deletion_operation_id
+            || self.deletion_evidence != acquired.deletion_evidence
+            || self.root.root().sequence() < acquired.root.root().sequence()
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(current_lease)
+    }
+
+    /// Validate the sole fresh-process reacquire after the retained durable
+    /// owner's prior lease has expired. The exact provider record and root are
+    /// unchanged; trusted time, expiry, and the canonical fence pair advance.
+    pub(crate) fn exact_wal_owner_reacquire_from(
+        &self,
+        previous: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let previous_lease = previous.exact_active_lease_for_owner(owner)?;
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.valid()
+            || !previous.valid()
+            || self.archive_id != previous.archive_id
+            || self.database_epoch != previous.database_epoch
+            || self.database_epoch_generation != previous.database_epoch_generation
+            || self.predecessor != previous.predecessor
+            || self.root != previous.root
+            || self.registry != previous.registry
+            || self.current_fencing_epoch != previous.next_fencing_epoch
+            || self.next_fencing_epoch
+                != self
+                    .current_fencing_epoch
+                    .checked_add(1)
+                    .ok_or(WitnessError::Fenced)?
+            || self.last_server_tick < previous.lease_expires_at_tick
+            || self.last_server_tick <= previous.last_server_tick
+            || self.lease_expires_at_tick <= previous.lease_expires_at_tick
+            || lease.fencing_epoch <= previous_lease.fencing_epoch
+            || self.migration != MigrationState::WalAuthoritative
+            || previous.migration != MigrationState::WalAuthoritative
+            || self.deletion != DeletionState::Active
+            || previous.deletion != DeletionState::Active
+            || self.deletion_fencing_epoch != previous.deletion_fencing_epoch
+            || self.deletion_worker_id != previous.deletion_worker_id
+            || self.deletion_operation_id != previous.deletion_operation_id
+            || self.deletion_evidence != previous.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
+    pub(crate) fn exact_wal_owner_renewal_from(
+        &self,
+        previous: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let previous_lease = previous.exact_active_lease_for_owner(owner)?;
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.valid()
+            || !previous.valid()
+            || self.archive_id != previous.archive_id
+            || self.database_epoch != previous.database_epoch
+            || self.database_epoch_generation != previous.database_epoch_generation
+            || self.predecessor != previous.predecessor
+            || self.root != previous.root
+            || self.registry != previous.registry
+            || self.current_fencing_epoch != previous.current_fencing_epoch
+            || self.next_fencing_epoch != previous.next_fencing_epoch
+            || self.last_server_tick <= previous.last_server_tick
+            || self.lease_expires_at_tick <= previous.lease_expires_at_tick
+            || lease.fencing_epoch != previous_lease.fencing_epoch
+            || self.migration != MigrationState::WalAuthoritative
+            || previous.migration != MigrationState::WalAuthoritative
+            || self.deletion != DeletionState::Active
+            || previous.deletion != DeletionState::Active
+            || self.deletion_fencing_epoch != previous.deletion_fencing_epoch
+            || self.deletion_worker_id != previous.deletion_worker_id
+            || self.deletion_operation_id != previous.deletion_operation_id
+            || self.deletion_evidence != previous.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
+    /// Authenticate a live-owner heartbeat. A provider may retain the exact
+    /// lease when ample lifetime remains, advance only trusted time, or extend
+    /// expiry at the same fence. It may not change any graph, registry,
+    /// deletion, owner, or fencing field.
+    pub(crate) fn exact_wal_owner_heartbeat_from(
+        &self,
+        previous: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let previous_lease = previous.exact_active_lease_for_owner(owner)?;
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.valid()
+            || !previous.valid()
+            || self.archive_id != previous.archive_id
+            || self.database_epoch != previous.database_epoch
+            || self.database_epoch_generation != previous.database_epoch_generation
+            || self.predecessor != previous.predecessor
+            || self.root != previous.root
+            || self.registry != previous.registry
+            || self.current_fencing_epoch != previous.current_fencing_epoch
+            || self.next_fencing_epoch != previous.next_fencing_epoch
+            || self.last_server_tick < previous.last_server_tick
+            || self.lease_expires_at_tick < previous.lease_expires_at_tick
+            || lease.fencing_epoch != previous_lease.fencing_epoch
+            || self.migration != MigrationState::WalAuthoritative
+            || previous.migration != MigrationState::WalAuthoritative
+            || self.deletion != DeletionState::Active
+            || previous.deletion != DeletionState::Active
+            || self.deletion_fencing_epoch != previous.deletion_fencing_epoch
+            || self.deletion_worker_id != previous.deletion_worker_id
+            || self.deletion_operation_id != previous.deletion_operation_id
+            || self.deletion_evidence != previous.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
+    /// Checkpoint staging may reconstruct only the exact active owner lease
+    /// already embedded in its authenticated expected witness. The private
+    /// token prevents this comparison fact from becoming general lease
+    /// authority outside the WAL publisher/control path.
+    pub(crate) fn wal_owner_checkpoint_lease(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+        owner: ObjectId,
+    ) -> Result<WitnessLease> {
+        if self.deletion != DeletionState::Active
+            || self.migration != MigrationState::WalAuthoritative
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        self.exact_active_lease_for_owner(owner)
+    }
+
+    /// Stable checkpoint-source subject. Provider-derived lease clock,
+    /// expiry, owner and fencing fields are deliberately removed, while the
+    /// complete archive/database-generation/predecessor/root/registry/
+    /// migration/deletion/evidence tuple remains encoded exactly. This lets a
+    /// same-subject heartbeat or reacquire retain one Store-owned source
+    /// without weakening any immutable witness binding.
+    pub(crate) fn wal_owner_checkpoint_source_subject(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+    ) -> Result<[u8; 32]> {
+        if !self.valid()
+            || self.deletion != DeletionState::Active
+            || self.migration != MigrationState::WalAuthoritative
+        {
+            return Err(WitnessError::Corrupt);
+        }
+        let mut stable = self.clone();
+        stable.owner_id = None;
+        stable.current_fencing_epoch = 0;
+        stable.next_fencing_epoch = 0;
+        stable.lease_expires_at_tick = 0;
+        stable.last_server_tick = 0;
+        let mut hasher = Sha256::new();
+        hasher.update(b"kioku/archive-v3/wal-owner-checkpoint-source-subject/v1\0");
+        hasher.update(stable.encode());
+        let commitment: [u8; 32] = hasher.finalize().into();
+        (commitment != [0; 32])
+            .then_some(commitment)
+            .ok_or(WitnessError::Corrupt)
+    }
+
+    pub(crate) fn exact_wal_owner_checkpoint_lease_successor_from(
+        &self,
+        previous: &Self,
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+    ) -> Result<()> {
+        let owner = previous.owner_id.ok_or(WitnessError::Fenced)?;
+        if self
+            .exact_wal_owner_heartbeat_from(previous, owner.as_bytes())
+            .is_ok()
+            || self
+                .exact_wal_owner_reacquire_from(previous, owner.as_bytes())
+                .is_ok()
+        {
+            Ok(())
+        } else {
+            Err(WitnessError::Fenced)
+        }
+    }
+
     /// Authenticate either the byte-exact retained terminal record or the
     /// sole witness-owned successor produced by releasing that record's
     /// maintenance lease. The release clears owner/expiry and monotonically
@@ -1212,6 +1486,14 @@ impl WitnessRecord {
         forged.migration = migration;
         forged
     }
+    #[cfg(test)]
+    pub(crate) fn released_wal_owner_for_test(&self) -> Self {
+        let mut released = self.clone();
+        released.migration = MigrationState::WalAuthoritative;
+        released.owner_id = None;
+        released.lease_expires_at_tick = 0;
+        released
+    }
     pub fn migration(&self) -> MigrationState {
         self.migration
     }
@@ -1521,6 +1803,9 @@ impl WitnessLease {
     }
     pub(crate) fn key_epoch(&self) -> KeyEpoch {
         self.key_epoch
+    }
+    pub(crate) fn owner(&self) -> ObjectId {
+        self.owner
     }
     pub(crate) fn fencing_epoch(&self) -> u64 {
         self.fencing_epoch
@@ -2006,6 +2291,28 @@ impl RecoveryRoot {
         })
     }
 
+    /// WAL-owner-only recovery conversion. The exact provider record must be
+    /// Active, WalAuthoritative, and hold a live witness-owned lease; a caller
+    /// still cannot nominate any root or registry field independently.
+    pub(crate) fn from_exact_wal_owner_record(record: &WitnessRecord) -> Result<Self> {
+        let owner = record.owner_id.ok_or(WitnessError::Fenced)?;
+        record.exact_active_lease_for_owner(owner)?;
+        if !record.valid()
+            || record.deletion != DeletionState::Active
+            || record.migration != MigrationState::WalAuthoritative
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(Self {
+            archive_id: record.archive_id,
+            root: record.root,
+            registry: record.registry,
+            predecessor: record.predecessor,
+            migration: record.migration,
+            deletion: record.deletion,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn with_migration_for_test(mut self, migration: MigrationState) -> Self {
         self.migration = migration;
@@ -2176,6 +2483,153 @@ impl InMemoryWitness {
             }
         }
         Self::from_records(Arc::new(FixedClock(tick)), record.into_iter().collect())
+    }
+
+    /// WAL-publisher-only exact acquisition. The byte-exact unleased terminal
+    /// record is checked before the trusted transaction tick is applied, so a
+    /// fresh process cannot adopt or renew another owner's live lease.
+    pub(crate) fn acquire_exact_wal_owner_lease(
+        &self,
+        expected: &WitnessRecord,
+        owner: ObjectId,
+        duration: u64,
+    ) -> Result<(WitnessRecord, WitnessLease)> {
+        if !nonzero_id(owner.as_bytes())
+            || expected.deletion != DeletionState::Active
+            || expected.migration != MigrationState::WalAuthoritative
+            || expected.owner_id.is_some()
+            || expected.lease_expires_at_tick != 0
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&expected.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        if current != expected {
+            return Err(WitnessError::CompareFailed);
+        }
+        let now = self.now(current)?;
+        let expires_at_tick = expiry(now, duration)?;
+        if current.owner_id.is_some() || now < current.lease_expires_at_tick {
+            return Err(WitnessError::Fenced);
+        }
+        let fencing_epoch = current.next_fencing_epoch;
+        current.next_fencing_epoch = fencing_epoch
+            .checked_add(1)
+            .ok_or(WitnessError::Malformed)?;
+        current.current_fencing_epoch = fencing_epoch;
+        current.owner_id = Some(owner);
+        current.lease_expires_at_tick = expires_at_tick;
+        let lease = WitnessLease {
+            archive_id: current.archive_id,
+            database_epoch: current.database_epoch,
+            key_epoch: current.registry.key_epoch,
+            owner,
+            fencing_epoch,
+            expires_at_tick,
+        };
+        Ok((current.clone(), lease))
+    }
+
+    pub(crate) fn reacquire_exact_wal_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: ObjectId,
+        duration: u64,
+    ) -> Result<(WitnessRecord, WitnessLease)> {
+        if !nonzero_id(owner.as_bytes())
+            || previous.deletion != DeletionState::Active
+            || previous.migration != MigrationState::WalAuthoritative
+            || previous.owner_id != Some(owner)
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&previous.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        if current != previous {
+            return Err(WitnessError::CompareFailed);
+        }
+        let now = self.now(current)?;
+        if now < previous.lease_expires_at_tick {
+            return Err(WitnessError::Fenced);
+        }
+        let expires_at_tick = expiry(now, duration)?;
+        let fencing_epoch = current.next_fencing_epoch;
+        current.current_fencing_epoch = fencing_epoch;
+        current.next_fencing_epoch = fencing_epoch
+            .checked_add(1)
+            .ok_or(WitnessError::Malformed)?;
+        current.owner_id = Some(owner);
+        current.lease_expires_at_tick = expires_at_tick;
+        let lease = current.exact_active_lease_for_owner(owner)?;
+        current.exact_wal_owner_reacquire_from(previous, owner.as_bytes())?;
+        Ok((current.clone(), lease))
+    }
+
+    /// Live-owner maintenance transaction. Same-second calls retain the
+    /// authenticated lease, later calls renew only when half its requested
+    /// lifetime has elapsed, and an expired same-owner lease reacquires at the
+    /// next fence. The caller classifies the exact returned transition before
+    /// persisting Control state.
+    pub(crate) fn maintain_exact_wal_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: ObjectId,
+        duration: u64,
+    ) -> Result<(WitnessRecord, WitnessLease)> {
+        if !nonzero_id(owner.as_bytes())
+            || duration == 0
+            || previous.deletion != DeletionState::Active
+            || previous.migration != MigrationState::WalAuthoritative
+            || previous.owner_id != Some(owner)
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&previous.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        if current != previous {
+            return Err(WitnessError::CompareFailed);
+        }
+        let now = self.now(current)?;
+        if now >= previous.lease_expires_at_tick {
+            let expires_at_tick = expiry(now, duration)?;
+            let fencing_epoch = current.next_fencing_epoch;
+            current.current_fencing_epoch = fencing_epoch;
+            current.next_fencing_epoch = fencing_epoch
+                .checked_add(1)
+                .ok_or(WitnessError::Malformed)?;
+            current.owner_id = Some(owner);
+            current.lease_expires_at_tick = expires_at_tick;
+        } else {
+            let remaining = previous
+                .lease_expires_at_tick
+                .checked_sub(now)
+                .ok_or(WitnessError::Malformed)?;
+            if remaining <= duration / 2 {
+                let next_expiry = expiry(now, duration)?;
+                if next_expiry > current.lease_expires_at_tick {
+                    current.lease_expires_at_tick = next_expiry;
+                }
+            }
+        }
+        let lease = current.exact_active_lease_for_owner(owner)?;
+        if current.current_fencing_epoch == previous.current_fencing_epoch {
+            current.exact_wal_owner_heartbeat_from(previous, owner.as_bytes())?;
+        } else {
+            current.exact_wal_owner_reacquire_from(previous, owner.as_bytes())?;
+        }
+        Ok((current.clone(), lease))
     }
 
     /// Terminal-only maintenance release. Unlike generic lease revocation,
@@ -4597,6 +5051,135 @@ mod tests {
             .exact_maintenance_terminal_or_release_from(&retained, owner)
             .is_err()));
     }
+
+    #[test]
+    fn wal_owner_acquire_renew_and_reacquire_are_exact_full_tuple_transitions() {
+        let (witness, _, bootstrap, _) = setup();
+        let importer = ObjectId::from_bytes(id(8));
+        let owner = ObjectId::from_bytes(id(61));
+        let mut terminal = witness.read_current(bootstrap.archive_id).unwrap().unwrap();
+        terminal.migration = MigrationState::WalAuthoritative;
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(terminal.encode()),
+            terminal.last_server_tick + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_terminal(&terminal, importer)
+            .unwrap();
+
+        let acquire_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(released.encode()),
+            released.last_server_tick + 1,
+        )
+        .unwrap();
+        let (acquired, lease) = acquire_provider
+            .acquire_exact_wal_owner_lease(&released, owner, 20)
+            .unwrap();
+        assert_eq!(
+            acquired
+                .exact_wal_owner_acquire_from(&released, owner.as_bytes())
+                .unwrap(),
+            lease
+        );
+        assert!(acquired
+            .with_next_fencing_epoch_for_test(acquired.next_fencing_epoch + 1)
+            .exact_wal_owner_acquire_from(&released, owner.as_bytes())
+            .is_err());
+
+        let renewal_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(acquired.encode()),
+            acquired.last_server_tick + 1,
+        )
+        .unwrap();
+        renewal_provider.renew_lease(lease, 40).unwrap();
+        let renewed = renewal_provider
+            .read_current(acquired.archive_id)
+            .unwrap()
+            .unwrap();
+        assert!(renewed
+            .exact_wal_owner_renewal_from(&acquired, owner.as_bytes())
+            .is_ok());
+        assert!(renewed
+            .with_lease_expiry_for_test(acquired.lease_expires_at_tick)
+            .exact_wal_owner_renewal_from(&acquired, owner.as_bytes())
+            .is_err());
+
+        let reacquire_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(renewed.encode()),
+            renewed.lease_expires_at_tick,
+        )
+        .unwrap();
+        let (reacquired, _) = reacquire_provider
+            .reacquire_exact_wal_owner_lease(&renewed, owner, 40)
+            .unwrap();
+        assert!(reacquired
+            .exact_wal_owner_reacquire_from(&renewed, owner.as_bytes())
+            .is_ok());
+        assert!(reacquired
+            .with_migration_for_test(MigrationState::ShadowWal)
+            .exact_wal_owner_reacquire_from(&renewed, owner.as_bytes())
+            .is_err());
+    }
+
+    #[test]
+    fn wal_owner_maintenance_reuses_adequate_lease_in_one_provider_second() {
+        let (witness, _, bootstrap, _) = setup();
+        let importer = ObjectId::from_bytes(id(8));
+        let owner = ObjectId::from_bytes(id(62));
+        let mut terminal = witness.read_current(bootstrap.archive_id).unwrap().unwrap();
+        terminal.migration = MigrationState::WalAuthoritative;
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(terminal.encode()),
+            terminal.last_server_tick + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_terminal(&terminal, importer)
+            .unwrap();
+        let provider_tick = released.last_server_tick + 1;
+        let provider =
+            InMemoryWitness::from_provider_record_at_tick(Some(released.encode()), provider_tick)
+                .unwrap();
+        let (acquired, lease) = provider
+            .acquire_exact_wal_owner_lease(&released, owner, 300)
+            .unwrap();
+
+        // An immediate submission and a second serialized submission in the
+        // same provider second both reuse the exact adequate lease. Neither
+        // attempts an impossible strictly-monotone renewal.
+        let (immediate, immediate_lease) = provider
+            .maintain_exact_wal_owner_lease(&acquired, owner, 300)
+            .unwrap();
+        let (second, second_lease) = provider
+            .maintain_exact_wal_owner_lease(&immediate, owner, 300)
+            .unwrap();
+        assert_eq!(immediate, acquired);
+        assert_eq!(second, acquired);
+        assert_eq!(immediate_lease, lease);
+        assert_eq!(second_lease, lease);
+        assert_eq!(second.last_server_tick, provider_tick);
+        let token = crate::archive_v3_wal_owner::WalCheckpointSourceContext::for_test();
+        assert_eq!(
+            acquired.wal_owner_checkpoint_source_subject(token).unwrap(),
+            second.wal_owner_checkpoint_source_subject(token).unwrap()
+        );
+        assert_ne!(
+            second.wal_owner_checkpoint_source_subject(token).unwrap(),
+            second
+                .with_candidate_root_for_test(
+                    RootReference::new(
+                        second.root().root().sequence() + 1,
+                        ObjectId::from_bytes(id(63)),
+                        hash(64),
+                    ),
+                    second.current_fencing_epoch,
+                )
+                .wal_owner_checkpoint_source_subject(token)
+                .unwrap()
+        );
+    }
+
     #[test]
     fn unavailable_and_debug_are_content_free() {
         let (w, _, r, l) = setup();
