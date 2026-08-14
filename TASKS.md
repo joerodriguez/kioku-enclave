@@ -243,6 +243,16 @@ separate activation blockers.
     exactly replay. The future provider deletion boundary must settle the exact
     object before constructing this plan; Store/provider list/read/delete,
     worker/launcher/task/acknowledgement wiring remain absent.
+  - [x] Add the inactive provider-accepted email A-domain: the already durable
+    delivery ID remains the external idempotency key and derives one opaque
+    operation before actor admission. The exact pending/retry predecessor row,
+    provider message ID, 2xx status, and fixed settlement timestamp are all
+    fingerprinted. A full-row CAS or exact terminal adoption and a distinct
+    1,048,576-row/32-MiB permanent ledger commit atomically. Missing or changed
+    predecessors, alternate provider facts, cap exhaustion, late ledger failure,
+    partial schema, tamper, and reopen fail closed or exactly replay. Sending,
+    retry allocation/timing, Store/worker/launcher/task/acknowledgement wiring,
+    and the webhook/push delivery domains remain absent.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.

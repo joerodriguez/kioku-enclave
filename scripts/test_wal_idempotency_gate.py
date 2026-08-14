@@ -932,6 +932,12 @@ impl X {
         retention_domain = (ROOT / "src/cp/media_worker/wal.rs").read_text(
             encoding="utf-8"
         )
+        email_worker = (ROOT / "src/cp/email_worker.rs").read_text(
+            encoding="utf-8"
+        )
+        email_domain = (ROOT / "src/cp/email_worker/wal.rs").read_text(
+            encoding="utf-8"
+        )
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("pub(crate) mod wal;", media)
         self.assertIn(
@@ -992,6 +998,22 @@ impl X {
         self.assertIn("WalIdempotencyError::Precondition", retention_domain)
         self.assertNotIn("RetentionSettlementPlan::", media_worker)
         self.assertNotIn("cp::media_worker::wal::", main)
+        self.assertIn("pub(crate) mod wal;", email_worker)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailAcceptedLedger",
+            gate,
+        )
+        self.assertIn("struct EmailAcceptedPlan", email_domain)
+        self.assertIn("struct EmailAcceptedLedger", email_domain)
+        self.assertIn("archive_v3_wal_email_accepted_operations", email_domain)
+        self.assertIn("DomainLedgerBounds::new", email_domain)
+        self.assertIn("WalIdempotencyError::Precondition", email_domain)
+        self.assertNotIn("EmailAcceptedPlan::", email_worker)
+        self.assertNotIn("cp::email_worker::wal::", main)
         for forbidden in (
             "crate::store::Store",
             "Store::new",
@@ -1006,6 +1028,7 @@ impl X {
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, retention_domain)
+            self.assertNotIn(forbidden, email_domain)
         for forbidden in (
             "begin_invocation(",
             "random_token_hex",
@@ -1034,6 +1057,17 @@ impl X {
             "std::time::",
         ):
             self.assertNotIn(forbidden, retention_domain)
+        for forbidden in (
+            "transport.send(",
+            "update_email_delivery_state(",
+            "set_email_delivery_next_attempt(",
+            "next_email_delivery(",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+        ):
+            self.assertNotIn(forbidden, email_domain)
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
