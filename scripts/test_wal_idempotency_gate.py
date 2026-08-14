@@ -938,6 +938,8 @@ impl X {
         email_domain = (ROOT / "src/cp/email_worker/wal.rs").read_text(
             encoding="utf-8"
         )
+        push = (ROOT / "src/cp/push.rs").read_text(encoding="utf-8")
+        push_domain = (ROOT / "src/cp/push/wal.rs").read_text(encoding="utf-8")
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("pub(crate) mod wal;", media)
         self.assertIn(
@@ -1014,6 +1016,22 @@ impl X {
         self.assertIn("WalIdempotencyError::Precondition", email_domain)
         self.assertNotIn("EmailAcceptedPlan::", email_worker)
         self.assertNotIn("cp::email_worker::wal::", main)
+        self.assertIn("pub(crate) mod wal;", push)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::push::wal::PushAcceptedPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::push::wal::PushAcceptedLedger",
+            gate,
+        )
+        self.assertIn("struct PushAcceptedPlan", push_domain)
+        self.assertIn("struct PushAcceptedLedger", push_domain)
+        self.assertIn("archive_v3_wal_push_accepted_operations", push_domain)
+        self.assertIn("DomainLedgerBounds::new", push_domain)
+        self.assertIn("WalIdempotencyError::Precondition", push_domain)
+        self.assertNotIn("PushAcceptedPlan::", push)
+        self.assertNotIn("cp::push::wal::", main)
         for forbidden in (
             "crate::store::Store",
             "Store::new",
@@ -1029,6 +1047,7 @@ impl X {
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, email_domain)
+            self.assertNotIn(forbidden, push_domain)
         for forbidden in (
             "begin_invocation(",
             "random_token_hex",
@@ -1068,6 +1087,18 @@ impl X {
             "std::time::",
         ):
             self.assertNotIn(forbidden, email_domain)
+        for forbidden in (
+            "transport.send(",
+            "update_push_delivery_state(",
+            "next_push_delivery(",
+            "disable_push_installation_generation(",
+            "upsert_push_installation(",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+        ):
+            self.assertNotIn(forbidden, push_domain)
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")

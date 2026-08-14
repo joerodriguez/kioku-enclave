@@ -1,5 +1,7 @@
 //! Privacy-minimized APNs installation registry, delivery worker, and browser handoff.
 
+pub(crate) mod wal;
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
