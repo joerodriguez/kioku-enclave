@@ -848,9 +848,10 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly six inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and now admits exactly seven inactive production A-domains:
 capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
-raw-media retention settlement, provider-accepted email, and Vertex usage terminal outcome.
+raw-media retention settlement, provider-accepted email, provider-accepted APNs, and Vertex usage
+terminal outcome.
 Capture-session finish derives an opaque
 operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
@@ -897,7 +898,14 @@ operation identity; its exact pending/retry row (including prior attempt, respon
 timestamps), provider message ID, 2xx status, and fixed acceptance time form the fingerprint. It
 either full-row-CASes that predecessor to accepted or adopts only the identical terminal row, with
 unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot send email, allocate or schedule a
-retry, call Store, launch a worker, or acknowledge delivery. All other production domain ledgers
+retry, call Store, launch a worker, or acknowledge delivery. The APNs child similarly accepts only
+the local settlement half of a definitive provider acceptance for an already durable delivery. Its
+UUID is fixed before I/O and sent as `apns-id`; that UUID derives the operation identity, while the
+exact episode/installation/version/handoff/collapse binding, pending/retry attempt and prior outcome,
+timestamps, definitive 200 status, and fixed acceptance time form the fingerprint. It full-row-CASes
+only that predecessor to accepted or adopts only the identical terminal row, including the terminal
+`next_attempt_at`, with unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot send, retry,
+mutate an installation, call Store, launch work, or acknowledge delivery. All other production domain ledgers
 remain absent and unsupported. A future owner must commit a domain row and its mutation
 under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
 substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
@@ -912,7 +920,8 @@ The reviewed operation inventory is deliberately asymmetric. Stable portable dom
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
 and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch,
-selected-screenshot receipt, raw-media retention settlement, provider-accepted email, and Vertex terminal outcome have production codecs so far; every other A
+selected-screenshot receipt, raw-media retention settlement, provider-accepted email,
+provider-accepted APNs, and Vertex terminal outcome have production codecs so far; every other A
 operation remains disabled
 pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and
 canonical media's first DEK/provider handoff remain B and are not admitted by those children.
