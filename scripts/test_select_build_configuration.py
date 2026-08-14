@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SELECTOR = ROOT / "scripts" / "select_build_configuration.py"
 LOCAL_PIPELINE = ROOT / "scripts" / "local_image_pipeline.py"
 DOCKERFILE = ROOT / "Dockerfile"
+DOCKERIGNORE = ROOT / ".dockerignore"
 RELEASE_SCRIPT = ROOT / "scripts" / "release.sh"
 METADATA_VERIFIER = ROOT / "scripts" / "verify_release_metadata.py"
 PROBE_PARSER = ROOT / "scripts" / "archive_witness_probe_config.py"
@@ -521,6 +522,9 @@ class SelectorTests(unittest.TestCase):
             self.assertNotIn(f"EVALUATION_{name}", pipeline)
         validator = "scripts/validate_archive_v3_shadow_runtime_environment.sh"
         self.assertIn(f"COPY --chmod=0555 {validator}", dockerfile)
+        dockerignore_lines = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+        self.assertIn("!scripts/", dockerignore_lines)
+        self.assertIn(f"!{validator}", dockerignore_lines)
         invocation = "&& /build/validate_archive_v3_shadow_runtime_environment.sh"
         self.assertIn(invocation, dockerfile)
         self.assertLess(dockerfile.index(f"COPY --chmod=0555 {validator}"), dockerfile.index(invocation))
