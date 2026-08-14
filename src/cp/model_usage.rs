@@ -977,6 +977,8 @@ mod tests {
             reviewer_verifier: None,
             apple_provider: None,
             sync_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
+            reference_batch_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
+            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
             mcp_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
             oauth_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
             test_email_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),

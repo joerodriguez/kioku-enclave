@@ -1013,6 +1013,8 @@ async fn main() {
             .map(|config| Arc::new(cp::auth::ReviewerIdentityVerifier::new(config.clone()))),
         apple_provider,
         sync_limiter: cp::limits::RateLimiter::new(10.0, 0.2),
+        reference_batch_limiter: cp::limits::RateLimiter::new(20.0, 2.0),
+        reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(32)),
         mcp_limiter: cp::limits::RateLimiter::new(60.0, 1.0),
         oauth_limiter: cp::limits::RateLimiter::new(120.0, 2.0),
         test_email_limiter: cp::limits::RateLimiter::new(3.0, 0.05),

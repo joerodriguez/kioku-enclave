@@ -1516,6 +1516,12 @@ header; before content persistence the enclave reserves budget by the event ID i
 to store. Identical retry and reference-to-canonical rebase are idempotent. This permits
 delivery after the live lease expires without charging transfer time, while preventing an
 unbounded inactive-lease upload path. Reservation telemetry contains no identifiers.
+Bounded screenshot-reference batches use one transport token but atomically create or reuse
+the same per-event reservations and debit every genuinely new logical observation. Their
+encrypted user-scoped receipt binds only a content-free batch correlation digest; it cannot
+authorize delivery, is migrated with a verified identity rebind, and is erased with account
+deletion. The per-user lifecycle and content-write guards remain held through durable archive
+save and reservation completion or retention.
 
 ### Billing request telemetry reveals route timing and outcome
 
@@ -1533,8 +1539,9 @@ user-level logs.
 
 ### Capture rejection telemetry reveals failed-upload timing and class
 
-The service emits one structured event only when `POST /api/v2/capture/events`
-fails. Each event contains a fixed schema and route label, numeric HTTP status
+The service emits one structured event only when `POST /api/v2/capture/events` or
+`POST /api/v2/capture/screen-reference-batches` fails. Each event contains a fixed schema
+and one of the two fixed route labels, numeric HTTP status
 and fixed class, one validated stream kind, `canonical`/`reference` disposition,
 one fixed failure-reason class, and elapsed milliseconds. Before a manifest can
 be validated, stream and disposition are the literal fixed value `unknown`.

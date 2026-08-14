@@ -78,7 +78,11 @@ in [`SECURITY.md`](SECURITY.md#source-to-image-rebuilds-are-not-yet-independentl
   after lease expiry without charging network-transfer time. A durable pending
   reservation is reconciled with its original billing idempotency key before any new
   reservation, so a crash or failed local commit neither double-charges nor blocks that
-  user indefinitely. Allowance amount, period cadence, catalog, and pricing remain opaque:
+  user indefinitely. Metadata-only Mac screen references may use the bounded JSON batch
+  route: one request holds the user lifecycle/content fence and saves the encrypted archive
+  once, while the existing per-event reservation rows still charge each new observation and
+  make ambiguous retry or individual-route fallback idempotent. Allowance amount, period
+  cadence, catalog, and pricing remain opaque:
   the enclave knows only the provider-neutral allowance snapshot and
   reservation decision. Catalog, pricing, payment, and subscription implementations live
   behind the external control-plane port and are not part of this repository.

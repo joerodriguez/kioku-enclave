@@ -30,6 +30,10 @@ const MAX_TEXT_LEN: usize = 20_000;
 const MAX_TURNS: usize = 10_000;
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_MULTIPART_BYTES: usize = MAX_AUDIO_BYTES as usize + MAX_MANIFEST_BYTES + 64 * 1024;
+const MAX_REFERENCE_BATCH_BYTES: usize = 1024 * 1024;
+const MAX_REFERENCE_BATCH_EVENTS: usize = 64;
+const REFERENCE_BATCH_ID_DOMAIN: &[u8] = b"kioku.screen-reference-batch.v1\0";
+const REFERENCE_BATCH_MANIFEST_DOMAIN: &[u8] = b"kioku.screen-reference-manifests.v1\0";
 const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
 const REQUEST_LOCAL_LABEL_MIGRATION_KEY: &str = "request-local-speaker-labels-v1";
 pub(crate) const UNIDENTIFIED_SPEAKER_LABEL: &str = "Unidentified voice";
@@ -501,6 +505,42 @@ fn manifest_digest(manifest: &CaptureEventManifest) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(manifest)?))
 }
 
+fn reference_batch_id(events: &[CaptureEventManifest]) -> Result<String> {
+    let count = u32::try_from(events.len())
+        .map_err(|_| EnclaveError::InvalidRequest("reference batch is too large".into()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(REFERENCE_BATCH_ID_DOMAIN);
+    hasher.update(count.to_be_bytes());
+    for event in events {
+        let event_id = event.event_id.as_bytes();
+        let event_id_len = u32::try_from(event_id.len())
+            .map_err(|_| EnclaveError::InvalidRequest("event_id is too large".into()))?;
+        let sequence = u64::try_from(event.sequence)
+            .map_err(|_| EnclaveError::InvalidRequest("sequence must be non-negative".into()))?;
+        hasher.update(event_id_len.to_be_bytes());
+        hasher.update(event_id);
+        hasher.update(sequence.to_be_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn reference_batch_manifest_digest(digests: &[String]) -> Result<String> {
+    let count = u32::try_from(digests.len())
+        .map_err(|_| EnclaveError::InvalidRequest("reference batch is too large".into()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(REFERENCE_BATCH_MANIFEST_DOMAIN);
+    hasher.update(count.to_be_bytes());
+    for digest in digests {
+        if !validate_sha256(digest) {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batch manifest digest is invalid".into(),
+            ));
+        }
+        hasher.update(digest.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn validate_media_bytes(
     manifest: &CaptureEventManifest,
     bytes: &[u8],
@@ -562,6 +602,115 @@ struct CaptureAccepted {
     media_disposition: MediaDisposition,
     processing_state: &'static str,
     committed_through_sequence: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScreenReferenceBatchRequest {
+    schema_version: i64,
+    batch_id: String,
+    events: Vec<CaptureEventManifest>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScreenReferenceBatchAccepted {
+    batch_id: String,
+    stream_id: String,
+    first_sequence: i64,
+    last_sequence: i64,
+    new_count: usize,
+    duplicate_count: usize,
+    committed_through_sequence: i64,
+}
+
+struct ValidatedReferenceBatch {
+    manifest_digests: Vec<String>,
+    aggregate_manifest_digest: String,
+    event_ids: Vec<String>,
+    stream_id: String,
+    first_sequence: i64,
+    last_sequence: i64,
+}
+
+fn validate_reference_batch(
+    request: &ScreenReferenceBatchRequest,
+) -> Result<ValidatedReferenceBatch> {
+    if request.schema_version != 1 {
+        return Err(EnclaveError::InvalidRequest(
+            "reference batch schema_version must be 1".into(),
+        ));
+    }
+    if request.events.is_empty() || request.events.len() > MAX_REFERENCE_BATCH_EVENTS {
+        return Err(EnclaveError::InvalidRequest(
+            "reference batch must contain between 1 and 64 events".into(),
+        ));
+    }
+    let first = &request.events[0];
+    let mut expected_sequence = first.sequence;
+    let mut event_ids = HashSet::with_capacity(request.events.len());
+    let mut manifest_digests = Vec::with_capacity(request.events.len());
+    for event in &request.events {
+        event.validate()?;
+        if event.stream_kind != StreamKind::MacScreen
+            || event.media_disposition != MediaDisposition::Reference
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batches accept only metadata-only mac_screen references".into(),
+            ));
+        }
+        if event.device_id != first.device_id
+            || event.install_id != first.install_id
+            || event.capture_session_id != first.capture_session_id
+            || event.stream_id != first.stream_id
+        {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batch scope must be uniform".into(),
+            ));
+        }
+        if event.sequence != expected_sequence {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batch sequences must be contiguous".into(),
+            ));
+        }
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            EnclaveError::InvalidRequest("reference batch sequence overflow".into())
+        })?;
+        if !event_ids.insert(event.event_id.clone()) {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batch event IDs must be unique".into(),
+            ));
+        }
+        let normalized_manifest = serde_json::to_vec(event)?;
+        if normalized_manifest.len() > MAX_MANIFEST_BYTES {
+            return Err(EnclaveError::InvalidRequest(
+                "reference batch event manifest is too large".into(),
+            ));
+        }
+        manifest_digests.push(sha256_hex(&normalized_manifest));
+    }
+    let expected_batch_id = reference_batch_id(&request.events)?;
+    if request.batch_id != expected_batch_id {
+        return Err(EnclaveError::InvalidRequest(
+            "reference batch_id does not match its ordered events".into(),
+        ));
+    }
+    let last_sequence = request
+        .events
+        .last()
+        .map(|event| event.sequence)
+        .expect("validated nonempty reference batch");
+    Ok(ValidatedReferenceBatch {
+        aggregate_manifest_digest: reference_batch_manifest_digest(&manifest_digests)?,
+        manifest_digests,
+        event_ids: request
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect(),
+        stream_id: first.stream_id.clone(),
+        first_sequence: first.sequence,
+        last_sequence,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -743,6 +892,11 @@ fn response_asset_id(manifest: &CaptureEventManifest) -> Result<String> {
 pub fn router() -> Router<Arc<CpState>> {
     Router::new()
         .route("/api/v2/capture/events", post(upload_capture_event))
+        .route(
+            "/api/v2/capture/screen-reference-batches",
+            post(upload_screen_reference_batch)
+                .layer(DefaultBodyLimit::max(MAX_REFERENCE_BATCH_BYTES)),
+        )
         .route("/api/v2/capture/events/{event_id}", get(capture_status))
         .route(
             "/api/v2/capture/sessions/{capture_session_id}",
@@ -757,6 +911,220 @@ pub fn router() -> Router<Arc<CpState>> {
             get(person_statements),
         )
         .layer(DefaultBodyLimit::max(MAX_MULTIPART_BYTES))
+}
+
+async fn upload_screen_reference_batch(
+    State(state): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
+    Json(request): Json<ScreenReferenceBatchRequest>,
+) -> Response {
+    let started_at = Instant::now();
+    let user_id = user.0;
+    let manifest = request.events.first();
+    if headers
+        .get("kioku-delivery-mode")
+        .and_then(|value| value.to_str().ok())
+        != Some("encrypted-outbox-v1")
+    {
+        return capture_failure_response_for_route(
+            "screen_reference_batch",
+            started_at,
+            manifest,
+            CaptureIngestFailureReason::RequestInvalid,
+            bad_request("reference batches require encrypted outbox delivery mode"),
+        );
+    }
+    match limits::account_active(&state.control, &user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return capture_failure_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                CaptureIngestFailureReason::AccountSuspended,
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "account_suspended"})),
+                )
+                    .into_response(),
+            )
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "capture reference batch account lookup failed");
+            return capture_failure_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                CaptureIngestFailureReason::AccountStatusUnavailable,
+                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response(),
+            );
+        }
+    }
+    if !state.reference_batch_limiter.consume(&user_id).await {
+        return capture_failure_response_for_route(
+            "screen_reference_batch",
+            started_at,
+            manifest,
+            CaptureIngestFailureReason::RateLimited,
+            rate_limited_response(),
+        );
+    }
+    let validated = match validate_reference_batch(&request) {
+        Ok(value) => value,
+        Err(error) => {
+            return capture_error_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                error,
+            )
+        }
+    };
+    let _batch_permit = match Arc::clone(&state.reference_batch_concurrency).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return capture_failure_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                CaptureIngestFailureReason::RateLimited,
+                rate_limited_response(),
+            )
+        }
+    };
+    let _lifecycle_guard = match state.store.lock_user_lifecycle(&user_id).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return capture_failure_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                CaptureIngestFailureReason::LifecycleUnavailable,
+                error.into_response(),
+            )
+        }
+    };
+    let _content_write = match state.store.acquire_content_write(&user_id).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            return capture_failure_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                CaptureIngestFailureReason::LifecycleUnavailable,
+                error.into_response(),
+            )
+        }
+    };
+    let preflight = state
+        .store
+        .with_user_read(&user_id, |conn| {
+            request
+                .events
+                .iter()
+                .zip(&validated.manifest_digests)
+                .map(|(event, digest)| preflight_source_event(conn, event, digest, None))
+                .collect::<Result<Vec<_>>>()
+        })
+        .await;
+    let preflight = match preflight {
+        Ok(value) => value,
+        Err(error) => {
+            return capture_error_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                error,
+            )
+        }
+    };
+    let new_event_ids = preflight
+        .iter()
+        .zip(&validated.event_ids)
+        .filter(|(outcome, _)| matches!(outcome, PreflightOutcome::New))
+        .map(|(_, event_id)| event_id.clone())
+        .collect::<Vec<_>>();
+    if let Err(response) = super::billing::reserve_recording_delivery_batch(
+        &state,
+        &user_id,
+        &request.batch_id,
+        &validated.aggregate_manifest_digest,
+        &validated.stream_id,
+        validated.first_sequence,
+        validated.last_sequence,
+        &validated.event_ids,
+        &new_event_ids,
+    )
+    .await
+    {
+        let reason = recording_entitlement_failure_reason(response.status());
+        return capture_failure_response_for_route(
+            "screen_reference_batch",
+            started_at,
+            manifest,
+            reason,
+            response,
+        );
+    }
+
+    let recorded = state
+        .store
+        .with_user(&user_id, |conn| {
+            record_reference_batch(conn, &user_id, &request.events, &validated.manifest_digests)
+        })
+        .await;
+    let recorded = match recorded {
+        Ok(value) => value,
+        Err(error) => {
+            return capture_error_response_for_route(
+                "screen_reference_batch",
+                started_at,
+                manifest,
+                error,
+            )
+        }
+    };
+    if let Err(error) = state.store.save_user(&user_id).await {
+        tracing::error!(error = %error, "capture reference batch persistence failed");
+        return capture_failure_response_for_route(
+            "screen_reference_batch",
+            started_at,
+            manifest,
+            CaptureIngestFailureReason::PersistenceUnavailable,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "capture persistence failed",
+            )
+                .into_response(),
+        );
+    }
+    super::billing::complete_recording_delivery_batch(
+        &state,
+        &user_id,
+        &request.batch_id,
+        &validated.aggregate_manifest_digest,
+        &validated.event_ids,
+    )
+    .await;
+    let status = if recorded.new_count == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    (
+        status,
+        Json(ScreenReferenceBatchAccepted {
+            batch_id: request.batch_id,
+            stream_id: validated.stream_id,
+            first_sequence: validated.first_sequence,
+            last_sequence: validated.last_sequence,
+            new_count: recorded.new_count,
+            duplicate_count: recorded.duplicate_count,
+            committed_through_sequence: recorded.committed_through_sequence,
+        }),
+    )
+        .into_response()
 }
 
 async fn upload_capture_event(
@@ -985,6 +1353,22 @@ async fn upload_capture_event(
         Ok(PreflightOutcome::Duplicate {
             committed_through_sequence,
         }) => {
+            // A prior attempt may have committed only to the in-memory archive
+            // before its durable save failed. Flush even duplicate preflight
+            // state before acknowledging or clearing delayed-delivery authority.
+            if let Err(error) = state.store.save_user(&user_id).await {
+                tracing::error!(error = %error, "duplicate capture persistence failed");
+                return capture_failure_response(
+                    started_at,
+                    Some(&manifest),
+                    CaptureIngestFailureReason::PersistenceUnavailable,
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "capture persistence failed",
+                    )
+                        .into_response(),
+                );
+            }
             if encrypted_outbox_delivery {
                 super::billing::complete_recording_delivery(&state, &user_id, &manifest.event_id)
                     .await;
@@ -1777,6 +2161,16 @@ fn capture_failure_response(
     reason: CaptureIngestFailureReason,
     response: Response,
 ) -> Response {
+    capture_failure_response_for_route("capture_event", started_at, manifest, reason, response)
+}
+
+fn capture_failure_response_for_route(
+    route: &'static str,
+    started_at: Instant,
+    manifest: Option<&CaptureEventManifest>,
+    reason: CaptureIngestFailureReason,
+    response: Response,
+) -> Response {
     let status = response.status().as_u16();
     let status_class = match status {
         400..=499 => "4xx",
@@ -1795,7 +2189,7 @@ fn capture_failure_response(
         tracing::error!(
             target: "kioku::capture_ingest",
             metric_schema = "capture_ingest_failure_v1",
-            route = "capture_event",
+            route,
             status,
             status_class,
             stream_kind,
@@ -1808,7 +2202,7 @@ fn capture_failure_response(
         tracing::warn!(
             target: "kioku::capture_ingest",
             metric_schema = "capture_ingest_failure_v1",
-            route = "capture_event",
+            route,
             status,
             status_class,
             stream_kind,
@@ -1826,8 +2220,18 @@ fn capture_error_response(
     manifest: Option<&CaptureEventManifest>,
     error: EnclaveError,
 ) -> Response {
+    capture_error_response_for_route("capture_event", started_at, manifest, error)
+}
+
+fn capture_error_response_for_route(
+    route: &'static str,
+    started_at: Instant,
+    manifest: Option<&CaptureEventManifest>,
+    error: EnclaveError,
+) -> Response {
     let reason = match &error {
-        EnclaveError::CaptureReference(reason) => match reason {
+        EnclaveError::CaptureReference(reason)
+        | EnclaveError::CaptureReferenceBatch { reason, .. } => match reason {
             CaptureReferenceFailureReason::CanonicalUnavailable => {
                 CaptureIngestFailureReason::CanonicalUnavailable
             }
@@ -1849,7 +2253,7 @@ fn capture_error_response(
         _ => CaptureIngestFailureReason::Internal,
     };
     let response = error.into_response();
-    capture_failure_response(started_at, manifest, reason, response)
+    capture_failure_response_for_route(route, started_at, manifest, reason, response)
 }
 
 fn recording_entitlement_failure_reason(status: StatusCode) -> CaptureIngestFailureReason {
@@ -2901,6 +3305,65 @@ fn record_reference_event(
     manifest: &CaptureEventManifest,
     manifest_digest: &str,
 ) -> Result<RecordOutcome> {
+    let tx = conn.unchecked_transaction()?;
+    let outcome =
+        record_reference_event_in_transaction(&tx, account_id, manifest, manifest_digest)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+struct RecordedReferenceBatch {
+    new_count: usize,
+    duplicate_count: usize,
+    committed_through_sequence: i64,
+}
+
+fn record_reference_batch(
+    conn: &Connection,
+    account_id: &str,
+    events: &[CaptureEventManifest],
+    manifest_digests: &[String],
+) -> Result<RecordedReferenceBatch> {
+    if events.is_empty() || events.len() != manifest_digests.len() {
+        return Err(EnclaveError::InvalidRequest(
+            "reference batch digest count is invalid".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut new_count = 0usize;
+    let mut duplicate_count = 0usize;
+    for (index, (event, digest)) in events.iter().zip(manifest_digests).enumerate() {
+        let outcome = match record_reference_event_in_transaction(&tx, account_id, event, digest) {
+            Ok(outcome) => outcome,
+            Err(EnclaveError::CaptureReference(reason)) => {
+                return Err(EnclaveError::CaptureReferenceBatch {
+                    reason,
+                    index,
+                    sequence: event.sequence,
+                })
+            }
+            Err(error) => return Err(error),
+        };
+        match outcome {
+            RecordOutcome::Created => new_count += 1,
+            RecordOutcome::Duplicate => duplicate_count += 1,
+        }
+    }
+    let committed_through_sequence = committed_through_sequence(&tx, &events[0].stream_id)?;
+    tx.commit()?;
+    Ok(RecordedReferenceBatch {
+        new_count,
+        duplicate_count,
+        committed_through_sequence,
+    })
+}
+
+fn record_reference_event_in_transaction(
+    conn: &Connection,
+    account_id: &str,
+    manifest: &CaptureEventManifest,
+    manifest_digest: &str,
+) -> Result<RecordOutcome> {
     manifest.validate()?;
     if manifest.media_disposition != MediaDisposition::Reference {
         return Err(EnclaveError::InvalidRequest(
@@ -2995,8 +3458,7 @@ fn record_reference_event(
         ));
     }
 
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO capture_sessions \
          (id,device_id,install_id,started_at,last_event_at,schema_version,ended_at) \
          VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END) \
@@ -3013,7 +3475,7 @@ fn record_reference_event(
             manifest.session_finished.unwrap_or(false)
         ],
     )?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO capture_streams \
          (id,capture_session_id,device_id,stream_kind) VALUES (?1,?2,?3,?4) \
          ON CONFLICT(id) DO NOTHING",
@@ -3026,7 +3488,7 @@ fn record_reference_event(
     )?;
     let context_json = serde_json::to_string(current_context)?;
     let internal_asset_id = format!("reference-{}", manifest.event_id);
-    let event_insert = tx.execute(
+    let event_insert = conn.execute(
         "INSERT INTO capture_events \
          (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence,\
           source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,\
@@ -3071,9 +3533,8 @@ fn record_reference_event(
         }
         return Err(error.into());
     }
-    record_browser_observation(&tx, manifest)?;
-    advance_contiguous_ack(&tx, &manifest.stream_id)?;
-    tx.commit()?;
+    record_browser_observation(conn, manifest)?;
+    advance_contiguous_ack(conn, &manifest.stream_id)?;
     Ok(RecordOutcome::Created)
 }
 
@@ -3489,6 +3950,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn batched_screen_reference_rebase_identifies_only_index_sequence_and_reason() {
+        let response = EnclaveError::CaptureReferenceBatch {
+            reason: CaptureReferenceFailureReason::CanonicalUnavailable,
+            index: 7,
+            sequence: 42,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1_024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "error": "screen_reference_rebase_required",
+                "reason": "canonical_unavailable",
+                "index": 7,
+                "sequence": 42
+            })
+        );
+    }
+
     #[test]
     fn capture_failure_telemetry_uses_only_fixed_reason_classes() {
         assert_eq!(
@@ -3771,6 +4255,166 @@ mod tests {
                 .to_string()
                 .contains("idempotency")
         );
+    }
+
+    #[test]
+    fn reference_batch_validation_is_bounded_contiguous_and_serializer_independent() {
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        let cross_language_vector = vec![
+            reference_to(&canonical, 43, "reference-event-1"),
+            reference_to(&canonical, 44, "reference-event-2"),
+        ];
+        assert_eq!(
+            reference_batch_id(&cross_language_vector).unwrap(),
+            "e8e70a04d46c07aa978325fc8bec5bc7e8a7d67a1f89d595facc835cbe234709"
+        );
+        let references = vec![
+            reference_to(&canonical, 1, "screen-event-1"),
+            reference_to(&canonical, 2, "screen-event-2"),
+        ];
+        let batch_id = reference_batch_id(&references).unwrap();
+        let request = ScreenReferenceBatchRequest {
+            schema_version: 1,
+            batch_id: batch_id.clone(),
+            events: references.clone(),
+        };
+        let validated = validate_reference_batch(&request).unwrap();
+        assert_eq!(validated.first_sequence, 1);
+        assert_eq!(validated.last_sequence, 2);
+        assert_eq!(validated.event_ids, ["screen-event-1", "screen-event-2"]);
+        assert_eq!(batch_id.len(), 64);
+
+        let mut changed_context = references.clone();
+        changed_context[1].context.as_mut().unwrap().window_title = Some("Changed".into());
+        changed_context[1]
+            .reference
+            .as_mut()
+            .unwrap()
+            .context_fingerprint =
+            semantic_context_fingerprint(changed_context[1].context.as_ref().unwrap()).unwrap();
+        assert_eq!(reference_batch_id(&changed_context).unwrap(), batch_id);
+        let changed_digests = changed_context
+            .iter()
+            .map(manifest_digest)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_ne!(
+            reference_batch_manifest_digest(&validated.manifest_digests).unwrap(),
+            reference_batch_manifest_digest(&changed_digests).unwrap()
+        );
+
+        let mut gap = request;
+        gap.events[1].sequence = 3;
+        gap.batch_id = reference_batch_id(&gap.events).unwrap();
+        assert!(validate_reference_batch(&gap).is_err());
+
+        let mut oversized = vec![reference_to(&canonical, 1, "oversized-reference")];
+        oversized[0].context.as_mut().unwrap().visible_windows =
+            Some(json!("x".repeat(MAX_MANIFEST_BYTES)));
+        oversized[0].reference.as_mut().unwrap().context_fingerprint =
+            semantic_context_fingerprint(oversized[0].context.as_ref().unwrap()).unwrap();
+        let oversized = ScreenReferenceBatchRequest {
+            schema_version: 1,
+            batch_id: reference_batch_id(&oversized).unwrap(),
+            events: oversized,
+        };
+        assert!(validate_reference_batch(&oversized).is_err());
+    }
+
+    #[test]
+    fn reference_batch_atomically_records_alternating_displays_and_mixed_duplicates() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let display_one = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        let mut display_two = valid_screen_manifest(1, "screen-event-1", "screen-asset-1");
+        display_two.context.as_mut().unwrap().display_id = Some(84);
+        record_source_event(
+            &conn,
+            "account-1",
+            &display_one,
+            &manifest_digest(&display_one).unwrap(),
+            "object-0",
+        )
+        .unwrap();
+        record_source_event(
+            &conn,
+            "account-1",
+            &display_two,
+            &manifest_digest(&display_two).unwrap(),
+            "object-1",
+        )
+        .unwrap();
+        let first = reference_to(&display_one, 2, "screen-event-2");
+        let second = reference_to(&display_two, 3, "screen-event-3");
+        record_reference_event(
+            &conn,
+            "account-1",
+            &first,
+            &manifest_digest(&first).unwrap(),
+        )
+        .unwrap();
+        let events = vec![first, second];
+        let digests = events
+            .iter()
+            .map(manifest_digest)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let outcome = record_reference_batch(&conn, "account-1", &events, &digests).unwrap();
+        assert_eq!(outcome.new_count, 1);
+        assert_eq!(outcome.duplicate_count, 1);
+        assert_eq!(outcome.committed_through_sequence, 3);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM capture_events WHERE media_disposition='reference'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn invalid_middle_reference_rolls_back_the_complete_batch() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        record_source_event(
+            &conn,
+            "account-1",
+            &canonical,
+            &manifest_digest(&canonical).unwrap(),
+            "object-0",
+        )
+        .unwrap();
+        let first = reference_to(&canonical, 1, "screen-event-1");
+        let mut invalid = reference_to(&canonical, 2, "screen-event-2");
+        invalid.reference.as_mut().unwrap().canonical_event_id = "missing-event".into();
+        let third = reference_to(&canonical, 3, "screen-event-3");
+        let events = vec![first, invalid, third];
+        let digests = events
+            .iter()
+            .map(manifest_digest)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(matches!(
+            record_reference_batch(&conn, "account-1", &events, &digests),
+            Err(EnclaveError::CaptureReferenceBatch {
+                reason: CaptureReferenceFailureReason::CanonicalUnavailable,
+                index: 1,
+                sequence: 2,
+            })
+        ));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM capture_events WHERE media_disposition='reference'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(committed_through_sequence(&conn, "screen-1").unwrap(), 0);
     }
 
     #[test]

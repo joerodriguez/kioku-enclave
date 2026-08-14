@@ -242,6 +242,73 @@ coverage.
 iOS imported screenshots remain intentional canonical assets; clients must not
 apply perceptual suppression to them.
 
+### Batch metadata-only screen references
+
+`POST /api/v2/capture/screen-reference-batches`
+
+Content type: `application/json`. This route is available only to the Mac's encrypted
+outbox delivery path and therefore requires
+`Kioku-Delivery-Mode: encrypted-outbox-v1`. The body is capped at 1 MiB. Its JSON object
+contains `schema_version: 1`, a `batch_id` of exactly 64 lowercase hexadecimal
+characters, and an `events` array containing 1 to 64 complete
+`CaptureEventManifest` reference objects.
+
+Every `events` member is the complete metadata-only `mac_screen` reference manifest
+described above. Members must have the same device, install, capture session, and stream;
+their sequences must be ascending and contiguous; their event IDs must be unique; and no
+member may contain media bytes. Each canonical dependency is validated independently, so
+references in one stream may target different earlier canonical displays.
+
+`batch_id` is SHA-256 over this exact byte preimage: UTF-8
+`kioku.screen-reference-batch.v1`, one zero byte, a big-endian unsigned 32-bit event
+count, then for each ordered event a big-endian unsigned 32-bit UTF-8 event-ID length,
+the event-ID bytes, and a big-endian unsigned 64-bit sequence. The enclave separately
+binds the receipt to its typed, normalized per-event manifest digests, so reusing a batch
+ID with changed manifests returns HTTP `409` even if JSON encoding or key order differs.
+
+A batch containing at least one new event returns HTTP `201`; an exact duplicate returns
+HTTP `200`:
+
+```json
+{
+  "batch_id": "64 lowercase hexadecimal characters",
+  "stream_id": "019fbab2-8413-7053-9117-eb249b72b169",
+  "first_sequence": 43,
+  "last_sequence": 63,
+  "new_count": 21,
+  "duplicate_count": 0,
+  "committed_through_sequence": 63
+}
+```
+
+The enclave validates the whole batch, bulk-reserves the existing per-event delayed-
+delivery authority, records every new reference/browser observation in one user
+transaction, advances the contiguous acknowledgement once, and durably saves the user
+archive once. It returns success only after that save. A failed or ambiguous save retains
+the per-event reservations for idempotent retry; it does not acknowledge volatile rows or
+spend the same event twice. Every genuinely new reference still costs one event credit and
+zero media bytes. The batch receipt is correlation state, not billing authority.
+
+A canonical dependency failure rejects the whole batch with HTTP `400` and the same fixed
+error and bounded reason as individual reference repair, plus only the failing zero-based
+`index` and `sequence`:
+
+```json
+{
+  "error": "screen_reference_rebase_required",
+  "reason": "context_fingerprint_mismatch",
+  "index": 7,
+  "sequence": 50
+}
+```
+
+The client must preserve every queued item, rebase only that exact observation as a
+canonical event with the same event ID and sequence, and retry the remaining dependency-
+ordered work. HTTP `401` requires credential refresh without retrying the stale bearer;
+HTTP `429` and 5xx retain ciphertext and use bounded backoff. The client may fall back to
+individual event upload only when an authenticated production server definitively returns
+`404`, `405`, or `501` for this additive route.
+
 `stream_kind` is one of `mic`, `system_audio`, `mac_screen`, `ios_mic`,
 `ios_imported_screenshot`, or `ios_shared_page`.
 

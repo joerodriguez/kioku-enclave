@@ -23,6 +23,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
+use crate::error::EnclaveError;
+
 use super::{auth::AuthUser, control_store::RetainedAccountMetrics, CpState};
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
@@ -1127,6 +1129,63 @@ pub async fn reserve_recording_delivery(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn reserve_recording_delivery_batch(
+    state: &CpState,
+    user_id: &str,
+    batch_id: &str,
+    manifest_digest: &str,
+    stream_id: &str,
+    first_sequence: i64,
+    last_sequence: i64,
+    event_ids: &[String],
+    new_event_ids: &[String],
+) -> Result<(), Response> {
+    match state
+        .control
+        .reserve_recording_delivery_batch(
+            user_id,
+            batch_id,
+            manifest_digest,
+            stream_id,
+            first_sequence,
+            last_sequence,
+            event_ids,
+            new_event_ids,
+        )
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) if !state.config.billing_enforcement_mode.enforces() => Ok(()),
+        Ok(false) => Err(inactive_lease()),
+        Err(EnclaveError::Conflict(message)) => {
+            Err(lease_conflict(if message.contains("too many pending") {
+                "reference_batch_limit"
+            } else {
+                "idempotency_conflict"
+            }))
+        }
+        Err(_) if !state.config.billing_enforcement_mode.enforces() => Ok(()),
+        Err(_) => Err(service_unavailable()),
+    }
+}
+
+pub async fn complete_recording_delivery_batch(
+    state: &CpState,
+    user_id: &str,
+    batch_id: &str,
+    manifest_digest: &str,
+    event_ids: &[String],
+) {
+    if let Err(error) = state
+        .control
+        .complete_recording_delivery_batch(user_id, batch_id, manifest_digest, event_ids)
+        .await
+    {
+        warn!(error = %error, "recording delivery batch reservation cleanup failed");
+    }
+}
+
 pub async fn complete_recording_delivery(state: &CpState, user_id: &str, event_id: &str) {
     if let Err(error) = state
         .control
@@ -2028,6 +2087,8 @@ mod tests {
             reviewer_verifier: None,
             apple_provider: None,
             sync_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
+            reference_batch_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
+            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
             mcp_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
             oauth_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
             test_email_limiter: super::super::limits::RateLimiter::new(1.0, 1.0),
