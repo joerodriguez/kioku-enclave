@@ -154,6 +154,34 @@ persistence or deletion.
 This PR-A protocol persists capability facts only. Destructive execution and cleanup remain
 separate activation blockers.
 
+## WAL logical idempotency activation gate
+
+- [x] Add fixed versioned operation kinds, nonzero opaque caller-stable IDs,
+  domain-separated bounded request fingerprints, bounded canonical replay
+  results, and sealed per-domain mutation/replay plans.
+- [x] Define the sealed per-domain ledger contract and a test-only bounded
+  exemplar: each future domain owns a distinct hard-capped row family and exact
+  indexed resolver; no universal table, full scan, or production implementation
+  exists. Prove atomic apply/replay, caps-before-SQL, conflict, rollback,
+  corruption, restart, and serialization behavior.
+- [x] Add a private test-only Store WAL policy that leaves all production
+  constructors on legacy snapshots and rejects generic mutation, dirty save or
+  eviction, legacy-envelope rewrite, and schema migration without provider PUT.
+- [x] Structurally pin all 148 production Store mutation/save call expressions,
+  all 15 factory-definition/call/literal construction sites, every policy
+  selector/reference, and 17 worker spawns—including full owning bodies and
+  cross-helper B dependencies—in an exact reviewed A/B/C inventory. Scanner
+  fixtures prove comments/literals/test items/nested functions, qualified calls,
+  new factories, or conditional-main policy selection cannot hide drift.
+- [x] Keep capture/result acknowledgement, archive publication, root/witness
+  authority, routes, workers, startup/config, providers, cloud mutation, and
+  deployment entirely disconnected.
+- [ ] Implement separately reviewed operation-specific A-domain owners and WAL
+  publication/reconciliation; refactor B domains with stable attempt identity;
+  keep C domains fail-closed before enabling the Store policy outside tests.
+
+This gate does not activate WAL persistence or change any user-visible runtime behavior.
+
 ## Firestore transport-probe release boundary
 
 - [x] Made one exact checked-in, non-secret probe profile the sole input to both build

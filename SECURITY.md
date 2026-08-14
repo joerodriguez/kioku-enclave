@@ -769,6 +769,45 @@ This codec/table is not yet route-wired, witnessed, or eligible as idempotency e
 retention and GC remain disabled until source-entity and retry-window semantics are
 implemented.
 
+**ADR-0022 inactive WAL logical-idempotency gate:** a separate fixed-domain codec accepts only
+nonzero caller-stable operation IDs, version/domain-separated request fingerprints, and bounded
+canonical replay results. Its sealed plans require each supported domain to own canonicalization,
+mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
+there is no universal receipt table, table selector, or lifetime scan. This slice provides only the
+sealed contract and a test-only 64-row/262,720-byte exemplar that reserves capacity before domain SQL
+and proves exact replay remains one indexed lookup at the cap. No production domain ledger exists,
+so unsupported domains remain disabled. A future owner must commit a domain row and its mutation
+under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
+substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
+before actor admission, reconcile pending publication, commit the logical mutation and same-ID
+capture, exact-read immutable uploads, CAS/reconcile the witness, and settle publication before
+acknowledging the retained result. Cancellation after local commit and before settlement poisons
+that actor until durable reconciliation; no detached publication is introduced here.
+
+The reviewed operation inventory is deliberately asymmetric. Stable portable domain A contains
+capture events and session finish, selected screenshots, finalization queue/commit, deterministic
+media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
+and reviewer/backfill writes. Domain B remains disabled pending explicit caller/attempt identity or
+semantic refactoring: leases and failure/retry counters or times, Vertex begin, media-DEK first
+write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
+purge, source-keyless legacy ingest, retired episode mutations, arbitrary Store SQL, and account
+deletion. A structural source inventory pins every production Store mutation/save call (including
+qualified forms), every factory definition/call and Store literal, every persistence-policy
+reference/assignment, and every worker spawn by exact owner/expression hashes. A new factory,
+visibility change, conditional runtime selector, or call site therefore requires renewed review.
+
+Every live Store constructor still selects legacy whole-snapshot persistence. The private
+`WalLogicalOnly` policy is test-only and fail-closed: reads use SQLite `query_only`; generic
+mutation closures, dirty save/eviction, envelope rewrite, and non-current schema are rejected
+without a provider write. A missing user is rejected before KMS wrapping, empty-database creation,
+temporary-file creation, or provider upload. Existing plaintext is preflighted as a complete
+checkpointed main database with no exact `-wal`/`-shm` sidecars, then opened through an immutable
+read-only SQLite URI. Schema compatibility is checked against a separately constructed current
+schema, and both successful and schema-failing opens leave the main file present with no sidecar.
+This slice has no WAL publisher, Store operation owner,
+capture/root/witness transition, runtime selector, route, worker, provider, cloud, or deployment
+wiring and does not activate archive-v3 persistence.
+
 Root objects are explicitly named as candidates. Crashes and CAS races may leave more
 than one immutable candidate for a sequence; none has authority unless the independent
 witness names its exact object ID and ciphertext hash, and recovery never selects one by

@@ -132,6 +132,10 @@ mod archive_v3_journal;
 // deletion, cutover, or other production authority.
 mod archive_v3_legacy_extent_session;
 mod archive_v3_operation;
+// Inactive ADR-0022 logical-write idempotency gate. It defines only a bounded,
+// domain-sealed replay contract plus a test exemplar, and no production ledger,
+// WAL publisher, Store authority, provider, witness, route, worker, or startup.
+mod archive_v3_wal_idempotency;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
 // registered SQLite VFS and has no Store, provider, route, or authority wiring.
 mod archive_v3_shadow;

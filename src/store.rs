@@ -47,6 +47,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     ffi::{CStr, CString},
     hash::{Hash, Hasher},
+    io::Read,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
@@ -192,6 +193,16 @@ struct UserHandle {
     temp_path: PathBuf,
 }
 
+/// Persistence authority selected only at construction. Production remains
+/// on the legacy whole-snapshot path. The inactive WAL-only policy is a
+/// fail-closed test seam: it permits guarded reads but cannot acknowledge or
+/// persist an unauthenticated logical mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorePersistencePolicy {
+    LegacySnapshot,
+    WalLogicalOnly,
+}
+
 /// The shared store, wrapped in Arc so handlers can clone it cheaply.
 pub struct Store {
     registry: Mutex<StoreRegistry>,
@@ -206,6 +217,7 @@ pub struct Store {
     /// Inactive local-only injection. Every production constructor stores
     /// `None`; no startup/config/provider path can install the capture VFS.
     shadow_capture: Option<Arc<StoreShadowCapture>>,
+    persistence_policy: StorePersistencePolicy,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     /// Current media write/read bucket. New capture objects are written here.
@@ -1100,6 +1112,26 @@ impl Store {
         max_open: usize,
         shadow_capture: Option<Arc<StoreShadowCapture>>,
     ) -> Self {
+        Self::new_internal_with_max_open_shadow_capture_and_policy(
+            kms,
+            gcs,
+            media_gcs,
+            legacy_media_gcs,
+            max_open,
+            shadow_capture,
+            StorePersistencePolicy::LegacySnapshot,
+        )
+    }
+
+    fn new_internal_with_max_open_shadow_capture_and_policy(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        media_gcs: Arc<dyn GcsClient>,
+        legacy_media_gcs: Arc<dyn GcsClient>,
+        max_open: usize,
+        shadow_capture: Option<Arc<StoreShadowCapture>>,
+        persistence_policy: StorePersistencePolicy,
+    ) -> Self {
         Store {
             registry: Mutex::new(StoreRegistry {
                 actors: HashMap::new(),
@@ -1112,6 +1144,7 @@ impl Store {
             lifecycle_gates: Mutex::new(HashMap::new()),
             content_write_barrier: Arc::new(ContentWriteBarrier::default()),
             shadow_capture,
+            persistence_policy,
             kms,
             gcs,
             media_gcs,
@@ -1122,6 +1155,27 @@ impl Store {
             legacy_checkpoint_reconciliation: Mutex::new(LegacyCheckpointReconciliation::default()),
             legacy_fence_key: StdRwLock::new(initial_legacy_fence_key()),
         }
+    }
+
+    /// Inactive test-only constructor for the fail-closed WAL logical-write
+    /// gate. There is deliberately no environment, startup, config, route, or
+    /// production constructor that can select this policy.
+    #[cfg(test)]
+    pub(crate) fn new_wal_logical_only_for_test(
+        kms: Arc<dyn KmsClient>,
+        gcs: Arc<dyn GcsClient>,
+        max_open: usize,
+    ) -> Self {
+        let media = Arc::clone(&gcs);
+        Self::new_internal_with_max_open_shadow_capture_and_policy(
+            kms,
+            gcs,
+            Arc::clone(&media),
+            media,
+            max_open,
+            None,
+            StorePersistencePolicy::WalLogicalOnly,
+        )
     }
 
     /// Install the KMS-protected key that separates provider fence names from
@@ -2445,12 +2499,29 @@ impl Store {
         let handle = state.handle.as_mut().ok_or_else(|| {
             EnclaveError::Store("open-user registry lost its SQLite handle".into())
         })?;
+        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly
+            && (handle.dirty || handle.blob_meta.retry_save_before_access)
+        {
+            return Err(wal_logical_only_error());
+        }
         if handle.blob_meta.retry_save_before_access {
             self.flush_handle(handle).await?;
         }
+        let wal_query_only = self.persistence_policy == StorePersistencePolicy::WalLogicalOnly;
+        if wal_query_only {
+            handle.conn.pragma_update(None, "query_only", true)?;
+        }
         let before = database_mutation_fingerprint(&handle.conn)?;
         let result = f(&handle.conn);
-        match database_mutation_fingerprint(&handle.conn) {
+        let after = database_mutation_fingerprint(&handle.conn);
+        let restore = wal_query_only
+            .then(|| handle.conn.pragma_update(None, "query_only", false))
+            .transpose();
+        if let Err(error) = restore {
+            handle.mark_dirty();
+            return Err(error.into());
+        }
+        match after {
             Ok(after) if after != before => handle.mark_dirty(),
             Ok(_) => {}
             Err(error) => {
@@ -2493,6 +2564,9 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
+        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+            return Err(wal_logical_only_error());
+        }
         let actor = self.actor_for_access(user_id).await?;
         let mut state = actor.state.lock().await;
 
@@ -2527,6 +2601,9 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<(T, bool)>,
     {
+        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+            return Err(wal_logical_only_error());
+        }
         self.with_user(user_id, move |conn| f(conn).map(|(value, _changed)| value))
             .await
     }
@@ -2540,6 +2617,13 @@ impl Store {
         let mut state = actor.state.lock().await;
         self.reject_if_blocked(user_id).await?;
         if let Some(handle) = state.handle.as_mut() {
+            if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+                return if handle.dirty || handle.blob_meta.retry_save_before_access {
+                    Err(wal_logical_only_error())
+                } else {
+                    Ok(())
+                };
+            }
             self.flush_handle(handle).await
         } else if state.cleanly_evicted {
             // Eviction serialized ahead of this save and flushed the same
@@ -3398,6 +3482,23 @@ impl Store {
         let had_handle = state.handle.is_some();
 
         if let Some(handle) = state.handle.as_mut() {
+            if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly
+                && (handle.dirty || handle.blob_meta.retry_save_before_access)
+            {
+                let mut registry = self.registry.lock().await;
+                if let Some(open) = registry.open_users.get_mut(&candidate.user_id) {
+                    if open.status == OpenStatus::Evicting
+                        && Arc::ptr_eq(&open.actor, &candidate.actor)
+                        && transition_matches(open, &candidate.transition)
+                    {
+                        open.status = OpenStatus::Open;
+                        open.transition = None;
+                    }
+                }
+                drop(registry);
+                self.registry_changed.notify_one();
+                return Err(wal_logical_only_error());
+            }
             // A failed flush leaves the connection, generation, and plaintext
             // temp files attached to the same actor. The waiting cache miss
             // fails rather than discarding unpersisted mutations.
@@ -3467,6 +3568,12 @@ impl Store {
                 )
             }
             Err(EnclaveError::NotFound) => {
+                // WAL-only has no reviewed bootstrap/genesis mutation. A
+                // missing user must fail before KMS wrap, empty-database
+                // creation, temp-file creation, or any provider write.
+                if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+                    return Err(wal_logical_only_error());
+                }
                 // New user — generate a fresh DEK and an empty database
                 info!("creating new user index");
                 let (dek, wrapped) = generate_and_wrap_dek(self.kms.as_ref()).await?;
@@ -3487,16 +3594,29 @@ impl Store {
         self.storage_metrics
             .record_logical_db_bytes(plaintext_db.len() as u64);
 
+        // A legacy envelope would require an authoritative rewrite even when
+        // its SQLite schema is otherwise current. WAL-only mode has no owner
+        // for that mutation, so reject before creating or opening a local
+        // database file.
+        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly
+            && envelope_rewrite_dirty
+        {
+            return Err(wal_logical_only_error());
+        }
+
         // Write plaintext to a temp file and open it with rusqlite
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
-        let (conn, shadow_capture_registration, migration_dirty) =
-            match open_db(&temp_path, self.shadow_capture.as_deref()) {
-                Ok(opened) => opened,
-                Err(e) => {
-                    remove_temp_db_files(&temp_path);
-                    return Err(e);
-                }
-            };
+        let (conn, shadow_capture_registration, migration_dirty) = match open_db(
+            &temp_path,
+            self.shadow_capture.as_deref(),
+            self.persistence_policy,
+        ) {
+            Ok(opened) => opened,
+            Err(e) => {
+                remove_temp_db_files(&temp_path);
+                return Err(e);
+            }
+        };
 
         Ok(UserHandle {
             user_id: user_id.to_string(),
@@ -3511,6 +3631,9 @@ impl Store {
     }
 
     async fn flush_handle(&self, handle: &mut UserHandle) -> Result<()> {
+        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly && handle.dirty {
+            return Err(wal_logical_only_error());
+        }
         self.flush_handle_with_admission(handle, false, None).await
     }
 
@@ -3541,6 +3664,9 @@ impl Store {
         deletion_owned: bool,
         allowed_marker_authority: Option<&str>,
     ) -> Result<()> {
+        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly && handle.dirty {
+            return Err(wal_logical_only_error());
+        }
         let started = Instant::now();
         self.storage_metrics.record_save_attempt();
         if !handle.dirty {
@@ -3871,6 +3997,12 @@ impl IdentityRebindTransition {
 
 fn deleted_user_error() -> EnclaveError {
     EnclaveError::Auth("user account is deleted".into())
+}
+
+fn wal_logical_only_error() -> EnclaveError {
+    EnclaveError::Store(
+        "legacy snapshot mutation is disabled until a WAL logical operation is prepared".into(),
+    )
 }
 
 impl UserHandle {
@@ -5059,10 +5191,33 @@ fn database_mutation_fingerprint(conn: &Connection) -> Result<DatabaseMutationFi
 fn open_db(
     path: &PathBuf,
     shadow_capture: Option<&StoreShadowCapture>,
+    persistence_policy: StorePersistencePolicy,
 ) -> Result<(Connection, Option<CaptureRegistration>, bool)> {
     // Register the sqlite-vec extension globally before any connection opens.
     // This is idempotent (Once guard) and thread-safe.
     init_vec_extension();
+    if persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+        // WAL-only is intentionally unavailable with capture: capture would
+        // observe local writes while this gate has no publication owner.
+        if shadow_capture.is_some() {
+            return Err(wal_logical_only_error());
+        }
+        validate_checkpointed_sqlite_file(path)?;
+        ensure_no_sqlite_sidecars(path)?;
+        // SQLite's ordinary read-only WAL mode may still create `-shm` or open
+        // a sidecar. `immutable=1` promises this private copy cannot change and
+        // makes reads use only the checkpointed main file.
+        let uri = sqlite_immutable_uri(path)?;
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let schema_result = validate_wal_logical_schema(&conn);
+        let sidecar_result = ensure_no_sqlite_sidecars(path);
+        schema_result?;
+        sidecar_result?;
+        return Ok((conn, None, false));
+    }
     // Register before opening so both the main database and its first WAL
     // attachment resolve the same connection-scoped capture state. Failure to
     // open drops/retire the registration before the caller removes the file.
@@ -5084,6 +5239,115 @@ fn open_db(
     run_migrations(&conn)?;
     let migrated = database_mutation_fingerprint(&conn)? != before;
     Ok((conn, registration, migrated))
+}
+
+fn ensure_no_sqlite_sidecars(path: &Path) -> Result<()> {
+    if ["-wal", "-shm"]
+        .iter()
+        .any(|suffix| sqlite_sidecar_path(path, suffix).exists())
+    {
+        return Err(wal_logical_only_error());
+    }
+    Ok(())
+}
+
+fn validate_checkpointed_sqlite_file(path: &Path) -> Result<()> {
+    let mut file = std::fs::File::open(path)?;
+    let metadata_len = file.metadata()?.len();
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0"
+        || !matches!(header[18], 1 | 2)
+        || header[19] != header[18]
+    {
+        return Err(wal_logical_only_error());
+    }
+    let change_counter = u32::from_be_bytes(
+        header[24..28]
+            .try_into()
+            .map_err(|_| wal_logical_only_error())?,
+    );
+    let database_pages = u32::from_be_bytes(
+        header[28..32]
+            .try_into()
+            .map_err(|_| wal_logical_only_error())?,
+    );
+    let valid_for = u32::from_be_bytes(
+        header[92..96]
+            .try_into()
+            .map_err(|_| wal_logical_only_error())?,
+    );
+    let encoded_page_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if encoded_page_size == 1 {
+        65_536_u64
+    } else {
+        u64::from(encoded_page_size)
+    };
+    let valid_page_size = page_size.is_power_of_two() && (512..=65_536).contains(&page_size);
+    let expected_len = page_size.checked_mul(u64::from(database_pages));
+    if !valid_page_size
+        || database_pages == 0
+        || change_counter != valid_for
+        || expected_len != Some(metadata_len)
+    {
+        return Err(wal_logical_only_error());
+    }
+    Ok(())
+}
+
+fn sqlite_immutable_uri(path: &Path) -> Result<String> {
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut uri, "%{byte:02X}").map_err(|_| wal_logical_only_error())?;
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Ok(uri)
+}
+
+type SchemaDescriptorRow = (String, String, String, String);
+
+fn schema_descriptor(conn: &Connection) -> Result<Vec<SchemaDescriptorRow>> {
+    let mut statement = conn.prepare(
+        "SELECT type,name,tbl_name,coalesce(sql,'')
+         FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type,name,tbl_name,coalesce(sql,'')",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Prove the decrypted database already has the exact schema a fresh current
+/// database would receive, without mutating the target. Older or extra schema
+/// fails closed until a separately authorized migration runs under legacy
+/// persistence.
+fn validate_wal_logical_schema(conn: &Connection) -> Result<()> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch(SCHEMA_SQL)?;
+    run_migrations(&canonical)?;
+    let current_versions = (
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+        conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?,
+    );
+    let canonical_versions = (
+        canonical.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+        canonical.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?,
+    );
+    if current_versions != canonical_versions
+        || schema_descriptor(conn)? != schema_descriptor(&canonical)?
+    {
+        return Err(wal_logical_only_error());
+    }
+    Ok(())
 }
 
 /// Build a fresh empty SQLite database in memory, serialize it, encrypt it,
@@ -6791,6 +7055,26 @@ pub(crate) mod tests {
         async fn unwrap_dek(&self, wrapped_b64: &str) -> crate::error::Result<Vec<u8>> {
             B64.decode(wrapped_b64)
                 .map_err(|e| crate::error::EnclaveError::Kms(e.to_string()))
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingKms {
+        wraps: AtomicUsize,
+        unwraps: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl KmsClient for CountingKms {
+        async fn wrap_dek(&self, plaintext_dek: &[u8]) -> crate::error::Result<String> {
+            self.wraps.fetch_add(1, Ordering::SeqCst);
+            Ok(B64.encode(plaintext_dek))
+        }
+
+        async fn unwrap_dek(&self, wrapped_b64: &str) -> crate::error::Result<Vec<u8>> {
+            self.unwraps.fetch_add(1, Ordering::SeqCst);
+            B64.decode(wrapped_b64)
+                .map_err(|error| crate::error::EnclaveError::Kms(error.to_string()))
         }
     }
 
@@ -9151,6 +9435,26 @@ pub(crate) mod tests {
         );
     }
 
+    fn seed_current_user_object(gcs: &FakeGcs, user_id: &str) {
+        let dek = Dek([6_u8; 32]);
+        let plaintext = create_empty_db(&dek).unwrap();
+        let ciphertext = encrypt_bound_blob(&dek, &plaintext, &user_blob_context(user_id)).unwrap();
+        gcs.objects.lock().unwrap().insert(
+            gcs_object_name(user_id),
+            vec![FakeObject {
+                ciphertext,
+                wrapped_dek_b64: B64.encode(dek.0),
+                generation: 1,
+                live: true,
+                soft_deleted: false,
+                hard_delete_time: None,
+                crc32c: "fake-crc32c".into(),
+                md5_hash: None,
+                legacy_recovery: None,
+            }],
+        );
+    }
+
     fn seed_user_object_with_legacy_envelope(gcs: &FakeGcs, user_id: &str) {
         let dek = Dek([9_u8; 32]);
         let plaintext = create_empty_db(&dek).unwrap();
@@ -9289,6 +9593,160 @@ pub(crate) mod tests {
             .expect("query_only must be restored after the read closure error");
         store.save_user("guarded-reader").await.unwrap();
         assert_eq!(gcs.put_attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn wal_logical_only_reads_are_query_only_and_mutation_closures_never_run() {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_current_user_object(&gcs, "wal-guard");
+        let store = Store::new_wal_logical_only_for_test(Arc::new(FakeKms), gcs.clone(), 2);
+        let puts_before = gcs.put_attempts();
+        let raw = store
+            .with_user("wal-guard", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES (?1)",
+                    ["2026-08-13T12:00:00Z"],
+                )?;
+                Ok(())
+            })
+            .await;
+        assert!(raw.is_err());
+        assert_eq!(gcs.put_attempts(), puts_before);
+
+        let mut_ran = Arc::new(AtomicBool::new(false));
+        let mut_ran_in_closure = Arc::clone(&mut_ran);
+        assert!(store
+            .with_user_mut("wal-guard", move |_| {
+                mut_ran_in_closure.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .is_err());
+        assert!(!mut_ran.load(Ordering::SeqCst));
+
+        let changed_ran = Arc::new(AtomicBool::new(false));
+        let changed_ran_in_closure = Arc::clone(&changed_ran);
+        assert!(store
+            .with_user_if_changed("wal-guard", move |_| {
+                changed_ran_in_closure.store(true, Ordering::SeqCst);
+                Ok(((), true))
+            })
+            .await
+            .is_err());
+        assert!(!changed_ran.load(Ordering::SeqCst));
+        assert_eq!(gcs.put_attempts(), puts_before);
+    }
+
+    #[tokio::test]
+    async fn wal_logical_only_dirty_save_and_eviction_stay_resident_without_put() {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_current_user_object(&gcs, "wal-dirty");
+        seed_current_user_object(&gcs, "wal-next");
+        let store = Store::new_wal_logical_only_for_test(Arc::new(FakeKms), gcs.clone(), 1);
+        store.with_user_read("wal-dirty", |_| Ok(())).await.unwrap();
+        let actor = match store.actor_for_existing("wal-dirty").await.unwrap() {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("fresh WAL-only actor was unexpectedly evicted"),
+        };
+        {
+            let mut state = actor.state.lock().await;
+            state.handle.as_mut().unwrap().mark_dirty();
+        }
+        let puts_before = gcs.put_attempts();
+        assert!(store.save_user("wal-dirty").await.is_err());
+        assert_eq!(gcs.put_attempts(), puts_before);
+        assert!(store.with_user_read("wal-next", |_| Ok(())).await.is_err());
+        assert_eq!(gcs.put_attempts(), puts_before);
+        let state = actor.state.lock().await;
+        assert!(state.handle.is_some());
+        assert!(state.handle.as_ref().unwrap().dirty);
+    }
+
+    #[tokio::test]
+    async fn wal_logical_only_rejects_migration_or_envelope_rewrite_without_put() {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_user_object_with_missing_schema(&gcs, "wal-migration");
+        seed_user_object_with_legacy_envelope(&gcs, "wal-envelope");
+        let store = Store::new_wal_logical_only_for_test(Arc::new(FakeKms), gcs.clone(), 1);
+        let puts_before = gcs.put_attempts();
+        assert!(store
+            .with_user_read("wal-migration", |_| Ok(()))
+            .await
+            .is_err());
+        assert_eq!(gcs.put_attempts(), puts_before);
+        assert!(matches!(
+            store.actor_for_existing("wal-migration").await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert!(store
+            .with_user_read("wal-envelope", |_| Ok(()))
+            .await
+            .is_err());
+        assert_eq!(gcs.put_attempts(), puts_before);
+        assert!(matches!(
+            store.actor_for_existing("wal-envelope").await,
+            Err(EnclaveError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wal_logical_only_missing_user_has_no_kms_temp_or_put_authority() {
+        let gcs = Arc::new(FakeGcs::new());
+        let kms = Arc::new(CountingKms::default());
+        let prefix = "kioku-wal-missing-";
+        let temp_count = || {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+                .count()
+        };
+        let before_temp = temp_count();
+        let store = Store::new_wal_logical_only_for_test(kms.clone(), gcs.clone(), 1);
+        assert!(store
+            .with_user_read("wal-missing", |_| Ok(()))
+            .await
+            .is_err());
+        assert_eq!(kms.wraps.load(Ordering::SeqCst), 0);
+        assert_eq!(kms.unwraps.load(Ordering::SeqCst), 0);
+        assert_eq!(gcs.put_attempts(), 0);
+        assert_eq!(temp_count(), before_temp);
+    }
+
+    #[test]
+    fn wal_logical_only_immutable_open_never_creates_sqlite_sidecars() {
+        let dek = Dek([8_u8; 32]);
+        let current = create_empty_db(&dek).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let current_path = directory.path().join("current.db");
+        std::fs::write(&current_path, &current).unwrap();
+        assert!(!sqlite_sidecar_path(&current_path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&current_path, "-shm").exists());
+        let (connection, registration, migrated) =
+            open_db(&current_path, None, StorePersistencePolicy::WalLogicalOnly).unwrap();
+        assert!(registration.is_none());
+        assert!(!migrated);
+        assert!(current_path.exists());
+        assert!(!sqlite_sidecar_path(&current_path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&current_path, "-shm").exists());
+        drop(connection);
+
+        let stale_path = directory.path().join("stale.db");
+        std::fs::write(&stale_path, current).unwrap();
+        let stale = Connection::open(&stale_path).unwrap();
+        stale.execute_batch("DROP TABLE email_deliveries;").unwrap();
+        stale
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(stale);
+        let _ = std::fs::remove_file(sqlite_sidecar_path(&stale_path, "-wal"));
+        let _ = std::fs::remove_file(sqlite_sidecar_path(&stale_path, "-shm"));
+        assert!(!sqlite_sidecar_path(&stale_path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&stale_path, "-shm").exists());
+        assert!(open_db(&stale_path, None, StorePersistencePolicy::WalLogicalOnly,).is_err());
+        assert!(stale_path.exists());
+        assert!(!sqlite_sidecar_path(&stale_path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&stale_path, "-shm").exists());
     }
 
     #[tokio::test]
@@ -9732,7 +10190,12 @@ pub(crate) mod tests {
 
         let directory = tempfile::TempDir::new().unwrap();
         let directory_path = directory.path().to_path_buf();
-        assert!(open_db(&directory_path, Some(capture.as_ref())).is_err());
+        assert!(open_db(
+            &directory_path,
+            Some(capture.as_ref()),
+            StorePersistencePolicy::LegacySnapshot,
+        )
+        .is_err());
         assert!(capture.registry.is_empty_for_test());
 
         let unavailable_capture = StoreShadowCapture {
@@ -9741,8 +10204,12 @@ pub(crate) mod tests {
         };
         let database = tempfile::NamedTempFile::new().unwrap();
         let database_path = database.path().to_path_buf();
-        let (connection, registration, _) =
-            open_db(&database_path, Some(&unavailable_capture)).unwrap();
+        let (connection, registration, _) = open_db(
+            &database_path,
+            Some(&unavailable_capture),
+            StorePersistencePolicy::LegacySnapshot,
+        )
+        .unwrap();
         assert!(registration.is_none());
         assert!(unavailable_capture.registry.is_empty_for_test());
         drop(connection);
