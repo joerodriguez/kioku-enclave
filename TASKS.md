@@ -120,8 +120,39 @@ This compiled coordinator does not activate archive-v3 persistence or deletion.
   destructive invocation, cloud mutation, deployment, and user-visible
   behavior disconnected.
 
-This compiled capability is not accepted by deletion and does not activate
-archive-v3 persistence or deletion.
+This compiled capability does not itself authorize provider I/O and does not activate archive-v3
+persistence or deletion.
+
+## Durable pre-witness deletion execution protocol
+
+- [x] Added a separate versioned encrypted-control execution row that binds the
+  exact pre-witness snapshot/seal revisions, bootstrap attempt, random nonzero
+  operation ID, ordered object-set commitment, dimensions, terminal hash, and
+  inventory commitment.
+- [x] Consume the complete authenticated pre-witness inventory only through a
+  producer-private conversion; IDs alone cannot recover execution authority,
+  and there is no conversion to normal witnessed deletion types.
+- [x] Revalidate the immutable tombstoned/fenced absence branch, deterministic
+  Created page set, snapshot, seal, and absence of the normal branch before
+  first bind, adoption, recovery, and every evidence CAS.
+- [x] Enforce the monotonic inventory-bound -> registry-erased ->
+  objects-absent -> physical-complete -> reserved payload-erased matrix with
+  full-row exact replay and rejection of alternate, skipped, regressed, zero,
+  cross-operation, or structurally invalid evidence.
+- [x] Own the sole control SQLite handle outside the shared cache across each
+  execution flush, so cancellation/failure forces an authoritative reload and
+  lost PUT success is accepted only by exact encrypted-ciphertext readback;
+  no local-only stage can mint a recovery capability.
+- [x] Preserve the explicit zero-object geometry under nonzero inventory,
+  object-set, and execution commitments without creating object/provider
+  access, and test close/reopen recovery at every stage.
+- [x] Keep all production destructive evidence producers, provider interfaces,
+  page cleanup, payload cleanup, driver invocation, Store/startup/runtime/
+  config/routes, cloud mutation, deployment, and user-visible behavior out of
+  scope and disconnected.
+
+This PR-A protocol persists capability facts only. Destructive execution and cleanup remain
+separate activation blockers.
 
 ## Firestore transport-probe release boundary
 

@@ -94,6 +94,10 @@ mod archive_v3_witness_disposition;
 // witness recovery, the frozen lifecycle snapshot, reachability, and encrypted
 // v2 pages without startup/runtime/provider construction or deletion calls.
 mod archive_v3_inventory_coordinator;
+// Inactive, type-separated durable execution ledger for pre-witness deletion.
+// It persists evidence commitments only and has no provider, page-store,
+// witness, Store, startup, route, or destructive implementation.
+mod archive_v3_pre_witness_deletion;
 // Inactive exact-name authenticated reachability visitor. Its report remains
 // non-authorizing and is consumed only by the inactive inventory coordinator.
 mod archive_v3_reachability;

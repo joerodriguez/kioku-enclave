@@ -596,6 +596,16 @@ impl CompletePreWitnessDeletionInventory {
         })
     }
 
+    /// Consuming conversion gated by the dedicated pre-witness execution
+    /// module's private producer token. This never yields a normal deletion
+    /// inventory or a provider entry capability.
+    pub(crate) fn into_pre_witness_execution_parts(
+        self,
+        _producer: &crate::archive_v3_pre_witness_deletion::PreWitnessExecutionInventoryProducer,
+    ) -> (Vec<LifecycleInventoryObject>, [u8; 32], usize, usize) {
+        (self.objects, self.commitment, self.key_bytes, self.pages)
+    }
+
     #[cfg(test)]
     pub(crate) fn objects_for_test(&self) -> &[LifecycleInventoryObject] {
         &self.objects
