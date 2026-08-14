@@ -547,6 +547,16 @@ fn service_unavailable() -> Response {
     )
 }
 
+fn checkout_conflict() -> Response {
+    no_store(
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"billing_checkout_conflict"})),
+        )
+            .into_response(),
+    )
+}
+
 async fn get_billing(
     State(state): State<std::sync::Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
@@ -1156,6 +1166,16 @@ fn valid_external_action_url(url: &str) -> bool {
     parsed.host_str().is_some()
 }
 
+fn checkout_response(result: Result<UrlResponse, BillingError>) -> Response {
+    match result {
+        Ok(response) if valid_external_action_url(&response.url) => {
+            no_store(Json(response).into_response())
+        }
+        Err(BillingError::Rejected(409)) => checkout_conflict(),
+        _ => service_unavailable(),
+    }
+}
+
 async fn create_checkout(
     State(state): State<std::sync::Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
@@ -1174,12 +1194,7 @@ async fn create_checkout(
         Ok(value) => value,
         Err(_) => return service_unavailable(),
     };
-    match state.billing.checkout(&account_id, &request).await {
-        Ok(response) if valid_external_action_url(&response.url) => {
-            no_store(Json(response).into_response())
-        }
-        _ => service_unavailable(),
-    }
+    checkout_response(state.billing.checkout(&account_id, &request).await)
 }
 
 async fn create_portal(
@@ -2111,6 +2126,24 @@ mod tests {
             after: None,
         }));
         assert!(serde_urlencoded::from_str::<MarginQuery>("period=2026-08").is_err());
+    }
+
+    #[test]
+    fn checkout_conflicts_are_not_mislabeled_as_unavailability() {
+        let conflict = checkout_response(Err(BillingError::Rejected(409)));
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(conflict.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+
+        let rejected = checkout_response(Err(BillingError::Rejected(422)));
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let invalid_destination = checkout_response(Ok(UrlResponse {
+            url: "http://checkout.example.test/session".into(),
+        }));
+        assert_eq!(
+            invalid_destination.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
