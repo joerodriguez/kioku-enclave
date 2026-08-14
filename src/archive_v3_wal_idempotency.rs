@@ -9,8 +9,9 @@
 //! domain. A caller cannot use a universal receipt table: it must hold a
 //! module-sealed domain plan whose distinct, bounded ledger fixes the request
 //! fingerprint, indexed resolver, and exact replay-result policy. A bounded
-//! test exemplar and the separately reviewed capture-session-finish child
-//! implement that contract; every other production domain remains unsealed.
+//! test exemplar plus the separately reviewed capture-session-finish and
+//! Vertex-usage-outcome children implement that contract; every other
+//! production domain remains unsealed.
 //! This module performs only local SQLite transactions and derives opaque
 //! identifiers. It has no Store connection, launcher, publisher construction,
 //! capture, root, witness, provider, route, worker, or startup path.
@@ -423,6 +424,8 @@ impl DomainLedgerBounds {
 
 impl sealed::DomainPlan for crate::cp::media::wal::CaptureSessionFinishPlan {}
 impl sealed::DomainLedger for crate::cp::media::wal::CaptureSessionFinishLedger {}
+impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageOutcomePlan {}
+impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexUsageOutcomeLedger {}
 
 /// Opaque plan produced before actor entry. Only the private WAL owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.

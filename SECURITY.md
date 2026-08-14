@@ -848,29 +848,40 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly one inactive production A-domain:
-capture-session finish. That domain derives an opaque operation ID from the validated caller-stable
+test-only 64-row/262,720-byte exemplar and now admits exactly two inactive production A-domains:
+capture-session finish and Vertex usage terminal outcome. Capture-session finish derives an opaque
+operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
 lazily creates only its distinct 65,536-row/128-MiB ledger schema within the same transaction. It
 reserves the maximum result before its first domain write, uses the operation primary key for exact
 replay, and full-tuple updates its authenticated row/byte counters. An absent session is a failed
 precondition that rolls back the new schema and consumes no identity; a late ledger failure rolls
-back the session update; a committed replay survives process reopen without another write. All
-other production domain ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
+back the session update; a committed replay survives process reopen without another write. The
+Vertex usage child accepts only the exact 68-byte vtx event ID that the still-disabled B-domain
+allocator must durably create before provider I/O. Its closed request codec distinguishes normalized
+metered/usage-missing response facts, ambiguous status, and not-billed status; the event-derived
+operation ID makes a substituted terminal outcome a fingerprint conflict. It transitions only an
+existing started row or exactly adopts the same pre-existing terminal facts, refreshes coverage only
+on the first transition, and retains the nine-byte unit result in its own
+1,048,576-row/32-MiB ledger. Missing or mismatched events, cap exhaustion, a late ledger insert,
+partial schema, and row/commitment tamper roll back or fail closed; exact replay survives reopen.
+All other production domain ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
 under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
 substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
 before actor admission, reconcile pending publication, commit the logical mutation and same-ID
 capture, exact-read immutable uploads, CAS/reconcile the witness, and settle publication before
 acknowledging the retained result. Cancellation after local commit and before settlement poisons
-that actor until durable reconciliation. The production codec has no Store, route, launcher,
-provider, task, runtime-policy, or acknowledgement connection, and introduces no detached
+that actor until durable reconciliation. The production codecs have no Store, route, launcher,
+worker, provider, task, runtime-policy, or acknowledgement connection, and introduce no detached
 publication.
 
 The reviewed operation inventory is deliberately asymmetric. Stable portable domain A contains
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
-and reviewer/backfill writes. Only capture-session finish has a production codec so far; every
-other A operation remains disabled pending its own separately reviewed codec and the closed launcher.
+and reviewer/backfill writes. Only capture-session finish and Vertex terminal outcome have
+production codecs so far; every other A operation remains disabled pending its own separately
+reviewed codec and the closed launcher. Vertex invocation begin remains B and is not admitted by the
+outcome child.
 Domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, Vertex begin, media-DEK first
 write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
