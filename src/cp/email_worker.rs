@@ -4,6 +4,8 @@
 //! snapshot and current preferences, 24-hour stable idempotency keys, bounded retries,
 //! and fail-closed secret hygiene.
 
+pub(crate) mod wal;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;

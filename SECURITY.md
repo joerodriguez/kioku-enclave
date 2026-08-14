@@ -848,9 +848,9 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly five inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and now admits exactly six inactive production A-domains:
 capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
-raw-media retention settlement, and Vertex usage terminal outcome.
+raw-media retention settlement, provider-accepted email, and Vertex usage terminal outcome.
 Capture-session finish derives an opaque
 operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
@@ -890,7 +890,14 @@ ready/failed media row pruned or adopt the identical terminal row, and it retain
 distinct 1,048,576-row/32-MiB ledger. An early deadline, changed provider fact, changed terminal time,
 cap exhaustion, late ledger failure, partial schema, tamper, or reopen fails closed or exactly replays.
 The future provider deletion boundary must authenticate and settle the exact object before constructing
-this plan; the child cannot call Store or list/read/delete provider objects. All other production domain ledgers
+this plan; the child cannot call Store or list/read/delete provider objects. The email child accepts
+only the local settlement half of a definitive provider acceptance for an
+already durable delivery. The same delivery ID is the external idempotency key and derives the
+operation identity; its exact pending/retry row (including prior attempt, response/error, and
+timestamps), provider message ID, 2xx status, and fixed acceptance time form the fingerprint. It
+either full-row-CASes that predecessor to accepted or adopts only the identical terminal row, with
+unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot send email, allocate or schedule a
+retry, call Store, launch a worker, or acknowledge delivery. All other production domain ledgers
 remain absent and unsupported. A future owner must commit a domain row and its mutation
 under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
 substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
@@ -905,7 +912,7 @@ The reviewed operation inventory is deliberately asymmetric. Stable portable dom
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
 and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch,
-selected-screenshot receipt, raw-media retention settlement, and Vertex terminal outcome have production codecs so far; every other A
+selected-screenshot receipt, raw-media retention settlement, provider-accepted email, and Vertex terminal outcome have production codecs so far; every other A
 operation remains disabled
 pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and
 canonical media's first DEK/provider handoff remain B and are not admitted by those children.

@@ -11,8 +11,9 @@
 //! fingerprint, indexed resolver, and exact replay-result policy. A bounded
 //! test exemplar plus the separately reviewed capture-session-finish,
 //! metadata-only screen-reference-batch, selected-screenshot receipt,
-//! raw-media retention settlement, and Vertex-usage-outcome children
-//! implement that contract; every other production domain remains unsealed.
+//! raw-media retention settlement, provider-accepted email, and
+//! Vertex-usage-outcome children implement that contract; every other
+//! production domain remains unsealed.
 //! This module performs only local SQLite transactions and derives opaque
 //! identifiers. It has no Store connection, launcher, publisher construction,
 //! capture, root, witness, provider, route, worker, or startup path.
@@ -433,6 +434,8 @@ impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotPlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::RetentionSettlementLedger {}
+impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan {}
+impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailAcceptedLedger {}
 
 /// Opaque plan produced before actor entry. Only the private WAL owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.
