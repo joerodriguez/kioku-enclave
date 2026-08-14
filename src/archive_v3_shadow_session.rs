@@ -23,6 +23,8 @@ const VERSION: u8 = 1;
 const SESSION_ID_DOMAIN: &[u8] = b"kioku:archive:v3:shadow-session\0";
 const MAINTENANCE_ZERO_WAL_BINDING_DOMAIN: &[u8] =
     b"kioku:archive:v3:maintenance-zero-wal-binding/v1\0";
+const WAL_OWNER_CHECKPOINT_BINDING_DOMAIN: &[u8] =
+    b"kioku:archive:v3:wal-owner-checkpoint-binding/v1\0";
 pub const SHADOW_SESSION_RECORD_BYTES: usize = 344;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,7 +239,7 @@ impl ShadowSessionBinding {
             .then_some(value)
             .ok_or(ShadowSessionError::Malformed("binding"))
     }
-    fn valid_identity(self) -> bool {
+    fn valid_identity_core(self) -> bool {
         nonzero(&self.archive_id)
             && nonzero(&self.database_epoch)
             && nonzero(&self.registry_epoch)
@@ -248,7 +250,9 @@ impl ShadowSessionBinding {
             && self.owner_fence != 0
             && nonzero(&self.operation_id)
             && nonzero(&self.request_fingerprint)
-            && matches!(self.migration_state, 0 | 1)
+    }
+    fn valid_identity(self) -> bool {
+        self.valid_identity_core() && matches!(self.migration_state, 0 | 1)
     }
     fn valid(self) -> bool {
         self.valid_identity()
@@ -392,6 +396,70 @@ impl ShadowSessionBinding {
             ) == (0, 0, 0))
             .then_some(binding)
             .ok_or(ShadowSessionError::Malformed("maintenance binding"))
+    }
+
+    /// Publisher-only canonical zero-WAL binding for one durable checkpoint
+    /// attempt. Ordinary capture still requires a nonzero WAL tuple and the
+    /// maintenance constructor remains limited to Legacy/ShadowWal.
+    pub(crate) fn from_wal_owner_checkpoint(
+        _token: crate::archive_v3_wal_owner::WalCheckpointSourceContext,
+        witness: &WitnessRecord,
+        lease: WitnessLease,
+        operation_id: [u8; 16],
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        attempt: u32,
+    ) -> Result<Self> {
+        if !nonzero(&operation_id)
+            || session_id.as_bytes() == &[0; 16]
+            || attempt_id.as_bytes() == &[0; 16]
+            || attempt == 0
+            || witness.deletion() != DeletionState::Active
+            || witness.migration() != MigrationState::WalAuthoritative
+            || lease.archive_id() != witness.archive_id()
+            || lease.database_epoch() != witness.database_epoch()
+            || lease.key_epoch() != witness.registry().key_epoch()
+            || !witness.authorizes_lease(lease)
+        {
+            return Err(ShadowSessionError::BindingConflict);
+        }
+        let mut request_fingerprint = Sha256::new();
+        request_fingerprint.update(WAL_OWNER_CHECKPOINT_BINDING_DOMAIN);
+        request_fingerprint.update(operation_id);
+        request_fingerprint.update(session_id.as_bytes());
+        request_fingerprint.update(attempt_id.as_bytes());
+        request_fingerprint.update(attempt.to_be_bytes());
+        let request_fingerprint: [u8; 32] = request_fingerprint.finalize().into();
+        let root = witness.root().root();
+        let registry = witness.registry();
+        let binding = Self {
+            archive_id: *witness.archive_id().as_bytes(),
+            database_epoch: *witness.database_epoch().as_bytes(),
+            database_epoch_generation: witness.database_epoch_generation(),
+            registry_epoch: *registry.key_epoch().as_bytes(),
+            registry_rotation_generation: registry.rotation_generation(),
+            registry_object_id: *registry.object_id().as_bytes(),
+            registry_ciphertext_hash: registry.ciphertext_hash(),
+            base_root_seq: root.sequence(),
+            base_root_object_id: *root.object_id().as_bytes(),
+            base_root_ciphertext_hash: root.ciphertext_hash(),
+            owner_fence: lease.fencing_epoch(),
+            operation_id,
+            request_fingerprint,
+            migration_state: witness.migration() as u8,
+            wal_generation: 0,
+            first_frame_no: 0,
+            frame_count: 0,
+        };
+        (binding.valid_identity_core()
+            && binding.migration_state == MigrationState::WalAuthoritative as u8
+            && (
+                binding.wal_generation,
+                binding.first_frame_no,
+                binding.frame_count,
+            ) == (0, 0, 0))
+            .then_some(binding)
+            .ok_or(ShadowSessionError::Malformed("WAL checkpoint binding"))
     }
 
     fn matches_witness_identity(self, witness: &WitnessRecord) -> bool {
@@ -859,6 +927,87 @@ mod tests {
             0,
             0,
             0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wal_owner_checkpoint_binding_accepts_only_authoritative_live_zero_wal_context() {
+        let (legacy, lease, _) = witnessed_binding();
+        let shadow_root = legacy
+            .with_candidate_root_for_test(
+                RootReference::new(1, ObjectId::from_bytes([41; 16]), [42; 32]),
+                lease.fencing_epoch(),
+            )
+            .root();
+        let shadow = legacy
+            .exact_migration_candidate(
+                &RootAdvance::new(lease, legacy.root(), legacy.registry(), shadow_root),
+                MigrationState::ShadowWal,
+            )
+            .unwrap();
+        let authoritative_root = shadow
+            .with_candidate_root_for_test(
+                RootReference::new(2, ObjectId::from_bytes([43; 16]), [44; 32]),
+                lease.fencing_epoch(),
+            )
+            .root();
+        let authoritative = shadow
+            .exact_migration_candidate(
+                &RootAdvance::new(lease, shadow.root(), shadow.registry(), authoritative_root),
+                MigrationState::WalAuthoritative,
+            )
+            .unwrap();
+        let token = crate::archive_v3_wal_owner::WalCheckpointSourceContext::for_test();
+        let first = ShadowSessionBinding::from_wal_owner_checkpoint(
+            token,
+            &authoritative,
+            lease,
+            [45; 16],
+            ShadowSessionId::from_bytes([46; 16]),
+            ShadowAttemptId::from_bytes([47; 16]),
+            1,
+        )
+        .unwrap();
+        let second = ShadowSessionBinding::from_wal_owner_checkpoint(
+            token,
+            &authoritative,
+            lease,
+            [45; 16],
+            ShadowSessionId::from_bytes([46; 16]),
+            ShadowAttemptId::from_bytes([48; 16]),
+            1,
+        )
+        .unwrap();
+        assert_ne!(first.request_fingerprint(), second.request_fingerprint());
+        assert!(ShadowSessionBinding::from_wal_owner_checkpoint(
+            token,
+            &legacy,
+            lease,
+            [45; 16],
+            ShadowSessionId::from_bytes([46; 16]),
+            ShadowAttemptId::from_bytes([47; 16]),
+            1,
+        )
+        .is_err());
+        assert!(ShadowSessionBinding::from_wal_owner_checkpoint(
+            token,
+            &shadow,
+            lease,
+            [45; 16],
+            ShadowSessionId::from_bytes([46; 16]),
+            ShadowAttemptId::from_bytes([47; 16]),
+            1,
+        )
+        .is_err());
+        assert!(ShadowSessionBinding::from_wal_owner_checkpoint(
+            token,
+            &authoritative,
+            lease,
+            [0; 16],
+            ShadowSessionId::from_bytes([46; 16]),
+            ShadowAttemptId::from_bytes([47; 16]),
+            1,
         )
         .is_err());
     }

@@ -22,9 +22,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    archive_v3::{ArchiveId, ExactKeyRegistryProvider, ImmutableObjectBackend},
+    archive_v3::{
+        resolve_archive_cipher, ArchiveId, ExactKeyRegistryProvider, ImmutableObjectBackend,
+        KeyKind, KeyRegistryContext, ObjectId, VerifiedArchiveCipher,
+    },
     archive_v3_firestore_shadow::FirestoreShadowWitness,
-    archive_v3_firestore_witness::FirestoreWitnessConfig,
+    archive_v3_firestore_witness::{FirestoreWitnessCommitError, FirestoreWitnessConfig},
     archive_v3_gcs::{
         ArchiveV3GcsTransport, GcsArchiveV3Backend, GcsArchiveV3RegistryProvider,
         GcsArchiveV3RootProvider,
@@ -39,10 +42,34 @@ use crate::{
     },
     archive_v3_registry_kms::GcpArchiveV3RegistryKms,
     archive_v3_shadow_coordinator::ShadowCheckpointWitnessProvider,
-    archive_v3_witness::ExactRootProvider,
+    archive_v3_witness::{
+        ExactRootProvider, RootAdvance, WitnessError, WitnessLease, WitnessRecord,
+    },
     cp::control_store::{ArchiveBinding, ControlStore},
     crypto::GcpKmsClient,
 };
+
+struct WalPublisherExactObjects {
+    inner: Arc<dyn ImmutableObjectBackend>,
+}
+
+#[async_trait::async_trait]
+impl crate::archive_v3_shadow_checkpoint::ExactImmutableObjectBackend for WalPublisherExactObjects {
+    async fn create_if_absent(
+        &self,
+        key: crate::archive_v3::ObjectKey,
+        value: crate::archive_v3::CiphertextEnvelope,
+    ) -> crate::archive_v3::Result<crate::archive_v3::CreateIfAbsent> {
+        self.inner.create_if_absent(key, value).await
+    }
+
+    async fn get(
+        &self,
+        key: &crate::archive_v3::ObjectKey,
+    ) -> crate::archive_v3::Result<Option<crate::archive_v3::CiphertextEnvelope>> {
+        self.inner.get(key).await
+    }
+}
 
 const ARCHIVE_BINDING_COMMITMENT_DOMAIN: &[u8] =
     b"kioku/archive-v3/single-archive-wal-runtime-binding/v1\0";
@@ -158,6 +185,7 @@ pub(crate) struct ArchiveV3ShadowRuntimeBundle {
     registries: Arc<dyn ExactKeyRegistryProvider>,
     _witness: Arc<dyn ShadowCheckpointWitnessProvider>,
     maintenance_witness: Option<Arc<dyn MaintenanceImportWitnessProvider>>,
+    wal_owner_witness: Option<Arc<FirestoreShadowWitness>>,
 }
 
 impl ArchiveV3ShadowRuntimeBundle {
@@ -200,7 +228,8 @@ impl ArchiveV3ShadowRuntimeBundle {
             _roots: Arc::new(GcsArchiveV3RootProvider::new(Arc::clone(&transport))),
             registries: Arc::new(GcsArchiveV3RegistryProvider::new(transport, registry_kms)),
             _witness: witness.clone(),
-            maintenance_witness: Some(witness),
+            maintenance_witness: Some(witness.clone()),
+            wal_owner_witness: Some(witness),
         })
     }
 
@@ -211,6 +240,7 @@ impl ArchiveV3ShadowRuntimeBundle {
             registries: components.registries,
             _witness: components.witness,
             maintenance_witness: None,
+            wal_owner_witness: None,
         }
     }
 
@@ -235,6 +265,16 @@ impl ArchiveV3ShadowRuntimeBundle {
         self.maintenance_witness.as_ref()
     }
 
+    pub(crate) fn into_wal_publisher(
+        self,
+        _token: crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+    ) -> Result<WalPublisherRuntimeOwner, ArchiveV3ShadowRuntimeConstructionError> {
+        if self.wal_owner_witness.is_none() {
+            return Err(ArchiveV3ShadowRuntimeConstructionError::Unavailable);
+        }
+        Ok(WalPublisherRuntimeOwner { bundle: self })
+    }
+
     #[cfg(test)]
     pub(crate) fn from_maintenance_test_components(
         objects: Arc<dyn ImmutableObjectBackend>,
@@ -247,7 +287,128 @@ impl ArchiveV3ShadowRuntimeBundle {
             registries,
             _witness: Arc::new(UnavailableShadowWitnessProvider),
             maintenance_witness: Some(witness),
+            wal_owner_witness: None,
         }
+    }
+}
+
+/// Opaque consuming runtime view. It owns the whole original bundle and
+/// exposes only operations needed by the private publisher child.
+pub(crate) struct WalPublisherRuntimeOwner {
+    bundle: ArchiveV3ShadowRuntimeBundle,
+}
+
+impl WalPublisherRuntimeOwner {
+    pub(crate) fn objects_owned(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+    ) -> Arc<dyn crate::archive_v3_shadow_checkpoint::ExactImmutableObjectBackend> {
+        Arc::new(WalPublisherExactObjects {
+            inner: Arc::clone(&self.bundle.objects),
+        })
+    }
+
+    fn wal_owner_witness(&self) -> &FirestoreShadowWitness {
+        self.bundle
+            .wal_owner_witness
+            .as_deref()
+            .expect("validated by consuming constructor")
+    }
+
+    pub(crate) async fn resolve_wal_owner_cipher(
+        &self,
+        _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        witness: &WitnessRecord,
+    ) -> crate::archive_v3::Result<VerifiedArchiveCipher> {
+        let registry = witness.registry();
+        let context = KeyRegistryContext::with_rotation_generation(
+            witness.archive_id(),
+            KeyKind::Archive,
+            registry.key_epoch(),
+            registry.rotation_generation(),
+        );
+        resolve_archive_cipher(
+            &context,
+            registry.object_id(),
+            registry.ciphertext_hash(),
+            self.bundle.registries.as_ref(),
+        )
+        .await
+    }
+
+    pub(crate) async fn read_wal_owner_current_exact(
+        &self,
+        token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        archive_id: ArchiveId,
+    ) -> Result<WitnessRecord, WitnessError> {
+        self.wal_owner_witness()
+            .wal_owner_read_current_exact(token, archive_id)
+            .await
+    }
+
+    pub(crate) async fn acquire_wal_owner_lease_unresolved(
+        &self,
+        token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        expected: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        self.wal_owner_witness()
+            .wal_owner_acquire_unresolved(token, expected, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn renew_wal_owner_lease_unresolved(
+        &self,
+        token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        retained: WitnessRecord,
+        lease: WitnessLease,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        self.wal_owner_witness()
+            .wal_owner_renew_unresolved(token, retained, lease, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn reacquire_wal_owner_lease_unresolved(
+        &self,
+        token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        previous: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        self.wal_owner_witness()
+            .wal_owner_reacquire_unresolved(token, previous, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn maintain_wal_owner_lease_unresolved(
+        &self,
+        token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        previous: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        self.wal_owner_witness()
+            .wal_owner_maintain_unresolved(token, previous, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn advance_wal_owner_root_unresolved(
+        &self,
+        token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,
+        expected: &WitnessRecord,
+        advance: RootAdvance,
+    ) -> Result<(), FirestoreWitnessCommitError> {
+        self.wal_owner_witness()
+            .wal_owner_advance_unresolved(token, expected, advance)
+            .await
+    }
+}
+
+impl fmt::Debug for WalPublisherRuntimeOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WalPublisherRuntimeOwner(<inactive>)")
     }
 }
 

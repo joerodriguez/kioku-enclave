@@ -581,14 +581,154 @@ mod tests {
         transport.0.lock().unwrap().time = "2026-01-02T03:04:06.123Z".to_owned();
         let adapter = witness(transport);
         let observed = adapter
-            .compare_and_advance_root_unresolved_async(retained.provider_advance(
-                crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_test(),
-            ))
+            .compare_and_advance_exact_wal_owner_root_unresolved_async(
+                authoritative.record().clone(),
+                retained.provider_advance(
+                    crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_test(),
+                ),
+            )
             .await;
         assert!(observed.is_ok());
         let observed = observed.ok().expect("checked exact witness advance");
         assert!(observed.record().last_server_tick() > authoritative.record().last_server_tick());
         assert!(retained.validate_observed(observed.record()).is_ok());
+
+        let tampered = authoritative.record().with_next_fencing_epoch_for_test(99);
+        let rejected = Arc::new(FakeTransport::new(
+            Some(tampered.encode()),
+            [CommitOutcome::Ok],
+        ));
+        rejected.0.lock().unwrap().time = "2026-01-02T03:04:06.123Z".to_owned();
+        assert!(matches!(
+            witness(rejected.clone())
+                .compare_and_advance_exact_wal_owner_root_unresolved_async(
+                    authoritative.record().clone(),
+                    retained.provider_advance(
+                        crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_test(),
+                    ),
+                )
+                .await,
+            Err(FirestoreWitnessCommitError::Rejected(_))
+        ));
+        assert_eq!(rejected.0.lock().unwrap().commits, 0);
+    }
+
+    #[tokio::test]
+    async fn wal_owner_acquire_preserves_ambiguity_and_authenticates_firestore_tick() {
+        let trusted_tick = firestore_read_time_tick(TIME).unwrap();
+        let local = InMemoryWitness::from_provider_record_at_tick(None, trusted_tick).unwrap();
+        let initial = local.bootstrap_at_tick(bootstrap(), trusted_tick).unwrap();
+        let importer = ObjectId::from_bytes(id(8));
+        local
+            .acquire_lease(
+                initial.archive_id(),
+                initial.database_epoch(),
+                initial.registry().key_epoch(),
+                importer,
+                60,
+            )
+            .unwrap();
+        let released = local
+            .read_current(initial.archive_id())
+            .unwrap()
+            .unwrap()
+            .released_wal_owner_for_test();
+        let owner = ObjectId::from_bytes(id(31));
+
+        let transport = Arc::new(FakeTransport::new(
+            Some(released.encode()),
+            [CommitOutcome::Ok],
+        ));
+        transport.0.lock().unwrap().time = "2026-01-02T03:04:06.123Z".to_owned();
+        let acquired = witness(transport)
+            .acquire_exact_wal_owner_lease_unresolved_async(released.clone(), owner, 60)
+            .await;
+        assert!(acquired.is_ok());
+        let (observed, lease) = acquired.ok().unwrap();
+        assert!(observed.last_server_tick() > released.last_server_tick());
+        assert_eq!(
+            observed
+                .exact_wal_owner_acquire_from(&released, owner.as_bytes())
+                .unwrap(),
+            lease
+        );
+
+        let renewing = Arc::new(FakeTransport::new(
+            Some(observed.encode()),
+            [CommitOutcome::Ok],
+        ));
+        renewing.0.lock().unwrap().time = "2026-01-02T03:04:07.123Z".to_owned();
+        let renewed = witness(renewing)
+            .renew_exact_wal_owner_lease_unresolved_async(observed.clone(), lease, 120)
+            .await;
+        assert!(renewed.is_ok());
+        let (renewed, renewed_lease) = renewed.ok().unwrap();
+        assert_eq!(
+            renewed
+                .exact_wal_owner_renewal_from(&observed, owner.as_bytes())
+                .unwrap(),
+            renewed_lease
+        );
+
+        let changed_current = observed.with_next_fencing_epoch_for_test(99);
+        let stale = Arc::new(FakeTransport::new(
+            Some(changed_current.encode()),
+            [CommitOutcome::Ok],
+        ));
+        stale.0.lock().unwrap().time = "2026-01-02T03:04:07.123Z".to_owned();
+        assert!(matches!(
+            witness(stale.clone())
+                .renew_exact_wal_owner_lease_unresolved_async(observed.clone(), lease, 120)
+                .await,
+            Err(FirestoreWitnessCommitError::Rejected(_))
+        ));
+        assert_eq!(stale.0.lock().unwrap().commits, 0);
+
+        let reacquiring = Arc::new(FakeTransport::new(
+            Some(observed.encode()),
+            [CommitOutcome::Ok],
+        ));
+        reacquiring.0.lock().unwrap().time = "2026-01-02T03:06:00.123Z".to_owned();
+        let reacquired = witness(reacquiring)
+            .reacquire_exact_wal_owner_lease_unresolved_async(observed.clone(), owner, 60)
+            .await;
+        assert!(reacquired.is_ok());
+        let (reacquired, reacquired_lease) = reacquired.ok().unwrap();
+        assert_eq!(
+            reacquired
+                .exact_wal_owner_reacquire_from(&observed, owner.as_bytes())
+                .unwrap(),
+            reacquired_lease
+        );
+
+        let lost = Arc::new(FakeTransport::new(
+            Some(released.encode()),
+            [CommitOutcome::LostResponse],
+        ));
+        lost.0.lock().unwrap().time = "2026-01-02T03:04:06.123Z".to_owned();
+        assert!(matches!(
+            witness(lost.clone())
+                .acquire_exact_wal_owner_lease_unresolved_async(released.clone(), owner, 60)
+                .await,
+            Err(FirestoreWitnessCommitError::OutcomeUnknown)
+        ));
+        let committed = WitnessRecord::decode(&lost.0.lock().unwrap().record.unwrap()).unwrap();
+        assert!(committed
+            .exact_wal_owner_acquire_from(&released, owner.as_bytes())
+            .is_ok());
+
+        let alternate = released.with_next_fencing_epoch_for_test(99);
+        let rejected = Arc::new(FakeTransport::new(
+            Some(released.encode()),
+            [CommitOutcome::Ok],
+        ));
+        assert!(matches!(
+            witness(rejected.clone())
+                .acquire_exact_wal_owner_lease_unresolved_async(alternate, owner, 60)
+                .await,
+            Err(FirestoreWitnessCommitError::Rejected(_))
+        ));
+        assert_eq!(rejected.0.lock().unwrap().commits, 0);
     }
 
     #[tokio::test]
@@ -2850,6 +2990,123 @@ impl FirestoreWitness {
         })
         .await
     }
+
+    /// Owner-publisher-only exact acquire. Commit ambiguity is deliberately
+    /// returned unresolved; encrypted Control owns the reserved owner ID and
+    /// settles it only from a fresh exact witness reread.
+    pub(crate) async fn acquire_exact_wal_owner_lease_unresolved_async(
+        &self,
+        expected: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(expected.archive_id(), |local| {
+                local.acquire_exact_wal_owner_lease(&expected, owner, duration_ticks)
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(value) => Ok(value),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    pub(crate) async fn reacquire_exact_wal_owner_lease_unresolved_async(
+        &self,
+        previous: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(previous.archive_id(), |local| {
+                local.reacquire_exact_wal_owner_lease(&previous, owner, duration_ticks)
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(value) => Ok(value),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    pub(crate) async fn renew_exact_wal_owner_lease_unresolved_async(
+        &self,
+        retained: WitnessRecord,
+        lease: WitnessLease,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(retained.archive_id(), |local| {
+                let current = local
+                    .read_current(retained.archive_id())?
+                    .ok_or(WitnessError::MissingArchive)?;
+                if current != retained {
+                    return Err(WitnessError::CompareFailed);
+                }
+                let renewed = local.renew_lease(lease, duration_ticks)?;
+                let observed = local
+                    .read_current(retained.archive_id())?
+                    .ok_or(WitnessError::MissingArchive)?;
+                Ok((observed, renewed))
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(value) => Ok(value),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    /// WAL-owner heartbeat/reacquire transaction. The provider transaction
+    /// tick decides whether to retain/renew the current fence or reacquire at
+    /// the next fence; response ambiguity remains unresolved for exact fresh
+    /// readback adoption by encrypted Control.
+    pub(crate) async fn maintain_exact_wal_owner_lease_unresolved_async(
+        &self,
+        retained: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(retained.archive_id(), |local| {
+                local.maintain_exact_wal_owner_lease(&retained, owner, duration_ticks)
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(value) => Ok(value),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
     pub(crate) async fn renew_lease_async(
         &self,
         lease: WitnessLease,
@@ -2915,6 +3172,44 @@ impl FirestoreWitness {
     ) -> std::result::Result<WitnessReceipt, FirestoreWitnessCommitError> {
         let outcome = self
             .update_unresolved(advance.archive_id(), |local| {
+                local.compare_and_advance_root(advance.clone())
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(receipt) => Ok(receipt),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    /// Publisher-only root advance. The full retained witness is compared
+    /// before Firestore's transaction tick is applied, so a tuple change that
+    /// happens to preserve the root/registry/lease projection cannot mutate.
+    pub(crate) async fn compare_and_advance_exact_wal_owner_root_unresolved_async(
+        &self,
+        expected: WitnessRecord,
+        advance: RootAdvance,
+    ) -> std::result::Result<WitnessReceipt, FirestoreWitnessCommitError> {
+        if expected.archive_id() != advance.archive_id() {
+            return Err(FirestoreWitnessCommitError::Rejected(
+                WitnessError::CompareFailed,
+            ));
+        }
+        let outcome = self
+            .update_unresolved(expected.archive_id(), |local| {
+                let current = local
+                    .read_current(expected.archive_id())?
+                    .ok_or(WitnessError::MissingArchive)?;
+                if current != expected {
+                    return Err(WitnessError::CompareFailed);
+                }
                 local.compare_and_advance_root(advance.clone())
             })
             .await

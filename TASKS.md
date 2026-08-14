@@ -169,7 +169,7 @@ separate activation blockers.
   eviction, legacy-envelope rewrite, and schema migration without provider PUT.
 - [x] Structurally pin all 148 production Store mutation/save call expressions,
   all 15 factory-definition/call/literal construction sites, all 41 policy
-  selectors/references, and 21 async or dedicated-thread worker spawns—including full owning bodies and
+  selectors/references, and 24 async or dedicated-thread worker spawns—including full owning bodies and
   cross-helper B dependencies—in an exact reviewed A/B/C inventory. Scanner
   fixtures prove comments/literals/test items/nested functions, qualified calls,
   new factories, or conditional-main policy selection cannot hide drift.
@@ -179,11 +179,22 @@ separate activation blockers.
 - [x] Add the inactive one-owner local mutation/capture and durable publication
   protocol with a dedicated SQLite blocking lane, exact pending-send recovery,
   permanent authenticated current-staging replay, kind-scoped durable identity,
-  and deterministic bounded artifact topology. Only test publication/domain
-  implementations exist and no runtime construction or acknowledgement is wired.
-- [ ] Implement separately reviewed production A-domain codecs and the concrete
-  WAL publication/checkpoint worker; refactor B domains with stable attempt identity;
-  keep C domains fail-closed before enabling the Store policy outside tests.
+  and deterministic bounded artifact topology. No production domain
+  implementation, runtime launcher, or acknowledgement is wired.
+- [x] Add the inactive single-archive publisher/checkpoint worker behind the
+  maintenance handoff: a shared adequate-lifetime/heartbeat/reacquire lease
+  manager; owned blocking SQLite construction and cleanup-owning streamed
+  checkpoint reads; exact deterministic chunk/manifest/root admission and
+  full-row recomputation; pending-send lost-success reconciliation; atomic
+  consumption of terminal logical/checkpoint comparison rows before later
+  owner-binding transitions; checkpoint-stage-aware source heartbeats that do
+  no lease mutation after candidate/send admission; and exact witnessed
+  recovery through a create/get-only provider capability. It remains private
+  and has no domain codec, launcher, route, startup, config, list/delete, or
+  serving path.
+- [ ] Implement separately reviewed production A-domain codecs and launcher
+  ownership; refactor B domains with stable attempt identity; keep C domains
+  fail-closed before enabling the Store policy outside tests.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

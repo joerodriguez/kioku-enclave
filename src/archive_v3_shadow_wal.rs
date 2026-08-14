@@ -29,10 +29,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     archive_v3::{
-        ArchiveId, ArchiveRoot, ArchiveV3Error, DatabaseEpoch, ImmutableObjectBackend,
-        ImmutableReference, LogicalLocation, ObjectContext, ObjectId, ObjectRole, ParentReference,
-        VerifiedArchiveCipher, ARCHIVE_FORMAT_VERSION, MAX_WAL_COMMITS_PER_ROOT,
-        MAX_WAL_SEGMENTS_PER_ROOT, MAX_WAL_TAIL_BYTES, SQLITE_PAGE_SIZE,
+        ArchiveId, ArchiveRoot, ArchiveV3Error, CiphertextEnvelope, DatabaseEpoch,
+        ImmutableObjectBackend, ImmutableReference, LogicalLocation, ObjectContext, ObjectId,
+        ObjectRole, ParentReference, VerifiedArchiveCipher, ARCHIVE_FORMAT_VERSION,
+        MAX_WAL_COMMITS_PER_ROOT, MAX_WAL_SEGMENTS_PER_ROOT, MAX_WAL_TAIL_BYTES, SQLITE_PAGE_SIZE,
     },
     archive_v3_journal::{
         resolve_verified_wal_commit_descriptor, resolve_verified_wal_segment,
@@ -40,9 +40,15 @@ use crate::{
         WalCommitDescriptor, WalSegment, MAX_WAL_COMMIT_DESCRIPTOR_BYTES, MAX_WAL_SEGMENT_BYTES,
     },
     archive_v3_shadow::CapturedWalCommit,
-    archive_v3_shadow_checkpoint::{recover_checkpoint_from_recovery_root, TmpfsCheckpointSink},
+    archive_v3_shadow_checkpoint::{
+        recover_checkpoint_from_recovery_root, ExactImmutableObjectBackend, ShadowCheckpointError,
+        ShadowObjectStaging, TmpfsCheckpointSink, UploadedCheckpoint,
+    },
     archive_v3_shadow_parity::OwnedPrivateStagedSqliteCopy,
-    archive_v3_witness::{DeletionState, MigrationState, RecoveryRoot, RootReference},
+    archive_v3_witness::{
+        DeletionState, MigrationState, RecoveryRoot, RootCommitment, RootReference, WitnessLease,
+        WitnessRecord,
+    },
 };
 
 const SQLITE_WAL_HEADER_BYTES: usize = 32;
@@ -108,6 +114,89 @@ struct WalCommitPreflight {
     commit_wal_bytes: u64,
 }
 
+struct WalSegmentUploadContext<'a> {
+    backend: &'a dyn ExactImmutableObjectBackend,
+    cipher: &'a VerifiedArchiveCipher,
+    archive_id: ArchiveId,
+    database_epoch: DatabaseEpoch,
+    root_seq: u64,
+    staging: &'a dyn WalObjectStaging,
+}
+
+/// Exact create/readback boundary used by the inactive WAL publisher. The
+/// production implementation reserves one Control row before provider create
+/// and materializes that same row only after exact readback. The direct
+/// adapter remains private to this module for existing foundation tests.
+#[async_trait]
+pub(crate) trait WalObjectStaging: Send + Sync {
+    async fn create_and_readback(
+        &self,
+        backend: &dyn ExactImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+    ) -> Result<CiphertextEnvelope>;
+}
+
+struct DirectWalObjectStaging;
+
+#[async_trait]
+impl WalObjectStaging for DirectWalObjectStaging {
+    async fn create_and_readback(
+        &self,
+        backend: &dyn ExactImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+    ) -> Result<CiphertextEnvelope> {
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await?;
+        let readback = backend
+            .get(&context.object_key())
+            .await?
+            .ok_or(ShadowWalError::MissingObject)?;
+        if readback != envelope {
+            return Err(ArchiveV3Error::Authentication.into());
+        }
+        Ok(readback)
+    }
+}
+
+/// Sized, owned adapter used only to carry either the legacy full backend or
+/// the WAL publisher's create/get-only backend into the cancellation-owned
+/// recovery task. It deliberately implements only the narrow exact-name
+/// capability even when its legacy variant internally owns the older broad
+/// trait object.
+enum OwnedExactBackend {
+    Legacy(Arc<dyn ImmutableObjectBackend>),
+    Narrow(Arc<dyn ExactImmutableObjectBackend>),
+}
+
+#[async_trait]
+impl ExactImmutableObjectBackend for OwnedExactBackend {
+    async fn create_if_absent(
+        &self,
+        key: crate::archive_v3::ObjectKey,
+        value: CiphertextEnvelope,
+    ) -> crate::archive_v3::Result<crate::archive_v3::CreateIfAbsent> {
+        match self {
+            Self::Legacy(backend) => {
+                ImmutableObjectBackend::create_if_absent(backend.as_ref(), key, value).await
+            }
+            Self::Narrow(backend) => backend.create_if_absent(key, value).await,
+        }
+    }
+
+    async fn get(
+        &self,
+        key: &crate::archive_v3::ObjectKey,
+    ) -> crate::archive_v3::Result<Option<CiphertextEnvelope>> {
+        match self {
+            Self::Legacy(backend) => ImmutableObjectBackend::get(backend.as_ref(), key).await,
+            Self::Narrow(backend) => backend.get(key).await,
+        }
+    }
+}
+
 impl UploadedWalCommit {
     pub(crate) fn root_seq(&self) -> u64 {
         self.root_seq
@@ -151,14 +240,18 @@ impl std::fmt::Debug for UploadedWalCommit {
 /// fetched, hash-checked, AEAD-opened, and decoded before the next object is
 /// created.
 async fn upload_captured_wal_segments(
-    backend: &dyn ImmutableObjectBackend,
-    cipher: &VerifiedArchiveCipher,
-    archive_id: ArchiveId,
-    database_epoch: DatabaseEpoch,
-    root_seq: u64,
+    context: WalSegmentUploadContext<'_>,
     capture: &CapturedWalCommit,
     preflight: &WalCommitPreflight,
 ) -> Result<UploadedWalSegments> {
+    let WalSegmentUploadContext {
+        backend,
+        cipher,
+        archive_id,
+        database_epoch,
+        root_seq,
+        staging,
+    } = context;
     if cipher.archive_id() != archive_id || root_seq == 0 {
         return Err(ArchiveV3Error::InvalidContext.into());
     }
@@ -221,8 +314,8 @@ async fn upload_captured_wal_segments(
         // bounded transient zeroized on success, error, and cancellation.
         let encoded = Zeroizing::new(segment.encode()?);
         let envelope = cipher.seal(&context, encoded.as_slice())?;
-        backend
-            .create_if_absent(context.object_key(), envelope.clone())
+        let exact = staging
+            .create_and_readback(backend, &context, envelope.clone())
             .await?;
         let reference = ImmutableReference {
             object_id,
@@ -230,6 +323,9 @@ async fn upload_captured_wal_segments(
         };
         // Do not return a root-composable reference until the exact object is
         // proven readable and valid under the context derived above.
+        if exact.hash() != reference.envelope_hash {
+            return Err(ArchiveV3Error::Authentication.into());
+        }
         let resolved = load_exact_wal_segment(backend, cipher, &context, &reference).await?;
         if resolved.reference() != &reference || resolved.segment() != &segment {
             return Err(ArchiveV3Error::Authentication.into());
@@ -302,6 +398,49 @@ pub(crate) fn captured_wal_segment_count(
     Ok(segment_count)
 }
 
+/// Exact pre-mutation checkpoint admission for the inactive single-archive
+/// owner. The reserve leaves room for the largest accepted logical commit, so
+/// a mutation can never cross a lineage cap after it has entered SQLite.
+pub(crate) async fn wal_owner_checkpoint_required(
+    recovery: &RecoveryRoot,
+    backend: &dyn ExactImmutableObjectBackend,
+    cipher: &VerifiedArchiveCipher,
+    archive_id: ArchiveId,
+) -> Result<bool> {
+    validate_recovery_cipher(recovery, cipher, archive_id)?;
+    let commitment = recovery.root();
+    let root = load_root(
+        backend,
+        cipher,
+        archive_id,
+        commitment.root(),
+        commitment.parent(),
+        commitment.database_epoch(),
+        commitment.key_epoch(),
+    )
+    .await?;
+    if root.owner_fencing_epoch != commitment.owner_fencing_epoch() {
+        return Err(ArchiveV3Error::Authentication.into());
+    }
+    root.validate()?;
+    Ok(wal_owner_checkpoint_geometry_requires(
+        u64::from(root.wal_commit_count),
+        u64::from(root.wal_segment_count),
+        root.wal_tail_bytes,
+    ))
+}
+
+fn wal_owner_checkpoint_geometry_requires(
+    commit_count: u64,
+    segment_count: u64,
+    tail_bytes: u64,
+) -> bool {
+    commit_count >= u64::from(MAX_WAL_COMMITS_PER_ROOT)
+        || segment_count
+            > u64::from(MAX_WAL_SEGMENTS_PER_ROOT.saturating_sub(MAX_WAL_SEGMENTS_PER_COMMIT))
+        || tail_bytes > MAX_WAL_TAIL_BYTES.saturating_sub(8 * 1024 * 1024)
+}
+
 /// Upload one captured commit and its authenticated lineage descriptor from
 /// the exact root named by a witness snapshot. The returned root remains only
 /// a candidate; this inactive function neither seals a root nor advances a
@@ -309,7 +448,7 @@ pub(crate) fn captured_wal_segment_count(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_captured_wal_commit(
     recovery: &RecoveryRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     owner_fencing_epoch: u64,
@@ -343,13 +482,14 @@ pub(crate) async fn upload_captured_wal_commit(
         operation_id,
         request_fingerprint,
         capture,
+        &DirectWalObjectStaging,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn upload_captured_wal_commit_from_base(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     base: &ArchiveRoot,
@@ -359,6 +499,7 @@ async fn upload_captured_wal_commit_from_base(
     operation_id: [u8; 16],
     request_fingerprint: [u8; 32],
     capture: &CapturedWalCommit,
+    staging: &dyn WalObjectStaging,
 ) -> Result<UploadedWalCommit> {
     base.validate()?;
     if base.checkpoint_root.is_none()
@@ -403,11 +544,14 @@ async fn upload_captured_wal_commit_from_base(
     }
     validate_capture_continuity(backend, cipher, archive_id, base, capture).await?;
     let uploaded = upload_captured_wal_segments(
-        backend,
-        cipher,
-        archive_id,
-        base.database_epoch,
-        root_seq,
+        WalSegmentUploadContext {
+            backend,
+            cipher,
+            archive_id,
+            database_epoch: base.database_epoch,
+            root_seq,
+            staging,
+        },
         capture,
         &preflight,
     )
@@ -462,13 +606,16 @@ async fn upload_captured_wal_commit_from_base(
         return Err(ArchiveV3Error::TooLarge("WAL commit descriptor").into());
     }
     let envelope = cipher.seal(&descriptor_context, encoded.as_slice())?;
-    backend
-        .create_if_absent(descriptor_context.object_key(), envelope.clone())
+    let exact_descriptor = staging
+        .create_and_readback(backend, &descriptor_context, envelope.clone())
         .await?;
     let descriptor_reference = ImmutableReference {
         object_id: descriptor_object_id,
         envelope_hash: envelope.hash(),
     };
+    if exact_descriptor.hash() != descriptor_reference.envelope_hash {
+        return Err(ArchiveV3Error::Authentication.into());
+    }
     let readback = load_exact_wal_commit_descriptor(
         backend,
         cipher,
@@ -512,6 +659,170 @@ async fn upload_captured_wal_commit_from_base(
             .ok_or(ShadowWalError::MissingCheckpointOrWal)?,
         candidate_root: root,
     })
+}
+
+/// WAL-owner-only upload path. Every immutable segment, descriptor, and root
+/// crosses the supplied durable staging boundary before provider creation.
+/// The returned commitment is derived from the exact root readback and cannot
+/// be reconstructed from caller-selected bytes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_captured_wal_commit_controlled(
+    recovery: &RecoveryRoot,
+    backend: &dyn ExactImmutableObjectBackend,
+    cipher: &VerifiedArchiveCipher,
+    archive_id: ArchiveId,
+    owner_fencing_epoch: u64,
+    operation_id: [u8; 16],
+    request_fingerprint: [u8; 32],
+    capture: &CapturedWalCommit,
+    staging: &dyn WalObjectStaging,
+) -> Result<crate::archive_v3_witness::RootCommitment> {
+    validate_recovery_cipher(recovery, cipher, archive_id)?;
+    let commitment = recovery.root();
+    let base = load_root(
+        backend,
+        cipher,
+        archive_id,
+        commitment.root(),
+        commitment.parent(),
+        commitment.database_epoch(),
+        commitment.key_epoch(),
+    )
+    .await?;
+    let uploaded = upload_captured_wal_commit_from_base(
+        backend,
+        cipher,
+        archive_id,
+        &base,
+        commitment.root(),
+        commitment.parent(),
+        owner_fencing_epoch,
+        operation_id,
+        request_fingerprint,
+        capture,
+        staging,
+    )
+    .await?;
+    let root_id = ObjectId::random();
+    let parent = ParentReference {
+        object_id: commitment.root().object_id(),
+        envelope_hash: commitment.root().ciphertext_hash(),
+    };
+    let context = ObjectContext::new(
+        archive_id,
+        commitment.database_epoch(),
+        commitment.key_epoch(),
+        ObjectRole::RootV3,
+        LogicalLocation::Root {
+            root_seq: uploaded.root_seq(),
+        },
+        root_id,
+        Some(parent),
+    )?;
+    let encoded = Zeroizing::new(uploaded.candidate_root().encode()?);
+    let envelope = cipher.seal(&context, encoded.as_slice())?;
+    let exact = staging
+        .create_and_readback(backend, &context, envelope.clone())
+        .await?;
+    if exact != envelope {
+        return Err(ArchiveV3Error::Authentication.into());
+    }
+    let root = RootReference::new(uploaded.root_seq(), root_id, exact.hash());
+    crate::archive_v3_witness::RootCommitment::from_persisted_wal_candidate(
+        crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_publisher(),
+        commitment.database_epoch(),
+        commitment.key_epoch(),
+        owner_fencing_epoch,
+        commitment.root(),
+        root,
+    )
+    .map_err(|_| ArchiveV3Error::Authentication.into())
+}
+
+/// Build the canonical zero-WAL root after a Store-owned checkpoint source has
+/// been uploaded and exactly read back through durable Control staging. The
+/// witness, lease, parent, archive/database/key epochs, and root sequence are
+/// not caller-selectable independent facts.
+pub(crate) async fn create_wal_owner_checkpoint_root(
+    backend: &dyn ExactImmutableObjectBackend,
+    cipher: &VerifiedArchiveCipher,
+    expected: &WitnessRecord,
+    lease: WitnessLease,
+    checkpoint: &UploadedCheckpoint,
+    staging: &ShadowObjectStaging<'_>,
+) -> Result<RootCommitment> {
+    if expected.deletion() != DeletionState::Active
+        || expected.migration() != MigrationState::WalAuthoritative
+        || !expected.authorizes_lease(lease)
+        || cipher.archive_id() != expected.archive_id()
+        || cipher.key_epoch() != expected.registry().key_epoch()
+        || checkpoint.logical_file_length() == 0
+        || checkpoint.database_plaintext_hash() == [0; 32]
+    {
+        return Err(ArchiveV3Error::InvalidContext.into());
+    }
+    let previous = expected.root().root();
+    let root_seq = previous
+        .sequence()
+        .checked_add(1)
+        .ok_or(ArchiveV3Error::Malformed("root sequence"))?;
+    let parent = ParentReference {
+        object_id: previous.object_id(),
+        envelope_hash: previous.ciphertext_hash(),
+    };
+    let object_id = ObjectId::random();
+    let context = ObjectContext::new(
+        expected.archive_id(),
+        expected.database_epoch(),
+        expected.registry().key_epoch(),
+        ObjectRole::RootV3,
+        LogicalLocation::Root { root_seq },
+        object_id,
+        Some(parent.clone()),
+    )?;
+    let root = ArchiveRoot {
+        root_seq,
+        parent: Some(parent),
+        database_epoch: expected.database_epoch(),
+        key_epoch: expected.registry().key_epoch(),
+        owner_fencing_epoch: lease.fencing_epoch(),
+        sqlite_page_size: SQLITE_PAGE_SIZE,
+        checkpoint_logical_file_length: checkpoint.logical_file_length(),
+        logical_file_length: checkpoint.logical_file_length(),
+        user_schema_version: checkpoint.user_schema_version(),
+        storage_format_version: ARCHIVE_FORMAT_VERSION,
+        wal_generation: 0,
+        wal_commit_count: 0,
+        wal_segment_count: 0,
+        wal_tail_bytes: 0,
+        checkpoint_root: Some(checkpoint.root().clone()),
+        extent_tree_root: None,
+        wal_commit_tail: None,
+    };
+    root.validate_for_context(&context)?;
+    let encoded = Zeroizing::new(root.encode()?);
+    let envelope = cipher.seal(&context, encoded.as_slice())?;
+    staging
+        .create_and_readback_verified(backend, &context, envelope.clone(), |readback| {
+            (readback == &envelope)
+                .then_some(())
+                .ok_or(ArchiveV3Error::Authentication)
+        })
+        .await
+        .map_err(|error| match error {
+            ShadowCheckpointError::Archive(error) => ShadowWalError::Archive(error),
+            ShadowCheckpointError::MissingObject => ShadowWalError::MissingObject,
+            _ => ShadowWalError::CompositeRecovery,
+        })?;
+    RootCommitment::from_persisted_wal_candidate(
+        crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_publisher(),
+        expected.database_epoch(),
+        expected.registry().key_epoch(),
+        lease.fencing_epoch(),
+        previous,
+        RootReference::new(root_seq, object_id, envelope.hash()),
+    )
+    .map_err(|_| ArchiveV3Error::Authentication.into())
 }
 
 /// A private staging adapter receives one fully authenticated lineage in
@@ -570,9 +881,16 @@ pub(crate) async fn recover_owned_private_staging(
     cipher: Arc<VerifiedArchiveCipher>,
     archive_id: ArchiveId,
 ) -> Result<OwnedPrivateStagedSqliteCopy> {
-    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None, false)
-        .await
-        .map(|recovered| recovered.owned)
+    recover_owned_private_staging_inner(
+        recovery,
+        Arc::new(OwnedExactBackend::Legacy(backend)),
+        cipher,
+        archive_id,
+        None,
+        false,
+    )
+    .await
+    .map(|recovered| recovered.owned)
 }
 
 /// Maintenance-only recovery result. It binds the owned recovered SQLite file
@@ -626,7 +944,15 @@ pub(crate) async fn recover_owned_maintenance_staging(
     {
         return Err(ShadowWalError::CompositeRecovery);
     }
-    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None, true).await
+    recover_owned_private_staging_inner(
+        recovery,
+        Arc::new(OwnedExactBackend::Legacy(backend)),
+        cipher,
+        archive_id,
+        None,
+        true,
+    )
+    .await
 }
 
 /// Inactive WAL-owner recovery path. The exact WalAuthoritative recovery root
@@ -634,7 +960,7 @@ pub(crate) async fn recover_owned_maintenance_staging(
 /// metadata before Store can open the owned staging copy.
 pub(crate) async fn recover_owned_wal_owner_staging(
     recovery: RecoveryRoot,
-    backend: Arc<dyn ImmutableObjectBackend>,
+    backend: Arc<dyn ExactImmutableObjectBackend>,
     cipher: Arc<VerifiedArchiveCipher>,
     archive_id: ArchiveId,
     binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
@@ -645,9 +971,16 @@ pub(crate) async fn recover_owned_wal_owner_staging(
         return Err(ShadowWalError::CompositeRecovery);
     }
     let retained = recovery.clone();
-    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None, false)
-        .await?
-        .authenticate_wal_owner(&retained, binding)
+    recover_owned_private_staging_inner(
+        recovery,
+        Arc::new(OwnedExactBackend::Narrow(backend)),
+        cipher,
+        archive_id,
+        None,
+        false,
+    )
+    .await?
+    .authenticate_wal_owner(&retained, binding)
 }
 
 #[cfg(test)]
@@ -670,7 +1003,7 @@ async fn recover_owned_private_staging_observed(
 ) -> Result<OwnedPrivateStagedSqliteCopy> {
     recover_owned_private_staging_inner(
         recovery,
-        backend,
+        Arc::new(OwnedExactBackend::Legacy(backend)),
         cipher,
         archive_id,
         Some(RecoveryObserver {
@@ -685,7 +1018,7 @@ async fn recover_owned_private_staging_observed(
 
 async fn recover_owned_private_staging_inner(
     recovery: RecoveryRoot,
-    backend: Arc<dyn ImmutableObjectBackend>,
+    backend: Arc<OwnedExactBackend>,
     cipher: Arc<VerifiedArchiveCipher>,
     archive_id: ArchiveId,
     observer: Option<RecoveryObserver>,
@@ -1023,7 +1356,7 @@ impl std::fmt::Debug for RecoveredWitnessWal {
 /// `RecoveryRoot` before its composite sink publishes either temporary file.
 pub(crate) async fn recover_witness_nominated_wal(
     recovery: &RecoveryRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     sink: &mut dyn WalRecoverySink,
@@ -1039,7 +1372,7 @@ pub(crate) async fn recover_witness_nominated_wal(
 
 async fn recover_witness_nominated_wal_inner(
     recovery: &RecoveryRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     sink: &mut dyn WalRecoverySink,
@@ -1073,7 +1406,7 @@ async fn recover_witness_nominated_wal_inner(
 
 async fn recover_maintenance_zero_wal(
     recovery: &RecoveryRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     sink: &mut dyn WalRecoverySink,
@@ -1093,7 +1426,7 @@ async fn recover_maintenance_zero_wal(
 /// a second root-selection API.
 async fn recover_exact_root_wal(
     root: &ArchiveRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     sink: &mut dyn WalRecoverySink,
@@ -1103,7 +1436,7 @@ async fn recover_exact_root_wal(
 
 async fn recover_exact_root_wal_mode(
     root: &ArchiveRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     sink: &mut dyn WalRecoverySink,
@@ -1319,7 +1652,7 @@ fn wal_commit_context(
 }
 
 async fn load_exact_wal_segment(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     context: &ObjectContext,
     reference: &ImmutableReference,
@@ -1340,7 +1673,7 @@ async fn load_exact_wal_segment(
 }
 
 async fn load_exact_wal_commit_descriptor(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     context: &ObjectContext,
     reference: &ImmutableReference,
@@ -1361,7 +1694,7 @@ async fn load_exact_wal_commit_descriptor(
 }
 
 async fn load_commit_segments(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     root: &ArchiveRoot,
@@ -1394,7 +1727,7 @@ async fn load_commit_segments(
 }
 
 async fn validate_capture_continuity(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     base: &ArchiveRoot,
@@ -1484,7 +1817,7 @@ fn validate_recovery_cipher(
 
 #[allow(clippy::too_many_arguments)]
 async fn load_root(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &dyn ExactImmutableObjectBackend,
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     reference: RootReference,
@@ -1533,6 +1866,30 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    #[test]
+    fn wal_owner_checkpoint_gate_reserves_one_maximum_commit_exactly() {
+        assert!(!wal_owner_checkpoint_geometry_requires(
+            u64::from(MAX_WAL_COMMITS_PER_ROOT - 1),
+            u64::from(MAX_WAL_SEGMENTS_PER_ROOT - MAX_WAL_SEGMENTS_PER_COMMIT),
+            MAX_WAL_TAIL_BYTES - 8 * 1024 * 1024,
+        ));
+        assert!(wal_owner_checkpoint_geometry_requires(
+            u64::from(MAX_WAL_COMMITS_PER_ROOT),
+            0,
+            0,
+        ));
+        assert!(wal_owner_checkpoint_geometry_requires(
+            0,
+            u64::from(MAX_WAL_SEGMENTS_PER_ROOT - MAX_WAL_SEGMENTS_PER_COMMIT + 1),
+            0,
+        ));
+        assert!(wal_owner_checkpoint_geometry_requires(
+            0,
+            0,
+            MAX_WAL_TAIL_BYTES - 8 * 1024 * 1024 + 1,
+        ));
+    }
     use crate::{
         archive_v3::{
             resolve_archive_cipher, ArchiveDek, ArchivePrefix, CiphertextEnvelope, CreateIfAbsent,
@@ -1699,7 +2056,7 @@ mod tests {
             value: CiphertextEnvelope,
         ) -> crate::archive_v3::Result<CreateIfAbsent> {
             *self.creates.lock().unwrap() += 1;
-            self.inner.create_if_absent(key, value).await
+            ImmutableObjectBackend::create_if_absent(&self.inner, key, value).await
         }
 
         async fn get(
@@ -1710,7 +2067,8 @@ mod tests {
             match fault {
                 ReadFault::Missing(pattern) if key.as_str().contains(&pattern) => return Ok(None),
                 ReadFault::Tampered(pattern) if key.as_str().contains(&pattern) => {
-                    let Some(envelope) = self.inner.get(key).await? else {
+                    let Some(envelope) = ImmutableObjectBackend::get(&self.inner, key).await?
+                    else {
                         return Ok(None);
                     };
                     let mut encoded = envelope.encode();
@@ -1728,7 +2086,7 @@ mod tests {
                         .await?;
                     for candidate in page.objects {
                         if candidate != *key && candidate.as_str().contains(&pattern) {
-                            return self.inner.get(&candidate).await;
+                            return ImmutableObjectBackend::get(&self.inner, &candidate).await;
                         }
                     }
                     return Ok(None);
@@ -1749,7 +2107,7 @@ mod tests {
                 }
                 _ => {}
             }
-            self.inner.get(key).await
+            ImmutableObjectBackend::get(&self.inner, key).await
         }
 
         async fn enumerate(
@@ -1772,7 +2130,7 @@ mod tests {
             &self,
             context: &ObjectContext,
         ) -> std::result::Result<CiphertextEnvelope, WitnessError> {
-            self.get(&context.object_key())
+            ImmutableObjectBackend::get(self, &context.object_key())
                 .await
                 .map_err(|_| WitnessError::Malformed)?
                 .ok_or(WitnessError::MissingRootObject)
@@ -1786,14 +2144,14 @@ mod tests {
             key: ObjectKey,
             value: crate::archive_v3::CiphertextEnvelope,
         ) -> crate::archive_v3::Result<CreateIfAbsent> {
-            self.inner.create_if_absent(key, value).await
+            ImmutableObjectBackend::create_if_absent(&self.inner, key, value).await
         }
 
         async fn get(
             &self,
             key: &ObjectKey,
         ) -> crate::archive_v3::Result<Option<crate::archive_v3::CiphertextEnvelope>> {
-            self.inner.get(key).await
+            ImmutableObjectBackend::get(&self.inner, key).await
         }
 
         async fn enumerate(
@@ -1817,7 +2175,7 @@ mod tests {
             key: ObjectKey,
             value: crate::archive_v3::CiphertextEnvelope,
         ) -> crate::archive_v3::Result<CreateIfAbsent> {
-            self.inner.create_if_absent(key, value).await
+            ImmutableObjectBackend::create_if_absent(&self.inner, key, value).await
         }
 
         async fn get(
@@ -1881,7 +2239,7 @@ mod tests {
     }
 
     async fn upload_captured_wal_commit(
-        backend: &dyn ImmutableObjectBackend,
+        backend: &dyn ExactImmutableObjectBackend,
         cipher: &VerifiedArchiveCipher,
         archive: ArchiveId,
         database: DatabaseEpoch,
@@ -1929,6 +2287,7 @@ mod tests {
             [10; 16],
             [11; 32],
             capture,
+            &super::DirectWalObjectStaging,
         )
         .await
     }
@@ -2211,10 +2570,13 @@ mod tests {
         let root_zero_envelope = cipher
             .seal(&root_zero_context, &root_zero.encode().unwrap())
             .unwrap();
-        backend
-            .create_if_absent(root_zero_context.object_key(), root_zero_envelope.clone())
-            .await
-            .unwrap();
+        ImmutableObjectBackend::create_if_absent(
+            backend.as_ref(),
+            root_zero_context.object_key(),
+            root_zero_envelope.clone(),
+        )
+        .await
+        .unwrap();
         let registry = KeyRegistryReference::new(
             key,
             cipher.registry_rotation_generation(),
@@ -2273,10 +2635,13 @@ mod tests {
             )
             .unwrap();
             let envelope = cipher.seal(&context, &root.encode().unwrap()).unwrap();
-            backend
-                .create_if_absent(context.object_key(), envelope)
-                .await
-                .unwrap();
+            ImmutableObjectBackend::create_if_absent(
+                backend.as_ref(),
+                context.object_key(),
+                envelope,
+            )
+            .await
+            .unwrap();
             let advance = RootAdvance::from_authenticated_candidate(
                 lease,
                 recovery.root(),
@@ -2617,6 +2982,7 @@ mod tests {
             [76; 16],
             [77; 32],
             &commits[1],
+            &super::DirectWalObjectStaging,
         )
         .await
         .unwrap();
@@ -2673,6 +3039,7 @@ mod tests {
             [0x86; 16],
             [0x87; 32],
             &captures[1],
+            &super::DirectWalObjectStaging,
         )
         .await
         .unwrap();
@@ -2891,6 +3258,7 @@ mod tests {
                     [5; 16],
                     [6; 32],
                     &captured_commit(1),
+                    &super::DirectWalObjectStaging,
                 )
                 .await,
                 Err(ShadowWalError::CheckpointRequired)
@@ -2950,6 +3318,7 @@ mod tests {
                 [5; 16],
                 [6; 32],
                 &captured_commit(255),
+                &super::DirectWalObjectStaging,
             )
             .await,
             Err(ShadowWalError::CheckpointRequired)
@@ -3011,6 +3380,7 @@ mod tests {
                 [5; 16],
                 [6; 32],
                 &captured_commit(1),
+                &super::DirectWalObjectStaging,
             )
             .await,
             Err(ShadowWalError::CheckpointRequired)
@@ -3175,6 +3545,7 @@ mod tests {
             [68; 16],
             [69; 32],
             &commits[0],
+            &super::DirectWalObjectStaging,
         )
         .await
         .unwrap();
@@ -3191,6 +3562,7 @@ mod tests {
             [72; 16],
             [73; 32],
             &commits[1],
+            &super::DirectWalObjectStaging,
         )
         .await
         .unwrap();

@@ -69,6 +69,44 @@ pub enum ShadowCheckpointError {
 
 pub type Result<T> = std::result::Result<T, ShadowCheckpointError>;
 
+/// Exact-name immutable create/read capability. It deliberately omits
+/// namespace enumeration and deletion so the WAL publisher cannot obtain
+/// either operation through its runtime handoff.
+#[async_trait::async_trait]
+pub(crate) trait ExactImmutableObjectBackend: Send + Sync {
+    async fn create_if_absent(
+        &self,
+        key: crate::archive_v3::ObjectKey,
+        value: CiphertextEnvelope,
+    ) -> crate::archive_v3::Result<crate::archive_v3::CreateIfAbsent>;
+
+    async fn get(
+        &self,
+        key: &crate::archive_v3::ObjectKey,
+    ) -> crate::archive_v3::Result<Option<CiphertextEnvelope>>;
+}
+
+#[async_trait::async_trait]
+impl<T> ExactImmutableObjectBackend for T
+where
+    T: ImmutableObjectBackend + ?Sized,
+{
+    async fn create_if_absent(
+        &self,
+        key: crate::archive_v3::ObjectKey,
+        value: CiphertextEnvelope,
+    ) -> crate::archive_v3::Result<crate::archive_v3::CreateIfAbsent> {
+        ImmutableObjectBackend::create_if_absent(self, key, value).await
+    }
+
+    async fn get(
+        &self,
+        key: &crate::archive_v3::ObjectKey,
+    ) -> crate::archive_v3::Result<Option<CiphertextEnvelope>> {
+        ImmutableObjectBackend::get(self, key).await
+    }
+}
+
 /// Narrow staging-inventory boundary.  It authorizes no provider operation by
 /// itself: callers reserve an exact opaque context before I/O, then may mark it
 /// materialized only after an exact immutable readback.  The concrete adapter
@@ -114,7 +152,7 @@ pub(crate) enum ShadowObjectInventoryError {
 /// issues `get` only for rows that were reserved before a crash; it neither
 /// creates replacement objects nor enumerates any provider namespace.
 pub(crate) async fn reconcile_reserved_shadow_objects(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     staging: &ShadowObjectStaging<'_>,
 ) -> Result<()> {
     let mut after_ordinal = None;
@@ -228,7 +266,7 @@ impl<'a> ShadowObjectStaging<'a> {
 
     pub(crate) async fn create_and_readback(
         &self,
-        backend: &dyn ImmutableObjectBackend,
+        backend: &(impl ExactImmutableObjectBackend + ?Sized),
         context: &ObjectContext,
         envelope: CiphertextEnvelope,
     ) -> Result<ShadowObjectFacts> {
@@ -242,7 +280,7 @@ impl<'a> ShadowObjectStaging<'a> {
     /// an object whose authenticated contents or context are invalid.
     pub(crate) async fn create_and_readback_verified(
         &self,
-        backend: &dyn ImmutableObjectBackend,
+        backend: &(impl ExactImmutableObjectBackend + ?Sized),
         context: &ObjectContext,
         envelope: CiphertextEnvelope,
         verify: impl FnOnce(&CiphertextEnvelope) -> ArchiveResult<()>,
@@ -308,6 +346,20 @@ impl<'a> ShadowObjectStaging<'a> {
 pub trait CheckpointSource: Send {
     fn logical_file_length(&self) -> Result<u64>;
     fn read_exact(&mut self, logical_offset: u64, destination: &mut [u8]) -> Result<()>;
+}
+
+/// Cleanup-owning blocking source used by the WAL publisher. Only bounded
+/// zeroizing chunks and authenticated fixed-size facts cross into async code;
+/// no path, file, or synchronous seek/read is exposed.
+#[async_trait::async_trait]
+pub(crate) trait OwnedCheckpointSource: Send + Sync {
+    fn authenticated_facts(&self) -> Result<(u64, [u8; 32], u32)>;
+
+    async fn read_exact_owned(
+        &self,
+        logical_offset: u64,
+        length: usize,
+    ) -> Result<Zeroizing<Vec<u8>>>;
 }
 
 /// File-backed stable source that can only be minted from the Store-owned
@@ -431,6 +483,34 @@ pub struct UploadedCheckpoint {
 }
 
 impl UploadedCheckpoint {
+    #[cfg(test)]
+    pub(crate) fn for_wal_checkpoint_control_test(
+        checkpoint_id: ObjectId,
+        root: ImmutableReference,
+        logical_file_length: u64,
+        total_chunks: u32,
+        database_plaintext_hash: [u8; 32],
+        user_schema_version: u32,
+    ) -> Result<Self> {
+        let expected_chunks = validate_snapshot_length(logical_file_length)?;
+        if checkpoint_id.as_bytes() == &[0; 16]
+            || root.object_id.as_bytes() == &[0; 16]
+            || root.envelope_hash == [0; 32]
+            || total_chunks != expected_chunks
+            || database_plaintext_hash == [0; 32]
+        {
+            return Err(ShadowCheckpointError::Source);
+        }
+        Ok(Self {
+            checkpoint_id,
+            root,
+            logical_file_length,
+            total_chunks,
+            database_plaintext_hash,
+            user_schema_version,
+        })
+    }
+
     pub fn checkpoint_id(&self) -> ObjectId {
         self.checkpoint_id
     }
@@ -465,7 +545,7 @@ impl std::fmt::Debug for UploadedCheckpoint {
 /// one 256-entry pending group per tree level is retained; no storage listing
 /// is used for deduplication or recovery selection.
 pub async fn upload_checkpoint<C: CheckpointCipher>(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
@@ -623,13 +703,178 @@ pub async fn upload_checkpoint<C: CheckpointCipher>(
     })
 }
 
+/// WAL-owner checkpoint upload from an already authenticated cleanup-owning
+/// blocking source. The first-pass hash/schema facts were produced on that
+/// worker; this second pass streams bounded chunks and checks the final digest.
+pub(crate) async fn upload_owned_checkpoint<C: CheckpointCipher>(
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
+    cipher: &C,
+    archive_id: ArchiveId,
+    database_epoch: DatabaseEpoch,
+    source: &dyn OwnedCheckpointSource,
+    staging: ShadowObjectStaging<'_>,
+) -> Result<UploadedCheckpoint> {
+    if cipher.archive_id() != archive_id {
+        return Err(ArchiveV3Error::InvalidContext.into());
+    }
+    let (logical_file_length, database_plaintext_hash, user_schema_version) =
+        source.authenticated_facts()?;
+    let total_chunks = validate_snapshot_length(logical_file_length)?;
+    if database_plaintext_hash == [0; 32] {
+        return Err(ShadowCheckpointError::Source);
+    }
+    let checkpoint_id = ObjectId::random();
+    let tree_height = manifest_tree_height(total_chunks)?;
+    let mut pending: Vec<Vec<ManifestSpan>> =
+        (0..usize::from(tree_height)).map(|_| Vec::new()).collect();
+    let mut root: Option<ManifestSpan> = None;
+    let mut leaf_entries = Vec::with_capacity(MAX_CHECKPOINT_MANIFEST_FANOUT);
+    let mut uploaded_hash = Sha256::new();
+
+    for chunk_index in 0..total_chunks {
+        let logical_offset = u64::from(chunk_index) * u64::from(CHECKPOINT_CHUNK_BYTES);
+        let remaining = logical_file_length
+            .checked_sub(logical_offset)
+            .ok_or(ArchiveV3Error::Malformed("checkpoint offset"))?;
+        let logical_byte_len = remaining.min(u64::from(CHECKPOINT_CHUNK_BYTES)) as u32;
+        let chunk = source
+            .read_exact_owned(logical_offset, logical_byte_len as usize)
+            .await?;
+        if chunk.len() != logical_byte_len as usize {
+            return Err(ShadowCheckpointError::Source);
+        }
+        uploaded_hash.update(chunk.as_slice());
+        let plaintext_hash: [u8; 32] = Sha256::digest(chunk.as_slice()).into();
+        let context = ObjectContext::new(
+            archive_id,
+            database_epoch,
+            cipher.key_epoch(),
+            ObjectRole::CheckpointChunkV3,
+            LogicalLocation::CheckpointChunk {
+                checkpoint_id,
+                chunk_index,
+                logical_offset,
+                byte_len: logical_byte_len,
+            },
+            ObjectId::random(),
+            None,
+        )?;
+        let envelope = cipher.seal(&context, chunk.as_slice())?;
+        staging
+            .create_and_readback(backend, &context, envelope.clone())
+            .await?;
+        leaf_entries.push(CheckpointChunkEntry {
+            chunk_index,
+            logical_offset,
+            logical_byte_len,
+            plaintext_hash,
+            reference: ImmutableReference {
+                object_id: context.object_id(),
+                envelope_hash: envelope.hash(),
+            },
+        });
+
+        if leaf_entries.len() == MAX_CHECKPOINT_MANIFEST_FANOUT || chunk_index + 1 == total_chunks {
+            let range_end = chunk_index + 1;
+            let range_start = range_end
+                .checked_sub(leaf_entries.len() as u32)
+                .ok_or(ArchiveV3Error::Malformed("checkpoint leaf range"))?;
+            let span = seal_manifest(
+                backend,
+                cipher,
+                archive_id,
+                database_epoch,
+                checkpoint_id,
+                0,
+                range_start,
+                range_end,
+                total_chunks,
+                logical_file_length,
+                database_plaintext_hash,
+                CheckpointManifestEntries::Chunks(std::mem::take(&mut leaf_entries)),
+                tree_height == 0,
+                staging.clone(),
+            )
+            .await?;
+            add_manifest_span(
+                backend,
+                cipher,
+                archive_id,
+                database_epoch,
+                checkpoint_id,
+                total_chunks,
+                logical_file_length,
+                tree_height,
+                &mut pending,
+                &mut root,
+                span,
+                database_plaintext_hash,
+                staging.clone(),
+            )
+            .await?;
+        }
+    }
+
+    if <[u8; 32]>::from(uploaded_hash.finalize()) != database_plaintext_hash {
+        return Err(ShadowCheckpointError::Source);
+    }
+    for level in 0..usize::from(tree_height) {
+        if !pending[level].is_empty() {
+            let children = std::mem::take(&mut pending[level]);
+            let span = seal_parent_manifest(
+                backend,
+                cipher,
+                archive_id,
+                database_epoch,
+                checkpoint_id,
+                total_chunks,
+                logical_file_length,
+                tree_height,
+                level as u8,
+                children,
+                database_plaintext_hash,
+                staging.clone(),
+            )
+            .await?;
+            add_manifest_span(
+                backend,
+                cipher,
+                archive_id,
+                database_epoch,
+                checkpoint_id,
+                total_chunks,
+                logical_file_length,
+                tree_height,
+                &mut pending,
+                &mut root,
+                span,
+                database_plaintext_hash,
+                staging.clone(),
+            )
+            .await?;
+        }
+    }
+    let root = root.ok_or(ArchiveV3Error::Malformed("checkpoint manifest root"))?;
+    if root.level != tree_height || root.range_start != 0 || root.range_end != total_chunks {
+        return Err(ArchiveV3Error::Malformed("checkpoint manifest root").into());
+    }
+    Ok(UploadedCheckpoint {
+        checkpoint_id,
+        root: root.reference,
+        logical_file_length,
+        total_chunks,
+        database_plaintext_hash,
+        user_schema_version,
+    })
+}
+
 /// Recovers only the checkpoint nominated by the current witness root.  The
 /// supplied cipher must have already been resolved from the same witnessed key
 /// registry epoch; this function does not accept a caller-selected root,
 /// manifest ID, prefix, or provider continuation token.
 pub async fn recover_witness_checkpoint<C: CheckpointCipher>(
     witness: &dyn Witness,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     sink: &mut dyn CheckpointSink,
@@ -650,7 +895,7 @@ pub async fn recover_witness_checkpoint<C: CheckpointCipher>(
 /// same exact-root recovery proof as [`recover_witness_checkpoint`].
 pub async fn recover_checkpoint_from_recovery_root<C: CheckpointCipher>(
     recovery: &RecoveryRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     sink: &mut dyn CheckpointSink,
@@ -666,7 +911,7 @@ pub async fn recover_checkpoint_from_recovery_root<C: CheckpointCipher>(
 
 async fn recover_checkpoint_from_recovery_root_inner<C: CheckpointCipher>(
     recovery: &RecoveryRoot,
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     sink: &mut dyn CheckpointSink,
@@ -911,7 +1156,7 @@ fn hash_snapshot(
 
 #[allow(clippy::too_many_arguments)]
 async fn add_manifest_span<C: CheckpointCipher>(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
@@ -961,7 +1206,7 @@ async fn add_manifest_span<C: CheckpointCipher>(
 
 #[allow(clippy::too_many_arguments)]
 async fn seal_parent_manifest<C: CheckpointCipher>(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
@@ -1014,7 +1259,7 @@ async fn seal_parent_manifest<C: CheckpointCipher>(
 
 #[allow(clippy::too_many_arguments)]
 async fn seal_manifest<C: CheckpointCipher>(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
@@ -1098,7 +1343,7 @@ fn manifest_context(
 }
 
 async fn load_exact_envelope(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     context: &ObjectContext,
     reference: &ImmutableReference,
 ) -> Result<CiphertextEnvelope> {
@@ -1116,7 +1361,7 @@ async fn load_exact_envelope(
 }
 
 async fn load_manifest<C: CheckpointCipher>(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     context: &ObjectContext,
     reference: &ImmutableReference,
@@ -1151,7 +1396,7 @@ fn validate_manifest_shape(
 
 #[allow(clippy::too_many_arguments)]
 async fn load_witness_root<C: CheckpointCipher>(
-    backend: &dyn ImmutableObjectBackend,
+    backend: &(impl ExactImmutableObjectBackend + ?Sized),
     cipher: &C,
     archive_id: ArchiveId,
     reference: RootReference,
@@ -1511,7 +1756,7 @@ mod tests {
             value: CiphertextEnvelope,
         ) -> ArchiveResult<CreateIfAbsent> {
             *self.creates.lock().unwrap() += 1;
-            self.inner.create_if_absent(key, value).await
+            ImmutableObjectBackend::create_if_absent(&self.inner, key, value).await
         }
         async fn get(&self, key: &ObjectKey) -> ArchiveResult<Option<CiphertextEnvelope>> {
             let fault = *self.fault.lock().unwrap();
@@ -1537,13 +1782,13 @@ mod tests {
                         .await?;
                     for candidate in page.objects {
                         if candidate.object_id() != id {
-                            other = self.inner.get(&candidate).await?;
+                            other = ImmutableObjectBackend::get(&self.inner, &candidate).await?;
                             break;
                         }
                     }
                     Ok(other)
                 }
-                _ => self.inner.get(key).await,
+                _ => ImmutableObjectBackend::get(&self.inner, key).await,
             }
         }
         async fn enumerate(
