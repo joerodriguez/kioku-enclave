@@ -9,7 +9,7 @@ configured webhook events use the separate webhook boundary.
 
 | File | Role |
 |---|---|
-| `main.rs` | Entry point; wires public OAuth, auth-gated Cloud Capture/session/push/query routes, environment-separated Secret-Manager APNs credentials, legacy `/v1/*`, public health/attestation, and offline ADR-0016 commands; starts media, summarization, finalization, push, and deletion workers; production fails closed without APNs configuration and serves only through `serve_tls` |
+| `main.rs` | Entry point; wires public OAuth, auth-gated Cloud Capture/session/push/query routes and separate single-event/reference-batch request budgets, environment-separated Secret-Manager APNs credentials, legacy `/v1/*`, public health/attestation, and offline ADR-0016 commands; starts media, summarization, finalization, push, and deletion workers; production fails closed without APNs configuration and serves only through `serve_tls` |
 | `tls.rs` | In-enclave rustls termination with a swappable certificate resolver and SHA-256 leaf fingerprint. Production uses ACME; static/generated certificate paths are custom/debug fallback mechanisms, not production launch overrides |
 | `acme.rs` | Required production ACME lifecycle: answers HTTP-01 on :80, generates the TLS key in the TEE, persists account/cert/key as context-bound KMS-wrapped state (`acme/tls.json.enc`), blocks boot until a usable cert exists, and hot-swaps renewals |
 | [`cp/`](cp/map.md) | **Control plane:** OAuth/DCR, sync, account, MCP + REST, quotas, capture-session feedback, ready-push installation/outbox/handoff, summarizer, and the encrypted identity control store |

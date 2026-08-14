@@ -12,6 +12,7 @@
 //! whole-blob persist-on-write is fine — unlike user indexes (see ADR-0002).
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -100,6 +101,8 @@ const MAX_RECORDING_LEASE_DENIALS_PER_USER: i64 = 100;
 const RECORDING_LEASE_DURATION_MS: i64 = 60_000;
 const RECORDING_DELIVERY_EVENTS_PER_MINUTE: i64 = 120;
 const RECORDING_DELIVERY_BYTES_PER_MINUTE: i64 = 256 * 1024 * 1024;
+const MAX_PENDING_REFERENCE_BATCH_RECEIPTS_PER_USER: i64 = 256;
+const MAX_COMPLETED_REFERENCE_BATCH_RECEIPTS_PER_USER: i64 = 512;
 const MAX_ARCHIVE_DELETION_CURSOR_BYTES: usize = 4 * 1024;
 const MAX_ARCHIVE_ID_CANDIDATES: usize = 8;
 const LIFECYCLE_REGISTRY_ORDINAL: u32 = 0;
@@ -124,6 +127,53 @@ fn grant_recording_delivery_minute(tx: &rusqlite::Transaction<'_>, user_id: &str
         ],
     )?;
     Ok(())
+}
+
+fn mark_satisfied_reference_batches(tx: &rusqlite::Transaction<'_>, user_id: &str) -> Result<bool> {
+    Ok(tx.execute(
+        "UPDATE capture_reference_batch_receipts
+         SET state='completed',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE user_id=?1 AND state='reserved' AND NOT EXISTS (
+           SELECT 1 FROM capture_reference_batch_events e
+           JOIN recording_delivery_reservations d
+             ON d.user_id=e.user_id AND d.event_id=e.event_id
+           WHERE e.user_id=capture_reference_batch_receipts.user_id
+             AND e.batch_id=capture_reference_batch_receipts.batch_id
+         )",
+        [user_id],
+    )? != 0)
+}
+
+fn prune_completed_reference_batches(
+    tx: &rusqlite::Transaction<'_>,
+    user_id: &str,
+) -> Result<bool> {
+    let batch_ids = {
+        let mut statement = tx.prepare(
+            "SELECT batch_id FROM capture_reference_batch_receipts
+             WHERE user_id=?1 AND state='completed'
+             ORDER BY updated_at DESC,batch_id DESC LIMIT -1 OFFSET ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![user_id, MAX_COMPLETED_REFERENCE_BATCH_RECEIPTS_PER_USER],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let mut changed = false;
+    for batch_id in batch_ids {
+        changed |= tx.execute(
+            "DELETE FROM capture_reference_batch_events WHERE user_id=?1 AND batch_id=?2",
+            rusqlite::params![user_id, batch_id],
+        )? != 0;
+        changed |= tx.execute(
+            "DELETE FROM capture_reference_batch_receipts WHERE user_id=?1 AND batch_id=?2",
+            rusqlite::params![user_id, batch_id],
+        )? != 0;
+    }
+    Ok(changed)
 }
 
 const SCHEMA: &str = r#"
@@ -243,6 +293,27 @@ CREATE TABLE IF NOT EXISTS recording_delivery_reservations (
     reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (user_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS capture_reference_batch_receipts (
+    user_id         TEXT NOT NULL,
+    batch_id        TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL,
+    stream_id       TEXT NOT NULL,
+    first_sequence  INTEGER NOT NULL CHECK (first_sequence >= 0),
+    last_sequence   INTEGER NOT NULL CHECK (last_sequence >= first_sequence),
+    event_count     INTEGER NOT NULL CHECK (event_count BETWEEN 1 AND 64),
+    state           TEXT NOT NULL CHECK (state IN ('awaiting_credit','reserved','completed')),
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (user_id, batch_id)
+);
+CREATE TABLE IF NOT EXISTS capture_reference_batch_events (
+    user_id  TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    ordinal  INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 63),
+    event_id TEXT NOT NULL,
+    PRIMARY KEY (user_id, batch_id, ordinal),
+    UNIQUE (user_id, batch_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS offline_recording_usage_receipts (
     user_id      TEXT NOT NULL,
@@ -14337,6 +14408,14 @@ fn delete_user_identity_conn(
         [user_id],
     )?;
     tx.execute(
+        "DELETE FROM capture_reference_batch_events WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
+        "DELETE FROM capture_reference_batch_receipts WHERE user_id = ?1",
+        [user_id],
+    )?;
+    tx.execute(
         "DELETE FROM offline_recording_usage_receipts WHERE user_id = ?1",
         [user_id],
     )?;
@@ -15656,6 +15735,8 @@ impl ControlStore {
                             "recording_lease_denials",
                             "recording_delivery_balances",
                             "recording_delivery_reservations",
+                            "capture_reference_batch_events",
+                            "capture_reference_batch_receipts",
                             "offline_recording_usage_receipts",
                             "webhook_subscriptions",
                             "episode_email_preferences",
@@ -16605,14 +16686,287 @@ impl ControlStore {
         .await
     }
 
+    /// Atomically reserves the existing per-event delayed-delivery authority
+    /// for one bounded reference batch. The batch receipt is correlation state;
+    /// individual `(user_id,event_id)` rows remain the billing/idempotency fence
+    /// so fallback to the single-event route cannot charge an event twice.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_recording_delivery_batch(
+        &self,
+        user_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        stream_id: &str,
+        first_sequence: i64,
+        last_sequence: i64,
+        event_ids: &[String],
+        new_event_ids: &[String],
+    ) -> Result<bool> {
+        let user_id = user_id.to_string();
+        let batch_id = batch_id.to_string();
+        let manifest_digest = manifest_digest.to_string();
+        let stream_id = stream_id.to_string();
+        let event_ids = event_ids.to_vec();
+        let new_event_ids = new_event_ids.to_vec();
+        self.write_if_changed(move |conn| {
+            let valid_digest = |value: &str| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            };
+            let event_id_set = event_ids.iter().collect::<HashSet<_>>();
+            if !valid_digest(&batch_id)
+                || !valid_digest(&manifest_digest)
+                || stream_id.is_empty()
+                || event_ids.is_empty()
+                || event_ids.len() > 64
+                || event_id_set.len() != event_ids.len()
+                || first_sequence < 0
+                || last_sequence < first_sequence
+                || last_sequence
+                    .checked_sub(first_sequence)
+                    .and_then(|span| span.checked_add(1))
+                    != Some(event_ids.len() as i64)
+                || new_event_ids
+                    .iter()
+                    .any(|event_id| !event_id_set.contains(event_id))
+                || new_event_ids.iter().collect::<HashSet<_>>().len() != new_event_ids.len()
+            {
+                return Err(EnclaveError::InvalidRequest(
+                    "reference batch reservation is invalid".into(),
+                ));
+            }
+
+            let tx = conn.unchecked_transaction()?;
+            let existing: Option<(String, String, i64, i64, i64, String)> = tx
+                .query_row(
+                    "SELECT manifest_digest,stream_id,first_sequence,last_sequence,event_count,state
+                     FROM capture_reference_batch_receipts WHERE user_id=?1 AND batch_id=?2",
+                    rusqlite::params![user_id, batch_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let mut changed = false;
+            let state = if let Some((
+                existing_digest,
+                existing_stream,
+                existing_first,
+                existing_last,
+                existing_count,
+                existing_state,
+            )) = existing
+            {
+                let stored_event_ids = {
+                    let mut statement = tx.prepare(
+                        "SELECT event_id FROM capture_reference_batch_events
+                         WHERE user_id=?1 AND batch_id=?2 ORDER BY ordinal",
+                    )?;
+                    let rows = statement
+                        .query_map(rusqlite::params![user_id, batch_id], |row| {
+                            row.get::<_, String>(0)
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    rows
+                };
+                if existing_digest != manifest_digest
+                    || existing_stream != stream_id
+                    || existing_first != first_sequence
+                    || existing_last != last_sequence
+                    || existing_count != event_ids.len() as i64
+                    || stored_event_ids != event_ids
+                {
+                    return Err(EnclaveError::Conflict(
+                        "idempotency conflict for reference batch".into(),
+                    ));
+                }
+                existing_state
+            } else {
+                let pending: i64 = tx.query_row(
+                    "SELECT count(*) FROM capture_reference_batch_receipts
+                     WHERE user_id=?1 AND state!='completed'",
+                    [&user_id],
+                    |row| row.get(0),
+                )?;
+                if pending >= MAX_PENDING_REFERENCE_BATCH_RECEIPTS_PER_USER {
+                    return Err(EnclaveError::Conflict(
+                        "too many pending reference batches".into(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT INTO capture_reference_batch_receipts
+                     (user_id,batch_id,manifest_digest,stream_id,first_sequence,last_sequence,
+                      event_count,state) VALUES (?1,?2,?3,?4,?5,?6,?7,'awaiting_credit')",
+                    rusqlite::params![
+                        user_id,
+                        batch_id,
+                        manifest_digest,
+                        stream_id,
+                        first_sequence,
+                        last_sequence,
+                        event_ids.len() as i64
+                    ],
+                )?;
+                for (ordinal, event_id) in event_ids.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO capture_reference_batch_events
+                         (user_id,batch_id,ordinal,event_id) VALUES (?1,?2,?3,?4)",
+                        rusqlite::params![user_id, batch_id, ordinal as i64, event_id],
+                    )?;
+                }
+                changed = true;
+                "awaiting_credit".to_string()
+            };
+
+            if state == "completed" {
+                if !new_event_ids.is_empty() {
+                    return Err(EnclaveError::Store(
+                        "completed reference batch is absent from the user archive".into(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok((true, changed));
+            }
+
+            let mut unreserved = Vec::new();
+            for event_id in &new_event_ids {
+                let exists: i64 = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM recording_delivery_reservations
+                     WHERE user_id=?1 AND event_id=?2)",
+                    rusqlite::params![user_id, event_id],
+                    |row| row.get(0),
+                )?;
+                if exists == 0 {
+                    unreserved.push(event_id);
+                }
+            }
+
+            let allowed = if unreserved.is_empty() {
+                true
+            } else {
+                let available: Option<i64> = tx
+                    .query_row(
+                        "SELECT event_credits FROM recording_delivery_balances WHERE user_id=?1",
+                        [&user_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                available.is_some_and(|credits| credits >= unreserved.len() as i64)
+            };
+            let unreserved_count = unreserved.len() as i64;
+            if allowed {
+                if !unreserved.is_empty() {
+                    tx.execute(
+                        "UPDATE recording_delivery_balances
+                         SET event_credits=event_credits-?2,
+                             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                         WHERE user_id=?1",
+                        rusqlite::params![user_id, unreserved_count],
+                    )?;
+                    for event_id in &unreserved {
+                        tx.execute(
+                            "INSERT INTO recording_delivery_reservations
+                             (user_id,event_id,reserved_bytes) VALUES (?1,?2,0)",
+                            rusqlite::params![user_id, event_id],
+                        )?;
+                    }
+                }
+                changed |= tx.execute(
+                    "UPDATE capture_reference_batch_receipts
+                     SET state='reserved',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE user_id=?1 AND batch_id=?2 AND state!='reserved'",
+                    rusqlite::params![user_id, batch_id],
+                )? != 0;
+            }
+            tx.commit()?;
+            Ok((allowed, changed || (allowed && unreserved_count != 0)))
+        })
+        .await
+    }
+
+    pub async fn complete_recording_delivery_batch(
+        &self,
+        user_id: &str,
+        batch_id: &str,
+        manifest_digest: &str,
+        event_ids: &[String],
+    ) -> Result<()> {
+        let user_id = user_id.to_string();
+        let batch_id = batch_id.to_string();
+        let manifest_digest = manifest_digest.to_string();
+        let event_ids = event_ids.to_vec();
+        self.write_if_changed(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let receipt: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT manifest_digest,state FROM capture_reference_batch_receipts
+                     WHERE user_id=?1 AND batch_id=?2",
+                    rusqlite::params![user_id, batch_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((stored_digest, _state)) = receipt else {
+                return Err(EnclaveError::Store(
+                    "reference batch receipt is missing".into(),
+                ));
+            };
+            let stored_event_ids = {
+                let mut statement = tx.prepare(
+                    "SELECT event_id FROM capture_reference_batch_events
+                     WHERE user_id=?1 AND batch_id=?2 ORDER BY ordinal",
+                )?;
+                let rows = statement
+                    .query_map(rusqlite::params![user_id, batch_id], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            if stored_digest != manifest_digest || stored_event_ids != event_ids {
+                return Err(EnclaveError::Conflict(
+                    "idempotency conflict for reference batch completion".into(),
+                ));
+            }
+            let mut changed = false;
+            for event_id in &event_ids {
+                changed |= tx.execute(
+                    "DELETE FROM recording_delivery_reservations
+                     WHERE user_id=?1 AND event_id=?2",
+                    rusqlite::params![user_id, event_id],
+                )? != 0;
+            }
+            changed |= tx.execute(
+                "UPDATE capture_reference_batch_receipts
+                 SET state='completed',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE user_id=?1 AND batch_id=?2 AND state!='completed'",
+                rusqlite::params![user_id, batch_id],
+            )? != 0;
+            changed |= mark_satisfied_reference_batches(&tx, &user_id)?;
+            changed |= prune_completed_reference_batches(&tx, &user_id)?;
+            tx.commit()?;
+            Ok(((), changed))
+        })
+        .await
+    }
+
     pub async fn complete_recording_delivery(&self, user_id: &str, event_id: &str) -> Result<()> {
         let user_id = user_id.to_string();
         let event_id = event_id.to_string();
         self.write_if_changed(move |conn| {
-            let changed = conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let mut changed = tx.execute(
                 "DELETE FROM recording_delivery_reservations WHERE user_id=?1 AND event_id=?2",
                 rusqlite::params![user_id, event_id],
             )? != 0;
+            changed |= mark_satisfied_reference_batches(&tx, &user_id)?;
+            changed |= prune_completed_reference_batches(&tx, &user_id)?;
+            tx.commit()?;
             Ok(((), changed))
         })
         .await
@@ -19227,6 +19581,24 @@ mod tests {
                     rusqlite::params![old_user_id, subject],
                 )?;
                 create_active_archive_binding_conn(conn, &old_user_id)?;
+                conn.execute(
+                    "INSERT INTO recording_delivery_reservations
+                     (user_id,event_id,reserved_bytes) VALUES (?1,'legacy-batched-event',0)",
+                    [&old_user_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO capture_reference_batch_receipts
+                     (user_id,batch_id,manifest_digest,stream_id,first_sequence,last_sequence,
+                      event_count,state)
+                     VALUES (?1,?2,?3,'screen-stream',1,1,1,'reserved')",
+                    rusqlite::params![old_user_id, "a".repeat(64), "b".repeat(64)],
+                )?;
+                conn.execute(
+                    "INSERT INTO capture_reference_batch_events
+                     (user_id,batch_id,ordinal,event_id)
+                     VALUES (?1,?2,0,'legacy-batched-event')",
+                    rusqlite::params![old_user_id, "a".repeat(64)],
+                )?;
                 Ok(())
             })
             .await
@@ -22149,6 +22521,26 @@ mod tests {
             [USER_ID],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO recording_delivery_reservations
+             (user_id,event_id,reserved_bytes) VALUES (?1,'batched-event',0)",
+            [USER_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_reference_batch_receipts
+             (user_id,batch_id,manifest_digest,stream_id,first_sequence,last_sequence,
+              event_count,state)
+             VALUES (?1,?2,?3,'screen-stream',1,1,1,'reserved')",
+            rusqlite::params![USER_ID, "a".repeat(64), "b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO capture_reference_batch_events
+             (user_id,batch_id,ordinal,event_id) VALUES (?1,?2,0,'batched-event')",
+            rusqlite::params![USER_ID, "a".repeat(64)],
+        )
+        .unwrap();
         let fence = crate::store::test_identity_rebind_fence_object_name(USER_ID);
         let first = begin_user_deletion_conn(&conn, USER_ID, OPERATION_ID, &fence)
             .unwrap()
@@ -22253,6 +22645,8 @@ mod tests {
             "recording_lease_denials",
             "recording_delivery_balances",
             "recording_delivery_reservations",
+            "capture_reference_batch_events",
+            "capture_reference_batch_receipts",
             "offline_recording_usage_receipts",
         ] {
             let count: i64 = conn
@@ -23234,6 +23628,36 @@ mod tests {
                 .as_deref(),
             Some("active")
         );
+        let stable_user_id_for_rows = stable_user_id.clone();
+        let old_user_id_for_rows = old_user_id.to_string();
+        let migrated_batch_rows: (i64, i64, i64, i64) = control
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT count(*) FROM capture_reference_batch_receipts WHERE user_id=?1",
+                        [&stable_user_id_for_rows],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT count(*) FROM capture_reference_batch_events WHERE user_id=?1",
+                        [&stable_user_id_for_rows],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT count(*) FROM recording_delivery_reservations WHERE user_id=?1",
+                        [&stable_user_id_for_rows],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT count(*) FROM capture_reference_batch_receipts WHERE user_id=?1",
+                        [&old_user_id_for_rows],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(migrated_batch_rows, (1, 1, 1, 0));
         let ledger = control
             .archive_deletion_ledger(&stable_user_id)
             .await
@@ -23941,6 +24365,7 @@ mod tests {
             control.upsert_user(&subject, "legacy@example.com").await,
             Err(EnclaveError::Conflict(_))
         ));
+
         let retained_id: String = control
             .read(move |conn| {
                 Ok(conn.query_row(
@@ -24350,6 +24775,168 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn reference_batch_bulk_reservation_is_per_event_idempotent_and_fallback_safe() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = control
+            .upsert_user("reference-batch-subject", "batch@example.com")
+            .await
+            .unwrap();
+        control
+            .complete_offline_recording_usage(&user.id, "batch-credit")
+            .await
+            .unwrap();
+        let batch_id = "a".repeat(64);
+        let manifest_digest = "b".repeat(64);
+        let event_ids = vec!["event-1".into(), "event-2".into(), "event-3".into()];
+        assert!(control
+            .reserve_recording_delivery_batch(
+                &user.id,
+                &batch_id,
+                &manifest_digest,
+                "screen-1",
+                1,
+                3,
+                &event_ids,
+                &event_ids,
+            )
+            .await
+            .unwrap());
+        // An ambiguous retry reuses all three per-event reservations and does
+        // not spend another logical-event credit.
+        assert!(control
+            .reserve_recording_delivery_batch(
+                &user.id,
+                &batch_id,
+                &manifest_digest,
+                "screen-1",
+                1,
+                3,
+                &event_ids,
+                &event_ids,
+            )
+            .await
+            .unwrap());
+        let user_id = user.id.clone();
+        let (credits, reservations, receipt_state): (i64, i64, String) = control
+            .read(move |conn| {
+                let credits = conn.query_row(
+                    "SELECT event_credits FROM recording_delivery_balances WHERE user_id=?1",
+                    [&user_id],
+                    |row| row.get(0),
+                )?;
+                let reservations = conn.query_row(
+                    "SELECT count(*) FROM recording_delivery_reservations WHERE user_id=?1",
+                    [&user_id],
+                    |row| row.get(0),
+                )?;
+                let state = conn.query_row(
+                    "SELECT state FROM capture_reference_batch_receipts WHERE user_id=?1",
+                    [&user_id],
+                    |row| row.get(0),
+                )?;
+                Ok((credits, reservations, state))
+            })
+            .await
+            .unwrap();
+        assert_eq!(credits, RECORDING_DELIVERY_EVENTS_PER_MINUTE - 3);
+        assert_eq!(reservations, 3);
+        assert_eq!(receipt_state, "reserved");
+
+        // Individual-route fallback clears the same event authority. The final
+        // event also completes the overlapping batch receipt.
+        for event_id in &event_ids {
+            control
+                .complete_recording_delivery(&user.id, event_id)
+                .await
+                .unwrap();
+        }
+        let user_id = user.id.clone();
+        let (reservations, receipt_state): (i64, String) = control
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT count(*) FROM recording_delivery_reservations WHERE user_id=?1",
+                        [&user_id],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM capture_reference_batch_receipts WHERE user_id=?1",
+                        [&user_id],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(reservations, 0);
+        assert_eq!(receipt_state, "completed");
+        assert!(matches!(
+            control
+                .reserve_recording_delivery_batch(
+                    &user.id,
+                    &batch_id,
+                    &"c".repeat(64),
+                    "screen-1",
+                    1,
+                    3,
+                    &event_ids,
+                    &[],
+                )
+                .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        let direct_batch_id = "d".repeat(64);
+        let direct_digest = "e".repeat(64);
+        let direct_events = vec!["event-4".into(), "event-5".into()];
+        assert!(control
+            .reserve_recording_delivery_batch(
+                &user.id,
+                &direct_batch_id,
+                &direct_digest,
+                "screen-1",
+                4,
+                5,
+                &direct_events,
+                &direct_events,
+            )
+            .await
+            .unwrap());
+        control
+            .complete_recording_delivery_batch(
+                &user.id,
+                &direct_batch_id,
+                &direct_digest,
+                &direct_events,
+            )
+            .await
+            .unwrap();
+        let user_id = user.id.clone();
+        let direct_state: (i64, String) = control
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT count(*) FROM recording_delivery_reservations
+                         WHERE user_id=?1 AND event_id IN ('event-4','event-5')",
+                        [&user_id],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM capture_reference_batch_receipts
+                         WHERE user_id=?1 AND batch_id=?2",
+                        rusqlite::params![user_id, direct_batch_id],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(direct_state, (0, "completed".into()));
     }
 
     #[tokio::test]

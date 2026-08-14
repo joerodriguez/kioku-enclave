@@ -117,6 +117,15 @@ pub enum EnclaveError {
     #[error("screen reference must be rebased: {0}")]
     CaptureReference(CaptureReferenceFailureReason),
 
+    #[error(
+        "screen reference batch item {index} at sequence {sequence} must be rebased: {reason}"
+    )]
+    CaptureReferenceBatch {
+        reason: CaptureReferenceFailureReason,
+        index: usize,
+        sequence: i64,
+    },
+
     #[error("not found")]
     NotFound,
 
@@ -139,9 +148,28 @@ impl IntoResponse for EnclaveError {
             )
                 .into_response();
         }
+        if let EnclaveError::CaptureReferenceBatch {
+            reason,
+            index,
+            sequence,
+        } = &self
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "screen_reference_rebase_required",
+                    "reason": reason.as_str(),
+                    "index": index,
+                    "sequence": sequence,
+                })),
+            )
+                .into_response();
+        }
         let (status, message) = match &self {
             EnclaveError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            EnclaveError::CaptureReference(_) => unreachable!("handled above"),
+            EnclaveError::CaptureReference(_) | EnclaveError::CaptureReferenceBatch { .. } => {
+                unreachable!("handled above")
+            }
             EnclaveError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             EnclaveError::Conflict(_) | EnclaveError::DeletionPending(_) => {
                 (StatusCode::CONFLICT, self.to_string())

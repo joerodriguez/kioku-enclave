@@ -56,7 +56,7 @@ and explicitly configured webhook events cross the TEE boundary as documented in
 | `Dockerfile` | Digest-pinned builder/model definition for the static `x86_64-unknown-linux-musl` image; Phase-0 bakes distinct current-media and legacy-media buckets, with legacy equal to the index bucket, with remaining rebuild limits documented in `SECURITY.md` |
 | `Cargo.toml` / `Cargo.lock` | Crate manifest |
 | `README.md` | What the enclave does + the attestation/privacy claim |
-| `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, durable session finish, exact-session status, privacy-safe push registration/handoff, retry semantics, browser metadata, processing status, and learned people profiles |
+| `API.md` | Stable Cloud Capture API v2 contract for pure-Swift macOS/iOS clients, bounded Mac screenshot-reference batches, durable session finish, exact-session status, privacy-safe push registration/handoff, retry semantics, browser metadata, processing status, and learned people profiles |
 | [eval/](eval/map.md) | Public, content-free voice/identity quality scoring plus archive-capacity contracts, synthetic regression inputs, and real-corpus methodology |
 | [scripts/](scripts/map.md) | Offline evaluation-asset and capacity-fixture generation, fail-closed inactive archive-v3 signed-capacity-evidence verification, versioning, build-profile, and signed-release operator tools |
 | [TASKS.md](TASKS.md) | Scoped ADR-0022 implementation evidence and intentionally remaining authority gates |

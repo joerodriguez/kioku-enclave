@@ -459,6 +459,8 @@ pub struct CpState {
     pub reviewer_verifier: Option<Arc<auth::ReviewerIdentityVerifier>>,
     pub apple_provider: Option<Arc<apple::AppleIdentityProvider>>,
     pub sync_limiter: limits::RateLimiter,
+    pub reference_batch_limiter: limits::RateLimiter,
+    pub reference_batch_concurrency: Arc<tokio::sync::Semaphore>,
     pub mcp_limiter: limits::RateLimiter,
     pub oauth_limiter: limits::RateLimiter,
     pub test_email_limiter: limits::RateLimiter,
