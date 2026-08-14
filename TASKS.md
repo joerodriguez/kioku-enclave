@@ -210,6 +210,16 @@ separate activation blockers.
     1,048,576-row/32-MiB permanent ledger. Missing/substituted events, cap
     exhaustion, late ledger failure, and tamper fail closed. The B-domain event
     allocator and every Store/worker/launcher/provider/ack path remain absent.
+  - [x] Add the inactive metadata-only screen-reference batch A-domain: the
+    existing deterministic batch ID is subtype-separated from singular capture
+    identity before actor admission, the complete normalized manifest vector is
+    fingerprinted under the 1-MiB gate, and all new/duplicate rows plus stream
+    acknowledgement and the exact bounded response share one transaction with a
+    distinct 1,048,576-row/512-MiB permanent ledger. Missing or changed canonical
+    evidence, a changed same-ID manifest, cap exhaustion, late ledger failure,
+    partial schema, tamper, and reopen all fail closed or exactly replay. Canonical
+    media upload and its B-domain DEK/provider handoff remain unsupported, and no
+    Store/route/launcher/provider/task/ack path is connected.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.
