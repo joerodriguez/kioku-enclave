@@ -35,8 +35,8 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
         "src/store.rs::new_with_media_and_legacy#0::factory_definition::new_with_media_and_legacy#0",
     }
 )
-EXPECTED_POLICY_SITE_COUNT = 40
-EXPECTED_POLICY_SITE_SHA256 = "7c936452ac71e2835e1400ee3d139e37ebfaa80c7d2dc17c67a96ffe57d23f4f"
+EXPECTED_POLICY_SITE_COUNT = 41
+EXPECTED_POLICY_SITE_SHA256 = "3ed87fa7d69ab7ce9bab59b18ab8e076eab2ce68e382daace80408ebe5011735"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 17
-EXPECTED_WORKER_SPAWN_SHA256 = "6aee447b2f5bf2efaefdba8bd0fe4d65806bae9f2107af92f2be3aff7088b5ec"
+EXPECTED_WORKER_SPAWN_COUNT = 21
+EXPECTED_WORKER_SPAWN_SHA256 = "b065da22ba10d87c21a76c9f2fb90859da2b69e9349c31bc9179ac25f1790d03"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -321,7 +321,7 @@ STORE_CALL = re.compile(
 )
 WORKER_SPAWN = re.compile(
     r"(?P<target>tokio::spawn)\s*\(|\.\s*(?P<method>spawn)\s*\(\s*async\b|"
-    r"\.\s*(?P<local>spawn_local)\s*\("
+    r"\.\s*(?P<thread>spawn)\s*\(\s*move\s*\|\||\.\s*(?P<local>spawn_local)\s*\("
 )
 
 
@@ -343,6 +343,7 @@ def store_call_sites() -> list[CallSite]:
 def worker_spawn_sites() -> list[CallSite]:
     normalized = re.compile(
         r"(?P<target>tokio::spawn)\s*\(|\.\s*(?P<target_method>spawn)\s*\(\s*async\b|"
+        r"\.\s*(?P<target_thread>spawn)\s*\(\s*move\s*\|\||"
         r"\.\s*(?P<target_local>spawn_local)\s*\("
     )
     sites: list[CallSite] = []
@@ -907,10 +908,30 @@ impl X {
             "tokio::spawn",
             "GcsClient",
             "Witness::advance",
-            "pub(crate) struct PreparedLogicalMutation",
             "pub struct PreparedLogicalMutation",
         ):
             self.assertNotIn(forbidden, gate)
+
+    def test_wal_owner_is_private_test_published_and_unwired(self) -> None:
+        owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
+        self.assertIn("mod archive_v3_wal_owner;", main)
+        self.assertNotIn("archive_v3_wal_owner::", main)
+        self.assertIn("struct SingleArchiveWalOwner", owner)
+        self.assertNotIn("pub(crate) struct SingleArchiveWalOwner", owner)
+        self.assertNotIn("pub struct SingleArchiveWalOwner", owner)
+        self.assertIn(
+            "#[cfg(test)]\n    #[async_trait]\n    impl WalPublicationAuthority", owner
+        )
+        for forbidden in (
+            "GcsClient",
+            "FirestoreWitness",
+            "Store::new",
+            "list_objects",
+            "delete_exact",
+            "std::env",
+        ):
+            self.assertNotIn(forbidden, owner)
 
 
 def classify_worker_spawn(site: CallSite) -> str:

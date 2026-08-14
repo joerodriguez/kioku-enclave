@@ -76,7 +76,7 @@ pub(crate) enum WalOperationKind {
 }
 
 impl WalOperationKind {
-    fn decode(value: i64) -> Result<Self> {
+    pub(crate) fn decode(value: i64) -> Result<Self> {
         match value {
             1 => Ok(Self::MediaCaptureEvent),
             2 => Ok(Self::CaptureSessionFinish),
@@ -133,7 +133,7 @@ impl WalLogicalOperationId {
             .ok_or(WalIdempotencyError::Malformed)
     }
 
-    const fn as_bytes(&self) -> &[u8; 16] {
+    pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
 }
@@ -169,8 +169,24 @@ impl WalRequestFingerprint {
         Ok(Self(fingerprint))
     }
 
-    const fn as_bytes(&self) -> &[u8; 32] {
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub(crate) fn from_control_bytes(
+        _token: crate::cp::control_store::WalOwnerPersistenceContext,
+        value: [u8; 32],
+    ) -> Result<Self> {
+        (value != [0; 32])
+            .then_some(Self(value))
+            .ok_or(WalIdempotencyError::Malformed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_owner_test(value: [u8; 32]) -> Result<Self> {
+        (value != [0; 32])
+            .then_some(Self(value))
+            .ok_or(WalIdempotencyError::Malformed)
     }
 }
 
@@ -181,17 +197,17 @@ impl fmt::Debug for WalRequestFingerprint {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-enum WalReplayResult {
+pub(crate) enum WalReplayResult {
     UnitApplied,
     CanonicalResponse(Zeroizing<Vec<u8>>),
 }
 
 impl WalReplayResult {
-    fn unit() -> Self {
+    pub(crate) fn unit() -> Self {
         Self::UnitApplied
     }
 
-    fn canonical_response(kind: WalOperationKind, bytes: Vec<u8>) -> Result<Self> {
+    pub(crate) fn canonical_response(kind: WalOperationKind, bytes: Vec<u8>) -> Result<Self> {
         if !kind.permits_canonical_response() {
             return Err(WalIdempotencyError::ResultUnsupported);
         }
@@ -204,7 +220,7 @@ impl WalReplayResult {
         Ok(Self::CanonicalResponse(Zeroizing::new(bytes)))
     }
 
-    fn encode(&self, kind: WalOperationKind) -> Result<Zeroizing<Vec<u8>>> {
+    pub(crate) fn encode(&self, kind: WalOperationKind) -> Result<Zeroizing<Vec<u8>>> {
         let mut encoded = Zeroizing::new(Vec::new());
         encoded.extend_from_slice(&WAL_IDEMPOTENCY_FORMAT_V1.to_be_bytes());
         encoded.extend_from_slice(&(kind as u16).to_be_bytes());
@@ -228,7 +244,7 @@ impl WalReplayResult {
         Ok(encoded)
     }
 
-    fn decode(kind: WalOperationKind, encoded: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(kind: WalOperationKind, encoded: &[u8]) -> Result<Self> {
         if encoded.len() < 9 || encoded.len() > MAX_CANONICAL_REPLAY_RESULT_BYTES + 9 {
             return Err(WalIdempotencyError::Corrupt);
         }
@@ -255,7 +271,7 @@ impl WalReplayResult {
         }
     }
 
-    fn commitment(&self, kind: WalOperationKind) -> Result<[u8; 32]> {
+    pub(crate) fn commitment(&self, kind: WalOperationKind) -> Result<[u8; 32]> {
         let encoded = self.encode(kind)?;
         let mut hasher = Sha256::new();
         hasher.update(REPLAY_RESULT_DOMAIN);
@@ -278,32 +294,54 @@ impl fmt::Debug for WalReplayResult {
     }
 }
 
+#[cfg(not(test))]
 mod sealed {
-    pub trait DomainLedger {}
-    pub trait DomainPlan {}
+    pub(crate) trait DomainLedger {}
+    pub(crate) trait DomainPlan {}
+}
+
+// Deterministic cross-module actor fixtures may exercise the boundary, but
+// production siblings cannot implement either sealed contract.
+#[cfg(test)]
+pub(crate) mod sealed {
+    pub(crate) trait DomainLedger {}
+    pub(crate) trait DomainPlan {}
 }
 
 /// Each supported domain owns request canonicalization, mutation SQL, and
 /// exact replay validation. No generic closure or arbitrary SQL reaches the
 /// permanent ledger surface.
-trait WalLogicalDomainPlan: sealed::DomainPlan + Send + Sized {
+pub(crate) trait WalLogicalDomainPlan: sealed::DomainPlan + Send + Sized + 'static {
     type Ledger: WalLogicalDomainLedger<Self>;
+    /// The originating logical domain is the only code allowed to decode its
+    /// bounded durable replay result into a caller-visible value.
+    type Output: Send + 'static;
 
     fn kind(&self) -> WalOperationKind;
     fn operation_id(&self) -> WalLogicalOperationId;
     fn canonical_request(&self) -> Result<Zeroizing<Vec<u8>>>;
     fn apply(&self, transaction: &Transaction<'_>) -> Result<WalReplayResult>;
     fn validate_replay(&self, result: &WalReplayResult) -> Result<()>;
+    fn decode_output(&self, result: &WalReplayResult) -> Result<Self::Output>;
 }
 
 /// Every portable domain owns a distinct, permanently retained, bounded row
 /// family and its exact indexed resolver. The shared gate deliberately has no
 /// universal table or table-name selector.
-trait WalLogicalDomainLedger<P: WalLogicalDomainPlan>: sealed::DomainLedger + Send {
+pub(crate) trait WalLogicalDomainLedger<P: WalLogicalDomainPlan>:
+    sealed::DomainLedger + Send
+{
+    /// Exact indexed replay lookup. It must authenticate the same bounded
+    /// domain result as `resolve_or_apply` without applying caller work.
+    fn lookup(
+        connection: &Connection,
+        prepared: &PreparedLogicalMutation<P>,
+    ) -> Result<Option<WalReplayResult>>;
+
     fn resolve_or_apply(
         transaction: &Transaction<'_>,
         prepared: &PreparedLogicalMutation<P>,
-    ) -> Result<LogicalMutationDisposition>;
+    ) -> Result<LogicalMutationResult>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,14 +376,14 @@ impl DomainLedgerBounds {
 
 /// Opaque plan produced before actor entry. Only this module's future owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.
-struct PreparedLogicalMutation<P: WalLogicalDomainPlan> {
+pub(crate) struct PreparedLogicalMutation<P: WalLogicalDomainPlan> {
     plan: P,
     operation_id: WalLogicalOperationId,
     request_fingerprint: WalRequestFingerprint,
 }
 
 impl<P: WalLogicalDomainPlan> PreparedLogicalMutation<P> {
-    fn prepare(plan: P) -> Result<Self> {
+    pub(crate) fn prepare(plan: P) -> Result<Self> {
         let operation_id = plan.operation_id();
         let canonical_request = plan.canonical_request()?;
         let request_fingerprint = WalRequestFingerprint::derive(plan.kind(), &canonical_request)?;
@@ -354,6 +392,22 @@ impl<P: WalLogicalDomainPlan> PreparedLogicalMutation<P> {
             operation_id,
             request_fingerprint,
         })
+    }
+
+    pub(crate) fn kind_for_owner(&self) -> WalOperationKind {
+        self.plan.kind()
+    }
+
+    pub(crate) const fn operation_id_for_owner(&self) -> WalLogicalOperationId {
+        self.operation_id
+    }
+
+    pub(crate) const fn request_fingerprint_for_owner(&self) -> WalRequestFingerprint {
+        self.request_fingerprint
+    }
+
+    pub(crate) const fn plan_for_domain_ledger(&self) -> &P {
+        &self.plan
     }
 }
 
@@ -364,23 +418,138 @@ impl<P: WalLogicalDomainPlan> fmt::Debug for PreparedLogicalMutation<P> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LogicalMutationDisposition {
+pub(crate) enum LogicalMutationDisposition {
     Applied,
     Replayed,
 }
 
+/// Opaque exact result of one domain-ledger resolution. Both first apply and
+/// replay retain the bounded canonical result; the WAL owner may inspect only
+/// the disposition while the domain codec remains the sole result decoder.
+pub(crate) enum LogicalMutationResult {
+    Applied(WalReplayResult),
+    Replayed(WalReplayResult),
+}
+
+impl LogicalMutationResult {
+    const fn disposition(&self) -> LogicalMutationDisposition {
+        match self {
+            Self::Applied(_) => LogicalMutationDisposition::Applied,
+            Self::Replayed(_) => LogicalMutationDisposition::Replayed,
+        }
+    }
+}
+
+/// Exact local result retained by the owner until publication settles. The
+/// replay bytes have no getter: only the domain ledger can validate them and
+/// only the WAL owner can carry the opaque value across its actor boundary.
+pub(crate) struct ValidatedWalLogicalResult<P: WalLogicalDomainPlan> {
+    plan: P,
+    result: WalReplayResult,
+}
+
+impl<P: WalLogicalDomainPlan> ValidatedWalLogicalResult<P> {
+    fn new(plan: P, result: WalReplayResult) -> Result<Self> {
+        plan.validate_replay(&result)?;
+        Ok(Self { plan, result })
+    }
+
+    /// This is deliberately consuming and remains the sole conversion from
+    /// the opaque retained result to the logical domain's typed output.
+    pub(crate) fn release(self) -> Result<P::Output> {
+        self.plan.decode_output(&self.result)
+    }
+}
+
+impl<P: WalLogicalDomainPlan> fmt::Debug for ValidatedWalLogicalResult<P> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ValidatedWalLogicalResult(<opaque>)")
+    }
+}
+
+pub(crate) struct ExecutedLogicalMutation<P: WalLogicalDomainPlan> {
+    kind: WalOperationKind,
+    operation_id: WalLogicalOperationId,
+    request_fingerprint: WalRequestFingerprint,
+    disposition: LogicalMutationDisposition,
+    result: ValidatedWalLogicalResult<P>,
+}
+
+impl<P: WalLogicalDomainPlan> ExecutedLogicalMutation<P> {
+    pub(crate) const fn kind(&self) -> WalOperationKind {
+        self.kind
+    }
+
+    pub(crate) const fn operation_id(&self) -> WalLogicalOperationId {
+        self.operation_id
+    }
+
+    pub(crate) const fn request_fingerprint(&self) -> WalRequestFingerprint {
+        self.request_fingerprint
+    }
+
+    pub(crate) const fn disposition(&self) -> LogicalMutationDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn into_validated_result(self) -> ValidatedWalLogicalResult<P> {
+        self.result
+    }
+}
+
+pub(crate) fn execute_prepared_for_owner<P: WalLogicalDomainPlan>(
+    connection: &mut Connection,
+    prepared: PreparedLogicalMutation<P>,
+) -> Result<ExecutedLogicalMutation<P>> {
+    let kind = prepared.plan.kind();
+    let operation_id = prepared.operation_id;
+    let request_fingerprint = prepared.request_fingerprint;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    let result = P::Ledger::resolve_or_apply(&transaction, &prepared)?;
+    let disposition = result.disposition();
+    let replay_result = match result {
+        LogicalMutationResult::Applied(result) | LogicalMutationResult::Replayed(result) => result,
+    };
+    prepared.plan.validate_replay(&replay_result)?;
+    transaction
+        .commit()
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    Ok(ExecutedLogicalMutation {
+        kind,
+        operation_id,
+        request_fingerprint,
+        disposition,
+        result: ValidatedWalLogicalResult::new(prepared.plan, replay_result)?,
+    })
+}
+
+pub(crate) fn lookup_prepared_for_owner<P: WalLogicalDomainPlan>(
+    connection: &Connection,
+    prepared: PreparedLogicalMutation<P>,
+) -> Result<PreparedLookup<P>> {
+    let result = P::Ledger::lookup(connection, &prepared)?;
+    match result {
+        Some(result) => Ok(PreparedLookup::Present(ValidatedWalLogicalResult::new(
+            prepared.plan,
+            result,
+        )?)),
+        None => Ok(PreparedLookup::Absent(prepared)),
+    }
+}
+
+pub(crate) enum PreparedLookup<P: WalLogicalDomainPlan> {
+    Absent(PreparedLogicalMutation<P>),
+    Present(ValidatedWalLogicalResult<P>),
+}
+
+#[cfg(test)]
 fn execute_prepared<P: WalLogicalDomainPlan>(
     connection: &mut Connection,
     prepared: PreparedLogicalMutation<P>,
 ) -> Result<LogicalMutationDisposition> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| WalIdempotencyError::Unavailable)?;
-    let disposition = P::Ledger::resolve_or_apply(&transaction, &prepared)?;
-    transaction
-        .commit()
-        .map_err(|_| WalIdempotencyError::Unavailable)?;
-    Ok(disposition)
+    execute_prepared_for_owner(connection, prepared).map(|result| result.disposition())
 }
 
 /// Process-local cancellation guard for the future actor owner. Dropping a
@@ -450,15 +619,15 @@ mod tests {
         DomainLedgerBounds::new(64, (64 * MAX_ENCODED_REPLAY_RESULT_BYTES) as u64);
 
     impl WalLogicalDomainLedger<TestDomain> for TestMediaCaptureLedger {
-        fn resolve_or_apply(
-            transaction: &Transaction<'_>,
+        fn lookup(
+            connection: &Connection,
             prepared: &PreparedLogicalMutation<TestDomain>,
-        ) -> Result<LogicalMutationDisposition> {
+        ) -> Result<Option<WalReplayResult>> {
             if prepared.plan.kind() != WalOperationKind::MediaCaptureEvent {
                 return Err(WalIdempotencyError::ResultUnsupported);
             }
             prepared.plan.lookup_count.fetch_add(1, Ordering::SeqCst);
-            let row = transaction
+            let row = connection
                 .query_row(
                     "SELECT format_version,codec_version,request_fingerprint,
                             result_bytes,result_commitment
@@ -476,28 +645,37 @@ mod tests {
                 )
                 .optional()
                 .map_err(|_| WalIdempotencyError::Unavailable)?;
-            if let Some((format, codec, fingerprint, encoded, commitment)) = row {
-                if format != i64::from(WAL_IDEMPOTENCY_FORMAT_V1)
-                    || codec != i64::from(WalOperationKind::MediaCaptureEvent.codec_version())
-                    || fingerprint.len() != 32
-                    || commitment.len() != 32
-                {
-                    return Err(WalIdempotencyError::Corrupt);
-                }
-                if fingerprint.as_slice() != prepared.request_fingerprint.as_bytes() {
-                    return Err(WalIdempotencyError::FingerprintConflict);
-                }
-                let result =
-                    WalReplayResult::decode(WalOperationKind::MediaCaptureEvent, &encoded)?;
-                if commitment.as_slice()
-                    != result
-                        .commitment(WalOperationKind::MediaCaptureEvent)?
-                        .as_slice()
-                {
-                    return Err(WalIdempotencyError::Corrupt);
-                }
-                prepared.plan.validate_replay(&result)?;
-                return Ok(LogicalMutationDisposition::Replayed);
+            let Some((format, codec, fingerprint, encoded, commitment)) = row else {
+                return Ok(None);
+            };
+            if format != i64::from(WAL_IDEMPOTENCY_FORMAT_V1)
+                || codec != i64::from(WalOperationKind::MediaCaptureEvent.codec_version())
+                || fingerprint.len() != 32
+                || commitment.len() != 32
+            {
+                return Err(WalIdempotencyError::Corrupt);
+            }
+            if fingerprint.as_slice() != prepared.request_fingerprint.as_bytes() {
+                return Err(WalIdempotencyError::FingerprintConflict);
+            }
+            let result = WalReplayResult::decode(WalOperationKind::MediaCaptureEvent, &encoded)?;
+            if commitment.as_slice()
+                != result
+                    .commitment(WalOperationKind::MediaCaptureEvent)?
+                    .as_slice()
+            {
+                return Err(WalIdempotencyError::Corrupt);
+            }
+            prepared.plan.validate_replay(&result)?;
+            Ok(Some(result))
+        }
+
+        fn resolve_or_apply(
+            transaction: &Transaction<'_>,
+            prepared: &PreparedLogicalMutation<TestDomain>,
+        ) -> Result<LogicalMutationResult> {
+            if let Some(result) = Self::lookup(transaction, prepared)? {
+                return Ok(LogicalMutationResult::Replayed(result));
             }
 
             let (rows, result_bytes) = transaction
@@ -542,12 +720,13 @@ mod tests {
                     [i64::try_from(encoded.len()).map_err(|_| WalIdempotencyError::Limit)?],
                 )
                 .map_err(|_| WalIdempotencyError::Unavailable)?;
-            Ok(LogicalMutationDisposition::Applied)
+            Ok(LogicalMutationResult::Applied(result))
         }
     }
 
     impl WalLogicalDomainPlan for TestDomain {
         type Ledger = TestMediaCaptureLedger;
+        type Output = WalReplayResult;
 
         fn kind(&self) -> WalOperationKind {
             self.kind
@@ -581,6 +760,11 @@ mod tests {
             } else {
                 Err(WalIdempotencyError::ResultUnsupported)
             }
+        }
+
+        fn decode_output(&self, result: &WalReplayResult) -> Result<Self::Output> {
+            self.validate_replay(result)?;
+            Ok(result.clone())
         }
     }
 
@@ -1084,7 +1268,6 @@ mod tests {
             concat!("Witness::", "advance"),
             concat!("tokio::", "spawn"),
             concat!("pub struct ", "PreparedLogicalMutation"),
-            concat!("pub(crate) struct ", "PreparedLogicalMutation"),
             concat!("OperationKind::", "AccountDelete"),
             concat!("OperationKind::", "EpisodeDelete"),
             concat!("archive_v3_wal_", "logical_operations"),

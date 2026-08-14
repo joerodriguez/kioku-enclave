@@ -401,6 +401,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wal_owner_root_advance_authenticates_the_firestore_provider_tick() {
+        let trusted_tick = firestore_read_time_tick(TIME).unwrap();
+        let local = InMemoryWitness::from_provider_record_at_tick(None, trusted_tick).unwrap();
+        let initial = local.bootstrap_at_tick(bootstrap(), trusted_tick).unwrap();
+        let owner = ObjectId::from_bytes(id(8));
+        let lease = local
+            .acquire_lease(
+                initial.archive_id(),
+                initial.database_epoch(),
+                initial.registry().key_epoch(),
+                owner,
+                60,
+            )
+            .unwrap();
+        let legacy = local.read_current(initial.archive_id()).unwrap().unwrap();
+        let shadow_root = RootCommitment::candidate_for_test(
+            legacy.database_epoch(),
+            legacy.registry().key_epoch(),
+            lease.fencing_epoch(),
+            legacy.root().root(),
+            RootReference::new(1, ObjectId::from_bytes(id(9)), hash(10)),
+        );
+        let shadow = local
+            .advance_migration(
+                RootAdvance::new(lease, legacy.root(), legacy.registry(), shadow_root),
+                crate::archive_v3_witness::MigrationState::ShadowWal,
+            )
+            .unwrap();
+        let authoritative_root = RootCommitment::candidate_for_test(
+            shadow.record().database_epoch(),
+            shadow.record().registry().key_epoch(),
+            lease.fencing_epoch(),
+            shadow.record().root().root(),
+            RootReference::new(2, ObjectId::from_bytes(id(11)), hash(12)),
+        );
+        let authoritative = local
+            .advance_migration(
+                RootAdvance::new(
+                    lease,
+                    shadow.record().root(),
+                    shadow.record().registry(),
+                    authoritative_root,
+                ),
+                crate::archive_v3_witness::MigrationState::WalAuthoritative,
+            )
+            .unwrap();
+        let candidate_root = RootCommitment::candidate_for_test(
+            authoritative.record().database_epoch(),
+            authoritative.record().registry().key_epoch(),
+            lease.fencing_epoch(),
+            authoritative.record().root().root(),
+            RootReference::new(3, ObjectId::from_bytes(id(13)), hash(14)),
+        );
+        let retained =
+            crate::archive_v3_witness::AuthenticatedWalRootAdvance::from_expected_witness(
+                crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_test(),
+                authoritative.record(),
+                candidate_root,
+            )
+            .unwrap();
+
+        let transport = Arc::new(FakeTransport::new(
+            Some(authoritative.record().encode()),
+            [CommitOutcome::Ok],
+        ));
+        transport.0.lock().unwrap().time = "2026-01-02T03:04:06.123Z".to_owned();
+        let adapter = witness(transport);
+        let observed = adapter
+            .compare_and_advance_root_unresolved_async(retained.provider_advance(
+                crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_test(),
+            ))
+            .await;
+        assert!(observed.is_ok());
+        let observed = observed.ok().expect("checked exact witness advance");
+        assert!(observed.record().last_server_tick() > authoritative.record().last_server_tick());
+        assert!(retained.validate_observed(observed.record()).is_ok());
+    }
+
+    #[tokio::test]
     async fn commit_started_bootstrap_pre_marker_failures_are_definitely_unsent() {
         let transport = Arc::new(FakeTransport::new(None, []));
         transport.fail_next(FailureStage::BatchGet);

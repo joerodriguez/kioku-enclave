@@ -261,15 +261,7 @@ fn preflight_captured_wal_commit(
         return Err(ArchiveV3Error::Malformed("captured WAL frames").into());
     }
     let frame_count = frames.len() / SQLITE_WAL_FRAME_BYTES;
-    let segment_count = frame_count
-        .checked_add(MAX_WAL_FRAMES_PER_SEGMENT - 1)
-        .ok_or(ArchiveV3Error::TooLarge("WAL segment count"))?
-        / MAX_WAL_FRAMES_PER_SEGMENT;
-    let segment_count =
-        u32::try_from(segment_count).map_err(|_| ArchiveV3Error::TooLarge("WAL segment count"))?;
-    if segment_count == 0 || segment_count > MAX_WAL_SEGMENTS_PER_COMMIT {
-        return Err(ArchiveV3Error::TooLarge("WAL commit segments").into());
-    }
+    let segment_count = captured_wal_segment_count(capture)?;
     let frame_count =
         u32::try_from(frame_count).map_err(|_| ArchiveV3Error::TooLarge("WAL frame count"))?;
     let commit_wal_bytes = u64::from(SQLITE_WAL_HEADER_BYTES as u32)
@@ -285,6 +277,29 @@ fn preflight_captured_wal_commit(
         segment_count,
         commit_wal_bytes,
     })
+}
+
+/// Shared deterministic split preflight used by both the uploader and the
+/// durable publication candidate. It exposes only the bounded object count,
+/// never captured bytes or provider authority.
+pub(crate) fn captured_wal_segment_count(
+    capture: &CapturedWalCommit,
+) -> std::result::Result<u32, ArchiveV3Error> {
+    let frames = capture.replay_frames();
+    if frames.is_empty() || !frames.len().is_multiple_of(SQLITE_WAL_FRAME_BYTES) {
+        return Err(ArchiveV3Error::Malformed("captured WAL frames"));
+    }
+    let frame_count = frames.len() / SQLITE_WAL_FRAME_BYTES;
+    let segment_count = frame_count
+        .checked_add(MAX_WAL_FRAMES_PER_SEGMENT - 1)
+        .ok_or(ArchiveV3Error::TooLarge("WAL segment count"))?
+        / MAX_WAL_FRAMES_PER_SEGMENT;
+    let segment_count =
+        u32::try_from(segment_count).map_err(|_| ArchiveV3Error::TooLarge("WAL segment count"))?;
+    if segment_count == 0 || segment_count > MAX_WAL_SEGMENTS_PER_COMMIT {
+        return Err(ArchiveV3Error::TooLarge("WAL commit segments"));
+    }
+    Ok(segment_count)
 }
 
 /// Upload one captured commit and its authenticated lineage descriptor from
@@ -566,6 +581,7 @@ pub(crate) async fn recover_owned_private_staging(
 pub(crate) struct RecoveredMaintenanceStaging {
     owned: OwnedPrivateStagedSqliteCopy,
     checkpoint: crate::archive_v3_shadow_checkpoint::UploadedCheckpoint,
+    recovered: RecoveredWitnessWal,
 }
 
 impl RecoveredMaintenanceStaging {
@@ -575,6 +591,21 @@ impl RecoveredMaintenanceStaging {
 
     pub(crate) fn checkpoint(&self) -> &crate::archive_v3_shadow_checkpoint::UploadedCheckpoint {
         &self.checkpoint
+    }
+
+    pub(crate) fn authenticate_wal_owner(
+        self,
+        recovery: &RecoveryRoot,
+        binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+    ) -> Result<crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging> {
+        crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging::from_exact_recovery(
+            self.owned,
+            recovery,
+            &self.checkpoint,
+            &self.recovered,
+            binding,
+        )
+        .map_err(|_| ShadowWalError::CompositeRecovery)
     }
 }
 
@@ -596,6 +627,27 @@ pub(crate) async fn recover_owned_maintenance_staging(
         return Err(ShadowWalError::CompositeRecovery);
     }
     recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None, true).await
+}
+
+/// Inactive WAL-owner recovery path. The exact WalAuthoritative recovery root
+/// is consumed by composite recovery and then rebound to the same checkpoint
+/// metadata before Store can open the owned staging copy.
+pub(crate) async fn recover_owned_wal_owner_staging(
+    recovery: RecoveryRoot,
+    backend: Arc<dyn ImmutableObjectBackend>,
+    cipher: Arc<VerifiedArchiveCipher>,
+    archive_id: ArchiveId,
+    binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+) -> Result<crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging> {
+    if recovery.migration() != MigrationState::WalAuthoritative
+        || recovery.deletion() != DeletionState::Active
+    {
+        return Err(ShadowWalError::CompositeRecovery);
+    }
+    let retained = recovery.clone();
+    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None, false)
+        .await?
+        .authenticate_wal_owner(&retained, binding)
 }
 
 #[cfg(test)]
@@ -655,7 +707,7 @@ async fn recover_owned_private_staging_inner(
         .await
         .map_err(|_| ShadowWalError::CompositeRecovery)?;
         let mut wal = CompositeWalRecoverySink::new(path.clone());
-        if allow_maintenance_zero_wal {
+        let recovered = if allow_maintenance_zero_wal {
             recover_maintenance_zero_wal(
                 &recovery,
                 backend.as_ref(),
@@ -663,7 +715,7 @@ async fn recover_owned_private_staging_inner(
                 archive_id,
                 &mut wal,
             )
-            .await?;
+            .await?
         } else {
             recover_witness_nominated_wal(
                 &recovery,
@@ -672,8 +724,8 @@ async fn recover_owned_private_staging_inner(
                 archive_id,
                 &mut wal,
             )
-            .await?;
-        }
+            .await?
+        };
         ensure_sqlite_sidecars_absent(&path).await?;
         let owned =
             OwnedPrivateStagedSqliteCopy::from_recovery_proof(CompositeRecoveryProof::new(path))
@@ -686,6 +738,7 @@ async fn recover_owned_private_staging_inner(
         Ok(RecoveredMaintenanceStaging {
             owned,
             checkpoint: checkpoint_metadata,
+            recovered,
         })
     })
     .await
@@ -942,6 +995,18 @@ pub struct RecoveredWitnessWal {
     commit_count: u32,
     segment_count: u32,
     wal_tail_bytes: u64,
+    logical_file_length: u64,
+    user_schema_version: u32,
+}
+
+impl RecoveredWitnessWal {
+    pub(super) const fn logical_file_length(&self) -> u64 {
+        self.logical_file_length
+    }
+
+    pub(super) const fn user_schema_version(&self) -> u32 {
+        self.user_schema_version
+    }
 }
 
 impl std::fmt::Debug for RecoveredWitnessWal {
@@ -1065,6 +1130,8 @@ async fn recover_exact_root_wal_mode(
             commit_count: 0,
             segment_count: 0,
             wal_tail_bytes: 0,
+            logical_file_length: root.logical_file_length,
+            user_schema_version: root.user_schema_version,
         });
     }
     let final_reference = root
@@ -1204,6 +1271,8 @@ async fn recover_exact_root_wal_mode(
         commit_count: root.wal_commit_count,
         segment_count: root.wal_segment_count,
         wal_tail_bytes: root.wal_tail_bytes,
+        logical_file_length: root.logical_file_length,
+        user_schema_version: root.user_schema_version,
     })
 }
 
@@ -2482,6 +2551,14 @@ mod tests {
         let key = KeyEpoch::from_bytes([53; 16]);
         let cipher = test_cipher(archive, key).await;
         let backend = InMemoryImmutableBackend::new();
+        assert_eq!(
+            captured_wal_segment_count(&captured_commit(254)).unwrap(),
+            1
+        );
+        assert_eq!(
+            captured_wal_segment_count(&captured_commit(255)).unwrap(),
+            2
+        );
         assert_eq!(
             upload_captured_wal_commit(
                 &backend,

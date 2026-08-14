@@ -31,9 +31,11 @@ use std::{
 
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::ffi;
+use sha2::{Digest, Sha256};
 
 use crate::archive_v3_shadow::{CapturedWalCommit, ShadowCaptureMetrics, WalCaptureState};
 use crate::archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionId};
+use crate::archive_v3_wal_owner::{AuthenticatedWalSettlement, WalOwnerContext};
 
 /// The registry deliberately has a small fixed owner count.  A caller must
 /// retire a path registration after closing its SQLite connection rather than
@@ -48,6 +50,7 @@ const MAX_CAPTURE_DRAINS_PER_STREAM: usize = 1024;
 static CAPTURE_VFS_INSTALLATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 const MAX_CAPTURE_STREAM_ID_CANDIDATES: usize = 16;
+const CAPTURE_STREAM_BINDING_DOMAIN: &[u8] = b"kioku/archive-v3/wal-owner-capture-stream/v1\0";
 
 /// Random process-local identity for one exact open Store connection. It is
 /// never derived from an archive, account, session, or publication attempt,
@@ -56,8 +59,17 @@ const MAX_CAPTURE_STREAM_ID_CANDIDATES: usize = 16;
 pub(crate) struct CaptureStreamId([u8; 16]);
 
 impl CaptureStreamId {
+    /// Bind this process-local stream into a publication context without ever
+    /// persisting, logging, or exposing the raw random stream identifier.
+    pub(crate) fn wal_owner_commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(CAPTURE_STREAM_BINDING_DOMAIN);
+        hasher.update(self.0);
+        hasher.finalize().into()
+    }
+
     #[cfg(test)]
-    const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_test_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
 }
@@ -200,6 +212,21 @@ pub(crate) struct CapturedCommitBatch {
     commits: Vec<CapturedWalCommit>,
 }
 
+/// Non-cloneable publication owner for one exact captured commit. Taking it
+/// detaches the selected queue prefix but leaves the registration's drain
+/// active. Drop restores that prefix at the front while the registration is
+/// live; retirement instead scrubs it. Only an authenticated settlement can
+/// consume the prefix permanently.
+pub(crate) struct OwnedCapturedDrain {
+    state: Arc<Mutex<RegisteredCaptureState>>,
+    stream_id: CaptureStreamId,
+    token: u64,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    commits: Option<Vec<CapturedWalCommit>>,
+    settled: bool,
+}
+
 impl CaptureRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -211,6 +238,25 @@ impl CaptureRegistry {
             .lock()
             .map(|inner| inner.slots.is_empty())
             .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_stream_for_test(&self, stream_id: CaptureStreamId) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.slots.values().any(|slot| slot.stream_id == stream_id))
+            .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_path_for_test(&self, path: &Path) -> bool {
+        let Ok(path) = canonical_scope_path(path.as_os_str().as_bytes()) else {
+            return true;
+        };
+        self.inner
+            .lock()
+            .map(|inner| inner.slots.contains_key(&path))
+            .unwrap_or(true)
     }
 
     /// Register one exact SQLite main-database filename.  `path` is retained
@@ -383,6 +429,19 @@ fn canonical_scope_path(bytes: &[u8]) -> Result<Vec<u8>, CaptureRegistryError> {
 }
 
 impl CaptureRegistration {
+    pub(crate) fn begin_exact_one_drain(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+    ) -> Result<CaptureDrainLease, CaptureRegistryError> {
+        let lease = self.begin_drain(session_id, attempt_id)?;
+        if lease.commit_count != 1 {
+            drop(lease);
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        Ok(lease)
+    }
+
     pub(crate) fn begin_drain(
         &self,
         session_id: ShadowSessionId,
@@ -445,6 +504,13 @@ impl CaptureRegistration {
         self.stream_id
     }
 
+    pub(crate) fn completed_len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.capture.completed_len())
+            .unwrap_or(usize::MAX)
+    }
+
     #[cfg(test)]
     fn attached_main_count(&self) -> usize {
         self.registry
@@ -470,6 +536,42 @@ impl Drop for CaptureRegistration {
 }
 
 impl CaptureDrainLease {
+    pub(crate) fn take_for_publication(
+        mut self,
+    ) -> Result<OwnedCapturedDrain, CaptureRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CaptureRegistryError::StateUnavailable)?;
+        if state.retired {
+            return Err(CaptureRegistryError::Retired);
+        }
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count: self.commit_count,
+        };
+        if self.commit_count != 1 || state.active_drain != Some(expected) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        let commits = state
+            .capture
+            .drain_completed_prefix(1)
+            .ok_or(CaptureRegistryError::DrainMismatch)?;
+        drop(state);
+        self.settled = true;
+        Ok(OwnedCapturedDrain {
+            state: Arc::clone(&self.state),
+            stream_id: self.stream_id,
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commits: Some(commits),
+            settled: false,
+        })
+    }
+
     pub(crate) fn commit(mut self) -> Result<CapturedCommitBatch, CaptureRegistryError> {
         let mut state = self
             .state
@@ -502,6 +604,114 @@ impl CaptureDrainLease {
             attempt_id: self.attempt_id,
             commits,
         })
+    }
+}
+
+impl OwnedCapturedDrain {
+    pub(crate) fn observed_wal_generation(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+    ) -> Result<u64, CaptureRegistryError> {
+        let commits = self
+            .commits
+            .as_deref()
+            .ok_or(CaptureRegistryError::DrainMismatch)?;
+        commits
+            .first()
+            .filter(|_| commits.len() == 1)
+            .map(CapturedWalCommit::wal_generation)
+            .filter(|generation| *generation != 0)
+            .ok_or(CaptureRegistryError::DrainMismatch)
+    }
+
+    pub(crate) fn exact_commit<'a>(
+        &'a self,
+        context: &WalOwnerContext,
+    ) -> Result<&'a CapturedWalCommit, CaptureRegistryError> {
+        let commits = self
+            .commits
+            .as_deref()
+            .ok_or(CaptureRegistryError::DrainMismatch)?;
+        let commit = commits
+            .first()
+            .filter(|_| commits.len() == 1)
+            .ok_or(CaptureRegistryError::DrainMismatch)?;
+        if !context.matches_capture(
+            self.stream_id,
+            self.session_id,
+            self.attempt_id,
+            commit.wal_generation(),
+        ) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        Ok(commit)
+    }
+
+    pub(crate) fn settle(
+        mut self,
+        context: &WalOwnerContext,
+        settlement: AuthenticatedWalSettlement,
+    ) -> Result<crate::archive_v3_wal_owner::WalOwnerStoreBinding, CaptureRegistryError> {
+        let commitment = self.exact_commit(context)?.publication_commitment();
+        if !settlement.authenticates(context, commitment) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        let next_binding = settlement.next_binding().clone();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CaptureRegistryError::StateUnavailable)?;
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count: 1,
+        };
+        if state.retired || state.active_drain != Some(expected) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        state.active_drain = None;
+        state
+            .settled_drains
+            .push((*self.session_id.as_bytes(), *self.attempt_id.as_bytes()));
+        self.commits.take();
+        self.settled = true;
+        Ok(next_binding)
+    }
+
+    pub(crate) fn stream_id(&self) -> CaptureStreamId {
+        self.stream_id
+    }
+}
+
+impl Drop for OwnedCapturedDrain {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let Some(commits) = self.commits.take() else {
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count: 1,
+        };
+        if state.retired || state.active_drain != Some(expected) {
+            return;
+        }
+        state.active_drain = None;
+        let _ = state.capture.restore_completed_prefix(commits);
+    }
+}
+
+impl std::fmt::Debug for OwnedCapturedDrain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnedCapturedDrain(<opaque>)")
     }
 }
 
@@ -1271,24 +1481,32 @@ mod tests {
         )
     }
 
-    fn setup_with_stream(
-        stream_id: CaptureStreamId,
-    ) -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
+    fn setup() -> (
+        TempDir,
+        CString,
+        CaptureRegistration,
+        Arc<crate::store::StoreShadowCapture>,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("capture.db");
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let capture = crate::store::StoreShadowCapture::shared_for_test();
+        let registration = capture.register_path_for_test(&path).unwrap();
+        (directory, c_path, registration, capture)
+    }
+
+    fn setup_owned_vfs() -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("capture.db");
         let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
         let registry = CaptureRegistry::new();
-        let registration = registry.register_exact(stream_id, &c_path).unwrap();
+        let registration = registry.register(&c_path).unwrap();
         let name = format!(
             "kioku-capture-test-{}",
             NEXT_VFS.fetch_add(1, Ordering::Relaxed)
         );
         let vfs = RegisteredCaptureVfs::install(&name, registry).unwrap();
         (directory, c_path, registration, vfs)
-    }
-
-    fn setup() -> (TempDir, CString, CaptureRegistration, RegisteredCaptureVfs) {
-        setup_with_stream(CaptureStreamId::from_bytes([7; 16]))
     }
 
     fn settle(registration: &CaptureRegistration, session: u8, attempt: u8) -> CapturedCommitBatch {
@@ -1302,11 +1520,11 @@ mod tests {
             .unwrap()
     }
 
-    fn open(path: &CStr, vfs: &RegisteredCaptureVfs) -> Connection {
+    fn open(path: &CStr, vfs_name: &CStr) -> Connection {
         Connection::open_with_flags_and_vfs(
             std::path::Path::new(std::str::from_utf8(path.to_bytes()).unwrap()),
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-            vfs.name(),
+            vfs_name,
         )
         .unwrap()
     }
@@ -1323,7 +1541,7 @@ mod tests {
     #[test]
     fn sqlite_commit_is_captured_and_replays_against_a_checkpointed_oracle() {
         let (directory, c_path, registration, vfs) = setup();
-        let connection = open(&c_path, &vfs);
+        let connection = open(&c_path, vfs.vfs_name_for_test());
         assert_eq!(registration.attached_main_count(), 1);
         wal_setup(&connection);
         let replay = directory.path().join("replay.db");
@@ -1380,7 +1598,7 @@ mod tests {
     #[test]
     fn rollback_does_not_publish_and_consecutive_transactions_remain_visible() {
         let (_directory, c_path, registration, vfs) = setup();
-        let connection = open(&c_path, &vfs);
+        let connection = open(&c_path, vfs.vfs_name_for_test());
         wal_setup(&connection);
         let _ = settle(&registration, 2, 1);
         connection
@@ -1415,7 +1633,7 @@ mod tests {
         let first_attempt = ShadowAttemptId::from_bytes([9; 16]);
         let later_attempt = ShadowAttemptId::from_bytes([10; 16]);
         let (_directory, c_path, registration, vfs) = setup();
-        let connection = open(&c_path, &vfs);
+        let connection = open(&c_path, vfs.vfs_name_for_test());
         wal_setup(&connection);
         let _ = settle(&registration, 3, 1);
         connection
@@ -1452,13 +1670,57 @@ mod tests {
     }
 
     #[test]
+    fn owned_exact_drain_restores_front_on_drop_and_retirement_scrubs_it() {
+        let session_id = ShadowSessionId::from_bytes([81; 16]);
+        let first_attempt = ShadowAttemptId::from_bytes([82; 16]);
+        let second_attempt = ShadowAttemptId::from_bytes([83; 16]);
+        let (_directory, c_path, registration, vfs) = setup();
+        let connection = open(&c_path, vfs.vfs_name_for_test());
+        wal_setup(&connection);
+        let _ = settle(&registration, 81, 1);
+        connection
+            .execute("INSERT INTO events VALUES (81)", [])
+            .unwrap();
+        assert_eq!(registration.completed_len(), 1);
+
+        let owned = registration
+            .begin_exact_one_drain(session_id, first_attempt)
+            .unwrap()
+            .take_for_publication()
+            .unwrap();
+        assert_eq!(registration.completed_len(), 0);
+        assert!(matches!(
+            registration.begin_exact_one_drain(session_id, second_attempt),
+            Err(CaptureRegistryError::DrainActive)
+        ));
+        drop(owned);
+        assert_eq!(registration.completed_len(), 1);
+
+        let owned = registration
+            .begin_exact_one_drain(session_id, second_attempt)
+            .unwrap()
+            .take_for_publication()
+            .unwrap();
+        let state = Arc::clone(&registration.state);
+        drop(registration);
+        assert!(state.lock().unwrap().capture.is_scrubbed_for_test());
+        drop(owned);
+        let state = state.lock().unwrap();
+        assert!(state.retired);
+        assert!(state.capture.is_scrubbed_for_test());
+        assert!(state.active_drain.is_none());
+        drop(state);
+        drop(connection);
+    }
+
+    #[test]
     fn retiring_a_connection_stream_invalidates_its_lease_and_restart_is_fresh() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("restart.db");
         let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
         let registry = CaptureRegistry::new();
         let first = registry
-            .register_exact(CaptureStreamId::from_bytes([21; 16]), &c_path)
+            .register_exact(CaptureStreamId::from_test_bytes([21; 16]), &c_path)
             .unwrap();
         let first_stream = first.stream_id();
         let lease = first
@@ -1471,7 +1733,7 @@ mod tests {
         assert!(matches!(lease.commit(), Err(CaptureRegistryError::Retired)));
 
         let restarted = registry
-            .register_exact(CaptureStreamId::from_bytes([24; 16]), &c_path)
+            .register_exact(CaptureStreamId::from_test_bytes([24; 16]), &c_path)
             .unwrap();
         assert_ne!(restarted.stream_id(), first_stream);
         assert!(restarted
@@ -1493,7 +1755,7 @@ mod tests {
         let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
         let registry = CaptureRegistry::new();
         let registration = registry
-            .register_exact(CaptureStreamId::from_bytes([61; 16]), &c_path)
+            .register_exact(CaptureStreamId::from_test_bytes([61; 16]), &c_path)
             .unwrap();
         let session_id = ShadowSessionId::from_bytes([62; 16]);
 
@@ -1526,7 +1788,7 @@ mod tests {
         let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
         let registry = CaptureRegistry::new();
         let registration = registry
-            .register_exact(CaptureStreamId::from_bytes([71; 16]), &c_path)
+            .register_exact(CaptureStreamId::from_test_bytes([71; 16]), &c_path)
             .unwrap();
         registration.state.lock().unwrap().next_drain_token = u64::MAX;
         assert!(matches!(
@@ -1546,7 +1808,7 @@ mod tests {
     #[test]
     fn sqlite_wal_restart_truncate_starts_a_new_capture_generation() {
         let (_directory, c_path, registration, vfs) = setup();
-        let connection = open(&c_path, &vfs);
+        let connection = open(&c_path, vfs.vfs_name_for_test());
         wal_setup(&connection);
         let _ = settle(&registration, 4, 1);
         connection
@@ -1581,7 +1843,7 @@ mod tests {
     #[test]
     fn registration_retirement_is_bounded_and_does_not_change_sqlite_results() {
         let (directory, c_path, registration, vfs) = setup();
-        let connection = open(&c_path, &vfs);
+        let connection = open(&c_path, vfs.vfs_name_for_test());
         wal_setup(&connection);
         drop(registration);
         connection
@@ -1600,7 +1862,7 @@ mod tests {
     #[test]
     fn retirement_scrubs_pending_capture_and_live_connection_cannot_repopulate_it() {
         let (_directory, c_path, registration, vfs) = setup();
-        let connection = open(&c_path, &vfs);
+        let connection = open(&c_path, vfs.vfs_name_for_test());
         wal_setup(&connection);
         let _ = settle(&registration, 51, 1);
         connection
@@ -1652,8 +1914,8 @@ mod tests {
 
     #[test]
     fn dropping_vfs_handle_keeps_live_connection_callback_memory_safe() {
-        let (directory, c_path, _registration, vfs) = setup();
-        let connection = open(&c_path, &vfs);
+        let (directory, c_path, _registration, vfs) = setup_owned_vfs();
+        let connection = open(&c_path, vfs.name());
         wal_setup(&connection);
         drop(vfs);
 

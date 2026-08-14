@@ -136,6 +136,10 @@ mod archive_v3_operation;
 // domain-sealed replay contract plus a test exemplar, and no production ledger,
 // WAL publisher, Store authority, provider, witness, route, worker, or startup.
 mod archive_v3_wal_idempotency;
+// Inactive one-owner logical mutation/capture/durable-publication protocol.
+// It has no production publication authority, provider construction, runtime,
+// Store registry, startup, route, acknowledgement, or activation path.
+mod archive_v3_wal_owner;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
 // registered SQLite VFS and has no Store, provider, route, or authority wiring.
 mod archive_v3_shadow;
