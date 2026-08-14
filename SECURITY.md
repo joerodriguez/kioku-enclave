@@ -440,10 +440,32 @@ fact before any external inventory-page operation. It never invokes reachability
 metadata. The shared page ledger derives the complete deterministic plan from that durable
 snapshot on every admission, recovery, and reconciliation: only an exact created prefix plus at
 most its exact unresolved next page is valid, and the zero-object plan rejects every page before
-durable admission or transport I/O. Restart after this boundary uses only the durable opaque archive/fence tuple and never
-remints absence or rereads Firestore. This capability still is not accepted by the deletion driver
-and has no Store/startup/runtime/route/config/provider construction, credential, cloud, or
-deployment wiring.
+durable admission or transport I/O. Restart after this boundary uses only the durable opaque
+archive/fence tuple and never remints absence or rereads Firestore. The sealed result can now be
+consumed only by a separate, inactive pre-witness execution protocol. That protocol authenticates
+the complete sealed page inventory in memory, binds its exact ordered object set and dimensions to
+one random nonzero operation ID, and atomically revalidates the tombstoned/fenced absence branch,
+immutable protocol tuple, deterministic Created page prefix, snapshot, seal, and absence of the
+normal branch before persisting execution state. Recovery must load and authenticate the complete
+inventory again; archive/fence/operation identifiers alone cannot reconstruct authority.
+
+The pre-witness execution row has its own version and commitment domains and a strict monotonic
+evidence matrix: inventory-bound, registry-erased, objects-absent, physical-complete, then the
+reserved payload-erased terminal. Every transition full-row-CASes the same operation, snapshot,
+seal, dimensions, object-set commitment, and prior evidence. Exact replay is idempotent; alternate,
+skipped, regressed, cross-operation, zero, or structurally invalid tuples fail closed. The
+capability-bearing SQLite mutation and encrypted-control flush own the sole handle outside the
+shared cache until the conditional PUT succeeds or an exact ciphertext readback reconciles its lost
+response. Cancellation or failure drops that local handle while the cache remains empty; the next
+operation reloads the provider's durable generation and can therefore see only the old row or the
+exact committed row, never an unflushed local stage or an invented generation. There is no detached
+flush. The
+zero-object branch retains zero page/artifact/key-byte dimensions and a zero terminal page hash
+under nonzero inventory, object-set, and execution commitments, and grants no object/provider
+access. Execution types are non-cloneable and cannot convert to normal witnessed deletion types.
+This slice deliberately supplies no production registry/object/drain evidence producer, provider
+capability or destructive driver, and no production payload-cleanup transition. It has no
+Store/startup/runtime/route/config/provider construction, credential, cloud, or deployment wiring.
 Legacy Google-ID rebinding is an encrypted, durable state machine rather than a request-local
 rename. Its random operation ID, exact old/stable IDs and object names, opaque archive binding,
 source generation, SHA-256 plaintext commitment, and monotonic stage are committed before the
@@ -534,9 +556,9 @@ unrelated retention assertion. The former independent inventory builder, test-ov
 commitment, and `FullReachabilitySeal` are removed. A complete deletion inventory is now minted
 only after the authenticated lifecycle-page loader verifies the exact durable seal (apart from
 explicit `cfg(test)` fixtures), so the reachability report remains non-authorizing on its own.
-Full activation remains blocked because the type-separated pre-witness inventory is deliberately
-non-authorizing and is not accepted by the deletion driver, and by the lack of
-startup/runtime/provider construction and deletion-driver invocation.
+Full activation remains blocked because the type-separated pre-witness execution protocol has no
+production destructive evidence producer, provider capability, cleanup transition, or driver
+invocation, and by the lack of startup/runtime/provider construction.
 The intended lifecycle order is fixed: freeze and drain admitted/ambiguous creates; tombstone the
 exact unchanged current root (or use a separately reviewed exact-absence coordinator for a bootstrap
 that never established a witness); reauthenticate that exact Tombstoned worker/operation/fence before
@@ -556,9 +578,11 @@ and exact deletion fence revalidates those references and reconstructs the seale
 physical completion it additionally reconstructs the durable-control receipt from the retained provider-drain
 commitment. Restart therefore never depends on a process retaining either receipt. The separately
 compiled pre-witness disposition can prove a never-started initial send. Its proof can seal a
-separate create-ahead-only inventory, including an explicit zero-object representation, but the
-result has no entry/provider capability and is intentionally not accepted by this driver in this
-slice; that reviewed authority integration remains an activation blocker.
+separate create-ahead-only inventory, including an explicit zero-object representation. The
+inactive type-separated execution protocol can durably bind that exact authenticated inventory and
+record only opaque evidence commitments, but it has no entry/provider capability, destructive
+evidence producer, cleanup producer, or driver invocation; those separately reviewed integrations
+remain activation blockers.
 The authenticated exact-name visitor and lifecycle inventory coordinator are compiled and tested
 but inactive; neither infers paths nor discovers objects by prefix. The driver has no Store, route, runtime,
 credential, or deployment wiring.

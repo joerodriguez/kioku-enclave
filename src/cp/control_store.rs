@@ -16,6 +16,7 @@ use std::{
     sync::Arc,
 };
 
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -33,19 +34,29 @@ use crate::{
         RecoveredPreWitnessInventory,
     },
     archive_v3_lifecycle::{
-        ActiveCreateAdmission, ArtifactCreateState, BootstrapPlan, DeletionInventorySeal,
-        DurableBootstrapReservation, DurableInventoryPage, DurablePhysicalCompletion,
-        ErasedInventoryPages, FrozenInventorySnapshot, FrozenPreWitnessInventorySnapshot,
-        InventoryPage, InventoryPageReference, LifecycleCreateOutcome, LifecycleError,
-        PhysicalDeletionReceipt, PlannedArtifact, PreWitnessDeletionInventorySeal,
-        PreparedBootstrap, RecoveredBootstrap, RecoveredDeletionLifecycle,
-        WitnessCreateDispatchLedger, WitnessSendStarted, LIFECYCLE_FORMAT_VERSION,
-        MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES, PRE_WITNESS_INVENTORY_FORMAT_V1,
-        WITNESS_CREATE_PROTOCOL_V1,
+        ActiveCreateAdmission, ArtifactCreateState, BootstrapAttemptId, BootstrapPlan,
+        DeletionInventorySeal, DurableBootstrapReservation, DurableInventoryPage,
+        DurablePhysicalCompletion, ErasedInventoryPages, FrozenInventorySnapshot,
+        FrozenPreWitnessInventorySnapshot, InventoryPage, InventoryPageReference,
+        LifecycleCreateOutcome, LifecycleError, PhysicalDeletionReceipt, PlannedArtifact,
+        PreWitnessDeletionInventorySeal, PreparedBootstrap, RecoveredBootstrap,
+        RecoveredDeletionLifecycle, WitnessCreateDispatchLedger, WitnessSendStarted,
+        LIFECYCLE_FORMAT_VERSION, MAX_BOOTSTRAP_WITNESS_BYTES, MAX_LIFECYCLE_PAGES,
+        PRE_WITNESS_INVENTORY_FORMAT_V1, WITNESS_CREATE_PROTOCOL_V1,
     },
     archive_v3_lifecycle_page_store::{
         DurablePageCreateAdmission, FrozenPageCreateSet, LifecyclePageAdmissionLedger,
         PageCreateDisposition, RecoveredPageCreatePlan,
+    },
+    archive_v3_pre_witness_deletion::{
+        execution_commitment, AuthenticatedPreWitnessExecutionInventory,
+        BoundPreWitnessDeletionExecution, DurablePreWitnessPhysicalCompletion,
+        PreWitnessDeletionExecutionControl, PreWitnessDeletionExecutionError,
+        PreWitnessExecutionBinding, PreWitnessExecutionBindingControlView,
+        PreWitnessExecutionInventoryControlView, PreWitnessExecutionStage,
+        PreWitnessPhysicalDeletionReceipt, RecoveredPreWitnessDeletionExecution,
+        VerifiedPreWitnessObjectsAbsent, VerifiedPreWitnessRegistryErasure,
+        PRE_WITNESS_DELETION_EXECUTION_FORMAT_V1,
     },
     archive_v3_witness_disposition::{
         AuthenticatedPreWitnessAbsence, ClosedWitnessPhase, ClosedWitnessProtocol,
@@ -504,6 +515,62 @@ CREATE TABLE IF NOT EXISTS archive_lifecycle_prewitness_inventory_pages (
     PRIMARY KEY (archive_id, page_ordinal),
     UNIQUE (archive_id, page_id),
     UNIQUE (archive_id, page_hash)
+);
+-- Type-separated execution protocol for the branch whose initial witness send
+-- was proven absent. It stores evidence commitments only; no provider or
+-- destructive operation is constructed by encrypted control.
+CREATE TABLE IF NOT EXISTS archive_lifecycle_prewitness_deletion_executions (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_lifecycle_prewitness_inventory_seals(archive_id),
+    format_version INTEGER NOT NULL CHECK (format_version = 1),
+    deletion_fence BLOB NOT NULL CHECK (length(deletion_fence) = 16 AND deletion_fence != zeroblob(16)),
+    bootstrap_attempt_id BLOB NOT NULL CHECK (length(bootstrap_attempt_id) = 16 AND bootstrap_attempt_id != zeroblob(16)),
+    operation_id BLOB NOT NULL UNIQUE CHECK (length(operation_id) = 16 AND operation_id != zeroblob(16)),
+    snapshot_revision INTEGER NOT NULL CHECK (snapshot_revision > 0),
+    seal_revision INTEGER NOT NULL CHECK (seal_revision = snapshot_revision + 1),
+    snapshot_commitment BLOB NOT NULL CHECK (length(snapshot_commitment) = 32 AND snapshot_commitment != zeroblob(32)),
+    page_count INTEGER NOT NULL CHECK (page_count >= 0 AND page_count <= 4096),
+    artifact_count INTEGER NOT NULL CHECK (artifact_count >= 0 AND artifact_count <= 131072),
+    key_byte_count INTEGER NOT NULL CHECK (key_byte_count >= 0 AND key_byte_count <= 67108864),
+    terminal_page_hash BLOB NOT NULL CHECK (length(terminal_page_hash) = 32),
+    inventory_commitment BLOB NOT NULL CHECK (length(inventory_commitment) = 32 AND inventory_commitment != zeroblob(32)),
+    object_set_commitment BLOB NOT NULL CHECK (length(object_set_commitment) = 32 AND object_set_commitment != zeroblob(32)),
+    execution_commitment BLOB NOT NULL CHECK (length(execution_commitment) = 32 AND execution_commitment != zeroblob(32)),
+    execution_revision INTEGER NOT NULL CHECK (execution_revision BETWEEN 1 AND 5),
+    stage TEXT NOT NULL CHECK (stage IN (
+        'inventory_bound', 'registry_erased', 'objects_absent',
+        'physical_complete', 'payload_erased'
+    )),
+    registry_evidence_commitment BLOB CHECK (registry_evidence_commitment IS NULL OR (length(registry_evidence_commitment) = 32 AND registry_evidence_commitment != zeroblob(32))),
+    objects_evidence_commitment BLOB CHECK (objects_evidence_commitment IS NULL OR (length(objects_evidence_commitment) = 32 AND objects_evidence_commitment != zeroblob(32))),
+    provider_drain_commitment BLOB CHECK (provider_drain_commitment IS NULL OR (length(provider_drain_commitment) = 32 AND provider_drain_commitment != zeroblob(32))),
+    payload_cleanup_commitment BLOB CHECK (payload_cleanup_commitment IS NULL OR (length(payload_cleanup_commitment) = 32 AND payload_cleanup_commitment != zeroblob(32))),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (
+        (page_count = 0 AND artifact_count = 0 AND key_byte_count = 0 AND terminal_page_hash = zeroblob(32))
+        OR
+        (page_count > 0 AND artifact_count > 0 AND key_byte_count > 0 AND terminal_page_hash != zeroblob(32))
+    ),
+    CHECK (
+        (stage = 'inventory_bound' AND execution_revision = 1
+         AND registry_evidence_commitment IS NULL AND objects_evidence_commitment IS NULL
+         AND provider_drain_commitment IS NULL AND payload_cleanup_commitment IS NULL)
+        OR
+        (stage = 'registry_erased' AND execution_revision = 2
+         AND registry_evidence_commitment IS NOT NULL AND objects_evidence_commitment IS NULL
+         AND provider_drain_commitment IS NULL AND payload_cleanup_commitment IS NULL)
+        OR
+        (stage = 'objects_absent' AND execution_revision = 3
+         AND registry_evidence_commitment IS NOT NULL AND objects_evidence_commitment IS NOT NULL
+         AND provider_drain_commitment IS NULL AND payload_cleanup_commitment IS NULL)
+        OR
+        (stage = 'physical_complete' AND execution_revision = 4
+         AND registry_evidence_commitment IS NOT NULL AND objects_evidence_commitment IS NOT NULL
+         AND provider_drain_commitment IS NOT NULL AND payload_cleanup_commitment IS NULL)
+        OR
+        (stage = 'payload_erased' AND execution_revision = 5
+         AND registry_evidence_commitment IS NOT NULL AND objects_evidence_commitment IS NOT NULL
+         AND provider_drain_commitment IS NOT NULL AND payload_cleanup_commitment IS NOT NULL)
+    )
 );
 -- Durable authority for the legacy identity -> stable-ID transition. This row
 -- is encrypted inside the control blob and precedes every provider mutation.
@@ -1239,6 +1306,10 @@ impl std::fmt::Debug for ArchiveLifecycleAnchor {
 
 fn lifecycle_store_error(_error: LifecycleError) -> EnclaveError {
     EnclaveError::Store("archive lifecycle ledger rejected durable state".into())
+}
+
+fn pre_witness_execution_store_error(_error: PreWitnessDeletionExecutionError) -> EnclaveError {
+    EnclaveError::Store("archive pre-witness execution rejected durable state".into())
 }
 
 fn fixed_16(value: Vec<u8>) -> Result<[u8; 16]> {
@@ -4361,6 +4432,809 @@ fn recover_pre_witness_inventory_conn(
     }
 }
 
+#[derive(Clone)]
+struct PreWitnessDeletionExecutionRow {
+    format_version: u16,
+    archive_id: ArchiveId,
+    deletion_fence: ObjectId,
+    attempt_id: BootstrapAttemptId,
+    operation_id: [u8; 16],
+    snapshot_revision: u64,
+    seal_revision: u64,
+    snapshot_commitment: [u8; 32],
+    page_count: u32,
+    artifact_count: u32,
+    key_bytes: u64,
+    terminal_page_hash: [u8; 32],
+    inventory_commitment: [u8; 32],
+    object_set_commitment: [u8; 32],
+    execution_commitment: [u8; 32],
+    execution_revision: u64,
+    stage: PreWitnessExecutionStage,
+    registry_evidence: Option<[u8; 32]>,
+    objects_evidence: Option<[u8; 32]>,
+    provider_drain: Option<[u8; 32]>,
+    payload_cleanup: Option<[u8; 32]>,
+}
+
+fn pre_witness_execution_stage_from_db(value: &str) -> Result<PreWitnessExecutionStage> {
+    match value {
+        "inventory_bound" => Ok(PreWitnessExecutionStage::InventoryBound),
+        "registry_erased" => Ok(PreWitnessExecutionStage::RegistryErased),
+        "objects_absent" => Ok(PreWitnessExecutionStage::ObjectsAbsent),
+        "physical_complete" => Ok(PreWitnessExecutionStage::PhysicalComplete),
+        "payload_erased" => Ok(PreWitnessExecutionStage::PayloadErased),
+        _ => Err(EnclaveError::Store(
+            "archive pre-witness execution stage is invalid".into(),
+        )),
+    }
+}
+
+fn pre_witness_execution_row_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<PreWitnessDeletionExecutionRow>> {
+    type ExecutionTuple = (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        i64,
+        Vec<u8>,
+        i64,
+        i64,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let row: Option<ExecutionTuple> = conn
+        .query_row(
+            "SELECT format_version, archive_id, deletion_fence, bootstrap_attempt_id,
+                    operation_id, snapshot_revision, seal_revision, snapshot_commitment,
+                    page_count, artifact_count, key_byte_count, terminal_page_hash,
+                    inventory_commitment, object_set_commitment, execution_commitment,
+                    execution_revision, stage, registry_evidence_commitment,
+                    objects_evidence_commitment, provider_drain_commitment,
+                    payload_cleanup_commitment
+             FROM archive_lifecycle_prewitness_deletion_executions
+             WHERE archive_id = ?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else { return Ok(None) };
+    let fixed_optional = |value: Option<Vec<u8>>| value.map(fixed_32).transpose();
+    let parsed = PreWitnessDeletionExecutionRow {
+        format_version: u16::try_from(row.0).map_err(|_| {
+            EnclaveError::Store("archive pre-witness execution version is invalid".into())
+        })?,
+        archive_id: ArchiveId::from_bytes(fixed_16(row.1)?),
+        deletion_fence: ObjectId::from_bytes(fixed_16(row.2)?),
+        attempt_id: BootstrapAttemptId::from_bytes(fixed_16(row.3)?)
+            .map_err(lifecycle_store_error)?,
+        operation_id: fixed_16(row.4)?,
+        snapshot_revision: u64::try_from(row.5).map_err(|_| {
+            EnclaveError::Store("archive pre-witness snapshot revision is invalid".into())
+        })?,
+        seal_revision: u64::try_from(row.6).map_err(|_| {
+            EnclaveError::Store("archive pre-witness seal revision is invalid".into())
+        })?,
+        snapshot_commitment: fixed_32(row.7)?,
+        page_count: u32::try_from(row.8)
+            .map_err(|_| EnclaveError::Store("archive page count is invalid".into()))?,
+        artifact_count: u32::try_from(row.9)
+            .map_err(|_| EnclaveError::Store("archive artifact count is invalid".into()))?,
+        key_bytes: u64::try_from(row.10)
+            .map_err(|_| EnclaveError::Store("archive key-byte count is invalid".into()))?,
+        terminal_page_hash: fixed_32_allow_zero(row.11)?,
+        inventory_commitment: fixed_32(row.12)?,
+        object_set_commitment: fixed_32(row.13)?,
+        execution_commitment: fixed_32(row.14)?,
+        execution_revision: u64::try_from(row.15)
+            .map_err(|_| EnclaveError::Store("archive execution revision is invalid".into()))?,
+        stage: pre_witness_execution_stage_from_db(&row.16)?,
+        registry_evidence: fixed_optional(row.17)?,
+        objects_evidence: fixed_optional(row.18)?,
+        provider_drain: fixed_optional(row.19)?,
+        payload_cleanup: fixed_optional(row.20)?,
+    };
+    let evidence_valid = match parsed.stage {
+        PreWitnessExecutionStage::InventoryBound => {
+            parsed.execution_revision == 1
+                && parsed.registry_evidence.is_none()
+                && parsed.objects_evidence.is_none()
+                && parsed.provider_drain.is_none()
+                && parsed.payload_cleanup.is_none()
+        }
+        PreWitnessExecutionStage::RegistryErased => {
+            parsed.execution_revision == 2
+                && parsed.registry_evidence.is_some()
+                && parsed.objects_evidence.is_none()
+                && parsed.provider_drain.is_none()
+                && parsed.payload_cleanup.is_none()
+        }
+        PreWitnessExecutionStage::ObjectsAbsent => {
+            parsed.execution_revision == 3
+                && parsed.registry_evidence.is_some()
+                && parsed.objects_evidence.is_some()
+                && parsed.provider_drain.is_none()
+                && parsed.payload_cleanup.is_none()
+        }
+        PreWitnessExecutionStage::PhysicalComplete => {
+            parsed.execution_revision == 4
+                && parsed.registry_evidence.is_some()
+                && parsed.objects_evidence.is_some()
+                && parsed.provider_drain.is_some()
+                && parsed.payload_cleanup.is_none()
+        }
+        PreWitnessExecutionStage::PayloadErased => {
+            parsed.execution_revision == 5
+                && parsed.registry_evidence.is_some()
+                && parsed.objects_evidence.is_some()
+                && parsed.provider_drain.is_some()
+                && parsed.payload_cleanup.is_some()
+        }
+    };
+    if parsed.format_version != PRE_WITNESS_DELETION_EXECUTION_FORMAT_V1 || !evidence_valid {
+        return Err(EnclaveError::Store(
+            "archive pre-witness execution tuple is corrupt".into(),
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+fn validate_pre_witness_execution_inventory_conn(
+    conn: &Connection,
+    view: PreWitnessExecutionInventoryControlView,
+) -> Result<(BootstrapAttemptId, [u8; 32])> {
+    let seal = view.seal();
+    let (loaded, _) =
+        load_pre_witness_sealed_inventory_conn(conn, seal.archive_id(), seal.deletion_fence())?;
+    if loaded != seal
+        || view.object_count() != seal.artifact_count()
+        || view.object_set_commitment().iter().all(|byte| *byte == 0)
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness execution inventory changed".into(),
+        ));
+    }
+    type SnapshotIdentity = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>);
+    let snapshot: SnapshotIdentity = conn.query_row(
+        "SELECT bootstrap_attempt_id, deletion_fence, lifecycle_revision,
+                format_version, snapshot_commitment
+         FROM archive_lifecycle_prewitness_inventory_snapshots WHERE archive_id = ?1",
+        [seal.archive_id().as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let attempt_id =
+        BootstrapAttemptId::from_bytes(fixed_16(snapshot.0)?).map_err(lifecycle_store_error)?;
+    let snapshot_revision = u64::try_from(snapshot.2)
+        .map_err(|_| EnclaveError::Store("archive snapshot revision is invalid".into()))?;
+    let snapshot_commitment = fixed_32(snapshot.4)?;
+    let normal_branch: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_lifecycle_inventory_snapshots WHERE archive_id = ?1",
+        [seal.archive_id().as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if fixed_16(snapshot.1)? != *seal.deletion_fence().as_bytes()
+        || snapshot.3 != i64::from(PRE_WITNESS_INVENTORY_FORMAT_V1)
+        || snapshot_revision != seal.snapshot_revision()
+        || normal_branch != 0
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness execution snapshot changed".into(),
+        ));
+    }
+    Ok((attempt_id, snapshot_commitment))
+}
+
+fn pre_witness_execution_binding_from_row(
+    row: &PreWitnessDeletionExecutionRow,
+) -> Result<PreWitnessExecutionBinding> {
+    PreWitnessExecutionBinding::from_persisted(
+        &LifecyclePersistenceContext::validated(),
+        row.archive_id,
+        row.deletion_fence,
+        row.attempt_id,
+        row.operation_id,
+        row.snapshot_revision,
+        row.seal_revision,
+        row.snapshot_commitment,
+        row.page_count,
+        row.artifact_count,
+        row.key_bytes,
+        row.terminal_page_hash,
+        row.inventory_commitment,
+        row.object_set_commitment,
+        row.execution_commitment,
+    )
+    .map_err(pre_witness_execution_store_error)
+}
+
+fn execution_row_matches_view(
+    row: &PreWitnessDeletionExecutionRow,
+    view: &PreWitnessExecutionBindingControlView,
+) -> bool {
+    row.archive_id == view.archive_id()
+        && row.deletion_fence == view.deletion_fence()
+        && row.attempt_id == view.attempt_id()
+        && row.operation_id == view.operation_id()
+        && row.snapshot_revision == view.snapshot_revision()
+        && row.seal_revision == view.seal_revision()
+        && row.snapshot_commitment == view.snapshot_commitment()
+        && row.inventory_commitment == view.inventory_commitment()
+        && row.object_set_commitment == view.object_set_commitment()
+        && row.execution_commitment == view.execution_commitment()
+        && row.page_count == view.page_count()
+        && row.artifact_count == view.artifact_count()
+        && row.key_bytes == view.key_bytes()
+        && row.terminal_page_hash == view.terminal_page_hash()
+}
+
+fn execution_row_matches_authenticated_inventory(
+    row: &PreWitnessDeletionExecutionRow,
+    inventory: PreWitnessExecutionInventoryControlView,
+    authenticated_attempt_id: BootstrapAttemptId,
+    authenticated_snapshot_commitment: [u8; 32],
+) -> bool {
+    let seal = inventory.seal();
+    row.archive_id == seal.archive_id()
+        && row.deletion_fence == seal.deletion_fence()
+        && row.attempt_id == authenticated_attempt_id
+        && row.snapshot_revision == seal.snapshot_revision()
+        && row.seal_revision == seal.revision()
+        && row.snapshot_commitment == authenticated_snapshot_commitment
+        && row.page_count == seal.page_count()
+        && row.artifact_count == seal.artifact_count()
+        && row.key_bytes == inventory.key_bytes()
+        && row.terminal_page_hash == seal.terminal_page_hash()
+        && row.inventory_commitment == seal.inventory_commitment()
+        && row.object_set_commitment == inventory.object_set_commitment()
+        && row.artifact_count == inventory.object_count()
+}
+
+fn recover_pre_witness_deletion_execution_conn(
+    conn: &Connection,
+    inventory: AuthenticatedPreWitnessExecutionInventory,
+) -> Result<RecoveredPreWitnessDeletionExecution> {
+    let persistence = LifecyclePersistenceContext::validated();
+    let view = inventory.control_view(&persistence);
+    let (attempt_id, snapshot_commitment) =
+        validate_pre_witness_execution_inventory_conn(conn, view)?;
+    let row = pre_witness_execution_row_conn(conn, view.seal().archive_id())?
+        .ok_or_else(|| EnclaveError::Conflict("archive pre-witness execution is absent".into()))?;
+    let binding = pre_witness_execution_binding_from_row(&row)?;
+    let binding_view = binding.control_view(&persistence);
+    if !execution_row_matches_view(&row, &binding_view)
+        || !execution_row_matches_authenticated_inventory(
+            &row,
+            view,
+            attempt_id,
+            snapshot_commitment,
+        )
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness execution inventory substitution rejected".into(),
+        ));
+    }
+    let bound = BoundPreWitnessDeletionExecution::from_persisted(
+        &persistence,
+        inventory,
+        binding,
+        attempt_id,
+        snapshot_commitment,
+    )
+    .map_err(pre_witness_execution_store_error)?;
+    match row.stage {
+        PreWitnessExecutionStage::InventoryBound => {
+            Ok(RecoveredPreWitnessDeletionExecution::InventoryBound(bound))
+        }
+        PreWitnessExecutionStage::RegistryErased => {
+            Ok(RecoveredPreWitnessDeletionExecution::RegistryErased(
+                bound,
+                row.registry_evidence.unwrap(),
+            ))
+        }
+        PreWitnessExecutionStage::ObjectsAbsent => {
+            Ok(RecoveredPreWitnessDeletionExecution::ObjectsAbsent(
+                bound,
+                row.registry_evidence.unwrap(),
+                row.objects_evidence.unwrap(),
+            ))
+        }
+        PreWitnessExecutionStage::PhysicalComplete => {
+            let bound_view = bound.binding().control_view(&persistence);
+            let durable_binding = PreWitnessExecutionBinding::from_persisted(
+                &persistence,
+                bound_view.archive_id(),
+                bound_view.deletion_fence(),
+                bound_view.attempt_id(),
+                bound_view.operation_id(),
+                bound_view.snapshot_revision(),
+                bound_view.seal_revision(),
+                bound_view.snapshot_commitment(),
+                bound_view.page_count(),
+                bound_view.artifact_count(),
+                bound_view.key_bytes(),
+                bound_view.terminal_page_hash(),
+                bound_view.inventory_commitment(),
+                bound_view.object_set_commitment(),
+                bound_view.execution_commitment(),
+            )
+            .map_err(pre_witness_execution_store_error)?;
+            let durable = DurablePreWitnessPhysicalCompletion::from_persisted(
+                &persistence,
+                durable_binding,
+                row.registry_evidence.unwrap(),
+                row.objects_evidence.unwrap(),
+                row.provider_drain.unwrap(),
+            )
+            .map_err(pre_witness_execution_store_error)?;
+            Ok(RecoveredPreWitnessDeletionExecution::PhysicalComplete(
+                durable,
+            ))
+        }
+        PreWitnessExecutionStage::PayloadErased => {
+            Ok(RecoveredPreWitnessDeletionExecution::PayloadErased(bound))
+        }
+    }
+}
+
+fn bind_pre_witness_deletion_execution_conn(
+    conn: &Connection,
+    inventory: AuthenticatedPreWitnessExecutionInventory,
+    proposed_operation_id: [u8; 16],
+) -> Result<BoundPreWitnessDeletionExecution> {
+    if proposed_operation_id.iter().all(|byte| *byte == 0) {
+        return Err(EnclaveError::Store(
+            "archive pre-witness execution operation ID is zero".into(),
+        ));
+    }
+    let persistence = LifecyclePersistenceContext::validated();
+    let view = inventory.control_view(&persistence);
+    let tx = conn.unchecked_transaction()?;
+    let (attempt_id, snapshot_commitment) =
+        validate_pre_witness_execution_inventory_conn(&tx, view)?;
+    let seal = view.seal();
+    if let Some(row) = pre_witness_execution_row_conn(&tx, seal.archive_id())? {
+        let binding = pre_witness_execution_binding_from_row(&row)?;
+        let binding_view = binding.control_view(&persistence);
+        if !execution_row_matches_view(&row, &binding_view)
+            || !execution_row_matches_authenticated_inventory(
+                &row,
+                view,
+                attempt_id,
+                snapshot_commitment,
+            )
+        {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness execution adoption changed".into(),
+            ));
+        }
+        tx.commit()?;
+        return BoundPreWitnessDeletionExecution::from_persisted(
+            &persistence,
+            inventory,
+            binding,
+            attempt_id,
+            snapshot_commitment,
+        )
+        .map_err(pre_witness_execution_store_error);
+    }
+    let commitment = execution_commitment(
+        seal.archive_id(),
+        seal.deletion_fence(),
+        attempt_id,
+        &proposed_operation_id,
+        seal.snapshot_revision(),
+        seal.revision(),
+        snapshot_commitment,
+        seal.page_count(),
+        seal.artifact_count(),
+        view.key_bytes(),
+        seal.terminal_page_hash(),
+        seal.inventory_commitment(),
+        view.object_set_commitment(),
+    );
+    let inserted = tx.execute(
+        "INSERT INTO archive_lifecycle_prewitness_deletion_executions
+         (archive_id,format_version,deletion_fence,bootstrap_attempt_id,operation_id,
+          snapshot_revision,seal_revision,snapshot_commitment,page_count,artifact_count,
+          key_byte_count,terminal_page_hash,inventory_commitment,object_set_commitment,
+          execution_commitment,execution_revision,stage)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,1,'inventory_bound')",
+        rusqlite::params![
+            seal.archive_id().as_bytes().as_slice(),
+            seal.deletion_fence().as_bytes().as_slice(),
+            attempt_id.as_bytes().as_slice(),
+            proposed_operation_id.as_slice(),
+            i64::try_from(seal.snapshot_revision()).map_err(|_| {
+                EnclaveError::Store("archive snapshot revision overflow".into())
+            })?,
+            i64::try_from(seal.revision())
+                .map_err(|_| EnclaveError::Store("archive seal revision overflow".into()))?,
+            snapshot_commitment.as_slice(),
+            i64::from(seal.page_count()),
+            i64::from(seal.artifact_count()),
+            i64::try_from(view.key_bytes())
+                .map_err(|_| EnclaveError::Store("archive key-byte count overflow".into()))?,
+            seal.terminal_page_hash().as_slice(),
+            seal.inventory_commitment().as_slice(),
+            view.object_set_commitment().as_slice(),
+            commitment.as_slice(),
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness execution bind failed".into(),
+        ));
+    }
+    let row = pre_witness_execution_row_conn(&tx, seal.archive_id())?
+        .ok_or_else(|| EnclaveError::Store("archive pre-witness execution disappeared".into()))?;
+    let binding = pre_witness_execution_binding_from_row(&row)?;
+    let binding_view = binding.control_view(&persistence);
+    if !execution_row_matches_view(&row, &binding_view)
+        || !execution_row_matches_authenticated_inventory(
+            &row,
+            view,
+            attempt_id,
+            snapshot_commitment,
+        )
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness execution insert changed".into(),
+        ));
+    }
+    tx.commit()?;
+    BoundPreWitnessDeletionExecution::from_persisted(
+        &persistence,
+        inventory,
+        binding,
+        attempt_id,
+        snapshot_commitment,
+    )
+    .map_err(pre_witness_execution_store_error)
+}
+
+fn advance_pre_witness_registry_erased_conn(
+    conn: &Connection,
+    evidence: VerifiedPreWitnessRegistryErasure,
+) -> Result<PreWitnessExecutionBindingControlView> {
+    let persistence = LifecyclePersistenceContext::validated();
+    let (binding, commitment) = evidence.into_control_parts(&persistence);
+    let tx = conn.unchecked_transaction()?;
+    validate_pre_witness_execution_seal_conn(&tx, &binding)?;
+    let row = pre_witness_execution_row_conn(&tx, binding.archive_id())?.ok_or_else(|| {
+        EnclaveError::Conflict("archive pre-witness execution disappeared".into())
+    })?;
+    if !execution_row_matches_view(&row, &binding) {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness registry evidence is cross-operation".into(),
+        ));
+    }
+    match row.stage {
+        PreWitnessExecutionStage::RegistryErased if row.registry_evidence == Some(commitment) => {
+            tx.commit()?;
+            return Ok(binding);
+        }
+        PreWitnessExecutionStage::InventoryBound => {}
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness registry transition skipped or regressed".into(),
+            ))
+        }
+    }
+    if commitment.iter().all(|byte| *byte == 0) {
+        return Err(EnclaveError::Store(
+            "archive pre-witness registry evidence is zero".into(),
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_prewitness_deletion_executions
+         SET execution_revision=2, stage='registry_erased', registry_evidence_commitment=?3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?1 AND operation_id=?2 AND execution_revision=1
+           AND stage='inventory_bound' AND execution_commitment=?4
+           AND registry_evidence_commitment IS NULL AND objects_evidence_commitment IS NULL
+           AND provider_drain_commitment IS NULL AND payload_cleanup_commitment IS NULL",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            binding.operation_id().as_slice(),
+            commitment.as_slice(),
+            binding.execution_commitment().as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness registry transition lost CAS".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(binding)
+}
+
+fn advance_pre_witness_objects_absent_conn(
+    conn: &Connection,
+    evidence: VerifiedPreWitnessObjectsAbsent,
+) -> Result<PreWitnessExecutionBindingControlView> {
+    let persistence = LifecyclePersistenceContext::validated();
+    let (binding, registry, objects) = evidence.into_control_parts(&persistence);
+    let tx = conn.unchecked_transaction()?;
+    validate_pre_witness_execution_seal_conn(&tx, &binding)?;
+    let row = pre_witness_execution_row_conn(&tx, binding.archive_id())?.ok_or_else(|| {
+        EnclaveError::Conflict("archive pre-witness execution disappeared".into())
+    })?;
+    if !execution_row_matches_view(&row, &binding) || row.registry_evidence != Some(registry) {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness objects evidence is cross-operation".into(),
+        ));
+    }
+    match row.stage {
+        PreWitnessExecutionStage::ObjectsAbsent if row.objects_evidence == Some(objects) => {
+            tx.commit()?;
+            return Ok(binding);
+        }
+        PreWitnessExecutionStage::RegistryErased => {}
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness objects transition skipped or regressed".into(),
+            ))
+        }
+    }
+    if objects.iter().all(|byte| *byte == 0) {
+        return Err(EnclaveError::Store(
+            "archive pre-witness objects evidence is zero".into(),
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_prewitness_deletion_executions
+         SET execution_revision=3, stage='objects_absent', objects_evidence_commitment=?4,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?1 AND operation_id=?2 AND execution_revision=2
+           AND stage='registry_erased' AND execution_commitment=?3
+           AND registry_evidence_commitment=?5 AND objects_evidence_commitment IS NULL
+           AND provider_drain_commitment IS NULL AND payload_cleanup_commitment IS NULL",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            binding.operation_id().as_slice(),
+            binding.execution_commitment().as_slice(),
+            objects.as_slice(),
+            registry.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness objects transition lost CAS".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(binding)
+}
+
+fn advance_pre_witness_physical_complete_conn(
+    conn: &Connection,
+    receipt: PreWitnessPhysicalDeletionReceipt,
+) -> Result<DurablePreWitnessPhysicalCompletion> {
+    let persistence = LifecyclePersistenceContext::validated();
+    let (binding, registry, objects, drain) = receipt.into_control_parts(&persistence);
+    let tx = conn.unchecked_transaction()?;
+    validate_pre_witness_execution_seal_conn(&tx, &binding)?;
+    let row = pre_witness_execution_row_conn(&tx, binding.archive_id())?.ok_or_else(|| {
+        EnclaveError::Conflict("archive pre-witness execution disappeared".into())
+    })?;
+    if !execution_row_matches_view(&row, &binding)
+        || row.registry_evidence != Some(registry)
+        || row.objects_evidence != Some(objects)
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness physical evidence is cross-operation".into(),
+        ));
+    }
+    match row.stage {
+        PreWitnessExecutionStage::PhysicalComplete if row.provider_drain == Some(drain) => {}
+        PreWitnessExecutionStage::ObjectsAbsent => {
+            let changed = tx.execute(
+                "UPDATE archive_lifecycle_prewitness_deletion_executions
+                 SET execution_revision=4, stage='physical_complete', provider_drain_commitment=?5,
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE archive_id=?1 AND operation_id=?2 AND execution_revision=3
+                   AND stage='objects_absent' AND execution_commitment=?3
+                   AND registry_evidence_commitment=?4 AND objects_evidence_commitment=?6
+                   AND provider_drain_commitment IS NULL AND payload_cleanup_commitment IS NULL",
+                rusqlite::params![
+                    binding.archive_id().as_bytes().as_slice(),
+                    binding.operation_id().as_slice(),
+                    binding.execution_commitment().as_slice(),
+                    registry.as_slice(),
+                    drain.as_slice(),
+                    objects.as_slice(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(EnclaveError::Conflict(
+                    "archive pre-witness physical transition lost CAS".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness physical transition skipped or regressed".into(),
+            ))
+        }
+    }
+    let durable_binding = PreWitnessExecutionBinding::from_persisted(
+        &persistence,
+        binding.archive_id(),
+        binding.deletion_fence(),
+        binding.attempt_id(),
+        binding.operation_id(),
+        binding.snapshot_revision(),
+        binding.seal_revision(),
+        binding.snapshot_commitment(),
+        binding.page_count(),
+        binding.artifact_count(),
+        binding.key_bytes(),
+        binding.terminal_page_hash(),
+        binding.inventory_commitment(),
+        binding.object_set_commitment(),
+        binding.execution_commitment(),
+    )
+    .map_err(pre_witness_execution_store_error)?;
+    let durable = DurablePreWitnessPhysicalCompletion::from_persisted(
+        &persistence,
+        durable_binding,
+        registry,
+        objects,
+        drain,
+    )
+    .map_err(pre_witness_execution_store_error)?;
+    tx.commit()?;
+    Ok(durable)
+}
+
+fn validate_pre_witness_execution_seal_conn(
+    conn: &Connection,
+    binding: &PreWitnessExecutionBindingControlView,
+) -> Result<()> {
+    let (seal, _) = load_pre_witness_sealed_inventory_conn(
+        conn,
+        binding.archive_id(),
+        binding.deletion_fence(),
+    )?;
+    if seal.snapshot_revision() != binding.snapshot_revision()
+        || seal.revision() != binding.seal_revision()
+        || seal.page_count() != binding.page_count()
+        || seal.artifact_count() != binding.artifact_count()
+        || seal.terminal_page_hash() != binding.terminal_page_hash()
+        || seal.inventory_commitment() != binding.inventory_commitment()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness execution seal changed".into(),
+        ));
+    }
+    let snapshot: (Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT bootstrap_attempt_id, snapshot_commitment
+         FROM archive_lifecycle_prewitness_inventory_snapshots WHERE archive_id=?1",
+        [binding.archive_id().as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if fixed_16(snapshot.0)? != *binding.attempt_id().as_bytes()
+        || fixed_32(snapshot.1)? != binding.snapshot_commitment()
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness execution snapshot changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn advance_pre_witness_payload_erased_conn(
+    conn: &Connection,
+    binding: &PreWitnessExecutionBinding,
+    registry: [u8; 32],
+    objects: [u8; 32],
+    drain: [u8; 32],
+    cleanup: [u8; 32],
+) -> Result<()> {
+    let persistence = LifecyclePersistenceContext::validated();
+    let binding = binding.control_view(&persistence);
+    let tx = conn.unchecked_transaction()?;
+    validate_pre_witness_execution_seal_conn(&tx, &binding)?;
+    let row = pre_witness_execution_row_conn(&tx, binding.archive_id())?.ok_or_else(|| {
+        EnclaveError::Conflict("archive pre-witness execution disappeared".into())
+    })?;
+    if !execution_row_matches_view(&row, &binding)
+        || row.registry_evidence != Some(registry)
+        || row.objects_evidence != Some(objects)
+        || row.provider_drain != Some(drain)
+        || cleanup.iter().all(|byte| *byte == 0)
+    {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness payload evidence changed".into(),
+        ));
+    }
+    match row.stage {
+        PreWitnessExecutionStage::PayloadErased if row.payload_cleanup == Some(cleanup) => {
+            tx.commit()?;
+            return Ok(());
+        }
+        PreWitnessExecutionStage::PhysicalComplete => {}
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "archive pre-witness payload transition skipped or regressed".into(),
+            ))
+        }
+    }
+    let changed = tx.execute(
+        "UPDATE archive_lifecycle_prewitness_deletion_executions
+         SET execution_revision=5, stage='payload_erased', payload_cleanup_commitment=?7,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?1 AND operation_id=?2 AND execution_revision=4
+           AND stage='physical_complete' AND execution_commitment=?3
+           AND registry_evidence_commitment=?4 AND objects_evidence_commitment=?5
+           AND provider_drain_commitment=?6 AND payload_cleanup_commitment IS NULL",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            binding.operation_id().as_slice(),
+            binding.execution_commitment().as_slice(),
+            registry.as_slice(),
+            objects.as_slice(),
+            drain.as_slice(),
+            cleanup.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict(
+            "archive pre-witness payload transition lost CAS".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn load_sealed_archive_inventory_references_conn(
     conn: &Connection,
     expected: &DeletionInventorySeal,
@@ -6662,6 +7536,33 @@ impl ControlStore {
                 return Err(error);
             }
         }
+        Ok(out)
+    }
+
+    /// Persist a capability-bearing mutation while the sole SQLite handle is
+    /// owned by this future rather than published through `inner`.
+    ///
+    /// If cancellation occurs at any await in `flush`, the local handle drops
+    /// and `inner` remains `None`. The next reader therefore reloads the exact
+    /// durable provider generation: it can observe either the old row or an
+    /// exactly reconciled successful PUT, but never the locally committed
+    /// SQLite state from an interrupted flush.
+    async fn write_owned_if_changed<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<(T, bool)>,
+    {
+        let mut guard = self.inner.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.load().await?);
+        }
+        let mut handle = guard
+            .take()
+            .ok_or_else(|| EnclaveError::Store("control handle disappeared".into()))?;
+        let (out, changed) = f(&handle.conn)?;
+        if changed {
+            self.flush(&mut handle).await?;
+        }
+        *guard = Some(handle);
         Ok(out)
     }
 
@@ -9924,6 +10825,79 @@ impl PreWitnessInventoryControl for ControlStore {
     }
 }
 
+fn random_pre_witness_deletion_operation_id() -> std::result::Result<[u8; 16], LifecycleError> {
+    for _ in 0..8 {
+        let mut value = [0u8; 16];
+        OsRng.fill_bytes(&mut value);
+        if value != [0; 16] {
+            return Ok(value);
+        }
+    }
+    Err(LifecycleError::Unavailable)
+}
+
+#[async_trait::async_trait]
+impl PreWitnessDeletionExecutionControl for ControlStore {
+    async fn bind_pre_witness_execution_inventory(
+        &self,
+        inventory: AuthenticatedPreWitnessExecutionInventory,
+    ) -> std::result::Result<BoundPreWitnessDeletionExecution, PreWitnessDeletionExecutionError>
+    {
+        let proposed = random_pre_witness_deletion_operation_id()
+            .map_err(|_| PreWitnessDeletionExecutionError::Unavailable)?;
+        self.write_owned_if_changed(move |conn| {
+            bind_pre_witness_deletion_execution_conn(conn, inventory, proposed)
+                .map(|bound| (bound, true))
+        })
+        .await
+        .map_err(|_| PreWitnessDeletionExecutionError::Unavailable)
+    }
+
+    async fn recover_pre_witness_deletion_execution(
+        &self,
+        inventory: AuthenticatedPreWitnessExecutionInventory,
+    ) -> std::result::Result<RecoveredPreWitnessDeletionExecution, PreWitnessDeletionExecutionError>
+    {
+        self.read(move |conn| recover_pre_witness_deletion_execution_conn(conn, inventory))
+            .await
+            .map_err(|_| PreWitnessDeletionExecutionError::Unavailable)
+    }
+
+    async fn record_pre_witness_registry_erased(
+        &self,
+        evidence: VerifiedPreWitnessRegistryErasure,
+    ) -> std::result::Result<(), PreWitnessDeletionExecutionError> {
+        self.write_owned_if_changed(move |conn| {
+            advance_pre_witness_registry_erased_conn(conn, evidence).map(|_| ((), true))
+        })
+        .await
+        .map_err(|_| PreWitnessDeletionExecutionError::Unavailable)
+    }
+
+    async fn record_pre_witness_objects_absent(
+        &self,
+        evidence: VerifiedPreWitnessObjectsAbsent,
+    ) -> std::result::Result<(), PreWitnessDeletionExecutionError> {
+        self.write_owned_if_changed(move |conn| {
+            advance_pre_witness_objects_absent_conn(conn, evidence).map(|_| ((), true))
+        })
+        .await
+        .map_err(|_| PreWitnessDeletionExecutionError::Unavailable)
+    }
+
+    async fn record_pre_witness_physical_complete(
+        &self,
+        receipt: PreWitnessPhysicalDeletionReceipt,
+    ) -> std::result::Result<DurablePreWitnessPhysicalCompletion, PreWitnessDeletionExecutionError>
+    {
+        self.write_owned_if_changed(move |conn| {
+            advance_pre_witness_physical_complete_conn(conn, receipt).map(|durable| (durable, true))
+        })
+        .await
+        .map_err(|_| PreWitnessDeletionExecutionError::Unavailable)
+    }
+}
+
 #[async_trait::async_trait]
 impl LifecyclePageAdmissionLedger for ControlStore {
     async fn admit_page_create(
@@ -9984,6 +10958,9 @@ mod tests {
         pause_next_control_list: AtomicBool,
         list_started: Notify,
         resume_list: Notify,
+        pause_before_put_target: std::sync::Mutex<Option<String>>,
+        put_started: Notify,
+        resume_before_put: Notify,
         pause_after_put_target: std::sync::Mutex<Option<String>>,
         put_committed: Notify,
         resume_put: Notify,
@@ -9999,6 +10976,9 @@ mod tests {
                 pause_next_control_list: AtomicBool::new(false),
                 list_started: Notify::new(),
                 resume_list: Notify::new(),
+                pause_before_put_target: std::sync::Mutex::new(None),
+                put_started: Notify::new(),
+                resume_before_put: Notify::new(),
                 pause_after_put_target: std::sync::Mutex::new(None),
                 put_committed: Notify::new(),
                 resume_put: Notify::new(),
@@ -10014,6 +10994,10 @@ mod tests {
 
         fn pause_after_next_put(&self, object_name: &str) {
             *self.pause_after_put_target.lock().unwrap() = Some(object_name.to_string());
+        }
+
+        fn pause_before_next_put(&self, object_name: &str) {
+            *self.pause_before_put_target.lock().unwrap() = Some(object_name.to_string());
         }
 
         fn pause_after_next_get(&self, object_name: &str) {
@@ -10068,6 +11052,19 @@ mod tests {
             wrapped_dek_b64: &str,
             if_generation_match: i64,
         ) -> Result<i64> {
+            let should_pause_before = {
+                let mut target = self.pause_before_put_target.lock().unwrap();
+                if target.as_deref() == Some(object_name) {
+                    *target = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_pause_before {
+                self.put_started.notify_one();
+                self.resume_before_put.notified().await;
+            }
             let generation = self
                 .inner
                 .put_object(
@@ -10425,6 +11422,183 @@ mod tests {
         assert_eq!(closed.phase(), ClosedWitnessPhase::ClosedUnsent);
         let absence = confirm_pre_witness_absence_conn(conn, &closed).unwrap();
         (plan, fence, absence)
+    }
+
+    fn sealed_pre_witness_execution_fixture(
+        conn: &Connection,
+        prepare_objects: bool,
+    ) -> (
+        BootstrapPlan,
+        ObjectId,
+        PreWitnessDeletionInventorySeal,
+        Vec<crate::archive_v3_lifecycle::LifecycleInventoryObject>,
+    ) {
+        let (plan, fence, absence) = confirmed_pre_witness_absence_fixture(conn, prepare_objects);
+        let snapshot = freeze_pre_witness_inventory_snapshot_conn(conn, absence).unwrap();
+        let pages = pre_witness_page_plan_for_snapshot(&snapshot).unwrap();
+        let objects = pages
+            .iter()
+            .flat_map(|page| page.entries().iter().cloned())
+            .collect::<Vec<_>>();
+        let durable_pages = pages
+            .iter()
+            .cloned()
+            .map(durable_inventory_page)
+            .collect::<Vec<_>>();
+        persist_lifecycle_page_creates(conn, fence, &durable_pages);
+        let authenticated =
+            AuthenticatedPreWitnessInventoryPlan::for_test(snapshot, pages, durable_pages).unwrap();
+        let seal = seal_pre_witness_inventory_conn(conn, &authenticated).unwrap();
+        (plan, fence, seal, objects)
+    }
+
+    fn execution_inventory_for_test(
+        seal: PreWitnessDeletionInventorySeal,
+        objects: &[crate::archive_v3_lifecycle::LifecycleInventoryObject],
+    ) -> AuthenticatedPreWitnessExecutionInventory {
+        AuthenticatedPreWitnessExecutionInventory::for_test(seal, objects.to_vec()).unwrap()
+    }
+
+    async fn durable_pre_witness_execution_fixture(
+        control: &ControlStore,
+        prepare_objects: bool,
+    ) -> (
+        BootstrapPlan,
+        ObjectId,
+        PreWitnessDeletionInventorySeal,
+        Vec<crate::archive_v3_lifecycle::LifecycleInventoryObject>,
+    ) {
+        control
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (id, google_sub, email)
+                     VALUES (?1, ?2, 'owner@example.com')",
+                    rusqlite::params![USER_ID, GOOGLE_SUB],
+                )?;
+                create_active_archive_binding_conn(conn, USER_ID)?;
+                Ok(sealed_pre_witness_execution_fixture(conn, prepare_objects))
+            })
+            .await
+            .unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PreWitnessDurableStep {
+        Bind,
+        Registry,
+        Objects,
+        Physical,
+    }
+
+    impl PreWitnessDurableStep {
+        const ALL: [Self; 4] = [Self::Bind, Self::Registry, Self::Objects, Self::Physical];
+
+        const fn durable_stage(self) -> PreWitnessExecutionStage {
+            match self {
+                Self::Bind => PreWitnessExecutionStage::InventoryBound,
+                Self::Registry => PreWitnessExecutionStage::RegistryErased,
+                Self::Objects => PreWitnessExecutionStage::ObjectsAbsent,
+                Self::Physical => PreWitnessExecutionStage::PhysicalComplete,
+            }
+        }
+
+        const fn prior_stage(self) -> Option<PreWitnessExecutionStage> {
+            match self {
+                Self::Bind => None,
+                Self::Registry => Some(PreWitnessExecutionStage::InventoryBound),
+                Self::Objects => Some(PreWitnessExecutionStage::RegistryErased),
+                Self::Physical => Some(PreWitnessExecutionStage::ObjectsAbsent),
+            }
+        }
+    }
+
+    async fn run_pre_witness_durable_step(
+        control: &ControlStore,
+        seal: PreWitnessDeletionInventorySeal,
+        objects: &[crate::archive_v3_lifecycle::LifecycleInventoryObject],
+        step: PreWitnessDurableStep,
+    ) -> std::result::Result<PreWitnessExecutionStage, PreWitnessDeletionExecutionError> {
+        let persistence = LifecyclePersistenceContext::validated();
+        match step {
+            PreWitnessDurableStep::Bind => {
+                control
+                    .bind_pre_witness_execution_inventory(execution_inventory_for_test(
+                        seal, objects,
+                    ))
+                    .await?;
+            }
+            PreWitnessDurableStep::Registry => {
+                let recovered = control
+                    .recover_pre_witness_deletion_execution(execution_inventory_for_test(
+                        seal, objects,
+                    ))
+                    .await?;
+                let evidence = VerifiedPreWitnessRegistryErasure::for_test(
+                    recovered.binding(),
+                    &persistence,
+                    [0xb1; 32],
+                )?;
+                control.record_pre_witness_registry_erased(evidence).await?;
+            }
+            PreWitnessDurableStep::Objects => {
+                let recovered = control
+                    .recover_pre_witness_deletion_execution(execution_inventory_for_test(
+                        seal, objects,
+                    ))
+                    .await?;
+                let registry = match &recovered {
+                    RecoveredPreWitnessDeletionExecution::RegistryErased(_, registry) => *registry,
+                    _ => return Err(PreWitnessDeletionExecutionError::Stale),
+                };
+                let evidence = VerifiedPreWitnessObjectsAbsent::for_test(
+                    recovered.binding(),
+                    &persistence,
+                    registry,
+                    [0xb2; 32],
+                )?;
+                control.record_pre_witness_objects_absent(evidence).await?;
+            }
+            PreWitnessDurableStep::Physical => {
+                let recovered = control
+                    .recover_pre_witness_deletion_execution(execution_inventory_for_test(
+                        seal, objects,
+                    ))
+                    .await?;
+                let (registry, objects_commitment) = match &recovered {
+                    RecoveredPreWitnessDeletionExecution::ObjectsAbsent(_, registry, objects) => {
+                        (*registry, *objects)
+                    }
+                    _ => return Err(PreWitnessDeletionExecutionError::Stale),
+                };
+                let drain = crate::archive_v3_pre_witness_deletion::VerifiedPreWitnessProviderDrain::for_test(
+                    recovered.binding(),
+                    &persistence,
+                    registry,
+                    objects_commitment,
+                    [0xb3; 32],
+                )?;
+                control
+                    .record_pre_witness_physical_complete(drain.into_physical_receipt())
+                    .await?;
+            }
+        }
+        Ok(step.durable_stage())
+    }
+
+    async fn prepare_before_pre_witness_durable_step(
+        control: &ControlStore,
+        seal: PreWitnessDeletionInventorySeal,
+        objects: &[crate::archive_v3_lifecycle::LifecycleInventoryObject],
+        target: PreWitnessDurableStep,
+    ) {
+        for step in PreWitnessDurableStep::ALL {
+            if step == target {
+                break;
+            }
+            run_pre_witness_durable_step(control, seal, objects, step)
+                .await
+                .unwrap();
+        }
     }
 
     #[test]
@@ -11227,6 +12401,689 @@ mod tests {
             }
             assert!(recover_pre_witness_inventory_conn(&conn, plan.archive_id(), fence).is_err());
         }
+    }
+
+    #[test]
+    fn pre_witness_execution_reopens_at_every_exact_stage_and_retains_zero_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pre-witness-execution.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (plan, fence, seal, objects) = sealed_pre_witness_execution_fixture(&conn, false);
+        assert!(objects.is_empty());
+        let bound = bind_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+            [0x51; 16],
+        )
+        .unwrap();
+        assert_eq!(bound.dimensions_for_test(), (0, 0));
+        let original = bound
+            .binding()
+            .control_view(&LifecyclePersistenceContext::validated());
+        assert_eq!(original.archive_id(), plan.archive_id());
+        assert_eq!(original.deletion_fence(), fence);
+        assert_eq!((original.page_count(), original.artifact_count()), (0, 0));
+        assert_eq!(original.terminal_page_hash(), [0; 32]);
+        assert_ne!(original.inventory_commitment(), [0; 32]);
+        assert_ne!(original.execution_commitment(), [0; 32]);
+        drop(bound);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+        )
+        .unwrap();
+        assert_eq!(recovered.stage(), PreWitnessExecutionStage::InventoryBound);
+        assert!(
+            recovered
+                .binding()
+                .control_view(&LifecyclePersistenceContext::validated())
+                == original
+        );
+        let registry = VerifiedPreWitnessRegistryErasure::for_test(
+            recovered.binding(),
+            &LifecyclePersistenceContext::validated(),
+            [0x61; 32],
+        )
+        .unwrap();
+        advance_pre_witness_registry_erased_conn(&conn, registry).unwrap();
+        drop(recovered);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+        )
+        .unwrap();
+        let (registry_commitment, binding) = match recovered {
+            RecoveredPreWitnessDeletionExecution::RegistryErased(bound, registry) => {
+                (registry, bound)
+            }
+            other => panic!("unexpected recovered stage: {other:?}"),
+        };
+        let objects_evidence = VerifiedPreWitnessObjectsAbsent::for_test(
+            binding.binding(),
+            &LifecyclePersistenceContext::validated(),
+            registry_commitment,
+            [0x62; 32],
+        )
+        .unwrap();
+        advance_pre_witness_objects_absent_conn(&conn, objects_evidence).unwrap();
+        let objects_replay = VerifiedPreWitnessObjectsAbsent::for_test(
+            binding.binding(),
+            &LifecyclePersistenceContext::validated(),
+            registry_commitment,
+            [0x62; 32],
+        )
+        .unwrap();
+        advance_pre_witness_objects_absent_conn(&conn, objects_replay).unwrap();
+        drop(binding);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+        )
+        .unwrap();
+        let (binding, registry_commitment, objects_commitment) = match recovered {
+            RecoveredPreWitnessDeletionExecution::ObjectsAbsent(bound, registry, objects) => {
+                (bound, registry, objects)
+            }
+            other => panic!("unexpected recovered stage: {other:?}"),
+        };
+        let drain =
+            crate::archive_v3_pre_witness_deletion::VerifiedPreWitnessProviderDrain::for_test(
+                binding.binding(),
+                &LifecyclePersistenceContext::validated(),
+                registry_commitment,
+                objects_commitment,
+                [0x63; 32],
+            )
+            .unwrap();
+        let durable =
+            advance_pre_witness_physical_complete_conn(&conn, drain.into_physical_receipt())
+                .unwrap();
+        let drain_replay =
+            crate::archive_v3_pre_witness_deletion::VerifiedPreWitnessProviderDrain::for_test(
+                binding.binding(),
+                &LifecyclePersistenceContext::validated(),
+                registry_commitment,
+                objects_commitment,
+                [0x63; 32],
+            )
+            .unwrap();
+        advance_pre_witness_physical_complete_conn(&conn, drain_replay.into_physical_receipt())
+            .unwrap();
+        assert_eq!(
+            format!("{durable:?}"),
+            "DurablePreWitnessPhysicalCompletion(<opaque>)"
+        );
+        drop(binding);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.stage(),
+            PreWitnessExecutionStage::PhysicalComplete
+        );
+        let row = pre_witness_execution_row_conn(&conn, plan.archive_id())
+            .unwrap()
+            .unwrap();
+        let cleanup = crate::archive_v3_pre_witness_deletion::payload_cleanup_commitment_for_test(
+            recovered.binding(),
+            &LifecyclePersistenceContext::validated(),
+            row.registry_evidence.unwrap(),
+            row.objects_evidence.unwrap(),
+            row.provider_drain.unwrap(),
+            [0x64; 32],
+        )
+        .unwrap();
+        advance_pre_witness_payload_erased_conn(
+            &conn,
+            recovered.binding(),
+            row.registry_evidence.unwrap(),
+            row.objects_evidence.unwrap(),
+            row.provider_drain.unwrap(),
+            cleanup,
+        )
+        .unwrap();
+        advance_pre_witness_payload_erased_conn(
+            &conn,
+            recovered.binding(),
+            row.registry_evidence.unwrap(),
+            row.objects_evidence.unwrap(),
+            row.provider_drain.unwrap(),
+            cleanup,
+        )
+        .unwrap();
+        drop(recovered);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let recovered = recover_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+        )
+        .unwrap();
+        assert_eq!(recovered.stage(), PreWitnessExecutionStage::PayloadErased);
+        let row = pre_witness_execution_row_conn(&conn, plan.archive_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.execution_revision, 5);
+        assert_eq!(row.stage, PreWitnessExecutionStage::PayloadErased);
+        assert_eq!(
+            lifecycle_anchor_conn(&conn, plan.archive_id())
+                .unwrap()
+                .unwrap()
+                .state,
+            ArchiveLifecycleState::InventorySealed
+        );
+    }
+
+    #[test]
+    fn pre_witness_execution_first_bind_adopts_one_operation_and_rejects_substitution() {
+        let conn = account_conn();
+        let (plan, _, seal, objects) = sealed_pre_witness_execution_fixture(&conn, true);
+        assert_eq!(objects.len(), 2);
+        let first = bind_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+            [0x71; 16],
+        )
+        .unwrap();
+        let first_view = first
+            .binding()
+            .control_view(&LifecyclePersistenceContext::validated());
+        drop(first);
+        let adopted = bind_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+            [0x72; 16],
+        )
+        .unwrap();
+        assert!(
+            adopted
+                .binding()
+                .control_view(&LifecyclePersistenceContext::validated())
+                == first_view
+        );
+        assert_eq!(first_view.operation_id(), [0x71; 16]);
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM archive_lifecycle_prewitness_deletion_executions
+                 WHERE archive_id=?1",
+                [plan.archive_id().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1);
+
+        let altered = crate::archive_v3_lifecycle::LifecycleInventoryObject::for_archive(
+            plan.archive_id(),
+            objects[0].key().clone(),
+            objects[0].role(),
+            [0x99; 32],
+        )
+        .unwrap();
+        let mut substituted = objects.clone();
+        substituted[0] = altered;
+        assert!(recover_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &substituted),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pre_witness_execution_rejects_recommitted_alternate_immutable_tuple() {
+        for field in ["attempt", "snapshot", "page_count", "terminal"] {
+            let conn = account_conn();
+            let (_, _, seal, objects) = sealed_pre_witness_execution_fixture(&conn, true);
+            bind_pre_witness_deletion_execution_conn(
+                &conn,
+                execution_inventory_for_test(seal, &objects),
+                [0x78; 16],
+            )
+            .unwrap();
+            let row = pre_witness_execution_row_conn(&conn, seal.archive_id())
+                .unwrap()
+                .unwrap();
+            let mut attempt_id = row.attempt_id;
+            let mut snapshot_commitment = row.snapshot_commitment;
+            let mut page_count = row.page_count;
+            let mut terminal_page_hash = row.terminal_page_hash;
+            match field {
+                "attempt" => {
+                    attempt_id = BootstrapAttemptId::from_bytes([0x91; 16]).unwrap();
+                }
+                "snapshot" => snapshot_commitment = [0x92; 32],
+                "page_count" => page_count = row.page_count.checked_add(1).unwrap(),
+                "terminal" => terminal_page_hash = [0x93; 32],
+                _ => unreachable!(),
+            }
+            let recomputed = execution_commitment(
+                row.archive_id,
+                row.deletion_fence,
+                attempt_id,
+                &row.operation_id,
+                row.snapshot_revision,
+                row.seal_revision,
+                snapshot_commitment,
+                page_count,
+                row.artifact_count,
+                row.key_bytes,
+                terminal_page_hash,
+                row.inventory_commitment,
+                row.object_set_commitment,
+            );
+            conn.execute(
+                "UPDATE archive_lifecycle_prewitness_deletion_executions
+                 SET bootstrap_attempt_id=?2, snapshot_commitment=?3, page_count=?4,
+                     terminal_page_hash=?5, execution_commitment=?6
+                 WHERE archive_id=?1",
+                rusqlite::params![
+                    seal.archive_id().as_bytes().as_slice(),
+                    attempt_id.as_bytes().as_slice(),
+                    snapshot_commitment.as_slice(),
+                    i64::from(page_count),
+                    terminal_page_hash.as_slice(),
+                    recomputed.as_slice(),
+                ],
+            )
+            .unwrap();
+            assert!(recover_pre_witness_deletion_execution_conn(
+                &conn,
+                execution_inventory_for_test(seal, &objects),
+            )
+            .is_err());
+            assert!(bind_pre_witness_deletion_execution_conn(
+                &conn,
+                execution_inventory_for_test(seal, &objects),
+                [0x79; 16],
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn pre_witness_execution_replay_is_exact_and_skips_regressions_or_alternates() {
+        let conn = account_conn();
+        let (_, _, seal, objects) = sealed_pre_witness_execution_fixture(&conn, true);
+        let bound = bind_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+            [0x73; 16],
+        )
+        .unwrap();
+        let persistence = LifecyclePersistenceContext::validated();
+        let premature_objects = VerifiedPreWitnessObjectsAbsent::for_test(
+            bound.binding(),
+            &persistence,
+            [0x81; 32],
+            [0x82; 32],
+        )
+        .unwrap();
+        assert!(advance_pre_witness_objects_absent_conn(&conn, premature_objects).is_err());
+
+        let registry =
+            VerifiedPreWitnessRegistryErasure::for_test(bound.binding(), &persistence, [0x83; 32])
+                .unwrap();
+        advance_pre_witness_registry_erased_conn(&conn, registry).unwrap();
+        let exact_replay =
+            VerifiedPreWitnessRegistryErasure::for_test(bound.binding(), &persistence, [0x83; 32])
+                .unwrap();
+        advance_pre_witness_registry_erased_conn(&conn, exact_replay).unwrap();
+        let alternate =
+            VerifiedPreWitnessRegistryErasure::for_test(bound.binding(), &persistence, [0x84; 32])
+                .unwrap();
+        assert!(advance_pre_witness_registry_erased_conn(&conn, alternate).is_err());
+
+        let row = pre_witness_execution_row_conn(&conn, seal.archive_id())
+            .unwrap()
+            .unwrap();
+        let registry_commitment = row.registry_evidence.unwrap();
+        let objects_evidence = VerifiedPreWitnessObjectsAbsent::for_test(
+            bound.binding(),
+            &persistence,
+            registry_commitment,
+            [0x85; 32],
+        )
+        .unwrap();
+        advance_pre_witness_objects_absent_conn(&conn, objects_evidence).unwrap();
+        let regression =
+            VerifiedPreWitnessRegistryErasure::for_test(bound.binding(), &persistence, [0x83; 32])
+                .unwrap();
+        assert!(advance_pre_witness_registry_erased_conn(&conn, regression).is_err());
+    }
+
+    #[test]
+    fn pre_witness_execution_evidence_from_another_operation_is_rejected() {
+        let conn = account_conn();
+        let (_, _, seal, objects) = sealed_pre_witness_execution_fixture(&conn, true);
+        let bound = bind_pre_witness_deletion_execution_conn(
+            &conn,
+            execution_inventory_for_test(seal, &objects),
+            [0x76; 16],
+        )
+        .unwrap();
+        let stale = VerifiedPreWitnessRegistryErasure::for_test(
+            bound.binding(),
+            &LifecyclePersistenceContext::validated(),
+            [0x86; 32],
+        )
+        .unwrap();
+        let row = pre_witness_execution_row_conn(&conn, seal.archive_id())
+            .unwrap()
+            .unwrap();
+        let replacement_operation = [0x77; 16];
+        let replacement_commitment = execution_commitment(
+            row.archive_id,
+            row.deletion_fence,
+            row.attempt_id,
+            &replacement_operation,
+            row.snapshot_revision,
+            row.seal_revision,
+            row.snapshot_commitment,
+            row.page_count,
+            row.artifact_count,
+            row.key_bytes,
+            row.terminal_page_hash,
+            row.inventory_commitment,
+            row.object_set_commitment,
+        );
+        conn.execute(
+            "UPDATE archive_lifecycle_prewitness_deletion_executions
+             SET operation_id=?2, execution_commitment=?3 WHERE archive_id=?1",
+            rusqlite::params![
+                seal.archive_id().as_bytes().as_slice(),
+                replacement_operation.as_slice(),
+                replacement_commitment.as_slice(),
+            ],
+        )
+        .unwrap();
+        assert!(advance_pre_witness_registry_erased_conn(&conn, stale).is_err());
+        assert!(matches!(
+            recover_pre_witness_deletion_execution_conn(
+                &conn,
+                execution_inventory_for_test(seal, &objects),
+            )
+            .unwrap(),
+            RecoveredPreWitnessDeletionExecution::InventoryBound(_)
+        ));
+    }
+
+    #[test]
+    fn pre_witness_execution_schema_rejects_unknown_skip_zero_and_illegal_geometry() {
+        for update in [
+            "format_version=2",
+            "operation_id=zeroblob(16)",
+            "execution_commitment=zeroblob(32)",
+            "execution_revision=3",
+            "stage='unknown'",
+            "stage='registry_erased'",
+            "stage='objects_absent'",
+            "registry_evidence_commitment=randomblob(32)",
+            "page_count=0",
+            "key_byte_count=0",
+            "terminal_page_hash=zeroblob(32)",
+        ] {
+            let conn = account_conn();
+            let (plan, _, seal, objects) = sealed_pre_witness_execution_fixture(&conn, true);
+            bind_pre_witness_deletion_execution_conn(
+                &conn,
+                execution_inventory_for_test(seal, &objects),
+                [0x74; 16],
+            )
+            .unwrap();
+            let result = conn.execute(
+                &format!(
+                    "UPDATE archive_lifecycle_prewitness_deletion_executions SET {update}
+                     WHERE archive_id=?1"
+                ),
+                [plan.archive_id().as_bytes().as_slice()],
+            );
+            assert!(
+                result.is_err(),
+                "illegal execution tuple was accepted: {update}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_witness_execution_revalidates_branch_pages_and_frozen_anchor_before_mint() {
+        for corruption in ["dual", "page", "admission", "active"] {
+            let conn = account_conn();
+            let (plan, fence, seal, objects) = sealed_pre_witness_execution_fixture(&conn, true);
+            match corruption {
+                "dual" => {
+                    conn.execute(
+                        "INSERT INTO archive_lifecycle_inventory_snapshots
+                         (archive_id,deletion_fence,lifecycle_revision,snapshot_commitment)
+                         VALUES (?1,?2,?3,randomblob(32))",
+                        rusqlite::params![
+                            plan.archive_id().as_bytes().as_slice(),
+                            fence.as_bytes().as_slice(),
+                            i64::try_from(seal.snapshot_revision()).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                }
+                "page" => {
+                    conn.execute(
+                        "UPDATE archive_lifecycle_prewitness_inventory_pages
+                         SET previous_hash=randomblob(32) WHERE archive_id=?1",
+                        [plan.archive_id().as_bytes().as_slice()],
+                    )
+                    .unwrap();
+                }
+                "admission" => {
+                    conn.execute(
+                        "DELETE FROM archive_lifecycle_page_creates WHERE archive_id=?1",
+                        [plan.archive_id().as_bytes().as_slice()],
+                    )
+                    .unwrap();
+                }
+                "active" => {
+                    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+                        .unwrap();
+                    conn.execute(
+                        "UPDATE archive_lifecycle_anchors SET state='witnessed'
+                         WHERE archive_id=?1",
+                        [plan.archive_id().as_bytes().as_slice()],
+                    )
+                    .unwrap();
+                    conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(bind_pre_witness_deletion_execution_conn(
+                &conn,
+                execution_inventory_for_test(seal, &objects),
+                [0x75; 16],
+            )
+            .is_err());
+            let minted: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM archive_lifecycle_prewitness_deletion_executions
+                     WHERE archive_id=?1",
+                    [plan.archive_id().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(minted, 0, "corruption unexpectedly minted: {corruption}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_pre_witness_execution_flush_before_put_reloads_only_old_durable_stage() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        for target in PreWitnessDurableStep::ALL {
+            let inner = Arc::new(FakeGcs::new());
+            let gcs = Arc::new(PausingGcs::new(inner.clone()));
+            let control = Arc::new(ControlStore::new(Arc::new(FakeKms), gcs.clone()));
+            let (_, _, seal, objects) = durable_pre_witness_execution_fixture(&control, true).await;
+            prepare_before_pre_witness_durable_step(&control, seal, &objects, target).await;
+            let durable_generation = inner.get_object(CONTROL_OBJECT).await.unwrap().generation;
+
+            gcs.pause_before_next_put(CONTROL_OBJECT);
+            let task_control = control.clone();
+            let task_objects = objects.clone();
+            let task = tokio::spawn(async move {
+                run_pre_witness_durable_step(&task_control, seal, &task_objects, target).await
+            });
+            gcs.put_started.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            gcs.resume_before_put.notify_one();
+            assert!(control.inner.lock().await.is_none());
+            assert_eq!(
+                inner.get_object(CONTROL_OBJECT).await.unwrap().generation,
+                durable_generation
+            );
+
+            let recovered = control
+                .recover_pre_witness_deletion_execution(execution_inventory_for_test(
+                    seal, &objects,
+                ))
+                .await;
+            match target.prior_stage() {
+                None => assert!(matches!(
+                    recovered,
+                    Err(PreWitnessDeletionExecutionError::Unavailable)
+                )),
+                Some(expected) => assert_eq!(recovered.unwrap().stage(), expected),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_pre_witness_execution_flush_after_put_reloads_exact_committed_stage() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        for target in PreWitnessDurableStep::ALL {
+            let inner = Arc::new(FakeGcs::new());
+            let gcs = Arc::new(PausingGcs::new(inner.clone()));
+            let control = Arc::new(ControlStore::new(Arc::new(FakeKms), gcs.clone()));
+            let (_, _, seal, objects) = durable_pre_witness_execution_fixture(&control, true).await;
+            prepare_before_pre_witness_durable_step(&control, seal, &objects, target).await;
+            let durable_generation = inner.get_object(CONTROL_OBJECT).await.unwrap().generation;
+
+            gcs.pause_after_next_put(CONTROL_OBJECT);
+            let task_control = control.clone();
+            let task_objects = objects.clone();
+            let task = tokio::spawn(async move {
+                run_pre_witness_durable_step(&task_control, seal, &task_objects, target).await
+            });
+            gcs.put_committed.notified().await;
+            assert!(
+                inner.get_object(CONTROL_OBJECT).await.unwrap().generation > durable_generation
+            );
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            gcs.resume_put.notify_one();
+            assert!(control.inner.lock().await.is_none());
+
+            let recovered = control
+                .recover_pre_witness_deletion_execution(execution_inventory_for_test(
+                    seal, &objects,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(recovered.stage(), target.durable_stage());
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_response_pre_witness_execution_put_reconciles_exact_generation_at_each_stage() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        for target in PreWitnessDurableStep::ALL {
+            let kms = Arc::new(FakeKms);
+            let gcs = Arc::new(FakeGcs::new());
+            let control = ControlStore::new(kms.clone(), gcs.clone());
+            let (_, _, seal, objects) = durable_pre_witness_execution_fixture(&control, true).await;
+            prepare_before_pre_witness_durable_step(&control, seal, &objects, target).await;
+            gcs.fail_next_put_after_commit(EnclaveError::Gcs(
+                "simulated lost pre-witness execution PUT".into(),
+            ));
+            assert_eq!(
+                run_pre_witness_durable_step(&control, seal, &objects, target)
+                    .await
+                    .unwrap(),
+                target.durable_stage()
+            );
+            let restarted = ControlStore::new(kms, gcs);
+            let recovered = restarted
+                .recover_pre_witness_deletion_execution(execution_inventory_for_test(
+                    seal, &objects,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(recovered.stage(), target.durable_stage());
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_first_bind_retry_adopts_committed_operation_not_alternate() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let inner = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(inner));
+        let control = Arc::new(ControlStore::new(Arc::new(FakeKms), gcs.clone()));
+        let (_, _, seal, objects) = durable_pre_witness_execution_fixture(&control, true).await;
+        gcs.pause_after_next_put(CONTROL_OBJECT);
+        let first_control = control.clone();
+        let first_objects = objects.clone();
+        let first = tokio::spawn(async move {
+            first_control
+                .bind_pre_witness_execution_inventory(execution_inventory_for_test(
+                    seal,
+                    &first_objects,
+                ))
+                .await
+        });
+        gcs.put_committed.notified().await;
+        let retry_control = control.clone();
+        let retry_objects = objects.clone();
+        let retry = tokio::spawn(async move {
+            retry_control
+                .bind_pre_witness_execution_inventory(execution_inventory_for_test(
+                    seal,
+                    &retry_objects,
+                ))
+                .await
+        });
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        gcs.resume_put.notify_one();
+        let adopted = retry.await.unwrap().unwrap();
+        let adopted_operation = adopted
+            .binding()
+            .control_view(&LifecyclePersistenceContext::validated())
+            .operation_id();
+        drop(adopted);
+        let recovered = control
+            .recover_pre_witness_deletion_execution(execution_inventory_for_test(seal, &objects))
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .binding()
+                .control_view(&LifecyclePersistenceContext::validated())
+                .operation_id(),
+            adopted_operation
+        );
     }
 
     #[test]
