@@ -220,6 +220,17 @@ separate activation blockers.
     partial schema, tamper, and reopen all fail closed or exactly replay. Canonical
     media upload and its B-domain DEK/provider handoff remain unsupported, and no
     Store/route/launcher/provider/task/ack path is connected.
+  - [x] Add the inactive selected-screenshot receipt A-domain: a future B
+    boundary must durably choose the 128-bit opaque upload attempt and exact
+    account-bound object key before provider I/O; that stable attempt derives
+    the operation identity and the complete episode/source/time/JPEG receipt is
+    fingerprinted before actor admission. Exact eligibility, screenshot binding,
+    receipt insertion or exact pre-existing adoption, bounded canonical response,
+    and a distinct 1,048,576-row/512-MiB ledger commit atomically. Alternate
+    object or screenshot bindings, cap exhaustion, late ledger failure, partial
+    schema, result tamper, and reopen all fail closed or exactly replay. The
+    media-DEK allocator, encryption/upload attempt, Store/route/launcher/provider/
+    task/ack path, and cleanup remain absent.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.

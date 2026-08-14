@@ -922,6 +922,10 @@ impl X {
         vertex_domain = (ROOT / "src/cp/model_usage/wal.rs").read_text(
             encoding="utf-8"
         )
+        query = (ROOT / "src/cp/query.rs").read_text(encoding="utf-8")
+        selected_domain = (ROOT / "src/cp/query/wal.rs").read_text(
+            encoding="utf-8"
+        )
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("pub(crate) mod wal;", media)
         self.assertIn(
@@ -951,6 +955,21 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", vertex_domain)
         self.assertIn("WalIdempotencyError::Precondition", vertex_domain)
         self.assertNotIn("cp::model_usage::wal::", main)
+        self.assertIn("pub(crate) mod wal;", query)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotLedger",
+            gate,
+        )
+        self.assertIn("struct SelectedScreenshotPlan", selected_domain)
+        self.assertIn("struct SelectedScreenshotLedger", selected_domain)
+        self.assertIn("archive_v3_wal_selected_screenshot_operations", selected_domain)
+        self.assertIn("DomainLedgerBounds::new", selected_domain)
+        self.assertIn("WalIdempotencyError::Precondition", selected_domain)
+        self.assertNotIn("cp::query::wal::", main)
         for forbidden in (
             "crate::store::Store",
             "Store::new",
@@ -963,6 +982,7 @@ impl X {
         ):
             self.assertNotIn(forbidden, domain)
             self.assertNotIn(forbidden, vertex_domain)
+            self.assertNotIn(forbidden, selected_domain)
         for forbidden in (
             "begin_invocation(",
             "random_token_hex",
@@ -970,6 +990,17 @@ impl X {
             "save_user(",
         ):
             self.assertNotIn(forbidden, vertex_domain)
+        for forbidden in (
+            "generate_and_wrap_dek",
+            "encrypt_bound_blob",
+            "put_user_media",
+            "random_token_hex",
+            "thread_rng",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+        ):
+            self.assertNotIn(forbidden, selected_domain)
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
