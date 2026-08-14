@@ -926,6 +926,12 @@ impl X {
         selected_domain = (ROOT / "src/cp/query/wal.rs").read_text(
             encoding="utf-8"
         )
+        media_worker = (ROOT / "src/cp/media_worker.rs").read_text(
+            encoding="utf-8"
+        )
+        retention_domain = (ROOT / "src/cp/media_worker/wal.rs").read_text(
+            encoding="utf-8"
+        )
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("pub(crate) mod wal;", media)
         self.assertIn(
@@ -970,6 +976,22 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", selected_domain)
         self.assertIn("WalIdempotencyError::Precondition", selected_domain)
         self.assertNotIn("cp::query::wal::", main)
+        self.assertIn("pub(crate) mod wal;", media_worker)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media_worker::wal::RetentionSettlementLedger",
+            gate,
+        )
+        self.assertIn("struct RetentionSettlementPlan", retention_domain)
+        self.assertIn("struct RetentionSettlementLedger", retention_domain)
+        self.assertIn("archive_v3_wal_retention_operations", retention_domain)
+        self.assertIn("DomainLedgerBounds::new", retention_domain)
+        self.assertIn("WalIdempotencyError::Precondition", retention_domain)
+        self.assertNotIn("RetentionSettlementPlan::", media_worker)
+        self.assertNotIn("cp::media_worker::wal::", main)
         for forbidden in (
             "crate::store::Store",
             "Store::new",
@@ -983,6 +1005,7 @@ impl X {
             self.assertNotIn(forbidden, domain)
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
+            self.assertNotIn(forbidden, retention_domain)
         for forbidden in (
             "begin_invocation(",
             "random_token_hex",
@@ -1001,6 +1024,16 @@ impl X {
             "tokio::spawn",
         ):
             self.assertNotIn(forbidden, selected_domain)
+        for forbidden in (
+            "delete_retained_media(",
+            "delete_object",
+            "list_objects",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+        ):
+            self.assertNotIn(forbidden, retention_domain)
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
