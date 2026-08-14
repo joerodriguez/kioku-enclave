@@ -25,7 +25,16 @@ DIGEST = "sha256:" + "b" * 64
 
 
 class LocalEvidenceTests(unittest.TestCase):
-    def create_bundle(self, directory: Path) -> tuple[Path, Path, Path, str]:
+    def create_bundle(
+        self,
+        directory: Path,
+        *,
+        buckets: tuple[str, str, str] = (
+            "kioku-production-indexes",
+            "kioku-production-media",
+            "kioku-production-indexes",
+        ),
+    ) -> tuple[Path, Path, Path, str]:
         private = directory / "private.pem"
         public = directory / "public.pem"
         subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private)], check=True)
@@ -54,8 +63,8 @@ class LocalEvidenceTests(unittest.TestCase):
             "image_digest": DIGEST,
             "release_url": "https://github.com/owner/repository/releases/tag/v1.2.3",
             "build_profile": "production", "voice_quality_gate": "owner_only_unvalidated",
-            "billing_enforcement_mode": "shadow", "gcs_bucket": "kioku-production-indexes",
-            "gcs_media_bucket": "kioku-production-media", "gcs_legacy_media_bucket": "kioku-production-indexes",
+            "billing_enforcement_mode": "shadow", "gcs_bucket": buckets[0],
+            "gcs_media_bucket": buckets[1], "gcs_legacy_media_bucket": buckets[2],
             "archive_witness_shadow_mode": "off", "archive_witness_project_id": "",
             "archive_witness_project_number": "", "archive_witness_database_id": "",
             "archive_v3_shadow_runtime_mode": "off", "archive_v3_archive_bucket": "",
@@ -139,16 +148,26 @@ class LocalEvidenceTests(unittest.TestCase):
             completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout)["metadata"]["image_digest"], DIGEST)
+            deployment_directory = directory / "deployment-contract"
+            deployment_directory.mkdir()
+            _, _, deployment_public, deployment_fingerprint = self.create_bundle(
+                deployment_directory,
+                buckets=(
+                    "kioku-joerodriguez-enclave-indexes",
+                    "kioku-joerodriguez-enclave-media",
+                    "kioku-joerodriguez-enclave-indexes",
+                ),
+            )
             deployment_contract = [
-                "python3", str(BUNDLE_VERIFIER), "--evidence-dir", str(directory),
+                "python3", str(BUNDLE_VERIFIER), "--evidence-dir", str(deployment_directory),
                 "--repository", "https://github.com/owner/repository",
                 "--release-tag", "v1.2.3", "--source-commit", COMMIT,
                 "--image-digest-uri", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave@" + DIGEST,
                 "--image-digest", DIGEST,
             ]
             deployment_environment = os.environ | {
-                "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY": str(public),
-                "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256": fingerprint,
+                "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY": str(deployment_public),
+                "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256": deployment_fingerprint,
             }
             deployed = subprocess.run(deployment_contract, cwd=ROOT, text=True, capture_output=True, env=deployment_environment)
             self.assertEqual(deployed.returncode, 0, deployed.stderr)
