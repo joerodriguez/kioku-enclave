@@ -76,7 +76,19 @@ use crate::{
         AuthenticatedMaintenanceImportPlan, MaintenanceImportOperationId, MaintenanceSourceBinding,
         MaintenanceStorePlanView,
     },
-    archive_v3_sqlite_vfs::{CaptureRegistration, CaptureRegistry, RegisteredCaptureVfs},
+    archive_v3_shadow_parity::AuthenticatedWalOwnerStaging,
+    archive_v3_sqlite_vfs::{
+        CaptureRegistration, CaptureRegistry, OwnedCapturedDrain, RegisteredCaptureVfs,
+    },
+    archive_v3_wal_idempotency::{
+        execute_prepared_for_owner, lookup_prepared_for_owner, LogicalMutationDisposition,
+        PreparedLogicalMutation, PreparedLookup, ValidatedWalLogicalResult, WalIdempotencyError,
+        WalLogicalDomainPlan,
+    },
+    archive_v3_wal_owner::{
+        WalOperationIdentity, WalOwnerAttempt, WalOwnerContext, WalOwnerError, WalOwnerInstanceId,
+        WalOwnerStoreBinding, WalOwnerStoreContext,
+    },
     crypto::{
         decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient,
     },
@@ -276,6 +288,27 @@ impl StoreShadowCapture {
 
     fn vfs_name(&self) -> &CStr {
         &self.vfs_name
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_for_test() -> Arc<Self> {
+        static CAPTURE: std::sync::OnceLock<Arc<StoreShadowCapture>> = std::sync::OnceLock::new();
+        Arc::clone(CAPTURE.get_or_init(|| {
+            Arc::new(
+                StoreShadowCapture::install("kioku-shared-capture-test")
+                    .expect("shared test capture VFS installs once"),
+            )
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_path_for_test(&self, path: &Path) -> Result<CaptureRegistration> {
+        self.register(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vfs_name_for_test(&self) -> &CStr {
+        self.vfs_name()
     }
 }
 
@@ -520,6 +553,370 @@ pub(crate) struct PinnedLegacySnapshot {
     _lifecycle_guard: OwnedMutexGuard<()>,
     _actor: Arc<UserActor>,
     _state: OwnedMutexGuard<UserActorState>,
+}
+
+/// Dedicated writable owner for one authenticated recovered archive-v3
+/// SQLite copy. It is disjoint from the ordinary Store registry and legacy
+/// persistence policy: the only mutation input is a sealed logical-domain
+/// plan, and the only output is an opaque captured publication lease.
+pub(crate) struct SingleArchiveWalStoreOwner {
+    staged: Option<AuthenticatedWalOwnerStaging>,
+    #[allow(
+        dead_code,
+        reason = "reserved for the inactive offline WAL owner; startup and serving remain intentionally unwired"
+    )]
+    path: PathBuf,
+    connection: Option<Connection>,
+    registration: Option<CaptureRegistration>,
+    _capture: Arc<StoreShadowCapture>,
+    token: WalOwnerStoreContext,
+    binding: WalOwnerStoreBinding,
+    instance_id: WalOwnerInstanceId,
+    poisoned: bool,
+}
+
+pub(crate) enum WalStoreApply<P: WalLogicalDomainPlan> {
+    Applied {
+        context: Box<WalOwnerContext>,
+        drain: OwnedCapturedDrain,
+        result: ValidatedWalLogicalResult<P>,
+    },
+    Replayed(ValidatedWalLogicalResult<P>),
+}
+
+pub(crate) enum WalStoreReplay<P: WalLogicalDomainPlan> {
+    Absent(PreparedLogicalMutation<P>),
+    Present(ValidatedWalLogicalResult<P>),
+}
+
+impl SingleArchiveWalStoreOwner {
+    #[allow(
+        dead_code,
+        reason = "reserved for the inactive offline WAL owner; startup and serving remain intentionally unwired"
+    )]
+    pub(crate) fn from_authenticated_staging(
+        token: WalOwnerStoreContext,
+        staged: AuthenticatedWalOwnerStaging,
+        binding: WalOwnerStoreBinding,
+        capture: Arc<StoreShadowCapture>,
+    ) -> std::result::Result<Self, WalOwnerError> {
+        let path = staged
+            .path_for_store(token, &binding)
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        let owned_path = path.to_path_buf();
+        let (connection, registration, migration_dirty) = open_db(
+            &owned_path,
+            Some(capture.as_ref()),
+            StorePersistencePolicy::LegacySnapshot,
+        )
+        .map_err(|_| WalOwnerError::Corrupt)?;
+        let registration = registration.ok_or(WalOwnerError::Capture)?;
+        if migration_dirty {
+            drop(connection);
+            drop(registration);
+            return Err(WalOwnerError::Corrupt);
+        }
+        staged
+            .validate_opened(token, &binding, &connection)
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        let instance_id = WalOwnerInstanceId::random_for_store(token)?;
+        Ok(Self {
+            staged: Some(staged),
+            path: owned_path,
+            connection: Some(connection),
+            registration: Some(registration),
+            _capture: capture,
+            token,
+            binding,
+            instance_id,
+            poisoned: false,
+        })
+    }
+
+    pub(crate) const fn binding(&self) -> &WalOwnerStoreBinding {
+        &self.binding
+    }
+
+    pub(crate) const fn instance_id(&self) -> WalOwnerInstanceId {
+        self.instance_id
+    }
+
+    /// Exact local lookup performed only after the actor has reconciled
+    /// encrypted Control and freshly authenticated the provider head. A
+    /// locally committed but unsettled operation retains exactly one captured
+    /// commit, so it cannot take this path.
+    pub(crate) fn lookup_settled_replay<P: WalLogicalDomainPlan>(
+        &mut self,
+        prepared: PreparedLogicalMutation<P>,
+    ) -> std::result::Result<WalStoreReplay<P>, WalOwnerError> {
+        if self.poisoned {
+            return Err(WalOwnerError::Poisoned);
+        }
+        let registration = self.registration.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        if registration.completed_len() != 0 {
+            return Ok(WalStoreReplay::Absent(prepared));
+        }
+        let connection = self.connection.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        let before =
+            database_mutation_fingerprint(connection).map_err(|_| WalOwnerError::Corrupt)?;
+        connection
+            .pragma_update(None, "query_only", true)
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        let result = lookup_prepared_for_owner(connection, prepared);
+        let after = database_mutation_fingerprint(connection);
+        let restore = connection.pragma_update(None, "query_only", false);
+        let capture_empty = registration.completed_len() == 0;
+        match (result, after, restore, capture_empty) {
+            (Ok(PreparedLookup::Present(result)), Ok(after), Ok(()), true) if after == before => {
+                Ok(WalStoreReplay::Present(result))
+            }
+            (Ok(PreparedLookup::Absent(prepared)), Ok(after), Ok(()), true) if after == before => {
+                Ok(WalStoreReplay::Absent(prepared))
+            }
+            (Err(WalIdempotencyError::FingerprintConflict), Ok(after), Ok(()), true)
+                if after == before =>
+            {
+                Err(WalOwnerError::Conflict)
+            }
+            _ => {
+                self.poison();
+                Err(WalOwnerError::Corrupt)
+            }
+        }
+    }
+
+    pub(crate) fn apply_prepared<P: WalLogicalDomainPlan>(
+        &mut self,
+        prepared: PreparedLogicalMutation<P>,
+        attempt: WalOwnerAttempt,
+    ) -> std::result::Result<WalStoreApply<P>, WalOwnerError> {
+        if self.poisoned {
+            return Err(WalOwnerError::Poisoned);
+        }
+        if !matches!(
+            attempt.stage(),
+            crate::archive_v3_wal_owner::WalPublicationStage::Prepared
+                | crate::archive_v3_wal_owner::WalPublicationStage::Captured
+        ) {
+            self.poison();
+            return Err(WalOwnerError::Conflict);
+        }
+        let identity: WalOperationIdentity = prepared.identity_for_owner();
+        let execution = execute_prepared_for_owner(
+            self.connection.as_mut().ok_or(WalOwnerError::Poisoned)?,
+            prepared,
+        )
+        .map_err(|_| WalOwnerError::Conflict)?;
+        if execution.kind() != identity.kind()
+            || execution.operation_id() != identity.operation_id()
+            || execution.request_fingerprint() != identity.request_fingerprint()
+        {
+            self.poison();
+            return Err(WalOwnerError::Corrupt);
+        }
+        let registration = self.registration.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        let disposition = execution.disposition();
+        let result = execution.into_validated_result();
+        match disposition {
+            LogicalMutationDisposition::Replayed => {
+                if attempt.stage() == crate::archive_v3_wal_owner::WalPublicationStage::Witnessed {
+                    if registration.completed_len() != 0 {
+                        self.poison();
+                        return Err(WalOwnerError::Capture);
+                    }
+                    return Ok(WalStoreApply::Replayed(result));
+                }
+                if !matches!(
+                    attempt.stage(),
+                    crate::archive_v3_wal_owner::WalPublicationStage::Prepared
+                        | crate::archive_v3_wal_owner::WalPublicationStage::Captured
+                ) || registration.completed_len() != 1
+                {
+                    self.poison();
+                    return Err(WalOwnerError::Capture);
+                }
+                self.take_exact_captured(identity, attempt, result)
+            }
+            LogicalMutationDisposition::Applied => {
+                self.take_exact_captured(identity, attempt, result)
+            }
+        }
+    }
+
+    fn take_exact_captured<P: WalLogicalDomainPlan>(
+        &mut self,
+        identity: WalOperationIdentity,
+        attempt: WalOwnerAttempt,
+        result: ValidatedWalLogicalResult<P>,
+    ) -> std::result::Result<WalStoreApply<P>, WalOwnerError> {
+        let registration = self.registration.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        let lease =
+            match registration.begin_exact_one_drain(attempt.session_id(), attempt.attempt_id()) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.poison();
+                    return Err(WalOwnerError::Capture);
+                }
+            };
+        let drain = match lease.take_for_publication() {
+            Ok(value) => value,
+            Err(_) => {
+                self.poison();
+                return Err(WalOwnerError::Capture);
+            }
+        };
+        let observed_wal_generation = drain
+            .observed_wal_generation(self.token)
+            .map_err(|_| WalOwnerError::Capture)?;
+        let context = WalOwnerContext::from_store(
+            self.token,
+            self.binding.clone(),
+            identity,
+            attempt.owner_id(),
+            self.instance_id,
+            drain.stream_id(),
+            attempt,
+            observed_wal_generation,
+        )?;
+        drain
+            .exact_commit(&context)
+            .map_err(|_| WalOwnerError::Capture)?;
+        Ok(WalStoreApply::Applied {
+            context: Box::new(context),
+            drain,
+            result,
+        })
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+        self.connection.take();
+        self.registration.take();
+        self.staged.take();
+    }
+
+    pub(crate) fn advance_binding(
+        &mut self,
+        context: &WalOwnerContext,
+        next: WalOwnerStoreBinding,
+    ) -> std::result::Result<(), WalOwnerError> {
+        if self.poisoned
+            || context.binding() != &self.binding
+            || next.archive_id() != self.binding.archive_id()
+            || next.database_epoch() != self.binding.database_epoch()
+            || next.key_epoch() != self.binding.key_epoch()
+            || next.root().sequence()
+                != self
+                    .binding
+                    .root()
+                    .sequence()
+                    .checked_add(1)
+                    .ok_or(WalOwnerError::Corrupt)?
+        {
+            self.poison();
+            return Err(WalOwnerError::Conflict);
+        }
+        self.binding = next;
+        Ok(())
+    }
+
+    pub(crate) const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_wal_owner_test(
+        binding: WalOwnerStoreBinding,
+    ) -> std::result::Result<Self, WalOwnerError> {
+        let plaintext = create_empty_db(&Dek([0x71; 32])).map_err(|_| WalOwnerError::Corrupt)?;
+        Self::from_wal_owner_test_plaintext(binding, plaintext)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_wal_owner_test_plaintext(
+        binding: WalOwnerStoreBinding,
+        plaintext: Vec<u8>,
+    ) -> std::result::Result<Self, WalOwnerError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        static NEXT_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let suffix = NEXT_CAPTURE.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "kioku-wal-owner-{}-{suffix}.db",
+            std::process::id()
+        ));
+        std::fs::write(&path, plaintext).map_err(|_| WalOwnerError::Corrupt)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        let setup = Connection::open(&path).map_err(|_| WalOwnerError::Corrupt)?;
+        setup
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS wal_owner_test_values(value BLOB NOT NULL);
+                 CREATE TABLE IF NOT EXISTS wal_owner_test_operations(
+                    operation_kind INTEGER NOT NULL,
+                    operation_id BLOB NOT NULL,
+                    request_fingerprint BLOB NOT NULL,
+                    result BLOB NOT NULL,
+                    PRIMARY KEY(operation_kind,operation_id),
+                    CHECK(operation_kind BETWEEN 1 AND 12),
+                    CHECK(length(operation_id)=16 AND operation_id<>zeroblob(16)),
+                    CHECK(length(request_fingerprint)=32 AND request_fingerprint<>zeroblob(32)),
+                    CHECK(length(result)>0 AND length(result)<=4096)
+                 ) WITHOUT ROWID;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        drop(setup);
+        let staged = AuthenticatedWalOwnerStaging::for_test(path, &binding, 0)
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        let capture = StoreShadowCapture::shared_for_test();
+        Self::from_authenticated_staging(WalOwnerStoreContext::for_test(), staged, binding, capture)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpointed_plaintext_for_wal_owner_test(
+        &mut self,
+    ) -> std::result::Result<Vec<u8>, WalOwnerError> {
+        if self.poisoned
+            || self
+                .registration
+                .as_ref()
+                .ok_or(WalOwnerError::Poisoned)?
+                .completed_len()
+                != 0
+        {
+            return Err(WalOwnerError::Conflict);
+        }
+        let connection = self.connection.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        if self
+            .registration
+            .as_ref()
+            .ok_or(WalOwnerError::Poisoned)?
+            .completed_len()
+            != 0
+        {
+            self.poison();
+            return Err(WalOwnerError::Capture);
+        }
+        std::fs::read(&self.path).map_err(|_| WalOwnerError::Corrupt)
+    }
+}
+
+impl Drop for SingleArchiveWalStoreOwner {
+    fn drop(&mut self) {
+        self.connection.take();
+        self.registration.take();
+        self.staged.take();
+    }
+}
+
+impl std::fmt::Debug for SingleArchiveWalStoreOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SingleArchiveWalStoreOwner(<opaque>)")
+    }
 }
 
 /// Owned, one-shot exact-generation revalidation capability. Only a pinned
@@ -10513,20 +10910,12 @@ pub(crate) mod tests {
         Store::new_internal_with_max_open(kms, gcs, Arc::clone(&media_gcs), media_gcs, max_open)
     }
 
-    static NEXT_STORE_CAPTURE_VFS: AtomicUsize = AtomicUsize::new(1);
-
     #[tokio::test]
     async fn optional_shadow_capture_survives_attempts_and_retires_on_eviction_and_deletion() {
         let ordinary = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         assert!(ordinary.shadow_capture.is_none());
 
-        let capture = Arc::new(
-            StoreShadowCapture::install(&format!(
-                "kioku-store-capture-test-{}",
-                NEXT_STORE_CAPTURE_VFS.fetch_add(1, Ordering::Relaxed)
-            ))
-            .unwrap(),
-        );
+        let capture = StoreShadowCapture::shared_for_test();
         let gcs = Arc::new(FakeGcs::new());
         let store = Store::new_internal_with_max_open_and_shadow_capture(
             Arc::new(FakeKms),
@@ -10647,25 +11036,29 @@ pub(crate) mod tests {
             eviction_lease.commit(),
             Err(crate::archive_v3_sqlite_vfs::CaptureRegistryError::Retired)
         ));
+        assert!(!capture.registry.contains_stream_for_test(first_stream));
 
         let deletion_actor = match store.actor_for_existing("capture-evictor").await.unwrap() {
             SaveTarget::Actor(actor) => actor,
             SaveTarget::AlreadyFlushed => panic!("deletion capture handle unexpectedly evicted"),
         };
-        let deletion_lease = {
+        let (deletion_lease, deletion_stream) = {
             let state = deletion_actor.state.lock().await;
-            state
+            let registration = state
                 .handle
                 .as_ref()
                 .unwrap()
                 ._shadow_capture_registration
                 .as_ref()
-                .unwrap()
+                .unwrap();
+            let stream = registration.stream_id();
+            let lease = registration
                 .begin_drain(
                     crate::archive_v3_shadow_session::ShadowSessionId::from_bytes([41; 16]),
                     crate::archive_v3_shadow_session::ShadowAttemptId::from_bytes([42; 16]),
                 )
-                .unwrap()
+                .unwrap();
+            (lease, stream)
         };
         drop(deletion_actor);
         store.delete_user("capture-evictor").await.unwrap();
@@ -10673,7 +11066,7 @@ pub(crate) mod tests {
             deletion_lease.commit(),
             Err(crate::archive_v3_sqlite_vfs::CaptureRegistryError::Retired)
         ));
-        assert!(capture.registry.is_empty_for_test());
+        assert!(!capture.registry.contains_stream_for_test(deletion_stream));
 
         let directory = tempfile::TempDir::new().unwrap();
         let directory_path = directory.path().to_path_buf();
@@ -10683,7 +11076,7 @@ pub(crate) mod tests {
             StorePersistencePolicy::LegacySnapshot,
         )
         .is_err());
-        assert!(capture.registry.is_empty_for_test());
+        assert!(!capture.registry.contains_path_for_test(&directory_path));
 
         let unavailable_capture = StoreShadowCapture {
             registry: CaptureRegistry::new(),

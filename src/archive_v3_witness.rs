@@ -342,6 +342,18 @@ pub struct RootCommitment {
     owner_fencing_epoch: u64,
 }
 impl RootCommitment {
+    pub(crate) fn from_persisted_wal_candidate(
+        _token: crate::archive_v3_wal_owner::WalWitnessAdvanceContext,
+        database_epoch: DatabaseEpoch,
+        key_epoch: KeyEpoch,
+        owner_fencing_epoch: u64,
+        parent: RootReference,
+        root: RootReference,
+    ) -> Result<Self> {
+        let value = Self::candidate(database_epoch, key_epoch, owner_fencing_epoch, parent, root);
+        value.valid().then_some(value).ok_or(WitnessError::Corrupt)
+    }
+
     pub(crate) const fn genesis(
         database_epoch: DatabaseEpoch,
         key_epoch: KeyEpoch,
@@ -732,6 +744,14 @@ impl WitnessRecord {
         self.authorizes_lease(lease)
             .then_some(lease)
             .ok_or(WitnessError::Fenced)
+    }
+
+    pub(crate) fn has_exact_active_wal_owner_lease(&self) -> bool {
+        self.migration == MigrationState::WalAuthoritative
+            && self
+                .owner_id
+                .and_then(|owner| self.exact_active_lease_for_owner(owner).ok())
+                .is_some()
     }
 
     fn same_maintenance_lease_subject(&self, previous: &Self, owner: ObjectId) -> bool {
@@ -1533,6 +1553,100 @@ pub struct RootAdvance {
     candidate_registry: KeyRegistryReference,
     candidate: RootCommitment,
 }
+
+/// Exact ordinary-root transition input retained by the inactive WAL owner.
+/// The provider may advance only its trusted transaction tick; every owner,
+/// lease, fence, predecessor, registry, epoch, deletion, and candidate-root
+/// fact is rederived from the byte-exact expected witness on every reopen.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AuthenticatedWalRootAdvance {
+    expected: [u8; WITNESS_RECORD_BYTES],
+    advance: RootAdvance,
+}
+
+impl AuthenticatedWalRootAdvance {
+    pub(crate) fn from_expected_witness(
+        _token: crate::archive_v3_wal_owner::WalWitnessAdvanceContext,
+        expected: &WitnessRecord,
+        candidate: RootCommitment,
+    ) -> Result<Self> {
+        if !expected.valid()
+            || expected.deletion != DeletionState::Active
+            || expected.migration != MigrationState::WalAuthoritative
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let owner = expected.owner_id.ok_or(WitnessError::Fenced)?;
+        let advance = RootAdvance {
+            lease: expected.exact_active_lease_for_owner(owner)?,
+            expected_root: expected.root,
+            expected_registry: expected.registry,
+            candidate_registry: expected.registry,
+            candidate,
+        };
+        normal_ok(expected, &advance, expected.last_server_tick, Normal::Root)?;
+        Ok(Self {
+            expected: expected.encode(),
+            advance,
+        })
+    }
+
+    pub(crate) fn from_persisted(
+        token: crate::archive_v3_wal_owner::WalWitnessAdvanceContext,
+        expected: &[u8; WITNESS_RECORD_BYTES],
+        candidate: RootCommitment,
+    ) -> Result<Self> {
+        let expected_record = WitnessRecord::decode(expected)?;
+        let value = Self::from_expected_witness(token, &expected_record, candidate)?;
+        if &value.expected != expected {
+            return Err(WitnessError::Corrupt);
+        }
+        Ok(value)
+    }
+
+    pub(crate) const fn expected_witness(&self) -> &[u8; WITNESS_RECORD_BYTES] {
+        &self.expected
+    }
+
+    pub(crate) const fn candidate(&self) -> RootCommitment {
+        self.advance.candidate
+    }
+
+    pub(crate) const fn candidate_registry(&self) -> KeyRegistryReference {
+        self.advance.candidate_registry
+    }
+
+    pub(crate) fn provider_advance(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalWitnessAdvanceContext,
+    ) -> RootAdvance {
+        self.advance.clone()
+    }
+
+    pub(crate) fn validate_observed(&self, observed: &WitnessRecord) -> Result<()> {
+        let expected = WitnessRecord::decode(&self.expected)?;
+        if observed.last_server_tick < expected.last_server_tick
+            || observed.last_server_tick >= self.advance.lease.expires_at_tick
+        {
+            return Err(WitnessError::Fenced);
+        }
+        let local = InMemoryWitness::from_provider_record_at_tick(
+            Some(self.expected),
+            observed.last_server_tick,
+        )?;
+        let reproduced = local.compare_and_advance_root(self.advance.clone())?;
+        (reproduced.record() == observed)
+            .then_some(())
+            .ok_or(WitnessError::InvalidTransition)
+    }
+}
+
+impl fmt::Debug for AuthenticatedWalRootAdvance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedWalRootAdvance(<opaque>)")
+    }
+}
+
 impl RootAdvance {
     pub(crate) fn archive_id(&self) -> ArchiveId {
         self.lease.archive_id
@@ -1769,6 +1883,26 @@ pub struct RecoveryRoot {
     deletion: DeletionState,
 }
 impl RecoveryRoot {
+    /// WAL-owner recovery authority is minted only from one exact active
+    /// WalAuthoritative provider record. It is deliberately distinct from the
+    /// maintenance migration recovery constructor.
+    pub(crate) fn from_exact_wal_authoritative_record(record: &WitnessRecord) -> Result<Self> {
+        if !record.valid()
+            || record.deletion != DeletionState::Active
+            || record.migration != MigrationState::WalAuthoritative
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(Self {
+            archive_id: record.archive_id,
+            root: record.root,
+            registry: record.registry,
+            predecessor: record.predecessor,
+            migration: record.migration,
+            deletion: record.deletion,
+        })
+    }
+
     /// Convert one freshly authenticated exact provider record into recovery
     /// authority only while it is the active, non-deleting archive. This is
     /// the maintenance-import counterpart to the deletion-only conversion;
@@ -3373,6 +3507,65 @@ mod tests {
             w.compare_and_advance_root(a),
             Err(WitnessError::CompareFailed)
         );
+    }
+
+    #[test]
+    fn wal_owner_advance_accepts_only_provider_tick_and_rejects_tuple_substitution() {
+        let (witness, clock, legacy, lease) = setup();
+        clock.set(11);
+        let shadow = witness
+            .advance_migration(adv(&legacy, lease, 81), MigrationState::ShadowWal)
+            .unwrap();
+        clock.set(12);
+        let authoritative = witness
+            .advance_migration(
+                adv(shadow.record(), lease, 82),
+                MigrationState::WalAuthoritative,
+            )
+            .unwrap();
+        let candidate = cand(authoritative.record(), lease.fencing_epoch, 83);
+        let retained = AuthenticatedWalRootAdvance::from_expected_witness(
+            crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_test(),
+            authoritative.record(),
+            candidate,
+        )
+        .unwrap();
+        let provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(authoritative.record().encode()),
+            15,
+        )
+        .unwrap();
+        let observed = provider
+            .compare_and_advance_root(retained.provider_advance(
+                crate::archive_v3_wal_owner::WalWitnessAdvanceContext::for_test(),
+            ))
+            .unwrap();
+        assert_eq!(observed.record().last_server_tick, 15);
+        assert!(retained.validate_observed(observed.record()).is_ok());
+
+        for mut substituted in [
+            observed.record().clone(),
+            observed.record().clone(),
+            observed.record().clone(),
+            observed.record().clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match substituted.0 {
+                0 => substituted.1.owner_id = Some(ObjectId::from_bytes(id(90))),
+                1 => substituted.1.current_fencing_epoch += 1,
+                2 => substituted.1.next_fencing_epoch += 1,
+                _ => {
+                    substituted.1.root.parent = Some(RootReference::new(
+                        1,
+                        ObjectId::from_bytes(id(91)),
+                        hash(92),
+                    ))
+                }
+            }
+            assert!(retained.validate_observed(&substituted.1).is_err());
+        }
     }
     #[test]
     fn database_epoch_cutover_requires_extent_authority_and_preserves_rollback() {

@@ -71,6 +71,13 @@ use crate::{
     },
     archive_v3_shadow_checkpoint::{ShadowObjectInventory, ShadowObjectInventoryError},
     archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionBinding, ShadowSessionId},
+    archive_v3_wal_owner::{
+        AuthenticatedWalArtifactSet, AuthenticatedWalSettlement, WalOperationIdentity,
+        WalOwnerAdmission, WalOwnerAttempt, WalOwnerControl, WalOwnerError, WalOwnerId,
+        WalOwnerInstanceId, WalOwnerStoreBinding, WalPublicationArtifact, WalPublicationCandidate,
+        WalPublicationStage, WitnessedWalCandidate, MAX_WAL_OWNER_ARTIFACTS,
+        MAX_WAL_OWNER_ATTEMPTS,
+    },
     archive_v3_witness_disposition::{
         AuthenticatedPreWitnessAbsence, ClosedWitnessPhase, ClosedWitnessProtocol,
         ExactNoneObservation, PreWitnessControlState, PreWitnessDispositionControl,
@@ -94,6 +101,8 @@ const LIFECYCLE_REGISTRY_ORDINAL: u32 = 0;
 const LIFECYCLE_ROOT_ORDINAL: u32 = 1;
 const LIFECYCLE_WITNESS_ORDINAL: u32 = 2;
 const WITNESS_PROTOCOL_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/witness-create-protocol/v1\0";
+const WAL_ARTIFACT_SET_COMMITMENT_DOMAIN: &[u8] =
+    b"kioku/archive-v3/wal-publication-artifact-set/v1\0";
 
 fn grant_recording_delivery_minute(tx: &rusqlite::Transaction<'_>, user_id: &str) -> Result<()> {
     tx.execute(
@@ -438,6 +447,116 @@ CREATE TABLE IF NOT EXISTS archive_v3_maintenance_import_artifacts (
     UNIQUE (archive_id, operation_id, attempt, object_id),
     FOREIGN KEY (archive_id, operation_id, attempt)
         REFERENCES archive_v3_maintenance_import_attempts(archive_id, operation_id, attempt)
+);
+-- Inactive single-owner WAL publication protocol. These rows contain only
+-- content-free authenticated bindings and immutable-object facts. They never
+-- contain logical mutation results, SQL, captured frames, plaintext, provider
+-- credentials, or acknowledgement authority.
+CREATE TABLE IF NOT EXISTS archive_v3_wal_owners (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_bindings(archive_id)
+        CHECK (length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK (format_version=1),
+    owner_id BLOB NOT NULL UNIQUE CHECK (length(owner_id)=16 AND owner_id!=zeroblob(16)),
+    database_epoch BLOB NOT NULL CHECK (length(database_epoch)=16 AND database_epoch!=zeroblob(16)),
+    key_epoch BLOB NOT NULL CHECK (length(key_epoch)=16 AND key_epoch!=zeroblob(16)),
+    root_seq INTEGER NOT NULL CHECK (root_seq>0),
+    root_object_id BLOB NOT NULL CHECK (length(root_object_id)=16 AND root_object_id!=zeroblob(16)),
+    root_ciphertext_hash BLOB NOT NULL CHECK (length(root_ciphertext_hash)=32 AND root_ciphertext_hash!=zeroblob(32)),
+    witness_record BLOB NOT NULL CHECK (length(witness_record)=724),
+    witness_hash BLOB NOT NULL CHECK (length(witness_hash)=32 AND witness_hash!=zeroblob(32)),
+    binding_commitment BLOB NOT NULL CHECK (length(binding_commitment)=32 AND binding_commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK (revision>0),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS archive_v3_wal_publications (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_v3_wal_owners(archive_id),
+    format_version INTEGER NOT NULL CHECK (format_version=1),
+    owner_id BLOB NOT NULL CHECK (length(owner_id)=16 AND owner_id!=zeroblob(16)),
+    owner_instance_id BLOB NOT NULL CHECK (length(owner_instance_id)=16 AND owner_instance_id!=zeroblob(16)),
+    operation_id BLOB NOT NULL CHECK (length(operation_id)=16 AND operation_id!=zeroblob(16)),
+    request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint)=32 AND request_fingerprint!=zeroblob(32)),
+    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 12),
+    expected_witness BLOB NOT NULL CHECK (length(expected_witness)=724),
+    expected_binding_commitment BLOB NOT NULL CHECK (length(expected_binding_commitment)=32 AND expected_binding_commitment!=zeroblob(32)),
+    session_id BLOB NOT NULL UNIQUE CHECK (length(session_id)=16 AND session_id!=zeroblob(16)),
+    attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 16),
+    attempt_id BLOB NOT NULL UNIQUE CHECK (length(attempt_id)=16 AND attempt_id!=zeroblob(16)),
+    expected_wal_generation INTEGER CHECK (expected_wal_generation IS NULL OR expected_wal_generation>0),
+    revision INTEGER NOT NULL CHECK (revision>0),
+    stage TEXT NOT NULL CHECK (stage IN (
+        'prepared','captured','candidate_ready','send_started','witnessed','manual_required'
+    )),
+    capture_commitment BLOB CHECK (capture_commitment IS NULL OR (length(capture_commitment)=32 AND capture_commitment!=zeroblob(32))),
+    first_frame_no INTEGER CHECK (first_frame_no IS NULL OR first_frame_no>0),
+    frame_count INTEGER CHECK (frame_count IS NULL OR (frame_count>0 AND frame_count<=16384)),
+    candidate_root_seq INTEGER CHECK (candidate_root_seq IS NULL OR candidate_root_seq>0),
+    candidate_root_object_id BLOB CHECK (candidate_root_object_id IS NULL OR (length(candidate_root_object_id)=16 AND candidate_root_object_id!=zeroblob(16))),
+    candidate_root_hash BLOB CHECK (candidate_root_hash IS NULL OR (length(candidate_root_hash)=32 AND candidate_root_hash!=zeroblob(32))),
+    candidate_owner_fencing_epoch INTEGER CHECK (candidate_owner_fencing_epoch IS NULL OR candidate_owner_fencing_epoch>0),
+    candidate_commitment BLOB CHECK (candidate_commitment IS NULL OR (length(candidate_commitment)=32 AND candidate_commitment!=zeroblob(32))),
+    candidate_artifact_commitment BLOB CHECK (candidate_artifact_commitment IS NULL OR (length(candidate_artifact_commitment)=32 AND candidate_artifact_commitment!=zeroblob(32))),
+    candidate_segment_count INTEGER CHECK (candidate_segment_count IS NULL OR candidate_segment_count BETWEEN 1 AND 16),
+    observed_witness BLOB CHECK (observed_witness IS NULL OR length(observed_witness)=724),
+    observed_binding_commitment BLOB CHECK (observed_binding_commitment IS NULL OR (length(observed_binding_commitment)=32 AND observed_binding_commitment!=zeroblob(32))),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (archive_id,operation_kind,operation_id),
+    FOREIGN KEY (archive_id) REFERENCES archive_v3_wal_owners(archive_id),
+    CHECK ((capture_commitment IS NULL)=(first_frame_no IS NULL)),
+    CHECK ((capture_commitment IS NULL)=(frame_count IS NULL)),
+    CHECK ((candidate_root_seq IS NULL)=(candidate_root_object_id IS NULL)),
+    CHECK ((candidate_root_seq IS NULL)=(candidate_root_hash IS NULL)),
+    CHECK ((candidate_root_seq IS NULL)=(candidate_owner_fencing_epoch IS NULL)),
+    CHECK ((candidate_root_seq IS NULL)=(candidate_commitment IS NULL)),
+    CHECK ((candidate_root_seq IS NULL)=(candidate_artifact_commitment IS NULL)),
+    CHECK ((candidate_root_seq IS NULL)=(candidate_segment_count IS NULL)),
+    CHECK ((observed_witness IS NULL)=(observed_binding_commitment IS NULL)),
+    CHECK (
+        (stage='prepared' AND expected_wal_generation IS NULL AND capture_commitment IS NULL
+            AND candidate_root_seq IS NULL AND observed_witness IS NULL)
+        OR (stage='captured' AND expected_wal_generation IS NOT NULL
+            AND capture_commitment IS NOT NULL AND candidate_root_seq IS NULL
+            AND observed_witness IS NULL)
+        OR (stage IN ('candidate_ready','send_started')
+            AND expected_wal_generation IS NOT NULL AND capture_commitment IS NOT NULL
+            AND candidate_root_seq IS NOT NULL AND observed_witness IS NULL)
+        OR (stage='witnessed' AND expected_wal_generation IS NOT NULL
+            AND capture_commitment IS NOT NULL AND candidate_root_seq IS NOT NULL
+            AND observed_witness IS NOT NULL)
+        OR (stage='manual_required' AND expected_wal_generation IS NOT NULL
+            AND capture_commitment IS NOT NULL
+            AND ((candidate_root_seq IS NULL AND observed_witness IS NULL)
+                 OR (candidate_root_seq IS NOT NULL AND observed_witness IS NULL)))
+    )
+);
+CREATE TABLE IF NOT EXISTS archive_v3_wal_publication_attempts (
+    archive_id BLOB NOT NULL,
+    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 12),
+    operation_id BLOB NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 16),
+    attempt_id BLOB NOT NULL UNIQUE CHECK (length(attempt_id)=16 AND attempt_id!=zeroblob(16)),
+    owner_instance_id BLOB NOT NULL CHECK (length(owner_instance_id)=16 AND owner_instance_id!=zeroblob(16)),
+    state TEXT NOT NULL CHECK (state IN ('active','superseded','witnessed','manual_required')),
+    PRIMARY KEY (archive_id,operation_kind,operation_id,attempt),
+    FOREIGN KEY (archive_id) REFERENCES archive_v3_wal_owners(archive_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS archive_v3_wal_one_active_attempt
+ON archive_v3_wal_publication_attempts(archive_id) WHERE state='active';
+CREATE TABLE IF NOT EXISTS archive_v3_wal_publication_artifacts (
+    archive_id BLOB NOT NULL,
+    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 12),
+    operation_id BLOB NOT NULL,
+    attempt INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal>=0 AND ordinal<18),
+    context_aad BLOB NOT NULL CHECK (length(context_aad)>0 AND length(context_aad)<=512),
+    object_id BLOB NOT NULL CHECK (length(object_id)=16 AND object_id!=zeroblob(16)),
+    object_role INTEGER NOT NULL CHECK (object_role IN (2,5,9)),
+    object_key TEXT NOT NULL CHECK (length(object_key)>0 AND length(object_key)<=512),
+    ciphertext_hash BLOB NOT NULL CHECK (length(ciphertext_hash)=32 AND ciphertext_hash!=zeroblob(32)),
+    state TEXT NOT NULL CHECK (state IN ('reserved','materialized')),
+    PRIMARY KEY (archive_id,operation_kind,operation_id,attempt,ordinal),
+    UNIQUE (archive_id,operation_kind,operation_id,attempt,object_id),
+    FOREIGN KEY (archive_id,operation_kind,operation_id,attempt)
+        REFERENCES archive_v3_wal_publication_attempts(archive_id,operation_kind,operation_id,attempt)
 );
 -- This is a durable, encrypted control-plane ledger for a later exact v3
 -- deletion worker.  It intentionally has no completed states: this release
@@ -943,6 +1062,18 @@ pub(crate) struct ArchiveBinding {
 /// construct it.
 #[derive(Clone, Copy)]
 pub(crate) struct MaintenancePersistenceContext(());
+
+/// Unforgeable producer token for WAL-owner durable capabilities. Only this
+/// encrypted control module can construct it.
+#[derive(Clone, Copy)]
+pub(crate) struct WalOwnerPersistenceContext(());
+
+#[cfg(test)]
+impl WalOwnerPersistenceContext {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
 
 #[cfg(test)]
 impl MaintenancePersistenceContext {
@@ -8628,6 +8759,1903 @@ fn validate_maintenance_artifact_rows_conn(
     Ok(())
 }
 
+fn map_wal_owner_error(error: WalOwnerError) -> EnclaveError {
+    match error {
+        WalOwnerError::Malformed | WalOwnerError::Corrupt => {
+            EnclaveError::Store("WAL owner state is corrupt".into())
+        }
+        WalOwnerError::Conflict => EnclaveError::Conflict("WAL owner state conflicts".into()),
+        WalOwnerError::Capture
+        | WalOwnerError::Persistence
+        | WalOwnerError::Publication
+        | WalOwnerError::Poisoned => EnclaveError::Store("WAL owner is unavailable".into()),
+    }
+}
+
+fn map_wal_persistence_error(error: EnclaveError) -> WalOwnerError {
+    match error {
+        EnclaveError::Conflict(_) | EnclaveError::Auth(_) => WalOwnerError::Conflict,
+        EnclaveError::InvalidRequest(_) => WalOwnerError::Corrupt,
+        _ => WalOwnerError::Persistence,
+    }
+}
+
+fn wal_publication_stage_from_db(value: &str) -> Result<WalPublicationStage> {
+    match value {
+        "prepared" => Ok(WalPublicationStage::Prepared),
+        "captured" => Ok(WalPublicationStage::Captured),
+        "candidate_ready" => Ok(WalPublicationStage::CandidateReady),
+        "send_started" => Ok(WalPublicationStage::SendStarted),
+        "witnessed" => Ok(WalPublicationStage::Witnessed),
+        "manual_required" => Ok(WalPublicationStage::ManualRequired),
+        _ => Err(EnclaveError::Store(
+            "unsupported WAL publication stage".into(),
+        )),
+    }
+}
+
+fn wal_publication_stage_as_db(value: WalPublicationStage) -> &'static str {
+    match value {
+        WalPublicationStage::Prepared => "prepared",
+        WalPublicationStage::Captured => "captured",
+        WalPublicationStage::CandidateReady => "candidate_ready",
+        WalPublicationStage::SendStarted => "send_started",
+        WalPublicationStage::Witnessed => "witnessed",
+        WalPublicationStage::ManualRequired => "manual_required",
+    }
+}
+
+fn validate_wal_owner_binding_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+) -> Result<Option<WalOwnerId>> {
+    let active: Option<String> = conn
+        .query_row(
+            "SELECT state FROM archive_bindings WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if active.as_deref() != Some("active_legacy") {
+        return Err(EnclaveError::Auth("WAL owner archive is inactive".into()));
+    }
+    type OwnerRow = (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    );
+    let row: Option<OwnerRow> = conn
+        .query_row(
+            "SELECT format_version,owner_id,database_epoch,key_epoch,root_seq,
+                    root_object_id,root_ciphertext_hash,witness_record,witness_hash,
+                    binding_commitment,revision
+             FROM archive_v3_wal_owners WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        format,
+        owner,
+        database,
+        key,
+        root_seq,
+        root_id,
+        root_hash,
+        witness,
+        witness_hash,
+        commitment,
+        revision,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if format != 1
+        || revision <= 0
+        || fixed_blob::<16>(&database, "WAL owner database epoch")?
+            != *binding.database_epoch().as_bytes()
+        || fixed_blob::<16>(&key, "WAL owner key epoch")? != *binding.key_epoch().as_bytes()
+        || u64::try_from(root_seq).ok() != Some(binding.root().sequence())
+        || fixed_blob::<16>(&root_id, "WAL owner root ID")?
+            != *binding.root().object_id().as_bytes()
+        || fixed_blob::<32>(&root_hash, "WAL owner root hash")? != binding.root().ciphertext_hash()
+        || witness.as_slice() != binding.witness_bytes()
+        || fixed_blob::<32>(&witness_hash, "WAL owner witness hash")? != binding.witness_hash()
+        || fixed_blob::<32>(&commitment, "WAL owner binding commitment")? != binding.commitment()
+    {
+        return Err(EnclaveError::Conflict("WAL owner binding changed".into()));
+    }
+    WalOwnerId::from_control_bytes(
+        WalOwnerPersistenceContext(()),
+        fixed_blob::<16>(&owner, "WAL owner ID")?,
+    )
+    .map(Some)
+    .map_err(map_wal_owner_error)
+}
+
+fn load_wal_owner_attempt_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+) -> Result<WalOwnerAttempt> {
+    struct PublicationRow {
+        format: i64,
+        owner: Vec<u8>,
+        instance: Vec<u8>,
+        operation: Vec<u8>,
+        fingerprint: Vec<u8>,
+        kind: i64,
+        expected_witness: Vec<u8>,
+        expected_binding: Vec<u8>,
+        session: Vec<u8>,
+        attempt: i64,
+        attempt_id: Vec<u8>,
+        wal_generation: Option<i64>,
+        revision: i64,
+        stage: String,
+        capture: Option<Vec<u8>>,
+        first_frame_no: Option<i64>,
+        frame_count: Option<i64>,
+        candidate_sequence: Option<i64>,
+        candidate_object_id: Option<Vec<u8>>,
+        candidate_hash: Option<Vec<u8>>,
+        candidate_fence: Option<i64>,
+        candidate_commitment: Option<Vec<u8>>,
+        artifact_commitment: Option<Vec<u8>>,
+        segment_count: Option<i64>,
+        observed_witness: Option<Vec<u8>>,
+        observed_binding: Option<Vec<u8>>,
+    }
+    let row: PublicationRow = conn.query_row(
+        "SELECT format_version,owner_id,owner_instance_id,operation_id,
+                request_fingerprint,operation_kind,expected_witness,
+                expected_binding_commitment,session_id,attempt,attempt_id,
+                expected_wal_generation,revision,stage,capture_commitment,
+                first_frame_no,frame_count,candidate_root_seq,
+                candidate_root_object_id,candidate_root_hash,
+                candidate_owner_fencing_epoch,candidate_commitment,
+                candidate_artifact_commitment,candidate_segment_count,
+                observed_witness,observed_binding_commitment
+         FROM archive_v3_wal_publications WHERE archive_id=?1",
+        [binding.archive_id().as_bytes().as_slice()],
+        |row| {
+            Ok(PublicationRow {
+                format: row.get(0)?,
+                owner: row.get(1)?,
+                instance: row.get(2)?,
+                operation: row.get(3)?,
+                fingerprint: row.get(4)?,
+                kind: row.get(5)?,
+                expected_witness: row.get(6)?,
+                expected_binding: row.get(7)?,
+                session: row.get(8)?,
+                attempt: row.get(9)?,
+                attempt_id: row.get(10)?,
+                wal_generation: row.get(11)?,
+                revision: row.get(12)?,
+                stage: row.get(13)?,
+                capture: row.get(14)?,
+                first_frame_no: row.get(15)?,
+                frame_count: row.get(16)?,
+                candidate_sequence: row.get(17)?,
+                candidate_object_id: row.get(18)?,
+                candidate_hash: row.get(19)?,
+                candidate_fence: row.get(20)?,
+                candidate_commitment: row.get(21)?,
+                artifact_commitment: row.get(22)?,
+                segment_count: row.get(23)?,
+                observed_witness: row.get(24)?,
+                observed_binding: row.get(25)?,
+            })
+        },
+    )?;
+    if row.format != 1
+        || fixed_blob::<16>(&row.operation, "WAL operation ID")?
+            != *identity.operation_id().as_bytes()
+        || fixed_blob::<32>(&row.fingerprint, "WAL request fingerprint")?
+            != *identity.request_fingerprint().as_bytes()
+        || row.kind != identity.kind() as i64
+    {
+        return Err(EnclaveError::Conflict(
+            "another WAL operation is active".into(),
+        ));
+    }
+    let expected_witness = fixed_blob::<{ crate::archive_v3_witness::WITNESS_RECORD_BYTES }>(
+        &row.expected_witness,
+        "WAL expected witness",
+    )?;
+    let expected_record = crate::archive_v3_witness::WitnessRecord::decode(&expected_witness)
+        .map_err(|_| EnclaveError::Store("invalid WAL expected witness".into()))?;
+    let expected_binding = WalOwnerStoreBinding::from_authenticated_witness(&expected_record)
+        .map_err(map_wal_owner_error)?;
+    if expected_binding.archive_id() != binding.archive_id()
+        || fixed_blob::<32>(&row.expected_binding, "WAL expected binding commitment")?
+            != expected_binding.commitment()
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL expected binding changed".into(),
+        ));
+    }
+    let owner_id = WalOwnerId::from_control_bytes(
+        WalOwnerPersistenceContext(()),
+        fixed_blob::<16>(&row.owner, "WAL owner ID")?,
+    )
+    .map_err(map_wal_owner_error)?;
+    let owner_instance_id = WalOwnerInstanceId::from_control_bytes(
+        WalOwnerPersistenceContext(()),
+        fixed_blob::<16>(&row.instance, "WAL owner instance ID")?,
+    )
+    .map_err(map_wal_owner_error)?;
+    let attempt = u32::try_from(row.attempt)
+        .ok()
+        .filter(|value| (1..=MAX_WAL_OWNER_ATTEMPTS).contains(value))
+        .ok_or_else(|| EnclaveError::Store("invalid WAL publication attempt".into()))?;
+    let wal_generation = row
+        .wal_generation
+        .map(|value| {
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| EnclaveError::Store("invalid WAL generation".into()))
+        })
+        .transpose()?;
+    let revision = u64::try_from(row.revision)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| EnclaveError::Store("invalid WAL publication revision".into()))?;
+    let stage = wal_publication_stage_from_db(&row.stage)?;
+    let capture = row
+        .capture
+        .map(|value| fixed_blob::<32>(&value, "WAL capture commitment"))
+        .transpose()?;
+    let first_frame_no = row
+        .first_frame_no
+        .map(|value| {
+            u64::try_from(value).map_err(|_| EnclaveError::Store("invalid WAL first frame".into()))
+        })
+        .transpose()?;
+    let frame_count = row
+        .frame_count
+        .map(|value| {
+            u32::try_from(value).map_err(|_| EnclaveError::Store("invalid WAL frame count".into()))
+        })
+        .transpose()?;
+    let session_id = ShadowSessionId::from_bytes(fixed_blob::<16>(&row.session, "WAL session ID")?);
+    if session_id
+        != identity
+            .session_id_for_control(WalOwnerPersistenceContext(()), binding.archive_id())
+            .map_err(map_wal_owner_error)?
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL session identity changed".into(),
+        ));
+    }
+    let attempt_id =
+        ShadowAttemptId::from_bytes(fixed_blob::<16>(&row.attempt_id, "WAL attempt ID")?);
+    let artifact_commitment = row.artifact_commitment.clone();
+    let candidate = match (
+        row.candidate_sequence,
+        row.candidate_object_id,
+        row.candidate_hash,
+        row.candidate_fence,
+        row.candidate_commitment,
+        artifact_commitment.as_ref(),
+        row.segment_count,
+    ) {
+        (None, None, None, None, None, None, None) => None,
+        (
+            Some(sequence),
+            Some(object_id),
+            Some(hash),
+            Some(fence),
+            Some(commitment),
+            Some(artifact),
+            Some(segment_count),
+        ) => Some(
+            WalPublicationCandidate::from_control_persisted(
+                WalOwnerPersistenceContext(()),
+                &expected_binding,
+                identity,
+                owner_id,
+                owner_instance_id,
+                session_id,
+                attempt_id,
+                attempt,
+                wal_generation.ok_or_else(|| {
+                    EnclaveError::Store("WAL candidate generation missing".into())
+                })?,
+                capture
+                    .ok_or_else(|| EnclaveError::Store("WAL candidate capture missing".into()))?,
+                first_frame_no.ok_or_else(|| {
+                    EnclaveError::Store("WAL candidate first frame missing".into())
+                })?,
+                frame_count.ok_or_else(|| {
+                    EnclaveError::Store("WAL candidate frame count missing".into())
+                })?,
+                u32::try_from(segment_count)
+                    .map_err(|_| EnclaveError::Store("invalid WAL segment count".into()))?,
+                fixed_blob::<32>(artifact, "WAL artifact commitment")?,
+                u64::try_from(sequence)
+                    .map_err(|_| EnclaveError::Store("invalid WAL candidate sequence".into()))?,
+                ObjectId::from_bytes(fixed_blob::<16>(&object_id, "WAL candidate root ID")?),
+                fixed_blob::<32>(&hash, "WAL candidate root hash")?,
+                u64::try_from(fence)
+                    .map_err(|_| EnclaveError::Store("invalid WAL candidate fence".into()))?,
+                expected_witness,
+                fixed_blob::<32>(&commitment, "WAL candidate commitment")?,
+            )
+            .map_err(map_wal_owner_error)?,
+        ),
+        _ => return Err(EnclaveError::Store("partial WAL candidate tuple".into())),
+    };
+    let observed_binding = match (row.observed_witness, row.observed_binding) {
+        (None, None) => None,
+        (Some(observed), Some(commitment)) => {
+            let candidate = candidate
+                .as_ref()
+                .ok_or_else(|| EnclaveError::Store("observed WAL candidate missing".into()))?;
+            let observed = fixed_blob::<{ crate::archive_v3_witness::WITNESS_RECORD_BYTES }>(
+                &observed,
+                "WAL observed witness",
+            )?;
+            let observed_binding = candidate
+                .observed_binding_for_control(WalOwnerPersistenceContext(()), &observed)
+                .map_err(map_wal_owner_error)?;
+            if fixed_blob::<32>(&commitment, "WAL observed binding commitment")?
+                != observed_binding.commitment()
+            {
+                return Err(EnclaveError::Conflict(
+                    "WAL observed binding changed".into(),
+                ));
+            }
+            Some(observed_binding)
+        }
+        _ => return Err(EnclaveError::Store("partial WAL observed tuple".into())),
+    };
+    let pending_successor = if matches!(
+        stage,
+        WalPublicationStage::CandidateReady | WalPublicationStage::SendStarted
+    ) && &expected_binding != binding
+    {
+        candidate
+            .as_ref()
+            .map(|candidate| {
+                candidate.observed_binding_for_control(
+                    WalOwnerPersistenceContext(()),
+                    binding.witness_bytes(),
+                )
+            })
+            .transpose()
+            .map_err(map_wal_owner_error)?
+            .as_ref()
+            == Some(binding)
+    } else {
+        false
+    };
+    let persisted_binding = if stage == WalPublicationStage::Witnessed {
+        binding
+    } else {
+        &expected_binding
+    };
+    let persisted_owner = validate_wal_owner_binding_conn(conn, persisted_binding)?
+        .ok_or_else(|| EnclaveError::Store("WAL owner is missing".into()))?;
+    if (stage == WalPublicationStage::Witnessed && observed_binding.as_ref() != Some(binding))
+        || (matches!(
+            stage,
+            WalPublicationStage::CandidateReady | WalPublicationStage::SendStarted
+        ) && &expected_binding != binding
+            && !pending_successor)
+        || (!matches!(
+            stage,
+            WalPublicationStage::CandidateReady
+                | WalPublicationStage::SendStarted
+                | WalPublicationStage::Witnessed
+        ) && &expected_binding != binding)
+    {
+        return Err(EnclaveError::Conflict("WAL live binding changed".into()));
+    }
+    let attempt = WalOwnerAttempt::from_control(
+        WalOwnerPersistenceContext(()),
+        owner_id,
+        owner_instance_id,
+        session_id,
+        attempt_id,
+        attempt,
+        wal_generation,
+        stage,
+        revision,
+        capture,
+        first_frame_no,
+        frame_count,
+        candidate,
+        observed_binding,
+    )
+    .map_err(map_wal_owner_error)?;
+    if attempt.owner_id() != persisted_owner {
+        return Err(EnclaveError::Conflict(
+            "WAL publication owner changed".into(),
+        ));
+    }
+    validate_wal_attempt_rows_conn(conn, &expected_binding, identity, &attempt)?;
+    if let Some(candidate) = attempt.candidate() {
+        let expected = candidate.artifact_commitment();
+        if validate_wal_artifact_set_conn(
+            conn,
+            &expected_binding,
+            identity,
+            attempt.attempt(),
+            candidate,
+        )? != expected
+        {
+            return Err(EnclaveError::Conflict(
+                "WAL artifact commitment changed".into(),
+            ));
+        }
+    }
+    Ok(attempt)
+}
+
+fn validate_wal_attempt_rows_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+    attempt: &WalOwnerAttempt,
+) -> Result<()> {
+    let (attempt_id, owner_instance_id, state): (Vec<u8>, Vec<u8>, String) = conn.query_row(
+        "SELECT attempt_id,owner_instance_id,state FROM archive_v3_wal_publication_attempts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3 AND attempt=?4",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            identity.operation_id().as_bytes().as_slice(),
+            i64::from(attempt.attempt()),
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let expected_state = match attempt.stage() {
+        WalPublicationStage::Prepared
+        | WalPublicationStage::Captured
+        | WalPublicationStage::CandidateReady
+        | WalPublicationStage::SendStarted => "active",
+        WalPublicationStage::Witnessed => "witnessed",
+        WalPublicationStage::ManualRequired => "manual_required",
+    };
+    if fixed_blob::<16>(&attempt_id, "WAL attempt ID")? != *attempt.attempt_id().as_bytes()
+        || fixed_blob::<16>(&owner_instance_id, "WAL owner instance ID")?
+            != *attempt.owner_instance_id().as_bytes()
+        || state != expected_state
+    {
+        return Err(EnclaveError::Conflict("WAL attempt row changed".into()));
+    }
+    if let Some(candidate) = attempt.candidate() {
+        validate_wal_artifact_set_conn(conn, binding, identity, attempt.attempt(), candidate)?;
+        return Ok(());
+    }
+    validate_partial_wal_artifact_set_conn(conn, binding, identity, attempt.attempt())?;
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_v3_wal_publication_artifacts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3 AND attempt=?4",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            identity.operation_id().as_bytes().as_slice(),
+            i64::from(attempt.attempt()),
+        ],
+        |row| row.get(0),
+    )?;
+    if attempt.stage() == WalPublicationStage::Prepared && count != 0 {
+        return Err(EnclaveError::Conflict(
+            "prepared WAL attempt has artifacts".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_wal_owner_operation_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+) -> Result<crate::archive_v3_wal_owner::WalOwnerAdmission> {
+    let publication: Option<(Vec<u8>, Vec<u8>, i64, String)> = conn
+        .query_row(
+            "SELECT operation_id,request_fingerprint,operation_kind,stage
+             FROM archive_v3_wal_publications WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((operation, fingerprint, kind, stage)) = publication else {
+        validate_wal_owner_binding_conn(conn, binding)?;
+        return Ok(WalOwnerAdmission::SettledHead);
+    };
+    if stage == "witnessed" {
+        validate_wal_owner_binding_conn(conn, binding)?
+            .ok_or_else(|| EnclaveError::Store("WAL owner is missing".into()))?;
+        // A terminal row for any prior operation is only comparison data. Its
+        // full tuple is still decoded before a local domain replay may rely on
+        // the current authenticated staging database.
+        let stored_identity = WalOperationIdentity::from_control_parts(
+            WalOwnerPersistenceContext(()),
+            kind,
+            &operation,
+            &fingerprint,
+        )
+        .map_err(map_wal_owner_error)?;
+        load_wal_owner_attempt_conn(conn, binding, stored_identity)?;
+        return Ok(if stored_identity == identity {
+            WalOwnerAdmission::SettledExactOperation
+        } else {
+            WalOwnerAdmission::SettledHead
+        });
+    }
+    if operation.as_slice() != identity.operation_id().as_bytes()
+        || fingerprint.as_slice() != identity.request_fingerprint().as_bytes()
+        || kind != identity.kind() as i64
+    {
+        return Err(EnclaveError::Conflict(
+            "another WAL operation is unresolved".into(),
+        ));
+    }
+    load_wal_owner_attempt_conn(conn, binding, identity)
+        .map(Box::new)
+        .map(WalOwnerAdmission::Retained)
+}
+
+fn prepare_wal_owner_operation_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    owner_instance_id: WalOwnerInstanceId,
+    identity: WalOperationIdentity,
+) -> Result<(WalOwnerAttempt, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let token = WalOwnerPersistenceContext(());
+    let existing: Option<(Vec<u8>, Vec<u8>, i64, String)> = tx
+        .query_row(
+            "SELECT operation_id,request_fingerprint,operation_kind,stage
+             FROM archive_v3_wal_publications WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if let Some((operation, fingerprint, kind, stage)) = existing {
+        if operation.as_slice() == identity.operation_id().as_bytes()
+            && fingerprint.as_slice() == identity.request_fingerprint().as_bytes()
+            && kind == identity.kind() as i64
+        {
+            let retained = load_wal_owner_attempt_conn(&tx, binding, identity)?;
+            if retained.owner_instance_id() != owner_instance_id
+                && matches!(
+                    retained.stage(),
+                    WalPublicationStage::Prepared | WalPublicationStage::Captured
+                )
+            {
+                let next_attempt = retained
+                    .attempt()
+                    .checked_add(1)
+                    .filter(|attempt| *attempt <= MAX_WAL_OWNER_ATTEMPTS)
+                    .ok_or_else(|| EnclaveError::Conflict("WAL attempt cap reached".into()))?;
+                let next_attempt_id = ShadowAttemptId::random();
+                if next_attempt_id.as_bytes() == &[0; 16]
+                    || tx.execute(
+                        "UPDATE archive_v3_wal_publication_attempts SET state='superseded'
+                         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+                           AND attempt=?4 AND attempt_id=?5 AND owner_instance_id=?6
+                           AND state='active'",
+                        rusqlite::params![
+                            binding.archive_id().as_bytes().as_slice(),
+                            identity.kind() as i64,
+                            identity.operation_id().as_bytes().as_slice(),
+                            i64::from(retained.attempt()),
+                            retained.attempt_id().as_bytes().as_slice(),
+                            retained.owner_instance_id().as_bytes().as_slice(),
+                        ],
+                    )? != 1
+                    || tx.execute(
+                        "UPDATE archive_v3_wal_publications
+                         SET owner_instance_id=?1,attempt=?2,attempt_id=?3,
+                             expected_witness=?4,expected_binding_commitment=?5,
+                             expected_wal_generation=NULL,stage='prepared',
+                             capture_commitment=NULL,first_frame_no=NULL,frame_count=NULL,
+                             candidate_root_seq=NULL,candidate_root_object_id=NULL,
+                             candidate_root_hash=NULL,candidate_owner_fencing_epoch=NULL,
+                             candidate_commitment=NULL,candidate_artifact_commitment=NULL,
+                             candidate_segment_count=NULL,observed_witness=NULL,
+                             observed_binding_commitment=NULL,revision=revision+1,
+                             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                         WHERE archive_id=?6 AND operation_id=?7 AND operation_kind=?8
+                           AND revision=?9
+                           AND stage IN ('prepared','captured')",
+                        rusqlite::params![
+                            owner_instance_id.as_bytes().as_slice(),
+                            i64::from(next_attempt),
+                            next_attempt_id.as_bytes().as_slice(),
+                            binding.witness_bytes().as_slice(),
+                            binding.commitment().as_slice(),
+                            binding.archive_id().as_bytes().as_slice(),
+                            identity.operation_id().as_bytes().as_slice(),
+                            identity.kind() as i64,
+                            i64::try_from(retained.revision()).map_err(|_| {
+                                EnclaveError::Store("WAL revision overflow".into())
+                            })?,
+                        ],
+                    )? != 1
+                    || tx.execute(
+                        "INSERT INTO archive_v3_wal_publication_attempts
+                         (archive_id,operation_kind,operation_id,attempt,attempt_id,
+                          owner_instance_id,state)
+                         VALUES (?1,?2,?3,?4,?5,?6,'active')",
+                        rusqlite::params![
+                            binding.archive_id().as_bytes().as_slice(),
+                            identity.kind() as i64,
+                            identity.operation_id().as_bytes().as_slice(),
+                            i64::from(next_attempt),
+                            next_attempt_id.as_bytes().as_slice(),
+                            owner_instance_id.as_bytes().as_slice(),
+                        ],
+                    )? != 1
+                {
+                    return Err(EnclaveError::Conflict(
+                        "WAL attempt supersession raced".into(),
+                    ));
+                }
+            }
+            let attempt = load_wal_owner_attempt_conn(&tx, binding, identity)?;
+            let changed = attempt.attempt() != retained.attempt();
+            tx.commit()?;
+            return Ok((attempt, changed));
+        }
+        if stage != "witnessed" {
+            return Err(EnclaveError::Conflict(
+                "another WAL operation is active".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM archive_v3_wal_publications WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+        )?;
+    }
+    let owner = match validate_wal_owner_binding_conn(&tx, binding)? {
+        Some(value) => value,
+        None => {
+            let value = WalOwnerId::random_for_control(token).map_err(map_wal_owner_error)?;
+            if tx.execute(
+                "INSERT INTO archive_v3_wal_owners
+                 (archive_id,format_version,owner_id,database_epoch,key_epoch,root_seq,
+                  root_object_id,root_ciphertext_hash,witness_record,witness_hash,
+                  binding_commitment,revision)
+                 VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)",
+                rusqlite::params![
+                    binding.archive_id().as_bytes().as_slice(),
+                    value.as_bytes().as_slice(),
+                    binding.database_epoch().as_bytes().as_slice(),
+                    binding.key_epoch().as_bytes().as_slice(),
+                    i64::try_from(binding.root().sequence())
+                        .map_err(|_| EnclaveError::Store("WAL root sequence overflow".into()))?,
+                    binding.root().object_id().as_bytes().as_slice(),
+                    binding.root().ciphertext_hash().as_slice(),
+                    binding.witness_bytes().as_slice(),
+                    binding.witness_hash().as_slice(),
+                    binding.commitment().as_slice(),
+                ],
+            )? != 1
+            {
+                return Err(EnclaveError::Conflict("WAL owner insert raced".into()));
+            }
+            value
+        }
+    };
+    let session = identity
+        .session_id_for_control(token, binding.archive_id())
+        .map_err(map_wal_owner_error)?;
+    let attempt_id = ShadowAttemptId::random();
+    if attempt_id.as_bytes() == &[0; 16] {
+        return Err(EnclaveError::Store(
+            "WAL attempt identity unavailable".into(),
+        ));
+    }
+    if tx.execute(
+        "INSERT INTO archive_v3_wal_publications
+         (archive_id,format_version,owner_id,owner_instance_id,operation_id,
+          request_fingerprint,operation_kind,expected_witness,
+          expected_binding_commitment,session_id,attempt,attempt_id,
+          expected_wal_generation,revision,stage)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,NULL,1,'prepared')",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            owner.as_bytes().as_slice(),
+            owner_instance_id.as_bytes().as_slice(),
+            identity.operation_id().as_bytes().as_slice(),
+            identity.request_fingerprint().as_bytes().as_slice(),
+            identity.kind() as i64,
+            binding.witness_bytes().as_slice(),
+            binding.commitment().as_slice(),
+            session.as_bytes().as_slice(),
+            attempt_id.as_bytes().as_slice(),
+        ],
+    )? != 1
+        || tx.execute(
+            "INSERT INTO archive_v3_wal_publication_attempts
+             (archive_id,operation_kind,operation_id,attempt,attempt_id,owner_instance_id,state)
+             VALUES (?1,?2,?3,1,?4,?5,'active')",
+            rusqlite::params![
+                binding.archive_id().as_bytes().as_slice(),
+                identity.kind() as i64,
+                identity.operation_id().as_bytes().as_slice(),
+                attempt_id.as_bytes().as_slice(),
+                owner_instance_id.as_bytes().as_slice(),
+            ],
+        )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL publication insert raced".into(),
+        ));
+    }
+    let attempt = load_wal_owner_attempt_conn(&tx, binding, identity)?;
+    tx.commit()?;
+    Ok((attempt, true))
+}
+
+fn validate_wal_context_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+) -> Result<WalOwnerAttempt> {
+    let attempt = load_wal_owner_attempt_conn(conn, context.binding(), context.identity())?;
+    if attempt.owner_id() != context.owner_id()
+        || attempt.owner_instance_id() != context.owner_instance_id()
+        || attempt.session_id() != context.session_id()
+        || attempt.attempt_id() != context.attempt_id()
+        || attempt.attempt() != context.attempt()
+        || attempt
+            .expected_wal_generation()
+            .is_some_and(|value| value != context.wal_generation())
+    {
+        return Err(EnclaveError::Conflict("WAL context changed".into()));
+    }
+    Ok(attempt)
+}
+
+fn record_wal_captured_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    capture: [u8; 32],
+    first_frame_no: u64,
+    frame_count: u32,
+) -> Result<(WalOwnerAttempt, bool)> {
+    if capture == [0; 32] || first_frame_no == 0 || frame_count == 0 || frame_count > 16_384 {
+        return Err(EnclaveError::Store("invalid WAL capture facts".into()));
+    }
+    let before = validate_wal_context_conn(conn, context)?;
+    if before.stage() == WalPublicationStage::Captured {
+        if before.capture_commitment() == Some(capture)
+            && before.expected_wal_generation() == Some(context.wal_generation())
+        {
+            return Ok((before, false));
+        }
+        return Err(EnclaveError::Conflict("WAL capture changed".into()));
+    }
+    if before.stage() != WalPublicationStage::Prepared {
+        return Err(EnclaveError::Conflict("WAL capture stage changed".into()));
+    }
+    let changed = conn.execute(
+        "UPDATE archive_v3_wal_publications
+         SET stage='captured',expected_wal_generation=?1,capture_commitment=?2,
+             first_frame_no=?3,frame_count=?4,revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?5 AND operation_id=?6 AND operation_kind=?7
+           AND revision=?8 AND stage='prepared'",
+        rusqlite::params![
+            i64::try_from(context.wal_generation())
+                .map_err(|_| EnclaveError::Store("WAL generation overflow".into()))?,
+            capture.as_slice(),
+            i64::try_from(first_frame_no)
+                .map_err(|_| EnclaveError::Store("WAL frame overflow".into()))?,
+            i64::from(frame_count),
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().operation_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            i64::try_from(before.revision())
+                .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(EnclaveError::Conflict("WAL capture CAS lost".into()));
+    }
+    Ok((
+        load_wal_owner_attempt_conn(conn, context.binding(), context.identity())?,
+        true,
+    ))
+}
+
+fn reserve_wal_artifact_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    artifact: &WalPublicationArtifact,
+) -> Result<bool> {
+    let attempt = validate_wal_context_conn(conn, context)?;
+    if attempt.stage() != WalPublicationStage::Captured {
+        return Err(EnclaveError::Conflict("WAL artifact stage changed".into()));
+    }
+    artifact
+        .validate_prefix_topology(context.binding(), context.wal_generation())
+        .map_err(map_wal_owner_error)?;
+    type WalArtifactLookupRow = (Vec<u8>, Vec<u8>, i64, String, Vec<u8>, String);
+    let existing: Option<WalArtifactLookupRow> = conn
+        .query_row(
+            "SELECT context_aad,object_id,object_role,object_key,ciphertext_hash,state
+             FROM archive_v3_wal_publication_artifacts
+             WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+               AND attempt=?4 AND ordinal=?5",
+            rusqlite::params![
+                context.binding().archive_id().as_bytes().as_slice(),
+                context.identity().kind() as i64,
+                context.identity().operation_id().as_bytes().as_slice(),
+                i64::from(context.attempt()),
+                i64::from(artifact.ordinal()),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((aad, id, role, key, hash, _state)) = existing {
+        return if aad.as_slice() == artifact.context_aad()
+            && id.as_slice() == artifact.object_id().as_bytes()
+            && role == artifact.role() as i64
+            && key == artifact.object_key()
+            && hash.as_slice() == artifact.ciphertext_hash()
+        {
+            Ok(false)
+        } else {
+            Err(EnclaveError::Conflict("WAL artifact changed".into()))
+        };
+    }
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_v3_wal_publication_artifacts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3 AND attempt=?4",
+        rusqlite::params![
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            context.identity().operation_id().as_bytes().as_slice(),
+            i64::from(context.attempt()),
+        ],
+        |row| row.get(0),
+    )?;
+    if count != i64::from(artifact.ordinal()) || count >= i64::from(MAX_WAL_OWNER_ARTIFACTS) {
+        return Err(EnclaveError::Conflict("WAL artifact prefix changed".into()));
+    }
+    let transition_valid = if count == 0 {
+        artifact.role() == ObjectRole::WalSegmentV3
+    } else {
+        let prior_role: i64 = conn.query_row(
+            "SELECT object_role FROM archive_v3_wal_publication_artifacts
+             WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+               AND attempt=?4 AND ordinal=?5",
+            rusqlite::params![
+                context.binding().archive_id().as_bytes().as_slice(),
+                context.identity().kind() as i64,
+                context.identity().operation_id().as_bytes().as_slice(),
+                i64::from(context.attempt()),
+                count - 1,
+            ],
+            |row| row.get(0),
+        )?;
+        match prior_role {
+            role if role == ObjectRole::WalSegmentV3 as i64 => {
+                artifact.role() == ObjectRole::WalCommitDescriptorV3
+                    || (artifact.role() == ObjectRole::WalSegmentV3
+                        && count
+                            < i64::from(crate::archive_v3_shadow_wal::MAX_WAL_SEGMENTS_PER_COMMIT))
+            }
+            role if role == ObjectRole::WalCommitDescriptorV3 as i64 => {
+                artifact.role() == ObjectRole::RootV3
+            }
+            _ => false,
+        }
+    };
+    if !transition_valid {
+        return Err(EnclaveError::Conflict(
+            "WAL artifact topology changed".into(),
+        ));
+    }
+    Ok(conn.execute(
+        "INSERT INTO archive_v3_wal_publication_artifacts
+         (archive_id,operation_kind,operation_id,attempt,ordinal,context_aad,object_id,object_role,
+          object_key,ciphertext_hash,state)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'reserved')",
+        rusqlite::params![
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            context.identity().operation_id().as_bytes().as_slice(),
+            i64::from(context.attempt()),
+            i64::from(artifact.ordinal()),
+            artifact.context_aad(),
+            artifact.object_id().as_bytes().as_slice(),
+            artifact.role() as i64,
+            artifact.object_key(),
+            artifact.ciphertext_hash().as_slice(),
+        ],
+    )? == 1)
+}
+
+fn materialize_wal_artifact_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    artifact: &WalPublicationArtifact,
+) -> Result<bool> {
+    reserve_wal_artifact_conn(conn, context, artifact)?;
+    let changed = conn.execute(
+        "UPDATE archive_v3_wal_publication_artifacts SET state='materialized'
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+           AND attempt=?4 AND ordinal=?5 AND context_aad=?6 AND object_id=?7
+           AND object_role=?8 AND object_key=?9 AND ciphertext_hash=?10
+           AND state='reserved'",
+        rusqlite::params![
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            context.identity().operation_id().as_bytes().as_slice(),
+            i64::from(context.attempt()),
+            i64::from(artifact.ordinal()),
+            artifact.context_aad(),
+            artifact.object_id().as_bytes().as_slice(),
+            artifact.role() as i64,
+            artifact.object_key(),
+            artifact.ciphertext_hash().as_slice(),
+        ],
+    )?;
+    if changed == 1 {
+        return Ok(true);
+    }
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT state FROM archive_v3_wal_publication_artifacts
+             WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+               AND attempt=?4 AND ordinal=?5",
+            rusqlite::params![
+                context.binding().archive_id().as_bytes().as_slice(),
+                context.identity().kind() as i64,
+                context.identity().operation_id().as_bytes().as_slice(),
+                i64::from(context.attempt()),
+                i64::from(artifact.ordinal()),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if state.as_deref() == Some("materialized") {
+        Ok(false)
+    } else {
+        Err(EnclaveError::Conflict(
+            "WAL artifact materialization changed".into(),
+        ))
+    }
+}
+
+fn record_wal_candidate_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    capture: [u8; 32],
+    candidate: &WalPublicationCandidate,
+) -> Result<(WalOwnerAttempt, bool)> {
+    let before = validate_wal_context_conn(conn, context)?;
+    if before.capture_commitment() != Some(capture) {
+        return Err(EnclaveError::Conflict(
+            "WAL candidate capture changed".into(),
+        ));
+    }
+    let artifact_commitment = validate_wal_artifact_set_conn(
+        conn,
+        context.binding(),
+        context.identity(),
+        context.attempt(),
+        candidate,
+    )?;
+    if artifact_commitment != candidate.artifact_commitment() {
+        return Err(EnclaveError::Conflict(
+            "WAL artifact commitment changed".into(),
+        ));
+    }
+    if matches!(
+        before.stage(),
+        WalPublicationStage::CandidateReady
+            | WalPublicationStage::SendStarted
+            | WalPublicationStage::Witnessed
+    ) {
+        let exact: bool = conn.query_row(
+            "SELECT candidate_root_seq=?1 AND candidate_root_object_id=?2
+                    AND candidate_root_hash=?3 AND candidate_owner_fencing_epoch=?4
+                    AND candidate_commitment=?5 AND candidate_artifact_commitment=?6
+                    AND candidate_segment_count=?7
+             FROM archive_v3_wal_publications WHERE archive_id=?8",
+            rusqlite::params![
+                i64::try_from(candidate.root().sequence())
+                    .map_err(|_| EnclaveError::Store("WAL root sequence overflow".into()))?,
+                candidate.root().object_id().as_bytes().as_slice(),
+                candidate.root().ciphertext_hash().as_slice(),
+                i64::try_from(candidate.owner_fencing_epoch())
+                    .map_err(|_| EnclaveError::Store("WAL candidate fence overflow".into()))?,
+                candidate.commitment().as_slice(),
+                artifact_commitment.as_slice(),
+                i64::from(candidate.segment_count()),
+                context.binding().archive_id().as_bytes().as_slice(),
+            ],
+            |row| row.get(0),
+        )?;
+        return exact
+            .then_some((before, false))
+            .ok_or_else(|| EnclaveError::Conflict("WAL candidate changed".into()));
+    }
+    if before.stage() != WalPublicationStage::Captured {
+        return Err(EnclaveError::Conflict("WAL candidate stage changed".into()));
+    }
+    if conn.execute(
+        "UPDATE archive_v3_wal_publications
+         SET stage='candidate_ready',candidate_root_seq=?1,candidate_root_object_id=?2,
+             candidate_root_hash=?3,candidate_owner_fencing_epoch=?4,
+             candidate_commitment=?5,candidate_artifact_commitment=?6,
+             candidate_segment_count=?7,revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?8 AND operation_id=?9 AND operation_kind=?10
+           AND revision=?11 AND stage='captured'",
+        rusqlite::params![
+            i64::try_from(candidate.root().sequence())
+                .map_err(|_| EnclaveError::Store("WAL root sequence overflow".into()))?,
+            candidate.root().object_id().as_bytes().as_slice(),
+            candidate.root().ciphertext_hash().as_slice(),
+            i64::try_from(candidate.owner_fencing_epoch())
+                .map_err(|_| EnclaveError::Store("WAL candidate fence overflow".into()))?,
+            candidate.commitment().as_slice(),
+            artifact_commitment.as_slice(),
+            i64::from(candidate.segment_count()),
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().operation_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            i64::try_from(before.revision())
+                .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict("WAL candidate CAS lost".into()));
+    }
+    Ok((
+        load_wal_owner_attempt_conn(conn, context.binding(), context.identity())?,
+        true,
+    ))
+}
+
+fn validate_wal_artifact_set_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+    attempt: u32,
+    candidate: &WalPublicationCandidate,
+) -> Result<[u8; 32]> {
+    if candidate.expected_binding() != binding || candidate.segment_count() == 0 {
+        return Err(EnclaveError::Conflict(
+            "WAL artifact binding changed".into(),
+        ));
+    }
+    type WalCaptureBindingRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>, i64, i64);
+    let (owner, instance, session, attempt_id, wal_generation, capture, first_frame, frame_count): WalCaptureBindingRow = conn.query_row(
+        "SELECT owner_id,owner_instance_id,session_id,attempt_id,
+                expected_wal_generation,capture_commitment,first_frame_no,frame_count
+         FROM archive_v3_wal_publications
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3 AND attempt=?4",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            identity.operation_id().as_bytes().as_slice(),
+            i64::from(attempt),
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+    )?;
+    let wal_generation = u64::try_from(wal_generation)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| EnclaveError::Store("invalid WAL generation".into()))?;
+    let capture = fixed_blob::<32>(&capture, "WAL capture commitment")?;
+    let first_frame = u64::try_from(first_frame)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| EnclaveError::Store("invalid WAL first frame".into()))?;
+    let frame_count = u32::try_from(frame_count)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| EnclaveError::Store("invalid WAL frame count".into()))?;
+    if capture != candidate.capture_commitment()
+        || first_frame != candidate.first_frame_no()
+        || frame_count != candidate.frame_count()
+    {
+        return Err(EnclaveError::Conflict("WAL capture tuple changed".into()));
+    }
+    let mut statement = conn.prepare(
+        "SELECT ordinal,context_aad,object_id,object_role,object_key,ciphertext_hash,state
+         FROM archive_v3_wal_publication_artifacts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3 AND attempt=?4
+         ORDER BY ordinal",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        binding.archive_id().as_bytes().as_slice(),
+        identity.kind() as i64,
+        identity.operation_id().as_bytes().as_slice(),
+        i64::from(attempt),
+    ])?;
+    let mut count = 0_u32;
+    let mut commitment = Sha256::new();
+    commitment.update(WAL_ARTIFACT_SET_COMMITMENT_DOMAIN);
+    commitment.update(binding.commitment());
+    commitment.update(identity.operation_id().as_bytes());
+    commitment.update(identity.request_fingerprint().as_bytes());
+    commitment.update((identity.kind() as u16).to_be_bytes());
+    commitment.update(attempt.to_be_bytes());
+    commitment.update(&owner);
+    commitment.update(&instance);
+    commitment.update(&session);
+    commitment.update(&attempt_id);
+    commitment.update(wal_generation.to_be_bytes());
+    commitment.update(capture);
+    commitment.update(first_frame.to_be_bytes());
+    commitment.update(frame_count.to_be_bytes());
+    commitment.update(candidate.segment_count().to_be_bytes());
+    while let Some(row) = rows.next()? {
+        if count >= MAX_WAL_OWNER_ARTIFACTS || row.get::<_, i64>(0)? != i64::from(count) {
+            return Err(EnclaveError::Conflict("WAL artifact prefix changed".into()));
+        }
+        let aad = row.get::<_, Vec<u8>>(1)?;
+        let object_id = ObjectId::from_bytes(fixed_blob::<16>(
+            &row.get::<_, Vec<u8>>(2)?,
+            "WAL artifact object ID",
+        )?);
+        let role = row.get::<_, i64>(3)?;
+        let key = row.get::<_, String>(4)?;
+        let hash = fixed_blob::<32>(&row.get::<_, Vec<u8>>(5)?, "WAL artifact ciphertext hash")?;
+        let artifact = WalPublicationArtifact::from_control_persisted(
+            WalOwnerPersistenceContext(()),
+            binding,
+            wal_generation,
+            candidate.segment_count(),
+            count,
+            aad,
+            object_id,
+            role,
+            key,
+            hash,
+        )
+        .map_err(map_wal_owner_error)?;
+        if row.get::<_, String>(6)? != "materialized"
+            || (artifact.role() == ObjectRole::RootV3
+                && (artifact.object_id() != candidate.root().object_id()
+                    || artifact.ciphertext_hash() != candidate.root().ciphertext_hash()))
+        {
+            return Err(EnclaveError::Conflict("WAL artifact changed".into()));
+        }
+        commitment.update(count.to_be_bytes());
+        commitment.update(
+            u16::try_from(artifact.context_aad().len())
+                .map_err(|_| EnclaveError::Store("WAL artifact AAD overflow".into()))?
+                .to_be_bytes(),
+        );
+        commitment.update(artifact.context_aad());
+        commitment.update(artifact.object_id().as_bytes());
+        commitment.update([artifact.role() as u8]);
+        commitment.update(
+            u16::try_from(artifact.object_key().len())
+                .map_err(|_| EnclaveError::Store("WAL artifact key overflow".into()))?
+                .to_be_bytes(),
+        );
+        commitment.update(artifact.object_key().as_bytes());
+        commitment.update(artifact.ciphertext_hash());
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| EnclaveError::Store("WAL artifact count overflow".into()))?;
+    }
+    if count != candidate.segment_count() + 2 {
+        return Err(EnclaveError::Conflict(
+            "WAL artifact set is incomplete".into(),
+        ));
+    }
+    commitment.update(count.to_be_bytes());
+    let commitment: [u8; 32] = commitment.finalize().into();
+    if commitment == [0; 32] {
+        return Err(EnclaveError::Store(
+            "WAL artifact commitment is invalid".into(),
+        ));
+    }
+    Ok(commitment)
+}
+
+fn validate_partial_wal_artifact_set_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+    attempt: u32,
+) -> Result<()> {
+    let wal_generation: Option<i64> = conn.query_row(
+        "SELECT expected_wal_generation FROM archive_v3_wal_publications
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3 AND attempt=?4",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            identity.operation_id().as_bytes().as_slice(),
+            i64::from(attempt)
+        ],
+        |row| row.get(0),
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT ordinal,context_aad,object_id,object_role,object_key,ciphertext_hash,state
+         FROM archive_v3_wal_publication_artifacts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3 AND attempt=?4
+         ORDER BY ordinal",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        binding.archive_id().as_bytes().as_slice(),
+        identity.kind() as i64,
+        identity.operation_id().as_bytes().as_slice(),
+        i64::from(attempt),
+    ])?;
+    let mut count = 0_u32;
+    let mut segments = 0_u32;
+    let mut descriptors = 0_u32;
+    let mut roots = 0_u32;
+    while let Some(row) = rows.next()? {
+        if count >= MAX_WAL_OWNER_ARTIFACTS || row.get::<_, i64>(0)? != i64::from(count) {
+            return Err(EnclaveError::Conflict("WAL artifact prefix changed".into()));
+        }
+        let role = match row.get::<_, i64>(3)? {
+            value if value == ObjectRole::WalSegmentV3 as i64 && descriptors == 0 && roots == 0 => {
+                segments = segments.saturating_add(1);
+                ObjectRole::WalSegmentV3
+            }
+            value
+                if value == ObjectRole::WalCommitDescriptorV3 as i64
+                    && segments != 0
+                    && descriptors == 0
+                    && roots == 0 =>
+            {
+                descriptors = descriptors.saturating_add(1);
+                ObjectRole::WalCommitDescriptorV3
+            }
+            value
+                if value == ObjectRole::RootV3 as i64
+                    && segments != 0
+                    && descriptors == 1
+                    && roots == 0 =>
+            {
+                roots = roots.saturating_add(1);
+                ObjectRole::RootV3
+            }
+            _ => return Err(EnclaveError::Store("invalid WAL artifact role".into())),
+        };
+        let generation = wal_generation
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value != 0)
+            .ok_or_else(|| EnclaveError::Conflict("WAL artifact generation missing".into()))?;
+        let artifact = WalPublicationArtifact::from_control_prefix(
+            WalOwnerPersistenceContext(()),
+            binding,
+            generation,
+            count,
+            row.get(1)?,
+            ObjectId::from_bytes(fixed_blob::<16>(
+                &row.get::<_, Vec<u8>>(2)?,
+                "WAL artifact object ID",
+            )?),
+            role as i64,
+            row.get(4)?,
+            fixed_blob::<32>(&row.get::<_, Vec<u8>>(5)?, "WAL artifact ciphertext hash")?,
+        )
+        .map_err(map_wal_owner_error)?;
+        let state = row.get::<_, String>(6)?;
+        if artifact.ordinal() != count || !matches!(state.as_str(), "reserved" | "materialized") {
+            return Err(EnclaveError::Conflict("WAL artifact changed".into()));
+        }
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| EnclaveError::Store("WAL artifact count overflow".into()))?;
+    }
+    Ok(())
+}
+
+fn authenticate_wal_artifact_set_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    capture: [u8; 32],
+    first_frame_no: u64,
+    frame_count: u32,
+) -> Result<AuthenticatedWalArtifactSet> {
+    let attempt = validate_wal_context_conn(conn, context)?;
+    if attempt.stage() != WalPublicationStage::Captured
+        || attempt.capture_commitment() != Some(capture)
+        || attempt.first_frame_no() != Some(first_frame_no)
+        || attempt.frame_count() != Some(frame_count)
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL artifact capture changed".into(),
+        ));
+    }
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_v3_wal_publication_artifacts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+           AND attempt=?4 AND state='materialized'",
+        rusqlite::params![
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            context.identity().operation_id().as_bytes().as_slice(),
+            i64::from(context.attempt()),
+        ],
+        |row| row.get(0),
+    )?;
+    let segment_count = u32::try_from(count)
+        .ok()
+        .and_then(|value| value.checked_sub(2))
+        .filter(|value| {
+            (1..=crate::archive_v3_shadow_wal::MAX_WAL_SEGMENTS_PER_COMMIT).contains(value)
+        })
+        .ok_or_else(|| EnclaveError::Conflict("WAL artifact set is incomplete".into()))?;
+    let mut statement = conn.prepare(
+        "SELECT ordinal,context_aad,object_id,object_role,object_key,ciphertext_hash,state
+         FROM archive_v3_wal_publication_artifacts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+           AND attempt=?4 ORDER BY ordinal",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        context.binding().archive_id().as_bytes().as_slice(),
+        context.identity().kind() as i64,
+        context.identity().operation_id().as_bytes().as_slice(),
+        i64::from(context.attempt()),
+    ])?;
+    let mut ordinal = 0_u32;
+    let mut commitment = Sha256::new();
+    commitment.update(WAL_ARTIFACT_SET_COMMITMENT_DOMAIN);
+    commitment.update(context.binding().commitment());
+    commitment.update(context.identity().operation_id().as_bytes());
+    commitment.update(context.identity().request_fingerprint().as_bytes());
+    commitment.update((context.identity().kind() as u16).to_be_bytes());
+    commitment.update(context.attempt().to_be_bytes());
+    commitment.update(context.owner_id().as_bytes());
+    commitment.update(context.owner_instance_id().as_bytes());
+    commitment.update(context.session_id().as_bytes());
+    commitment.update(context.attempt_id().as_bytes());
+    commitment.update(context.wal_generation().to_be_bytes());
+    commitment.update(capture);
+    commitment.update(first_frame_no.to_be_bytes());
+    commitment.update(frame_count.to_be_bytes());
+    commitment.update(segment_count.to_be_bytes());
+    while let Some(row) = rows.next()? {
+        if row.get::<_, i64>(0)? != i64::from(ordinal) {
+            return Err(EnclaveError::Conflict("WAL artifact prefix changed".into()));
+        }
+        let artifact = WalPublicationArtifact::from_control_persisted(
+            WalOwnerPersistenceContext(()),
+            context.binding(),
+            context.wal_generation(),
+            segment_count,
+            ordinal,
+            row.get(1)?,
+            ObjectId::from_bytes(fixed_blob::<16>(
+                &row.get::<_, Vec<u8>>(2)?,
+                "WAL artifact object ID",
+            )?),
+            row.get(3)?,
+            row.get(4)?,
+            fixed_blob::<32>(&row.get::<_, Vec<u8>>(5)?, "WAL artifact ciphertext hash")?,
+        )
+        .map_err(map_wal_owner_error)?;
+        if row.get::<_, String>(6)? != "materialized" {
+            return Err(EnclaveError::Conflict("WAL artifact changed".into()));
+        }
+        commitment.update(ordinal.to_be_bytes());
+        commitment.update(
+            u16::try_from(artifact.context_aad().len())
+                .map_err(|_| EnclaveError::Store("WAL artifact AAD overflow".into()))?
+                .to_be_bytes(),
+        );
+        commitment.update(artifact.context_aad());
+        commitment.update(artifact.object_id().as_bytes());
+        commitment.update([artifact.role() as u8]);
+        commitment.update(
+            u16::try_from(artifact.object_key().len())
+                .map_err(|_| EnclaveError::Store("WAL artifact key overflow".into()))?
+                .to_be_bytes(),
+        );
+        commitment.update(artifact.object_key().as_bytes());
+        commitment.update(artifact.ciphertext_hash());
+        ordinal += 1;
+    }
+    if ordinal != segment_count + 2 {
+        return Err(EnclaveError::Conflict(
+            "WAL artifact set is incomplete".into(),
+        ));
+    }
+    commitment.update(ordinal.to_be_bytes());
+    let commitment: [u8; 32] = commitment.finalize().into();
+    AuthenticatedWalArtifactSet::from_control_validation(
+        WalOwnerPersistenceContext(()),
+        context,
+        capture,
+        first_frame_no,
+        frame_count,
+        segment_count,
+        commitment,
+    )
+    .map_err(map_wal_owner_error)
+}
+
+fn mark_wal_send_started_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    candidate: &WalPublicationCandidate,
+) -> Result<(WalOwnerAttempt, bool)> {
+    let capture = before_capture(conn, context)?
+        .ok_or_else(|| EnclaveError::Store("WAL capture missing".into()))?;
+    let before = record_wal_candidate_conn(conn, context, capture, candidate)?.0;
+    if before.stage() == WalPublicationStage::SendStarted
+        || before.stage() == WalPublicationStage::Witnessed
+    {
+        return Ok((before, false));
+    }
+    if before.stage() != WalPublicationStage::CandidateReady {
+        return Err(EnclaveError::Conflict("WAL send stage changed".into()));
+    }
+    if conn.execute(
+        "UPDATE archive_v3_wal_publications SET stage='send_started',revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?1 AND operation_id=?2 AND operation_kind=?3
+           AND revision=?4 AND stage='candidate_ready'",
+        rusqlite::params![
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().operation_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            i64::try_from(before.revision())
+                .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict("WAL send CAS lost".into()));
+    }
+    Ok((
+        load_wal_owner_attempt_conn(conn, context.binding(), context.identity())?,
+        true,
+    ))
+}
+
+fn before_capture(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+) -> Result<Option<[u8; 32]>> {
+    conn.query_row(
+        "SELECT capture_commitment FROM archive_v3_wal_publications
+         WHERE archive_id=?1 AND operation_id=?2 AND operation_kind=?3",
+        rusqlite::params![
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().operation_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+        ],
+        |row| row.get::<_, Option<Vec<u8>>>(0),
+    )?
+    .map(|value| fixed_blob::<32>(&value, "WAL capture commitment"))
+    .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_completed_wal_publication_conn(
+    conn: &Connection,
+    prior_binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+    owner_id: WalOwnerId,
+    owner_instance_id: WalOwnerInstanceId,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    attempt: u32,
+    expected_wal_generation: u64,
+    capture: [u8; 32],
+    candidate: &WalPublicationCandidate,
+    next: &WalOwnerStoreBinding,
+) -> Result<Option<WalOwnerStoreBinding>> {
+    let expected = candidate.expected_binding();
+    if prior_binding != expected && prior_binding != next {
+        return Err(EnclaveError::Conflict(
+            "completed WAL predecessor changed".into(),
+        ));
+    }
+    let current_commitment: Vec<u8> = conn.query_row(
+        "SELECT binding_commitment FROM archive_v3_wal_owners WHERE archive_id=?1",
+        [expected.archive_id().as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if fixed_blob::<32>(&current_commitment, "WAL owner binding commitment")? != next.commitment() {
+        return Ok(None);
+    }
+    if validate_wal_owner_binding_conn(conn, next)? != Some(owner_id) {
+        return Err(EnclaveError::Conflict("completed WAL owner changed".into()));
+    }
+    let completed = load_wal_owner_attempt_conn(conn, next, identity)?;
+    if completed.stage() != WalPublicationStage::Witnessed
+        || completed.owner_id() != owner_id
+        || completed.owner_instance_id() != owner_instance_id
+        || completed.session_id() != session_id
+        || completed.attempt_id() != attempt_id
+        || completed.attempt() != attempt
+        || completed.expected_wal_generation() != Some(expected_wal_generation)
+        || completed.capture_commitment() != Some(capture)
+        || completed.first_frame_no() != Some(candidate.first_frame_no())
+        || completed.frame_count() != Some(candidate.frame_count())
+        || completed.candidate() != Some(candidate)
+    {
+        return Err(EnclaveError::Conflict(
+            "completed WAL publication changed".into(),
+        ));
+    }
+    let attempt_state: String = conn.query_row(
+        "SELECT state FROM archive_v3_wal_publication_attempts
+         WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+           AND attempt=?4 AND attempt_id=?5",
+        rusqlite::params![
+            expected.archive_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            identity.operation_id().as_bytes().as_slice(),
+            i64::from(attempt),
+            attempt_id.as_bytes().as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    if attempt_state != "witnessed" {
+        return Err(EnclaveError::Conflict(
+            "completed WAL attempt changed".into(),
+        ));
+    }
+    validate_wal_artifact_set_conn(conn, expected, identity, attempt, candidate)?;
+    Ok(Some(next.clone()))
+}
+
+fn record_wal_witnessed_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    capture: [u8; 32],
+    witnessed: &WitnessedWalCandidate,
+) -> Result<(AuthenticatedWalSettlement, bool)> {
+    let candidate = witnessed.candidate();
+    let next = witnessed.next_binding().map_err(map_wal_owner_error)?;
+    if validate_completed_wal_publication_conn(
+        conn,
+        context.binding(),
+        context.identity(),
+        context.owner_id(),
+        context.owner_instance_id(),
+        context.session_id(),
+        context.attempt_id(),
+        context.attempt(),
+        context.wal_generation(),
+        capture,
+        candidate,
+        &next,
+    )?
+    .is_some()
+    {
+        return AuthenticatedWalSettlement::from_control_cas(
+            WalOwnerPersistenceContext(()),
+            context,
+            capture,
+            candidate,
+            next,
+        )
+        .map(|value| (value, false))
+        .map_err(map_wal_owner_error);
+    }
+    let before = record_wal_candidate_conn(conn, context, capture, candidate)?.0;
+    if before.stage() != WalPublicationStage::SendStarted {
+        return Err(EnclaveError::Conflict("WAL witness stage changed".into()));
+    }
+    let tx = conn.unchecked_transaction()?;
+    if tx.execute(
+        "UPDATE archive_v3_wal_publications SET stage='witnessed',
+             observed_witness=?1,observed_binding_commitment=?2,revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?3 AND operation_id=?4 AND operation_kind=?5
+           AND revision=?6 AND stage='send_started'
+           AND capture_commitment=?7 AND candidate_commitment=?8",
+        rusqlite::params![
+            witnessed.observed_witness().as_slice(),
+            next.commitment().as_slice(),
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().operation_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            i64::try_from(before.revision())
+                .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+            capture.as_slice(),
+            candidate.commitment().as_slice(),
+        ],
+    )? != 1
+        || tx.execute(
+            "UPDATE archive_v3_wal_publication_attempts SET state='witnessed'
+             WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+               AND attempt=?4 AND state='active'",
+            rusqlite::params![
+                context.binding().archive_id().as_bytes().as_slice(),
+                context.identity().kind() as i64,
+                context.identity().operation_id().as_bytes().as_slice(),
+                i64::from(context.attempt()),
+            ],
+        )? != 1
+        || tx.execute(
+            "UPDATE archive_v3_wal_owners
+             SET database_epoch=?1,key_epoch=?2,root_seq=?3,root_object_id=?4,
+                 root_ciphertext_hash=?5,witness_record=?6,witness_hash=?7,
+                 binding_commitment=?8,revision=revision+1,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id=?9 AND owner_id=?10 AND binding_commitment=?11",
+            rusqlite::params![
+                next.database_epoch().as_bytes().as_slice(),
+                next.key_epoch().as_bytes().as_slice(),
+                i64::try_from(next.root().sequence())
+                    .map_err(|_| EnclaveError::Store("WAL root sequence overflow".into()))?,
+                next.root().object_id().as_bytes().as_slice(),
+                next.root().ciphertext_hash().as_slice(),
+                next.witness_bytes().as_slice(),
+                next.witness_hash().as_slice(),
+                next.commitment().as_slice(),
+                context.binding().archive_id().as_bytes().as_slice(),
+                context.owner_id().as_bytes().as_slice(),
+                context.binding().commitment().as_slice(),
+            ],
+        )? != 1
+    {
+        return Err(EnclaveError::Conflict("WAL witnessed CAS lost".into()));
+    }
+    tx.commit()?;
+    AuthenticatedWalSettlement::from_control_cas(
+        WalOwnerPersistenceContext(()),
+        context,
+        capture,
+        candidate,
+        next,
+    )
+    .map(|value| (value, true))
+    .map_err(map_wal_owner_error)
+}
+
+fn validate_recovered_wal_attempt_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+    retained: &WalOwnerAttempt,
+    candidate: &WalPublicationCandidate,
+) -> Result<WalOwnerAttempt> {
+    let current = load_wal_owner_attempt_conn(conn, binding, identity)?;
+    if current.owner_id() != retained.owner_id()
+        || current.owner_instance_id() != retained.owner_instance_id()
+        || current.session_id() != retained.session_id()
+        || current.attempt_id() != retained.attempt_id()
+        || current.attempt() != retained.attempt()
+        || current.expected_wal_generation() != retained.expected_wal_generation()
+        || current.capture_commitment() != retained.capture_commitment()
+        || current.candidate() != Some(candidate)
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL recovered attempt changed".into(),
+        ));
+    }
+    Ok(current)
+}
+
+fn mark_recovered_wal_send_started_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+    retained: &WalOwnerAttempt,
+    candidate: &WalPublicationCandidate,
+) -> Result<(WalOwnerAttempt, bool)> {
+    let current =
+        validate_recovered_wal_attempt_conn(conn, binding, identity, retained, candidate)?;
+    if current.stage() == WalPublicationStage::SendStarted {
+        return Ok((current, false));
+    }
+    if current.stage() != WalPublicationStage::CandidateReady
+        || retained.stage() != WalPublicationStage::CandidateReady
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL recovered send stage changed".into(),
+        ));
+    }
+    if conn.execute(
+        "UPDATE archive_v3_wal_publications SET stage='send_started',revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?1 AND operation_id=?2 AND operation_kind=?3 AND revision=?4
+           AND stage='candidate_ready' AND candidate_commitment=?5",
+        rusqlite::params![
+            binding.archive_id().as_bytes().as_slice(),
+            identity.operation_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            i64::try_from(current.revision())
+                .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+            candidate.commitment().as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict("WAL recovered send CAS lost".into()));
+    }
+    Ok((load_wal_owner_attempt_conn(conn, binding, identity)?, true))
+}
+
+fn record_recovered_wal_witnessed_conn(
+    conn: &Connection,
+    binding: &WalOwnerStoreBinding,
+    identity: WalOperationIdentity,
+    retained: &WalOwnerAttempt,
+    witnessed: &WitnessedWalCandidate,
+) -> Result<(WalOwnerStoreBinding, bool)> {
+    let candidate = witnessed.candidate();
+    let next = witnessed.next_binding().map_err(map_wal_owner_error)?;
+    let expected_wal_generation = retained
+        .expected_wal_generation()
+        .ok_or_else(|| EnclaveError::Store("WAL recovered generation missing".into()))?;
+    let capture = retained
+        .capture_commitment()
+        .ok_or_else(|| EnclaveError::Store("WAL recovered capture missing".into()))?;
+    if let Some(next) = validate_completed_wal_publication_conn(
+        conn,
+        binding,
+        identity,
+        retained.owner_id(),
+        retained.owner_instance_id(),
+        retained.session_id(),
+        retained.attempt_id(),
+        retained.attempt(),
+        expected_wal_generation,
+        capture,
+        candidate,
+        &next,
+    )? {
+        return Ok((next, false));
+    }
+    let current =
+        validate_recovered_wal_attempt_conn(conn, binding, identity, retained, candidate)?;
+    if current.stage() != WalPublicationStage::SendStarted
+        || retained.stage() != WalPublicationStage::SendStarted
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL recovered witness stage changed".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let expected = candidate.expected_binding();
+    if tx.execute(
+        "UPDATE archive_v3_wal_publications SET stage='witnessed',
+             observed_witness=?1,observed_binding_commitment=?2,revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?3 AND operation_id=?4 AND operation_kind=?5 AND revision=?6
+           AND stage='send_started' AND candidate_commitment=?7",
+        rusqlite::params![
+            witnessed.observed_witness().as_slice(),
+            next.commitment().as_slice(),
+            expected.archive_id().as_bytes().as_slice(),
+            identity.operation_id().as_bytes().as_slice(),
+            identity.kind() as i64,
+            i64::try_from(current.revision())
+                .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+            candidate.commitment().as_slice(),
+        ],
+    )? != 1
+        || tx.execute(
+            "UPDATE archive_v3_wal_publication_attempts SET state='witnessed'
+             WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+               AND attempt=?4 AND state='active'",
+            rusqlite::params![
+                expected.archive_id().as_bytes().as_slice(),
+                identity.kind() as i64,
+                identity.operation_id().as_bytes().as_slice(),
+                i64::from(retained.attempt()),
+            ],
+        )? != 1
+        || tx.execute(
+            "UPDATE archive_v3_wal_owners
+             SET database_epoch=?1,key_epoch=?2,root_seq=?3,root_object_id=?4,
+                 root_ciphertext_hash=?5,witness_record=?6,witness_hash=?7,
+                 binding_commitment=?8,revision=revision+1,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE archive_id=?9 AND owner_id=?10 AND binding_commitment=?11",
+            rusqlite::params![
+                next.database_epoch().as_bytes().as_slice(),
+                next.key_epoch().as_bytes().as_slice(),
+                i64::try_from(next.root().sequence())
+                    .map_err(|_| EnclaveError::Store("WAL root sequence overflow".into()))?,
+                next.root().object_id().as_bytes().as_slice(),
+                next.root().ciphertext_hash().as_slice(),
+                next.witness_bytes().as_slice(),
+                next.witness_hash().as_slice(),
+                next.commitment().as_slice(),
+                expected.archive_id().as_bytes().as_slice(),
+                retained.owner_id().as_bytes().as_slice(),
+                expected.commitment().as_slice(),
+            ],
+        )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "WAL recovered witness CAS lost".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((next, true))
+}
+
+fn require_wal_manual_conn(
+    conn: &Connection,
+    context: &crate::archive_v3_wal_owner::WalOwnerContext,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let before = validate_wal_context_conn(&tx, context)?;
+    if before.stage() == WalPublicationStage::ManualRequired {
+        return Ok(false);
+    }
+    if matches!(
+        before.stage(),
+        WalPublicationStage::Prepared | WalPublicationStage::Witnessed
+    ) {
+        return Err(EnclaveError::Conflict(
+            "WAL manual transition is invalid".into(),
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE archive_v3_wal_publications SET stage='manual_required',revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?1 AND operation_id=?2 AND operation_kind=?3 AND revision=?4
+           AND attempt=?5 AND stage=?6",
+        rusqlite::params![
+            context.binding().archive_id().as_bytes().as_slice(),
+            context.identity().operation_id().as_bytes().as_slice(),
+            context.identity().kind() as i64,
+            i64::try_from(before.revision())
+                .map_err(|_| EnclaveError::Store("WAL revision overflow".into()))?,
+            i64::from(context.attempt()),
+            wal_publication_stage_as_db(before.stage()),
+        ],
+    )?;
+    if changed != 1
+        || tx.execute(
+            "UPDATE archive_v3_wal_publication_attempts SET state='manual_required'
+             WHERE archive_id=?1 AND operation_kind=?2 AND operation_id=?3
+               AND attempt=?4 AND state='active'",
+            rusqlite::params![
+                context.binding().archive_id().as_bytes().as_slice(),
+                context.identity().kind() as i64,
+                context.identity().operation_id().as_bytes().as_slice(),
+                i64::from(context.attempt()),
+            ],
+        )? != 1
+    {
+        return Err(EnclaveError::Conflict("WAL manual CAS lost".into()));
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
 fn fixed_blob<const N: usize>(value: &[u8], field: &'static str) -> Result<[u8; N]> {
     value
         .try_into()
@@ -13370,6 +15398,171 @@ impl MaintenanceImportPersistence for ControlStore {
         })
         .await
         .map_err(map_maintenance_persistence_error)
+    }
+}
+
+#[async_trait::async_trait]
+impl WalOwnerControl for ControlStore {
+    async fn inspect_operation(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        identity: WalOperationIdentity,
+    ) -> std::result::Result<crate::archive_v3_wal_owner::WalOwnerAdmission, WalOwnerError> {
+        self.read(|conn| inspect_wal_owner_operation_conn(conn, binding, identity))
+            .await
+            .map_err(map_wal_persistence_error)
+    }
+
+    async fn prepare_operation(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        owner_instance_id: WalOwnerInstanceId,
+        identity: WalOperationIdentity,
+    ) -> std::result::Result<WalOwnerAttempt, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            prepare_wal_owner_operation_conn(conn, binding, owner_instance_id, identity)
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn record_captured(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        capture_commitment: [u8; 32],
+        first_frame_no: u64,
+        frame_count: u32,
+    ) -> std::result::Result<WalOwnerAttempt, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            record_wal_captured_conn(
+                conn,
+                context,
+                capture_commitment,
+                first_frame_no,
+                frame_count,
+            )
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn reserve_artifact(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        artifact: &WalPublicationArtifact,
+    ) -> std::result::Result<(), WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            reserve_wal_artifact_conn(conn, context, artifact).map(|changed| ((), changed))
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn mark_artifact_materialized(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        artifact: &WalPublicationArtifact,
+    ) -> std::result::Result<(), WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            materialize_wal_artifact_conn(conn, context, artifact).map(|changed| ((), changed))
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn authenticate_artifact_set(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        capture_commitment: [u8; 32],
+        first_frame_no: u64,
+        frame_count: u32,
+    ) -> std::result::Result<AuthenticatedWalArtifactSet, WalOwnerError> {
+        self.read(|conn| {
+            authenticate_wal_artifact_set_conn(
+                conn,
+                context,
+                capture_commitment,
+                first_frame_no,
+                frame_count,
+            )
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn record_candidate(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        capture_commitment: [u8; 32],
+        candidate: &WalPublicationCandidate,
+    ) -> std::result::Result<WalOwnerAttempt, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            record_wal_candidate_conn(conn, context, capture_commitment, candidate)
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn mark_send_started(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        candidate: &WalPublicationCandidate,
+    ) -> std::result::Result<WalOwnerAttempt, WalOwnerError> {
+        self.write_owned_if_changed(|conn| mark_wal_send_started_conn(conn, context, candidate))
+            .await
+            .map_err(map_wal_persistence_error)
+    }
+
+    async fn record_witnessed(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        capture_commitment: [u8; 32],
+        witnessed: WitnessedWalCandidate,
+    ) -> std::result::Result<AuthenticatedWalSettlement, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            record_wal_witnessed_conn(conn, context, capture_commitment, &witnessed)
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn mark_recovered_send_started(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        identity: WalOperationIdentity,
+        attempt: &WalOwnerAttempt,
+        candidate: &WalPublicationCandidate,
+    ) -> std::result::Result<WalOwnerAttempt, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            mark_recovered_wal_send_started_conn(conn, binding, identity, attempt, candidate)
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn record_recovered_witnessed(
+        &self,
+        binding: &WalOwnerStoreBinding,
+        identity: WalOperationIdentity,
+        attempt: &WalOwnerAttempt,
+        witnessed: WitnessedWalCandidate,
+    ) -> std::result::Result<WalOwnerStoreBinding, WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            record_recovered_wal_witnessed_conn(conn, binding, identity, attempt, &witnessed)
+        })
+        .await
+        .map_err(map_wal_persistence_error)
+    }
+
+    async fn require_manual(
+        &self,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+    ) -> std::result::Result<(), WalOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            require_wal_manual_conn(conn, context).map(|changed| ((), changed))
+        })
+        .await
+        .map_err(map_wal_persistence_error)
     }
 }
 
@@ -20637,6 +22830,796 @@ mod tests {
             .unwrap();
         assert!(maintenance_import_record_conn(&conn, operation_id).is_err());
         assert!(maintenance_import_plan_conn(&conn, USER_ID).is_err());
+    }
+
+    fn wal_owner_records(
+        archive_id: ArchiveId,
+    ) -> (
+        crate::archive_v3_witness::WitnessRecord,
+        crate::archive_v3_witness::WitnessRecord,
+    ) {
+        use crate::archive_v3::{DatabaseEpoch, KeyEpoch};
+        use crate::archive_v3_witness::{
+            InMemoryWitness, KeyRegistryReference, MigrationState, RootAdvance, RootCommitment,
+            RootReference, Witness, WitnessBootstrap,
+        };
+
+        let database_epoch = DatabaseEpoch::from_bytes([0xa1; 16]);
+        let key_epoch = KeyEpoch::from_bytes([0xa2; 16]);
+        let registry =
+            KeyRegistryReference::new(key_epoch, 0, ObjectId::from_bytes([0xa3; 16]), [0xa4; 32]);
+        let witness = InMemoryWitness::new();
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive_id,
+                database_epoch,
+                RootCommitment::genesis(
+                    database_epoch,
+                    key_epoch,
+                    RootReference::new(0, ObjectId::from_bytes([0xa5; 16]), [0xa6; 32]),
+                ),
+                registry,
+            ))
+            .unwrap();
+        let lease = witness
+            .acquire_lease(
+                archive_id,
+                database_epoch,
+                key_epoch,
+                ObjectId::from_bytes([0xa7; 16]),
+                900,
+            )
+            .unwrap();
+        let legacy = witness.read_current(archive_id).unwrap().unwrap();
+        let shadow_root = legacy
+            .with_candidate_root_for_test(
+                RootReference::new(1, ObjectId::from_bytes([0xa8; 16]), [0xa9; 32]),
+                lease.fencing_epoch(),
+            )
+            .root();
+        let shadow = legacy
+            .exact_migration_candidate(
+                &RootAdvance::new(lease, legacy.root(), registry, shadow_root),
+                MigrationState::ShadowWal,
+            )
+            .unwrap();
+        let current_root = shadow
+            .with_candidate_root_for_test(
+                RootReference::new(2, ObjectId::from_bytes([0xaa; 16]), [0xab; 32]),
+                lease.fencing_epoch(),
+            )
+            .root();
+        let current = shadow
+            .exact_migration_candidate(
+                &RootAdvance::new(lease, shadow.root(), registry, current_root),
+                MigrationState::WalAuthoritative,
+            )
+            .unwrap();
+        let next = current.with_candidate_root_for_test(
+            RootReference::new(3, ObjectId::from_bytes([0xac; 16]), [0xad; 32]),
+            lease.fencing_epoch(),
+        );
+        (current, next)
+    }
+
+    fn wal_owner_fixture(
+        conn: &Connection,
+    ) -> (
+        WalOwnerStoreBinding,
+        WalOperationIdentity,
+        crate::archive_v3_witness::WitnessRecord,
+    ) {
+        let archive_id = validate_active_archive_binding_conn(conn, USER_ID)
+            .unwrap()
+            .archive_id();
+        let _ = maintenance_import_plan_conn(conn, USER_ID).unwrap();
+        let (current, next) = wal_owner_records(archive_id);
+        (
+            WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap(),
+            WalOperationIdentity::for_test(
+                crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
+                0xb1,
+                0xb2,
+            ),
+            next,
+        )
+    }
+
+    fn materialize_wal_test_candidate(
+        conn: &Connection,
+        binding: &WalOwnerStoreBinding,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        next: &crate::archive_v3_witness::WitnessRecord,
+        capture: [u8; 32],
+    ) -> WalPublicationCandidate {
+        let root = next.root().root();
+        for (ordinal, role, location, object_id, hash) in [
+            (
+                0,
+                ObjectRole::WalSegmentV3,
+                LogicalLocation::Wal {
+                    root_seq: root.sequence(),
+                    wal_generation: 1,
+                    segment_index: 0,
+                },
+                ObjectId::from_bytes([0xb8; 16]),
+                [0xb9; 32],
+            ),
+            (
+                1,
+                ObjectRole::WalCommitDescriptorV3,
+                LogicalLocation::WalCommitDescriptor {
+                    root_seq: root.sequence(),
+                },
+                ObjectId::from_bytes([0xba; 16]),
+                [0xbb; 32],
+            ),
+            (
+                2,
+                ObjectRole::RootV3,
+                LogicalLocation::Root {
+                    root_seq: root.sequence(),
+                },
+                root.object_id(),
+                root.ciphertext_hash(),
+            ),
+        ] {
+            let parent =
+                (role == ObjectRole::RootV3).then_some(crate::archive_v3::ParentReference {
+                    object_id: binding.root().object_id(),
+                    envelope_hash: binding.root().ciphertext_hash(),
+                });
+            let object_context = ObjectContext::new(
+                binding.archive_id(),
+                binding.database_epoch(),
+                binding.key_epoch(),
+                role,
+                location,
+                object_id,
+                parent,
+            )
+            .unwrap();
+            let artifact =
+                WalPublicationArtifact::for_control_test(context, ordinal, &object_context, hash)
+                    .unwrap();
+            assert!(reserve_wal_artifact_conn(conn, context, &artifact).unwrap());
+            assert!(materialize_wal_artifact_conn(conn, context, &artifact).unwrap());
+        }
+        let artifacts = authenticate_wal_artifact_set_conn(conn, context, capture, 1, 1).unwrap();
+        WalPublicationCandidate::for_persistence_test(
+            context,
+            capture,
+            1,
+            1,
+            next.root(),
+            artifacts,
+        )
+        .unwrap()
+    }
+
+    fn wal_owner_instance(value: u8) -> WalOwnerInstanceId {
+        WalOwnerInstanceId::from_control_bytes(WalOwnerPersistenceContext::for_test(), [value; 16])
+            .unwrap()
+    }
+
+    fn reserve_one_wal_test_segment(
+        conn: &Connection,
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        ordinal: u32,
+    ) {
+        let object_id = ObjectId::from_bytes([0xd0_u8.wrapping_add(ordinal as u8); 16]);
+        let object_context = ObjectContext::new(
+            context.binding().archive_id(),
+            context.binding().database_epoch(),
+            context.binding().key_epoch(),
+            ObjectRole::WalSegmentV3,
+            LogicalLocation::Wal {
+                root_seq: context.binding().root().sequence() + 1,
+                wal_generation: context.wal_generation(),
+                segment_index: ordinal,
+            },
+            object_id,
+            None,
+        )
+        .unwrap();
+        let artifact = WalPublicationArtifact::for_control_test(
+            context,
+            ordinal,
+            &object_context,
+            [0xe0_u8.wrapping_add(ordinal as u8); 32],
+        )
+        .unwrap();
+        assert!(reserve_wal_artifact_conn(conn, context, &artifact).unwrap());
+        assert!(materialize_wal_artifact_conn(conn, context, &artifact).unwrap());
+    }
+
+    fn wal_test_artifact(
+        context: &crate::archive_v3_wal_owner::WalOwnerContext,
+        ordinal: u32,
+        role: ObjectRole,
+    ) -> WalPublicationArtifact {
+        let root_seq = context.binding().root().sequence() + 1;
+        let location = match role {
+            ObjectRole::WalSegmentV3 => LogicalLocation::Wal {
+                root_seq,
+                wal_generation: context.wal_generation(),
+                segment_index: ordinal,
+            },
+            ObjectRole::WalCommitDescriptorV3 => LogicalLocation::WalCommitDescriptor { root_seq },
+            ObjectRole::RootV3 => LogicalLocation::Root { root_seq },
+            _ => unreachable!(),
+        };
+        let parent = (role == ObjectRole::RootV3).then_some(crate::archive_v3::ParentReference {
+            object_id: context.binding().root().object_id(),
+            envelope_hash: context.binding().root().ciphertext_hash(),
+        });
+        let object_id = ObjectId::from_bytes([0x40_u8.wrapping_add(ordinal as u8); 16]);
+        let object_context = ObjectContext::new(
+            context.binding().archive_id(),
+            context.binding().database_epoch(),
+            context.binding().key_epoch(),
+            role,
+            location,
+            object_id,
+            parent,
+        )
+        .unwrap();
+        WalPublicationArtifact::for_control_test(
+            context,
+            ordinal,
+            &object_context,
+            [0x60_u8.wrapping_add(ordinal as u8); 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wal_owner_control_protocol_is_exact_monotone_and_restart_stable() {
+        let conn = account_conn();
+        let (binding, identity, next) = wal_owner_fixture(&conn);
+        let instance = wal_owner_instance(0xaf);
+        let prepared =
+            prepare_wal_owner_operation_conn(&conn, &binding, instance, identity).unwrap();
+        assert_eq!(prepared.0.stage(), WalPublicationStage::Prepared);
+        assert!(prepared.1);
+        assert!(
+            !prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+                .unwrap()
+                .1
+        );
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            identity,
+            prepared.0.owner_id(),
+            instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0xb3; 16]),
+            prepared.0,
+            1,
+        )
+        .unwrap();
+        let capture = [0xb4; 32];
+        assert_eq!(
+            record_wal_captured_conn(&conn, &context, capture, 1, 1)
+                .unwrap()
+                .0
+                .stage(),
+            WalPublicationStage::Captured
+        );
+        let candidate = materialize_wal_test_candidate(&conn, &binding, &context, &next, capture);
+        assert_eq!(
+            record_wal_candidate_conn(&conn, &context, capture, &candidate)
+                .unwrap()
+                .0
+                .stage(),
+            WalPublicationStage::CandidateReady
+        );
+        let retained = prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+            .unwrap()
+            .0;
+        assert_eq!(retained.candidate(), Some(&candidate));
+        let send_started =
+            mark_recovered_wal_send_started_conn(&conn, &binding, identity, &retained, &candidate)
+                .unwrap()
+                .0;
+        assert_eq!(send_started.stage(), WalPublicationStage::SendStarted);
+        let witnessed = WitnessedWalCandidate::for_control_test(candidate.clone(), next).unwrap();
+        let (next_binding, changed) = record_recovered_wal_witnessed_conn(
+            &conn,
+            &binding,
+            identity,
+            &send_started,
+            &witnessed,
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            load_wal_owner_attempt_conn(&conn, &next_binding, identity)
+                .unwrap()
+                .stage(),
+            WalPublicationStage::Witnessed
+        );
+        let (replayed_binding, changed) = record_recovered_wal_witnessed_conn(
+            &conn,
+            &binding,
+            identity,
+            &send_started,
+            &witnessed,
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(replayed_binding, next_binding);
+    }
+
+    #[test]
+    fn wal_owner_pending_candidate_successor_reopens_and_terminalizes_without_new_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wal-owner-pending-success.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (binding, identity, next) = wal_owner_fixture(&conn);
+        let instance = wal_owner_instance(0x91);
+        let prepared = prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+            .unwrap()
+            .0;
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            identity,
+            prepared.owner_id(),
+            instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0x92; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        let capture = [0x93; 32];
+        record_wal_captured_conn(&conn, &context, capture, 1, 1).unwrap();
+        let candidate = materialize_wal_test_candidate(&conn, &binding, &context, &next, capture);
+        record_wal_candidate_conn(&conn, &context, capture, &candidate).unwrap();
+        let retained = mark_recovered_wal_send_started_conn(
+            &conn,
+            &binding,
+            identity,
+            &load_wal_owner_attempt_conn(&conn, &binding, identity).unwrap(),
+            &candidate,
+        )
+        .unwrap()
+        .0;
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let next_binding = WalOwnerStoreBinding::from_authenticated_witness(&next).unwrap();
+        let reopened = inspect_wal_owner_operation_conn(&conn, &next_binding, identity).unwrap();
+        let WalOwnerAdmission::Retained(reopened) = reopened else {
+            panic!("pending publication was not retained");
+        };
+        assert_eq!(reopened.stage(), WalPublicationStage::SendStarted);
+        let witnessed = WitnessedWalCandidate::for_control_test(candidate, next).unwrap();
+        assert!(
+            record_recovered_wal_witnessed_conn(
+                &conn,
+                &next_binding,
+                identity,
+                &reopened,
+                &witnessed,
+            )
+            .unwrap()
+            .1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_wal_publication_attempts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(retained.attempt(), 1);
+        assert!(matches!(
+            inspect_wal_owner_operation_conn(&conn, &next_binding, identity).unwrap(),
+            WalOwnerAdmission::SettledExactOperation
+        ));
+    }
+
+    #[test]
+    fn wal_owner_artifact_reservation_rejects_nonterminal_and_postterminal_roles() {
+        let conn = account_conn();
+        let (binding, identity, _) = wal_owner_fixture(&conn);
+        let instance = wal_owner_instance(0x94);
+        let prepared = prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+            .unwrap()
+            .0;
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding,
+            identity,
+            prepared.owner_id(),
+            instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0x95; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        record_wal_captured_conn(&conn, &context, [0x96; 32], 1, 1).unwrap();
+        assert!(reserve_wal_artifact_conn(
+            &conn,
+            &context,
+            &wal_test_artifact(&context, 0, ObjectRole::RootV3),
+        )
+        .is_err());
+        assert!(reserve_wal_artifact_conn(
+            &conn,
+            &context,
+            &wal_test_artifact(&context, 0, ObjectRole::WalSegmentV3),
+        )
+        .unwrap());
+        assert!(reserve_wal_artifact_conn(
+            &conn,
+            &context,
+            &wal_test_artifact(&context, 1, ObjectRole::WalCommitDescriptorV3),
+        )
+        .unwrap());
+        for role in [ObjectRole::WalSegmentV3, ObjectRole::WalCommitDescriptorV3] {
+            assert!(reserve_wal_artifact_conn(
+                &conn,
+                &context,
+                &wal_test_artifact(&context, 2, role),
+            )
+            .is_err());
+        }
+        assert!(reserve_wal_artifact_conn(
+            &conn,
+            &context,
+            &wal_test_artifact(&context, 2, ObjectRole::RootV3),
+        )
+        .unwrap());
+        assert!(reserve_wal_artifact_conn(
+            &conn,
+            &context,
+            &wal_test_artifact(&context, 3, ObjectRole::WalSegmentV3),
+        )
+        .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_wal_publication_artifacts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn wal_owner_durable_identity_is_archive_kind_and_operation_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wal-owner-kind-scope.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (binding, first_identity, next) = wal_owner_fixture(&conn);
+        let first_instance = wal_owner_instance(0x97);
+        let prepared =
+            prepare_wal_owner_operation_conn(&conn, &binding, first_instance, first_identity)
+                .unwrap()
+                .0;
+        let first_session = prepared.session_id();
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            first_identity,
+            prepared.owner_id(),
+            first_instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0x98; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        let capture = [0x99; 32];
+        record_wal_captured_conn(&conn, &context, capture, 1, 1).unwrap();
+        let candidate = materialize_wal_test_candidate(&conn, &binding, &context, &next, capture);
+        record_wal_candidate_conn(&conn, &context, capture, &candidate).unwrap();
+        let send = mark_recovered_wal_send_started_conn(
+            &conn,
+            &binding,
+            first_identity,
+            &load_wal_owner_attempt_conn(&conn, &binding, first_identity).unwrap(),
+            &candidate,
+        )
+        .unwrap()
+        .0;
+        let witnessed = WitnessedWalCandidate::for_control_test(candidate, next.clone()).unwrap();
+        let next_binding =
+            record_recovered_wal_witnessed_conn(&conn, &binding, first_identity, &send, &witnessed)
+                .unwrap()
+                .0;
+        let second_identity = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::CaptureSessionFinish,
+            0xb1,
+            0x9a,
+        );
+        let second = prepare_wal_owner_operation_conn(
+            &conn,
+            &next_binding,
+            wal_owner_instance(0x9b),
+            second_identity,
+        )
+        .unwrap()
+        .0;
+        assert_ne!(first_session, second.session_id());
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        assert_eq!(
+            load_wal_owner_attempt_conn(&conn, &next_binding, second_identity)
+                .unwrap()
+                .stage(),
+            WalPublicationStage::Prepared
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(DISTINCT operation_kind)
+                 FROM archive_v3_wal_publication_attempts WHERE operation_id=?1",
+                [first_identity.operation_id().as_bytes().as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn wal_owner_control_rejects_alternate_identity_candidate_and_corrupt_rows() {
+        let conn = account_conn();
+        let (binding, identity, next) = wal_owner_fixture(&conn);
+        let instance = wal_owner_instance(0xb0);
+        let prepared = prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+            .unwrap()
+            .0;
+        let alternate = WalOperationIdentity::for_test(
+            crate::archive_v3_wal_idempotency::WalOperationKind::MediaCaptureEvent,
+            0xb1,
+            0xb5,
+        );
+        assert!(prepare_wal_owner_operation_conn(&conn, &binding, instance, alternate).is_err());
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            identity,
+            prepared.owner_id(),
+            instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0xb6; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        let capture = [0xb7; 32];
+        record_wal_captured_conn(&conn, &context, capture, 1, 1).unwrap();
+        let artifact_set = AuthenticatedWalArtifactSet::from_control_validation(
+            WalOwnerPersistenceContext::for_test(),
+            &context,
+            capture,
+            1,
+            1,
+            1,
+            [0xcf; 32],
+        )
+        .unwrap();
+        let candidate = WalPublicationCandidate::for_persistence_test(
+            &context,
+            capture,
+            1,
+            1,
+            next.root(),
+            artifact_set,
+        )
+        .unwrap();
+        assert!(record_wal_candidate_conn(&conn, &context, capture, &candidate).is_err());
+
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_wal_publications SET stage='unknown' WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        assert!(load_wal_owner_attempt_conn(&conn, &binding, identity).is_err());
+    }
+
+    #[test]
+    fn wal_owner_control_rejects_materialized_artifact_substitution() {
+        let conn = account_conn();
+        let (binding, identity, next) = wal_owner_fixture(&conn);
+        let instance = wal_owner_instance(0xb1);
+        let prepared = prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+            .unwrap()
+            .0;
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            identity,
+            prepared.owner_id(),
+            instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0xbc; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        let capture = [0xbd; 32];
+        record_wal_captured_conn(&conn, &context, capture, 1, 1).unwrap();
+        let candidate = materialize_wal_test_candidate(&conn, &binding, &context, &next, capture);
+        record_wal_candidate_conn(&conn, &context, capture, &candidate).unwrap();
+
+        conn.execute(
+            "UPDATE archive_v3_wal_publication_artifacts SET ciphertext_hash=?1
+             WHERE archive_id=?2 AND operation_id=?3 AND attempt=1 AND ordinal=0",
+            rusqlite::params![
+                [0xbeu8; 32].as_slice(),
+                binding.archive_id().as_bytes().as_slice(),
+                identity.operation_id().as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+        assert!(load_wal_owner_attempt_conn(&conn, &binding, identity).is_err());
+    }
+
+    #[test]
+    fn wal_owner_schema_rejects_null_zero_skip_and_out_of_order_geometry() {
+        let conn = account_conn();
+        let (binding, identity, _) = wal_owner_fixture(&conn);
+        prepare_wal_owner_operation_conn(&conn, &binding, wal_owner_instance(0xb2), identity)
+            .unwrap();
+        for sql in [
+            "UPDATE archive_v3_wal_publications SET expected_wal_generation=1 WHERE stage='prepared'",
+            "UPDATE archive_v3_wal_publications SET stage='captured' WHERE stage='prepared'",
+            "UPDATE archive_v3_wal_publications SET capture_commitment=zeroblob(32) WHERE stage='prepared'",
+            "UPDATE archive_v3_wal_publications SET attempt=17",
+            "UPDATE archive_v3_wal_owners SET binding_commitment=zeroblob(32)",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "accepted illegal SQL: {sql}");
+        }
+    }
+
+    #[test]
+    fn wal_owner_fresh_process_supersedes_precandidate_attempt_and_retains_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wal-owner-control.sqlite");
+        let conn = lifecycle_file_conn(&path);
+        let (binding, identity, _) = wal_owner_fixture(&conn);
+        let first_instance = wal_owner_instance(0xc0);
+        let prepared = prepare_wal_owner_operation_conn(&conn, &binding, first_instance, identity)
+            .unwrap()
+            .0;
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            identity,
+            prepared.owner_id(),
+            first_instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0xc1; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        record_wal_captured_conn(&conn, &context, [0xc2; 32], 1, 1).unwrap();
+        reserve_one_wal_test_segment(&conn, &context, 0);
+        drop(conn);
+
+        let conn = lifecycle_file_conn(&path);
+        let (binding, identity, _) = wal_owner_fixture(&conn);
+        let second_instance = wal_owner_instance(0xc3);
+        let second = prepare_wal_owner_operation_conn(&conn, &binding, second_instance, identity)
+            .unwrap()
+            .0;
+        assert_eq!(second.attempt(), 2);
+        assert_eq!(second.stage(), WalPublicationStage::Prepared);
+        assert_eq!(second.owner_instance_id(), second_instance);
+        let (superseded, retained_artifacts): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   (SELECT count(*) FROM archive_v3_wal_publication_attempts WHERE state='superseded'),
+                   (SELECT count(*) FROM archive_v3_wal_publication_artifacts WHERE attempt=1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((superseded, retained_artifacts), (1, 1));
+        assert_eq!(
+            prepare_wal_owner_operation_conn(&conn, &binding, second_instance, identity)
+                .unwrap()
+                .0
+                .attempt(),
+            2
+        );
+
+        for value in 0xc4..=0xd1 {
+            let current = prepare_wal_owner_operation_conn(
+                &conn,
+                &binding,
+                wal_owner_instance(value),
+                identity,
+            )
+            .unwrap()
+            .0;
+            assert!(current.attempt() <= MAX_WAL_OWNER_ATTEMPTS);
+        }
+        assert!(prepare_wal_owner_operation_conn(
+            &conn,
+            &binding,
+            wal_owner_instance(0xd2),
+            identity,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wal_owner_loader_rejects_unknown_format_and_manual_shapes_reopen_exactly() {
+        let conn = account_conn();
+        let (binding, identity, _next) = wal_owner_fixture(&conn);
+        let instance = wal_owner_instance(0xd3);
+        let prepared = prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+            .unwrap()
+            .0;
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            identity,
+            prepared.owner_id(),
+            instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0xd4; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        let capture = [0xd5; 32];
+        record_wal_captured_conn(&conn, &context, capture, 1, 1).unwrap();
+        assert!(require_wal_manual_conn(&conn, &context).unwrap());
+        assert!(!require_wal_manual_conn(&conn, &context).unwrap());
+        assert_eq!(
+            load_wal_owner_attempt_conn(&conn, &binding, identity)
+                .unwrap()
+                .stage(),
+            WalPublicationStage::ManualRequired
+        );
+
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_wal_publications SET format_version=99 WHERE archive_id=?1",
+            [binding.archive_id().as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        assert!(load_wal_owner_attempt_conn(&conn, &binding, identity).is_err());
+
+        let conn = account_conn();
+        let (binding, identity, next) = wal_owner_fixture(&conn);
+        let instance = wal_owner_instance(0xd6);
+        let prepared = prepare_wal_owner_operation_conn(&conn, &binding, instance, identity)
+            .unwrap()
+            .0;
+        let context = crate::archive_v3_wal_owner::WalOwnerContext::from_store(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            binding.clone(),
+            identity,
+            prepared.owner_id(),
+            instance,
+            crate::archive_v3_sqlite_vfs::CaptureStreamId::from_test_bytes([0xd7; 16]),
+            prepared,
+            1,
+        )
+        .unwrap();
+        let capture = [0xd8; 32];
+        record_wal_captured_conn(&conn, &context, capture, 1, 1).unwrap();
+        let candidate = materialize_wal_test_candidate(&conn, &binding, &context, &next, capture);
+        record_wal_candidate_conn(&conn, &context, capture, &candidate).unwrap();
+        mark_wal_send_started_conn(&conn, &context, &candidate).unwrap();
+        assert!(require_wal_manual_conn(&conn, &context).unwrap());
+        let reopened = load_wal_owner_attempt_conn(&conn, &binding, identity).unwrap();
+        assert_eq!(reopened.stage(), WalPublicationStage::ManualRequired);
+        assert_eq!(reopened.candidate(), Some(&candidate));
     }
 
     #[test]

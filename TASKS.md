@@ -168,16 +168,21 @@ separate activation blockers.
   constructors on legacy snapshots and rejects generic mutation, dirty save or
   eviction, legacy-envelope rewrite, and schema migration without provider PUT.
 - [x] Structurally pin all 148 production Store mutation/save call expressions,
-  all 15 factory-definition/call/literal construction sites, every policy
-  selector/reference, and 17 worker spawns—including full owning bodies and
+  all 15 factory-definition/call/literal construction sites, all 41 policy
+  selectors/references, and 21 async or dedicated-thread worker spawns—including full owning bodies and
   cross-helper B dependencies—in an exact reviewed A/B/C inventory. Scanner
   fixtures prove comments/literals/test items/nested functions, qualified calls,
   new factories, or conditional-main policy selection cannot hide drift.
 - [x] Keep capture/result acknowledgement, archive publication, root/witness
   authority, routes, workers, startup/config, providers, cloud mutation, and
   deployment entirely disconnected.
-- [ ] Implement separately reviewed operation-specific A-domain owners and WAL
-  publication/reconciliation; refactor B domains with stable attempt identity;
+- [x] Add the inactive one-owner local mutation/capture and durable publication
+  protocol with a dedicated SQLite blocking lane, exact pending-send recovery,
+  permanent authenticated current-staging replay, kind-scoped durable identity,
+  and deterministic bounded artifact topology. Only test publication/domain
+  implementations exist and no runtime construction or acknowledgement is wired.
+- [ ] Implement separately reviewed production A-domain codecs and the concrete
+  WAL publication/checkpoint worker; refactor B domains with stable attempt identity;
   keep C domains fail-closed before enabling the Store policy outside tests.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.

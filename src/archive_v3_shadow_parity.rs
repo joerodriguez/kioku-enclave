@@ -333,6 +333,135 @@ pub(crate) struct OwnedPrivateStagedSqliteCopy {
     cleanup_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+/// Recovery-minted staging authority for one exact WalAuthoritative head. The
+/// owned path never leaves this value; Store can only consume it together with
+/// the exact witness binding authenticated during recovery.
+pub(crate) struct AuthenticatedWalOwnerStaging {
+    owned: OwnedPrivateStagedSqliteCopy,
+    archive_id: crate::archive_v3::ArchiveId,
+    database_epoch: crate::archive_v3::DatabaseEpoch,
+    key_epoch: crate::archive_v3::KeyEpoch,
+    root: crate::archive_v3_witness::RootReference,
+    binding_commitment: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    final_plaintext_hash: [u8; 32],
+    checkpoint_len: u64,
+    schema_version: u32,
+}
+
+impl AuthenticatedWalOwnerStaging {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        path: PathBuf,
+        binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+        schema_version: u32,
+    ) -> Result<Self, ShadowParityError> {
+        let owned = OwnedPrivateStagedSqliteCopy::for_wal_owner_test(path)?;
+        let bytes =
+            std::fs::read(&owned.copy.path).map_err(|_| ShadowParityError::InvalidStagedCopy)?;
+        Ok(Self {
+            archive_id: binding.archive_id(),
+            database_epoch: binding.database_epoch(),
+            key_epoch: binding.key_epoch(),
+            root: binding.root(),
+            binding_commitment: binding.commitment(),
+            checkpoint_hash: sha2::Sha256::digest(&bytes).into(),
+            final_plaintext_hash: sha2::Sha256::digest(&bytes).into(),
+            checkpoint_len: u64::try_from(bytes.len())
+                .map_err(|_| ShadowParityError::InvalidStagedCopy)?,
+            schema_version,
+            owned,
+        })
+    }
+
+    pub(super) fn from_exact_recovery(
+        owned: OwnedPrivateStagedSqliteCopy,
+        recovery: &crate::archive_v3_witness::RecoveryRoot,
+        checkpoint: &crate::archive_v3_shadow_checkpoint::UploadedCheckpoint,
+        recovered: &crate::archive_v3_shadow_wal::RecoveredWitnessWal,
+        binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+    ) -> Result<Self, ShadowParityError> {
+        if recovery.migration() != crate::archive_v3_witness::MigrationState::WalAuthoritative
+            || recovery.deletion() != crate::archive_v3_witness::DeletionState::Active
+            || recovery.archive_id() != binding.archive_id()
+            || recovery.root().root() != binding.root()
+            || recovery.root().database_epoch() != binding.database_epoch()
+            || recovery.registry().key_epoch() != binding.key_epoch()
+            || checkpoint.logical_file_length() == 0
+            || checkpoint.database_plaintext_hash() == [0; 32]
+        {
+            return Err(ShadowParityError::InvalidStagedCopy);
+        }
+        owned.copy.validate_unchanged()?;
+        let final_bytes =
+            std::fs::read(&owned.copy.path).map_err(|_| ShadowParityError::InvalidStagedCopy)?;
+        let final_plaintext_hash: [u8; 32] = sha2::Sha256::digest(&final_bytes).into();
+        Ok(Self {
+            owned,
+            archive_id: recovery.archive_id(),
+            database_epoch: recovery.root().database_epoch(),
+            key_epoch: recovery.registry().key_epoch(),
+            root: recovery.root().root(),
+            binding_commitment: binding.commitment(),
+            checkpoint_hash: checkpoint.database_plaintext_hash(),
+            final_plaintext_hash,
+            checkpoint_len: recovered.logical_file_length(),
+            schema_version: recovered.user_schema_version(),
+        })
+    }
+
+    pub(crate) fn path_for_store(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+        binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+    ) -> Result<&Path, ShadowParityError> {
+        if self.archive_id != binding.archive_id()
+            || self.database_epoch != binding.database_epoch()
+            || self.key_epoch != binding.key_epoch()
+            || self.root != binding.root()
+            || self.binding_commitment != binding.commitment()
+            || self.checkpoint_hash == [0; 32]
+            || self.final_plaintext_hash == [0; 32]
+            || self.checkpoint_len == 0
+        {
+            return Err(ShadowParityError::InvalidStagedCopy);
+        }
+        self.owned.copy.validate_unchanged()?;
+        Ok(&self.owned.copy.path)
+    }
+
+    pub(crate) fn validate_opened(
+        &self,
+        token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+        binding: &crate::archive_v3_wal_owner::WalOwnerStoreBinding,
+        connection: &rusqlite::Connection,
+    ) -> Result<(), ShadowParityError> {
+        let path = self.path_for_store(token, binding)?;
+        let metadata = std::fs::metadata(path).map_err(|_| ShadowParityError::InvalidStagedCopy)?;
+        let schema: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|_| ShadowParityError::InvalidStagedCopy)?;
+        if metadata.len() != self.checkpoint_len || schema != self.schema_version {
+            return Err(ShadowParityError::InvalidStagedCopy);
+        }
+        let bytes = std::fs::read(path).map_err(|_| ShadowParityError::InvalidStagedCopy)?;
+        // Reading the exact bytes here closes the post-proof replacement race;
+        // the authenticated checkpoint hash remains bound comparison data,
+        // while WAL replay may legitimately change the final database hash.
+        let final_plaintext_hash: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        if final_plaintext_hash != self.final_plaintext_hash {
+            return Err(ShadowParityError::InvalidStagedCopy);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AuthenticatedWalOwnerStaging {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedWalOwnerStaging(<redacted>)")
+    }
+}
+
 impl OwnedPrivateStagedSqliteCopy {
     pub(super) fn from_recovery_proof(
         proof: CompositeRecoveryProof,
@@ -351,6 +480,22 @@ impl OwnedPrivateStagedSqliteCopy {
     #[cfg(test)]
     pub(crate) fn path_for_test(&self) -> &Path {
         &self.copy.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_wal_owner_test(path: PathBuf) -> Result<Self, ShadowParityError> {
+        Self::from_recovery_proof(CompositeRecoveryProof::for_test(path))
+    }
+
+    /// Producer-gated borrow for the inactive single-archive WAL owner. The
+    /// path never crosses that Store constructor and this owned staging value
+    /// remains responsible for scrubbing the SQLite family on drop.
+    pub(crate) fn path_for_wal_owner(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+    ) -> Result<&Path, ShadowParityError> {
+        self.copy.validate_unchanged()?;
+        Ok(&self.copy.path)
     }
 
     #[cfg(test)]

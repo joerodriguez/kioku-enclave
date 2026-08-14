@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::archive_v3::{ArchiveV3Error, ImmutableReference, ObjectId, Result, SQLITE_PAGE_SIZE};
@@ -40,6 +41,8 @@ pub const MAX_COMPLETED_SHADOW_COMMITS: usize = 8;
 /// bounds steady-state retained payload bytes to 16 MiB per owner state.
 pub const MAX_COMPLETED_SHADOW_BYTES: usize = MAX_SHADOW_WAL_BYTES;
 const MAX_COVERAGE_RANGES: usize = 4_096;
+const CAPTURE_PUBLICATION_COMMITMENT_DOMAIN: &[u8] =
+    b"kioku/archive-v3/wal-owner-captured-commit/v1\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShadowCaptureFault {
@@ -99,6 +102,23 @@ impl CapturedWalCommit {
 
     pub fn frame_count(&self) -> u32 {
         (self.frames.len() / SQLITE_WAL_FRAME_BYTES) as u32
+    }
+
+    /// Content-free commitment consumed by the durable publication protocol.
+    /// It binds the exact captured bytes without exposing them through the
+    /// owner/control boundary.
+    pub(crate) fn publication_commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(CAPTURE_PUBLICATION_COMMITMENT_DOMAIN);
+        hasher.update(self.wal_generation.to_be_bytes());
+        hasher.update(self.first_frame_no.to_be_bytes());
+        hasher.update(self.frame_count().to_be_bytes());
+        hasher.update(self.checksum_before[0].to_be_bytes());
+        hasher.update(self.checksum_before[1].to_be_bytes());
+        hasher.update(self.wal_header);
+        hasher.update((self.frames.len() as u64).to_be_bytes());
+        hasher.update(&self.frames);
+        hasher.finalize().into()
     }
 
     /// Convert a bounded one-object capture through the existing archive-v3
@@ -419,6 +439,37 @@ impl WalCaptureState {
         }
         self.completed_bytes = remaining_bytes;
         Some(commits)
+    }
+
+    /// Restore an exact previously drained prefix ahead of commits observed
+    /// later. This is used only by the owner-scoped publication lease when a
+    /// candidate has not durably settled. The original ordering and byte
+    /// accounting are restored; any impossible bound/accounting state fails
+    /// closed and lets the owned commits zeroize on drop.
+    pub(crate) fn restore_completed_prefix(
+        &mut self,
+        mut commits: Vec<CapturedWalCommit>,
+    ) -> std::result::Result<(), Vec<CapturedWalCommit>> {
+        let restored_bytes = match commits.iter().try_fold(0usize, |total, commit| {
+            total.checked_add(commit.frames.len())
+        }) {
+            Some(value) => value,
+            None => return Err(commits),
+        };
+        if self.disabled.is_some()
+            || self.completed.len().saturating_add(commits.len()) > MAX_COMPLETED_SHADOW_COMMITS
+            || self
+                .completed_bytes
+                .checked_add(restored_bytes)
+                .is_none_or(|value| value > MAX_COMPLETED_SHADOW_BYTES)
+        {
+            return Err(commits);
+        }
+        while let Some(commit) = commits.pop() {
+            self.completed.push_front(commit);
+        }
+        self.completed_bytes += restored_bytes;
+        Ok(())
     }
 
     pub(crate) fn completed_len(&self) -> usize {

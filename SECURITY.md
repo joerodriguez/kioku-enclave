@@ -854,7 +854,8 @@ write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C
 purge, source-keyless legacy ingest, retired episode mutations, arbitrary Store SQL, and account
 deletion. A structural source inventory pins every production Store mutation/save call (including
 qualified forms), every factory definition/call and Store literal, every persistence-policy
-reference/assignment, and every worker spawn by exact owner/expression hashes. A new factory,
+reference/assignment, and every async or dedicated-thread worker spawn by exact owner/expression
+hashes. A new factory,
 visibility change, conditional runtime selector, or call site therefore requires renewed review.
 
 Every live Store constructor still selects legacy whole-snapshot persistence. The private
@@ -865,9 +866,54 @@ temporary-file creation, or provider upload. Existing plaintext is preflighted a
 checkpointed main database with no exact `-wal`/`-shm` sidecars, then opened through an immutable
 read-only SQLite URI. Schema compatibility is checked against a separately constructed current
 schema, and both successful and schema-failing opens leave the main file present with no sidecar.
-This slice has no WAL publisher, Store operation owner,
-capture/root/witness transition, runtime selector, route, worker, provider, cloud, or deployment
-wiring and does not activate archive-v3 persistence.
+This inactive slice adds a private, single-archive local owner without changing that live Store
+policy. A dedicated `SingleArchiveWalStoreOwner` can be created only from an owned authenticated
+private recovery copy, an exact Active/WalAuthoritative witness binding, a private owner token, and
+an owned capture installation. It is disjoint from the ordinary Store registry and legacy object
+paths. It accepts only a sealed `PreparedLogicalMutation`; the domain resolver and mutation share
+one `BEGIN IMMEDIATE`, and both Applied and Replayed retain the exact bounded opaque result. No
+connection, SQL, raw result bytes, provider acknowledgement, root selector, or generic closure
+escapes that boundary. The SQLite connection and capture registration stay on one owned blocking
+thread; the Tokio actor exchanges only sealed commands and opaque results, so stalled SQLite work
+cannot stall unrelated async work.
+
+After a first apply, capture admits exactly one complete commit and transfers a non-cloneable drain
+to the actor. A second mutation is blocked while that drain is outstanding. Dropping it before an
+authenticated settlement restores the exact prefix at the front of the live queue; retiring the
+registration instead zeroizes the detached frames. Encrypted control separately commits versioned
+owner, publication, attempt, and immutable-artifact rows through cancellation-safe owned flushes.
+Durable operation/session/attempt/artifact identity is the exact archive, operation kind, and
+domain operation-ID tuple; equal IDs in different domains cannot collide or substitute.
+Stages are monotonic Prepared, Captured, CandidateReady, SendStarted, and Witnessed, with a terminal
+ManualRequired branch. Every row binds the exact archive/database/key/root witness, operation ID,
+fingerprint, process instance, session/attempt, WAL generation, first frame/count, capture, and the
+complete canonical AAD/key/role/hash topology for one to sixteen segments followed by exactly one
+descriptor and root. Reserve-time transitions reject a descriptor before a nonempty dense segment
+prefix, a second descriptor, or anything after the root before provider creation; candidate fanout
+must equal the uploader's fixed captured-frame split. The immutable expected full witness remains retained through terminal state;
+the candidate commits its exact ordinary-root transition input and the separately stored observed
+provider record may differ only by the provider-derived monotonic tick. Fresh-process recovery may
+supersede only Prepared/Captured attempts, retains every old artifact row for deletion inventory,
+and consumes one of the fixed sixteen attempts before recreating a WAL with new SQLite salts.
+CandidateReady/SendStarted recovery reconciles before the old-head gate and accepts only the
+retained expected witness or the candidate's exact authenticated successor, so a lost successful
+send cannot cause a second mutation or provider send. Only exact durable replay is idempotent;
+alternate identity, result, capture, frame geometry, candidate,
+artifact prefix/AAD, expected/observed witness, stage, or unsupported/corrupt tuples fail closed.
+
+Submission moves a plan into the actor queue before awaiting its response, so caller cancellation
+cannot cancel work after the local commit. Replay results remain opaque until encrypted Control is
+read-only reconciled and a fresh provider-authenticated exact Active/WalAuthoritative head with the
+retained lease is read. The authenticated current staging database then supplies the permanent
+bounded per-domain result row, so operation A can replay after settled operation B without
+replacing B's terminal Control row or creating a publication. The process-local capture-stream commitment is included only in the settlement
+context, never persisted or logged, so an old receipt cannot consume a fresh registration's drain.
+Settlement alone advances the owner binding and releases the drain. PR A intentionally provides
+only a `cfg(test)` publication authority and test domain;
+there is no production immutable-object uploader, checkpoint worker, witness transport adapter,
+runtime constructor, startup/route/config selector, serving or acknowledgement surface, list/delete
+operation, or Store policy activation. Production Store constructors remain LegacySnapshot and the
+test-only `WalLogicalOnly` gate remains unchanged.
 
 Root objects are explicitly named as candidates. Crashes and CAS races may leave more
 than one immutable candidate for a sequence; none has authority unless the independent
