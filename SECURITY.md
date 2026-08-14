@@ -848,8 +848,9 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly two inactive production A-domains:
-capture-session finish and Vertex usage terminal outcome. Capture-session finish derives an opaque
+test-only 64-row/262,720-byte exemplar and now admits exactly three inactive production A-domains:
+capture-session finish, metadata-only screen-reference batch, and Vertex usage terminal outcome.
+Capture-session finish derives an opaque
 operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
 lazily creates only its distinct 65,536-row/128-MiB ledger schema within the same transaction. It
@@ -865,7 +866,15 @@ existing started row or exactly adopts the same pre-existing terminal facts, ref
 on the first transition, and retains the nine-byte unit result in its own
 1,048,576-row/32-MiB ledger. Missing or mismatched events, cap exhaustion, a late ledger insert,
 partial schema, and row/commitment tamper roll back or fail closed; exact replay survives reopen.
-All other production domain ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
+The screen-reference child accepts only the existing bounded contiguous Mac-screen reference batch,
+derives a subtype-separated opaque identity from its cross-language stable batch ID, and fingerprints
+the account plus complete normalized ordered manifests under the common 1-MiB limit. Exact reference
+preconditions, every new/duplicate row, contiguous stream acknowledgement, bounded canonical response,
+and its distinct 1,048,576-row/512-MiB ledger commit atomically. Missing or changed canonical evidence,
+a changed manifest under the same batch ID, cap exhaustion, late ledger failure, partial schema, and
+tamper roll back or fail closed; exact replay survives reopen. Canonical media upload remains outside
+this child behind its disabled B-domain media-DEK/provider handoff. All other production domain ledgers
+remain absent and unsupported. A future owner must commit a domain row and its mutation
 under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
 substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
 before actor admission, reconcile pending publication, commit the logical mutation and same-ID
@@ -878,10 +887,10 @@ publication.
 The reviewed operation inventory is deliberately asymmetric. Stable portable domain A contains
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
-and reviewer/backfill writes. Only capture-session finish and Vertex terminal outcome have
-production codecs so far; every other A operation remains disabled pending its own separately
-reviewed codec and the closed launcher. Vertex invocation begin remains B and is not admitted by the
-outcome child.
+and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch, and
+Vertex terminal outcome have production codecs so far; every other A operation remains disabled
+pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and
+canonical media's first DEK/provider handoff remain B and are not admitted by those children.
 Domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, Vertex begin, media-DEK first
 write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:

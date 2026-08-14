@@ -5,9 +5,13 @@
 
 //! Inactive WAL logical-operation codecs owned by Cloud Capture.
 //!
-//! This first production A-domain converts capture-session finish into one
-//! closed request/result codec and one distinct permanent ledger. It has no
-//! Store, route, launcher, provider, task, or acknowledgement authority.
+//! The parent converts capture-session finish into one closed request/result
+//! codec and distinct permanent ledger. Its private child separately converts
+//! the deterministic metadata-only screen-reference batch. Neither has Store,
+//! route, launcher, provider, task, or acknowledgement authority.
+
+mod reference_batch;
+pub(crate) use reference_batch::{MediaReferenceBatchLedger, MediaReferenceBatchPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use zeroize::Zeroizing;
