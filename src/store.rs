@@ -72,6 +72,10 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::{
+    archive_v3_maintenance_import::{
+        AuthenticatedMaintenanceImportPlan, MaintenanceImportOperationId, MaintenanceSourceBinding,
+        MaintenanceStorePlanView,
+    },
     archive_v3_sqlite_vfs::{CaptureRegistration, CaptureRegistry, RegisteredCaptureVfs},
     crypto::{
         decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, Dek, KmsClient,
@@ -445,6 +449,22 @@ struct PersistedLegacyWriteIntent {
     intent: LegacyWriteIntent,
 }
 
+fn valid_legacy_fence_authority(authority: &str) -> bool {
+    let suffix = if authority.starts_with("rebind_") || authority.starts_with("delete_") {
+        authority.get(7..)
+    } else if authority.starts_with("archive_") {
+        authority.get(8..)
+    } else {
+        None
+    };
+    suffix.is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
+}
+
 /// Store-owned two-namespace transition. Both lifecycle gates, raw-content
 /// admissions, and actor states remain fenced until `complete` makes only the
 /// stable namespace available. Dropping a pending transition deliberately
@@ -459,6 +479,165 @@ pub(crate) struct IdentityRebindTransition {
     stable_actor: Arc<UserActor>,
     old_state: OwnedMutexGuard<UserActorState>,
     _stable_state: OwnedMutexGuard<UserActorState>,
+}
+
+/// Unforgeable Store-side token for consuming the identity-bearing portion of
+/// an authenticated maintenance plan. No caller can extract that identity.
+pub(crate) struct StoreMaintenanceContext(());
+
+/// Store-owned one-user maintenance transition. Dropping it deliberately
+/// leaves durable/provider fences closed; restart must reauthenticate the
+/// encrypted control operation before obtaining another transition.
+pub(crate) struct ArchiveMaintenanceTransition {
+    store: Arc<Store>,
+    plan: MaintenanceStorePlanView,
+    _lifecycle_guard: OwnedMutexGuard<()>,
+    actor: Arc<UserActor>,
+    state: OwnedMutexGuard<UserActorState>,
+}
+
+/// Content-free tentative source facts observed while all local admissions
+/// are already closed but before the permanent provider marker is created.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaintenanceTentativeSource {
+    pub(crate) base_generation: i64,
+    pub(crate) plaintext_hash: [u8; 32],
+    pub(crate) plaintext_len: u64,
+    pub(crate) sqlite_schema_version: u32,
+    pub(crate) wrapped_dek_commitment: [u8; 32],
+}
+
+/// Owned, immutable plaintext snapshot. Its path and identity fields have no
+/// general getters; checkpoint/parity adapters borrow it through reviewed
+/// producer seams. Drop scrubs the database and both SQLite sidecars.
+pub(crate) struct PinnedLegacySnapshot {
+    path: PathBuf,
+    _archive_id: crate::archive_v3::ArchiveId,
+    _operation_id: MaintenanceImportOperationId,
+    source: MaintenanceSourceBinding,
+    _store: Arc<Store>,
+    _plan: MaintenanceStorePlanView,
+    _lifecycle_guard: OwnedMutexGuard<()>,
+    _actor: Arc<UserActor>,
+    _state: OwnedMutexGuard<UserActorState>,
+}
+
+/// Owned, one-shot exact-generation revalidation capability. Only a pinned
+/// maintenance snapshot can mint it; it carries no path or identity getters
+/// and owns only the provider handle plus the immutable source binding needed
+/// across asynchronous provider reads.
+pub(crate) struct MaintenanceGenerationRevalidation {
+    store: Arc<Store>,
+    user_id: UserId,
+    source: MaintenanceSourceBinding,
+}
+
+/// The permanent marker can serialize behind one already-admitted legacy
+/// writer. In that sole case Store retains every local gate and returns the
+/// newly authoritative, still-unmodified source so encrypted control can
+/// durably rebase before the mandatory generation bump is retried.
+pub(crate) enum MaintenanceFenceAndPin {
+    Pinned(PinnedLegacySnapshot),
+    Rebase {
+        transition: ArchiveMaintenanceTransition,
+        source: MaintenanceTentativeSource,
+    },
+}
+
+impl PinnedLegacySnapshot {
+    pub(crate) const fn source_binding(&self) -> MaintenanceSourceBinding {
+        self.source
+    }
+
+    pub(crate) fn path_for_checkpoint_source(
+        &self,
+        _token: crate::archive_v3_shadow_checkpoint::MaintenanceCheckpointSourceContext,
+    ) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn path_for_parity(
+        &self,
+        _token: crate::archive_v3_shadow_parity::MaintenanceParitySourceContext,
+    ) -> &Path {
+        &self.path
+    }
+
+    #[cfg(test)]
+    fn path_for_maintenance_test(&self) -> &Path {
+        &self.path
+    }
+
+    /// Mint the owned fresh-read capability immediately before parity becomes
+    /// durable. The pinned snapshot remains owned by the coordinator so its
+    /// lifecycle gates and scratch cleanup stay in force during revalidation.
+    pub(crate) fn exact_generation_revalidation(&self) -> MaintenanceGenerationRevalidation {
+        MaintenanceGenerationRevalidation {
+            store: Arc::clone(&self._store),
+            user_id: self._plan.user_id.clone(),
+            source: self.source,
+        }
+    }
+}
+
+impl MaintenanceGenerationRevalidation {
+    /// Fresh exact-generation revalidation. This performs no write and rejects
+    /// any envelope, metadata, plaintext, or schema substitution.
+    pub(crate) async fn verify(self) -> Result<()> {
+        let Self {
+            store,
+            user_id,
+            source,
+        } = self;
+        let source = source.store_view(StoreMaintenanceContext(()));
+        let object = store
+            .gcs
+            .get_object_generation(&gcs_object_name(&user_id), source.generation)
+            .await?;
+        if object.generation != source.generation
+            || <[u8; 32]>::from(Sha256::digest(object.wrapped_dek_b64.as_bytes()))
+                != source.wrapped_dek_commitment
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance pinned generation metadata changed".into(),
+            ));
+        }
+        let dek = load_dek(store.kms.as_ref(), &object.wrapped_dek_b64).await?;
+        let opened = decrypt_bound_blob(&dek, &object.ciphertext, &user_blob_context(&user_id))?;
+        if u64::try_from(opened.plaintext.len()).ok() != Some(source.plaintext_len)
+            || <[u8; 32]>::from(Sha256::digest(&opened.plaintext)) != source.plaintext_hash
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance pinned generation plaintext changed".into(),
+            ));
+        }
+        let path = write_private_temp_db(&user_id, &opened.plaintext).await?;
+        let schema = (|| -> Result<u32> {
+            let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let value: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            u32::try_from(value)
+                .map_err(|_| EnclaveError::Store("maintenance source schema is invalid".into()))
+        })();
+        remove_temp_db_files(&path);
+        if schema? != source.sqlite_schema_version {
+            return Err(EnclaveError::Conflict(
+                "maintenance pinned generation schema changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PinnedLegacySnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PinnedLegacySnapshot(<redacted>)")
+    }
+}
+
+impl Drop for PinnedLegacySnapshot {
+    fn drop(&mut self) {
+        remove_temp_db_files(&self.path);
+    }
 }
 
 impl ContentWriteLease {
@@ -1568,9 +1747,7 @@ impl Store {
                 let authority = String::from_utf8(marker.ciphertext).map_err(|_| {
                     EnclaveError::Store("legacy content fence authority is invalid".into())
                 })?;
-                let valid_authority = (authority.starts_with("rebind_")
-                    || authority.starts_with("delete_"))
-                    && authority.len() == 71;
+                let valid_authority = valid_legacy_fence_authority(&authority);
                 if marker.generation <= 0
                     || marker.wrapped_dek_b64 != IDENTITY_REBIND_FENCE_METADATA
                     || !valid_authority
@@ -2049,9 +2226,7 @@ impl Store {
         proposed_authority: &str,
     ) -> Result<String> {
         validate_user_id(user_id)?;
-        if !(proposed_authority.starts_with("rebind_") || proposed_authority.starts_with("delete_"))
-            || proposed_authority.len() != 71
-        {
+        if !valid_legacy_fence_authority(proposed_authority) {
             return Err(EnclaveError::Store(
                 "invalid proposed legacy write fence authority".into(),
             ));
@@ -2418,6 +2593,30 @@ impl Store {
             }
             notified.await;
         }
+    }
+
+    /// Acquire every process-local single-user gate before the permanent
+    /// archive fence is allowed to reach the provider. The input is a
+    /// non-cloneable encrypted-control capability, never a raw user/archive
+    /// pair. This method is intentionally not wired to production startup.
+    pub(crate) async fn begin_archive_maintenance(
+        self: &Arc<Self>,
+        _token: crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext,
+        plan: AuthenticatedMaintenanceImportPlan,
+    ) -> Result<ArchiveMaintenanceTransition> {
+        let plan = plan.into_store_view(StoreMaintenanceContext(()));
+        validate_user_id(&plan.user_id)?;
+        let lifecycle_guard = self.lock_user_lifecycle(&plan.user_id).await?;
+        self.block_content_writes_for_deletion(&plan.user_id).await;
+        let actor = self.actor_for_deletion(&plan.user_id).await;
+        let state = Arc::clone(&actor.state).lock_owned().await;
+        Ok(ArchiveMaintenanceTransition {
+            store: Arc::clone(self),
+            plan,
+            _lifecycle_guard: lifecycle_guard,
+            actor,
+            state,
+        })
     }
 
     /// Begin a two-namespace identity transition. This performs no provider
@@ -3634,7 +3833,8 @@ impl Store {
         if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly && handle.dirty {
             return Err(wal_logical_only_error());
         }
-        self.flush_handle_with_admission(handle, false, None).await
+        self.flush_handle_with_admission(handle, false, None, true)
+            .await
     }
 
     /// Deletion closes normal admission before making its final local state
@@ -3645,7 +3845,7 @@ impl Store {
         handle: &mut UserHandle,
         marker_authority: &str,
     ) -> Result<()> {
-        self.flush_handle_with_admission(handle, true, Some(marker_authority))
+        self.flush_handle_with_admission(handle, true, Some(marker_authority), true)
             .await
     }
 
@@ -3654,7 +3854,20 @@ impl Store {
         handle: &mut UserHandle,
         marker_authority: &str,
     ) -> Result<()> {
-        self.flush_handle_with_admission(handle, true, Some(marker_authority))
+        self.flush_handle_with_admission(handle, true, Some(marker_authority), true)
+            .await
+    }
+
+    async fn flush_handle_for_maintenance(
+        &self,
+        handle: &mut UserHandle,
+        marker_authority: &str,
+    ) -> Result<()> {
+        // Maintenance itself pins the exact bumped generation. Creating an
+        // additional legacy recovery-copy object is outside this protocol's
+        // reviewed effect set and is unnecessary while the permanent marker
+        // has already closed all ordinary legacy writers.
+        self.flush_handle_with_admission(handle, true, Some(marker_authority), false)
             .await
     }
 
@@ -3663,6 +3876,7 @@ impl Store {
         handle: &mut UserHandle,
         deletion_owned: bool,
         allowed_marker_authority: Option<&str>,
+        preserve_recovery_checkpoint: bool,
     ) -> Result<()> {
         if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly && handle.dirty {
             return Err(wal_logical_only_error());
@@ -3697,7 +3911,12 @@ impl Store {
             self.acquire_content_write_inner(&handle.user_id, false)?
         };
         let result = self
-            .flush_handle_inner(handle, &content_write, allowed_marker_authority)
+            .flush_handle_inner(
+                handle,
+                &content_write,
+                allowed_marker_authority,
+                preserve_recovery_checkpoint,
+            )
             .await;
         let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         match &result {
@@ -3721,6 +3940,7 @@ impl Store {
         handle: &mut UserHandle,
         content_write: &ContentWriteLease,
         allowed_marker_authority: Option<&str>,
+        preserve_recovery_checkpoint: bool,
     ) -> Result<(u64, u64, u64)> {
         // The WAL length before checkpoint is the best available Phase-0 proxy
         // for bytes changed since the previous flush. It is not exact dirty
@@ -3756,7 +3976,8 @@ impl Store {
         // verified day, and re-verify once after process restart.
         let checkpoint_now = (self.checkpoint_clock)();
         let checkpoint_day = utc_epoch_day(checkpoint_now);
-        if handle.blob_meta.generation > 0
+        if preserve_recovery_checkpoint
+            && handle.blob_meta.generation > 0
             && handle.blob_meta.verified_legacy_recovery_day != Some(checkpoint_day)
         {
             self.ensure_legacy_recovery_checkpoint(
@@ -3992,6 +4213,253 @@ impl IdentityRebindTransition {
             barrier.blocked_users.remove(&self.stable_user_id);
         }
         self.store.content_write_barrier.changed.notify_waiters();
+    }
+}
+
+impl ArchiveMaintenanceTransition {
+    async fn source_facts(handle: &mut UserHandle) -> Result<MaintenanceTentativeSource> {
+        if handle.blob_meta.generation <= 0 {
+            return Err(EnclaveError::NotFound);
+        }
+        handle
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let plaintext = tokio::fs::read(&handle.temp_path).await?;
+        let plaintext_len = u64::try_from(plaintext.len())
+            .map_err(|_| EnclaveError::Store("maintenance source is too large".into()))?;
+        if plaintext_len == 0
+            || !plaintext_len.is_multiple_of(u64::from(crate::archive_v3::SQLITE_PAGE_SIZE))
+            || plaintext_len > crate::archive_v3::MAX_DATABASE_BYTES
+        {
+            return Err(EnclaveError::Store(
+                "maintenance source geometry is invalid".into(),
+            ));
+        }
+        let sqlite_schema_version: i64 =
+            handle
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let sqlite_schema_version = u32::try_from(sqlite_schema_version)
+            .map_err(|_| EnclaveError::Store("maintenance source schema is invalid".into()))?;
+        Ok(MaintenanceTentativeSource {
+            base_generation: handle.blob_meta.generation,
+            plaintext_hash: Sha256::digest(&plaintext).into(),
+            plaintext_len,
+            sqlite_schema_version,
+            wrapped_dek_commitment: Sha256::digest(handle.blob_meta.wrapped_dek_b64.as_bytes())
+                .into(),
+        })
+    }
+
+    /// Observe the tentative exact source without provider mutation. The
+    /// lifecycle/actor/content gates have already been acquired by `begin`.
+    pub(crate) async fn tentative_source(&mut self) -> Result<MaintenanceTentativeSource> {
+        self.store
+            .ensure_loaded(&self.plan.user_id, &self.actor, &mut self.state)
+            .await?;
+        let handle =
+            self.state.handle.as_mut().ok_or_else(|| {
+                EnclaveError::Store("maintenance source actor disappeared".into())
+            })?;
+        Self::source_facts(handle).await
+    }
+
+    /// Create/adopt the permanent provider marker, drain every pre-marker
+    /// intent, perform the mandatory same-plaintext generation-CAS bump, and
+    /// consume the actor into an owned private snapshot.
+    pub(crate) async fn fence_and_pin(
+        mut self,
+        expected: MaintenanceTentativeSource,
+    ) -> Result<MaintenanceFenceAndPin> {
+        let authority = self
+            .store
+            .fence_and_drain_legacy_writes(&self.plan.user_id, &self.plan.fence_authority)
+            .await?;
+        if authority != self.plan.fence_authority {
+            return Err(EnclaveError::Conflict(
+                "legacy archive fence belongs to another operation".into(),
+            ));
+        }
+        let observed = self.tentative_source().await?;
+        if observed.base_generation < expected.base_generation
+            || observed.plaintext_hash != expected.plaintext_hash
+            || observed.plaintext_len != expected.plaintext_len
+            || observed.sqlite_schema_version != expected.sqlite_schema_version
+            || observed.wrapped_dek_commitment != expected.wrapped_dek_commitment
+        {
+            return Ok(MaintenanceFenceAndPin::Rebase {
+                transition: self,
+                source: observed,
+            });
+        }
+        let handle =
+            self.state.handle.as_mut().ok_or_else(|| {
+                EnclaveError::Store("maintenance source actor disappeared".into())
+            })?;
+        let had_local_changes = handle.dirty || handle.blob_meta.retry_save_before_access;
+        handle.mark_dirty();
+        if let Err(error) = self
+            .store
+            .flush_handle_for_maintenance(handle, &authority)
+            .await
+        {
+            if !had_local_changes && matches!(&error, EnclaveError::Conflict(_)) {
+                let stale = self.state.handle.take().ok_or_else(|| {
+                    EnclaveError::Store("maintenance source actor disappeared".into())
+                })?;
+                let stale_path = stale.temp_path.clone();
+                drop(stale);
+                remove_temp_db_files(&stale_path);
+                let fresh = self.store.load_user(&self.plan.user_id).await?;
+                self.state.handle = Some(fresh);
+                let source = self.tentative_source().await?;
+                return Ok(MaintenanceFenceAndPin::Rebase {
+                    transition: self,
+                    source,
+                });
+            }
+            return Err(error);
+        }
+        let pinned = Self::source_facts(handle).await?;
+        if pinned.base_generation <= expected.base_generation
+            || pinned.plaintext_hash != expected.plaintext_hash
+            || pinned.plaintext_len != expected.plaintext_len
+            || pinned.sqlite_schema_version != expected.sqlite_schema_version
+            || pinned.wrapped_dek_commitment != expected.wrapped_dek_commitment
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance generation bump changed plaintext".into(),
+            ));
+        }
+        let source = MaintenanceSourceBinding::from_pinned(
+            self.plan.archive_id,
+            self.plan.operation_id,
+            pinned.base_generation,
+            pinned.plaintext_hash,
+            pinned.plaintext_len,
+            pinned.sqlite_schema_version,
+            pinned.wrapped_dek_commitment,
+        )
+        .map_err(|_| EnclaveError::Store("maintenance pinned source is invalid".into()))?;
+        let handle =
+            self.state.handle.take().ok_or_else(|| {
+                EnclaveError::Store("maintenance source actor disappeared".into())
+            })?;
+        let path = handle.temp_path.clone();
+        drop(handle);
+        remove_temp_db_sidecars(&path);
+        if let Err(error) = ensure_temp_db_sidecars_absent(&path) {
+            remove_temp_db_files(&path);
+            return Err(error);
+        }
+        self.state.cleanly_evicted = false;
+        self.store
+            .release_open_registration(&self.plan.user_id, &self.actor)
+            .await;
+        Ok(MaintenanceFenceAndPin::Pinned(PinnedLegacySnapshot {
+            path,
+            _archive_id: self.plan.archive_id,
+            _operation_id: self.plan.operation_id,
+            source,
+            _store: self.store,
+            _plan: self.plan,
+            _lifecycle_guard: self._lifecycle_guard,
+            _actor: self.actor,
+            _state: self.state,
+        }))
+    }
+
+    /// Restart recovery reads only the exact positive generation committed by
+    /// encrypted control and reauthenticates envelope context, wrapped-DEK
+    /// metadata, plaintext digest/length, and SQLite schema before reminting a
+    /// private staging owner.
+    pub(crate) async fn recover_pinned(
+        mut self,
+        expected: MaintenanceSourceBinding,
+    ) -> Result<PinnedLegacySnapshot> {
+        let expected_view = expected.store_view(StoreMaintenanceContext(()));
+        let authority = self
+            .store
+            .fence_and_drain_legacy_writes(&self.plan.user_id, &self.plan.fence_authority)
+            .await?;
+        if authority != self.plan.fence_authority {
+            return Err(EnclaveError::Conflict(
+                "legacy archive fence belongs to another operation".into(),
+            ));
+        }
+        if let Some(handle) = self.state.handle.take() {
+            let stale_path = handle.temp_path.clone();
+            drop(handle);
+            remove_temp_db_files(&stale_path);
+        }
+        self.store
+            .release_open_registration(&self.plan.user_id, &self.actor)
+            .await;
+        let object = self
+            .store
+            .gcs
+            .get_object_generation(
+                &gcs_object_name(&self.plan.user_id),
+                expected_view.generation,
+            )
+            .await?;
+        if object.generation != expected_view.generation
+            || Sha256::digest(object.wrapped_dek_b64.as_bytes()).as_slice()
+                != expected_view.wrapped_dek_commitment
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance pinned generation metadata changed".into(),
+            ));
+        }
+        let dek = load_dek(self.store.kms.as_ref(), &object.wrapped_dek_b64).await?;
+        let opened = decrypt_bound_blob(
+            &dek,
+            &object.ciphertext,
+            &user_blob_context(&self.plan.user_id),
+        )?;
+        if u64::try_from(opened.plaintext.len()).ok() != Some(expected_view.plaintext_len)
+            || <[u8; 32]>::from(Sha256::digest(&opened.plaintext)) != expected_view.plaintext_hash
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance pinned generation plaintext changed".into(),
+            ));
+        }
+        let path = write_private_temp_db(&self.plan.user_id, &opened.plaintext).await?;
+        let schema_result = (|| -> Result<u32> {
+            let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let value: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            u32::try_from(value)
+                .map_err(|_| EnclaveError::Store("maintenance source schema is invalid".into()))
+        })();
+        let schema = match schema_result {
+            Ok(schema) => schema,
+            Err(error) => {
+                remove_temp_db_files(&path);
+                return Err(error);
+            }
+        };
+        if schema != expected_view.sqlite_schema_version {
+            remove_temp_db_files(&path);
+            return Err(EnclaveError::Conflict(
+                "maintenance pinned generation schema changed".into(),
+            ));
+        }
+        remove_temp_db_sidecars(&path);
+        if let Err(error) = ensure_temp_db_sidecars_absent(&path) {
+            remove_temp_db_files(&path);
+            return Err(error);
+        }
+        Ok(PinnedLegacySnapshot {
+            path,
+            _archive_id: self.plan.archive_id,
+            _operation_id: self.plan.operation_id,
+            source: expected,
+            _store: self.store,
+            _plan: self.plan,
+            _lifecycle_guard: self._lifecycle_guard,
+            _actor: self.actor,
+            _state: self.state,
+        })
     }
 }
 
@@ -6661,9 +7129,28 @@ async fn write_private_temp_db(user_id: &str, plaintext: &[u8]) -> Result<PathBu
 /// Best-effort removal of the plaintext database and SQLite sidecar files.
 fn remove_temp_db_files(path: &Path) {
     let _ = std::fs::remove_file(path);
+    remove_temp_db_sidecars(path);
+}
+
+fn remove_temp_db_sidecars(path: &Path) {
     for suffix in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
     }
+}
+
+fn ensure_temp_db_sidecars_absent(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        match std::fs::metadata(sqlite_sidecar_path(path, suffix)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                return Err(EnclaveError::Store(
+                    "maintenance snapshot retained a SQLite sidecar".into(),
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -12757,6 +13244,154 @@ pub(crate) mod tests {
                 .any(|name| name.starts_with(&format!("legacy-recovery/{user_id}/"))),
             "expected named daily recovery checkpoint"
         );
+    }
+
+    fn maintenance_test_plan(user_id: &str) -> AuthenticatedMaintenanceImportPlan {
+        AuthenticatedMaintenanceImportPlan::for_test(
+            user_id,
+            crate::archive_v3::ArchiveId::from_bytes([0x61; 16]),
+            [0x62; 16],
+            crate::archive_v3::ObjectId::from_bytes([0x63; 16]),
+        )
+    }
+
+    #[tokio::test]
+    async fn archive_maintenance_fences_bumps_and_scrubs_one_exact_snapshot() {
+        let user_id = "11111111-1111-4111-8111-111111111199";
+        let kms: Arc<dyn KmsClient> = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(kms, gcs.clone()));
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata(key,value) VALUES('maintenance','source')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(user_id).await.unwrap();
+        let object_name = gcs_object_name(user_id);
+        assert_eq!(gcs.exact_generation_count(&object_name), 1);
+
+        let mut transition = store
+            .begin_archive_maintenance(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                maintenance_test_plan(user_id),
+            )
+            .await
+            .unwrap();
+        let tentative = transition.tentative_source().await.unwrap();
+        assert!(tentative.base_generation > 0);
+        assert_eq!(tentative.sqlite_schema_version, 0);
+        let pinned = match transition.fence_and_pin(tentative).await.unwrap() {
+            MaintenanceFenceAndPin::Pinned(pinned) => pinned,
+            MaintenanceFenceAndPin::Rebase { .. } => panic!("unexpected maintenance rebase"),
+        };
+        let source = pinned.source_binding();
+        let source_view = source.store_view(StoreMaintenanceContext(()));
+        assert!(source_view.generation > tentative.base_generation);
+        assert_eq!(source_view.plaintext_hash, tentative.plaintext_hash);
+        assert_eq!(source_view.plaintext_len, tentative.plaintext_len);
+        assert_eq!(gcs.exact_generation_count(&object_name), 2);
+
+        let path = pinned.path_for_maintenance_test().to_path_buf();
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        std::fs::write(&wal, b"plaintext-sidecar").unwrap();
+        std::fs::write(&shm, b"plaintext-sidecar").unwrap();
+        drop(pinned);
+        assert!(!path.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert_eq!(gcs.exact_generation_count(&object_name), 2);
+    }
+
+    #[tokio::test]
+    async fn archive_maintenance_restart_recovers_only_exact_pinned_generation() {
+        let user_id = "11111111-1111-4111-8111-111111111198";
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
+        store
+            .with_user(user_id, |conn| {
+                conn.execute(
+                    "INSERT INTO app_metadata(key,value) VALUES('maintenance','restart')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(user_id).await.unwrap();
+        let mut transition = store
+            .begin_archive_maintenance(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                maintenance_test_plan(user_id),
+            )
+            .await
+            .unwrap();
+        let tentative = transition.tentative_source().await.unwrap();
+        let pinned = match transition.fence_and_pin(tentative).await.unwrap() {
+            MaintenanceFenceAndPin::Pinned(pinned) => pinned,
+            MaintenanceFenceAndPin::Rebase { .. } => panic!("unexpected maintenance rebase"),
+        };
+        let source = pinned.source_binding();
+        let source_view = source.store_view(StoreMaintenanceContext(()));
+        drop(pinned);
+        drop(store);
+
+        let restarted = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
+        let transition = restarted
+            .begin_archive_maintenance(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                maintenance_test_plan(user_id),
+            )
+            .await
+            .unwrap();
+        let recovered = transition.recover_pinned(source).await.unwrap();
+        recovered
+            .exact_generation_revalidation()
+            .verify()
+            .await
+            .unwrap();
+        assert!(recovered.path_for_maintenance_test().exists());
+        drop(recovered);
+
+        gcs.vanish_next_exact_generation_get(&gcs_object_name(user_id), source_view.generation);
+        let second_restart = Arc::new(Store::new(Arc::new(FakeKms), gcs));
+        let transition = second_restart
+            .begin_archive_maintenance(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                maintenance_test_plan(user_id),
+            )
+            .await
+            .unwrap();
+        assert!(transition.recover_pinned(source).await.is_err());
+    }
+
+    #[test]
+    fn archive_maintenance_store_surface_has_no_delete_or_live_constructor() {
+        let source = include_str!("store.rs");
+        let main = include_str!("main.rs");
+        let begin = source.find("impl ArchiveMaintenanceTransition").unwrap();
+        let end = source[begin..]
+            .find("fn deleted_user_error")
+            .map(|offset| begin + offset)
+            .unwrap();
+        let implementation = &source[begin..end];
+        for forbidden in [
+            concat!("delete_", "object"),
+            concat!("list_", "object"),
+            concat!("purge_", "versions"),
+            concat!("WalLogical", "Only"),
+        ] {
+            assert!(
+                !implementation.contains(forbidden),
+                "forbidden operation: {forbidden}"
+            );
+        }
+        assert!(!main.contains("begin_archive_maintenance"));
     }
 
     #[tokio::test]

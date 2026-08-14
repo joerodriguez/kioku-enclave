@@ -116,6 +116,53 @@ surfaces.
   remains false. Startup does not construct pending, durable, or sealed capability types,
   so both checked off and active image evidence have zero runtime effect on Store/VFS,
   lifecycle, routes, health, roots, users, or cloud state.
+- The compiled maintenance importer is the only consumer allowed to turn that sealed
+  single-archive runtime into an offline state machine. Encrypted control first binds one
+  active account/archive to random opaque operation, owner, session, and attempt IDs plus a
+  permanent `archive_` fence. Store acquires the one-user lifecycle, actor, and content-write
+  gates before that fence is created, drains retained pre-fence write intents, and forces a
+  same-plaintext generation-CAS bump. The resulting private tmpfs owner commits the exact
+  positive object generation, wrapped-DEK metadata hash, plaintext SHA-256 and length, SQLite
+  user version, archive, and operation. Restart exact-gets and authenticates only that
+  generation; drop removes the database, WAL, and SHM files while provider and local fences
+  remain closed. A remote writer may win only before the marker/forced bump; while control is
+  still in Fencing, the new exact source is durably rebased before another attempt.
+
+  The importer then requires an already-existing exact Active+Legacy witness. Missing,
+  deleting, differently migrated, root/registry-substituted, or lease-conflicting state causes
+  no archive create. Every checkpoint/manifest/root object is reserved in encrypted control
+  before immutable create and authenticated exact readback; partial randomized uploads are
+  retained as superseded attempts rather than overwritten. R1 is exactly the current root's
+  successor with the pinned checkpoint and canonical zero-WAL geometry. Its complete bytes are
+  durable before `ShadowSendUnknown`; only a fresh exact witness read can settle it as
+  ShadowWal. Recovery derives authority only from those exact witness bytes, authenticates and
+  decrypts the root and full checkpoint without listing, and compares independent SQLite copies
+  with the full parity verifier on a blocking lane. Immediately before parity becomes durable,
+  Store rereads the exact pinned legacy generation and the coordinator rereads the unchanged
+  witness. R2 is a new exact root over the same authenticated checkpoint, is likewise durable
+  before send, and terminal state is recorded only after an exact WalAuthoritative witness
+  readback. The coordinator selects the distinct durable R2 attempt before reconciling any
+  ShadowWal-bound artifact. A same-fence restart adopts that attempt's empty or partial exact
+  prefix without consuming another attempt; a witness-authenticated higher-fence reacquire
+  supersedes any partial attempt and starts a fresh empty one. Renewal and reacquire adoption
+  compare the full immutable graph, registry, migration, deletion, owner, current/next-fence,
+  trusted-tick, and expiry tuple, and encrypted control CASes the exact prior witness bytes plus
+  lease fields. The checkpoint-only staging binding has its own domain-separated producer-gated
+  constructor and accepts only canonical zero-WAL `0/0/0`; ordinary shadow bindings remain
+  all-nonzero. Ambiguous sends retain one candidate forever; an alternate record becomes manual.
+  Reloading a terminal control row still requires a fresh exact active WalAuthoritative witness
+  read and retries best-effort lease revocation before returning the offline completion.
+
+  The coordinator's outer owned task keeps provider-send and scratch cleanup ownership across
+  caller cancellation; process restart resumes only the durable stage and exact artifact prefix.
+  It never lists or deletes archive-v3 objects, deletes the legacy source, clears the legacy
+  fence, alters the account/archive binding, advances beyond WalAuthoritative, or emits
+  serving/read/ack authority. The bounded legacy-intent prefix scan above is used only to drain
+  already durable pre-marker writes. No main,
+  startup, route, worker, Store constructor, config/environment selector, health result, cloud
+  command, or deployment path calls it. Activation still requires an external zero-replica
+  maintenance window, an already provisioned Legacy witness, and separately reviewed production
+  WAL logical-operation owners and serving integration.
 - KMS encrypt/decrypt uses an attestation token exchanged through the configured WIF
   provider. There is no VM-service-account credential fallback for KMS.
 - A token returned by the public `/v1/attestation` endpoint uses the HTTPS verifier URL

@@ -42,7 +42,7 @@ use crate::{
     archive_v3_shadow::CapturedWalCommit,
     archive_v3_shadow_checkpoint::{recover_checkpoint_from_recovery_root, TmpfsCheckpointSink},
     archive_v3_shadow_parity::OwnedPrivateStagedSqliteCopy,
-    archive_v3_witness::{RecoveryRoot, RootReference},
+    archive_v3_witness::{DeletionState, MigrationState, RecoveryRoot, RootReference},
 };
 
 const SQLITE_WAL_HEADER_BYTES: usize = 32;
@@ -555,7 +555,47 @@ pub(crate) async fn recover_owned_private_staging(
     cipher: Arc<VerifiedArchiveCipher>,
     archive_id: ArchiveId,
 ) -> Result<OwnedPrivateStagedSqliteCopy> {
-    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None).await
+    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None, false)
+        .await
+        .map(|recovered| recovered.owned)
+}
+
+/// Maintenance-only recovery result. It binds the owned recovered SQLite file
+/// to the authenticated checkpoint metadata from the same exact witnessed
+/// root, including the canonical zero-WAL case.
+pub(crate) struct RecoveredMaintenanceStaging {
+    owned: OwnedPrivateStagedSqliteCopy,
+    checkpoint: crate::archive_v3_shadow_checkpoint::UploadedCheckpoint,
+}
+
+impl RecoveredMaintenanceStaging {
+    pub(crate) fn owned(&self) -> &OwnedPrivateStagedSqliteCopy {
+        &self.owned
+    }
+
+    pub(crate) fn checkpoint(&self) -> &crate::archive_v3_shadow_checkpoint::UploadedCheckpoint {
+        &self.checkpoint
+    }
+}
+
+impl std::fmt::Debug for RecoveredMaintenanceStaging {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RecoveredMaintenanceStaging(<redacted>)")
+    }
+}
+
+pub(crate) async fn recover_owned_maintenance_staging(
+    recovery: RecoveryRoot,
+    backend: Arc<dyn ImmutableObjectBackend>,
+    cipher: Arc<VerifiedArchiveCipher>,
+    archive_id: ArchiveId,
+) -> Result<RecoveredMaintenanceStaging> {
+    if recovery.migration() != MigrationState::ShadowWal
+        || recovery.deletion() != DeletionState::Active
+    {
+        return Err(ShadowWalError::CompositeRecovery);
+    }
+    recover_owned_private_staging_inner(recovery, backend, cipher, archive_id, None, true).await
 }
 
 #[cfg(test)]
@@ -585,8 +625,10 @@ async fn recover_owned_private_staging_observed(
             path_sender,
             cleanup_sender,
         }),
+        false,
     )
     .await
+    .map(|recovered| recovered.owned)
 }
 
 async fn recover_owned_private_staging_inner(
@@ -595,14 +637,15 @@ async fn recover_owned_private_staging_inner(
     cipher: Arc<VerifiedArchiveCipher>,
     archive_id: ArchiveId,
     observer: Option<RecoveryObserver>,
-) -> Result<OwnedPrivateStagedSqliteCopy> {
+    allow_maintenance_zero_wal: bool,
+) -> Result<RecoveredMaintenanceStaging> {
     tokio::spawn(async move {
         let path = fresh_recovery_path()?;
         let mut cleanup = CompositeRecoveryCleanup::new(path.clone());
         observe_recovery(observer, &path, &mut cleanup);
         let mut checkpoint =
             TmpfsCheckpointSink::create(&path).map_err(|_| ShadowWalError::CompositeRecovery)?;
-        recover_checkpoint_from_recovery_root(
+        let checkpoint_metadata = recover_checkpoint_from_recovery_root(
             &recovery,
             backend.as_ref(),
             cipher.as_ref(),
@@ -612,14 +655,25 @@ async fn recover_owned_private_staging_inner(
         .await
         .map_err(|_| ShadowWalError::CompositeRecovery)?;
         let mut wal = CompositeWalRecoverySink::new(path.clone());
-        recover_witness_nominated_wal(
-            &recovery,
-            backend.as_ref(),
-            cipher.as_ref(),
-            archive_id,
-            &mut wal,
-        )
-        .await?;
+        if allow_maintenance_zero_wal {
+            recover_maintenance_zero_wal(
+                &recovery,
+                backend.as_ref(),
+                cipher.as_ref(),
+                archive_id,
+                &mut wal,
+            )
+            .await?;
+        } else {
+            recover_witness_nominated_wal(
+                &recovery,
+                backend.as_ref(),
+                cipher.as_ref(),
+                archive_id,
+                &mut wal,
+            )
+            .await?;
+        }
         ensure_sqlite_sidecars_absent(&path).await?;
         let owned =
             OwnedPrivateStagedSqliteCopy::from_recovery_proof(CompositeRecoveryProof::new(path))
@@ -629,7 +683,10 @@ async fn recover_owned_private_staging_inner(
         #[cfg(test)]
         owned.observe_cleanup_for_test(cleanup.cleanup_sender.take());
         cleanup.disarm();
-        Ok(owned)
+        Ok(RecoveredMaintenanceStaging {
+            owned,
+            checkpoint: checkpoint_metadata,
+        })
     })
     .await
     .map_err(|_| ShadowWalError::CompositeRecovery)?
@@ -873,9 +930,10 @@ fn fresh_recovery_path() -> Result<PathBuf> {
     Err(ShadowWalError::CompositeRecovery)
 }
 
-/// Opaque proof that the exact witnessed root had both a checkpoint reference
-/// and a complete verified WAL chain. The composite staging path consumes this
-/// internally and never exposes a partial checkpoint or WAL to its caller.
+/// Opaque proof that the exact witnessed root had a checkpoint and either a
+/// complete verified WAL chain or the one canonical maintenance-import
+/// zero-WAL geometry. The composite staging path consumes this internally and
+/// never exposes a partial checkpoint or WAL to its caller.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecoveredWitnessWal {
     checkpoint_root: ImmutableReference,
@@ -906,7 +964,8 @@ pub(crate) async fn recover_witness_nominated_wal(
     sink: &mut dyn WalRecoverySink,
 ) -> Result<RecoveredWitnessWal> {
     let result =
-        recover_witness_nominated_wal_inner(recovery, backend, cipher, archive_id, sink).await;
+        recover_witness_nominated_wal_inner(recovery, backend, cipher, archive_id, sink, false)
+            .await;
     if result.is_err() {
         sink.abort();
     }
@@ -919,6 +978,7 @@ async fn recover_witness_nominated_wal_inner(
     cipher: &VerifiedArchiveCipher,
     archive_id: ArchiveId,
     sink: &mut dyn WalRecoverySink,
+    allow_maintenance_zero_wal: bool,
 ) -> Result<RecoveredWitnessWal> {
     validate_recovery_cipher(recovery, cipher, archive_id)?;
     let commitment = recovery.root();
@@ -935,7 +995,31 @@ async fn recover_witness_nominated_wal_inner(
     if root.owner_fencing_epoch != commitment.owner_fencing_epoch() {
         return Err(ArchiveV3Error::Authentication.into());
     }
-    recover_exact_root_wal(&root, backend, cipher, archive_id, sink).await
+    recover_exact_root_wal_mode(
+        &root,
+        backend,
+        cipher,
+        archive_id,
+        sink,
+        allow_maintenance_zero_wal,
+    )
+    .await
+}
+
+async fn recover_maintenance_zero_wal(
+    recovery: &RecoveryRoot,
+    backend: &dyn ImmutableObjectBackend,
+    cipher: &VerifiedArchiveCipher,
+    archive_id: ArchiveId,
+    sink: &mut dyn WalRecoverySink,
+) -> Result<RecoveredWitnessWal> {
+    let result =
+        recover_witness_nominated_wal_inner(recovery, backend, cipher, archive_id, sink, true)
+            .await;
+    if result.is_err() {
+        sink.abort();
+    }
+    result
 }
 
 /// This private helper is deliberately reachable only after
@@ -949,11 +1033,40 @@ async fn recover_exact_root_wal(
     archive_id: ArchiveId,
     sink: &mut dyn WalRecoverySink,
 ) -> Result<RecoveredWitnessWal> {
+    recover_exact_root_wal_mode(root, backend, cipher, archive_id, sink, false).await
+}
+
+async fn recover_exact_root_wal_mode(
+    root: &ArchiveRoot,
+    backend: &dyn ImmutableObjectBackend,
+    cipher: &VerifiedArchiveCipher,
+    archive_id: ArchiveId,
+    sink: &mut dyn WalRecoverySink,
+    allow_maintenance_zero_wal: bool,
+) -> Result<RecoveredWitnessWal> {
     root.validate()?;
     let checkpoint_root = root
         .checkpoint_root
         .clone()
         .ok_or(ShadowWalError::MissingCheckpointOrWal)?;
+    if allow_maintenance_zero_wal
+        && root.wal_commit_tail.is_none()
+        && root.wal_generation == 0
+        && root.wal_commit_count == 0
+        && root.wal_segment_count == 0
+        && root.wal_tail_bytes == 0
+        && root.extent_tree_root.is_none()
+        && root.checkpoint_logical_file_length == root.logical_file_length
+    {
+        return Ok(RecoveredWitnessWal {
+            checkpoint_root,
+            root_seq: root.root_seq,
+            wal_generation: 0,
+            commit_count: 0,
+            segment_count: 0,
+            wal_tail_bytes: 0,
+        });
+    }
     let final_reference = root
         .wal_commit_tail
         .clone()
@@ -2533,6 +2646,42 @@ mod tests {
         assert_eq!(values, vec!["first", "second"]);
         drop(connection);
         drop(owned);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn maintenance_recovery_accepts_only_checkpointed_canonical_zero_wal_geometry() {
+        let (checkpoint, _) = real_sqlite_checkpoint_and_commits();
+        let fixture = composite_fixture_from(checkpoint, Vec::new()).await;
+        let backend: Arc<dyn ImmutableObjectBackend> = fixture.backend.clone();
+        assert!(recover_owned_private_staging(
+            fixture.recovery.clone(),
+            Arc::clone(&backend),
+            Arc::clone(&fixture.cipher),
+            fixture.archive,
+        )
+        .await
+        .is_err());
+        let recovered = recover_owned_maintenance_staging(
+            fixture
+                .recovery
+                .with_migration_for_test(MigrationState::ShadowWal),
+            backend,
+            fixture.cipher,
+            fixture.archive,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.checkpoint().logical_file_length(),
+            std::fs::metadata(recovered.owned().path_for_test())
+                .unwrap()
+                .len()
+        );
+        let path = recovered.owned().path_for_test().to_path_buf();
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
+        drop(recovered);
         assert!(!path.exists());
     }
 

@@ -33,10 +33,14 @@ use crate::{
     archive_v3_gcs_http::{
         valid_archive_v3_bucket_name, ArchiveV3SoftDeleteDrainGate, GcpArchiveV3HttpTransport,
     },
+    archive_v3_maintenance_import::{
+        AuthenticatedMaintenanceImportPlan, MaintenanceImportError,
+        MaintenanceImportWitnessProvider, SingleArchiveMaintenanceImporter,
+    },
     archive_v3_registry_kms::GcpArchiveV3RegistryKms,
     archive_v3_shadow_coordinator::ShadowCheckpointWitnessProvider,
     archive_v3_witness::ExactRootProvider,
-    cp::control_store::ArchiveBinding,
+    cp::control_store::{ArchiveBinding, ControlStore},
     crypto::GcpKmsClient,
 };
 
@@ -149,10 +153,11 @@ impl fmt::Debug for ArchiveV3ShadowRuntimeDeployment {
 
 /// Private provider owner. It is never returned without exact durable binding.
 struct ArchiveV3ShadowRuntimeBundle {
-    _objects: Arc<dyn ImmutableObjectBackend>,
+    objects: Arc<dyn ImmutableObjectBackend>,
     _roots: Arc<dyn ExactRootProvider>,
-    _registries: Arc<dyn ExactKeyRegistryProvider>,
+    registries: Arc<dyn ExactKeyRegistryProvider>,
     _witness: Arc<dyn ShadowCheckpointWitnessProvider>,
+    maintenance_witness: Option<Arc<dyn MaintenanceImportWitnessProvider>>,
 }
 
 impl ArchiveV3ShadowRuntimeBundle {
@@ -184,25 +189,28 @@ impl ArchiveV3ShadowRuntimeBundle {
             &deployment.witness_database_id,
         )
         .map_err(|_| ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment)?;
-        let witness = Arc::new(
+        let objects: Arc<dyn ImmutableObjectBackend> =
+            Arc::new(GcsArchiveV3Backend::new(Arc::clone(&transport)));
+        let witness: Arc<FirestoreShadowWitness> = Arc::new(
             FirestoreShadowWitness::new(witness_config)
                 .map_err(|_| ArchiveV3ShadowRuntimeConstructionError::Unavailable)?,
         );
-
-        Ok(Self::from_components(ShadowRuntimeComponents {
-            objects: Arc::new(GcsArchiveV3Backend::new(Arc::clone(&transport))),
-            roots: Arc::new(GcsArchiveV3RootProvider::new(Arc::clone(&transport))),
+        Ok(Self {
+            objects,
+            _roots: Arc::new(GcsArchiveV3RootProvider::new(Arc::clone(&transport))),
             registries: Arc::new(GcsArchiveV3RegistryProvider::new(transport, registry_kms)),
-            witness,
-        }))
+            _witness: witness.clone(),
+            maintenance_witness: Some(witness),
+        })
     }
 
     fn from_components(components: ShadowRuntimeComponents) -> Self {
         Self {
-            _objects: components.objects,
+            objects: components.objects,
             _roots: components.roots,
-            _registries: components.registries,
+            registries: components.registries,
             _witness: components.witness,
+            maintenance_witness: None,
         }
     }
 }
@@ -239,8 +247,8 @@ impl PendingSingleArchiveWalRuntime {
             return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
         }
         Ok(SealedSingleArchiveWalRuntime {
-            _archive_id: binding.archive_id,
-            _bundle: self.bundle,
+            archive_id: binding.archive_id,
+            bundle: self.bundle,
         })
     }
 
@@ -287,8 +295,38 @@ impl fmt::Debug for DurableSingleArchiveBinding {
 /// providers remain private and it exposes no read, write, capture, witness,
 /// acknowledgement, task, callback, or deletion operation.
 pub(crate) struct SealedSingleArchiveWalRuntime {
-    _archive_id: ArchiveId,
-    _bundle: ArchiveV3ShadowRuntimeBundle,
+    archive_id: ArchiveId,
+    bundle: ArchiveV3ShadowRuntimeBundle,
+}
+
+/// Private-field token proving that raw runtime providers were consumed by
+/// the sealed runtime rather than assembled by a sibling module.
+pub(crate) struct MaintenanceRuntimeContext(());
+
+impl SealedSingleArchiveWalRuntime {
+    /// One-shot inactive composition. This has no startup caller and returns
+    /// only the private maintenance state machine, never raw providers.
+    pub(crate) fn into_maintenance_importer(
+        self,
+        plan: AuthenticatedMaintenanceImportPlan,
+        persistence: Arc<ControlStore>,
+        store: Arc<crate::store::Store>,
+    ) -> Result<SingleArchiveMaintenanceImporter, MaintenanceImportError> {
+        let witness = self
+            .bundle
+            .maintenance_witness
+            .ok_or(MaintenanceImportError::Unavailable)?;
+        SingleArchiveMaintenanceImporter::from_sealed_runtime(
+            MaintenanceRuntimeContext(()),
+            self.archive_id,
+            self.bundle.objects,
+            self.bundle.registries,
+            witness,
+            persistence,
+            store,
+            plan,
+        )
+    }
 }
 
 impl fmt::Debug for SealedSingleArchiveWalRuntime {
@@ -696,7 +734,7 @@ mod tests {
             concat!("pub(crate) fn wit", "ness("),
             concat!("tokio::", "spawn"),
             concat!("std::thread::", "spawn"),
-            concat!("St", "ore"),
+            concat!("Store", "::"),
             concat!("with_", "user"),
             concat!("WalLogical", "Only"),
         ] {
@@ -705,7 +743,8 @@ mod tests {
                 "forbidden surface: {forbidden}"
             );
         }
-        assert!(!source.contains(concat!("impl SealedSingleArchiveWal", "Runtime {")));
+        assert!(source.contains(concat!("impl SealedSingleArchiveWal", "Runtime {")));
+        assert!(source.contains("fn into_maintenance_importer("));
         let factory = source
             .find("fn from_control_store(")
             .expect("durable binding factory");

@@ -23,8 +23,14 @@ use crate::{
         FirestoreWitness, FirestoreWitnessCommitError, FirestoreWitnessConfig,
         FirestoreWitnessTransportError,
     },
+    archive_v3_maintenance_import::{
+        MaintenanceImportWitnessProvider, MaintenanceWitnessCommitError,
+    },
     archive_v3_shadow_coordinator::{ShadowCheckpointWitnessProvider, ShadowWitnessCommitError},
-    archive_v3_witness::{RootAdvance, WitnessError, WitnessReceipt, WitnessRecord},
+    archive_v3_witness::{
+        DeletionState, MigrationState, RootAdvance, WitnessError, WitnessLease, WitnessReceipt,
+        WitnessRecord,
+    },
 };
 
 /// Concrete provider bundle for the shadow coordinator.  Its fields remain
@@ -85,6 +91,86 @@ impl ShadowCheckpointWitnessProvider for FirestoreShadowWitness {
                 }
                 FirestoreWitnessCommitError::OutcomeUnknown => {
                     ShadowWitnessCommitError::OutcomeUnknown
+                }
+            })
+    }
+}
+
+#[async_trait]
+impl MaintenanceImportWitnessProvider for FirestoreShadowWitness {
+    async fn read_current_exact(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<WitnessRecord, WitnessError> {
+        self.witness
+            .read_current_async(archive_id)
+            .await?
+            .ok_or(WitnessError::MissingArchive)
+    }
+
+    async fn acquire_lease_exact(
+        &self,
+        record: &WitnessRecord,
+        owner: crate::archive_v3::ObjectId,
+        duration_ticks: u64,
+    ) -> Result<WitnessLease, WitnessError> {
+        if !matches!(
+            record.migration(),
+            MigrationState::Legacy | MigrationState::ShadowWal
+        ) || record.deletion() != DeletionState::Active
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        self.witness
+            .acquire_lease_async(
+                record.archive_id(),
+                record.database_epoch(),
+                record.registry().key_epoch(),
+                owner,
+                duration_ticks,
+            )
+            .await
+    }
+
+    async fn validate_exact_lease(
+        &self,
+        record: &WitnessRecord,
+        owner: crate::archive_v3::ObjectId,
+    ) -> Result<WitnessLease, WitnessError> {
+        self.witness
+            .validate_exact_maintenance_lease_async(record, owner)
+            .await
+    }
+
+    async fn renew_lease_exact(
+        &self,
+        lease: WitnessLease,
+        duration_ticks: u64,
+    ) -> Result<WitnessLease, WitnessError> {
+        self.witness.renew_lease_async(lease, duration_ticks).await
+    }
+
+    async fn revoke_lease_best_effort(&self, lease: WitnessLease) {
+        let _ = self.witness.revoke_lease_async(lease).await;
+    }
+
+    async fn advance_migration_unresolved(
+        &self,
+        expected: WitnessRecord,
+        candidate: WitnessRecord,
+        advance: RootAdvance,
+        next: MigrationState,
+    ) -> Result<(), MaintenanceWitnessCommitError> {
+        self.witness
+            .advance_exact_migration_candidate_unresolved_async(expected, candidate, advance, next)
+            .await
+            .map_err(|error| match error {
+                FirestoreWitnessCommitError::Rejected(_) => MaintenanceWitnessCommitError::Rejected,
+                FirestoreWitnessCommitError::Failed(_) => {
+                    MaintenanceWitnessCommitError::DefinitelyFailed
+                }
+                FirestoreWitnessCommitError::OutcomeUnknown => {
+                    MaintenanceWitnessCommitError::OutcomeUnknown
                 }
             })
     }

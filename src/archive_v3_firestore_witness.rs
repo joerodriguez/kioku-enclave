@@ -353,6 +353,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_migration_commits_control_retained_bytes_across_read_tick_drift() {
+        let transport = Arc::new(FakeTransport::new(None, [CommitOutcome::Ok]));
+        let adapter = witness(transport.clone());
+        let initial = adapter.bootstrap_async(bootstrap()).await.unwrap();
+        let owner = ObjectId::from_bytes(id(8));
+        let lease = adapter
+            .acquire_lease_async(
+                initial.archive_id(),
+                initial.database_epoch(),
+                initial.registry().key_epoch(),
+                owner,
+                60,
+            )
+            .await
+            .unwrap();
+        let expected = adapter
+            .read_current_async(initial.archive_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let candidate_root = RootCommitment::candidate_for_test(
+            expected.database_epoch(),
+            expected.registry().key_epoch(),
+            lease.fencing_epoch(),
+            expected.root().root(),
+            RootReference::new(1, ObjectId::from_bytes(id(9)), hash(10)),
+        );
+        let advance = RootAdvance::new(lease, expected.root(), expected.registry(), candidate_root);
+        let candidate = expected
+            .exact_migration_candidate(
+                &advance,
+                crate::archive_v3_witness::MigrationState::ShadowWal,
+            )
+            .unwrap();
+        transport.0.lock().unwrap().time = "2026-01-02T03:04:06.123Z".to_owned();
+        assert!(adapter
+            .advance_exact_migration_candidate_unresolved_async(
+                expected,
+                candidate.clone(),
+                advance,
+                crate::archive_v3_witness::MigrationState::ShadowWal,
+            )
+            .await
+            .is_ok());
+        assert_eq!(transport.0.lock().unwrap().record, Some(candidate.encode()));
+    }
+
+    #[tokio::test]
     async fn commit_started_bootstrap_pre_marker_failures_are_definitely_unsent() {
         let transport = Arc::new(FakeTransport::new(None, []));
         transport.fail_next(FailureStage::BatchGet);
@@ -2569,6 +2617,27 @@ impl FirestoreWitness {
             .map(|bytes| WitnessRecord::decode(&bytes))
             .transpose()
     }
+
+    /// Authenticate exact stored bytes while evaluating their lease against
+    /// this read's trusted provider tick. The refreshed local record is never
+    /// returned or persisted, preserving byte-exact send reconciliation.
+    pub(crate) async fn validate_exact_maintenance_lease_async(
+        &self,
+        expected: &WitnessRecord,
+        owner: crate::archive_v3::ObjectId,
+    ) -> std::result::Result<WitnessLease, WitnessError> {
+        let (read, record) = self.fresh_record(expected.archive_id()).await?;
+        let encoded = record.ok_or(WitnessError::MissingArchive)?;
+        if encoded != expected.encode() {
+            return Err(WitnessError::Fenced);
+        }
+        let local =
+            InMemoryWitness::from_provider_record_at_tick(Some(encoded), read.trusted_tick)?;
+        let refreshed = local
+            .read_current(expected.archive_id())?
+            .ok_or(WitnessError::MissingArchive)?;
+        refreshed.exact_active_lease_for_owner(owner)
+    }
     pub(crate) async fn recovery_root_async(
         &self,
         archive_id: ArchiveId,
@@ -2651,6 +2720,135 @@ impl FirestoreWitness {
             local.advance_migration(advance.clone(), next)
         })
         .await
+    }
+
+    /// Maintenance-only unresolved migration CAS. Once the exact candidate is
+    /// durable, a lost provider response must remain distinguishable from a
+    /// definitive rejection so restart can reconcile only that candidate.
+    pub(crate) async fn advance_migration_unresolved_async(
+        &self,
+        advance: RootAdvance,
+        next: crate::archive_v3_witness::MigrationState,
+    ) -> std::result::Result<WitnessReceipt, FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(advance.archive_id(), |local| {
+                local.advance_migration(advance.clone(), next)
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(receipt) => Ok(receipt),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    /// Commit only the byte-exact maintenance candidate that encrypted control
+    /// retained before send. The fresh transaction read is used to authenticate
+    /// the exact current bytes and lease at its trusted tick, but it must never
+    /// rewrite the candidate's retained server-tick field on retry.
+    pub(crate) async fn advance_exact_migration_candidate_unresolved_async(
+        &self,
+        expected: WitnessRecord,
+        candidate: WitnessRecord,
+        advance: RootAdvance,
+        next: crate::archive_v3_witness::MigrationState,
+    ) -> std::result::Result<(), FirestoreWitnessCommitError> {
+        if !expected
+            .exact_migration_candidate(&advance, next)
+            .is_ok_and(|exact| exact == candidate)
+        {
+            return Err(FirestoreWitnessCommitError::Rejected(
+                WitnessError::InvalidTransition,
+            ));
+        }
+        let expected_encoded = expected.encode();
+        let candidate_encoded = candidate.encode();
+        let document = self.namespace.document(expected.archive_id());
+        for attempt in 0..MAX_ABORTED_ATTEMPTS {
+            let token = self
+                .token()
+                .await
+                .map_err(FirestoreWitnessCommitError::Failed)?;
+            let transaction = self
+                .transport
+                .begin_read_write(token.as_str(), begin_request_json())
+                .await
+                .map_err(map_transport)
+                .map_err(FirestoreWitnessCommitError::Failed)?;
+            let read = self
+                .transport
+                .batch_get_exact(
+                    token.as_str(),
+                    &transaction,
+                    batch_get_request_json(&document, Some(&transaction)),
+                )
+                .await
+                .map_err(map_transport)
+                .map_err(FirestoreWitnessCommitError::Failed)?;
+            let current = decode_read(&read, expected.archive_id())
+                .map_err(FirestoreWitnessCommitError::Failed)?
+                .ok_or(FirestoreWitnessCommitError::Failed(
+                    WitnessError::MissingArchive,
+                ))?;
+            if current == candidate_encoded {
+                return Ok(());
+            }
+            if current != expected_encoded {
+                return Err(FirestoreWitnessCommitError::Rejected(
+                    WitnessError::CompareFailed,
+                ));
+            }
+            let local =
+                InMemoryWitness::from_provider_record_at_tick(Some(current), read.trusted_tick)
+                    .map_err(FirestoreWitnessCommitError::Failed)?;
+            let receipt = local
+                .advance_migration(advance.clone(), next)
+                .map_err(FirestoreWitnessCommitError::Rejected)?;
+            if !receipt
+                .record()
+                .matches_retained_maintenance_candidate(&candidate)
+            {
+                return Err(FirestoreWitnessCommitError::Rejected(
+                    WitnessError::InvalidTransition,
+                ));
+            }
+            let commit = commit_request_json(
+                &document,
+                &transaction,
+                &candidate_encoded,
+                read.update_time.as_ref().map(FirestoreTimestamp::as_str),
+            );
+            match self
+                .transport
+                .commit_full_record(token.as_str(), &transaction, commit)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(FirestoreWitnessTransportError::Aborted)
+                    if attempt + 1 < MAX_ABORTED_ATTEMPTS =>
+                {
+                    continue
+                }
+                Err(FirestoreWitnessTransportError::OutcomeUnknown)
+                | Err(FirestoreWitnessTransportError::PreconditionFailed)
+                | Err(FirestoreWitnessTransportError::Aborted) => {
+                    return Err(FirestoreWitnessCommitError::OutcomeUnknown)
+                }
+                Err(error) => {
+                    return Err(FirestoreWitnessCommitError::Failed(map_transport(error)))
+                }
+            }
+        }
+        Err(FirestoreWitnessCommitError::Failed(
+            WitnessError::Unavailable,
+        ))
     }
     pub(crate) async fn rotate_key_registry_async(
         &self,
