@@ -300,7 +300,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('choices=("production", "evaluation")', pipeline)
         self.assertIn("selected_configuration(", pipeline)
         self.assertIn("check_voice_release_gate.py", pipeline)
-        self.assertIn('"schema_version": 8', pipeline)
+        self.assertIn('"schema_version": 9', pipeline)
         self.assertIn('"release_url"', pipeline)
         self.assertIn("enclave-release.json", pipeline)
         self.assertNotIn("GITHUB_OUTPUT", pipeline)
@@ -317,7 +317,7 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('[ -n "${APNS_TEAM_ID}" ]', dockerfile)
         self.assertIn("ENV KIOKU_BUILD_PROFILE=${KIOKU_BUILD_PROFILE}", dockerfile)
 
-    def test_selector_docker_and_local_schema_v8_manifest_bind_the_same_three_buckets(self) -> None:
+    def test_selector_docker_and_local_schema_v9_manifest_bind_the_same_three_buckets(self) -> None:
         completed, selected = self.run_selector("production", environment())
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("ENCLAVE_GCS_BUCKET=kioku-production-indexes\n", selected)
@@ -345,8 +345,8 @@ class SelectorTests(unittest.TestCase):
             self.assertIn(f'"{manifest_field}"', verifier)
         self.assertIn('[ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
         self.assertNotIn('[ "${GCS_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
-        self.assertIn('"schema_version": 8', pipeline)
-        self.assertIn("schema_version must be 8", verifier)
+        self.assertIn('"schema_version": 9', pipeline)
+        self.assertIn("schema_version must be 9", verifier)
 
     def test_probe_mode_defaults_off_with_empty_baked_namespace(self) -> None:
         completed, selected = self.run_selector("production", environment())
@@ -430,7 +430,7 @@ class SelectorTests(unittest.TestCase):
         self.assertLess(probe, store)
         self.assertIn(".await\n    .expect", main[probe:kms])
 
-    def test_shadow_runtime_is_exact_off_baked_and_has_no_override_or_startup_call(self) -> None:
+    def test_shadow_runtime_is_image_bound_tag_selected_and_has_no_override_or_startup_call(self) -> None:
         completed, selected = self.run_selector("production", environment())
         self.assertEqual(completed.returncode, 0, completed.stderr)
         for name in (
@@ -440,26 +440,60 @@ class SelectorTests(unittest.TestCase):
             "ARCHIVE_V3_WITNESS_PROJECT_ID",
             "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
             "ARCHIVE_V3_WITNESS_DATABASE_ID",
+            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
         ):
             self.assertIn(f"{name}=\n", selected)
         self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
 
-        hostile = {
-            "schema_version": 1,
-            "mode": "shadow-v1",
-            "archive_bucket": "archive-bucket",
+        active = {
+            "schema_version": 2,
+            "mode": "single-archive-wal-v1",
+            "archive_bucket": "archive-bucket-1",
             "archive_gcs_project_number": "123456789",
             "registry_kms_version": "7",
             "witness_project_id": "project-1",
             "witness_project_number": "987654321",
             "witness_database_id": "witness-db",
+            "archive_binding_commitment": "1" * 64,
         }
         completed, selected = self.run_selector(
-            "production", environment(), shadow_runtime_config=hostile
+            "production", environment(), source_ref="main", shadow_runtime_config=active
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
+        self.assertNotIn("archive-bucket-1", selected)
+
+        wal_tag = "v1.2.3-archive-v3-wal.1"
+        completed, selected = self.run_selector(
+            "production", environment(), source_ref=wal_tag, shadow_runtime_config=active
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=single-archive-wal-v1\n", selected)
+        self.assertIn("ARCHIVE_V3_ARCHIVE_BUCKET=archive-bucket-1\n", selected)
+        self.assertIn("ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT=" + "1" * 64 + "\n", selected)
+
+        completed, selected = self.run_selector(
+            "evaluation", environment(), source_ref=wal_tag, shadow_runtime_config=active
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
+        self.assertNotIn("archive-bucket-1", selected)
+
+        for ref in ("v1.2.3", "v1.2.3-rc.1", "feature/runtime"):
+            with self.subTest(ref=ref):
+                completed, selected = self.run_selector(
+                    "production", environment(), source_ref=ref, shadow_runtime_config=active
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(selected, "")
+                self.assertIn("exact vX.Y.Z-archive-v3-wal.N", completed.stderr)
+
+        completed, selected = self.run_selector(
+            "production", environment(), source_ref=wal_tag
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(selected, "")
-        self.assertIn("must be exact off", completed.stderr)
+        self.assertIn("requires the complete active runtime profile", completed.stderr)
 
         pipeline = LOCAL_PIPELINE.read_text(encoding="utf-8")
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
@@ -468,7 +502,7 @@ class SelectorTests(unittest.TestCase):
         for source in (SELECTOR.read_text(encoding="utf-8"), verifier):
             self.assertIn("from archive_v3_shadow_runtime_config import", source)
             self.assertIn("load_shadow_runtime_config", source)
-        self.assertNotIn("shadow-v1", parser)
+        self.assertIn("single-archive-wal-v1", parser)
         self.assertNotIn("inputs.archive_v3", pipeline.lower())
         for name in (
             "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
@@ -478,14 +512,42 @@ class SelectorTests(unittest.TestCase):
             "ARCHIVE_V3_WITNESS_PROJECT_ID",
             "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
             "ARCHIVE_V3_WITNESS_DATABASE_ID",
+            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
         ):
             self.assertIn(f'("{name}", configuration["{name}"])', pipeline)
             self.assertIn(f"ARG {name}", dockerfile)
             self.assertIn(f"{name}=${{{name}}}", dockerfile)
             self.assertNotIn(f"PRODUCTION_{name}", pipeline)
             self.assertNotIn(f"EVALUATION_{name}", pipeline)
+        validator = "scripts/validate_archive_v3_shadow_runtime_environment.sh"
+        self.assertIn(f"COPY --chmod=0555 {validator}", dockerfile)
+        invocation = "&& /build/validate_archive_v3_shadow_runtime_environment.sh"
+        self.assertIn(invocation, dockerfile)
+        self.assertLess(dockerfile.index(f"COPY --chmod=0555 {validator}"), dockerfile.index(invocation))
+        for name in (
+            "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
+            "ARCHIVE_V3_ARCHIVE_BUCKET",
+            "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER",
+            "ARCHIVE_V3_REGISTRY_KMS_VERSION",
+            "ARCHIVE_V3_WITNESS_PROJECT_ID",
+            "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
+            "ARCHIVE_V3_WITNESS_DATABASE_ID",
+            "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
+        ):
+            self.assertIn(f'"${{{name}}}"', dockerfile)
+        self.assertIn('"archive_v3_archive_binding_commitment"', pipeline)
+        self.assertIn('"archive_v3_archive_binding_commitment"', verifier)
         main = MAIN.read_text(encoding="utf-8")
-        self.assertNotIn("ArchiveV3ShadowRuntimeBundle::new", main)
+        self.assertNotIn("PendingSingleArchiveWalRuntime::new", main)
+        self.assertNotIn("DurableSingleArchiveBinding::from_control_store", main)
+
+        hostile = environment()
+        hostile["PRODUCTION_ARCHIVE_V3_SHADOW_RUNTIME_MODE"] = "single-archive-wal-v1"
+        hostile["PRODUCTION_ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"] = "f" * 64
+        completed, selected = self.run_selector("production", hostile)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ARCHIVE_V3_SHADOW_RUNTIME_MODE=off\n", selected)
+        self.assertNotIn("f" * 64, selected)
 
 
 if __name__ == "__main__":

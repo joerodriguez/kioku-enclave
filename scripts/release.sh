@@ -76,9 +76,6 @@ for command_name in git gh python3 openssl; do need "$command_name"; done
 cd "$REPO_ROOT"
 [[ "$(git branch --show-current)" == main ]] || die "releases must be prepared from local main"
 [[ -z "$(git status --porcelain)" ]] || die "working tree is not clean"
-git fetch origin main
-COMMIT="$(git rev-parse HEAD)"
-[[ "$COMMIT" == "$(git rev-parse origin/main)" ]] || die "local main must exactly match origin/main"
 
 # Read the exact local configuration through the same no-shell, ownership- and
 # schema-checked parser used for image builds.  Only non-secret release claims
@@ -94,12 +91,22 @@ keys = (
     "PROJECT_ID", "REGION", "AR_REPOSITORY", "IMAGE_NAME",
     "ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET",
     "ENCLAVE_GCS_LEGACY_MEDIA_BUCKET", "BILLING_ENFORCEMENT_MODE",
+    "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
 )
 print("\x1f".join((*[configuration[key] for key in keys], builder)))
 PY
 )" || die "local release configuration is invalid"
-IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
+IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
+if [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
+  die "active archive-v3 WAL images cannot roll until the deployment compatibility PR is merged"
+fi
+
+# Keep the active-image rollout quarantine entirely local. It runs before the
+# origin refresh so an ineligible roll performs no network or external action.
+git fetch origin main
+COMMIT="$(git rev-parse HEAD)"
+[[ "$COMMIT" == "$(git rev-parse origin/main)" ]] || die "local main must exactly match origin/main"
 IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
 
 MANIFEST="$EVIDENCE_DIR/enclave-local-build-evidence.json"
@@ -146,8 +153,8 @@ if metadata["billing_enforcement_mode"] != sys.argv[2]:
     raise SystemExit("release metadata billing-enforcement mode differs from selected configuration")
 print("ok")
 PY
-)" || die "schema-8 release metadata does not match the checked source/configuration"
-[[ "$METADATA_CHECKS" == ok ]] || die "schema-8 release metadata check did not complete"
+)" || die "schema-9 release metadata does not match the checked source/configuration"
+[[ "$METADATA_CHECKS" == ok ]] || die "schema-9 release metadata check did not complete"
 
 verify_tag_signer() {
   local verification fingerprints

@@ -3,22 +3,26 @@
     reason = "construction-only ADR-0022 runtime bundle is intentionally not wired to startup or authority"
 )]
 
-//! Construction-only ADR-0022 shadow runtime composition.
+//! Sealed, inactive ADR-0022 single-archive WAL runtime composition.
 //!
 //! This module accepts only typed deployment fragments and builds the fixed
 //! archive-GCS, registry-KMS, and named-Firestore provider graph. Construction
-//! is synchronous and performs no provider request. Every capability remains
-//! behind private fields: there is no handle, getter, task, worker, Store/VFS
-//! hook, route, health signal, admission input, or deletion driver. The GCS
+//! is synchronous and performs no provider request. The graph remains pending
+//! until it consumes one opaque durable control-store archive binding whose
+//! domain-separated commitment exactly matches the image-baked deployment
+//! claim. Every capability remains behind private fields: there is no handle,
+//! getter, callback, task, worker, operation, acknowledgement, persistent-state/VFS hook,
+//! route, health signal, admission input, or deletion driver. The GCS
 //! hard-delete gate is permanently false until a later independently audited
 //! slice supplies authenticated lifecycle evidence.
 
 use std::{fmt, sync::Arc};
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    archive_v3::{ExactKeyRegistryProvider, ImmutableObjectBackend},
+    archive_v3::{ArchiveId, ExactKeyRegistryProvider, ImmutableObjectBackend},
     archive_v3_firestore_shadow::FirestoreShadowWitness,
     archive_v3_firestore_witness::FirestoreWitnessConfig,
     archive_v3_gcs::{
@@ -32,8 +36,12 @@ use crate::{
     archive_v3_registry_kms::GcpArchiveV3RegistryKms,
     archive_v3_shadow_coordinator::ShadowCheckpointWitnessProvider,
     archive_v3_witness::ExactRootProvider,
+    cp::control_store::ArchiveBinding,
     crypto::GcpKmsClient,
 };
+
+const ARCHIVE_BINDING_COMMITMENT_DOMAIN: &[u8] =
+    b"kioku/archive-v3/single-archive-wal-runtime-binding/v1\0";
 
 /// Redacted construction result. It never carries provider paths, deployment
 /// identifiers, bearer material, or response bodies.
@@ -43,6 +51,42 @@ pub(crate) enum ArchiveV3ShadowRuntimeConstructionError {
     InvalidDeployment,
     #[error("archive-v3 shadow runtime construction is unavailable")]
     Unavailable,
+}
+
+/// Image-baked commitment to exactly one opaque durable archive identity.
+/// The commitment has no archive-ID getter and its Debug output is redacted.
+#[derive(PartialEq, Eq)]
+pub(crate) struct ArchiveV3ArchiveBindingCommitment([u8; 32]);
+
+impl ArchiveV3ArchiveBindingCommitment {
+    fn from_lower_hex(value: &str) -> Result<Self, ArchiveV3ShadowRuntimeConstructionError> {
+        if value.len() != 64
+            || value
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || value.bytes().all(|byte| byte == b'0')
+        {
+            return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
+        }
+        let mut decoded = [0u8; 32];
+        for (output, pair) in decoded.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            *output = (lower_hex_nibble(pair[0]) << 4) | lower_hex_nibble(pair[1]);
+        }
+        Ok(Self(decoded))
+    }
+
+    fn for_archive(archive_id: ArchiveId) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(ARCHIVE_BINDING_COMMITMENT_DOMAIN);
+        hasher.update(archive_id.as_bytes());
+        Self(hasher.finalize().into())
+    }
+}
+
+impl fmt::Debug for ArchiveV3ArchiveBindingCommitment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ArchiveV3ArchiveBindingCommitment(<redacted>)")
+    }
 }
 
 /// Exact, image-bound fragments from which all provider coordinates are
@@ -55,6 +99,7 @@ pub(crate) struct ArchiveV3ShadowRuntimeDeployment {
     witness_project_id: String,
     witness_project_number: String,
     witness_database_id: String,
+    archive_binding_commitment: ArchiveV3ArchiveBindingCommitment,
 }
 
 impl ArchiveV3ShadowRuntimeDeployment {
@@ -66,9 +111,12 @@ impl ArchiveV3ShadowRuntimeDeployment {
         witness_project_id: &str,
         witness_project_number: &str,
         witness_database_id: &str,
+        archive_binding_commitment: &str,
     ) -> Result<Self, ArchiveV3ShadowRuntimeConstructionError> {
         if !valid_archive_v3_bucket_name(archive_bucket)
+            || !canonical_numeric_id(archive_gcs_project_number)
             || !canonical_numeric_id(registry_kms_version)
+            || !canonical_numeric_id(witness_project_number)
             || ArchiveV3GcsAudience::for_project_number(archive_gcs_project_number).is_err()
             || FirestoreWitnessConfig::new(
                 witness_project_id,
@@ -79,6 +127,8 @@ impl ArchiveV3ShadowRuntimeDeployment {
         {
             return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
         }
+        let archive_binding_commitment =
+            ArchiveV3ArchiveBindingCommitment::from_lower_hex(archive_binding_commitment)?;
         Ok(Self {
             archive_bucket: archive_bucket.to_owned(),
             archive_gcs_project_number: archive_gcs_project_number.to_owned(),
@@ -86,6 +136,7 @@ impl ArchiveV3ShadowRuntimeDeployment {
             witness_project_id: witness_project_id.to_owned(),
             witness_project_number: witness_project_number.to_owned(),
             witness_database_id: witness_database_id.to_owned(),
+            archive_binding_commitment,
         })
     }
 }
@@ -96,10 +147,8 @@ impl fmt::Debug for ArchiveV3ShadowRuntimeDeployment {
     }
 }
 
-/// Construction-only capability container. Private fields, lack of getters,
-/// and lack of `Clone` prevent callers from extracting an independently usable
-/// provider or runtime handle.
-pub(crate) struct ArchiveV3ShadowRuntimeBundle {
+/// Private provider owner. It is never returned without exact durable binding.
+struct ArchiveV3ShadowRuntimeBundle {
     _objects: Arc<dyn ImmutableObjectBackend>,
     _roots: Arc<dyn ExactRootProvider>,
     _registries: Arc<dyn ExactKeyRegistryProvider>,
@@ -110,8 +159,8 @@ impl ArchiveV3ShadowRuntimeBundle {
     /// Build fixed-origin clients without reading environment or performing
     /// provider I/O. Merely constructing this inert owner grants no operation
     /// that can read, create, delete, witness, route, or influence authority.
-    pub(crate) fn new(
-        deployment: ArchiveV3ShadowRuntimeDeployment,
+    fn new(
+        deployment: &ArchiveV3ShadowRuntimeDeployment,
         kms: Arc<GcpKmsClient>,
     ) -> Result<Self, ArchiveV3ShadowRuntimeConstructionError> {
         let audience =
@@ -122,7 +171,7 @@ impl ArchiveV3ShadowRuntimeBundle {
         );
         let drain = Arc::new(ConstructionOnlyDrainGate);
         let transport: Arc<dyn ArchiveV3GcsTransport> = Arc::new(
-            GcpArchiveV3HttpTransport::new(deployment.archive_bucket, bearer, drain)
+            GcpArchiveV3HttpTransport::new(deployment.archive_bucket.clone(), bearer, drain)
                 .map_err(map_gcs_construction_error)?,
         );
         let registry_kms = Arc::new(
@@ -155,6 +204,96 @@ impl ArchiveV3ShadowRuntimeBundle {
             _registries: components.registries,
             _witness: components.witness,
         }
+    }
+}
+
+/// Pending, non-cloneable single-archive runtime capability. It owns the
+/// provider graph but exposes no operation before consuming the durable
+/// binding, and consumption makes a second bind impossible.
+pub(crate) struct PendingSingleArchiveWalRuntime {
+    bundle: ArchiveV3ShadowRuntimeBundle,
+    expected_binding: ArchiveV3ArchiveBindingCommitment,
+}
+
+impl PendingSingleArchiveWalRuntime {
+    pub(crate) fn new(
+        deployment: ArchiveV3ShadowRuntimeDeployment,
+        kms: Arc<GcpKmsClient>,
+    ) -> Result<Self, ArchiveV3ShadowRuntimeConstructionError> {
+        let bundle = ArchiveV3ShadowRuntimeBundle::new(&deployment, kms)?;
+        Ok(Self {
+            bundle,
+            expected_binding: deployment.archive_binding_commitment,
+        })
+    }
+
+    /// Synchronously bind this one-shot capability to the exact durable
+    /// archive identity committed by the image. This performs no provider I/O.
+    pub(crate) fn bind_once(
+        self,
+        binding: DurableSingleArchiveBinding,
+    ) -> Result<SealedSingleArchiveWalRuntime, ArchiveV3ShadowRuntimeConstructionError> {
+        if ArchiveV3ArchiveBindingCommitment::for_archive(binding.archive_id)
+            != self.expected_binding
+        {
+            return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
+        }
+        Ok(SealedSingleArchiveWalRuntime {
+            _archive_id: binding.archive_id,
+            _bundle: self.bundle,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_test_components(
+        expected_binding: ArchiveV3ArchiveBindingCommitment,
+        components: ShadowRuntimeComponents,
+    ) -> Self {
+        Self {
+            bundle: ArchiveV3ShadowRuntimeBundle::from_components(components),
+            expected_binding,
+        }
+    }
+}
+
+impl fmt::Debug for PendingSingleArchiveWalRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PendingSingleArchiveWalRuntime(<inactive>)")
+    }
+}
+
+/// Opaque durable-binding capability. Production construction accepts only
+/// the encrypted control store's private `ArchiveBinding`, never a user ID,
+/// account ID, string, or caller-supplied raw archive bytes.
+pub(crate) struct DurableSingleArchiveBinding {
+    archive_id: ArchiveId,
+}
+
+impl DurableSingleArchiveBinding {
+    pub(crate) fn from_control_store(binding: ArchiveBinding) -> Self {
+        Self {
+            archive_id: binding.archive_id(),
+        }
+    }
+}
+
+impl fmt::Debug for DurableSingleArchiveBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DurableSingleArchiveBinding(<opaque>)")
+    }
+}
+
+/// Bound but deliberately inert runtime owner. Its archive identity and all
+/// providers remain private and it exposes no read, write, capture, witness,
+/// acknowledgement, task, callback, or deletion operation.
+pub(crate) struct SealedSingleArchiveWalRuntime {
+    _archive_id: ArchiveId,
+    _bundle: ArchiveV3ShadowRuntimeBundle,
+}
+
+impl fmt::Debug for SealedSingleArchiveWalRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SealedSingleArchiveWalRuntime(<inactive>)")
     }
 }
 
@@ -192,6 +331,14 @@ fn canonical_numeric_id(value: &str) -> bool {
         && value.parse::<u64>().is_ok()
 }
 
+const fn lower_hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => 0,
+    }
+}
+
 fn map_gcs_construction_error(
     error: crate::archive_v3_gcs::GcsArchiveV3TransportError,
 ) -> ArchiveV3ShadowRuntimeConstructionError {
@@ -225,6 +372,7 @@ mod tests {
             "project-1",
             "987654321",
             "witness-db",
+            "1111111111111111111111111111111111111111111111111111111111111111",
         )
         .unwrap()
     }
@@ -244,6 +392,7 @@ mod tests {
                 "project-1",
                 "987654321",
                 "witness-db",
+                "1111111111111111111111111111111111111111111111111111111111111111",
             )
             .is_err());
         }
@@ -261,6 +410,27 @@ mod tests {
                 "project-1",
                 "987654321",
                 "witness-db",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .is_err());
+            assert!(ArchiveV3ShadowRuntimeDeployment::new(
+                "archive-shadow-1",
+                invalid,
+                "7",
+                "project-1",
+                "987654321",
+                "witness-db",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .is_err());
+            assert!(ArchiveV3ShadowRuntimeDeployment::new(
+                "archive-shadow-1",
+                "123456789",
+                "7",
+                "project-1",
+                invalid,
+                "witness-db",
+                "1111111111111111111111111111111111111111111111111111111111111111",
             )
             .is_err());
         }
@@ -271,6 +441,7 @@ mod tests {
             "project-1",
             "987654321",
             "(default)",
+            "1111111111111111111111111111111111111111111111111111111111111111",
         )
         .is_err());
         assert!(ArchiveV3ShadowRuntimeDeployment::new(
@@ -280,8 +451,27 @@ mod tests {
             "project-1",
             "987654321",
             "witness-db",
+            "1111111111111111111111111111111111111111111111111111111111111111",
         )
         .is_err());
+        for invalid in [
+            "",
+            "0",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "111111111111111111111111111111111111111111111111111111111111111g",
+        ] {
+            assert!(ArchiveV3ShadowRuntimeDeployment::new(
+                "archive-shadow-1",
+                "123456789",
+                "7",
+                "project-1",
+                "987654321",
+                "witness-db",
+                invalid,
+            )
+            .is_err());
+        }
     }
 
     #[tokio::test]
@@ -380,30 +570,164 @@ mod tests {
     }
 
     #[test]
-    fn bundle_owns_private_components_without_invoking_them() {
+    fn pending_binding_is_one_shot_exact_and_performs_zero_provider_calls() {
         let calls = Arc::new(AtomicUsize::new(0));
         let components = || {
             Arc::new(NeverCalled {
                 calls: Arc::clone(&calls),
             })
         };
-        let bundle = ArchiveV3ShadowRuntimeBundle::from_components(ShadowRuntimeComponents {
-            objects: components(),
-            roots: components(),
-            registries: components(),
-            witness: components(),
-        });
-        assert_eq!(
-            format!("{bundle:?}"),
-            "ArchiveV3ShadowRuntimeBundle(<inactive>)"
+        let archive_id = crate::archive_v3::ArchiveId::from_bytes([19; 16]);
+        let pending = PendingSingleArchiveWalRuntime::from_test_components(
+            ArchiveV3ArchiveBindingCommitment::for_archive(archive_id),
+            ShadowRuntimeComponents {
+                objects: components(),
+                roots: components(),
+                registries: components(),
+                witness: components(),
+            },
         );
-        drop(bundle);
+        assert_eq!(
+            format!("{pending:?}"),
+            "PendingSingleArchiveWalRuntime(<inactive>)"
+        );
+        let binding = DurableSingleArchiveBinding::from_control_store(
+            crate::cp::control_store::ArchiveBinding::for_runtime_test(archive_id),
+        );
+        assert_eq!(
+            format!("{binding:?}"),
+            "DurableSingleArchiveBinding(<opaque>)"
+        );
+        let sealed = pending.bind_once(binding).unwrap();
+        assert_eq!(
+            format!("{sealed:?}"),
+            "SealedSingleArchiveWalRuntime(<inactive>)"
+        );
+        drop(sealed);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn bundle_is_send_and_sync_but_exposes_no_runtime_handle() {
+    fn wrong_binding_is_rejected_without_invoking_or_returning_components() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let component = || {
+            Arc::new(NeverCalled {
+                calls: Arc::clone(&calls),
+            })
+        };
+        let expected = crate::archive_v3::ArchiveId::from_bytes([21; 16]);
+        let wrong = crate::archive_v3::ArchiveId::from_bytes([22; 16]);
+        let pending = PendingSingleArchiveWalRuntime::from_test_components(
+            ArchiveV3ArchiveBindingCommitment::for_archive(expected),
+            ShadowRuntimeComponents {
+                objects: component(),
+                roots: component(),
+                registries: component(),
+                witness: component(),
+            },
+        );
+        let binding = DurableSingleArchiveBinding::from_control_store(
+            crate::cp::control_store::ArchiveBinding::for_runtime_test(wrong),
+        );
+        assert!(matches!(
+            pending.bind_once(binding),
+            Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn commitment_is_domain_separated_and_capabilities_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<ArchiveV3ShadowRuntimeBundle>();
+        assert_send_sync::<PendingSingleArchiveWalRuntime>();
+        assert_send_sync::<DurableSingleArchiveBinding>();
+        assert_send_sync::<SealedSingleArchiveWalRuntime>();
+        assert_ne!(
+            ArchiveV3ArchiveBindingCommitment::for_archive(ArchiveId::from_bytes([1; 16])),
+            ArchiveV3ArchiveBindingCommitment::for_archive(ArchiveId::from_bytes([2; 16]))
+        );
+        assert_eq!(
+            ArchiveV3ArchiveBindingCommitment::for_archive(ArchiveId::from_bytes([1; 16])).0,
+            [
+                0xc4, 0xb0, 0x1e, 0xae, 0x95, 0xc1, 0x37, 0xef, 0x5d, 0x77, 0xf9, 0x08, 0x49, 0x6a,
+                0xf2, 0xcd, 0x87, 0xd1, 0xa9, 0x73, 0x82, 0xc0, 0x97, 0xed, 0xc3, 0xdf, 0xfa, 0x3a,
+                0xeb, 0x11, 0xc7, 0xe1,
+            ]
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                ArchiveV3ArchiveBindingCommitment::for_archive(ArchiveId::from_bytes([1; 16]))
+            ),
+            "ArchiveV3ArchiveBindingCommitment(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn source_exposes_no_runtime_operation_or_live_wiring() {
+        let source = include_str!("archive_v3_shadow_runtime.rs");
+        let main = include_str!("main.rs");
+        let control = include_str!("cp/control_store.rs");
+        for type_name in [
+            "ArchiveV3ArchiveBindingCommitment",
+            "PendingSingleArchiveWalRuntime",
+            "DurableSingleArchiveBinding",
+            "SealedSingleArchiveWalRuntime",
+        ] {
+            let declaration = source
+                .find(&format!("struct {type_name}"))
+                .expect("capability declaration");
+            let attributes = &source[source[..declaration]
+                .rfind("\n\n")
+                .map_or(0, |offset| offset + 2)..declaration];
+            assert!(
+                !attributes.contains("Clone") && !attributes.contains("Copy"),
+                "{type_name} must remain non-cloneable"
+            );
+        }
+        for forbidden in [
+            concat!("impl Clone", " for PendingSingleArchiveWalRuntime"),
+            concat!("impl Clone", " for DurableSingleArchiveBinding"),
+            concat!("impl Clone", " for SealedSingleArchiveWalRuntime"),
+            concat!("pub(crate) fn archive_", "id(&self)"),
+            concat!("pub(crate) fn object", "s("),
+            concat!("pub(crate) fn root", "s("),
+            concat!("pub(crate) fn registr", "ies("),
+            concat!("pub(crate) fn wit", "ness("),
+            concat!("tokio::", "spawn"),
+            concat!("std::thread::", "spawn"),
+            concat!("St", "ore"),
+            concat!("with_", "user"),
+            concat!("WalLogical", "Only"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "forbidden surface: {forbidden}"
+            );
+        }
+        assert!(!source.contains(concat!("impl SealedSingleArchiveWal", "Runtime {")));
+        let factory = source
+            .find("fn from_control_store(")
+            .expect("durable binding factory");
+        let signature_end = source[factory..]
+            .find('{')
+            .map(|offset| factory + offset)
+            .expect("durable binding factory body");
+        let signature = &source[factory..signature_end];
+        assert!(signature.contains("binding: ArchiveBinding"));
+        for forbidden in ["ArchiveId", "[u8", "str", "user", "account"] {
+            assert!(!signature.contains(forbidden));
+        }
+        let test_factory = control
+            .find("fn for_runtime_test(")
+            .expect("control-store test binding factory");
+        assert!(control[test_factory.saturating_sub(80)..test_factory].contains("#[cfg(test)]"));
+        for forbidden in [
+            "PendingSingleArchiveWalRuntime::new",
+            "DurableSingleArchiveBinding::from_control_store",
+            "SealedSingleArchiveWalRuntime",
+        ] {
+            assert!(!main.contains(forbidden), "live wiring: {forbidden}");
+        }
     }
 }

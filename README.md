@@ -417,10 +417,14 @@ and release verification derive them through one strict parser from the reviewed
 [`config/archive-witness-probe.json`](config/archive-witness-probe.json). The checked-in
 file is exact `off` with an empty namespace.
 
-The seven `ARCHIVE_V3_*` shadow-runtime arguments are likewise derived only from
+The eight `ARCHIVE_V3_*` shadow-runtime arguments are likewise derived only from
 [`config/archive-v3-shadow-runtime.json`](config/archive-v3-shadow-runtime.json). This
-slice accepts exactly `off` with all six provider fragments empty. It has no active/tag
-variant, operator-configuration or command-line override, startup constructor, or provider I/O.
+schema-2 file remains checked in as exact `off` with all seven fragments empty. A complete
+`single-archive-wal-v1` profile is eligible only for an exact
+`vX.Y.Z-archive-v3-wal.N` production image; evaluation and `main` pretag builds force it
+off, an exact WAL tag with an off profile fails, and no operator, environment, or dispatch
+input can override it. The profile seals only an inactive one-shot archive-binding
+capability: startup does not construct it and it performs no provider I/O.
 
 ```sh
 docker build --platform linux/amd64 \
@@ -443,6 +447,7 @@ docker build --platform linux/amd64 \
   --build-arg ARCHIVE_V3_WITNESS_PROJECT_ID= \
   --build-arg ARCHIVE_V3_WITNESS_PROJECT_NUMBER= \
   --build-arg ARCHIVE_V3_WITNESS_DATABASE_ID= \
+  --build-arg ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT= \
   --build-arg RUN_SA_EMAIL=legacy-caller@my-project.iam.gserviceaccount.com \
   --build-arg ENCLAVE_AUDIENCE=https://api.example.com \
   --build-arg ATTEST_STS_AUDIENCE='//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/confidential-space' \
@@ -481,7 +486,7 @@ binding.
 | `GCS_MEDIA_BUCKET` | Current encrypted bounded-retention raw-media bucket; new media is written here |
 | `GCS_LEGACY_MEDIA_BUCKET` | Required migration-only media read/delete bucket; must exactly equal `GCS_BUCKET` for Phase-0 |
 | `ARCHIVE_WITNESS_SHADOW_MODE`, `ARCHIVE_WITNESS_PROJECT_ID`, `ARCHIVE_WITNESS_PROJECT_NUMBER`, `ARCHIVE_WITNESS_DATABASE_ID` | Non-authoritative Firestore transport probe derived only from checked-in `config/archive-witness-probe.json`. It starts exact `off`/empty; evaluation and main stay off, operator configuration/commands cannot override it, and `probe-v1` requires a complete named namespace plus exact `vX.Y.Z-witness-probe.N` prerelease. Its bounded redacted result grants no startup, health, rollout, or archive authority |
-| `ARCHIVE_V3_SHADOW_RUNTIME_MODE`, `ARCHIVE_V3_ARCHIVE_BUCKET`, `ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER`, `ARCHIVE_V3_REGISTRY_KMS_VERSION`, `ARCHIVE_V3_WITNESS_PROJECT_ID`, `ARCHIVE_V3_WITNESS_PROJECT_NUMBER`, `ARCHIVE_V3_WITNESS_DATABASE_ID` | Construction-only ADR-0022 provider bundle claim derived only from checked-in `config/archive-v3-shadow-runtime.json`. The only accepted profile is exact `off` with every provider fragment empty; no startup code constructs the bundle and no provider, Store, route, health, deletion, or archive authority is activated |
+| `ARCHIVE_V3_SHADOW_RUNTIME_MODE`, `ARCHIVE_V3_ARCHIVE_BUCKET`, `ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER`, `ARCHIVE_V3_REGISTRY_KMS_VERSION`, `ARCHIVE_V3_WITNESS_PROJECT_ID`, `ARCHIVE_V3_WITNESS_PROJECT_NUMBER`, `ARCHIVE_V3_WITNESS_DATABASE_ID`, `ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT` | Image-bound ADR-0022 single-archive runtime claim derived only from checked-in `config/archive-v3-shadow-runtime.json`. `off` requires every fragment empty; the complete active form is canonical-tag-only, is independently grammar-checked by Docker, and commits to one opaque durable archive ID. No startup code constructs the capability and no provider, Store, route, health, deletion, WAL publication, or archive authority is activated. Schema-9 active evidence cannot roll—even far enough to refresh origin—until the deployment repository merges its compatibility PR |
 | `RUN_SA_EMAIL` | Google service-account identity accepted by legacy routes |
 | `ENCLAVE_AUDIENCE` | Exact `aud` expected on legacy caller ID tokens; normally the public HTTPS API URL |
 | `ATTEST_STS_AUDIENCE` | Internal WIF provider resource for KMS STS exchange; never a public token audience |
