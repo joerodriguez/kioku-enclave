@@ -3,6 +3,8 @@
 //! durably persisted; terminal telemetry delivery is retried without repeating
 //! a paid model call.
 
+pub(crate) mod wal;
+
 use std::{sync::Arc, time::Duration};
 
 use rusqlite::params;

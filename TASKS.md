@@ -202,6 +202,14 @@ separate activation blockers.
     preconditions and late ledger failures roll back without consuming the
     identity; exact committed replay survives reopen. It has no launcher,
     route, Store policy, provider, task, or acknowledgement wiring.
+  - [x] Add the inactive Vertex usage terminal-outcome A-domain for an already
+    durable event: exact normalized response, ambiguous, and not-billed request
+    variants derive one opaque ID from the strict vtx event identity, apply
+    only from started or exactly adopt the same terminal facts, refresh
+    coverage only on the first transition, and retain unit replay in a distinct
+    1,048,576-row/32-MiB permanent ledger. Missing/substituted events, cap
+    exhaustion, late ledger failure, and tamper fail closed. The B-domain event
+    allocator and every Store/worker/launcher/provider/ack path remain absent.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.

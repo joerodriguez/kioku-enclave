@@ -12,10 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLASSIFICATIONS = frozenset({"A", "B", "C"})
-EXPECTED_STORE_CALL_COUNT = 148
-EXPECTED_STORE_CALL_SHA256 = "aa81b50e49d7b5bbce475d26d3bcec720bade77f015fd47a2b500b55735264ed"
+EXPECTED_STORE_CALL_COUNT = 151
+EXPECTED_STORE_CALL_SHA256 = "b558be76d3a94f57c0f96ba2658570c94d84f939283447100be370d433ac0d82"
 EXPECTED_STORE_SURFACE_COUNT = 15
-EXPECTED_STORE_SURFACE_SHA256 = "983616ff4e989476f08588a065fcfcd17366b175500265b104d68a9da63a9334"
+EXPECTED_STORE_SURFACE_SHA256 = "3abb7ccb5ae7ef2470b99a0de068af22ad64134d741c9bf2f0ebfdf6e431c54c"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::main#0::Store::new_with_media_and_legacy#0",
@@ -54,7 +54,7 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     }
 )
 EXPECTED_WORKER_SPAWN_COUNT = 24
-EXPECTED_WORKER_SPAWN_SHA256 = "1ed48491a1d6a5dd7fee31b5869c437df25bc5fb97f0955e91b007aac8d7fce4"
+EXPECTED_WORKER_SPAWN_SHA256 = "9cc0d93f6da8418dc1db2ccf30245a8b938b44fd4525139d3a3fb5bd3f6f5506"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -534,6 +534,7 @@ A_OWNERS = frozenset(
         "src/cp/media.rs::capture_status#0",
         "src/cp/media.rs::capture_session_status#0",
         "src/cp/media.rs::finish_capture_session#0",
+        "src/cp/media.rs::upload_screen_reference_batch#0",
         "src/cp/media.rs::list_people#0",
         "src/cp/media.rs::person_profile#0",
         "src/cp/media.rs::person_evidence#0",
@@ -618,6 +619,7 @@ CALL_OVERRIDES = {
     "src/cp/media.rs::upload_capture_event#0::with_user#0": "A",
     "src/cp/media.rs::upload_capture_event#0::with_user#1": "A",
     "src/cp/media.rs::upload_capture_event#0::save_user#0": "A",
+    "src/cp/media.rs::upload_capture_event#0::save_user#1": "A",
     # Deterministic work result is A; reservation/model attempts remain B.
     "src/cp/media_worker.rs::process_work_unit#0::with_user#0": "A",
     "src/cp/media_worker.rs::process_work_unit#0::with_user#1": "A",
@@ -912,10 +914,14 @@ impl X {
         ):
             self.assertNotIn(forbidden, gate)
 
-    def test_first_production_a_domain_is_closed_and_unwired(self) -> None:
+    def test_production_a_domains_are_closed_and_unwired(self) -> None:
         gate = (ROOT / "src/archive_v3_wal_idempotency.rs").read_text(encoding="utf-8")
         media = (ROOT / "src/cp/media.rs").read_text(encoding="utf-8")
         domain = (ROOT / "src/cp/media/wal.rs").read_text(encoding="utf-8")
+        model_usage = (ROOT / "src/cp/model_usage.rs").read_text(encoding="utf-8")
+        vertex_domain = (ROOT / "src/cp/model_usage/wal.rs").read_text(
+            encoding="utf-8"
+        )
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("pub(crate) mod wal;", media)
         self.assertIn(
@@ -929,6 +935,22 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", domain)
         self.assertIn("WalIdempotencyError::Precondition", domain)
         self.assertNotIn("cp::media::wal::", main)
+        self.assertIn("pub(crate) mod wal;", model_usage)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageOutcomePlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexUsageOutcomeLedger",
+            gate,
+        )
+        self.assertIn("struct VertexUsageOutcomePlan", vertex_domain)
+        self.assertIn("struct VertexUsageOutcomeLedger", vertex_domain)
+        self.assertIn("archive_v3_wal_vertex_usage_operations", vertex_domain)
+        self.assertIn("MAX_VERTEX_USAGE_ROWS", vertex_domain)
+        self.assertIn("DomainLedgerBounds::new", vertex_domain)
+        self.assertIn("WalIdempotencyError::Precondition", vertex_domain)
+        self.assertNotIn("cp::model_usage::wal::", main)
         for forbidden in (
             "crate::store::Store",
             "Store::new",
@@ -940,6 +962,14 @@ impl X {
             "delete_exact",
         ):
             self.assertNotIn(forbidden, domain)
+            self.assertNotIn(forbidden, vertex_domain)
+        for forbidden in (
+            "begin_invocation(",
+            "random_token_hex",
+            "with_user(",
+            "save_user(",
+        ):
+            self.assertNotIn(forbidden, vertex_domain)
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
