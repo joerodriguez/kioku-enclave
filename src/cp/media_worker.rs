@@ -6,6 +6,8 @@
 //! Vertex Gemini, validates constrained JSON, and transactionally projects the
 //! result into the searchable archive. No media or generated content is logged.
 
+pub(crate) mod wal;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

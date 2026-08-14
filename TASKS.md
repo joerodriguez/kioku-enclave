@@ -231,6 +231,18 @@ separate activation blockers.
     schema, result tamper, and reopen all fail closed or exactly replay. The
     media-DEK allocator, encryption/upload attempt, Store/route/launcher/provider/
     task/ack path, and cleanup remain absent.
+  - [x] Add the inactive raw-media retention-settlement A-domain: the stable
+    account/event identity derives one opaque operation before actor admission,
+    while the exact account-bound object key, bucket-local generation/backend,
+    plaintext hash, retention deadline, eligible ready/failed predecessor, and
+    fixed terminal timestamp form its request fingerprint. Only an exact row can
+    become pruned or be adopted as an identical pre-existing terminal, and a
+    distinct 1,048,576-row/32-MiB ledger reserves capacity before domain SQL.
+    Substituted provider facts, early or ineligible rows, cap exhaustion, late
+    ledger failure, partial schema, result tamper, and reopen fail closed or
+    exactly replay. The future provider deletion boundary must settle the exact
+    object before constructing this plan; Store/provider list/read/delete,
+    worker/launcher/task/acknowledgement wiring remain absent.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.
