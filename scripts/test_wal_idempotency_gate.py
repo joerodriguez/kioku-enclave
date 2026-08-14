@@ -912,6 +912,35 @@ impl X {
         ):
             self.assertNotIn(forbidden, gate)
 
+    def test_first_production_a_domain_is_closed_and_unwired(self) -> None:
+        gate = (ROOT / "src/archive_v3_wal_idempotency.rs").read_text(encoding="utf-8")
+        media = (ROOT / "src/cp/media.rs").read_text(encoding="utf-8")
+        domain = (ROOT / "src/cp/media/wal.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
+        self.assertIn("pub(crate) mod wal;", media)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media::wal::CaptureSessionFinishPlan",
+            gate,
+        )
+        self.assertIn("struct CaptureSessionFinishPlan", domain)
+        self.assertIn("struct CaptureSessionFinishLedger", domain)
+        self.assertIn("archive_v3_wal_capture_session_finish_operations", domain)
+        self.assertIn("MAX_CAPTURE_SESSION_FINISH_ROWS", domain)
+        self.assertIn("DomainLedgerBounds::new", domain)
+        self.assertIn("WalIdempotencyError::Precondition", domain)
+        self.assertNotIn("cp::media::wal::", main)
+        for forbidden in (
+            "crate::store::Store",
+            "Store::new",
+            "tokio::spawn",
+            "std::env::",
+            "GcsClient",
+            "FirestoreWitness",
+            "list_objects",
+            "delete_exact",
+        ):
+            self.assertNotIn(forbidden, domain)
+
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
         publisher = (ROOT / "src/archive_v3_wal_owner/publisher.rs").read_text(

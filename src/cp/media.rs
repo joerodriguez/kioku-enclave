@@ -1,5 +1,7 @@
 //! V2 raw-media capture API and cloud processing ledger.
 
+pub(crate) mod wal;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;

@@ -1,20 +1,22 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 logical-write gate is compiled before a WAL publication owner exists"
+    reason = "inactive ADR-0022 logical-write gate is compiled before production launcher or serving activation"
 )]
 
-//! Inactive, fail-closed logical-operation idempotency gate for a future
-//! archive-v3 WAL writer.
+//! Inactive, fail-closed logical-operation idempotency gate for archive-v3 WAL.
 //!
-//! Any future replay rows are permanent within their exact owning operation
+//! Replay rows are permanent within their exact owning operation
 //! domain. A caller cannot use a universal receipt table: it must hold a
 //! module-sealed domain plan whose distinct, bounded ledger fixes the request
-//! fingerprint, indexed resolver, and exact replay-result policy. Only a
-//! bounded test exemplar implements that contract in this slice. This module
-//! performs only local SQLite transactions. It has no Store connection,
-//! publisher, capture, root, witness, provider, route, worker, or startup path.
+//! fingerprint, indexed resolver, and exact replay-result policy. A bounded
+//! test exemplar and the separately reviewed capture-session-finish child
+//! implement that contract; every other production domain remains unsealed.
+//! This module performs only local SQLite transactions and derives opaque
+//! identifiers. It has no Store connection, launcher, publisher construction,
+//! capture, root, witness, provider, route, worker, or startup path.
 //!
-//! The future owner order is deliberately documented but not implemented:
+//! The private owner enforces this order once a future launcher supplies it a
+//! sealed plan:
 //! derive stable ID/fingerprint before actor admission; reconcile any pending
 //! attempt; enter `BEGIN IMMEDIATE`; resolve-or-apply the domain mutation and
 //! exact result atomically; capture the same ID/fingerprint; publish and exact-
@@ -29,11 +31,12 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 const WAL_IDEMPOTENCY_FORMAT_V1: u16 = 1;
+const OPERATION_ID_DOMAIN: &[u8] = b"kioku/archive-v3/wal-logical-operation-id/v1\0";
 const REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"kioku/archive-v3/wal-logical-request-fingerprint/v1\0";
 const REPLAY_RESULT_DOMAIN: &[u8] = b"kioku/archive-v3/wal-logical-replay-result/v1\0";
 const MAX_CANONICAL_WAL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CANONICAL_REPLAY_RESULT_BYTES: usize = 4096;
-const MAX_ENCODED_REPLAY_RESULT_BYTES: usize = MAX_CANONICAL_REPLAY_RESULT_BYTES + 9;
+pub(crate) const MAX_ENCODED_REPLAY_RESULT_BYTES: usize = MAX_CANONICAL_REPLAY_RESULT_BYTES + 9;
 const RESULT_UNIT: u8 = 1;
 const RESULT_CANONICAL_RESPONSE: u8 = 2;
 
@@ -49,6 +52,8 @@ pub(crate) enum WalIdempotencyError {
     FingerprintConflict,
     #[error("WAL logical operation domain rejected the replay result")]
     ResultUnsupported,
+    #[error("WAL logical operation precondition is not satisfied")]
+    Precondition,
     #[error("WAL logical operation transaction is unavailable")]
     Unavailable,
 }
@@ -94,7 +99,7 @@ impl WalOperationKind {
         }
     }
 
-    const fn codec_version(self) -> u16 {
+    pub(crate) const fn codec_version(self) -> u16 {
         match self {
             Self::MediaCaptureEvent
             | Self::CaptureSessionFinish
@@ -117,6 +122,10 @@ impl WalOperationKind {
             Self::MediaCaptureEvent | Self::CaptureSessionFinish | Self::SelectedScreenshot
         )
     }
+
+    pub(crate) const fn format_version() -> u16 {
+        WAL_IDEMPOTENCY_FORMAT_V1
+    }
 }
 
 /// Nonzero stable ID supplied by the portable domain, never allocated after a
@@ -135,6 +144,39 @@ impl WalLogicalOperationId {
 
     pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
+    }
+
+    /// Derives an opaque operation ID from an originating domain's already
+    /// validated, caller-stable source identity. The source is fixed before
+    /// actor admission; retries derive the same ID without a counter, clock,
+    /// random allocation, or database lookup.
+    pub(crate) fn from_stable_source(
+        kind: WalOperationKind,
+        canonical_source: &[u8],
+    ) -> Result<Self> {
+        if canonical_source.is_empty() || canonical_source.len() > MAX_CANONICAL_WAL_REQUEST_BYTES {
+            return Err(if canonical_source.is_empty() {
+                WalIdempotencyError::Malformed
+            } else {
+                WalIdempotencyError::Limit
+            });
+        }
+        let source_length =
+            u32::try_from(canonical_source.len()).map_err(|_| WalIdempotencyError::Limit)?;
+        let mut hasher = Sha256::new();
+        hasher.update(OPERATION_ID_DOMAIN);
+        hasher.update(WAL_IDEMPOTENCY_FORMAT_V1.to_be_bytes());
+        hasher.update((kind as u16).to_be_bytes());
+        hasher.update(kind.codec_version().to_be_bytes());
+        hasher.update(source_length.to_be_bytes());
+        hasher.update(canonical_source);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut value = [0u8; 16];
+        value.copy_from_slice(&digest[..16]);
+        if value == [0; 16] {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        Ok(Self(value))
     }
 }
 
@@ -345,20 +387,25 @@ pub(crate) trait WalLogicalDomainLedger<P: WalLogicalDomainPlan>:
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DomainLedgerBounds {
+pub(crate) struct DomainLedgerBounds {
     max_rows: u32,
     max_result_bytes: u64,
 }
 
 impl DomainLedgerBounds {
-    const fn new(max_rows: u32, max_result_bytes: u64) -> Self {
+    pub(crate) const fn new(max_rows: u32, max_result_bytes: u64) -> Self {
         Self {
             max_rows,
             max_result_bytes,
         }
     }
 
-    fn admit(self, rows: u32, result_bytes: u64, next_result_bytes: usize) -> Result<()> {
+    pub(crate) fn admit(
+        self,
+        rows: u32,
+        result_bytes: u64,
+        next_result_bytes: usize,
+    ) -> Result<()> {
         let next_result_bytes =
             u64::try_from(next_result_bytes).map_err(|_| WalIdempotencyError::Limit)?;
         if self.max_rows == 0
@@ -374,7 +421,10 @@ impl DomainLedgerBounds {
     }
 }
 
-/// Opaque plan produced before actor entry. Only this module's future owner
+impl sealed::DomainPlan for crate::cp::media::wal::CaptureSessionFinishPlan {}
+impl sealed::DomainLedger for crate::cp::media::wal::CaptureSessionFinishLedger {}
+
+/// Opaque plan produced before actor entry. Only the private WAL owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.
 pub(crate) struct PreparedLogicalMutation<P: WalLogicalDomainPlan> {
     plan: P,
@@ -822,6 +872,16 @@ mod tests {
     #[test]
     fn ids_fingerprints_domains_versions_and_bounds_are_strict() {
         assert!(WalLogicalOperationId::from_bytes([0; 16]).is_err());
+        assert!(WalLogicalOperationId::from_stable_source(
+            WalOperationKind::MediaCaptureEvent,
+            &[]
+        )
+        .is_err());
+        assert!(WalLogicalOperationId::from_stable_source(
+            WalOperationKind::MediaCaptureEvent,
+            &vec![1; MAX_CANONICAL_WAL_REQUEST_BYTES + 1]
+        )
+        .is_err());
         let id = WalLogicalOperationId::from_bytes([1; 16]).unwrap();
         assert_eq!(format!("{id:?}"), "WalLogicalOperationId(<opaque>)");
         assert!(WalRequestFingerprint::derive(WalOperationKind::MediaCaptureEvent, &[]).is_err());
