@@ -151,6 +151,7 @@ mod archive_v3_shadow_parity;
 // matched durable control-store binding; startup never constructs it and it
 // has no Store/VFS/lifecycle, route, health, admission, deletion, task, flag,
 // callback, operation, or authority wiring.
+mod archive_v3_maintenance_import;
 mod archive_v3_shadow_runtime;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
 // Store/VFS runtime connection, provider construction, flag, route, or authority.

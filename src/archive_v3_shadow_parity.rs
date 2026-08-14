@@ -280,6 +280,8 @@ pub(crate) struct PrivateStagedSqliteCopy {
     identity: StagedIdentity,
 }
 
+pub(crate) struct MaintenanceParitySourceContext(());
+
 impl PrivateStagedSqliteCopy {
     #[cfg(test)]
     pub(crate) fn new(path: PathBuf) -> Result<Self, ShadowParityError> {
@@ -289,6 +291,27 @@ impl PrivateStagedSqliteCopy {
 
     fn from_owned_recovery(proof: CompositeRecoveryProof) -> Result<Self, ShadowParityError> {
         let path = proof.into_path();
+        let identity = staged_identity(&path)?;
+        Ok(Self { path, identity })
+    }
+
+    /// Maintenance-only source capability. The path is obtained exclusively
+    /// from the Store-owned pinned snapshot and is revalidated here; no caller
+    /// path can cross this proof boundary.
+    pub(crate) fn from_pinned_maintenance_source(
+        source: &crate::store::PinnedLegacySnapshot,
+    ) -> Result<Self, ShadowParityError> {
+        let path = source
+            .path_for_parity(MaintenanceParitySourceContext(()))
+            .to_path_buf();
+        let identity = staged_identity(&path)?;
+        Ok(Self { path, identity })
+    }
+
+    pub(crate) fn from_owned_maintenance_recovery(
+        recovered: &OwnedPrivateStagedSqliteCopy,
+    ) -> Result<Self, ShadowParityError> {
+        let path = recovered.copy.path.clone();
         let identity = staged_identity(&path)?;
         Ok(Self { path, identity })
     }
@@ -452,6 +475,21 @@ pub(crate) struct ShadowParityDigests {
     vectors: OpaqueParityDigest,
     table_counts: OpaqueParityDigest,
     selected_queries: OpaqueParityDigest,
+}
+
+impl ShadowParityDigests {
+    /// One domain-separated commitment to every independent parity dimension.
+    /// Raw per-table/query digests remain private to this verifier.
+    pub(crate) fn maintenance_commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kioku/archive-v3/maintenance-full-parity/v1\0");
+        hasher.update(self.logical_export.0);
+        hasher.update(self.full_logical_database.0);
+        hasher.update(self.vectors.0);
+        hasher.update(self.table_counts.0);
+        hasher.update(self.selected_queries.0);
+        hasher.finalize().into()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

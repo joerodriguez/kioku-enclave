@@ -48,6 +48,17 @@ use crate::{
         DurablePageCreateAdmission, FrozenPageCreateSet, LifecyclePageAdmissionLedger,
         PageCreateDisposition, RecoveredPageCreatePlan,
     },
+    archive_v3_maintenance_import::{
+        operation_commitment_for_control, AuthenticatedMaintenanceImportPlan,
+        MaintenanceImportError, MaintenanceImportOperationId, MaintenanceImportPersistence,
+        MaintenanceImportRecord, MaintenanceImportStage, MaintenanceSourceBinding,
+        MaintenanceZeroWalBindingContext, PreparedMaintenanceMigration,
+        MAX_MAINTENANCE_IMPORT_ATTEMPTS,
+    },
+    archive_v3_operation::{
+        RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryEntry, ShadowObjectInventoryPage,
+        ShadowObjectState,
+    },
     archive_v3_pre_witness_deletion::{
         execution_commitment, AuthenticatedPreWitnessExecutionInventory,
         BoundPreWitnessDeletionExecution, DurablePreWitnessPhysicalCompletion,
@@ -58,6 +69,8 @@ use crate::{
         VerifiedPreWitnessObjectsAbsent, VerifiedPreWitnessRegistryErasure,
         PRE_WITNESS_DELETION_EXECUTION_FORMAT_V1,
     },
+    archive_v3_shadow_checkpoint::{ShadowObjectInventory, ShadowObjectInventoryError},
+    archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionBinding, ShadowSessionId},
     archive_v3_witness_disposition::{
         AuthenticatedPreWitnessAbsence, ClosedWitnessPhase, ClosedWitnessProtocol,
         ExactNoneObservation, PreWitnessControlState, PreWitnessDispositionControl,
@@ -65,7 +78,7 @@ use crate::{
     cp::isotime,
     crypto::{decrypt_bound_blob, encrypt_bound_blob, generate_and_wrap_dek, load_dek, KmsClient},
     error::{EnclaveError, Result},
-    store::{validate_user_id, GcsClient, IdentityRebindSource, Store},
+    store::{validate_user_id, GcsClient, IdentityRebindSource, MaintenanceTentativeSource, Store},
 };
 
 const CONTROL_OBJECT: &str = "control/control.db.enc";
@@ -291,6 +304,140 @@ CREATE TABLE IF NOT EXISTS archive_bindings (
     state      TEXT NOT NULL CHECK (state IN ('active_legacy', 'tombstoned')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     tombstoned_at TEXT
+);
+-- Inactive, single-archive maintenance import. This encrypted control row is
+-- the sole restart authority for the permanent legacy fence, exact pinned
+-- generation, lease, both immutable root candidates, and both migration
+-- sends. It is intentionally not referenced by startup or serving code.
+CREATE TABLE IF NOT EXISTS archive_v3_maintenance_imports (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_bindings(archive_id)
+        CHECK (length(archive_id) = 16 AND archive_id != zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK (format_version = 1),
+    user_id TEXT NOT NULL UNIQUE REFERENCES archive_bindings(user_id),
+    operation_id BLOB NOT NULL UNIQUE CHECK (length(operation_id) = 16 AND operation_id != zeroblob(16)),
+    owner_id BLOB NOT NULL CHECK (length(owner_id) = 16 AND owner_id != zeroblob(16)),
+    session_id BLOB NOT NULL UNIQUE CHECK (length(session_id) = 16 AND session_id != zeroblob(16)),
+    attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 16),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    stage TEXT NOT NULL CHECK (stage IN (
+        'prepared','fencing','legacy_pinned','shadow_uploading',
+        'shadow_send_unknown','shadow_wal','parity_verified',
+        'authoritative_uploading','authoritative_send_unknown',
+        'wal_authoritative','manual_required'
+    )),
+    fence_authority TEXT NOT NULL CHECK (
+        length(fence_authority) = 72
+        AND substr(fence_authority, 1, 8) = 'archive_'
+        AND substr(fence_authority, 9) NOT GLOB '*[^0-9a-f]*'
+    ),
+    operation_commitment BLOB NOT NULL CHECK (length(operation_commitment) = 32 AND operation_commitment != zeroblob(32)),
+    tentative_generation INTEGER CHECK (tentative_generation IS NULL OR tentative_generation >= 0),
+    tentative_plaintext_hash BLOB CHECK (tentative_plaintext_hash IS NULL OR (length(tentative_plaintext_hash) = 32 AND tentative_plaintext_hash != zeroblob(32))),
+    tentative_plaintext_len INTEGER CHECK (tentative_plaintext_len IS NULL OR (tentative_plaintext_len > 0 AND tentative_plaintext_len <= 34359738368 AND tentative_plaintext_len % 4096 = 0)),
+    tentative_schema_version INTEGER CHECK (tentative_schema_version IS NULL OR tentative_schema_version >= 0),
+    tentative_wrapped_dek_commitment BLOB CHECK (tentative_wrapped_dek_commitment IS NULL OR (length(tentative_wrapped_dek_commitment) = 32 AND tentative_wrapped_dek_commitment != zeroblob(32))),
+    source_generation INTEGER CHECK (source_generation IS NULL OR source_generation > 0),
+    source_plaintext_hash BLOB CHECK (source_plaintext_hash IS NULL OR (length(source_plaintext_hash) = 32 AND source_plaintext_hash != zeroblob(32))),
+    source_plaintext_len INTEGER CHECK (source_plaintext_len IS NULL OR (source_plaintext_len > 0 AND source_plaintext_len <= 34359738368 AND source_plaintext_len % 4096 = 0)),
+    source_schema_version INTEGER CHECK (source_schema_version IS NULL OR source_schema_version >= 0),
+    source_wrapped_dek_commitment BLOB CHECK (source_wrapped_dek_commitment IS NULL OR (length(source_wrapped_dek_commitment) = 32 AND source_wrapped_dek_commitment != zeroblob(32))),
+    source_commitment BLOB CHECK (source_commitment IS NULL OR (length(source_commitment) = 32 AND source_commitment != zeroblob(32))),
+    witness_record BLOB CHECK (witness_record IS NULL OR length(witness_record) = 724),
+    witness_record_hash BLOB CHECK (witness_record_hash IS NULL OR (length(witness_record_hash) = 32 AND witness_record_hash != zeroblob(32))),
+    lease_fence INTEGER CHECK (lease_fence IS NULL OR lease_fence > 0),
+    lease_expiry INTEGER CHECK (lease_expiry IS NULL OR lease_expiry > 0),
+    shadow_candidate BLOB CHECK (shadow_candidate IS NULL OR length(shadow_candidate) = 724),
+    shadow_candidate_hash BLOB CHECK (shadow_candidate_hash IS NULL OR (length(shadow_candidate_hash) = 32 AND shadow_candidate_hash != zeroblob(32))),
+    parity_commitment BLOB CHECK (parity_commitment IS NULL OR (length(parity_commitment) = 32 AND parity_commitment != zeroblob(32))),
+    authoritative_base_ordinal INTEGER CHECK (
+        authoritative_base_ordinal IS NULL OR
+        (authoritative_base_ordinal >= 0 AND authoritative_base_ordinal <= 32898)
+    ),
+    authoritative_candidate BLOB CHECK (authoritative_candidate IS NULL OR length(authoritative_candidate) = 724),
+    authoritative_candidate_hash BLOB CHECK (authoritative_candidate_hash IS NULL OR (length(authoritative_candidate_hash) = 32 AND authoritative_candidate_hash != zeroblob(32))),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (archive_id, operation_id),
+    CHECK ((source_generation IS NULL) = (source_commitment IS NULL)),
+    CHECK ((tentative_generation IS NULL) = (tentative_plaintext_hash IS NULL)),
+    CHECK ((tentative_generation IS NULL) = (tentative_plaintext_len IS NULL)),
+    CHECK ((tentative_generation IS NULL) = (tentative_schema_version IS NULL)),
+    CHECK ((tentative_generation IS NULL) = (tentative_wrapped_dek_commitment IS NULL)),
+    CHECK ((stage = 'prepared') = (tentative_generation IS NULL)),
+    CHECK ((source_generation IS NULL) = (source_plaintext_hash IS NULL)),
+    CHECK ((source_generation IS NULL) = (source_plaintext_len IS NULL)),
+    CHECK ((source_generation IS NULL) = (source_schema_version IS NULL)),
+    CHECK ((source_generation IS NULL) = (source_wrapped_dek_commitment IS NULL)),
+    CHECK ((witness_record IS NULL) = (witness_record_hash IS NULL)),
+    CHECK ((witness_record IS NULL) = (lease_fence IS NULL)),
+    CHECK ((witness_record IS NULL) = (lease_expiry IS NULL)),
+    CHECK ((shadow_candidate IS NULL) = (shadow_candidate_hash IS NULL)),
+    CHECK ((authoritative_candidate IS NULL) = (authoritative_candidate_hash IS NULL)),
+    CHECK ((stage IN ('prepared','fencing')) = (source_generation IS NULL)),
+    CHECK ((stage IN ('prepared','fencing','legacy_pinned')) = (witness_record IS NULL)),
+    CHECK (
+        (stage IN ('prepared','fencing','legacy_pinned') AND shadow_candidate IS NULL)
+        OR stage = 'shadow_uploading'
+        OR (stage IN ('shadow_send_unknown','shadow_wal','parity_verified',
+                      'authoritative_uploading','authoritative_send_unknown',
+                      'wal_authoritative','manual_required') AND shadow_candidate IS NOT NULL)
+    ),
+    CHECK (
+        (stage IN ('prepared','fencing','legacy_pinned','shadow_uploading',
+                   'shadow_send_unknown','shadow_wal')
+         AND parity_commitment IS NULL AND authoritative_base_ordinal IS NULL)
+        OR (stage IN ('parity_verified','authoritative_uploading',
+                      'authoritative_send_unknown','wal_authoritative')
+            AND parity_commitment IS NOT NULL AND authoritative_base_ordinal IS NOT NULL)
+        OR (stage='manual_required' AND
+            ((parity_commitment IS NULL AND authoritative_base_ordinal IS NULL)
+             OR (parity_commitment IS NOT NULL AND authoritative_base_ordinal IS NOT NULL)))
+    ),
+    CHECK (((stage IN ('parity_verified','authoritative_uploading','authoritative_send_unknown','wal_authoritative')) OR
+            (stage='manual_required' AND authoritative_candidate IS NOT NULL)) =
+           (authoritative_base_ordinal IS NOT NULL)),
+    CHECK (
+        (stage IN ('prepared','fencing','legacy_pinned','shadow_uploading',
+                   'shadow_send_unknown','shadow_wal','parity_verified')
+         AND authoritative_candidate IS NULL)
+        OR (stage IN ('authoritative_uploading','authoritative_send_unknown','wal_authoritative')
+            AND authoritative_candidate IS NOT NULL)
+        OR stage='manual_required'
+    ),
+    CHECK (stage!='manual_required' OR
+            ((authoritative_candidate IS NULL AND parity_commitment IS NULL) OR
+             (authoritative_candidate IS NOT NULL AND parity_commitment IS NOT NULL)))
+);
+CREATE TABLE IF NOT EXISTS archive_v3_maintenance_import_attempts (
+    archive_id BLOB NOT NULL,
+    operation_id BLOB NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 16),
+    attempt_id BLOB NOT NULL UNIQUE CHECK (length(attempt_id) = 16 AND attempt_id != zeroblob(16)),
+    state TEXT NOT NULL CHECK (state IN ('active','superseded','manual_required','terminal')),
+    PRIMARY KEY (archive_id, operation_id, attempt),
+    FOREIGN KEY (archive_id, operation_id)
+        REFERENCES archive_v3_maintenance_imports(archive_id, operation_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS archive_v3_maintenance_one_active_attempt
+ON archive_v3_maintenance_import_attempts(archive_id) WHERE state = 'active';
+CREATE TABLE IF NOT EXISTS archive_v3_maintenance_import_artifacts (
+    archive_id BLOB NOT NULL,
+    operation_id BLOB NOT NULL,
+    attempt INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 32898),
+    object_id BLOB NOT NULL CHECK (length(object_id) = 16 AND object_id != zeroblob(16)),
+    object_role INTEGER NOT NULL CHECK (object_role IN (1,5,8)),
+    root_seq INTEGER CHECK (
+        (object_role = 5 AND root_seq IS NOT NULL AND root_seq > 0)
+        OR (object_role != 5 AND root_seq IS NULL)
+    ),
+    context_aad BLOB NOT NULL CHECK (length(context_aad) > 0 AND length(context_aad) <= 512),
+    object_key TEXT NOT NULL CHECK (length(object_key) > 0 AND length(object_key) <= 512),
+    ciphertext_hash BLOB NOT NULL CHECK (length(ciphertext_hash) = 32 AND ciphertext_hash != zeroblob(32)),
+    state TEXT NOT NULL CHECK (state IN ('reserved','materialized')),
+    PRIMARY KEY (archive_id, operation_id, attempt, ordinal),
+    UNIQUE (archive_id, operation_id, attempt, object_id),
+    FOREIGN KEY (archive_id, operation_id, attempt)
+        REFERENCES archive_v3_maintenance_import_attempts(archive_id, operation_id, attempt)
 );
 -- This is a durable, encrypted control-plane ledger for a later exact v3
 -- deletion worker.  It intentionally has no completed states: this release
@@ -789,6 +936,19 @@ pub struct AccountDeletionOperation {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ArchiveBinding {
     archive_id: ArchiveId,
+}
+
+/// Unforgeable producer token for maintenance-import capabilities. Its field
+/// is private to encrypted control; sibling modules may accept but cannot
+/// construct it.
+#[derive(Clone, Copy)]
+pub(crate) struct MaintenancePersistenceContext(());
+
+#[cfg(test)]
+impl MaintenancePersistenceContext {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
 }
 
 impl std::fmt::Debug for ArchiveBinding {
@@ -6258,6 +6418,2226 @@ fn validate_active_archive_binding_conn(
     Ok(ledger.binding)
 }
 
+#[allow(
+    dead_code,
+    reason = "reserved for the reviewed offline maintenance launcher; startup and serving remain intentionally unwired"
+)]
+fn maintenance_import_plan_conn(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<(AuthenticatedMaintenanceImportPlan, bool)> {
+    validate_user_id(user_id)?;
+    let status: Option<String> = conn
+        .query_row("SELECT status FROM users WHERE id = ?1", [user_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if status.as_deref() != Some("active") {
+        return Err(EnclaveError::Auth(
+            "maintenance import requires an active account".into(),
+        ));
+    }
+    let binding = validate_active_archive_binding_conn(conn, user_id)?;
+    let token = MaintenancePersistenceContext(());
+    type ExistingMaintenancePlan = (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        String,
+        String,
+    );
+    let existing: Option<ExistingMaintenancePlan> = conn
+        .query_row(
+            "SELECT i.operation_id,i.owner_id,i.session_id,i.attempt,a.attempt_id,
+                    i.fence_authority,i.operation_commitment,i.stage,a.state
+             FROM archive_v3_maintenance_imports i
+             JOIN archive_v3_maintenance_import_attempts a
+               ON a.archive_id=i.archive_id AND a.operation_id=i.operation_id
+              AND a.attempt=i.attempt
+             WHERE i.archive_id = ?1",
+            [binding.archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((
+        operation_id,
+        owner_id,
+        session_id,
+        attempt,
+        attempt_id,
+        fence_authority,
+        stored_commitment,
+        stage,
+        attempt_state,
+    )) = existing
+    {
+        let operation_id = MaintenanceImportOperationId::from_control(
+            token,
+            fixed_blob::<16>(&operation_id, "maintenance operation ID")?,
+        )
+        .map_err(maintenance_store_error)?;
+        let owner_id = ObjectId::from_bytes(fixed_blob::<16>(&owner_id, "maintenance owner ID")?);
+        let attempt = u32::try_from(attempt)
+            .map_err(|_| EnclaveError::Store("maintenance attempt is invalid".into()))?;
+        let expected_commitment = operation_commitment_for_control(
+            token,
+            binding.archive_id,
+            operation_id,
+            owner_id,
+            &fence_authority,
+        );
+        let expected_session = ShadowSessionId::for_operation(*operation_id.as_bytes())
+            .map_err(|_| EnclaveError::Store("maintenance session ID is invalid".into()))?;
+        let expected_attempt_state = match stage.as_str() {
+            "wal_authoritative" => "terminal",
+            "manual_required" => "manual_required",
+            _ => "active",
+        };
+        if attempt_state != expected_attempt_state
+            || fixed_blob::<16>(&session_id, "maintenance session ID")?
+                != *expected_session.as_bytes()
+            || fixed_blob::<32>(&stored_commitment, "maintenance operation commitment")?
+                != expected_commitment
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance import durable prepare changed".into(),
+            ));
+        }
+        // Re-adoption is itself capability minting. Validate the complete
+        // retained stage/candidate/lease/attempt/artifact tuple, not merely
+        // the identity columns needed to format the returned plan.
+        let _ = maintenance_import_record_conn(conn, operation_id)?;
+        let plan = AuthenticatedMaintenanceImportPlan::from_control(
+            token,
+            user_id.to_owned(),
+            binding.archive_id,
+            operation_id,
+            owner_id,
+            attempt,
+            ShadowAttemptId::from_bytes(fixed_blob::<16>(&attempt_id, "maintenance attempt ID")?),
+            fence_authority,
+        )
+        .map_err(maintenance_store_error)?;
+        return Ok((plan, false));
+    }
+
+    let operation_id = MaintenanceImportOperationId::random_for_control(token);
+    let owner_id = ObjectId::random();
+    let attempt = 1u32;
+    let attempt_id = ObjectId::random();
+    let fence_authority = format!("archive_{}", super::tokens::random_token_hex());
+    let operation_commitment = operation_commitment_for_control(
+        token,
+        binding.archive_id,
+        operation_id,
+        owner_id,
+        &fence_authority,
+    );
+    let session_id = ShadowSessionId::for_operation(*operation_id.as_bytes())
+        .map_err(|_| EnclaveError::Store("maintenance session ID is invalid".into()))?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO archive_v3_maintenance_imports (
+            archive_id,format_version,user_id,operation_id,owner_id,session_id,attempt,
+            revision,stage,fence_authority,operation_commitment
+         ) VALUES (?1,1,?2,?3,?4,?5,?6,1,'prepared',?7,?8)",
+        rusqlite::params![
+            binding.archive_id.as_bytes().as_slice(),
+            user_id,
+            operation_id.as_bytes().as_slice(),
+            owner_id.as_bytes().as_slice(),
+            session_id.as_bytes().as_slice(),
+            i64::from(attempt),
+            fence_authority,
+            operation_commitment.as_slice(),
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO archive_v3_maintenance_import_attempts
+         (archive_id,operation_id,attempt,attempt_id,state)
+         VALUES (?1,?2,?3,?4,'active')",
+        rusqlite::params![
+            binding.archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(attempt),
+            attempt_id.as_bytes().as_slice(),
+        ],
+    )?;
+    tx.commit()?;
+    let plan = AuthenticatedMaintenanceImportPlan::from_control(
+        token,
+        user_id.to_owned(),
+        binding.archive_id,
+        operation_id,
+        owner_id,
+        attempt,
+        ShadowAttemptId::from_bytes(*attempt_id.as_bytes()),
+        fence_authority,
+    )
+    .map_err(maintenance_store_error)?;
+    Ok((plan, true))
+}
+
+type MaintenanceImportStoredRow = (
+    Vec<u8>,         // archive_id
+    Vec<u8>,         // owner_id
+    i64,             // attempt
+    Vec<u8>,         // attempt_id
+    String,          // attempt_state
+    i64,             // revision
+    String,          // stage
+    String,          // fence_authority
+    Vec<u8>,         // operation_commitment
+    Option<i64>,     // tentative_generation
+    Option<Vec<u8>>, // tentative_plaintext_hash
+    Option<i64>,     // tentative_plaintext_len
+    Option<i64>,     // tentative_schema_version
+    Option<Vec<u8>>, // tentative_wrapped_dek_commitment
+    Option<i64>,     // source_generation
+    Option<Vec<u8>>, // source_plaintext_hash
+    Option<i64>,     // source_plaintext_len
+    Option<i64>,     // source_schema_version
+    Option<Vec<u8>>, // source_wrapped_dek_commitment
+    Option<Vec<u8>>, // source_commitment
+    Option<Vec<u8>>, // witness_record
+    Option<Vec<u8>>, // witness_record_hash
+    Option<i64>,     // lease_fence
+    Option<i64>,     // lease_expiry
+    Option<Vec<u8>>, // shadow_candidate
+    Option<Vec<u8>>, // shadow_candidate_hash
+    Option<Vec<u8>>, // parity_commitment
+    Option<i64>,     // authoritative_base_ordinal
+    Option<Vec<u8>>, // authoritative_candidate
+    Option<Vec<u8>>, // authoritative_candidate_hash
+);
+
+fn maintenance_import_record_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<MaintenanceImportRecord> {
+    let stored: MaintenanceImportStoredRow = conn
+        .query_row(
+            "SELECT i.archive_id,i.owner_id,i.attempt,a.attempt_id,a.state,
+                    i.revision,i.stage,i.fence_authority,
+                    operation_commitment,tentative_generation,tentative_plaintext_hash,
+                    tentative_plaintext_len,tentative_schema_version,
+                    tentative_wrapped_dek_commitment,
+                    source_generation,source_plaintext_hash,
+                    source_plaintext_len,source_schema_version,
+                    source_wrapped_dek_commitment,source_commitment,
+                    witness_record,witness_record_hash,lease_fence,lease_expiry,
+                    shadow_candidate,shadow_candidate_hash,parity_commitment,
+                    authoritative_base_ordinal,
+                    authoritative_candidate,authoritative_candidate_hash
+             FROM archive_v3_maintenance_imports i
+             JOIN archive_v3_maintenance_import_attempts a
+               ON a.archive_id=i.archive_id AND a.operation_id=i.operation_id
+              AND a.attempt=i.attempt
+             JOIN archive_bindings b
+               ON b.archive_id=i.archive_id AND b.user_id=i.user_id
+             JOIN archive_deletion_ledgers d ON d.archive_id=i.archive_id
+             JOIN users u ON u.id=i.user_id
+             WHERE i.operation_id = ?1 AND b.state='active_legacy'
+               AND d.state='active_legacy' AND d.deletion_fence_id IS NULL
+               AND u.status='active'",
+            [operation_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                    row.get(21)?,
+                    row.get(22)?,
+                    row.get(23)?,
+                    row.get(24)?,
+                    row.get(25)?,
+                    row.get(26)?,
+                    row.get(27)?,
+                    row.get(28)?,
+                    row.get(29)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => EnclaveError::NotFound,
+            other => other.into(),
+        })?;
+    let (
+        archive_id,
+        owner_id,
+        attempt,
+        attempt_id,
+        attempt_state,
+        revision,
+        stage,
+        fence_authority,
+        operation_commitment,
+        tentative_generation,
+        tentative_hash,
+        tentative_len,
+        tentative_schema,
+        tentative_wrapped,
+        source_generation,
+        source_hash,
+        source_len,
+        source_schema,
+        source_wrapped,
+        source_commitment,
+        witness_bytes,
+        witness_hash,
+        lease_fence,
+        lease_expiry,
+        shadow_candidate,
+        shadow_hash,
+        parity,
+        authoritative_base_ordinal,
+        authoritative_candidate,
+        authoritative_hash,
+    ) = stored;
+    if revision <= 0 {
+        return Err(EnclaveError::Store(
+            "maintenance import revision is invalid".into(),
+        ));
+    }
+    let token = MaintenancePersistenceContext(());
+    let archive_id =
+        ArchiveId::from_bytes(fixed_blob::<16>(&archive_id, "maintenance archive ID")?);
+    let owner_id = ObjectId::from_bytes(fixed_blob::<16>(&owner_id, "maintenance owner ID")?);
+    let attempt = u32::try_from(attempt)
+        .map_err(|_| EnclaveError::Store("maintenance attempt is invalid".into()))?;
+    let attempt_id =
+        ShadowAttemptId::from_bytes(fixed_blob::<16>(&attempt_id, "maintenance attempt ID")?);
+    let expected_operation_commitment = operation_commitment_for_control(
+        token,
+        archive_id,
+        operation_id,
+        owner_id,
+        &fence_authority,
+    );
+    if fixed_blob::<32>(&operation_commitment, "maintenance operation commitment")?
+        != expected_operation_commitment
+    {
+        return Err(EnclaveError::Store(
+            "maintenance operation commitment changed".into(),
+        ));
+    }
+    let tentative = match (
+        tentative_generation,
+        tentative_hash,
+        tentative_len,
+        tentative_schema,
+        tentative_wrapped,
+    ) {
+        (None, None, None, None, None) => None,
+        (Some(generation), Some(hash), Some(length), Some(schema), Some(wrapped)) => {
+            Some(MaintenanceTentativeSource {
+                base_generation: generation,
+                plaintext_hash: fixed_blob::<32>(&hash, "maintenance tentative hash")?,
+                plaintext_len: u64::try_from(length).map_err(|_| {
+                    EnclaveError::Store("maintenance tentative length is invalid".into())
+                })?,
+                sqlite_schema_version: u32::try_from(schema).map_err(|_| {
+                    EnclaveError::Store("maintenance tentative schema is invalid".into())
+                })?,
+                wrapped_dek_commitment: fixed_blob::<32>(
+                    &wrapped,
+                    "maintenance tentative wrapped DEK commitment",
+                )?,
+            })
+        }
+        _ => {
+            return Err(EnclaveError::Store(
+                "maintenance tentative source tuple is incomplete".into(),
+            ))
+        }
+    };
+    let source = match (
+        source_generation,
+        source_hash,
+        source_len,
+        source_schema,
+        source_wrapped,
+        source_commitment,
+    ) {
+        (None, None, None, None, None, None) => None,
+        (
+            Some(generation),
+            Some(hash),
+            Some(length),
+            Some(schema),
+            Some(wrapped),
+            Some(commitment),
+        ) => {
+            let source = MaintenanceSourceBinding::from_pinned(
+                archive_id,
+                operation_id,
+                generation,
+                fixed_blob::<32>(&hash, "maintenance source hash")?,
+                u64::try_from(length).map_err(|_| {
+                    EnclaveError::Store("maintenance source length is invalid".into())
+                })?,
+                u32::try_from(schema).map_err(|_| {
+                    EnclaveError::Store("maintenance source schema is invalid".into())
+                })?,
+                fixed_blob::<32>(&wrapped, "maintenance wrapped DEK commitment")?,
+            )
+            .map_err(maintenance_store_error)?;
+            if source.control_view(token).commitment
+                != fixed_blob::<32>(&commitment, "maintenance source commitment")?
+            {
+                return Err(EnclaveError::Store(
+                    "maintenance source commitment changed".into(),
+                ));
+            }
+            Some(source)
+        }
+        _ => {
+            return Err(EnclaveError::Store(
+                "maintenance source tuple is incomplete".into(),
+            ))
+        }
+    };
+    let decoded_witness = if let Some(bytes) = witness_bytes.as_ref() {
+        if witness_hash
+            .as_deref()
+            .and_then(|hash| <[u8; 32]>::try_from(hash).ok())
+            != Some(Sha256::digest(bytes).into())
+        {
+            return Err(EnclaveError::Store(
+                "maintenance witness commitment changed".into(),
+            ));
+        }
+        let record = crate::archive_v3_witness::WitnessRecord::decode(bytes)
+            .map_err(|_| EnclaveError::Store("maintenance witness is invalid".into()))?;
+        let lease = record
+            .exact_active_lease_for_owner(owner_id)
+            .map_err(|_| EnclaveError::Store("maintenance lease is invalid".into()))?;
+        if lease_fence.and_then(|value| u64::try_from(value).ok()) != Some(lease.fencing_epoch())
+            || lease_expiry.and_then(|value| u64::try_from(value).ok())
+                != Some(lease.expires_at_tick())
+        {
+            return Err(EnclaveError::Store(
+                "maintenance persisted lease changed".into(),
+            ));
+        }
+        Some(record)
+    } else if witness_hash.is_some() || lease_fence.is_some() || lease_expiry.is_some() {
+        return Err(EnclaveError::Store(
+            "maintenance witness tuple is incomplete".into(),
+        ));
+    } else {
+        None
+    };
+    let checked_candidate = |bytes: Option<Vec<u8>>,
+                             hash: Option<Vec<u8>>,
+                             field: &'static str|
+     -> Result<Option<Vec<u8>>> {
+        match (bytes, hash) {
+            (None, None) => Ok(None),
+            (Some(bytes), Some(hash))
+                if !bytes.is_empty()
+                    && <[u8; 32]>::from(Sha256::digest(&bytes))
+                        == fixed_blob::<32>(&hash, field)? =>
+            {
+                Ok(Some(bytes))
+            }
+            _ => Err(EnclaveError::Store(format!("{field} is inconsistent"))),
+        }
+    };
+    let (artifact_count, first_ordinal, last_ordinal): (i64, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT count(*),min(ordinal),max(ordinal)
+             FROM archive_v3_maintenance_import_artifacts
+             WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(attempt),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let next_artifact_ordinal = match (artifact_count, first_ordinal, last_ordinal) {
+        (0, None, None) => 0,
+        (count, Some(0), Some(last)) if count > 0 && last == count - 1 => u32::try_from(count)
+            .map_err(|_| {
+                EnclaveError::Store("maintenance artifact inventory exceeds its cap".into())
+            })?,
+        _ => {
+            return Err(EnclaveError::Store(
+                "maintenance artifact ordinals are not a complete prefix".into(),
+            ))
+        }
+    };
+    let authoritative_base_ordinal = authoritative_base_ordinal
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("maintenance authoritative base is invalid".into()))?;
+    let stage = MaintenanceImportStage::from_db(&stage).map_err(maintenance_store_error)?;
+    let expected_attempt_state = match stage {
+        MaintenanceImportStage::WalAuthoritative => "terminal",
+        MaintenanceImportStage::ManualRequired => "manual_required",
+        _ => "active",
+    };
+    if attempt_state != expected_attempt_state {
+        return Err(EnclaveError::Store(
+            "maintenance current attempt state is invalid".into(),
+        ));
+    }
+    let mut attempt_statement = conn.prepare(
+        "SELECT attempt,state FROM archive_v3_maintenance_import_attempts
+         WHERE archive_id=?1 AND operation_id=?2 ORDER BY attempt",
+    )?;
+    let attempts = attempt_statement.query_map(
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+        ],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let mut seen_attempts = 0u32;
+    for row in attempts {
+        let (number, state) = row?;
+        seen_attempts = seen_attempts
+            .checked_add(1)
+            .ok_or_else(|| EnclaveError::Store("maintenance attempt history overflow".into()))?;
+        let expected_state = if seen_attempts < attempt {
+            "superseded"
+        } else if seen_attempts == attempt {
+            expected_attempt_state
+        } else {
+            return Err(EnclaveError::Store(
+                "maintenance attempt history exceeds the current attempt".into(),
+            ));
+        };
+        if number != i64::from(seen_attempts) || state != expected_state {
+            return Err(EnclaveError::Store(
+                "maintenance attempt history is not canonical".into(),
+            ));
+        }
+    }
+    if seen_attempts != attempt || seen_attempts > MAX_MAINTENANCE_IMPORT_ATTEMPTS {
+        return Err(EnclaveError::Store(
+            "maintenance attempt history is incomplete".into(),
+        ));
+    }
+    let requires_authoritative_base = matches!(
+        stage,
+        MaintenanceImportStage::ParityVerified
+            | MaintenanceImportStage::AuthoritativeUploading
+            | MaintenanceImportStage::AuthoritativeSendUnknown
+            | MaintenanceImportStage::WalAuthoritative
+    ) || (stage == MaintenanceImportStage::ManualRequired
+        && authoritative_candidate.is_some());
+    if requires_authoritative_base != authoritative_base_ordinal.is_some()
+        || authoritative_base_ordinal.is_some_and(|base| base > next_artifact_ordinal)
+    {
+        return Err(EnclaveError::Store(
+            "maintenance authoritative artifact prefix is invalid".into(),
+        ));
+    }
+    let shadow_candidate = checked_candidate(
+        shadow_candidate,
+        shadow_hash,
+        "maintenance shadow candidate",
+    )?;
+    let authoritative_candidate = checked_candidate(
+        authoritative_candidate,
+        authoritative_hash,
+        "maintenance authoritative candidate",
+    )?;
+    let decoded_shadow = shadow_candidate
+        .as_deref()
+        .map(crate::archive_v3_witness::WitnessRecord::decode)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("maintenance shadow candidate is invalid".into()))?;
+    let decoded_authoritative = authoritative_candidate
+        .as_deref()
+        .map(crate::archive_v3_witness::WitnessRecord::decode)
+        .transpose()
+        .map_err(|_| {
+            EnclaveError::Store("maintenance authoritative candidate is invalid".into())
+        })?;
+    if let (Some(current), Some(candidate)) = (&decoded_witness, &decoded_shadow) {
+        let exact = match current.migration() {
+            crate::archive_v3_witness::MigrationState::Legacy
+                if matches!(
+                    stage,
+                    MaintenanceImportStage::ShadowUploading
+                        | MaintenanceImportStage::ShadowSendUnknown
+                        | MaintenanceImportStage::ManualRequired
+                ) =>
+            {
+                current.retained_maintenance_candidate_is_exact(
+                    token,
+                    candidate,
+                    owner_id,
+                    crate::archive_v3_witness::MigrationState::ShadowWal,
+                )
+            }
+            crate::archive_v3_witness::MigrationState::ShadowWal
+                if matches!(
+                    stage,
+                    MaintenanceImportStage::ShadowWal
+                        | MaintenanceImportStage::ParityVerified
+                        | MaintenanceImportStage::AuthoritativeUploading
+                        | MaintenanceImportStage::AuthoritativeSendUnknown
+                ) || (stage == MaintenanceImportStage::ManualRequired
+                    && decoded_authoritative.is_some()) =>
+            {
+                current.retained_maintenance_candidate_has_lease_descendant(
+                    token,
+                    candidate,
+                    owner_id,
+                    crate::archive_v3_witness::MigrationState::ShadowWal,
+                )
+            }
+            crate::archive_v3_witness::MigrationState::WalAuthoritative
+                if stage == MaintenanceImportStage::WalAuthoritative =>
+            {
+                candidate.retained_maintenance_predecessor_matches_current(
+                    token,
+                    current,
+                    decoded_authoritative.as_ref().ok_or_else(|| {
+                        EnclaveError::Store("maintenance terminal candidate is absent".into())
+                    })?,
+                    owner_id,
+                    crate::archive_v3_witness::MigrationState::WalAuthoritative,
+                )
+            }
+            _ => false,
+        };
+        if !exact {
+            return Err(EnclaveError::Store(
+                "maintenance shadow candidate changed".into(),
+            ));
+        }
+    }
+    if let (Some(current), Some(candidate)) = (&decoded_witness, &decoded_authoritative) {
+        let exact = match current.migration() {
+            crate::archive_v3_witness::MigrationState::ShadowWal
+                if matches!(
+                    stage,
+                    MaintenanceImportStage::AuthoritativeUploading
+                        | MaintenanceImportStage::AuthoritativeSendUnknown
+                        | MaintenanceImportStage::ManualRequired
+                ) =>
+            {
+                current.retained_maintenance_candidate_is_exact(
+                    token,
+                    candidate,
+                    owner_id,
+                    crate::archive_v3_witness::MigrationState::WalAuthoritative,
+                )
+            }
+            crate::archive_v3_witness::MigrationState::WalAuthoritative
+                if stage == MaintenanceImportStage::WalAuthoritative =>
+            {
+                current.retained_maintenance_candidate_has_lease_descendant(
+                    token,
+                    candidate,
+                    owner_id,
+                    crate::archive_v3_witness::MigrationState::WalAuthoritative,
+                )
+            }
+            _ => false,
+        };
+        if !exact {
+            return Err(EnclaveError::Store(
+                "maintenance authoritative candidate changed".into(),
+            ));
+        }
+    }
+    validate_maintenance_artifact_rows_conn(
+        conn,
+        archive_id,
+        operation_id,
+        owner_id,
+        attempt,
+        next_artifact_ordinal,
+        stage,
+        authoritative_base_ordinal,
+        expected_operation_commitment,
+        decoded_witness.as_ref(),
+        decoded_shadow.as_ref(),
+        decoded_authoritative.as_ref(),
+    )?;
+    MaintenanceImportRecord::from_control_persistence(
+        token,
+        stage,
+        archive_id,
+        operation_id,
+        owner_id,
+        attempt,
+        attempt_id,
+        next_artifact_ordinal,
+        expected_operation_commitment,
+        tentative,
+        source,
+        witness_bytes,
+        shadow_candidate,
+        parity
+            .map(|value| fixed_blob::<32>(&value, "maintenance parity commitment"))
+            .transpose()?,
+        authoritative_candidate,
+    )
+    .map_err(maintenance_store_error)
+}
+
+fn persist_maintenance_fencing_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    tentative: MaintenanceTentativeSource,
+) -> Result<MaintenanceImportRecord> {
+    let updated = conn.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage='fencing', revision=revision+1,
+             tentative_generation=?2,tentative_plaintext_hash=?3,
+             tentative_plaintext_len=?4,tentative_schema_version=?5,
+             tentative_wrapped_dek_commitment=?6,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage='prepared'
+           AND tentative_generation IS NULL",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            tentative.base_generation,
+            tentative.plaintext_hash.as_slice(),
+            i64::try_from(tentative.plaintext_len)
+                .map_err(|_| EnclaveError::Store("maintenance source is too large".into()))?,
+            i64::from(tentative.sqlite_schema_version),
+            tentative.wrapped_dek_commitment.as_slice(),
+        ],
+    )?;
+    if updated > 1 {
+        return Err(EnclaveError::Store(
+            "maintenance fencing affected multiple rows".into(),
+        ));
+    }
+    let exact: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM archive_v3_maintenance_imports
+            WHERE operation_id=?1 AND stage NOT IN ('prepared','manual_required')
+              AND tentative_generation=?2 AND tentative_plaintext_hash=?3
+              AND tentative_plaintext_len=?4 AND tentative_schema_version=?5
+              AND tentative_wrapped_dek_commitment=?6
+         )",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            tentative.base_generation,
+            tentative.plaintext_hash.as_slice(),
+            i64::try_from(tentative.plaintext_len)
+                .map_err(|_| EnclaveError::Store("maintenance source is too large".into()))?,
+            i64::from(tentative.sqlite_schema_version),
+            tentative.wrapped_dek_commitment.as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    if exact != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance fencing state changed".into(),
+        ));
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_pinned_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    source: MaintenanceSourceBinding,
+) -> Result<MaintenanceImportRecord> {
+    let token = MaintenancePersistenceContext(());
+    let source = source.control_view(token);
+    let updated = conn.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage='legacy_pinned',revision=revision+1,
+             source_generation=?2,source_plaintext_hash=?3,
+             source_plaintext_len=?4,source_schema_version=?5,
+             source_wrapped_dek_commitment=?6,source_commitment=?7,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage='fencing'
+           AND tentative_plaintext_hash=?3 AND tentative_plaintext_len=?4
+           AND tentative_schema_version=?5
+           AND tentative_wrapped_dek_commitment=?6
+           AND ?2 > tentative_generation",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            source.generation,
+            source.plaintext_hash.as_slice(),
+            i64::try_from(source.plaintext_len)
+                .map_err(|_| EnclaveError::Store("maintenance source is too large".into()))?,
+            i64::from(source.sqlite_schema_version),
+            source.wrapped_dek_commitment.as_slice(),
+            source.commitment.as_slice(),
+        ],
+    )?;
+    if updated == 0 {
+        let exact: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_v3_maintenance_imports
+             WHERE operation_id=?1 AND stage NOT IN ('prepared','fencing','manual_required')
+               AND source_generation=?2 AND source_commitment=?3)",
+            rusqlite::params![
+                operation_id.as_bytes().as_slice(),
+                source.generation,
+                source.commitment.as_slice(),
+            ],
+            |row| row.get(0),
+        )?;
+        if exact != 1 {
+            return Err(EnclaveError::Conflict(
+                "maintenance pinned source changed".into(),
+            ));
+        }
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_fencing_rebase_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    previous: MaintenanceTentativeSource,
+    replacement: MaintenanceTentativeSource,
+) -> Result<MaintenanceImportRecord> {
+    if replacement.base_generation <= previous.base_generation {
+        return Err(EnclaveError::Conflict(
+            "maintenance fencing rebase did not advance the source".into(),
+        ));
+    }
+    let updated = conn.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET revision=revision+1,tentative_generation=?7,
+             tentative_plaintext_hash=?8,tentative_plaintext_len=?9,
+             tentative_schema_version=?10,tentative_wrapped_dek_commitment=?11,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage='fencing'
+           AND source_generation IS NULL AND witness_record IS NULL
+           AND shadow_candidate IS NULL AND authoritative_candidate IS NULL
+           AND tentative_generation=?2 AND tentative_plaintext_hash=?3
+           AND tentative_plaintext_len=?4 AND tentative_schema_version=?5
+           AND tentative_wrapped_dek_commitment=?6",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            previous.base_generation,
+            previous.plaintext_hash.as_slice(),
+            i64::try_from(previous.plaintext_len)
+                .map_err(|_| EnclaveError::Store("maintenance source is too large".into()))?,
+            i64::from(previous.sqlite_schema_version),
+            previous.wrapped_dek_commitment.as_slice(),
+            replacement.base_generation,
+            replacement.plaintext_hash.as_slice(),
+            i64::try_from(replacement.plaintext_len)
+                .map_err(|_| EnclaveError::Store("maintenance source is too large".into()))?,
+            i64::from(replacement.sqlite_schema_version),
+            replacement.wrapped_dek_commitment.as_slice(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance fencing rebase authority changed".into(),
+        ));
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_witness_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    source: MaintenanceSourceBinding,
+    witness: &crate::archive_v3_witness::WitnessRecord,
+    lease: crate::archive_v3_witness::WitnessLease,
+) -> Result<MaintenanceImportRecord> {
+    let token = MaintenancePersistenceContext(());
+    let source = source.control_view(token);
+    if witness.migration() != crate::archive_v3_witness::MigrationState::Legacy
+        || witness.deletion() != crate::archive_v3_witness::DeletionState::Active
+        || !witness.authorizes_lease(lease)
+    {
+        return Err(EnclaveError::Conflict(
+            "maintenance witness is not active legacy authority".into(),
+        ));
+    }
+    let encoded = witness.encode();
+    let hash: [u8; 32] = Sha256::digest(encoded).into();
+    let updated = conn.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage='shadow_uploading',revision=revision+1,
+             witness_record=?3,witness_record_hash=?4,
+             lease_fence=?5,lease_expiry=?6,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage='legacy_pinned'
+           AND archive_id=?2 AND source_commitment=?7",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            witness.archive_id().as_bytes().as_slice(),
+            encoded.as_slice(),
+            hash.as_slice(),
+            i64::try_from(lease.fencing_epoch())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            i64::try_from(lease.expires_at_tick())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            source.commitment.as_slice(),
+        ],
+    )?;
+    if updated == 0 {
+        let exact: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_v3_maintenance_imports
+             WHERE operation_id=?1 AND stage NOT IN ('prepared','fencing','legacy_pinned','manual_required')
+               AND witness_record_hash=?2 AND source_commitment=?3)",
+            rusqlite::params![
+                operation_id.as_bytes().as_slice(),
+                hash.as_slice(),
+                source.commitment.as_slice(),
+            ],
+            |row| row.get(0),
+        )?;
+        if exact != 1 {
+            return Err(EnclaveError::Conflict(
+                "maintenance witnessed source changed".into(),
+            ));
+        }
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_candidate_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    from: MaintenanceImportStage,
+    candidate: PreparedMaintenanceMigration,
+) -> Result<MaintenanceImportRecord> {
+    let candidate = candidate.control_view(MaintenancePersistenceContext(()));
+    let (expected_from, next_stage, candidate_column, hash_column) = match (from, candidate.next) {
+        (
+            MaintenanceImportStage::ShadowUploading,
+            crate::archive_v3_witness::MigrationState::ShadowWal,
+        ) => (
+            "shadow_uploading",
+            "shadow_uploading",
+            "shadow_candidate",
+            "shadow_candidate_hash",
+        ),
+        (
+            MaintenanceImportStage::ParityVerified,
+            crate::archive_v3_witness::MigrationState::WalAuthoritative,
+        ) => (
+            "parity_verified",
+            "authoritative_uploading",
+            "authoritative_candidate",
+            "authoritative_candidate_hash",
+        ),
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "maintenance candidate transition is invalid".into(),
+            ))
+        }
+    };
+    let durable = maintenance_import_record_conn(conn, operation_id)?;
+    if durable.stage() != from {
+        return Err(EnclaveError::Conflict(
+            "maintenance candidate stage changed".into(),
+        ));
+    }
+    let current = durable
+        .witnessed_record()
+        .map_err(maintenance_store_error)?
+        .ok_or_else(|| EnclaveError::Store("maintenance candidate has no witness".into()))?;
+    let candidate_record =
+        crate::archive_v3_witness::WitnessRecord::decode(&candidate.candidate)
+            .map_err(|_| EnclaveError::Store("maintenance candidate is invalid".into()))?;
+    if <[u8; 32]>::from(Sha256::digest(current.encode())) != candidate.expected_current_hash
+        || !current.retained_maintenance_candidate_is_exact(
+            MaintenancePersistenceContext(()),
+            &candidate_record,
+            durable.owner_id_for_control(MaintenancePersistenceContext(())),
+            candidate.next,
+        )
+    {
+        return Err(EnclaveError::Conflict(
+            "maintenance candidate does not extend the exact witness".into(),
+        ));
+    }
+    let root = candidate_record.root().root();
+    let exact_root: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_v3_maintenance_import_artifacts
+         WHERE operation_id=?1 AND attempt=(
+           SELECT attempt FROM archive_v3_maintenance_imports WHERE operation_id=?1
+         ) AND object_id=?2 AND object_role=?3 AND root_seq=?4
+           AND ciphertext_hash=?5 AND state='materialized'",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            root.object_id().as_bytes().as_slice(),
+            ObjectRole::RootV3 as i64,
+            i64::try_from(root.sequence())
+                .map_err(|_| EnclaveError::Store("maintenance root sequence overflow".into()))?,
+            root.ciphertext_hash().as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    if exact_root != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance candidate root is not durably materialized".into(),
+        ));
+    }
+    let hash: [u8; 32] = Sha256::digest(&candidate.candidate).into();
+    let sql = format!(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage=?2,revision=revision+1,{candidate_column}=?3,{hash_column}=?4,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?5 AND witness_record_hash=?6
+           AND NOT EXISTS (
+             SELECT 1 FROM archive_v3_maintenance_import_artifacts x
+             WHERE x.archive_id=archive_v3_maintenance_imports.archive_id
+               AND x.operation_id=archive_v3_maintenance_imports.operation_id
+               AND x.attempt=archive_v3_maintenance_imports.attempt
+               AND x.state!='materialized'
+           )"
+    );
+    let updated = conn.execute(
+        &sql,
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            next_stage,
+            candidate.candidate,
+            hash.as_slice(),
+            expected_from,
+            candidate.expected_current_hash.as_slice(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance candidate durable state changed".into(),
+        ));
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_renewed_lease_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected_stage: MaintenanceImportStage,
+    previous: &crate::archive_v3_witness::WitnessRecord,
+    renewed: &crate::archive_v3_witness::WitnessRecord,
+    lease: crate::archive_v3_witness::WitnessLease,
+) -> Result<MaintenanceImportRecord> {
+    let owner_bytes: Vec<u8> = conn.query_row(
+        "SELECT owner_id FROM archive_v3_maintenance_imports WHERE operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let owner = ObjectId::from_bytes(fixed_blob::<16>(&owner_bytes, "maintenance lease owner")?);
+    let previous_lease = previous
+        .exact_active_lease_for_owner(owner)
+        .map_err(|_| EnclaveError::Conflict("maintenance previous lease is invalid".into()))?;
+    let exact_renewal = renewed
+        .exact_maintenance_renewal_from(previous, owner)
+        .map_err(|_| EnclaveError::Conflict("maintenance renewed lease is not exact".into()))?;
+    if !matches!(
+        expected_stage,
+        MaintenanceImportStage::ShadowUploading
+            | MaintenanceImportStage::ShadowWal
+            | MaintenanceImportStage::ParityVerified
+    ) || exact_renewal != lease
+    {
+        return Err(EnclaveError::Conflict(
+            "maintenance renewed lease changed immutable witness facts".into(),
+        ));
+    }
+    let previous_encoded = previous.encode();
+    let previous_hash: [u8; 32] = Sha256::digest(previous_encoded.as_slice()).into();
+    let encoded = renewed.encode();
+    let renewed_hash: [u8; 32] = Sha256::digest(encoded).into();
+    let updated = conn.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET revision=revision+1,witness_record=?3,witness_record_hash=?4,
+             lease_fence=?5,lease_expiry=?6,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?2 AND witness_record_hash=?7
+           AND witness_record=?8 AND lease_fence=?9 AND lease_expiry=?10",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            expected_stage.as_db(),
+            encoded.as_slice(),
+            renewed_hash.as_slice(),
+            i64::try_from(lease.fencing_epoch())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            i64::try_from(lease.expires_at_tick())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            previous_hash.as_slice(),
+            previous_encoded.as_slice(),
+            i64::try_from(previous_lease.fencing_epoch())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            i64::try_from(previous_lease.expires_at_tick())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance renewed lease CAS changed".into(),
+        ));
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_reacquired_lease_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected_stage: MaintenanceImportStage,
+    previous: &crate::archive_v3_witness::WitnessRecord,
+    reacquired: &crate::archive_v3_witness::WitnessRecord,
+    lease: crate::archive_v3_witness::WitnessLease,
+) -> Result<MaintenanceImportRecord> {
+    let previous_owner: Vec<u8> = conn.query_row(
+        "SELECT owner_id FROM archive_v3_maintenance_imports WHERE operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let owner = ObjectId::from_bytes(fixed_blob::<16>(
+        &previous_owner,
+        "maintenance reacquired lease owner",
+    )?);
+    let previous_lease = previous
+        .exact_active_lease_for_owner(owner)
+        .map_err(|_| EnclaveError::Conflict("maintenance previous lease is invalid".into()))?;
+    let exact_reacquire = reacquired
+        .exact_maintenance_reacquire_from(previous, owner)
+        .map_err(|_| EnclaveError::Conflict("maintenance reacquired lease is not exact".into()))?;
+    if !matches!(
+        expected_stage,
+        MaintenanceImportStage::ShadowUploading
+            | MaintenanceImportStage::ShadowWal
+            | MaintenanceImportStage::ParityVerified
+    ) || exact_reacquire != lease
+    {
+        return Err(EnclaveError::Conflict(
+            "maintenance reacquired lease changed immutable witness facts".into(),
+        ));
+    }
+    type ReacquireState = (
+        Vec<u8>,
+        i64,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        i64,
+    );
+    let state: ReacquireState = conn.query_row(
+        "SELECT i.archive_id,i.attempt,i.stage,i.shadow_candidate,
+                i.authoritative_candidate,i.authoritative_base_ordinal,
+                (SELECT count(*) FROM archive_v3_maintenance_import_artifacts x
+                 WHERE x.archive_id=i.archive_id AND x.operation_id=i.operation_id
+                   AND x.attempt=i.attempt)
+         FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    if state.2 != expected_stage.as_db()
+        || (expected_stage == MaintenanceImportStage::ShadowUploading && state.3.is_some())
+        || (expected_stage == MaintenanceImportStage::ParityVerified && state.4.is_some())
+    {
+        return Err(EnclaveError::Conflict(
+            "maintenance lease cannot be reacquired with a retained send".into(),
+        ));
+    }
+    let current_attempt = u32::try_from(state.1)
+        .map_err(|_| EnclaveError::Store("maintenance attempt is invalid".into()))?;
+    let authoritative_base = state
+        .5
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("maintenance authoritative base is invalid".into()))?;
+    let current_artifacts = u32::try_from(state.6)
+        .map_err(|_| EnclaveError::Store("maintenance artifact count is invalid".into()))?;
+    let partial_attempt = match expected_stage {
+        MaintenanceImportStage::ShadowUploading => current_artifacts != 0,
+        MaintenanceImportStage::ParityVerified => {
+            let base = authoritative_base.ok_or_else(|| {
+                EnclaveError::Store("maintenance authoritative base is absent".into())
+            })?;
+            if current_artifacts < base {
+                return Err(EnclaveError::Store(
+                    "maintenance authoritative artifact prefix regressed".into(),
+                ));
+            }
+            // An ordinary same-fence restart adopts this retained R2 prefix.
+            // A genuine higher-fence reacquire cannot carry its create
+            // authority, so it supersedes any nonempty R2 attempt.
+            current_artifacts > base
+        }
+        MaintenanceImportStage::ShadowWal => false,
+        _ => unreachable!("validated stage"),
+    };
+    let next_attempt = if partial_attempt {
+        current_attempt
+            .checked_add(1)
+            .filter(|attempt| *attempt <= MAX_MAINTENANCE_IMPORT_ATTEMPTS)
+            .ok_or_else(|| {
+                EnclaveError::Conflict("maintenance import exhausted its attempt cap".into())
+            })?
+    } else {
+        current_attempt
+    };
+    let encoded = reacquired.encode();
+    let hash: [u8; 32] = Sha256::digest(encoded).into();
+    let previous_encoded = previous.encode();
+    let previous_hash: [u8; 32] = Sha256::digest(previous_encoded.as_slice()).into();
+    let tx = conn.unchecked_transaction()?;
+    if partial_attempt {
+        let history_count: i64 = tx.query_row(
+            "SELECT count(*) FROM archive_v3_maintenance_import_attempts
+             WHERE archive_id=?1 AND operation_id=?2",
+            rusqlite::params![state.0.as_slice(), operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if history_count != i64::from(current_attempt) {
+            return Err(EnclaveError::Store(
+                "maintenance attempt history is not canonical".into(),
+            ));
+        }
+        if tx.execute(
+            "UPDATE archive_v3_maintenance_import_attempts SET state='superseded'
+             WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND state='active'",
+            rusqlite::params![
+                state.0.as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(current_attempt),
+            ],
+        )? != 1
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance reacquired attempt changed".into(),
+            ));
+        }
+        let next_attempt_id = ObjectId::random();
+        tx.execute(
+            "INSERT INTO archive_v3_maintenance_import_attempts
+             (archive_id,operation_id,attempt,attempt_id,state)
+             VALUES (?1,?2,?3,?4,'active')",
+            rusqlite::params![
+                state.0.as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(next_attempt),
+                next_attempt_id.as_bytes().as_slice(),
+            ],
+        )?;
+    }
+    let updated = tx.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET revision=revision+1,attempt=?3,witness_record=?4,witness_record_hash=?5,
+             lease_fence=?6,lease_expiry=?7,
+             authoritative_base_ordinal=CASE WHEN ?8=1 THEN 0 ELSE authoritative_base_ordinal END,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?2 AND attempt=?9 AND witness_record_hash=?10
+           AND witness_record=?11 AND lease_fence=?12 AND lease_expiry=?13
+           AND (?2!='shadow_uploading' OR shadow_candidate IS NULL)
+           AND (?2!='parity_verified' OR authoritative_candidate IS NULL)",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            expected_stage.as_db(),
+            i64::from(next_attempt),
+            encoded.as_slice(),
+            hash.as_slice(),
+            i64::try_from(lease.fencing_epoch())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            i64::try_from(lease.expires_at_tick())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            if partial_attempt && expected_stage == MaintenanceImportStage::ParityVerified {
+                1_i64
+            } else {
+                0_i64
+            },
+            i64::from(current_attempt),
+            previous_hash.as_slice(),
+            previous_encoded.as_slice(),
+            i64::try_from(previous_lease.fencing_epoch())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            i64::try_from(previous_lease.expires_at_tick())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance reacquired lease CAS changed".into(),
+        ));
+    }
+    tx.commit()?;
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn prepare_maintenance_shadow_upload_attempt_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<MaintenanceImportRecord> {
+    type AttemptState = (Vec<u8>, i64, String, Option<Vec<u8>>, i64, i64);
+    let state: AttemptState = conn.query_row(
+        "SELECT i.archive_id,i.attempt,i.stage,i.shadow_candidate,
+                (SELECT count(*) FROM archive_v3_maintenance_import_artifacts x
+                  WHERE x.archive_id=i.archive_id AND x.operation_id=i.operation_id
+                    AND x.attempt=i.attempt),
+                (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                  WHERE a.archive_id=i.archive_id AND a.operation_id=i.operation_id
+                    AND a.attempt=i.attempt AND a.state='active')
+         FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    if state.2 != "shadow_uploading" || state.3.is_some() || state.5 != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance shadow upload attempt is not replaceable".into(),
+        ));
+    }
+    if state.4 == 0 {
+        return maintenance_import_record_conn(conn, operation_id);
+    }
+    let attempt = u32::try_from(state.1)
+        .map_err(|_| EnclaveError::Store("maintenance attempt is invalid".into()))?;
+    let next_attempt = attempt
+        .checked_add(1)
+        .filter(|value| *value <= 16)
+        .ok_or_else(|| {
+            EnclaveError::Conflict("maintenance import exhausted its attempt cap".into())
+        })?;
+    let archive_id = fixed_blob::<16>(&state.0, "maintenance archive ID")?;
+    let attempt_count: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_v3_maintenance_import_attempts
+         WHERE archive_id=?1 AND operation_id=?2",
+        rusqlite::params![archive_id.as_slice(), operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if attempt_count != i64::from(attempt) || attempt_count >= 16 {
+        return Err(EnclaveError::Store(
+            "maintenance attempt history is not canonical".into(),
+        ));
+    }
+    let next_attempt_id = ObjectId::random();
+    let tx = conn.unchecked_transaction()?;
+    let superseded = tx.execute(
+        "UPDATE archive_v3_maintenance_import_attempts SET state='superseded'
+         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND state='active'",
+        rusqlite::params![
+            archive_id.as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(attempt),
+        ],
+    )?;
+    if superseded != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance upload attempt changed".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO archive_v3_maintenance_import_attempts
+         (archive_id,operation_id,attempt,attempt_id,state)
+         VALUES (?1,?2,?3,?4,'active')",
+        rusqlite::params![
+            archive_id.as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(next_attempt),
+            next_attempt_id.as_bytes().as_slice(),
+        ],
+    )?;
+    let advanced = tx.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET attempt=?2,revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND attempt=?3 AND stage='shadow_uploading'
+           AND shadow_candidate IS NULL",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            i64::from(next_attempt),
+            i64::from(attempt),
+        ],
+    )?;
+    if advanced != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance upload attempt CAS changed".into(),
+        ));
+    }
+    tx.commit()?;
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn prepare_maintenance_authoritative_upload_attempt_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<MaintenanceImportRecord> {
+    type AttemptState = (Vec<u8>, i64, String, Option<Vec<u8>>, i64, i64, i64);
+    let state: AttemptState = conn.query_row(
+        "SELECT i.archive_id,i.attempt,i.stage,i.authoritative_candidate,
+                i.authoritative_base_ordinal,
+                (SELECT count(*) FROM archive_v3_maintenance_import_artifacts x
+                  WHERE x.archive_id=i.archive_id AND x.operation_id=i.operation_id
+                    AND x.attempt=i.attempt),
+                (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                  WHERE a.archive_id=i.archive_id AND a.operation_id=i.operation_id
+                    AND a.attempt=i.attempt AND a.state='active')
+         FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    if state.2 != "parity_verified" || state.3.is_some() || state.6 != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance authoritative upload attempt is not replaceable".into(),
+        ));
+    }
+    // R1's checkpoint plus root can consume the entire 32,898-object attempt
+    // budget at the maximum database size. R2 therefore always owns a distinct
+    // retained attempt. Once that authoritative attempt is durable, restart
+    // adopts its empty or partial exact prefix rather than burning another
+    // attempt before reconciliation I/O.
+    if state.4 == 0 {
+        return maintenance_import_record_conn(conn, operation_id);
+    }
+    if state.5 < state.4 {
+        return Err(EnclaveError::Store(
+            "maintenance authoritative artifact prefix regressed".into(),
+        ));
+    }
+    let attempt = u32::try_from(state.1)
+        .map_err(|_| EnclaveError::Store("maintenance attempt is invalid".into()))?;
+    let next_attempt = attempt
+        .checked_add(1)
+        .filter(|value| *value <= 16)
+        .ok_or_else(|| {
+            EnclaveError::Conflict("maintenance import exhausted its attempt cap".into())
+        })?;
+    let archive_id = fixed_blob::<16>(&state.0, "maintenance archive ID")?;
+    let attempt_count: i64 = conn.query_row(
+        "SELECT count(*) FROM archive_v3_maintenance_import_attempts
+         WHERE archive_id=?1 AND operation_id=?2",
+        rusqlite::params![archive_id.as_slice(), operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if attempt_count != i64::from(attempt) || attempt_count >= 16 {
+        return Err(EnclaveError::Store(
+            "maintenance attempt history is not canonical".into(),
+        ));
+    }
+    let next_attempt_id = ObjectId::random();
+    let tx = conn.unchecked_transaction()?;
+    let superseded = tx.execute(
+        "UPDATE archive_v3_maintenance_import_attempts SET state='superseded'
+         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND state='active'",
+        rusqlite::params![
+            archive_id.as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(attempt),
+        ],
+    )?;
+    if superseded != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance upload attempt changed".into(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO archive_v3_maintenance_import_attempts
+         (archive_id,operation_id,attempt,attempt_id,state)
+         VALUES (?1,?2,?3,?4,'active')",
+        rusqlite::params![
+            archive_id.as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(next_attempt),
+            next_attempt_id.as_bytes().as_slice(),
+        ],
+    )?;
+    let advanced = tx.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET attempt=?2,revision=revision+1,authoritative_base_ordinal=0,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND attempt=?3 AND stage='parity_verified'
+           AND authoritative_candidate IS NULL AND authoritative_base_ordinal=?4",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            i64::from(next_attempt),
+            i64::from(attempt),
+            state.4,
+        ],
+    )?;
+    if advanced != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance authoritative attempt CAS changed".into(),
+        ));
+    }
+    tx.commit()?;
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_send_unknown_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    from: MaintenanceImportStage,
+) -> Result<MaintenanceImportRecord> {
+    let (from_db, next_db, candidate_column) = match from {
+        MaintenanceImportStage::ShadowUploading => (
+            "shadow_uploading",
+            "shadow_send_unknown",
+            "shadow_candidate",
+        ),
+        MaintenanceImportStage::AuthoritativeUploading => (
+            "authoritative_uploading",
+            "authoritative_send_unknown",
+            "authoritative_candidate",
+        ),
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "maintenance send transition is invalid".into(),
+            ))
+        }
+    };
+    let sql = format!(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage=?2,revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?3 AND {candidate_column} IS NOT NULL"
+    );
+    let updated = conn.execute(
+        &sql,
+        rusqlite::params![operation_id.as_bytes().as_slice(), next_db, from_db],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance send marker changed".into(),
+        ));
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_manual_required_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected_stage: MaintenanceImportStage,
+) -> Result<MaintenanceImportRecord> {
+    if !matches!(
+        expected_stage,
+        MaintenanceImportStage::ShadowSendUnknown
+            | MaintenanceImportStage::AuthoritativeSendUnknown
+    ) {
+        return Err(EnclaveError::Conflict(
+            "maintenance manual transition is invalid".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let updated = tx.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage='manual_required',revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?2",
+        rusqlite::params![operation_id.as_bytes().as_slice(), expected_stage.as_db()],
+    )?;
+    let attempt = tx.execute(
+        "UPDATE archive_v3_maintenance_import_attempts SET state='manual_required'
+         WHERE operation_id=?1 AND state='active'",
+        [operation_id.as_bytes().as_slice()],
+    )?;
+    if updated != 1 || attempt != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance manual CAS changed".into(),
+        ));
+    }
+    tx.commit()?;
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn reconcile_maintenance_witness_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected_stage: MaintenanceImportStage,
+    observed: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<MaintenanceImportRecord> {
+    let (stage_db, next_db, candidate_column, candidate_hash_column) = match expected_stage {
+        MaintenanceImportStage::ShadowSendUnknown => (
+            "shadow_send_unknown",
+            "shadow_wal",
+            "shadow_candidate",
+            "shadow_candidate_hash",
+        ),
+        MaintenanceImportStage::AuthoritativeSendUnknown => (
+            "authoritative_send_unknown",
+            "wal_authoritative",
+            "authoritative_candidate",
+            "authoritative_candidate_hash",
+        ),
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "maintenance reconciliation stage is invalid".into(),
+            ))
+        }
+    };
+    let encoded = observed.encode();
+    let hash: [u8; 32] = Sha256::digest(encoded).into();
+    let sql = format!(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage=?2,revision=revision+1,witness_record=?3,witness_record_hash=?4,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?5 AND {candidate_column}=?3
+           AND {candidate_hash_column}=?4"
+    );
+    let updated = conn.execute(
+        &sql,
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            next_db,
+            encoded.as_slice(),
+            hash.as_slice(),
+            stage_db,
+        ],
+    )?;
+    if updated == 0 {
+        return Err(EnclaveError::Conflict(
+            "maintenance witness did not nominate the retained candidate".into(),
+        ));
+    }
+    if expected_stage == MaintenanceImportStage::AuthoritativeSendUnknown {
+        let terminalized = conn.execute(
+            "UPDATE archive_v3_maintenance_import_attempts SET state='terminal'
+             WHERE operation_id=?1 AND state='active'
+               AND attempt=(SELECT attempt FROM archive_v3_maintenance_imports
+                            WHERE operation_id=?1 AND stage='wal_authoritative')",
+            [operation_id.as_bytes().as_slice()],
+        )?;
+        if terminalized != 1 {
+            return Err(EnclaveError::Store(
+                "maintenance terminal attempt changed".into(),
+            ));
+        }
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+fn persist_maintenance_parity_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    source: MaintenanceSourceBinding,
+    exact_shadow_witness: &crate::archive_v3_witness::WitnessRecord,
+    parity_commitment: [u8; 32],
+) -> Result<MaintenanceImportRecord> {
+    if parity_commitment.iter().all(|byte| *byte == 0)
+        || exact_shadow_witness.migration() != crate::archive_v3_witness::MigrationState::ShadowWal
+        || exact_shadow_witness.deletion() != crate::archive_v3_witness::DeletionState::Active
+    {
+        return Err(EnclaveError::Conflict(
+            "maintenance parity authority is invalid".into(),
+        ));
+    }
+    let source = source.control_view(MaintenancePersistenceContext(()));
+    let witness_hash: [u8; 32] = Sha256::digest(exact_shadow_witness.encode()).into();
+    let updated = conn.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage='parity_verified',revision=revision+1,parity_commitment=?2,
+             authoritative_base_ordinal=(
+               SELECT count(*) FROM archive_v3_maintenance_import_artifacts x
+               WHERE x.archive_id=archive_v3_maintenance_imports.archive_id
+                 AND x.operation_id=archive_v3_maintenance_imports.operation_id
+                 AND x.attempt=archive_v3_maintenance_imports.attempt
+             ),
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage='shadow_wal'
+           AND source_commitment=?3 AND witness_record_hash=?4
+           AND NOT EXISTS (
+             SELECT 1 FROM archive_v3_maintenance_import_artifacts x
+             WHERE x.archive_id=archive_v3_maintenance_imports.archive_id
+               AND x.operation_id=archive_v3_maintenance_imports.operation_id
+               AND x.attempt=archive_v3_maintenance_imports.attempt
+               AND x.state!='materialized'
+           )",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            parity_commitment.as_slice(),
+            source.commitment.as_slice(),
+            witness_hash.as_slice(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "maintenance parity state changed".into(),
+        ));
+    }
+    maintenance_import_record_conn(conn, operation_id)
+}
+
+type MaintenanceArtifactAuthority = (ArchiveId, MaintenanceImportOperationId, u32, ObjectId);
+
+fn maintenance_artifact_authority_conn(
+    conn: &Connection,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    binding: ShadowSessionBinding,
+) -> Result<MaintenanceArtifactAuthority> {
+    type ArtifactAuthorityRow = (
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    );
+    let row: ArtifactAuthorityRow = conn.query_row(
+        "SELECT i.archive_id,i.operation_id,i.attempt,a.attempt_id,i.stage,
+                i.owner_id,i.operation_commitment,i.witness_record
+         FROM archive_v3_maintenance_imports i
+         JOIN archive_v3_maintenance_import_attempts a
+           ON a.archive_id=i.archive_id AND a.operation_id=i.operation_id
+          AND a.attempt=i.attempt
+         JOIN archive_bindings b
+           ON b.archive_id=i.archive_id AND b.user_id=i.user_id
+         JOIN archive_deletion_ledgers d ON d.archive_id=i.archive_id
+         JOIN users u ON u.id=i.user_id
+         WHERE i.session_id=?1 AND a.attempt_id=?2 AND a.state='active'
+           AND b.state='active_legacy' AND d.state='active_legacy'
+           AND d.deletion_fence_id IS NULL AND u.status='active'",
+        rusqlite::params![
+            session_id.as_bytes().as_slice(),
+            attempt_id.as_bytes().as_slice()
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let archive_id =
+        ArchiveId::from_bytes(fixed_blob::<16>(&row.0, "maintenance artifact archive")?);
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&row.1, "maintenance artifact operation")?,
+    )
+    .map_err(maintenance_store_error)?;
+    let attempt = u32::try_from(row.2)
+        .map_err(|_| EnclaveError::Store("maintenance artifact attempt is invalid".into()))?;
+    let stored_attempt =
+        ObjectId::from_bytes(fixed_blob::<16>(&row.3, "maintenance artifact attempt ID")?);
+    let owner_id = ObjectId::from_bytes(fixed_blob::<16>(&row.5, "maintenance artifact owner")?);
+    let operation_commitment =
+        fixed_blob::<32>(&row.6, "maintenance artifact operation commitment")?;
+    let witness = crate::archive_v3_witness::WitnessRecord::decode(&row.7)
+        .map_err(|_| EnclaveError::Store("maintenance artifact witness is invalid".into()))?;
+    let lease = witness
+        .exact_active_lease_for_owner(owner_id)
+        .map_err(|_| EnclaveError::Conflict("maintenance artifact lease is invalid".into()))?;
+    let expected_binding = ShadowSessionBinding::from_maintenance_witness(
+        MaintenanceZeroWalBindingContext::from_control(MaintenancePersistenceContext(())),
+        &witness,
+        lease,
+        *operation_id.as_bytes(),
+        operation_commitment,
+        0,
+        0,
+        0,
+    )
+    .map_err(|_| EnclaveError::Store("maintenance artifact binding is invalid".into()))?;
+    if binding.archive_id() != *archive_id.as_bytes()
+        || binding.operation_id() != *operation_id.as_bytes()
+        || binding != expected_binding
+        || !matches!(row.4.as_str(), "shadow_uploading" | "parity_verified")
+    {
+        return Err(EnclaveError::Conflict(
+            "maintenance artifact authority changed".into(),
+        ));
+    }
+    Ok((archive_id, operation_id, attempt, stored_attempt))
+}
+
+fn record_maintenance_artifact_conn(
+    conn: &Connection,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    binding: ShadowSessionBinding,
+    facts: &ShadowObjectFacts,
+    materialized: bool,
+) -> Result<RecordOutcome> {
+    let (archive_id, operation_id, attempt, _) =
+        maintenance_artifact_authority_conn(conn, session_id, attempt_id, binding)?;
+    let token = MaintenancePersistenceContext(());
+    if !facts.matches_maintenance_binding(token, binding) {
+        return Err(EnclaveError::Conflict(
+            "maintenance artifact context changed".into(),
+        ));
+    }
+    let facts_view = facts
+        .maintenance_persistence_view(token)
+        .map_err(|_| EnclaveError::Store("maintenance artifact is invalid".into()))?;
+    let root_seq = facts_view
+        .root_seq
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("maintenance root sequence overflow".into()))?;
+    if !materialized {
+        let (retained_count, exact_existing): (i64, i64) = conn.query_row(
+            "SELECT count(*),EXISTS(
+               SELECT 1 FROM archive_v3_maintenance_import_artifacts
+               WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND ordinal=?4
+                 AND object_id=?5 AND object_role=?6
+                 AND ((root_seq IS NULL AND ?7 IS NULL) OR root_seq=?7)
+                 AND context_aad=?8 AND object_key=?9 AND ciphertext_hash=?10
+             ) FROM archive_v3_maintenance_import_artifacts
+             WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(attempt),
+                i64::from(facts_view.ordinal),
+                facts_view.object_id.as_bytes().as_slice(),
+                facts_view.object_role as i64,
+                root_seq,
+                facts_view.context_aad,
+                facts_view.object_key,
+                facts_view.ciphertext_hash.as_slice(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if exact_existing == 0
+            && usize::try_from(retained_count).ok().is_none_or(|count| {
+                count >= crate::archive_v3_operation::MAX_SHADOW_OBJECTS_PER_ATTEMPT
+            })
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance retained artifact inventory reached its cap".into(),
+            ));
+        }
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO archive_v3_maintenance_import_artifacts
+             (archive_id,operation_id,attempt,ordinal,object_id,object_role,
+              root_seq,context_aad,object_key,ciphertext_hash,state)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'reserved')",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(attempt),
+                i64::from(facts_view.ordinal),
+                facts_view.object_id.as_bytes().as_slice(),
+                facts_view.object_role as i64,
+                root_seq,
+                facts_view.context_aad,
+                facts_view.object_key,
+                facts_view.ciphertext_hash.as_slice(),
+            ],
+        )?;
+        if inserted == 1 {
+            return Ok(RecordOutcome::Recorded);
+        }
+    } else {
+        let updated = conn.execute(
+            "UPDATE archive_v3_maintenance_import_artifacts SET state='materialized'
+             WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND ordinal=?4
+               AND object_id=?5 AND object_role=?6
+               AND ((root_seq IS NULL AND ?7 IS NULL) OR root_seq=?7)
+               AND context_aad=?8 AND object_key=?9 AND ciphertext_hash=?10
+               AND state IN ('reserved','materialized')",
+            rusqlite::params![
+                archive_id.as_bytes().as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(attempt),
+                i64::from(facts_view.ordinal),
+                facts_view.object_id.as_bytes().as_slice(),
+                facts_view.object_role as i64,
+                root_seq,
+                facts_view.context_aad,
+                facts_view.object_key,
+                facts_view.ciphertext_hash.as_slice(),
+            ],
+        )?;
+        if updated == 1 {
+            return Ok(RecordOutcome::Recorded);
+        }
+    }
+    let exact: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_maintenance_import_artifacts
+         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND ordinal=?4
+           AND object_id=?5 AND object_role=?6
+           AND ((root_seq IS NULL AND ?7 IS NULL) OR root_seq=?7)
+           AND context_aad=?8 AND object_key=?9 AND ciphertext_hash=?10
+           AND (?11=0 OR state='materialized'))",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(attempt),
+            i64::from(facts_view.ordinal),
+            facts_view.object_id.as_bytes().as_slice(),
+            facts_view.object_role as i64,
+            root_seq,
+            facts_view.context_aad,
+            facts_view.object_key,
+            facts_view.ciphertext_hash.as_slice(),
+            i64::from(materialized),
+        ],
+        |row| row.get(0),
+    )?;
+    if exact == 1 {
+        Ok(RecordOutcome::AlreadyRecorded)
+    } else {
+        Err(EnclaveError::Conflict(
+            "maintenance artifact row conflicts".into(),
+        ))
+    }
+}
+
+fn load_maintenance_artifact_page_conn(
+    conn: &Connection,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
+    binding: ShadowSessionBinding,
+    after_ordinal: Option<u32>,
+) -> Result<ShadowObjectInventoryPage> {
+    let (archive_id, operation_id, attempt, _) =
+        maintenance_artifact_authority_conn(conn, session_id, attempt_id, binding)?;
+    let after = after_ordinal.map(i64::from).unwrap_or(-1);
+    type ArtifactRow = (
+        i64,
+        Vec<u8>,
+        i64,
+        Option<i64>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        String,
+    );
+    let mut statement = conn.prepare(
+        "SELECT ordinal,object_id,object_role,root_seq,context_aad,object_key,
+                ciphertext_hash,state
+         FROM archive_v3_maintenance_import_artifacts
+         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND ordinal>?4
+         ORDER BY ordinal LIMIT 257",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(attempt),
+            after,
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let token = MaintenancePersistenceContext(());
+    let mut entries = Vec::new();
+    let mut has_more = false;
+    for row in rows {
+        let row: ArtifactRow = row?;
+        if entries.len() == 256 {
+            has_more = true;
+            break;
+        }
+        let ordinal = u32::try_from(row.0)
+            .map_err(|_| EnclaveError::Store("maintenance artifact ordinal is invalid".into()))?;
+        let facts = ShadowObjectFacts::from_maintenance_persistence(
+            token,
+            ordinal,
+            ObjectId::from_bytes(fixed_blob::<16>(&row.1, "maintenance artifact ID")?),
+            row.2,
+            row.3
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store("maintenance root sequence invalid".into()))?,
+            row.4,
+            row.5,
+            fixed_blob::<32>(&row.6, "maintenance artifact hash")?,
+        )
+        .map_err(|_| EnclaveError::Store("maintenance artifact row is corrupt".into()))?;
+        if !facts.matches_maintenance_binding(token, binding) {
+            return Err(EnclaveError::Store(
+                "maintenance artifact binding changed".into(),
+            ));
+        }
+        let state = match row.7.as_str() {
+            "reserved" => ShadowObjectState::Reserved,
+            "materialized" => ShadowObjectState::Materialized,
+            _ => {
+                return Err(EnclaveError::Store(
+                    "maintenance artifact state is invalid".into(),
+                ))
+            }
+        };
+        entries.push(ShadowObjectInventoryEntry::from_maintenance_persistence(
+            token, facts, state,
+        ));
+    }
+    let next_ordinal = if has_more {
+        entries
+            .last()
+            .map(|entry| {
+                entry
+                    .facts()
+                    .maintenance_persistence_view(token)
+                    .map(|facts| facts.ordinal)
+                    .map_err(|_| EnclaveError::Store("maintenance artifact is invalid".into()))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(ShadowObjectInventoryPage::from_maintenance_persistence(
+        token,
+        entries,
+        next_ordinal,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_maintenance_artifact_rows_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    owner_id: ObjectId,
+    attempt: u32,
+    expected_count: u32,
+    stage: MaintenanceImportStage,
+    authoritative_base: Option<u32>,
+    operation_commitment: [u8; 32],
+    witness: Option<&crate::archive_v3_witness::WitnessRecord>,
+    shadow_candidate: Option<&crate::archive_v3_witness::WitnessRecord>,
+    authoritative_candidate: Option<&crate::archive_v3_witness::WitnessRecord>,
+) -> Result<()> {
+    if witness.is_none() {
+        return (expected_count == 0).then_some(()).ok_or_else(|| {
+            EnclaveError::Store("maintenance artifacts precede witness authority".into())
+        });
+    }
+    let witness = witness.expect("checked above");
+    let uses_binding = matches!(
+        stage,
+        MaintenanceImportStage::ShadowUploading
+            | MaintenanceImportStage::ShadowSendUnknown
+            | MaintenanceImportStage::ParityVerified
+            | MaintenanceImportStage::AuthoritativeUploading
+            | MaintenanceImportStage::AuthoritativeSendUnknown
+    );
+    let binding = uses_binding
+        .then(|| {
+            let lease = witness
+                .exact_active_lease_for_owner(owner_id)
+                .map_err(|_| EnclaveError::Store("maintenance artifact lease is invalid".into()))?;
+            ShadowSessionBinding::from_maintenance_witness(
+                MaintenanceZeroWalBindingContext::from_control(MaintenancePersistenceContext(())),
+                witness,
+                lease,
+                *operation_id.as_bytes(),
+                operation_commitment,
+                0,
+                0,
+                0,
+            )
+            .map_err(|_| EnclaveError::Store("maintenance artifact binding is invalid".into()))
+        })
+        .transpose()?;
+    if stage == MaintenanceImportStage::WalAuthoritative
+        && (authoritative_base != Some(0) || authoritative_candidate.is_none())
+    {
+        return Err(EnclaveError::Store(
+            "maintenance terminal artifact lineage is incomplete".into(),
+        ));
+    }
+    let roots = if stage == MaintenanceImportStage::WalAuthoritative {
+        authoritative_candidate
+            .into_iter()
+            .map(crate::archive_v3_witness::WitnessRecord::root)
+            .collect::<Vec<_>>()
+    } else {
+        shadow_candidate
+            .into_iter()
+            .chain(authoritative_candidate)
+            .map(crate::archive_v3_witness::WitnessRecord::root)
+            .collect::<Vec<_>>()
+    };
+    type ArtifactRow = (
+        i64,
+        Vec<u8>,
+        i64,
+        Option<i64>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        String,
+    );
+    let mut statement = conn.prepare(
+        "SELECT ordinal,object_id,object_role,root_seq,context_aad,object_key,
+                ciphertext_hash,state
+         FROM archive_v3_maintenance_import_artifacts
+         WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3
+         ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            i64::from(attempt),
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let token = MaintenancePersistenceContext(());
+    let require_materialized = matches!(
+        stage,
+        MaintenanceImportStage::ShadowSendUnknown
+            | MaintenanceImportStage::ShadowWal
+            | MaintenanceImportStage::AuthoritativeUploading
+            | MaintenanceImportStage::AuthoritativeSendUnknown
+            | MaintenanceImportStage::WalAuthoritative
+            | MaintenanceImportStage::ManualRequired
+    ) || (stage == MaintenanceImportStage::ParityVerified
+        && authoritative_base != Some(0));
+    let mut seen = 0u32;
+    for row in rows {
+        let row: ArtifactRow = row?;
+        let ordinal = u32::try_from(row.0)
+            .map_err(|_| EnclaveError::Store("maintenance artifact ordinal is invalid".into()))?;
+        if ordinal != seen {
+            return Err(EnclaveError::Store(
+                "maintenance artifact prefix is not contiguous".into(),
+            ));
+        }
+        let facts = ShadowObjectFacts::from_maintenance_persistence(
+            token,
+            ordinal,
+            ObjectId::from_bytes(fixed_blob::<16>(&row.1, "maintenance artifact ID")?),
+            row.2,
+            row.3
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store("maintenance root sequence invalid".into()))?,
+            row.4,
+            row.5,
+            fixed_blob::<32>(&row.6, "maintenance artifact hash")?,
+        )
+        .map_err(|_| EnclaveError::Store("maintenance artifact row is corrupt".into()))?;
+        let use_binding = match stage {
+            MaintenanceImportStage::ShadowUploading | MaintenanceImportStage::ShadowSendUnknown => {
+                true
+            }
+            MaintenanceImportStage::ParityVerified
+            | MaintenanceImportStage::AuthoritativeUploading
+            | MaintenanceImportStage::AuthoritativeSendUnknown => {
+                authoritative_base.is_some_and(|base| ordinal >= base)
+            }
+            _ => false,
+        };
+        let exact = if use_binding {
+            binding.is_some_and(|binding| facts.matches_maintenance_binding(token, binding))
+        } else {
+            facts.matches_maintenance_lineage(
+                token,
+                archive_id,
+                witness.database_epoch(),
+                witness.registry().key_epoch(),
+                &roots,
+            )
+        };
+        if !exact || (require_materialized && row.7 != "materialized") {
+            return Err(EnclaveError::Store(
+                "maintenance artifact row changed".into(),
+            ));
+        }
+        seen = seen
+            .checked_add(1)
+            .ok_or_else(|| EnclaveError::Store("maintenance artifact count overflow".into()))?;
+    }
+    if seen != expected_count {
+        return Err(EnclaveError::Store(
+            "maintenance artifact count changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn fixed_blob<const N: usize>(value: &[u8], field: &'static str) -> Result<[u8; N]> {
+    value
+        .try_into()
+        .map_err(|_| EnclaveError::Store(format!("{field} is invalid")))
+}
+
+fn maintenance_store_error(_error: MaintenanceImportError) -> EnclaveError {
+    EnclaveError::Store("maintenance import durable state is invalid".into())
+}
+
 /// Revalidate every local precondition for a legacy-ID migration. Callers do
 /// this only after holding both Store lifecycle gates, and repeat it in the
 /// final transaction after provider work. The expected random binding makes a
@@ -9619,6 +11999,22 @@ impl ControlStore {
             .await
     }
 
+    /// Prepare or exactly adopt the inactive one-user maintenance operation.
+    /// This is the only producer of its non-cloneable plan and it performs no
+    /// archive, witness, or legacy provider I/O.
+    #[allow(
+        dead_code,
+        reason = "reserved for the reviewed offline maintenance launcher; startup and serving remain intentionally unwired"
+    )]
+    pub(crate) async fn prepare_archive_v3_maintenance_import(
+        &self,
+        user_id: &str,
+    ) -> Result<AuthenticatedMaintenanceImportPlan> {
+        let user_id = user_id.to_owned();
+        self.write_owned_if_changed(move |conn| maintenance_import_plan_conn(conn, &user_id))
+            .await
+    }
+
     /// Inactive archive-v3 lifecycle methods. They mutate only the encrypted
     /// control ledger and are intentionally not called by startup, Store,
     /// routes, or any provider adapter. Account deletion only atomically
@@ -10682,6 +13078,298 @@ impl PreWitnessDispositionControl for ControlStore {
         })
         .await
         .map_err(|_| LifecycleError::Unavailable)
+    }
+}
+
+fn map_maintenance_persistence_error(error: EnclaveError) -> MaintenanceImportError {
+    match error {
+        EnclaveError::Conflict(_) | EnclaveError::Auth(_) => MaintenanceImportError::Conflict,
+        EnclaveError::Store(_) | EnclaveError::InvalidRequest(_) => MaintenanceImportError::Corrupt,
+        _ => MaintenanceImportError::Unavailable,
+    }
+}
+
+#[async_trait::async_trait]
+impl ShadowObjectInventory for ControlStore {
+    async fn reserve_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+        self.write_owned_if_changed(move |conn| {
+            record_maintenance_artifact_conn(conn, session_id, attempt_id, binding, &facts, false)
+                .map(|outcome| (outcome, true))
+        })
+        .await
+        .map_err(|error| match error {
+            EnclaveError::Conflict(_) => ShadowObjectInventoryError::Conflict,
+            _ => ShadowObjectInventoryError::Unavailable,
+        })
+    }
+
+    async fn mark_materialized_exact(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        facts: ShadowObjectFacts,
+    ) -> std::result::Result<RecordOutcome, ShadowObjectInventoryError> {
+        self.write_owned_if_changed(move |conn| {
+            record_maintenance_artifact_conn(conn, session_id, attempt_id, binding, &facts, true)
+                .map(|outcome| (outcome, true))
+        })
+        .await
+        .map_err(|error| match error {
+            EnclaveError::Conflict(_) => ShadowObjectInventoryError::Conflict,
+            _ => ShadowObjectInventoryError::Unavailable,
+        })
+    }
+
+    async fn load_exact_attempt_page(
+        &self,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        after_ordinal: Option<u32>,
+    ) -> std::result::Result<ShadowObjectInventoryPage, ShadowObjectInventoryError> {
+        self.read(move |conn| {
+            load_maintenance_artifact_page_conn(
+                conn,
+                session_id,
+                attempt_id,
+                binding,
+                after_ordinal,
+            )
+        })
+        .await
+        .map_err(|error| match error {
+            EnclaveError::Conflict(_) => ShadowObjectInventoryError::Conflict,
+            _ => ShadowObjectInventoryError::Unavailable,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl MaintenanceImportPersistence for ControlStore {
+    fn as_shadow_inventory(&self) -> &dyn ShadowObjectInventory {
+        self
+    }
+
+    async fn load_exact(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.read(move |conn| maintenance_import_record_conn(conn, operation_id))
+            .await
+            .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_fencing(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        tentative: MaintenanceTentativeSource,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_fencing_conn(conn, operation_id, tentative)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_pinned_source(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        source: MaintenanceSourceBinding,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_pinned_conn(conn, operation_id, source).map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_fencing_rebase(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        previous: MaintenanceTentativeSource,
+        replacement: MaintenanceTentativeSource,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_fencing_rebase_conn(conn, operation_id, previous, replacement)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_witness_and_lease(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        source: MaintenanceSourceBinding,
+        witness: &crate::archive_v3_witness::WitnessRecord,
+        lease: crate::archive_v3_witness::WitnessLease,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        let witness = witness.clone();
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_witness_conn(conn, operation_id, source, &witness, lease)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn prepare_shadow_upload_attempt(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            let before = maintenance_import_record_conn(conn, operation_id)?;
+            let before_attempt = before.attempt_id();
+            let record = prepare_maintenance_shadow_upload_attempt_conn(conn, operation_id)?;
+            let changed = record.attempt_id() != before_attempt;
+            Ok((record, changed))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn prepare_authoritative_upload_attempt(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            let before = maintenance_import_record_conn(conn, operation_id)?;
+            let before_attempt = before.attempt_id();
+            let record = prepare_maintenance_authoritative_upload_attempt_conn(conn, operation_id)?;
+            let changed = record.attempt_id() != before_attempt;
+            Ok((record, changed))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_renewed_lease(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        expected_stage: MaintenanceImportStage,
+        previous: &crate::archive_v3_witness::WitnessRecord,
+        renewed: &crate::archive_v3_witness::WitnessRecord,
+        lease: crate::archive_v3_witness::WitnessLease,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        let previous = previous.clone();
+        let renewed = renewed.clone();
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_renewed_lease_conn(
+                conn,
+                operation_id,
+                expected_stage,
+                &previous,
+                &renewed,
+                lease,
+            )
+            .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_reacquired_lease(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        expected_stage: MaintenanceImportStage,
+        previous: &crate::archive_v3_witness::WitnessRecord,
+        reacquired: &crate::archive_v3_witness::WitnessRecord,
+        lease: crate::archive_v3_witness::WitnessLease,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        let previous = previous.clone();
+        let reacquired = reacquired.clone();
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_reacquired_lease_conn(
+                conn,
+                operation_id,
+                expected_stage,
+                &previous,
+                &reacquired,
+                lease,
+            )
+            .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_manual_required(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        expected_stage: MaintenanceImportStage,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_manual_required_conn(conn, operation_id, expected_stage)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_candidate_before_send(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        from: MaintenanceImportStage,
+        candidate: PreparedMaintenanceMigration,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_candidate_conn(conn, operation_id, from, candidate)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_send_unknown(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        from: MaintenanceImportStage,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_send_unknown_conn(conn, operation_id, from)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn reconcile_exact_witness(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        expected_stage: MaintenanceImportStage,
+        observed: &crate::archive_v3_witness::WitnessRecord,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        let observed = observed.clone();
+        self.write_owned_if_changed(move |conn| {
+            reconcile_maintenance_witness_conn(conn, operation_id, expected_stage, &observed)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_parity_verified(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        source: MaintenanceSourceBinding,
+        exact_shadow_witness: &crate::archive_v3_witness::WitnessRecord,
+        parity_commitment: [u8; 32],
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        let witness = exact_shadow_witness.clone();
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_parity_conn(conn, operation_id, source, &witness, parity_commitment)
+                .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
     }
 }
 
@@ -16500,6 +19188,1477 @@ mod tests {
         assert!(!path.exists());
         assert!(!wal.exists());
         assert!(!shm.exists());
+    }
+
+    fn maintenance_operation_id(conn: &Connection) -> MaintenanceImportOperationId {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT operation_id FROM archive_v3_maintenance_imports",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        MaintenanceImportOperationId::from_control(
+            MaintenancePersistenceContext::for_test(),
+            fixed_blob::<16>(&bytes, "test maintenance operation").unwrap(),
+        )
+        .unwrap()
+    }
+
+    struct MaintenanceControlRecoveryFixture {
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        owner_id: ObjectId,
+        session_id: ShadowSessionId,
+        source: MaintenanceSourceBinding,
+        legacy: crate::archive_v3_witness::WitnessRecord,
+        shadow: crate::archive_v3_witness::WitnessRecord,
+        shadow_advance: crate::archive_v3_witness::RootAdvance,
+        shadow_facts: ShadowObjectFacts,
+        authoritative: crate::archive_v3_witness::WitnessRecord,
+        authoritative_advance: crate::archive_v3_witness::RootAdvance,
+        authoritative_binding: ShadowSessionBinding,
+        authoritative_facts: ShadowObjectFacts,
+    }
+
+    fn maintenance_root_candidate(
+        current: &crate::archive_v3_witness::WitnessRecord,
+        owner_id: ObjectId,
+        sequence: u64,
+        object_id: ObjectId,
+        cipher: &crate::archive_v3::ArchiveCipher,
+        ordinal: u32,
+        migration: crate::archive_v3_witness::MigrationState,
+    ) -> (
+        crate::archive_v3_witness::RootAdvance,
+        crate::archive_v3_witness::WitnessRecord,
+        ShadowObjectFacts,
+    ) {
+        use crate::archive_v3::ParentReference;
+
+        let lease = current.exact_active_lease_for_owner(owner_id).unwrap();
+        let parent = current.root().root();
+        let context = ObjectContext::new(
+            current.archive_id(),
+            current.database_epoch(),
+            current.registry().key_epoch(),
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: sequence },
+            object_id,
+            Some(ParentReference {
+                object_id: parent.object_id(),
+                envelope_hash: parent.ciphertext_hash(),
+            }),
+        )
+        .unwrap();
+        let envelope = cipher.seal(&context, b"maintenance-control-root").unwrap();
+        let candidate_root = current
+            .with_candidate_root_for_test(
+                crate::archive_v3_witness::RootReference::new(sequence, object_id, envelope.hash()),
+                lease.fencing_epoch(),
+            )
+            .root();
+        let advance = crate::archive_v3_witness::RootAdvance::new(
+            lease,
+            current.root(),
+            current.registry(),
+            candidate_root,
+        );
+        let candidate = current
+            .exact_migration_candidate(&advance, migration)
+            .unwrap();
+        let facts = ShadowObjectFacts::from_sealed(&context, &envelope, ordinal).unwrap();
+        (advance, candidate, facts)
+    }
+
+    fn seed_maintenance_shadow_uploading(
+        conn: &Connection,
+    ) -> Result<MaintenanceControlRecoveryFixture> {
+        use crate::archive_v3::{ArchiveCipher, ArchiveDek, DatabaseEpoch, KeyEpoch};
+        use crate::archive_v3_witness::{
+            InMemoryWitness, KeyRegistryReference, MigrationState, RootCommitment, RootReference,
+            Witness, WitnessBootstrap,
+        };
+
+        let operation_id = maintenance_operation_id(conn);
+        type Authority = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+        let authority: Authority = conn.query_row(
+            "SELECT i.archive_id,i.owner_id,i.session_id,a.attempt_id,
+                    i.operation_commitment
+             FROM archive_v3_maintenance_imports i
+             JOIN archive_v3_maintenance_import_attempts a
+               ON a.archive_id=i.archive_id AND a.operation_id=i.operation_id
+              AND a.attempt=i.attempt",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let archive_id =
+            ArchiveId::from_bytes(fixed_blob::<16>(&authority.0, "test maintenance archive")?);
+        let owner_id =
+            ObjectId::from_bytes(fixed_blob::<16>(&authority.1, "test maintenance owner")?);
+        let session_id = ShadowSessionId::from_bytes(fixed_blob::<16>(
+            &authority.2,
+            "test maintenance session",
+        )?);
+        let attempt_id = ShadowAttemptId::from_bytes(fixed_blob::<16>(
+            &authority.3,
+            "test maintenance attempt",
+        )?);
+        let database_epoch = DatabaseEpoch::from_bytes([0x81; 16]);
+        let key_epoch = KeyEpoch::from_bytes([0x82; 16]);
+        let registry =
+            KeyRegistryReference::new(key_epoch, 0, ObjectId::from_bytes([0x83; 16]), [0x84; 32]);
+        let initial = RootCommitment::genesis(
+            database_epoch,
+            key_epoch,
+            RootReference::new(0, ObjectId::from_bytes([0x85; 16]), [0x86; 32]),
+        );
+        let witness = InMemoryWitness::new();
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive_id,
+                database_epoch,
+                initial,
+                registry,
+            ))
+            .map_err(|_| EnclaveError::Store("test witness bootstrap failed".into()))?;
+        witness
+            .acquire_lease(archive_id, database_epoch, key_epoch, owner_id, 900)
+            .map_err(|_| EnclaveError::Store("test witness lease failed".into()))?;
+        let legacy = witness
+            .read_current(archive_id)
+            .map_err(|_| EnclaveError::Store("test witness read failed".into()))?
+            .unwrap();
+        let cipher = ArchiveCipher::new(ArchiveDek::from_bytes([0x87; 32]));
+        let (shadow_advance, shadow, shadow_facts) = maintenance_root_candidate(
+            &legacy,
+            owner_id,
+            1,
+            ObjectId::from_bytes([0x88; 16]),
+            &cipher,
+            0,
+            MigrationState::ShadowWal,
+        );
+        let (authoritative_advance, authoritative, authoritative_facts) =
+            maintenance_root_candidate(
+                &shadow,
+                owner_id,
+                2,
+                ObjectId::from_bytes([0x89; 16]),
+                &cipher,
+                0,
+                MigrationState::WalAuthoritative,
+            );
+        let tentative = MaintenanceTentativeSource {
+            base_generation: 1,
+            plaintext_hash: [0x8a; 32],
+            plaintext_len: 4096,
+            sqlite_schema_version: 0,
+            wrapped_dek_commitment: [0x8b; 32],
+        };
+        persist_maintenance_fencing_conn(conn, operation_id, tentative)?;
+        let source = MaintenanceSourceBinding::from_pinned(
+            archive_id,
+            operation_id,
+            2,
+            tentative.plaintext_hash,
+            tentative.plaintext_len,
+            tentative.sqlite_schema_version,
+            tentative.wrapped_dek_commitment,
+        )
+        .map_err(maintenance_store_error)?;
+        persist_maintenance_pinned_conn(conn, operation_id, source)?;
+        let lease = legacy
+            .exact_active_lease_for_owner(owner_id)
+            .map_err(|_| EnclaveError::Store("test witness lease is invalid".into()))?;
+        persist_maintenance_witness_conn(conn, operation_id, source, &legacy, lease)?;
+        let shadow_binding = ShadowSessionBinding::from_maintenance_witness(
+            MaintenanceZeroWalBindingContext::from_control(MaintenancePersistenceContext(())),
+            &legacy,
+            lease,
+            *operation_id.as_bytes(),
+            fixed_blob::<32>(&authority.4, "test operation commitment")?,
+            0,
+            0,
+            0,
+        )
+        .map_err(|_| EnclaveError::Store("test maintenance binding is invalid".into()))?;
+        record_maintenance_artifact_conn(
+            conn,
+            session_id,
+            attempt_id,
+            shadow_binding,
+            &shadow_facts,
+            false,
+        )?;
+        record_maintenance_artifact_conn(
+            conn,
+            session_id,
+            attempt_id,
+            shadow_binding,
+            &shadow_facts,
+            true,
+        )?;
+        let authoritative_lease = shadow
+            .exact_active_lease_for_owner(owner_id)
+            .map_err(|_| EnclaveError::Store("test authoritative lease is invalid".into()))?;
+        let authoritative_binding = ShadowSessionBinding::from_maintenance_witness(
+            MaintenanceZeroWalBindingContext::from_control(MaintenancePersistenceContext(())),
+            &shadow,
+            authoritative_lease,
+            *operation_id.as_bytes(),
+            fixed_blob::<32>(&authority.4, "test operation commitment")?,
+            0,
+            0,
+            0,
+        )
+        .map_err(|_| EnclaveError::Store("test authoritative binding is invalid".into()))?;
+        Ok(MaintenanceControlRecoveryFixture {
+            archive_id,
+            operation_id,
+            owner_id,
+            session_id,
+            source,
+            legacy,
+            shadow,
+            shadow_advance,
+            shadow_facts,
+            authoritative,
+            authoritative_advance,
+            authoritative_binding,
+            authoritative_facts,
+        })
+    }
+
+    fn seed_maintenance_shadow_send_unknown(
+        conn: &Connection,
+    ) -> Result<MaintenanceControlRecoveryFixture> {
+        use crate::archive_v3_witness::MigrationState;
+
+        let fixture = seed_maintenance_shadow_uploading(conn)?;
+        let prepared = PreparedMaintenanceMigration::from_authenticated_advance(
+            &fixture.legacy,
+            &fixture.shadow_advance,
+            MigrationState::ShadowWal,
+        )
+        .map_err(maintenance_store_error)?;
+        persist_maintenance_candidate_conn(
+            conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowUploading,
+            prepared,
+        )?;
+        persist_maintenance_send_unknown_conn(
+            conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowUploading,
+        )?;
+        Ok(fixture)
+    }
+
+    fn seed_maintenance_wal_authoritative(
+        conn: &Connection,
+    ) -> Result<MaintenanceControlRecoveryFixture> {
+        use crate::archive_v3_witness::MigrationState;
+
+        maintenance_import_plan_conn(conn, USER_ID)?;
+        let fixture = seed_maintenance_shadow_send_unknown(conn)?;
+        reconcile_maintenance_witness_conn(
+            conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowSendUnknown,
+            &fixture.shadow,
+        )?;
+        persist_maintenance_parity_conn(
+            conn,
+            fixture.operation_id,
+            fixture.source,
+            &fixture.shadow,
+            [0x90; 32],
+        )?;
+        let authoritative =
+            prepare_maintenance_authoritative_upload_attempt_conn(conn, fixture.operation_id)?;
+        record_maintenance_artifact_conn(
+            conn,
+            fixture.session_id,
+            authoritative.attempt_id(),
+            fixture.authoritative_binding,
+            &fixture.authoritative_facts,
+            false,
+        )?;
+        record_maintenance_artifact_conn(
+            conn,
+            fixture.session_id,
+            authoritative.attempt_id(),
+            fixture.authoritative_binding,
+            &fixture.authoritative_facts,
+            true,
+        )?;
+        let prepared = PreparedMaintenanceMigration::from_authenticated_advance(
+            &fixture.shadow,
+            &fixture.authoritative_advance,
+            MigrationState::WalAuthoritative,
+        )
+        .map_err(maintenance_store_error)?;
+        persist_maintenance_candidate_conn(
+            conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ParityVerified,
+            prepared,
+        )?;
+        persist_maintenance_send_unknown_conn(
+            conn,
+            fixture.operation_id,
+            MaintenanceImportStage::AuthoritativeUploading,
+        )?;
+        let terminal = reconcile_maintenance_witness_conn(
+            conn,
+            fixture.operation_id,
+            MaintenanceImportStage::AuthoritativeSendUnknown,
+            &fixture.authoritative,
+        )?;
+        if terminal.stage() != MaintenanceImportStage::WalAuthoritative {
+            return Err(EnclaveError::Store(
+                "test maintenance terminal was not durable".into(),
+            ));
+        }
+        Ok(fixture)
+    }
+
+    fn replace_current_maintenance_artifact(
+        conn: &Connection,
+        operation_id: MaintenanceImportOperationId,
+        facts: &ShadowObjectFacts,
+        state: &str,
+    ) -> Result<()> {
+        let view = facts
+            .maintenance_persistence_view(MaintenancePersistenceContext::for_test())
+            .map_err(|_| EnclaveError::Store("test maintenance artifact is invalid".into()))?;
+        let updated = conn.execute(
+            "UPDATE archive_v3_maintenance_import_artifacts
+             SET object_id=?2,object_role=?3,root_seq=?4,context_aad=?5,
+                 object_key=?6,ciphertext_hash=?7,state=?8
+             WHERE operation_id=?1
+               AND attempt=(SELECT attempt FROM archive_v3_maintenance_imports
+                            WHERE operation_id=?1)",
+            rusqlite::params![
+                operation_id.as_bytes().as_slice(),
+                view.object_id.as_bytes().as_slice(),
+                view.object_role as i64,
+                view.root_seq.and_then(|value| i64::try_from(value).ok()),
+                view.context_aad,
+                view.object_key,
+                view.ciphertext_hash.as_slice(),
+                state,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(EnclaveError::Store(
+                "test maintenance artifact replacement changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_prepare_is_exact_single_archive_and_restart_stable() {
+        let conn = account_conn();
+        let (_, created) = maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        assert!(created);
+        let first: (Vec<u8>, Vec<u8>, Vec<u8>, i64, String, String) = conn
+            .query_row(
+                "SELECT i.operation_id,i.owner_id,i.session_id,i.attempt,i.stage,a.state
+                 FROM archive_v3_maintenance_imports i
+                 JOIN archive_v3_maintenance_import_attempts a
+                   ON a.archive_id=i.archive_id AND a.operation_id=i.operation_id
+                  AND a.attempt=i.attempt",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(first.3, 1);
+        assert_eq!(first.4, "prepared");
+        assert_eq!(first.5, "active");
+        assert_ne!(first.0, vec![0; 16]);
+        assert_ne!(first.1, vec![0; 16]);
+        assert_ne!(first.2, vec![0; 16]);
+
+        let (_, created) = maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        assert!(!created);
+        let replay: (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT operation_id,owner_id,session_id
+                 FROM archive_v3_maintenance_imports",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(replay, (first.0, first.1, first.2));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_maintenance_imports",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_reopens_across_both_witness_settlements_and_reuses_partial_r2() {
+        use crate::{
+            archive_v3_shadow_checkpoint::ShadowObjectInventory,
+            archive_v3_witness::MigrationState,
+            store::tests::{FakeGcs, FakeKms},
+        };
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let user = control
+            .upsert_user("maintenance-recovery-subject", "recovery@example.com")
+            .await
+            .unwrap();
+        let _plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let fixture = control
+            .write(seed_maintenance_shadow_send_unknown)
+            .await
+            .unwrap();
+
+        gcs.fail_next_put_after_commit(EnclaveError::Gcs("lost R1 control response".into()));
+        assert_eq!(
+            MaintenanceImportPersistence::reconcile_exact_witness(
+                &control,
+                fixture.operation_id,
+                MaintenanceImportStage::ShadowSendUnknown,
+                &fixture.shadow,
+            )
+            .await
+            .unwrap()
+            .stage(),
+            MaintenanceImportStage::ShadowWal
+        );
+        drop(control);
+
+        let reopened = ControlStore::new(kms.clone(), gcs.clone());
+        assert_eq!(
+            MaintenanceImportPersistence::load_exact(&reopened, fixture.operation_id)
+                .await
+                .unwrap()
+                .stage(),
+            MaintenanceImportStage::ShadowWal
+        );
+        assert_eq!(
+            MaintenanceImportPersistence::persist_parity_verified(
+                &reopened,
+                fixture.operation_id,
+                fixture.source,
+                &fixture.shadow,
+                [0x91; 32],
+            )
+            .await
+            .unwrap()
+            .stage(),
+            MaintenanceImportStage::ParityVerified
+        );
+        drop(reopened);
+
+        let reopened = ControlStore::new(kms.clone(), gcs.clone());
+        let (stage, current_attempt, r1_rows, attempt_rows): (String, i64, i64, i64) = reopened
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT i.stage,i.attempt,
+                            (SELECT count(*) FROM archive_v3_maintenance_import_artifacts x
+                              WHERE x.operation_id=i.operation_id AND x.attempt=1),
+                            (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                              WHERE a.operation_id=i.operation_id)
+                     FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+                    [fixture.operation_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stage, "parity_verified");
+        assert_eq!(current_attempt, 1);
+        assert_eq!(r1_rows, 1);
+        assert_eq!(attempt_rows, 1);
+
+        let authoritative_attempt =
+            MaintenanceImportPersistence::prepare_authoritative_upload_attempt(
+                &reopened,
+                fixture.operation_id,
+            )
+            .await
+            .unwrap();
+        let retained_attempt_id = authoritative_attempt.attempt_id();
+        assert_eq!(authoritative_attempt.next_artifact_ordinal(), 0);
+        assert_eq!(
+            ShadowObjectInventory::reserve_exact(
+                &reopened,
+                fixture.session_id,
+                retained_attempt_id,
+                fixture.authoritative_binding,
+                fixture.authoritative_facts.clone(),
+            )
+            .await
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        drop(reopened);
+
+        let reopened = ControlStore::new(kms.clone(), gcs.clone());
+        let reserved = MaintenanceImportPersistence::prepare_authoritative_upload_attempt(
+            &reopened,
+            fixture.operation_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reserved.attempt_id(), retained_attempt_id);
+        assert_eq!(reserved.next_artifact_ordinal(), 1);
+        assert_eq!(
+            ShadowObjectInventory::mark_materialized_exact(
+                &reopened,
+                fixture.session_id,
+                retained_attempt_id,
+                fixture.authoritative_binding,
+                fixture.authoritative_facts.clone(),
+            )
+            .await
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        drop(reopened);
+
+        let reopened = ControlStore::new(kms.clone(), gcs.clone());
+        let materialized = MaintenanceImportPersistence::prepare_authoritative_upload_attempt(
+            &reopened,
+            fixture.operation_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(materialized.attempt_id(), retained_attempt_id);
+        assert_eq!(materialized.next_artifact_ordinal(), 1);
+        let attempt_rows: i64 = reopened
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_maintenance_import_attempts
+                     WHERE operation_id=?1",
+                    [fixture.operation_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempt_rows, 2, "recovery burned an extra R2 attempt");
+
+        let prepared = PreparedMaintenanceMigration::from_authenticated_advance(
+            &fixture.shadow,
+            &fixture.authoritative_advance,
+            MigrationState::WalAuthoritative,
+        )
+        .unwrap();
+        assert_eq!(
+            MaintenanceImportPersistence::persist_candidate_before_send(
+                &reopened,
+                fixture.operation_id,
+                MaintenanceImportStage::ParityVerified,
+                prepared,
+            )
+            .await
+            .unwrap()
+            .stage(),
+            MaintenanceImportStage::AuthoritativeUploading
+        );
+        MaintenanceImportPersistence::persist_send_unknown(
+            &reopened,
+            fixture.operation_id,
+            MaintenanceImportStage::AuthoritativeUploading,
+        )
+        .await
+        .unwrap();
+        gcs.fail_next_put_after_commit(EnclaveError::Gcs("lost terminal control response".into()));
+        assert_eq!(
+            MaintenanceImportPersistence::reconcile_exact_witness(
+                &reopened,
+                fixture.operation_id,
+                MaintenanceImportStage::AuthoritativeSendUnknown,
+                &fixture.authoritative,
+            )
+            .await
+            .unwrap()
+            .stage(),
+            MaintenanceImportStage::WalAuthoritative
+        );
+        drop(reopened);
+
+        let terminal = ControlStore::new(kms, gcs);
+        assert_eq!(
+            MaintenanceImportPersistence::load_exact(&terminal, fixture.operation_id)
+                .await
+                .unwrap()
+                .stage(),
+            MaintenanceImportStage::WalAuthoritative
+        );
+        let terminal_attempts: (i64, i64, i64) = terminal
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT i.attempt,
+                            (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                              WHERE a.operation_id=i.operation_id),
+                            (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                              WHERE a.operation_id=i.operation_id AND a.state='terminal')
+                     FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+                    [fixture.operation_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(terminal_attempts, (2, 2, 1));
+        assert_eq!(fixture.archive_id, fixture.shadow.archive_id());
+        assert_eq!(
+            fixture
+                .shadow
+                .exact_active_lease_for_owner(fixture.owner_id)
+                .unwrap()
+                .fencing_epoch(),
+            fixture
+                .authoritative
+                .exact_active_lease_for_owner(fixture.owner_id)
+                .unwrap()
+                .fencing_epoch()
+        );
+    }
+
+    #[test]
+    fn maintenance_terminal_validates_only_exact_r2_lineage_and_materialization() {
+        use crate::archive_v3::{ArchiveCipher, ArchiveDek, ParentReference};
+        use crate::archive_v3_witness::MigrationState;
+
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        assert_eq!(
+            maintenance_import_record_conn(&conn, fixture.operation_id)
+                .unwrap()
+                .stage(),
+            MaintenanceImportStage::WalAuthoritative
+        );
+
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        replace_current_maintenance_artifact(
+            &conn,
+            fixture.operation_id,
+            &fixture.shadow_facts,
+            "materialized",
+        )
+        .unwrap();
+        assert!(maintenance_import_record_conn(&conn, fixture.operation_id).is_err());
+
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        let cipher = ArchiveCipher::new(ArchiveDek::from_bytes([0x98; 32]));
+        let (_, _, alternate_r2_facts) = maintenance_root_candidate(
+            &fixture.shadow,
+            fixture.owner_id,
+            2,
+            ObjectId::from_bytes([0x99; 16]),
+            &cipher,
+            0,
+            MigrationState::WalAuthoritative,
+        );
+        replace_current_maintenance_artifact(
+            &conn,
+            fixture.operation_id,
+            &alternate_r2_facts,
+            "materialized",
+        )
+        .unwrap();
+        assert!(maintenance_import_record_conn(&conn, fixture.operation_id).is_err());
+
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        let root = fixture.authoritative.root().root();
+        let wrong_parent = ObjectContext::new(
+            fixture.archive_id,
+            fixture.authoritative.database_epoch(),
+            fixture.authoritative.registry().key_epoch(),
+            ObjectRole::RootV3,
+            LogicalLocation::Root {
+                root_seq: root.sequence(),
+            },
+            root.object_id(),
+            Some(ParentReference {
+                object_id: ObjectId::from_bytes([0x9a; 16]),
+                envelope_hash: [0x9b; 32],
+            }),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_maintenance_import_artifacts
+             SET context_aad=?2 WHERE operation_id=?1
+               AND attempt=(SELECT attempt FROM archive_v3_maintenance_imports
+                            WHERE operation_id=?1)",
+            rusqlite::params![
+                fixture.operation_id.as_bytes().as_slice(),
+                wrong_parent.canonical_aad(),
+            ],
+        )
+        .unwrap();
+        assert!(maintenance_import_record_conn(&conn, fixture.operation_id).is_err());
+
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        let cipher = ArchiveCipher::new(ArchiveDek::from_bytes([0x9c; 32]));
+        let (_, alternate, _) = maintenance_root_candidate(
+            &fixture.shadow,
+            fixture.owner_id,
+            2,
+            ObjectId::from_bytes([0x9d; 16]),
+            &cipher,
+            0,
+            MigrationState::WalAuthoritative,
+        );
+        let encoded = alternate.encode();
+        let hash: [u8; 32] = Sha256::digest(encoded).into();
+        conn.execute(
+            "UPDATE archive_v3_maintenance_imports
+             SET authoritative_candidate=?2,authoritative_candidate_hash=?3
+             WHERE operation_id=?1",
+            rusqlite::params![
+                fixture.operation_id.as_bytes().as_slice(),
+                encoded,
+                hash.as_slice(),
+            ],
+        )
+        .unwrap();
+        assert!(maintenance_import_record_conn(&conn, fixture.operation_id).is_err());
+
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        conn.execute(
+            "UPDATE archive_v3_maintenance_import_artifacts SET state='reserved'
+             WHERE operation_id=?1
+               AND attempt=(SELECT attempt FROM archive_v3_maintenance_imports
+                            WHERE operation_id=?1)",
+            [fixture.operation_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(maintenance_import_record_conn(&conn, fixture.operation_id).is_err());
+
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        let root = fixture.authoritative.root().root();
+        let parent = fixture.authoritative.root().parent().unwrap();
+        let wrong_namespace = ObjectContext::new(
+            ArchiveId::from_bytes([0x9e; 16]),
+            fixture.authoritative.database_epoch(),
+            fixture.authoritative.registry().key_epoch(),
+            ObjectRole::RootV3,
+            LogicalLocation::Root {
+                root_seq: root.sequence(),
+            },
+            root.object_id(),
+            Some(ParentReference {
+                object_id: parent.object_id(),
+                envelope_hash: parent.ciphertext_hash(),
+            }),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_maintenance_import_artifacts
+             SET context_aad=?2 WHERE operation_id=?1
+               AND attempt=(SELECT attempt FROM archive_v3_maintenance_imports
+                            WHERE operation_id=?1)",
+            rusqlite::params![
+                fixture.operation_id.as_bytes().as_slice(),
+                wrong_namespace.canonical_aad(),
+            ],
+        )
+        .unwrap();
+        assert!(maintenance_import_record_conn(&conn, fixture.operation_id).is_err());
+    }
+
+    #[test]
+    fn maintenance_settled_candidate_descendants_are_stage_gated() {
+        let conn = account_conn();
+        maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        let fixture = seed_maintenance_shadow_send_unknown(&conn).unwrap();
+        reconcile_maintenance_witness_conn(
+            &conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowSendUnknown,
+            &fixture.shadow,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_maintenance_imports SET stage='shadow_send_unknown'
+             WHERE operation_id=?1",
+            [fixture.operation_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(maintenance_import_record_conn(&conn, fixture.operation_id).is_err());
+    }
+
+    #[test]
+    fn maintenance_control_rejects_nonexact_lease_tuple_before_cas() {
+        let conn = account_conn();
+        maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        let fixture = seed_maintenance_shadow_uploading(&conn).unwrap();
+        let previous_lease = fixture
+            .legacy
+            .exact_active_lease_for_owner(fixture.owner_id)
+            .unwrap();
+        let renewed = fixture.legacy.renewed_maintenance_lease_for_test();
+        let next_fence_changed = renewed.with_next_fencing_epoch_for_test(
+            previous_lease.fencing_epoch().checked_add(2).unwrap(),
+        );
+        let changed_lease = next_fence_changed
+            .exact_active_lease_for_owner(fixture.owner_id)
+            .unwrap();
+        assert!(persist_maintenance_renewed_lease_conn(
+            &conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowUploading,
+            &fixture.legacy,
+            &next_fence_changed,
+            changed_lease,
+        )
+        .is_err());
+        let decreased_expiry =
+            renewed.with_lease_expiry_for_test(previous_lease.expires_at_tick().saturating_sub(1));
+        let decreased_lease = decreased_expiry
+            .exact_active_lease_for_owner(fixture.owner_id)
+            .unwrap();
+        assert!(persist_maintenance_renewed_lease_conn(
+            &conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowUploading,
+            &fixture.legacy,
+            &decreased_expiry,
+            decreased_lease,
+        )
+        .is_err());
+        let reacquired = fixture.legacy.reacquired_maintenance_lease_for_test();
+        let wrong_reacquire = reacquired.with_next_fencing_epoch_for_test(
+            reacquired
+                .exact_active_lease_for_owner(fixture.owner_id)
+                .unwrap()
+                .fencing_epoch()
+                .checked_add(2)
+                .unwrap(),
+        );
+        let wrong_reacquire_lease = wrong_reacquire
+            .exact_active_lease_for_owner(fixture.owner_id)
+            .unwrap();
+        assert!(persist_maintenance_reacquired_lease_conn(
+            &conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowUploading,
+            &fixture.legacy,
+            &wrong_reacquire,
+            wrong_reacquire_lease,
+        )
+        .is_err());
+        let retained = maintenance_import_record_conn(&conn, fixture.operation_id).unwrap();
+        assert!(retained
+            .witnessed_record()
+            .unwrap()
+            .is_some_and(|record| record == fixture.legacy));
+    }
+
+    #[tokio::test]
+    async fn shadow_upload_reacquire_lost_response_reopens_higher_fence_and_new_attempt() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let user = control
+            .upsert_user(
+                "maintenance-shadow-reacquire",
+                "shadow-reacquire@example.com",
+            )
+            .await
+            .unwrap();
+        control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let fixture = control
+            .write(seed_maintenance_shadow_uploading)
+            .await
+            .unwrap();
+        let reacquired = fixture.legacy.reacquired_maintenance_lease_for_test();
+        let lease = reacquired
+            .exact_maintenance_reacquire_from(&fixture.legacy, fixture.owner_id)
+            .unwrap();
+        gcs.fail_next_put_after_commit(EnclaveError::Gcs(
+            "lost shadow-upload reacquire control response".into(),
+        ));
+        let persisted = MaintenanceImportPersistence::persist_reacquired_lease(
+            &control,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowUploading,
+            &fixture.legacy,
+            &reacquired,
+            lease,
+        )
+        .await
+        .unwrap();
+        assert_eq!(persisted.next_artifact_ordinal(), 0);
+        drop(control);
+
+        let reopened = ControlStore::new(kms, gcs);
+        let recovered = MaintenanceImportPersistence::load_exact(&reopened, fixture.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(recovered.stage(), MaintenanceImportStage::ShadowUploading);
+        assert_eq!(recovered.next_artifact_ordinal(), 0);
+        assert!(recovered
+            .witnessed_record()
+            .unwrap()
+            .is_some_and(|record| record == reacquired));
+        let attempts: (i64, i64, i64) = reopened
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT i.attempt,
+                            (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                              WHERE a.operation_id=i.operation_id),
+                            (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                              WHERE a.operation_id=i.operation_id AND a.state='superseded')
+                     FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+                    [fixture.operation_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts, (2, 2, 1));
+    }
+
+    #[tokio::test]
+    async fn parity_partial_reacquire_cancel_after_put_reopens_reset_attempt() {
+        use crate::{
+            archive_v3_shadow_checkpoint::ShadowObjectInventory,
+            store::tests::{FakeGcs, FakeKms},
+        };
+
+        let kms = Arc::new(FakeKms);
+        let backing = Arc::new(FakeGcs::new());
+        let gcs = Arc::new(PausingGcs::new(backing.clone()));
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let user = control
+            .upsert_user(
+                "maintenance-parity-reacquire",
+                "parity-reacquire@example.com",
+            )
+            .await
+            .unwrap();
+        control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let fixture = control
+            .write(seed_maintenance_shadow_send_unknown)
+            .await
+            .unwrap();
+        MaintenanceImportPersistence::reconcile_exact_witness(
+            control.as_ref(),
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowSendUnknown,
+            &fixture.shadow,
+        )
+        .await
+        .unwrap();
+        MaintenanceImportPersistence::persist_parity_verified(
+            control.as_ref(),
+            fixture.operation_id,
+            fixture.source,
+            &fixture.shadow,
+            [0xa1; 32],
+        )
+        .await
+        .unwrap();
+        let r2 = MaintenanceImportPersistence::prepare_authoritative_upload_attempt(
+            control.as_ref(),
+            fixture.operation_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ShadowObjectInventory::reserve_exact(
+                control.as_ref(),
+                fixture.session_id,
+                r2.attempt_id(),
+                fixture.authoritative_binding,
+                fixture.authoritative_facts.clone(),
+            )
+            .await
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+
+        let reacquired = fixture.shadow.reacquired_maintenance_lease_for_test();
+        let lease = reacquired
+            .exact_maintenance_reacquire_from(&fixture.shadow, fixture.owner_id)
+            .unwrap();
+        gcs.pause_after_next_put(CONTROL_OBJECT);
+        let task_control = control.clone();
+        let operation_id = fixture.operation_id;
+        let previous = fixture.shadow.clone();
+        let committed = reacquired.clone();
+        let mut task = tokio::spawn(async move {
+            MaintenanceImportPersistence::persist_reacquired_lease(
+                task_control.as_ref(),
+                operation_id,
+                MaintenanceImportStage::ParityVerified,
+                &previous,
+                &committed,
+                lease,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            tokio::select! {
+                () = gcs.put_committed.notified() => {}
+                outcome = &mut task => match outcome {
+                    Ok(Err(error)) => panic!(
+                        "maintenance reacquire failed before the committed PUT barrier: {error:?}"
+                    ),
+                    Ok(Ok(_)) => panic!(
+                        "maintenance reacquire completed without pausing after the committed PUT"
+                    ),
+                    Err(error) => panic!(
+                        "maintenance reacquire task failed before the committed PUT barrier: {error}"
+                    ),
+                },
+            }
+        })
+        .await
+        .expect("maintenance reacquire did not reach the committed PUT barrier");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        gcs.resume_put.notify_one();
+        assert!(control.inner.lock().await.is_none());
+        drop(control);
+
+        let reopened = ControlStore::new(kms.clone(), gcs);
+        let recovered = MaintenanceImportPersistence::load_exact(&reopened, fixture.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(recovered.stage(), MaintenanceImportStage::ParityVerified);
+        assert_eq!(recovered.next_artifact_ordinal(), 0);
+        assert!(recovered
+            .witnessed_record()
+            .unwrap()
+            .is_some_and(|record| record == reacquired));
+        let attempts: (i64, i64, i64, Option<i64>) = reopened
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT i.attempt,
+                            (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                              WHERE a.operation_id=i.operation_id),
+                            (SELECT count(*) FROM archive_v3_maintenance_import_attempts a
+                              WHERE a.operation_id=i.operation_id AND a.state='superseded'),
+                            i.authoritative_base_ordinal
+                     FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+                    [fixture.operation_id.as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts, (3, 3, 2, Some(0)));
+
+        use crate::archive_v3::{ArchiveCipher, ArchiveDek};
+        use crate::archive_v3_witness::MigrationState;
+
+        let operation_commitment: [u8; 32] = reopened
+            .read(move |conn| {
+                let bytes: Vec<u8> = conn.query_row(
+                    "SELECT operation_commitment FROM archive_v3_maintenance_imports
+                     WHERE operation_id=?1",
+                    [fixture.operation_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )?;
+                fixed_blob::<32>(&bytes, "test maintenance operation commitment")
+            })
+            .await
+            .unwrap();
+        let cipher = ArchiveCipher::new(ArchiveDek::from_bytes([0xa2; 32]));
+        let (_, _, first_reacquired_facts) = maintenance_root_candidate(
+            &reacquired,
+            fixture.owner_id,
+            2,
+            ObjectId::from_bytes([0xa3; 16]),
+            &cipher,
+            0,
+            MigrationState::WalAuthoritative,
+        );
+        let first_reacquired_binding = ShadowSessionBinding::from_maintenance_witness(
+            MaintenanceZeroWalBindingContext::from_control(MaintenancePersistenceContext(())),
+            &reacquired,
+            reacquired
+                .exact_active_lease_for_owner(fixture.owner_id)
+                .unwrap(),
+            *fixture.operation_id.as_bytes(),
+            operation_commitment,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            ShadowObjectInventory::reserve_exact(
+                &reopened,
+                fixture.session_id,
+                recovered.attempt_id(),
+                first_reacquired_binding,
+                first_reacquired_facts.clone(),
+            )
+            .await
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            ShadowObjectInventory::mark_materialized_exact(
+                &reopened,
+                fixture.session_id,
+                recovered.attempt_id(),
+                first_reacquired_binding,
+                first_reacquired_facts,
+            )
+            .await
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+
+        let reacquired_again = reacquired.reacquired_maintenance_lease_for_test();
+        let next_lease = reacquired_again
+            .exact_maintenance_reacquire_from(&reacquired, fixture.owner_id)
+            .unwrap();
+        drop(reopened);
+        let second_gcs = Arc::new(PausingGcs::new(backing));
+        let second_control = Arc::new(ControlStore::new(kms.clone(), second_gcs.clone()));
+        second_gcs.pause_after_next_put(CONTROL_OBJECT);
+        let task_control = second_control.clone();
+        let previous = reacquired.clone();
+        let committed = reacquired_again.clone();
+        let operation_id = fixture.operation_id;
+        let mut second_task = tokio::spawn(async move {
+            MaintenanceImportPersistence::persist_reacquired_lease(
+                task_control.as_ref(),
+                operation_id,
+                MaintenanceImportStage::ParityVerified,
+                &previous,
+                &committed,
+                next_lease,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            tokio::select! {
+                () = second_gcs.put_committed.notified() => {}
+                outcome = &mut second_task => match outcome {
+                    Ok(Err(error)) => panic!(
+                        "second maintenance reacquire failed before the committed PUT barrier: {error:?}"
+                    ),
+                    Ok(Ok(_)) => panic!(
+                        "second maintenance reacquire completed without pausing after the committed PUT"
+                    ),
+                    Err(error) => panic!(
+                        "second maintenance reacquire task failed before the committed PUT barrier: {error}"
+                    ),
+                },
+            }
+        })
+        .await
+        .expect("second maintenance reacquire did not reach the committed PUT barrier");
+        second_task.abort();
+        assert!(second_task.await.unwrap_err().is_cancelled());
+        assert!(second_control.inner.lock().await.is_none());
+        drop(second_control);
+
+        let terminal_control = ControlStore::new(kms.clone(), second_gcs.clone());
+        let second_recovered =
+            MaintenanceImportPersistence::load_exact(&terminal_control, fixture.operation_id)
+                .await
+                .unwrap();
+        assert_eq!(second_recovered.next_artifact_ordinal(), 0);
+        let (authoritative_advance, authoritative, authoritative_facts) =
+            maintenance_root_candidate(
+                &reacquired_again,
+                fixture.owner_id,
+                2,
+                ObjectId::from_bytes([0xa4; 16]),
+                &cipher,
+                0,
+                MigrationState::WalAuthoritative,
+            );
+        let authoritative_binding = ShadowSessionBinding::from_maintenance_witness(
+            MaintenanceZeroWalBindingContext::from_control(MaintenancePersistenceContext(())),
+            &reacquired_again,
+            next_lease,
+            *fixture.operation_id.as_bytes(),
+            operation_commitment,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            ShadowObjectInventory::reserve_exact(
+                &terminal_control,
+                fixture.session_id,
+                second_recovered.attempt_id(),
+                authoritative_binding,
+                authoritative_facts.clone(),
+            )
+            .await
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        assert_eq!(
+            ShadowObjectInventory::mark_materialized_exact(
+                &terminal_control,
+                fixture.session_id,
+                second_recovered.attempt_id(),
+                authoritative_binding,
+                authoritative_facts,
+            )
+            .await
+            .unwrap(),
+            RecordOutcome::Recorded
+        );
+        let prepared = PreparedMaintenanceMigration::from_authenticated_advance(
+            &reacquired_again,
+            &authoritative_advance,
+            MigrationState::WalAuthoritative,
+        )
+        .unwrap();
+        MaintenanceImportPersistence::persist_candidate_before_send(
+            &terminal_control,
+            fixture.operation_id,
+            MaintenanceImportStage::ParityVerified,
+            prepared,
+        )
+        .await
+        .unwrap();
+        MaintenanceImportPersistence::persist_send_unknown(
+            &terminal_control,
+            fixture.operation_id,
+            MaintenanceImportStage::AuthoritativeUploading,
+        )
+        .await
+        .unwrap();
+        MaintenanceImportPersistence::reconcile_exact_witness(
+            &terminal_control,
+            fixture.operation_id,
+            MaintenanceImportStage::AuthoritativeSendUnknown,
+            &authoritative,
+        )
+        .await
+        .unwrap();
+        drop(terminal_control);
+        let terminal_reopened = ControlStore::new(kms, second_gcs);
+        let terminal =
+            MaintenanceImportPersistence::load_exact(&terminal_reopened, fixture.operation_id)
+                .await
+                .unwrap();
+        assert_eq!(terminal.stage(), MaintenanceImportStage::WalAuthoritative);
+        assert!(terminal
+            .witnessed_record()
+            .unwrap()
+            .is_some_and(|record| record == authoritative));
+    }
+
+    #[test]
+    fn maintenance_prepare_rejects_inactive_authority_before_row_creation() {
+        for mutation in [
+            "UPDATE users SET status='deleting' WHERE id='11111111-1111-4111-8111-111111111111'",
+            "UPDATE archive_deletion_ledgers SET state='tombstoned',deletion_fence_id=x'01010101010101010101010101010101',tombstoned_at='2026-08-14T00:00:00.000Z'",
+        ] {
+            let conn = account_conn();
+            conn.execute_batch(mutation).unwrap();
+            assert!(maintenance_import_plan_conn(&conn, USER_ID).is_err());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_maintenance_imports",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_fencing_and_pinned_source_bind_exact_tuple_with_schema_zero() {
+        let conn = account_conn();
+        maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        let operation_id = maintenance_operation_id(&conn);
+        let archive_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT archive_id FROM archive_v3_maintenance_imports",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let archive_id = ArchiveId::from_bytes(
+            fixed_blob::<16>(&archive_bytes, "test maintenance archive").unwrap(),
+        );
+        let tentative = MaintenanceTentativeSource {
+            base_generation: 1,
+            plaintext_hash: [0x21; 32],
+            plaintext_len: 4096,
+            sqlite_schema_version: 0,
+            wrapped_dek_commitment: [0x22; 32],
+        };
+        assert_eq!(
+            persist_maintenance_fencing_conn(&conn, operation_id, tentative)
+                .unwrap()
+                .stage(),
+            MaintenanceImportStage::Fencing
+        );
+        let source = MaintenanceSourceBinding::from_pinned(
+            archive_id,
+            operation_id,
+            2,
+            tentative.plaintext_hash,
+            tentative.plaintext_len,
+            tentative.sqlite_schema_version,
+            tentative.wrapped_dek_commitment,
+        )
+        .unwrap();
+        assert_eq!(
+            persist_maintenance_pinned_conn(&conn, operation_id, source)
+                .unwrap()
+                .stage(),
+            MaintenanceImportStage::LegacyPinned
+        );
+        assert_eq!(
+            maintenance_import_record_conn(&conn, operation_id)
+                .unwrap()
+                .source(),
+            Some(source)
+        );
+        assert!(conn
+            .execute("UPDATE archive_v3_maintenance_imports SET attempt=17", [],)
+            .is_err());
+    }
+
+    #[test]
+    fn maintenance_schema_rejects_early_evidence_and_noncanonical_artifact_geometry() {
+        let conn = account_conn();
+        maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        for mutation in [
+            "UPDATE archive_v3_maintenance_imports
+             SET shadow_candidate=zeroblob(724),shadow_candidate_hash=x'1111111111111111111111111111111111111111111111111111111111111111'",
+            "UPDATE archive_v3_maintenance_imports
+             SET parity_commitment=x'2222222222222222222222222222222222222222222222222222222222222222',
+                 authoritative_base_ordinal=0",
+            "UPDATE archive_v3_maintenance_imports
+             SET fence_authority='archive_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'",
+        ] {
+            assert!(conn.execute_batch(mutation).is_err(), "accepted {mutation}");
+        }
+
+        let insert = |role: i64, root_seq: Option<i64>, context_len: i64| {
+            conn.execute(
+                "INSERT INTO archive_v3_maintenance_import_artifacts
+                 (archive_id,operation_id,attempt,ordinal,object_id,object_role,
+                  root_seq,context_aad,object_key,ciphertext_hash,state)
+                 SELECT archive_id,operation_id,attempt,0,
+                        x'01010101010101010101010101010101',?1,?2,
+                        zeroblob(?3),'x',
+                        x'3333333333333333333333333333333333333333333333333333333333333333',
+                        'reserved'
+                 FROM archive_v3_maintenance_imports",
+                rusqlite::params![role, root_seq, context_len],
+            )
+        };
+        assert!(insert(ObjectRole::WalSegmentV3 as i64, None, 1).is_err());
+        assert!(insert(ObjectRole::CheckpointChunkV3 as i64, Some(1), 1).is_err());
+        assert!(insert(ObjectRole::CheckpointChunkV3 as i64, None, 513).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_maintenance_import_artifacts",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn maintenance_decoder_rejects_self_consistent_stage_and_commitment_corruption() {
+        let conn = account_conn();
+        maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        let operation_id = maintenance_operation_id(&conn);
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_maintenance_imports
+             SET operation_commitment=?1,stage='wal_authoritative'",
+            [[0x7f_u8; 32].as_slice()],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        assert!(maintenance_import_record_conn(&conn, operation_id).is_err());
+        assert!(maintenance_import_plan_conn(&conn, USER_ID).is_err());
+    }
+
+    #[test]
+    fn maintenance_control_surface_uses_owned_flushes_and_is_not_live_wired() {
+        let source = include_str!("control_store.rs");
+        let main = include_str!("../main.rs");
+        let start = source
+            .find("impl MaintenanceImportPersistence for ControlStore")
+            .unwrap();
+        let end = source[start..]
+            .find("impl DeletionInventoryControl for ControlStore")
+            .map(|offset| start + offset)
+            .unwrap();
+        let implementation = &source[start..end];
+        assert!(implementation.contains("write_owned_if_changed"));
+        assert!(!implementation.contains("write_if_changed("));
+        for forbidden in [
+            concat!("prepare_archive_v3_maintenance", "_import("),
+            concat!("MaintenanceImportPersistence", " for ControlStore"),
+        ] {
+            assert!(!main.contains(forbidden), "live wiring: {forbidden}");
+        }
     }
 
     #[tokio::test]

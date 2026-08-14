@@ -14,7 +14,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -43,6 +43,7 @@ use crate::{
     },
     archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionBinding, ShadowSessionId},
     archive_v3_witness::{RecoveryRoot, RootReference, Witness, WitnessError},
+    store::PinnedLegacySnapshot,
 };
 
 /// The recovery walk retains at most this many manifest work items.  The
@@ -200,6 +201,31 @@ impl<'a> ShadowObjectStaging<'a> {
         }
     }
 
+    pub(crate) fn from_maintenance_attempt(
+        _token: crate::archive_v3_maintenance_import::MaintenanceStagingContext,
+        inventory: &'a dyn ShadowObjectInventory,
+        session_id: ShadowSessionId,
+        attempt_id: ShadowAttemptId,
+        binding: ShadowSessionBinding,
+        next_ordinal: u32,
+    ) -> Result<Self> {
+        if usize::try_from(next_ordinal)
+            .ok()
+            .is_none_or(|value| value > MAX_SHADOW_OBJECTS_PER_ATTEMPT)
+        {
+            return Err(ShadowCheckpointError::Inventory(
+                ShadowObjectInventoryError::AttemptExhausted,
+            ));
+        }
+        Ok(Self {
+            inventory,
+            session_id,
+            attempt_id,
+            binding,
+            next_ordinal: Arc::new(AtomicU32::new(next_ordinal)),
+        })
+    }
+
     pub(crate) async fn create_and_readback(
         &self,
         backend: &dyn ImmutableObjectBackend,
@@ -282,6 +308,67 @@ impl<'a> ShadowObjectStaging<'a> {
 pub trait CheckpointSource: Send {
     fn logical_file_length(&self) -> Result<u64>;
     fn read_exact(&mut self, logical_offset: u64, destination: &mut [u8]) -> Result<()>;
+}
+
+/// File-backed stable source that can only be minted from the Store-owned
+/// pinned maintenance snapshot. It accepts no caller path and never writes.
+pub(crate) struct MaintenanceCheckpointSource {
+    file: File,
+    logical_file_length: u64,
+}
+
+pub(crate) struct MaintenanceCheckpointSourceContext(());
+
+impl MaintenanceCheckpointSource {
+    pub(crate) fn from_pinned(owner: &PinnedLegacySnapshot) -> Result<Self> {
+        let path = owner.path_for_checkpoint_source(MaintenanceCheckpointSourceContext(()));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(path)
+            .map_err(|_| ShadowCheckpointError::Source)?;
+        let metadata = file.metadata().map_err(|_| ShadowCheckpointError::Source)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(ShadowCheckpointError::Source);
+            }
+        }
+        let logical_file_length = metadata.len();
+        if logical_file_length == 0
+            || !logical_file_length.is_multiple_of(u64::from(SQLITE_PAGE_SIZE))
+            || logical_file_length > MAX_DATABASE_BYTES
+        {
+            return Err(ShadowCheckpointError::Source);
+        }
+        Ok(Self {
+            file,
+            logical_file_length,
+        })
+    }
+}
+
+impl CheckpointSource for MaintenanceCheckpointSource {
+    fn logical_file_length(&self) -> Result<u64> {
+        Ok(self.logical_file_length)
+    }
+
+    fn read_exact(&mut self, logical_offset: u64, destination: &mut [u8]) -> Result<()> {
+        let end = logical_offset
+            .checked_add(destination.len() as u64)
+            .ok_or(ShadowCheckpointError::Source)?;
+        if destination.is_empty() || end > self.logical_file_length {
+            return Err(ShadowCheckpointError::Source);
+        }
+        self.file
+            .seek(SeekFrom::Start(logical_offset))
+            .and_then(|_| self.file.read_exact(destination))
+            .map_err(|_| ShadowCheckpointError::Source)
+    }
 }
 
 /// Recovery destination with a fixed caller-owned capacity or a streamed

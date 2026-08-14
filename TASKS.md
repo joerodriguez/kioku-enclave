@@ -222,6 +222,46 @@ Schema-9 active image evidence is not deployable. The deployment repository must
 merge an independently reviewed compatibility PR; this enclave slice does not change that
 repository, construct the runtime at startup, or enable any user-visible behavior.
 
+## Inactive single-archive maintenance import engine
+
+- [x] Added a strict encrypted-control v1 operation plus retained upload-attempt and
+  exact artifact inventories. One active operation is allowed per archive, attempts
+  are capped at 16, retained immutable objects at 32,898 per attempt, and every capability-
+  bearing control mutation owns the sole SQLite handle until its conditional upload
+  is durable or recovery reloads provider-authoritative state.
+- [x] Added a Store-owned one-user transition that acquires lifecycle, actor, and
+  content-admission gates before provider fencing; creates/adopts a permanent distinct
+  `archive_` fence; drains pre-marker intents; performs the mandatory same-plaintext
+  generation-CAS bump; and pins the exact generation, wrapped-DEK metadata commitment,
+  plaintext hash/length, and SQLite user version in a cleanup-owned private snapshot.
+- [x] Added exact restart recovery of only that retained generation and cancellation-
+  safe cleanup of the database, WAL, and SHM files. A single permissible pre-fence
+  writer win is durably rebased only while still in Fencing; no later source change is
+  accepted.
+- [x] Added the complete offline R1/R2 coordinator: authenticate an existing exact
+  Active+Legacy witness/root/registry, lease it, upload and read back the checkpoint
+  plus canonical zero-WAL R1, durably mark the send unknown, reconcile only from an
+  exact witness reread into ShadowWal, recover the exact checkpoint, compare independent
+  full SQLite copies, freshly revalidate source+witness, then select/recover one distinct
+  durable R2 attempt, create/read back R2, and reconcile exactly into WalAuthoritative.
+  Empty/reserved/materialized R2 prefixes reopen without burning another attempt while the
+  retained witness fence is unchanged. Exact higher-fence reacquire validates the full witness
+  lease tuple and supersedes a partial attempt before any further create; renewal validates the
+  unchanged current/next fences plus strictly increasing trusted tick and expiry. Maintenance
+  checkpoint staging uses a separate domain-bound constructor that accepts only the canonical
+  zero-WAL tuple while ordinary shadow bindings remain all-nonzero. Terminal reopen freshly
+  validates the exact witness and retries best-effort lease revocation.
+- [x] Kept the result offline and non-serving. The importer is obtainable only by
+  consuming the sealed image-bound runtime and a non-cloneable encrypted-control plan;
+  there is no main/startup/Store constructor call, route, worker, environment/config
+  selector, serving policy switch, archive-v3 provider delete/list, legacy source
+  deletion, cloud action, or deployment change. The existing bounded legacy-intent
+  prefix scan remains solely the pre-marker drain mechanism.
+
+This engine remains inactive. Launch still requires an existing exact Legacy witness and an
+external maintenance window that proves zero serving replicas; WalAuthoritative is not a
+serving-ready state and production WAL domain owners remain an activation blocker.
+
 ## Capacity fixture and local gate
 
 - [x] Versioned deterministic, numeric-only 12-month fixtures for 40, 80, and 100

@@ -19,8 +19,8 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::archive_v3::{
-    CiphertextEnvelope, ImmutableReference, LogicalLocation, ObjectContext, ObjectId, ObjectKey,
-    ObjectRole,
+    ArchiveId, CiphertextEnvelope, DatabaseEpoch, ImmutableReference, KeyEpoch, LogicalLocation,
+    ObjectContext, ObjectId, ObjectKey, ObjectRole,
 };
 use crate::archive_v3_legacy_extent_session::{
     LegacyExtentAttemptId, LegacyExtentCandidate, LegacyExtentRootAdmission,
@@ -556,6 +556,14 @@ impl ShadowObjectInventoryEntry {
     pub(crate) fn facts(&self) -> &ShadowObjectFacts {
         &self.facts
     }
+
+    pub(crate) fn from_maintenance_persistence(
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        facts: ShadowObjectFacts,
+        state: ShadowObjectState,
+    ) -> Self {
+        Self { facts, state }
+    }
 }
 
 impl fmt::Debug for ShadowObjectInventoryEntry {
@@ -582,6 +590,27 @@ impl ShadowObjectInventoryPage {
     pub(crate) const fn next_ordinal(&self) -> Option<u32> {
         self.next_ordinal
     }
+
+    pub(crate) fn from_maintenance_persistence(
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        entries: Vec<ShadowObjectInventoryEntry>,
+        next_ordinal: Option<u32>,
+    ) -> Self {
+        Self {
+            entries,
+            next_ordinal,
+        }
+    }
+}
+
+pub(crate) struct MaintenanceObjectFactsView<'a> {
+    pub(crate) ordinal: u32,
+    pub(crate) object_id: ObjectId,
+    pub(crate) object_role: ObjectRole,
+    pub(crate) root_seq: Option<u64>,
+    pub(crate) context_aad: &'a [u8],
+    pub(crate) object_key: &'a str,
+    pub(crate) ciphertext_hash: [u8; 32],
 }
 
 impl ShadowObjectFacts {
@@ -634,6 +663,46 @@ impl ShadowObjectFacts {
         ))
     }
 
+    pub(crate) fn maintenance_persistence_view(
+        &self,
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+    ) -> Result<MaintenanceObjectFactsView<'_>> {
+        self.validate_canonical()?;
+        Ok(MaintenanceObjectFactsView {
+            ordinal: self.ordinal,
+            object_id: self.object_id,
+            object_role: self.object_role,
+            root_seq: self.root_seq,
+            context_aad: self.context_aad.as_slice(),
+            object_key: &self.object_key,
+            ciphertext_hash: self.ciphertext_hash,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_maintenance_persistence(
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        ordinal: u32,
+        object_id: ObjectId,
+        object_role: i64,
+        root_seq: Option<u64>,
+        context_aad: Vec<u8>,
+        object_key: String,
+        ciphertext_hash: [u8; 32],
+    ) -> Result<Self> {
+        let value = Self {
+            ordinal,
+            object_id,
+            object_role: decode_object_role(object_role)?,
+            root_seq,
+            context_aad: Zeroizing::new(context_aad),
+            object_key,
+            ciphertext_hash,
+        };
+        value.validate_canonical()?;
+        Ok(value)
+    }
+
     fn is_root_candidate(&self, candidate: ShadowCandidate) -> bool {
         self.object_role == ObjectRole::RootV3
             && self.root_seq == Some(candidate.root_seq())
@@ -659,6 +728,53 @@ impl ShadowObjectFacts {
             && context.archive_id().as_bytes() == &binding.archive_id()
             && context.database_epoch().as_bytes() == &binding.database_epoch()
             && context.key_epoch().as_bytes() == &binding.registry_epoch()
+    }
+
+    pub(crate) fn matches_maintenance_binding(
+        &self,
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        binding: ShadowSessionBinding,
+    ) -> bool {
+        self.matches_binding(binding)
+    }
+
+    /// Restart validation after R1 changes the witness-selected base. Every
+    /// artifact must remain in the one archive/database/key namespace and a
+    /// root row must exactly equal one of the retained R1/R2 commitments,
+    /// including its canonical parent AAD.
+    pub(crate) fn matches_maintenance_lineage(
+        &self,
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        archive_id: ArchiveId,
+        database_epoch: DatabaseEpoch,
+        key_epoch: KeyEpoch,
+        roots: &[crate::archive_v3_witness::RootCommitment],
+    ) -> bool {
+        let Ok(context) = self.decode_and_validate_canonical() else {
+            return false;
+        };
+        if context.archive_id() != archive_id
+            || context.database_epoch() != database_epoch
+            || context.key_epoch() != key_epoch
+        {
+            return false;
+        }
+        let LogicalLocation::Root { root_seq } = context.location() else {
+            return true;
+        };
+        roots.iter().any(|root| {
+            let reference = root.root();
+            let expected_parent = root
+                .parent()
+                .map(|parent| crate::archive_v3::ParentReference {
+                    object_id: parent.object_id(),
+                    envelope_hash: parent.ciphertext_hash(),
+                });
+            *root_seq == reference.sequence()
+                && self.object_id == reference.object_id()
+                && self.ciphertext_hash == reference.ciphertext_hash()
+                && context.parent() == expected_parent.as_ref()
+        })
     }
 
     fn validate_canonical(&self) -> Result<()> {

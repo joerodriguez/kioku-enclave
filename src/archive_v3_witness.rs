@@ -371,6 +371,17 @@ impl RootCommitment {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn candidate_for_test(
+        database_epoch: DatabaseEpoch,
+        key_epoch: KeyEpoch,
+        owner_fencing_epoch: u64,
+        parent: RootReference,
+        root: RootReference,
+    ) -> Self {
+        Self::candidate(database_epoch, key_epoch, owner_fencing_epoch, parent, root)
+    }
+
     /// Authenticate, decode, and context-check the exact immutable root envelope
     /// before producing the only commitment accepted by non-test advance builders.
     pub(crate) async fn from_authenticated_provider_object(
@@ -697,6 +708,313 @@ impl WitnessRecord {
             && self.lease_expires_at_tick == lease.expires_at_tick
             && self.deletion == DeletionState::Active
     }
+
+    /// Recover the exact still-current maintenance lease without accepting a
+    /// caller-supplied fence or expiry. A missing, expired, deleting, or
+    /// differently-owned lease never becomes retry authority.
+    pub(crate) fn exact_active_lease_for_owner(&self, owner: ObjectId) -> Result<WitnessLease> {
+        if self.deletion != DeletionState::Active
+            || self.owner_id != Some(owner)
+            || self.current_fencing_epoch == 0
+            || self.lease_expires_at_tick == 0
+            || self.last_server_tick >= self.lease_expires_at_tick
+        {
+            return Err(WitnessError::Fenced);
+        }
+        let lease = WitnessLease {
+            archive_id: self.archive_id,
+            database_epoch: self.database_epoch,
+            key_epoch: self.registry.key_epoch,
+            owner,
+            fencing_epoch: self.current_fencing_epoch,
+            expires_at_tick: self.lease_expires_at_tick,
+        };
+        self.authorizes_lease(lease)
+            .then_some(lease)
+            .ok_or(WitnessError::Fenced)
+    }
+
+    fn same_maintenance_lease_subject(&self, previous: &Self, owner: ObjectId) -> bool {
+        self.valid()
+            && previous.valid()
+            && self.archive_id == previous.archive_id
+            && self.database_epoch == previous.database_epoch
+            && self.database_epoch_generation == previous.database_epoch_generation
+            && self.predecessor == previous.predecessor
+            && self.root == previous.root
+            && self.registry == previous.registry
+            && self.owner_id == Some(owner)
+            && previous.owner_id == Some(owner)
+            && self.migration == previous.migration
+            && self.deletion == DeletionState::Active
+            && previous.deletion == DeletionState::Active
+            && self.deletion_fencing_epoch == previous.deletion_fencing_epoch
+            && self.deletion_worker_id == previous.deletion_worker_id
+            && self.deletion_operation_id == previous.deletion_operation_id
+            && self.deletion_evidence == previous.deletion_evidence
+    }
+
+    /// Accept only the witness-owned transition produced by renewing the
+    /// retained maintenance lease. Comparing the full records here prevents a
+    /// same-owner record with a changed graph, next fence, or deletion tuple
+    /// from being adopted as renewal authority after restart.
+    pub(crate) fn exact_maintenance_renewal_from(
+        &self,
+        previous: &Self,
+        owner: ObjectId,
+    ) -> Result<WitnessLease> {
+        let previous_lease = previous.exact_active_lease_for_owner(owner)?;
+        let renewed_lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.same_maintenance_lease_subject(previous, owner)
+            || self.current_fencing_epoch != previous.current_fencing_epoch
+            || self.next_fencing_epoch != previous.next_fencing_epoch
+            || self.last_server_tick <= previous.last_server_tick
+            || self.lease_expires_at_tick <= previous.lease_expires_at_tick
+            || renewed_lease.fencing_epoch != previous_lease.fencing_epoch
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(renewed_lease)
+    }
+
+    /// Accept only the witness-owned transition produced by acquiring the
+    /// retained owner after its prior lease expired. A reacquire consumes the
+    /// exact previously advertised next fence, advances the next fence once,
+    /// and monotonically advances trusted time and expiry while every graph,
+    /// migration, and deletion fact remains identical.
+    pub(crate) fn exact_maintenance_reacquire_from(
+        &self,
+        previous: &Self,
+        owner: ObjectId,
+    ) -> Result<WitnessLease> {
+        let previous_lease = previous.exact_active_lease_for_owner(owner)?;
+        let reacquired_lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.same_maintenance_lease_subject(previous, owner)
+            || self.current_fencing_epoch != previous.next_fencing_epoch
+            || self.next_fencing_epoch
+                != self
+                    .current_fencing_epoch
+                    .checked_add(1)
+                    .ok_or(WitnessError::Fenced)?
+            || self.last_server_tick <= previous.last_server_tick
+            || self.last_server_tick < previous.lease_expires_at_tick
+            || self.lease_expires_at_tick <= previous.lease_expires_at_tick
+            || reacquired_lease.fencing_epoch <= previous_lease.fencing_epoch
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(reacquired_lease)
+    }
+
+    /// Deterministically apply one already-authenticated migration advance to
+    /// a private in-memory copy. Maintenance control persists these exact
+    /// bytes before the provider request, so restart compares full witness
+    /// state rather than reconstructing or accepting a caller root.
+    pub(crate) fn exact_migration_candidate(
+        &self,
+        advance: &RootAdvance,
+        next: MigrationState,
+    ) -> Result<WitnessRecord> {
+        if !self.valid() || advance.archive_id() != self.archive_id {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let local = InMemoryWitness::from_provider_record_at_tick(
+            Some(self.encode()),
+            self.last_server_tick,
+        )?;
+        local
+            .advance_migration(advance.clone(), next)
+            .map(|receipt| receipt.record().clone())
+    }
+
+    /// Encrypted-control restart validation for retained maintenance sends.
+    /// The persisted candidate is comparison data only: applying its root and
+    /// registry to this exact current record must reproduce every candidate
+    /// byte before control may remint a durable stage.
+    pub(crate) fn retained_maintenance_candidate_is_exact(
+        &self,
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        candidate: &WitnessRecord,
+        owner: ObjectId,
+        next: MigrationState,
+    ) -> bool {
+        let Ok(lease) = self.exact_active_lease_for_owner(owner) else {
+            return false;
+        };
+        let advance = RootAdvance {
+            lease,
+            expected_root: self.root,
+            expected_registry: self.registry,
+            candidate_registry: candidate.registry,
+            candidate: candidate.root,
+        };
+        self.exact_migration_candidate(&advance, next)
+            .is_ok_and(|expected| expected == *candidate)
+    }
+
+    /// Validate a retained migration candidate after the provider has moved
+    /// to that candidate and may subsequently have renewed the same lease.
+    /// The only mutable fields admitted are the monotonically newer provider
+    /// tick and lease expiry; all graph, registry, ownership, fencing, and
+    /// deletion facts remain byte-for-byte identical.
+    pub(crate) fn retained_maintenance_candidate_matches_current(
+        &self,
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        candidate: &WitnessRecord,
+        owner: ObjectId,
+        next: MigrationState,
+    ) -> bool {
+        self.valid()
+            && candidate.valid()
+            && self.migration == next
+            && candidate.migration == next
+            && self.deletion == DeletionState::Active
+            && candidate.deletion == DeletionState::Active
+            && self.archive_id == candidate.archive_id
+            && self.database_epoch == candidate.database_epoch
+            && self.database_epoch_generation == candidate.database_epoch_generation
+            && self.predecessor == candidate.predecessor
+            && self.root == candidate.root
+            && self.registry == candidate.registry
+            && self.owner_id == Some(owner)
+            && candidate.owner_id == Some(owner)
+            && self.current_fencing_epoch == candidate.current_fencing_epoch
+            && self.next_fencing_epoch == candidate.next_fencing_epoch
+            && candidate.lease_expires_at_tick <= self.lease_expires_at_tick
+            && candidate.last_server_tick <= self.last_server_tick
+            && self.deletion_fencing_epoch == candidate.deletion_fencing_epoch
+            && self.deletion_worker_id == candidate.deletion_worker_id
+            && self.deletion_operation_id == candidate.deletion_operation_id
+            && self.deletion_evidence == candidate.deletion_evidence
+    }
+
+    /// Validate the current provider record as a monotone lease descendant of
+    /// an already-settled migration candidate. This deliberately differs from
+    /// the strict one-step renewal and reacquire validators: encrypted control
+    /// may restart after more than one provider-authenticated lease transition,
+    /// while the byte-exact migration candidate must remain immutable.
+    pub(crate) fn retained_maintenance_candidate_has_lease_descendant(
+        &self,
+        _token: crate::cp::control_store::MaintenancePersistenceContext,
+        candidate: &WitnessRecord,
+        owner: ObjectId,
+        next: MigrationState,
+    ) -> bool {
+        let immutable_subject_is_exact = self.valid()
+            && candidate.valid()
+            && self.migration == next
+            && candidate.migration == next
+            && self.deletion == DeletionState::Active
+            && candidate.deletion == DeletionState::Active
+            && self.archive_id == candidate.archive_id
+            && self.database_epoch == candidate.database_epoch
+            && self.database_epoch_generation == candidate.database_epoch_generation
+            && self.predecessor == candidate.predecessor
+            && self.root == candidate.root
+            && self.registry == candidate.registry
+            && self.owner_id == Some(owner)
+            && candidate.owner_id == Some(owner)
+            && self.deletion_fencing_epoch == candidate.deletion_fencing_epoch
+            && self.deletion_worker_id == candidate.deletion_worker_id
+            && self.deletion_operation_id == candidate.deletion_operation_id
+            && self.deletion_evidence == candidate.deletion_evidence;
+        let canonical_fence_pairs = candidate
+            .current_fencing_epoch
+            .checked_add(1)
+            .is_some_and(|next_fence| next_fence == candidate.next_fencing_epoch)
+            && self
+                .current_fencing_epoch
+                .checked_add(1)
+                .is_some_and(|next_fence| next_fence == self.next_fencing_epoch);
+        let same_fence_renewal_lineage = self.current_fencing_epoch
+            == candidate.current_fencing_epoch
+            && self.next_fencing_epoch == candidate.next_fencing_epoch
+            && self.last_server_tick >= candidate.last_server_tick
+            && self.lease_expires_at_tick >= candidate.lease_expires_at_tick;
+        let reacquired_lineage = self.current_fencing_epoch >= candidate.next_fencing_epoch
+            && self.last_server_tick >= candidate.lease_expires_at_tick
+            && self.lease_expires_at_tick > candidate.lease_expires_at_tick;
+        immutable_subject_is_exact
+            && canonical_fence_pairs
+            && (same_fence_renewal_lineage || reacquired_lineage)
+    }
+
+    /// Validate the retained predecessor of a terminal maintenance candidate.
+    /// The predecessor may carry an older exact lease expiry/provider tick;
+    /// applying the terminal root to it must still produce a candidate whose
+    /// only differences from the current record are those admitted monotonic
+    /// lease fields.
+    pub(crate) fn retained_maintenance_predecessor_matches_current(
+        &self,
+        token: crate::cp::control_store::MaintenancePersistenceContext,
+        current: &WitnessRecord,
+        retained_current_candidate: &WitnessRecord,
+        owner: ObjectId,
+        next: MigrationState,
+    ) -> bool {
+        if !current.retained_maintenance_candidate_has_lease_descendant(
+            token,
+            retained_current_candidate,
+            owner,
+            next,
+        ) {
+            return false;
+        }
+        let mut predecessor_at_send = self.clone();
+        predecessor_at_send.current_fencing_epoch =
+            retained_current_candidate.current_fencing_epoch;
+        predecessor_at_send.next_fencing_epoch = retained_current_candidate.next_fencing_epoch;
+        predecessor_at_send.lease_expires_at_tick =
+            retained_current_candidate.lease_expires_at_tick;
+        predecessor_at_send.last_server_tick = retained_current_candidate.last_server_tick;
+        if !predecessor_at_send.retained_maintenance_candidate_has_lease_descendant(
+            token,
+            self,
+            owner,
+            self.migration,
+        ) {
+            return false;
+        }
+        let Ok(lease) = predecessor_at_send.exact_active_lease_for_owner(owner) else {
+            return false;
+        };
+        let advance = RootAdvance {
+            lease,
+            expected_root: predecessor_at_send.root,
+            expected_registry: predecessor_at_send.registry,
+            candidate_registry: retained_current_candidate.registry,
+            candidate: retained_current_candidate.root,
+        };
+        predecessor_at_send
+            .exact_migration_candidate(&advance, next)
+            .is_ok_and(|candidate| candidate == *retained_current_candidate)
+    }
+
+    /// Firestore's transaction read advances only the trusted local tick while
+    /// validating a retained maintenance send. All durable candidate fields
+    /// except that refreshed tick must remain identical before the adapter may
+    /// commit the byte-exact control-retained candidate.
+    pub(crate) fn matches_retained_maintenance_candidate(&self, candidate: &WitnessRecord) -> bool {
+        self.valid()
+            && candidate.valid()
+            && self.archive_id == candidate.archive_id
+            && self.database_epoch == candidate.database_epoch
+            && self.database_epoch_generation == candidate.database_epoch_generation
+            && self.predecessor == candidate.predecessor
+            && self.root == candidate.root
+            && self.registry == candidate.registry
+            && self.owner_id == candidate.owner_id
+            && self.current_fencing_epoch == candidate.current_fencing_epoch
+            && self.next_fencing_epoch == candidate.next_fencing_epoch
+            && self.lease_expires_at_tick == candidate.lease_expires_at_tick
+            && self.last_server_tick >= candidate.last_server_tick
+            && self.migration == candidate.migration
+            && self.deletion == candidate.deletion
+            && self.deletion_fencing_epoch == candidate.deletion_fencing_epoch
+            && self.deletion_worker_id == candidate.deletion_worker_id
+            && self.deletion_operation_id == candidate.deletion_operation_id
+            && self.deletion_evidence == candidate.deletion_evidence
+    }
     pub(crate) fn predecessor_root(&self) -> Option<RootCommitment> {
         self.predecessor.map(|value| value.root)
     }
@@ -741,6 +1059,46 @@ impl WitnessRecord {
             self.root.root(),
             candidate,
         );
+        forged
+    }
+    #[cfg(test)]
+    pub(crate) fn renewed_maintenance_lease_for_test(&self) -> Self {
+        let mut renewed = self.clone();
+        renewed.last_server_tick = self
+            .last_server_tick
+            .checked_add(1)
+            .expect("test maintenance tick overflow");
+        renewed.lease_expires_at_tick = self
+            .lease_expires_at_tick
+            .checked_add(10)
+            .expect("test maintenance expiry overflow");
+        renewed
+    }
+    #[cfg(test)]
+    pub(crate) fn reacquired_maintenance_lease_for_test(&self) -> Self {
+        let mut reacquired = self.clone();
+        reacquired.current_fencing_epoch = self.next_fencing_epoch;
+        reacquired.next_fencing_epoch = self
+            .next_fencing_epoch
+            .checked_add(1)
+            .expect("test maintenance fence overflow");
+        reacquired.last_server_tick = self.lease_expires_at_tick;
+        reacquired.lease_expires_at_tick = self
+            .lease_expires_at_tick
+            .checked_add(10)
+            .expect("test maintenance expiry overflow");
+        reacquired
+    }
+    #[cfg(test)]
+    pub(crate) fn with_next_fencing_epoch_for_test(&self, next: u64) -> Self {
+        let mut forged = self.clone();
+        forged.next_fencing_epoch = next;
+        forged
+    }
+    #[cfg(test)]
+    pub(crate) fn with_lease_expiry_for_test(&self, expiry: u64) -> Self {
+        let mut forged = self.clone();
+        forged.lease_expires_at_tick = expiry;
         forged
     }
     #[cfg(test)]
@@ -1068,6 +1426,9 @@ impl WitnessLease {
     pub(crate) fn fencing_epoch(&self) -> u64 {
         self.fencing_epoch
     }
+    pub(crate) fn expires_at_tick(&self) -> u64 {
+        self.expires_at_tick
+    }
 }
 impl fmt::Debug for WitnessLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1175,6 +1536,30 @@ pub struct RootAdvance {
 impl RootAdvance {
     pub(crate) fn archive_id(&self) -> ArchiveId {
         self.lease.archive_id
+    }
+
+    /// Rehydrate one exact durable send after process restart. The candidate
+    /// contributes no authority: rebuilding and applying this advance to the
+    /// freshly read exact current witness must reproduce every candidate byte.
+    pub(crate) fn from_retained_migration_candidate(
+        _token: crate::archive_v3_maintenance_import::MaintenanceWitnessRecoveryContext,
+        current: &WitnessRecord,
+        candidate: &WitnessRecord,
+        owner: ObjectId,
+        next: MigrationState,
+    ) -> Result<Self> {
+        let lease = current.exact_active_lease_for_owner(owner)?;
+        let advance = Self {
+            lease,
+            expected_root: current.root,
+            expected_registry: current.registry,
+            candidate_registry: candidate.registry,
+            candidate: candidate.root,
+        };
+        if current.exact_migration_candidate(&advance, next)? != *candidate {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(advance)
     }
     #[cfg(test)]
     pub(crate) const fn new(
@@ -1384,6 +1769,36 @@ pub struct RecoveryRoot {
     deletion: DeletionState,
 }
 impl RecoveryRoot {
+    /// Convert one freshly authenticated exact provider record into recovery
+    /// authority only while it is the active, non-deleting archive. This is
+    /// the maintenance-import counterpart to the deletion-only conversion;
+    /// callers cannot nominate a root independently of the witness bytes.
+    pub(crate) fn from_exact_active_record(record: &WitnessRecord) -> Result<Self> {
+        if !record.valid()
+            || record.deletion != DeletionState::Active
+            || !matches!(
+                record.migration,
+                MigrationState::Legacy | MigrationState::ShadowWal
+            )
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(Self {
+            archive_id: record.archive_id,
+            root: record.root,
+            registry: record.registry,
+            predecessor: record.predecessor,
+            migration: record.migration,
+            deletion: record.deletion,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_migration_for_test(mut self, migration: MigrationState) -> Self {
+        self.migration = migration;
+        self
+    }
+
     pub fn archive_id(&self) -> ArchiveId {
         self.archive_id
     }
@@ -1511,6 +1926,24 @@ pub struct InMemoryWitness {
 impl InMemoryWitness {
     pub fn new() -> Self {
         Self::with_clock(Arc::new(SystemClock))
+    }
+    #[cfg(test)]
+    pub(crate) fn with_incrementing_clock_for_test(start_tick: u64) -> Self {
+        struct IncrementingClock(std::sync::atomic::AtomicU64);
+        impl TrustedClock for IncrementingClock {
+            fn now_tick(&self) -> Result<u64> {
+                self.0
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |tick| tick.checked_add(1),
+                    )
+                    .map_err(|_| WitnessError::Clock)
+            }
+        }
+        Self::with_clock(Arc::new(IncrementingClock(
+            std::sync::atomic::AtomicU64::new(start_tick),
+        )))
     }
     fn with_clock(clock: Arc<dyn TrustedClock>) -> Self {
         Self::with_clock_and_authenticator(clock, Arc::new(DenyDeletionWorkers))
@@ -1675,6 +2108,32 @@ impl InMemoryWitness {
         }
         state.records.insert(record.archive_id, record);
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn advance_exact_retained_migration_for_test(
+        &self,
+        advance: RootAdvance,
+        next: MigrationState,
+        candidate: &WitnessRecord,
+    ) -> Result<WitnessReceipt> {
+        let mut state = self.lock()?;
+        available(&state)?;
+        let record = state
+            .records
+            .get_mut(&advance.lease.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        let mut produced = record.clone();
+        let now = self.now(&mut produced)?;
+        normal_ok(&produced, &advance, now, Normal::Migration(next))?;
+        produced.migration = next;
+        produced.root = advance.candidate;
+        if !produced.matches_retained_maintenance_candidate(candidate) {
+            return Err(WitnessError::InvalidTransition);
+        }
+        *record = candidate.clone();
+        Ok(WitnessReceipt {
+            record: candidate.clone(),
+        })
     }
     fn normal(&self, a: RootAdvance, kind: Normal) -> Result<WitnessReceipt> {
         let mut s = self.lock()?;
@@ -3591,6 +4050,98 @@ mod tests {
             )
             .unwrap();
         assert_eq!(complete.record.migration, MigrationState::Deleted);
+    }
+    #[test]
+    fn maintenance_lease_transitions_bind_full_fence_and_time_tuple() {
+        let (witness, _, bootstrap, lease) = setup();
+        let owner = ObjectId::from_bytes(id(8));
+        let current = witness.read_current(bootstrap.archive_id).unwrap().unwrap();
+        let token = crate::cp::control_store::MaintenancePersistenceContext::for_test();
+        let renewed = current.renewed_maintenance_lease_for_test();
+        assert_eq!(
+            renewed
+                .exact_maintenance_renewal_from(&current, owner)
+                .unwrap()
+                .fencing_epoch(),
+            lease.fencing_epoch()
+        );
+        assert!(renewed
+            .with_next_fencing_epoch_for_test(current.next_fencing_epoch + 1)
+            .exact_maintenance_renewal_from(&current, owner)
+            .is_err());
+        assert!(renewed
+            .with_lease_expiry_for_test(lease.expires_at_tick() - 1)
+            .exact_maintenance_renewal_from(&current, owner)
+            .is_err());
+
+        let reacquired = current.reacquired_maintenance_lease_for_test();
+        assert_eq!(
+            reacquired
+                .exact_maintenance_reacquire_from(&current, owner)
+                .unwrap()
+                .fencing_epoch(),
+            current.next_fencing_epoch
+        );
+        assert!(reacquired
+            .with_next_fencing_epoch_for_test(reacquired.next_fencing_epoch + 1)
+            .exact_maintenance_reacquire_from(&current, owner)
+            .is_err());
+
+        assert!(renewed.retained_maintenance_candidate_has_lease_descendant(
+            token,
+            &current,
+            owner,
+            MigrationState::Legacy,
+        ));
+        assert!(
+            reacquired.retained_maintenance_candidate_has_lease_descendant(
+                token,
+                &current,
+                owner,
+                MigrationState::Legacy,
+            )
+        );
+        let reacquired_again = reacquired.reacquired_maintenance_lease_for_test();
+        assert!(
+            reacquired_again.retained_maintenance_candidate_has_lease_descendant(
+                token,
+                &current,
+                owner,
+                MigrationState::Legacy,
+            )
+        );
+        assert!(!reacquired_again
+            .with_next_fencing_epoch_for_test(reacquired_again.next_fencing_epoch + 1)
+            .retained_maintenance_candidate_has_lease_descendant(
+                token,
+                &current,
+                owner,
+                MigrationState::Legacy,
+            ));
+        assert!(!reacquired_again
+            .with_lease_expiry_for_test(current.lease_expires_at_tick)
+            .retained_maintenance_candidate_has_lease_descendant(
+                token,
+                &current,
+                owner,
+                MigrationState::Legacy,
+            ));
+        assert!(!reacquired_again
+            .with_migration_for_test(MigrationState::ShadowWal)
+            .retained_maintenance_candidate_has_lease_descendant(
+                token,
+                &current,
+                owner,
+                MigrationState::Legacy,
+            ));
+        assert!(!reacquired_again
+            .with_deletion_for_test(DeletionState::Tombstoned)
+            .retained_maintenance_candidate_has_lease_descendant(
+                token,
+                &current,
+                owner,
+                MigrationState::Legacy,
+            ));
     }
     #[test]
     fn unavailable_and_debug_are_content_free() {
