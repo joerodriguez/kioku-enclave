@@ -8,6 +8,8 @@
 //! or version-stale canonical brief. `/api/webhooks` manages signed,
 //! user-configured finalized-episode event destinations.
 
+pub(crate) mod wal;
+
 use std::sync::Arc;
 
 use axum::{
@@ -1956,8 +1958,31 @@ fn record_screenshot_image(
     jpeg: &ValidatedJpeg,
 ) -> crate::error::Result<ScreenshotRecordOutcome> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let target = validate_screenshot_upload_target(
+    let outcome = record_screenshot_image_in_transaction(
         &tx,
+        image_id,
+        object_key,
+        episode_id,
+        source_key,
+        requested_captured_at,
+        jpeg,
+    )?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_screenshot_image_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    image_id: &str,
+    object_key: &str,
+    episode_id: i64,
+    source_key: &str,
+    requested_captured_at: &str,
+    jpeg: &ValidatedJpeg,
+) -> crate::error::Result<ScreenshotRecordOutcome> {
+    let target = validate_screenshot_upload_target(
+        transaction,
         episode_id,
         source_key,
         requested_captured_at,
@@ -1971,12 +1996,11 @@ fn record_screenshot_image(
             captured_at,
         } => (screenshot_id, captured_at),
         ScreenshotUploadTarget::Existing(existing) => {
-            tx.commit()?;
-            return Ok(ScreenshotRecordOutcome::Existing(existing));
+            return Ok(ScreenshotRecordOutcome::Existing(existing))
         }
     };
 
-    tx.execute(
+    transaction.execute(
         "INSERT INTO screenshot_images \
          (id, screenshot_id, episode_id, source_key, captured_at, object_key, mime_type, width, height, byte_length, sha256) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'image/jpeg', ?7, ?8, ?9, ?10)",
@@ -2005,7 +2029,6 @@ fn record_screenshot_image(
         byte_length: jpeg.byte_length,
         sha256: jpeg.sha256.clone(),
     };
-    tx.commit()?;
     Ok(ScreenshotRecordOutcome::Created(created))
 }
 
