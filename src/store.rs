@@ -555,6 +555,23 @@ pub(crate) struct PinnedLegacySnapshot {
     _state: OwnedMutexGuard<UserActorState>,
 }
 
+/// Long-lived process-local admission fence transferred by the completed
+/// maintenance import. The pinned plaintext family is scrubbed before this
+/// value is minted, while the lifecycle and actor guards remain owned until a
+/// future WAL owner consumes or drops the handoff.
+pub(crate) struct StoreWalAuthorityFence {
+    _pinned: PinnedLegacySnapshot,
+}
+
+#[cfg(test)]
+impl StoreWalAuthorityFence {
+    pub(crate) fn scratch_family_absent_for_test(&self) -> bool {
+        !self._pinned.path.exists()
+            && !sqlite_sidecar_path(&self._pinned.path, "-wal").exists()
+            && !sqlite_sidecar_path(&self._pinned.path, "-shm").exists()
+    }
+}
+
 /// Dedicated writable owner for one authenticated recovered archive-v3
 /// SQLite copy. It is disjoint from the ordinary Store registry and legacy
 /// persistence policy: the only mutation input is a sealed logical-domain
@@ -975,6 +992,28 @@ impl PinnedLegacySnapshot {
             source: self.source,
         }
     }
+
+    pub(crate) fn into_wal_authority_fence(
+        self,
+        _token: crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext,
+        expected_source: MaintenanceSourceBinding,
+    ) -> Result<StoreWalAuthorityFence> {
+        if self.source != expected_source {
+            return Err(EnclaveError::Conflict(
+                "maintenance WAL handoff source changed".into(),
+            ));
+        }
+        remove_temp_db_files(&self.path);
+        if self.path.exists()
+            || sqlite_sidecar_path(&self.path, "-wal").exists()
+            || sqlite_sidecar_path(&self.path, "-shm").exists()
+        {
+            return Err(EnclaveError::Store(
+                "maintenance WAL handoff scratch cleanup failed".into(),
+            ));
+        }
+        Ok(StoreWalAuthorityFence { _pinned: self })
+    }
 }
 
 impl MaintenanceGenerationRevalidation {
@@ -1028,6 +1067,12 @@ impl MaintenanceGenerationRevalidation {
 impl std::fmt::Debug for PinnedLegacySnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PinnedLegacySnapshot(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for StoreWalAuthorityFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreWalAuthorityFence(<opaque>)")
     }
 }
 

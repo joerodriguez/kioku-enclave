@@ -254,8 +254,17 @@ repository, construct the runtime at startup, or enable any user-visible behavio
   lease tuple and supersedes a partial attempt before any further create; renewal validates the
   unchanged current/next fences plus strictly increasing trusted tick and expiry. Maintenance
   checkpoint staging uses a separate domain-bound constructor that accepts only the canonical
-  zero-WAL tuple while ordinary shadow bindings remain all-nonzero. Terminal reopen freshly
-  validates the exact witness and retries best-effort lease revocation.
+  zero-WAL tuple while ordinary shadow bindings remain all-nonzero. Terminal reopen reacquires
+  the Store transition and exact pinned source, reloads exact Control state, freshly validates
+  Active/WalAuthoritative R2, and uses a full-record terminal-specific transaction that clears only
+  the importer owner/expiry even at or after expiry; lost response remains unknown until a fresh
+  exact same-fence successor read proves no active lease. Any higher-fence record rejects because
+  the released witness cannot authenticate its intervening owner. The resulting
+  non-cloneable WAL-owner-token-gated handoff scrubs DB/WAL/SHM while retaining
+  the lifecycle/actor guards and moves the opaque archive binding, exact witness, Control handle,
+  and whole provider bundle without exposing raw getters. Each non-cloneable handoff value is
+  consumed once; terminal restart may remint it, so durable globally unique owner acquisition is
+  deferred to the inactive WAL worker slice.
 - [x] Kept the result offline and non-serving. The importer is obtainable only by
   consuming the sealed image-bound runtime and a non-cloneable encrypted-control plan;
   there is no main/startup/Store constructor call, route, worker, environment/config

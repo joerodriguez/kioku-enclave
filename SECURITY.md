@@ -150,8 +150,21 @@ surfaces.
   lease fields. The checkpoint-only staging binding has its own domain-separated producer-gated
   constructor and accepts only canonical zero-WAL `0/0/0`; ordinary shadow bindings remain
   all-nonzero. Ambiguous sends retain one candidate forever; an alternate record becomes manual.
-  Reloading a terminal control row still requires a fresh exact active WalAuthoritative witness
-  read and retries best-effort lease revocation before returning the offline completion.
+  Reloading a terminal control row still reacquires the Store transition and exact pinned
+  source generation, reloads the complete terminal Control tuple, requires a fresh exact active
+  WalAuthoritative R2 witness, and executes the unresolved terminal-specific lease release followed by a fresh read
+  proving that no active import lease remains. Both reads use a witness-private full-record
+  validator: they admit only the exact retained terminal or its canonical lease-release successor,
+  whose owner/expiry alone clear and whose provider tick advances monotonically (including exact
+  or post-expiry release) while archive, database generation, predecessor, root, registry,
+  migration, deletion, and all evidence stay exact, including both current and next fences. Any
+  higher-fence record is rejected because a released witness cannot prove the intervening owner.
+  Only then is the DB/WAL/SHM scratch family scrubbed
+  and the pinned lifecycle/actor admission guards, opaque archive binding, exact terminal witness,
+  Control handle, and whole provider bundle moved into a non-cloneable WAL-owner-token-gated
+  handoff. The handoff has no raw getters, is non-cloneable, and each value exposes one consuming
+  view. A terminal restart can mint another value; durable globally unique WAL-owner acquisition
+  and serialization are explicitly deferred to the inactive WAL worker slice.
 
   The coordinator's outer owned task keeps provider-send and scratch cleanup ownership across
   caller cancellation; process restart resumes only the durable stage and exact artifact prefix.
