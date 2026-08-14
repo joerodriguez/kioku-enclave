@@ -505,11 +505,18 @@ def create_release_evidence(
         capture=True,
     )
     completed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    gcloud_version_lines = [
+        line.strip()
+        for line in run(["gcloud", "version"], capture=True).stdout.splitlines()
+        if line.strip()
+    ]
+    if not gcloud_version_lines:
+        raise PipelineError("gcloud version output is empty")
     versions = {
         "docker-buildx": run(["docker", "buildx", "version"], capture=True).stdout.strip(),
         "syft": run(["syft", "--version"], capture=True).stdout.strip(),
         "grype": run(["grype", "--version"], capture=True).stdout.strip(),
-        "gcloud": run(["gcloud", "version"], capture=True).stdout.strip(),
+        "gcloud": gcloud_version_lines[0],
     }
     command = [
         sys.executable,
@@ -558,6 +565,7 @@ def authenticate_and_push(
 ) -> str:
     gcloud_prefix = ["gcloud", f"--impersonate-service-account={impersonated_account}"]
     registry = f"{configuration['REGION']}-docker.pkg.dev"
+    docker_host = active_docker_host()
     access_token = run(
         gcloud_prefix + ["auth", "print-access-token"], capture=True
     ).stdout.strip()
@@ -575,6 +583,7 @@ def authenticate_and_push(
         pushed = run(
             ["docker", "--config", str(docker_config), "push", image_uri],
             capture=True,
+            environment={"DOCKER_HOST": docker_host},
         )
     matches = DIGEST_IN_OUTPUT.findall(pushed.stdout + "\n" + pushed.stderr)
     if not matches:

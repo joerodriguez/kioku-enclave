@@ -108,6 +108,8 @@ class LocalImagePipelineTests(unittest.TestCase):
                 return SimpleNamespace(stdout="", stderr="")
             if command[:3] == ["git", "rev-parse", "HEAD"]:
                 return SimpleNamespace(stdout="b" * 40 + "\n")
+            if command[:3] == ["git", "rev-list", "-n"]:
+                return SimpleNamespace(stdout="b" * 40 + "\n")
             if command[:3] == ["git", "log", "-1"]:
                 return SimpleNamespace(stdout="1700000000\n")
             if command[:4] == ["git", "remote", "get-url", "origin"]:
@@ -123,7 +125,9 @@ class LocalImagePipelineTests(unittest.TestCase):
             if command[:2] == ["grype", "--version"]:
                 return SimpleNamespace(stdout="grype 0.116.0\n")
             if command[:2] == ["gcloud", "version"]:
-                return SimpleNamespace(stdout="Google Cloud SDK 580.0.0\n")
+                return SimpleNamespace(
+                    stdout="Google Cloud SDK 580.0.0\nbq 2.1.23\ngsutil 5.36\n"
+                )
             if command[0] == "syft":
                 self.assertEqual(environment, {"DOCKER_HOST": "unix:///private/tmp/kioku-docker.sock"})
                 self.assertTrue(command[1].startswith("docker:"))
@@ -138,6 +142,9 @@ class LocalImagePipelineTests(unittest.TestCase):
             if command[0] == "grype":
                 return SimpleNamespace(stdout="{\"matches\": []}\n", stderr="")
             if command[0] == "docker" and "push" in command:
+                self.assertEqual(
+                    environment, {"DOCKER_HOST": "unix:///private/tmp/kioku-docker.sock"}
+                )
                 return SimpleNamespace(stdout=f"digest: {digest} size: 123\n", stderr="")
             if command[0] == "gcloud" and command[-2:] == ["auth", "print-access-token"]:
                 return SimpleNamespace(stdout="ya29." + "t" * 40 + "\n", stderr="")
@@ -173,6 +180,8 @@ class LocalImagePipelineTests(unittest.TestCase):
                     str(config),
                     "--output-dir",
                     str(output),
+                    "--source-ref",
+                    "refs/tags/v1.2.3",
                     "--apply",
                 ]
                 pipeline.main()
@@ -198,6 +207,13 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertLess(scan_index, auth_index)
         self.assertLess(auth_index, login_index)
         self.assertLess(login_index, push_index)
+        evidence_command = next(
+            command
+            for command in calls
+            if command[:2] == [sys.executable, str(SCRIPTS / "local_build_evidence.py")]
+        )
+        self.assertIn("gcloud=Google Cloud SDK 580.0.0", evidence_command)
+        self.assertFalse(any("\n" in argument for argument in evidence_command))
         self.assertNotIn("configure-docker", str(calls))
         self.assertNotIn("ya29.", str(calls))
 
