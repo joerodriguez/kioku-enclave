@@ -9,9 +9,11 @@
 //! child reauthenticates the complete eligible screenshot target and atomically
 //! reserves its count/bytes while retaining the exact numeric screenshot ID,
 //! account-bound object key, predecessor commitment, request fingerprint,
-//! binding, and typed receipt. It cannot allocate randomness or a DEK, read
-//! media bytes, encrypt, call a provider or Store, launch work, retry, release a
-//! rejected reservation, clean up an object, or acknowledge a request.
+//! binding, and typed receipt. Its sibling A codec can reauthenticate only one
+//! exact binding for local settlement. This child cannot allocate randomness or
+//! a DEK, read media bytes, encrypt, call a provider or Store, launch work,
+//! retry, release a rejected reservation, clean up an object, or acknowledge a
+//! request.
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use sha2::{Digest, Sha256};
@@ -565,6 +567,110 @@ impl StoredLedgerRow {
             && self.predecessor_commitment.as_slice() == plan.predecessor_commitment.as_slice()
             && self.binding_commitment.as_slice() == plan.receipt.binding_commitment.as_slice()
     }
+}
+
+/// Reauthenticates one permanent pre-provider selected-screenshot attempt for
+/// its exact local result. The caller receives only the bound numeric
+/// screenshot identity; it cannot enumerate attempts or recover an unrelated
+/// object capability.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::cp::query) fn authenticate_selected_screenshot_attempt_binding(
+    connection: &Connection,
+    account_id: &str,
+    image_id: &str,
+    object_key: &str,
+    episode_id: i64,
+    source_key: &str,
+    captured_at: &str,
+    jpeg: &ValidatedJpeg,
+    binding_commitment: &[u8; 32],
+) -> Result<i64> {
+    if schema_state(connection)? == LedgerSchemaState::Absent {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    validate_schema_marker(connection)?;
+    let row = connection
+        .query_row(
+            "SELECT operation_id,format_version,codec_version,request_fingerprint,
+                    account_id,image_id,object_key,episode_id,screenshot_id,source_key,captured_at,
+                    width,height,byte_length,sha256,predecessor_commitment,
+                    binding_commitment,result_bytes,result_commitment
+             FROM archive_v3_wal_selected_screenshot_attempt_operations
+             WHERE image_id=?1",
+            [image_id],
+            StoredLedgerRow::from_row,
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?
+        .ok_or(WalIdempotencyError::Precondition)?;
+    if row.operation_id.len() != 16
+        || row.request_fingerprint.len() != 32
+        || row.predecessor_commitment.len() != 32
+        || row.binding_commitment.len() != 32
+        || row.result_commitment.len() != 32
+        || row.result_bytes.len() > MAX_ENCODED_RESULT_BYTES
+        || row.format_version != i64::from(WalOperationKind::format_version())
+        || row.codec_version != i64::from(WalOperationKind::SelectedScreenshot.codec_version())
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let target = SelectedScreenshotAttemptTarget {
+        screenshot_id: row.screenshot_id,
+        predecessor_commitment: row
+            .predecessor_commitment
+            .as_slice()
+            .try_into()
+            .map_err(|_| WalIdempotencyError::Corrupt)?,
+    };
+    let expected = SelectedScreenshotAttemptPlan::build(
+        None,
+        row.account_id.clone(),
+        row.image_id.clone(),
+        row.episode_id,
+        row.source_key.clone(),
+        row.captured_at.clone(),
+        ValidatedJpeg {
+            width: row.width,
+            height: row.height,
+            byte_length: row.byte_length,
+            sha256: row.sha256.clone(),
+        },
+        target,
+    )
+    .map_err(|_| WalIdempotencyError::Corrupt)?;
+    if row.operation_id.as_slice() != expected.operation_id.as_bytes().as_slice()
+        || row.object_key != expected.object_key
+        || row.binding_commitment.as_slice() != expected.receipt.binding_commitment.as_slice()
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let prepared =
+        PreparedLogicalMutation::prepare(expected).map_err(|_| WalIdempotencyError::Corrupt)?;
+    if row.request_fingerprint.as_slice()
+        != prepared
+            .request_fingerprint_for_owner()
+            .as_bytes()
+            .as_slice()
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    SelectedScreenshotAttemptLedger::lookup(connection, &prepared)?
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    if row.account_id != account_id
+        || row.image_id != image_id
+        || row.object_key != object_key
+        || row.episode_id != episode_id
+        || row.source_key != source_key
+        || row.captured_at != captured_at
+        || row.width != jpeg.width
+        || row.height != jpeg.height
+        || row.byte_length != jpeg.byte_length
+        || row.sha256 != jpeg.sha256
+        || row.binding_commitment.as_slice() != binding_commitment
+    {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    Ok(row.screenshot_id)
 }
 
 pub(in crate::cp::query) fn authenticate_selected_screenshot_upload_predecessor(
