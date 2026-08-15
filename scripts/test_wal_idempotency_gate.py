@@ -221,6 +221,15 @@ def cfg_test_spans(code: str) -> list[Span]:
     return spans
 
 
+def without_cfg_test_items(source: str) -> str:
+    """Blank complete cfg(test) items while retaining production source text."""
+    code = sanitize_rust(source)
+    chars = list(source)
+    for span in cfg_test_spans(code):
+        _blank(chars, span.start, span.end)
+    return "".join(chars)
+
+
 def _excluded(offset: int, exclusions: list[Span]) -> bool:
     return any(span.start <= offset < span.end for span in exclusions)
 
@@ -945,11 +954,11 @@ impl X {
         attempt_domain = (
             ROOT / "src/cp/media_worker/wal/attempt.rs"
         ).read_text(encoding="utf-8")
-        attempt_production = attempt_domain.split("#[cfg(test)]", 1)[0]
+        attempt_production = without_cfg_test_items(attempt_domain)
         result_domain = (ROOT / "src/cp/media_worker/wal/result.rs").read_text(
             encoding="utf-8"
         )
-        result_production = result_domain.split("#[cfg(test)]", 1)[0]
+        result_production = without_cfg_test_items(result_domain)
         email_worker = (ROOT / "src/cp/email_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -1099,6 +1108,9 @@ impl X {
         )
         self.assertIn("predecessor_commitment BLOB NOT NULL", attempt_domain)
         self.assertIn("current_screen_work_attempt_commitments", attempt_domain)
+        self.assertIn(
+            "authenticate_screen_storyboard_attempt_binding", attempt_domain
+        )
         self.assertIn("MIN_PROVIDER_ATTEMPT_WINDOW_MILLIS", result_domain)
         self.assertIn("screen-storyboard-vertex-attempt-v1", attempt_domain)
         self.assertIn("MAX_ROWS: u32 = 1_048_576", attempt_domain)
@@ -1111,6 +1123,17 @@ impl X {
             "archive_v3_wal_screen_storyboard_result_operations", result_domain
         )
         self.assertIn("screen-storyboard-no-people-v1", result_domain)
+        self.assertIn(
+            "screen-storyboard-no-people-v2-bound-attempt", result_domain
+        )
+        self.assertIn(
+            "ScreenStoryboardResultRequestContract::BoundV2", result_domain
+        )
+        self.assertIn("authenticate_attempt_binding", result_domain)
+        self.assertIn(
+            "#[cfg(test)]\n    #[allow(clippy::too_many_arguments)]\n    fn new_unbound_v1",
+            result_domain,
+        )
         self.assertIn("MAX_ROWS: u32 = 1_048_576", result_domain)
         self.assertIn("DomainLedgerBounds::new", result_domain)
         self.assertIn("WalIdempotencyError::Precondition", result_domain)

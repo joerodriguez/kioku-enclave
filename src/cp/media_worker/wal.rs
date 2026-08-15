@@ -11,9 +11,10 @@
 //! It cannot read, list, delete, or otherwise reach a provider, call Store,
 //! launch work, or acknowledge retention completion. A private B child fixes
 //! stable screen Vertex attempt identity and billing intent before provider I/O;
-//! the private result child covers only screen storyboards without person
-//! evidence and does not yet consume that binding. Audio and every person/
-//! identity/voice mutation remain unsupported.
+//! the private production-facing result-v2 child covers only screen storyboards
+//! without person evidence and reauthenticates that exact binding before its
+//! local mutation. Audio and every person/identity/voice mutation remain
+//! unsupported.
 
 pub(super) mod attempt;
 pub(super) mod result;

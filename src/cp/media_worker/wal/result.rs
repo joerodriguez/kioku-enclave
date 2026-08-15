@@ -5,9 +5,10 @@
 
 //! Inactive deterministic screen-storyboard result WAL subtype.
 //!
-//! The sibling B boundary can durably fix the Vertex attempt before provider
-//! I/O, but this result-v1 contract does not yet consume that binding. The
-//! subtype accepts only a fully leased screen work unit whose
+//! The production-facing v2 contract consumes the sibling B boundary that
+//! durably fixes the Vertex attempt before provider I/O. The exact historical
+//! v1 request encoding remains test-covered but has no production constructor.
+//! The subtype accepts only a fully leased screen work unit whose
 //! provider usage has already reached a terminal result, caller-fixed row IDs,
 //! one fixed commit time, and results with no person evidence. It authenticates
 //! every work/member/job/capture/media predecessor before atomically inserting
@@ -27,7 +28,10 @@ use crate::archive_v3_wal_idempotency::{
 };
 
 const REQUEST_V1: u16 = 1;
-const SUBTYPE: &[u8] = b"screen-storyboard-no-people-v1";
+const REQUEST_V2: u16 = 2;
+const SUBTYPE_V1: &[u8] = b"screen-storyboard-no-people-v1";
+const SUBTYPE_V2: &[u8] = b"screen-storyboard-no-people-v2-bound-attempt";
+const BOUND_OPERATION_SOURCE_DOMAIN: &[u8] = b"screen-storyboard-result-bound-v2\0";
 const PROCESSOR_VERSION: i64 = 1;
 const PROMPT_VERSION: i64 = 2;
 const RESULT_SCHEMA_VERSION: i64 = 2;
@@ -119,6 +123,7 @@ impl ScreenStoryboardFrameResult {
 
 pub(crate) struct ScreenStoryboardResultPlan {
     operation_id: WalLogicalOperationId,
+    request_contract: ScreenStoryboardResultRequestContract,
     account_id: String,
     vertex_event_id: String,
     vertex_attempt_commitment: [u8; 32],
@@ -129,9 +134,73 @@ pub(crate) struct ScreenStoryboardResultPlan {
     frames: Vec<ScreenStoryboardFrameResult>,
 }
 
+#[derive(Clone, Copy)]
+enum ScreenStoryboardResultRequestContract {
+    UnboundV1,
+    BoundV2 {
+        attempt_binding_commitment: [u8; 32],
+    },
+}
+
 impl ScreenStoryboardResultPlan {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::cp::media_worker) fn new(
+        account_id: String,
+        vertex_event_id: String,
+        vertex_attempt_commitment: [u8; 32],
+        attempt_binding_commitment: [u8; 32],
+        work_unit_id: String,
+        predecessor_commitment: [u8; 32],
+        requested_model: String,
+        committed_at: String,
+        frames: Vec<ScreenStoryboardFrameResult>,
+    ) -> Result<Self> {
+        if attempt_binding_commitment == [0; 32] {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        Self::build(
+            ScreenStoryboardResultRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            },
+            account_id,
+            vertex_event_id,
+            vertex_attempt_commitment,
+            work_unit_id,
+            predecessor_commitment,
+            requested_model,
+            committed_at,
+            frames,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_unbound_v1(
+        account_id: String,
+        vertex_event_id: String,
+        vertex_attempt_commitment: [u8; 32],
+        work_unit_id: String,
+        predecessor_commitment: [u8; 32],
+        requested_model: String,
+        committed_at: String,
+        frames: Vec<ScreenStoryboardFrameResult>,
+    ) -> Result<Self> {
+        Self::build(
+            ScreenStoryboardResultRequestContract::UnboundV1,
+            account_id,
+            vertex_event_id,
+            vertex_attempt_commitment,
+            work_unit_id,
+            predecessor_commitment,
+            requested_model,
+            committed_at,
+            frames,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        request_contract: ScreenStoryboardResultRequestContract,
         account_id: String,
         vertex_event_id: String,
         vertex_attempt_commitment: [u8; 32],
@@ -168,12 +237,30 @@ impl ScreenStoryboardResultPlan {
         {
             return Err(WalIdempotencyError::Malformed);
         }
-        let operation_id = WalLogicalOperationId::from_stable_source(
-            WalOperationKind::DeterministicMediaWorkResult,
-            vertex_event_id.as_bytes(),
-        )?;
+        let operation_id = match request_contract {
+            ScreenStoryboardResultRequestContract::UnboundV1 => {
+                WalLogicalOperationId::from_stable_source(
+                    WalOperationKind::DeterministicMediaWorkResult,
+                    vertex_event_id.as_bytes(),
+                )?
+            }
+            ScreenStoryboardResultRequestContract::BoundV2 { .. } => {
+                let mut source = Vec::with_capacity(
+                    BOUND_OPERATION_SOURCE_DOMAIN
+                        .len()
+                        .saturating_add(vertex_event_id.len()),
+                );
+                source.extend_from_slice(BOUND_OPERATION_SOURCE_DOMAIN);
+                source.extend_from_slice(vertex_event_id.as_bytes());
+                WalLogicalOperationId::from_stable_source(
+                    WalOperationKind::DeterministicMediaWorkResult,
+                    &source,
+                )?
+            }
+        };
         Ok(Self {
             operation_id,
+            request_contract,
             account_id,
             vertex_event_id,
             vertex_attempt_commitment,
@@ -202,8 +289,19 @@ impl WalLogicalDomainPlan for ScreenStoryboardResultPlan {
 
     fn canonical_request(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut request = Zeroizing::new(Vec::with_capacity(64 * 1024));
-        request.extend_from_slice(&REQUEST_V1.to_be_bytes());
-        encode_bytes(&mut request, SUBTYPE)?;
+        match self.request_contract {
+            ScreenStoryboardResultRequestContract::UnboundV1 => {
+                request.extend_from_slice(&REQUEST_V1.to_be_bytes());
+                encode_bytes(&mut request, SUBTYPE_V1)?;
+            }
+            ScreenStoryboardResultRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            } => {
+                request.extend_from_slice(&REQUEST_V2.to_be_bytes());
+                encode_bytes(&mut request, SUBTYPE_V2)?;
+                request.extend_from_slice(&attempt_binding_commitment);
+            }
+        }
         encode_string(&mut request, &self.account_id)?;
         encode_string(&mut request, &self.vertex_event_id)?;
         request.extend_from_slice(&self.vertex_attempt_commitment);
@@ -243,6 +341,11 @@ impl WalLogicalDomainPlan for ScreenStoryboardResultPlan {
         {
             return Err(WalIdempotencyError::Precondition);
         }
+        if let Some(bound_attempt) = self.authenticate_attempt_binding(transaction)? {
+            if hash_screen_work_attempt(transaction, &self.work_unit_id)? != bound_attempt {
+                return Err(WalIdempotencyError::Precondition);
+            }
+        }
         validate_commit_time(transaction, self, &authenticated)?;
         ensure_targets_absent(transaction, &self.frames)?;
         for (member, frame) in authenticated.members.iter().zip(&self.frames) {
@@ -264,6 +367,25 @@ impl WalLogicalDomainPlan for ScreenStoryboardResultPlan {
 
     fn decode_output(&self, result: &WalReplayResult) -> Result<Self::Output> {
         self.validate_replay(result)
+    }
+}
+
+impl ScreenStoryboardResultPlan {
+    fn authenticate_attempt_binding(&self, connection: &Connection) -> Result<Option<[u8; 32]>> {
+        match self.request_contract {
+            ScreenStoryboardResultRequestContract::UnboundV1 => Ok(None),
+            ScreenStoryboardResultRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            } => super::attempt::authenticate_screen_storyboard_attempt_binding(
+                connection,
+                &self.account_id,
+                &self.vertex_event_id,
+                &self.work_unit_id,
+                &self.requested_model,
+                &attempt_binding_commitment,
+            )
+            .map(Some),
+        }
     }
 }
 
@@ -326,6 +448,9 @@ impl WalLogicalDomainLedger<ScreenStoryboardResultPlan> for ScreenStoryboardResu
             return Err(WalIdempotencyError::Corrupt);
         }
         prepared.plan_for_domain_ledger().validate_replay(&result)?;
+        let _ = prepared
+            .plan_for_domain_ledger()
+            .authenticate_attempt_binding(connection)?;
         Ok(Some(result))
     }
 
@@ -380,6 +505,12 @@ impl WalLogicalDomainLedger<ScreenStoryboardResultPlan> for ScreenStoryboardResu
             )
             .map_err(|_| WalIdempotencyError::Unavailable)?;
         if changed != 1 {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        let Some(stored) = Self::lookup(transaction, prepared)? else {
+            return Err(WalIdempotencyError::Corrupt);
+        };
+        if stored != result {
             return Err(WalIdempotencyError::Corrupt);
         }
         Ok(LogicalMutationResult::Applied(result))
@@ -2170,7 +2301,7 @@ pub(super) mod tests {
         count: usize,
         suffix: &str,
     ) -> ScreenStoryboardResultPlan {
-        ScreenStoryboardResultPlan::new(
+        ScreenStoryboardResultPlan::new_unbound_v1(
             ACCOUNT.into(),
             vertex.into(),
             current_screen_vertex_attempt_commitment(connection, vertex, MODEL).unwrap(),
@@ -2262,6 +2393,42 @@ pub(super) mod tests {
         assert_eq!(
             execute_error(&mut connection, changed),
             WalIdempotencyError::FingerprintConflict
+        );
+    }
+
+    #[test]
+    fn bound_v2_identity_is_distinct_while_historical_v1_stays_exact() {
+        let connection = connection();
+        seed_work(&connection, WORK_ONE, VERTEX_ONE, 1, 1);
+        let v1 = plan(&connection, WORK_ONE, VERTEX_ONE, 1, 1, "versioned");
+        let v2 = ScreenStoryboardResultPlan::new(
+            ACCOUNT.to_owned(),
+            VERTEX_ONE.to_owned(),
+            current_screen_vertex_attempt_commitment(&connection, VERTEX_ONE, MODEL).unwrap(),
+            [3_u8; 32],
+            WORK_ONE.to_owned(),
+            current_screen_work_predecessor_commitment(&connection, WORK_ONE).unwrap(),
+            MODEL.to_owned(),
+            COMMITTED_AT.to_owned(),
+            frames(1, 1, "versioned"),
+        )
+        .unwrap();
+        assert_eq!(
+            v1.operation_id(),
+            WalLogicalOperationId::from_stable_source(
+                WalOperationKind::DeterministicMediaWorkResult,
+                VERTEX_ONE.as_bytes(),
+            )
+            .unwrap()
+        );
+        assert_ne!(v1.operation_id(), v2.operation_id());
+        assert_eq!(
+            &v1.canonical_request().unwrap()[..2],
+            &REQUEST_V1.to_be_bytes()
+        );
+        assert_eq!(
+            &v2.canonical_request().unwrap()[..2],
+            &REQUEST_V2.to_be_bytes()
         );
     }
 
@@ -2517,6 +2684,48 @@ pub(super) mod tests {
                 .unwrap(),
             "processing"
         );
+    }
+
+    #[test]
+    fn post_insert_ledger_rewrite_rolls_back_every_result_row() {
+        let mut connection = connection();
+        seed_work(&connection, WORK_ONE, VERTEX_ONE, 1, 1);
+        let plan = plan(&connection, WORK_ONE, VERTEX_ONE, 1, 1, "exact-readback");
+        connection
+            .execute_batch(
+                "CREATE TABLE archive_v3_wal_screen_storyboard_result_schema (
+                    singleton INTEGER PRIMARY KEY,format_version INTEGER NOT NULL,codec_version INTEGER NOT NULL
+                 ) STRICT;
+                 CREATE TABLE archive_v3_wal_screen_storyboard_result_operations (
+                    operation_id BLOB PRIMARY KEY,format_version INTEGER NOT NULL,codec_version INTEGER NOT NULL,
+                    request_fingerprint BLOB NOT NULL,result_bytes BLOB NOT NULL,result_commitment BLOB NOT NULL
+                 ) STRICT, WITHOUT ROWID;
+                 CREATE TABLE archive_v3_wal_screen_storyboard_result_state (
+                    singleton INTEGER PRIMARY KEY,row_count INTEGER NOT NULL,result_bytes INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO archive_v3_wal_screen_storyboard_result_schema VALUES (1,1,1);
+                 INSERT INTO archive_v3_wal_screen_storyboard_result_state VALUES (1,0,0);
+                 CREATE TRIGGER rewrite_result_ledger AFTER INSERT
+                 ON archive_v3_wal_screen_storyboard_result_operations
+                 BEGIN
+                   UPDATE archive_v3_wal_screen_storyboard_result_operations
+                   SET request_fingerprint=zeroblob(32)
+                   WHERE operation_id=NEW.operation_id;
+                 END;",
+            )
+            .unwrap();
+        assert_eq!(
+            execute_error(&mut connection, plan),
+            WalIdempotencyError::FingerprintConflict
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM screenshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(load_ledger_state(&connection).unwrap(), (0, 0));
     }
 
     #[test]
