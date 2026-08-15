@@ -54,7 +54,7 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     }
 )
 EXPECTED_WORKER_SPAWN_COUNT = 24
-EXPECTED_WORKER_SPAWN_SHA256 = "9cc0d93f6da8418dc1db2ccf30245a8b938b44fd4525139d3a3fb5bd3f6f5506"
+EXPECTED_WORKER_SPAWN_SHA256 = "168c68613f08ab942d4d831520d306433cb0c51b04bc32c01338a780ec4d81b4"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -1956,20 +1956,64 @@ impl X {
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
+        launcher = (ROOT / "src/archive_v3_wal_owner/launcher.rs").read_text(
+            encoding="utf-8"
+        )
         publisher = (ROOT / "src/archive_v3_wal_owner/publisher.rs").read_text(
+            encoding="utf-8"
+        )
+        maintenance = (ROOT / "src/archive_v3_maintenance_import.rs").read_text(
+            encoding="utf-8"
+        )
+        idempotency = (ROOT / "src/archive_v3_wal_idempotency.rs").read_text(
             encoding="utf-8"
         )
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("mod archive_v3_wal_owner;", main)
         self.assertNotIn("archive_v3_wal_owner::", main)
+        self.assertIn("mod launcher;", owner)
         self.assertIn("struct SingleArchiveWalOwner", owner)
         self.assertNotIn("pub(crate) struct SingleArchiveWalOwner", owner)
         self.assertNotIn("pub struct SingleArchiveWalOwner", owner)
+        launcher_production = without_cfg_test_items(launcher)
+        self.assertIn(
+            "pub(super) struct SingleArchiveWalLauncherOwner", launcher_production
+        )
+        self.assertNotIn(
+            "pub(crate) struct SingleArchiveWalLauncherOwner", launcher_production
+        )
+        self.assertNotIn("pub struct SingleArchiveWalLauncherOwner", launcher_production)
+        self.assertIn(
+            "SingleArchiveWalPublisher::start(handoff)", launcher_production
+        )
+        self.assertIn(
+            "pub(super) async fn submit<P: WalLogicalDomainPlan>",
+            launcher_production,
+        )
+        self.assertNotIn("WalOwnerHandle<", owner)
+        self.assertIn("Box<dyn ErasedPreparedLogicalMutation>", owner)
+        self.assertIn(
+            "pub(crate) trait ErasedPreparedLogicalMutation:", idempotency
+        )
+        self.assertIn(
+            "ErasedPreparedLogicalMutation for PreparedLogicalMutation<P>",
+            idempotency,
+        )
+        self.assertEqual(
+            idempotency.count("impl<P: WalLogicalDomainPlan> ErasedPreparedLogicalMutation"),
+            1,
+        )
         self.assertIn("pub(super) struct SingleArchiveWalPublisher", publisher)
         self.assertNotIn("pub(crate) struct SingleArchiveWalPublisher", publisher)
         self.assertNotIn("pub struct SingleArchiveWalPublisher", publisher)
         self.assertIn("impl WalPublicationAuthority for SingleArchiveWalPublisher", publisher)
         self.assertIn("CompletedMaintenanceWalHandoff", publisher)
+        self.assertNotIn("operation_id: _", publisher)
+        self.assertNotIn("source: _", publisher)
+        self.assertIn("MaintenanceImportPersistence::load_exact", publisher)
+        self.assertIn("_maintenance_parity: CompletedMaintenanceParityEvidence", publisher)
+        self.assertIn("struct CompletedMaintenanceParityEvidence", maintenance)
+        self.assertIn("reauthenticate_for_wal_owner", maintenance)
         for forbidden in (
             "GcsClient",
             "FirestoreWitness::",
@@ -1979,6 +2023,7 @@ impl X {
             "std::env::",
         ):
             self.assertNotIn(forbidden, owner)
+            self.assertNotIn(forbidden, launcher_production)
             self.assertNotIn(forbidden, publisher)
 
 

@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 single-archive WAL publisher is compiled before any domain or startup wiring"
+    reason = "inactive ADR-0022 single-archive WAL publisher is compiled before any external domain adapter or startup wiring"
 )]
 
 //! Private provider/checkpoint half of the single-archive WAL owner.
@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     archive_v3::{ArchiveId, ObjectId, VerifiedArchiveCipher},
     archive_v3_maintenance_import::{
-        CompletedMaintenanceWalHandoff, CompletedMaintenanceWalHandoffView,
+        CompletedMaintenanceParityEvidence, CompletedMaintenanceWalHandoff,
+        CompletedMaintenanceWalHandoffView, MaintenanceImportPersistence,
     },
     archive_v3_operation::{RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage},
     archive_v3_shadow_checkpoint::{
@@ -1454,6 +1455,7 @@ pub(super) struct SingleArchiveWalPublisher {
     control: Arc<crate::cp::control_store::ControlStore>,
     capture: Arc<crate::store::StoreShadowCapture>,
     _archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    _maintenance_parity: CompletedMaintenanceParityEvidence,
 }
 
 impl SingleArchiveWalPublisher {
@@ -1505,12 +1507,7 @@ impl SingleArchiveWalPublisher {
         WalOwnerStoreBinding::from_authenticated_witness(&observed)
     }
 
-    pub(super) async fn start<P>(
-        handoff: CompletedMaintenanceWalHandoff,
-    ) -> Result<WalOwnerHandle<P>>
-    where
-        P: crate::archive_v3_wal_idempotency::WalLogicalDomainPlan,
-    {
+    pub(super) async fn start(handoff: CompletedMaintenanceWalHandoff) -> Result<WalOwnerHandle> {
         let view = handoff.into_wal_owner(WalOwnerStoreContext(()));
         let (publisher, staged, binding, store_fence) = Self::from_handoff_view(view).await?;
         let store = super::WalStoreLane::spawn_authenticated(
@@ -1540,11 +1537,23 @@ impl SingleArchiveWalPublisher {
             runtime,
             terminal_witness,
             archive_binding,
-            operation_id: _,
-            source: _,
+            parity,
             control,
             store_fence,
         } = view;
+        let terminal_control = MaintenanceImportPersistence::load_exact(
+            control.as_ref(),
+            parity.operation_id_for_wal_owner(WalOwnerStoreContext(())),
+        )
+        .await
+        .map_err(|_| WalOwnerError::Conflict)?;
+        parity
+            .reauthenticate_for_wal_owner(
+                WalOwnerStoreContext(()),
+                &terminal_control,
+                &terminal_witness,
+            )
+            .map_err(|_| WalOwnerError::Conflict)?;
         let runtime = runtime
             .into_wal_publisher(super::WalPublisherRuntimeContext(()))
             .map_err(|_| WalOwnerError::Publication)?;
@@ -1679,6 +1688,7 @@ impl SingleArchiveWalPublisher {
             control,
             capture,
             _archive_binding: archive_binding,
+            _maintenance_parity: parity,
         };
         Ok((publisher, staged, binding, store_fence))
     }

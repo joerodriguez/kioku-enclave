@@ -1,6 +1,6 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 maintenance import is compiled and tested before any launcher exists"
+    reason = "inactive ADR-0022 maintenance import is compiled and tested before any external launcher or serving wiring"
 )]
 
 //! Inactive, single-archive ADR-0022 maintenance importer.
@@ -1408,8 +1408,7 @@ pub(crate) struct CompletedMaintenanceWalHandoff {
     runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
     terminal_witness: WitnessRecord,
     archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
-    operation_id: MaintenanceImportOperationId,
-    source: MaintenanceSourceBinding,
+    parity: CompletedMaintenanceParityEvidence,
     control: Arc<crate::cp::control_store::ControlStore>,
     store_fence: crate::store::StoreWalAuthorityFence,
 }
@@ -1418,10 +1417,57 @@ pub(crate) struct CompletedMaintenanceWalHandoffView {
     pub(crate) runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
     pub(crate) terminal_witness: WitnessRecord,
     pub(crate) archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
-    pub(crate) operation_id: MaintenanceImportOperationId,
-    pub(crate) source: MaintenanceSourceBinding,
+    pub(crate) parity: CompletedMaintenanceParityEvidence,
     pub(crate) control: Arc<crate::cp::control_store::ControlStore>,
     pub(crate) store_fence: crate::store::StoreWalAuthorityFence,
+}
+
+/// Non-cloneable proof that the offline maintenance transition reached its
+/// exact terminal Control row only after full independent legacy/shadow
+/// parity. The WAL launcher can re-read and authenticate that exact row, but
+/// cannot mint or detach the parity commitment.
+pub(crate) struct CompletedMaintenanceParityEvidence {
+    terminal_control: MaintenanceImportRecord,
+}
+
+impl CompletedMaintenanceParityEvidence {
+    fn from_terminal(
+        terminal_control: MaintenanceImportRecord,
+        source: MaintenanceSourceBinding,
+        terminal_witness: &WitnessRecord,
+    ) -> Result<Self, MaintenanceImportError> {
+        validate_terminal_parity_evidence(&terminal_control, source, terminal_witness)?;
+        Ok(Self { terminal_control })
+    }
+
+    pub(crate) const fn operation_id_for_wal_owner(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+    ) -> MaintenanceImportOperationId {
+        self.terminal_control.operation_id
+    }
+
+    pub(crate) fn reauthenticate_for_wal_owner(
+        &self,
+        _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+        observed: &MaintenanceImportRecord,
+        terminal_witness: &WitnessRecord,
+    ) -> Result<(), MaintenanceImportError> {
+        if observed != &self.terminal_control {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        let source = self
+            .terminal_control
+            .source()
+            .ok_or(MaintenanceImportError::Corrupt)?;
+        validate_terminal_parity_evidence(&self.terminal_control, source, terminal_witness)
+    }
+}
+
+impl fmt::Debug for CompletedMaintenanceParityEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletedMaintenanceParityEvidence(<opaque>)")
+    }
 }
 
 impl CompletedMaintenanceWalHandoff {
@@ -1433,8 +1479,7 @@ impl CompletedMaintenanceWalHandoff {
             runtime: self.runtime,
             terminal_witness: self.terminal_witness,
             archive_binding: self.archive_binding,
-            operation_id: self.operation_id,
-            source: self.source,
+            parity: self.parity,
             control: self.control,
             store_fence: self.store_fence,
         }
@@ -1583,15 +1628,52 @@ async fn finish_offline_import(
     let store_fence = pinned
         .into_wal_authority_fence(MaintenanceCoordinatorContext(()), source)
         .map_err(|_| MaintenanceImportError::Conflict)?;
+    let parity =
+        CompletedMaintenanceParityEvidence::from_terminal(exact_durable, source, &released)?;
     Ok(CompletedMaintenanceWalHandoff {
         runtime,
         terminal_witness: released,
         archive_binding,
-        operation_id: expected_durable.operation_id,
-        source,
+        parity,
         control,
         store_fence,
     })
+}
+
+fn validate_terminal_parity_evidence(
+    terminal_control: &MaintenanceImportRecord,
+    source: MaintenanceSourceBinding,
+    terminal_witness: &WitnessRecord,
+) -> Result<(), MaintenanceImportError> {
+    if terminal_control.stage() != MaintenanceImportStage::WalAuthoritative
+        || terminal_control.source() != Some(source)
+        || terminal_control.parity_commitment.is_none()
+        || terminal_witness.archive_id() != terminal_control.archive_id
+        || terminal_witness.deletion() != DeletionState::Active
+        || terminal_witness.migration() != MigrationState::WalAuthoritative
+    {
+        return Err(MaintenanceImportError::Corrupt);
+    }
+    let retained_terminal = terminal_control
+        .witnessed_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    if terminal_witness
+        .exact_maintenance_terminal_or_release_from(&retained_terminal, terminal_control.owner_id)
+        .map_err(|_| MaintenanceImportError::Conflict)?
+    {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    let retained_candidate = terminal_control
+        .authoritative_candidate_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    let retained_root = RecoveryRoot::from_exact_wal_authoritative_record(&retained_candidate)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    let terminal_root = RecoveryRoot::from_exact_wal_authoritative_record(terminal_witness)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    if terminal_root != retained_root {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    Ok(())
 }
 
 fn validate_exact_terminal_control(
@@ -3216,11 +3298,27 @@ mod tests {
             MigrationState::WalAuthoritative
         );
         assert!(owner_view.store_fence.scratch_family_absent_for_test());
-        let _retained_authority = (
-            owner_view.operation_id,
-            owner_view.source,
-            owner_view.control,
+        let retained_terminal = MaintenanceImportPersistence::load_exact(
+            owner_view.control.as_ref(),
+            owner_view.parity.operation_id_for_wal_owner(
+                crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+            ),
+        )
+        .await
+        .unwrap();
+        owner_view
+            .parity
+            .reauthenticate_for_wal_owner(
+                crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+                &retained_terminal,
+                &owner_view.terminal_witness,
+            )
+            .unwrap();
+        assert_eq!(
+            format!("{:?}", owner_view.parity),
+            "CompletedMaintenanceParityEvidence(<opaque>)"
         );
+        let _retained_authority = (owner_view.parity, owner_view.control);
     }
 
     #[test]
