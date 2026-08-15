@@ -302,6 +302,24 @@ separate activation blockers.
     allocation, media bytes, encryption/provider I/O, Store/route/launcher/task/
     retry/cleanup/acknowledgement wiring and authenticated C
     rejection/termination release remain separate reviewed slices.
+  - [x] Add the inactive selected-screenshot ciphertext-candidate continuation.
+    Its constructor accepts only the exact attempt binding, typed installed-
+    media-DEK receipt, borrowed validated JPEG/DEK, and caller-supplied
+    context-bound ciphertext. Before actor admission it checks the JPEG hash and
+    length, revalidates the DEK receipt against the same plaintext key, exact-
+    decrypts the ciphertext under the account/object AAD, and derives a keyed
+    candidate commitment. One immediate transaction requires the exact
+    unconsumed attempt and installed-DEK ledgers, retains only ciphertext and
+    commitments, exact-reads the row, and advances full counters under a
+    1,048,576-row/128-MiB-result/512-MiB-ciphertext cap. Exact replay may survive
+    later matching A settlement. A private exact-name restart loader preflights
+    stored lengths, requires the account/attempt plus borrowed DEK, decrypts and
+    reconstructs the complete candidate, and returns only that named ciphertext
+    and receipt. Changed bytes/key/AAD/predecessors, consumed first apply, cap
+    exhaustion, partial schema, row/counter tamper, and late readback failure
+    reject or roll back. KMS production, send-start, provider
+    I/O/readback/outcome, C settlement, Store/route/launcher/task/retry/delete/
+    list/cleanup/acknowledgement wiring remain absent.
   - [x] Bind the production-facing selected-screenshot A receipt to the exact
     permanent B attempt. The version-2 request uses a distinct operation domain,
     carries the B binding commitment, reconstructs the full B row and typed
