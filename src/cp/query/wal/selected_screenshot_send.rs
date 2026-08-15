@@ -503,6 +503,51 @@ pub(super) fn prepare_selected_screenshot_send_started(
     Ok(Some(SelectedScreenshotSendStartedPlan::new(&candidate)?))
 }
 
+/// Reauthenticates one exact durable marker and its candidate from the complete
+/// provider binding. No DEK, ciphertext, enumeration, or provider capability
+/// crosses this terminal-settlement helper.
+pub(super) fn authenticate_selected_screenshot_send_provider_facts(
+    connection: &Connection,
+    facts: &SelectedScreenshotSendProviderFacts<'_>,
+) -> Result<()> {
+    let candidate_receipt = SelectedScreenshotUploadCandidateReceipt::from_terminal_facts(
+        facts.image_id.to_owned(),
+        facts.object_key.to_owned(),
+        facts.attempt_binding_commitment,
+        facts.wrapped_dek_commitment,
+        facts.media_dek_binding_commitment,
+        facts.aad_commitment,
+        facts.ciphertext_length,
+        facts.ciphertext_sha256,
+        facts.candidate_binding_commitment,
+    )?;
+    let receipt = SelectedScreenshotSendStartedReceipt {
+        account_id: facts.account_id.to_owned(),
+        image_id: facts.image_id.to_owned(),
+        object_key: facts.object_key.to_owned(),
+        candidate_request_fingerprint: facts.candidate_request_fingerprint,
+        attempt_binding_commitment: facts.attempt_binding_commitment,
+        wrapped_dek_commitment: facts.wrapped_dek_commitment,
+        media_dek_binding_commitment: facts.media_dek_binding_commitment,
+        aad_commitment: facts.aad_commitment,
+        ciphertext_length: facts.ciphertext_length,
+        ciphertext_sha256: facts.ciphertext_sha256,
+        candidate_binding_commitment: facts.candidate_binding_commitment,
+        send_request_id: facts.send_request_id.to_owned(),
+        send_binding_commitment: facts.send_binding_commitment,
+    };
+    let plan = SelectedScreenshotSendStartedPlan {
+        operation_id: derive_operation_id(facts.image_id)?,
+        candidate_receipt,
+        receipt,
+    };
+    let prepared =
+        PreparedLogicalMutation::prepare(plan).map_err(|_| WalIdempotencyError::Corrupt)?;
+    SelectedScreenshotSendStartedLedger::lookup(connection, &prepared)?
+        .ok_or(WalIdempotencyError::Precondition)?;
+    Ok(())
+}
+
 fn authenticate_candidate(
     connection: &Connection,
     plan: &SelectedScreenshotSendStartedPlan,

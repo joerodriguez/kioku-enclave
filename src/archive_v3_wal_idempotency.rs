@@ -447,6 +447,8 @@ impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotUploadCandi
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotUploadCandidateLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotSendStartedPlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotSendStartedLedger {}
+impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotTerminationPlan {}
+impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotTerminationLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::FinalizationQueueLedger {}
 impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan {}

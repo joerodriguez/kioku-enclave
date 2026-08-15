@@ -300,8 +300,10 @@ separate activation blockers.
     ledger capacity exhaustion, late readback failure, partial schema, tamper,
     and reopen fail closed or exactly replay. Random/clock/DEK
     allocation, media bytes, encryption/provider I/O, Store/route/launcher/task/
-    retry/cleanup/acknowledgement wiring and authenticated C
-    rejection/termination release remain separate reviewed slices.
+    retry/cleanup/acknowledgement wiring remain absent. The separately reviewed
+    authenticated C termination child now releases only an exact definitive-
+    no-object reservation for a different target; the original target remains
+    permanently burned.
   - [x] Add the inactive selected-screenshot ciphertext-candidate continuation.
     Its constructor accepts only the exact attempt binding, typed installed-
     media-DEK receipt, borrowed validated JPEG/DEK, and caller-supplied
@@ -319,8 +321,9 @@ separate activation blockers.
     exhaustion, partial schema, row/counter tamper, and late readback failure
     reject or roll back. Its authenticated payload/loader/ciphertext getter are
     confined to the private WAL family. KMS production, send-start, provider
-    I/O/readback/outcome, C settlement, Store/route/launcher/task/retry/delete/
-    list/cleanup/acknowledgement wiring remain absent.
+    I/O/readback/outcome, Store/route/launcher/task/retry/delete/list/cleanup/
+    acknowledgement wiring remain absent; the separate inactive C child blocks
+    new candidate admission after an exact terminal.
   - [x] Add the inactive selected-screenshot `SendStarted` continuation. Its
     constructor accepts only the private exact-name candidate payload that was
     reauthenticated with the borrowed media DEK. It derives one deterministic
@@ -339,22 +342,43 @@ separate activation blockers.
     provider-proof child can consume the latter. Changed
     candidate/marker/request facts, consumed first
     apply, partial schema, row/counter tamper, and late readback failure reject
-    or roll back. Provider construction/I/O/readback/outcome authentication, C
-    settlement, KMS production, Store/route/launcher/task/retry/delete/list/
-    cleanup/acknowledgement wiring remain absent.
+    or roll back. Provider construction/I/O/readback/outcome authentication,
+    KMS production, Store/route/launcher/task/retry/delete/list/cleanup/
+    acknowledgement wiring remain absent; the separate inactive C child fences
+    provider preparation after an exact terminal.
   - [x] Add the inactive provider-neutral selected-screenshot outcome proof
     boundary. It can prepare only from the exact-name, DEK-authenticated
     `SendStarted` marker plus the exact installed wrapped DEK, then grants an
     injected transport only one conditional create and one bounded exact-name
-    readback. Exact ciphertext, wrapped-key metadata, request identity, and a
+    readback. Before returning the sole owned request, one immediate transaction
+    retains a bounded full-binding execution claim; duplicate preparation or a
+    lost request is fail-closed/manual rather than retry authority. Exact
+    ciphertext, wrapped-key metadata, request identity, and a
     positive generation mint a non-cloneable accepted proof. Only a separately
     classified definitive no-create response followed by exact absence mints a
     non-cloneable rejection proof. Lost/unknown/unavailable outcomes retain the
     reservation, while collisions, malformed evidence, claimed creates without
     exact readback, and protocol/size faults require manual handling. It never
     retries and has no concrete transport, GCS/Store client, enumeration,
-    delete, KMS, clock/randomness, C settlement, A settlement, route, launcher,
-    task, cleanup, acknowledgement, startup, or serving wiring.
+    delete, KMS, clock/randomness, A settlement, route, launcher, task, cleanup,
+    acknowledgement, startup, or serving wiring. Its rejection proof can be
+    consumed only by the separate inactive C child below.
+  - [x] Add the inactive selected-screenshot definitive-no-object C settlement.
+    Its constructor consumes only the provider boundary's non-cloneable
+    rejection proof plus a caller-fixed canonical observation time. One
+    immediate transaction reauthenticates the exact execution claim, complete
+    permanent B attempt, ciphertext candidate, `SendStarted` marker, exact
+    rejection proof, and continued absence of any local or A-v2 result before inserting a distinct
+    unit-result terminal ledger with full counter CAS and exact readback.
+    Exact replay and exact-name restart reauthenticate the entire chain without
+    retrying the provider. The original target stays permanently burned, while
+    only a fully authenticated terminal releases its episode count/bytes for a
+    different target; missing, partial, conflicting, or tampered C state stays
+    reserved fail-closed. A-v2 admission, new candidate admission, and provider
+    request preparation reject the exact terminal. Unknown/unavailable/manual
+    outcomes cannot construct C. It has no provider transport, retry, Store,
+    KMS, list/delete, clock/randomness, route, launcher, task, cleanup,
+    acknowledgement, startup, or serving wiring.
   - [x] Bind the production-facing selected-screenshot A receipt to the exact
     permanent B attempt. The version-2 request uses a distinct operation domain,
     carries the B binding commitment, reconstructs the full B row and typed
@@ -364,9 +388,9 @@ separate activation blockers.
     exact local result, and source/member topology. Missing, substituted, or
     tampered attempts, rebound results, and a late binding failure roll back or
     fail closed; the historical unbound v1 constructor remains test-only.
-    Provider receipt authentication, DEK/encryption/upload, C rejection and
-    termination release, Store/route/launcher/task/retry/cleanup/acknowledgement
-    wiring remain separate reviewed slices.
+    Exact C termination now blocks this local A settlement. Provider-accepted
+    receipt authentication, DEK/encryption/upload, Store/route/launcher/task/
+    retry/cleanup/acknowledgement wiring remain separate reviewed slices.
   - [x] Add the inactive caller-stable finalization-queue A-domain: an exact
     128-bit request ID plus stable account derive the opaque operation before
     actor admission, while the episode, fixed target version, caller-supplied

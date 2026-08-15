@@ -15,7 +15,7 @@
 //! a claimed create, and collisions remain unresolved or manual and retain all
 //! durable budget reservation.
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -29,6 +29,13 @@ use super::selected_screenshot_send::{
 const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
 const ACCEPTED_BINDING_DOMAIN: &[u8] = b"selected-screenshot-provider-accepted-v1\0";
 const REJECTED_BINDING_DOMAIN: &[u8] = b"selected-screenshot-provider-definitive-no-object-v1\0";
+const EXECUTION_CLAIM_DOMAIN: &[u8] = b"selected-screenshot-provider-execution-claim-v1\0";
+const EXECUTION_CLAIM_SCHEMA_TABLE: &str =
+    "archive_v3_wal_selected_screenshot_provider_execution_schema";
+const EXECUTION_CLAIM_TABLE: &str = "archive_v3_wal_selected_screenshot_provider_executions";
+const EXECUTION_CLAIM_STATE_TABLE: &str =
+    "archive_v3_wal_selected_screenshot_provider_execution_state";
+const MAX_EXECUTION_CLAIMS: u32 = 1_048_576;
 const MAX_ACCOUNT_ID_BYTES: usize = 128;
 const MAX_OBJECT_KEY_BYTES: usize = 512;
 const MAX_WRAPPED_DEK_B64_BYTES: usize = 24 * 1024;
@@ -166,6 +173,82 @@ impl SelectedScreenshotProviderBinding {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_terminal_facts(
+        account_id: String,
+        image_id: String,
+        object_key: String,
+        candidate_request_fingerprint: [u8; 32],
+        attempt_binding_commitment: [u8; 32],
+        wrapped_dek_commitment: [u8; 32],
+        media_dek_binding_commitment: [u8; 32],
+        aad_commitment: [u8; 32],
+        ciphertext_length: u32,
+        ciphertext_sha256: [u8; 32],
+        candidate_binding_commitment: [u8; 32],
+        send_request_id: String,
+        send_binding_commitment: [u8; 32],
+    ) -> Result<Self> {
+        crate::store::validate_user_id(&account_id).map_err(|_| WalIdempotencyError::Corrupt)?;
+        let expected_object_key =
+            crate::store::selected_evidence_media_object_key(&account_id, &image_id)
+                .map_err(|_| WalIdempotencyError::Corrupt)?;
+        if account_id.len() > MAX_ACCOUNT_ID_BYTES
+            || !super::valid_lower_hex(&image_id, 32)
+            || object_key != expected_object_key
+            || object_key.is_empty()
+            || object_key.len() > MAX_OBJECT_KEY_BYTES
+            || ciphertext_length == 0
+            || !super::valid_lower_hex(&send_request_id, SEND_REQUEST_ID_BYTES)
+            || [
+                candidate_request_fingerprint,
+                attempt_binding_commitment,
+                wrapped_dek_commitment,
+                media_dek_binding_commitment,
+                aad_commitment,
+                ciphertext_sha256,
+                candidate_binding_commitment,
+                send_binding_commitment,
+            ]
+            .contains(&[0; 32])
+        {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        Ok(Self {
+            account_id,
+            image_id,
+            object_key,
+            candidate_request_fingerprint,
+            attempt_binding_commitment,
+            wrapped_dek_commitment,
+            media_dek_binding_commitment,
+            aad_commitment,
+            ciphertext_length,
+            ciphertext_sha256,
+            candidate_binding_commitment,
+            send_request_id,
+            send_binding_commitment,
+        })
+    }
+
+    pub(super) fn send_facts(&self) -> SelectedScreenshotSendProviderFacts<'_> {
+        SelectedScreenshotSendProviderFacts {
+            account_id: &self.account_id,
+            image_id: &self.image_id,
+            object_key: &self.object_key,
+            candidate_request_fingerprint: self.candidate_request_fingerprint,
+            attempt_binding_commitment: self.attempt_binding_commitment,
+            wrapped_dek_commitment: self.wrapped_dek_commitment,
+            media_dek_binding_commitment: self.media_dek_binding_commitment,
+            aad_commitment: self.aad_commitment,
+            ciphertext_length: self.ciphertext_length,
+            ciphertext_sha256: self.ciphertext_sha256,
+            candidate_binding_commitment: self.candidate_binding_commitment,
+            send_request_id: &self.send_request_id,
+            send_binding_commitment: self.send_binding_commitment,
+        }
+    }
+
     pub(super) fn account_id(&self) -> &str {
         &self.account_id
     }
@@ -290,6 +373,14 @@ impl SelectedScreenshotProviderRejectedNoObject {
     pub(super) const fn rejection_commitment(&self) -> [u8; 32] {
         self.rejection_commitment
     }
+
+    pub(super) fn into_parts(self) -> (SelectedScreenshotProviderBinding, [u8; 32], [u8; 32]) {
+        (
+            self.binding,
+            self.evidence_commitment,
+            self.rejection_commitment,
+        )
+    }
 }
 
 impl std::fmt::Debug for SelectedScreenshotProviderRejectedNoObject {
@@ -327,8 +418,10 @@ pub(super) fn prepare_selected_screenshot_provider_request(
     image_id: &str,
     plaintext_dek: &Dek,
 ) -> Result<Option<SelectedScreenshotProviderRequest>> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
     let Some(authenticated) = load_authenticated_selected_screenshot_send_started(
-        connection,
+        &transaction,
         account_id,
         image_id,
         plaintext_dek,
@@ -337,7 +430,14 @@ pub(super) fn prepare_selected_screenshot_provider_request(
         return Ok(None);
     };
     let binding = SelectedScreenshotProviderBinding::from_authenticated_send(&authenticated)?;
-    let wrapped_dek_b64 = connection
+    super::selected_screenshot_termination::ensure_attempt_not_terminated(
+        &transaction,
+        binding.account_id(),
+        binding.image_id(),
+        binding.object_key(),
+        &binding.attempt_binding_commitment(),
+    )?;
+    let wrapped_dek_b64 = transaction
         .query_row(
             "SELECT value FROM app_metadata WHERE key=?1",
             [MEDIA_DEK_METADATA_KEY],
@@ -347,11 +447,16 @@ pub(super) fn prepare_selected_screenshot_provider_request(
         .map_err(|_| WalIdempotencyError::Unavailable)?
         .ok_or(WalIdempotencyError::Corrupt)?;
     validate_wrapped_dek(&wrapped_dek_b64, &binding.wrapped_dek_commitment)?;
-    Ok(Some(SelectedScreenshotProviderRequest {
+    claim_provider_execution(&transaction, &binding)?;
+    let request = SelectedScreenshotProviderRequest {
         binding,
         ciphertext: Zeroizing::new(authenticated.ciphertext().to_vec()),
         wrapped_dek_b64: Zeroizing::new(wrapped_dek_b64),
-    }))
+    };
+    transaction
+        .commit()
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    Ok(Some(request))
 }
 
 /// Perform exactly one create attempt and one exact readback. This function
@@ -490,6 +595,246 @@ fn validate_wrapped_dek(value: &str, expected_commitment: &[u8; 32]) -> Result<(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionClaimSchemaState {
+    Absent,
+    Present,
+}
+
+/// Atomically and permanently admits the sole provider execution for this
+/// `SendStarted` binding. Losing the returned in-memory request after commit is
+/// fail-closed/manual; the boundary deliberately has no retry authority.
+fn claim_provider_execution(
+    transaction: &Transaction<'_>,
+    binding: &SelectedScreenshotProviderBinding,
+) -> Result<()> {
+    ensure_execution_claim_schema(transaction)?;
+    let collisions = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM archive_v3_wal_selected_screenshot_provider_executions
+             WHERE image_id=?1 OR object_key=?2 OR attempt_binding_commitment=?3
+                OR send_request_id=?4 OR send_binding_commitment=?5",
+            params![
+                binding.image_id,
+                binding.object_key,
+                binding.attempt_binding_commitment.as_slice(),
+                binding.send_request_id,
+                binding.send_binding_commitment.as_slice(),
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    if collisions != 0 {
+        if collisions != 1 {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        authenticate_provider_execution_claim(transaction, binding)?;
+        return Err(WalIdempotencyError::Precondition);
+    }
+    let row_count = load_execution_claim_state(transaction)?;
+    if row_count >= MAX_EXECUTION_CLAIMS {
+        return Err(WalIdempotencyError::Limit);
+    }
+    let claim_commitment = derive_execution_claim_commitment(binding)?;
+    transaction
+        .execute(
+            "INSERT INTO archive_v3_wal_selected_screenshot_provider_executions
+             (claim_commitment,account_id,image_id,object_key,
+              attempt_binding_commitment,send_request_id,send_binding_commitment)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                claim_commitment.as_slice(),
+                binding.account_id,
+                binding.image_id,
+                binding.object_key,
+                binding.attempt_binding_commitment.as_slice(),
+                binding.send_request_id,
+                binding.send_binding_commitment.as_slice(),
+            ],
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    let changed = transaction
+        .execute(
+            "UPDATE archive_v3_wal_selected_screenshot_provider_execution_state
+             SET row_count=row_count+1 WHERE singleton=1 AND row_count=?1",
+            [i64::from(row_count)],
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    if changed != 1 {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    authenticate_provider_execution_claim(transaction, binding)?;
+    if load_execution_claim_state(transaction)? != row_count.saturating_add(1) {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Reauthenticates the unique durable execution claim consumed by a C
+/// terminal. Missing, partial, colliding, or tampered state is corruption; it
+/// can never authorize release.
+pub(super) fn authenticate_provider_execution_claim(
+    connection: &Connection,
+    binding: &SelectedScreenshotProviderBinding,
+) -> Result<()> {
+    if execution_claim_schema_state(connection)? != ExecutionClaimSchemaState::Present {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    validate_execution_claim_schema(connection)?;
+    let expected = derive_execution_claim_commitment(binding)?;
+    let stored = connection
+        .query_row(
+            "SELECT claim_commitment,account_id,image_id,object_key,
+                    attempt_binding_commitment,send_request_id,send_binding_commitment
+             FROM archive_v3_wal_selected_screenshot_provider_executions
+             WHERE image_id=?1",
+            [binding.image_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    if stored.0.as_slice() != expected
+        || stored.1 != binding.account_id
+        || stored.2 != binding.image_id
+        || stored.3 != binding.object_key
+        || stored.4.as_slice() != binding.attempt_binding_commitment
+        || stored.5 != binding.send_request_id
+        || stored.6.as_slice() != binding.send_binding_commitment
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    Ok(())
+}
+
+fn execution_claim_schema_state(connection: &Connection) -> Result<ExecutionClaimSchemaState> {
+    let present = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='table' AND name IN (?1,?2,?3)",
+            params![
+                EXECUTION_CLAIM_SCHEMA_TABLE,
+                EXECUTION_CLAIM_TABLE,
+                EXECUTION_CLAIM_STATE_TABLE,
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    match present {
+        0 => Ok(ExecutionClaimSchemaState::Absent),
+        3 => Ok(ExecutionClaimSchemaState::Present),
+        _ => Err(WalIdempotencyError::Corrupt),
+    }
+}
+
+fn ensure_execution_claim_schema(transaction: &Transaction<'_>) -> Result<()> {
+    match execution_claim_schema_state(transaction)? {
+        ExecutionClaimSchemaState::Present => validate_execution_claim_schema(transaction),
+        ExecutionClaimSchemaState::Absent => {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE archive_v3_wal_selected_screenshot_provider_execution_schema (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                        format_version INTEGER NOT NULL CHECK(format_version=1),
+                        codec_version INTEGER NOT NULL CHECK(codec_version=1)
+                     ) STRICT;
+                     CREATE TABLE archive_v3_wal_selected_screenshot_provider_executions (
+                        claim_commitment BLOB PRIMARY KEY NOT NULL,
+                        account_id TEXT NOT NULL,
+                        image_id TEXT NOT NULL UNIQUE,
+                        object_key TEXT NOT NULL UNIQUE,
+                        attempt_binding_commitment BLOB NOT NULL UNIQUE,
+                        send_request_id TEXT NOT NULL UNIQUE,
+                        send_binding_commitment BLOB NOT NULL UNIQUE,
+                        CHECK(length(claim_commitment)=32 AND claim_commitment<>zeroblob(32)),
+                        CHECK(length(account_id) BETWEEN 1 AND 128),
+                        CHECK(length(image_id)=32),
+                        CHECK(length(object_key) BETWEEN 1 AND 512),
+                        CHECK(length(attempt_binding_commitment)=32 AND attempt_binding_commitment<>zeroblob(32)),
+                        CHECK(length(send_request_id)=64),
+                        CHECK(length(send_binding_commitment)=32 AND send_binding_commitment<>zeroblob(32))
+                     ) STRICT, WITHOUT ROWID;
+                     CREATE TABLE archive_v3_wal_selected_screenshot_provider_execution_state (
+                        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                        row_count INTEGER NOT NULL CHECK(row_count BETWEEN 0 AND 1048576)
+                     ) STRICT;
+                     INSERT INTO archive_v3_wal_selected_screenshot_provider_execution_schema
+                        (singleton,format_version,codec_version) VALUES (1,1,1);
+                     INSERT INTO archive_v3_wal_selected_screenshot_provider_execution_state
+                        (singleton,row_count) VALUES (1,0);",
+                )
+                .map_err(|_| WalIdempotencyError::Unavailable)?;
+            validate_execution_claim_schema(transaction)
+        }
+    }
+}
+
+fn validate_execution_claim_schema(connection: &Connection) -> Result<()> {
+    let marker = connection
+        .query_row(
+            "SELECT format_version,codec_version
+             FROM archive_v3_wal_selected_screenshot_provider_execution_schema
+             WHERE singleton=1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
+    if marker != Some((1, 1)) {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let _ = load_execution_claim_state(connection)?;
+    Ok(())
+}
+
+fn load_execution_claim_state(connection: &Connection) -> Result<u32> {
+    let stored = connection
+        .query_row(
+            "SELECT row_count
+             FROM archive_v3_wal_selected_screenshot_provider_execution_state
+             WHERE singleton=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Corrupt)?
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    let row_count = u32::try_from(stored).map_err(|_| WalIdempotencyError::Corrupt)?;
+    let actual = connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_v3_wal_selected_screenshot_provider_executions",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
+    if row_count > MAX_EXECUTION_CLAIMS || actual != i64::from(row_count) {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    Ok(row_count)
+}
+
+fn derive_execution_claim_commitment(
+    binding: &SelectedScreenshotProviderBinding,
+) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(EXECUTION_CLAIM_DOMAIN);
+    hash_provider_binding(&mut hasher, binding)?;
+    let commitment: [u8; 32] = hasher.finalize().into();
+    (commitment != [0; 32])
+        .then_some(commitment)
+        .ok_or(WalIdempotencyError::Corrupt)
+}
+
 fn readback_matches(
     request: &SelectedScreenshotProviderRequest,
     readback: &SelectedScreenshotProviderReadback,
@@ -538,6 +883,16 @@ fn derive_rejected_commitment(
     let commitment: [u8; 32] = hasher.finalize().into();
     (commitment != [0; 32])
         .then_some(commitment)
+        .ok_or(WalIdempotencyError::Corrupt)
+}
+
+pub(super) fn authenticate_rejected_no_object_facts(
+    binding: &SelectedScreenshotProviderBinding,
+    evidence_commitment: &[u8; 32],
+    rejection_commitment: &[u8; 32],
+) -> Result<()> {
+    (derive_rejected_commitment(binding, evidence_commitment)? == *rejection_commitment)
+        .then_some(())
         .ok_or(WalIdempotencyError::Corrupt)
 }
 
@@ -826,6 +1181,20 @@ mod tests {
         (connection, dek)
     }
 
+    fn send_started_fixture() -> (Connection, Dek) {
+        let (mut connection, dek) = candidate_ready_fixture();
+        let send_plan =
+            prepare_selected_screenshot_send_started(&connection, ACCOUNT, IMAGE_ID, &dek)
+                .unwrap()
+                .unwrap();
+        execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(send_plan).unwrap(),
+        )
+        .unwrap();
+        (connection, dek)
+    }
+
     #[test]
     fn preparation_requires_exact_send_marker_and_installed_wrapper() {
         let (mut connection, dek) = candidate_ready_fixture();
@@ -855,6 +1224,11 @@ mod tests {
             usize::try_from(prepared.binding.ciphertext_length()).unwrap()
         );
         assert!(!prepared.wrapped_dek_b64.is_empty());
+        assert_eq!(
+            prepare_selected_screenshot_provider_request(&connection, ACCOUNT, IMAGE_ID, &dek)
+                .err(),
+            Some(WalIdempotencyError::Precondition)
+        );
 
         connection
             .execute(
@@ -866,6 +1240,87 @@ mod tests {
             prepare_selected_screenshot_provider_request(&connection, ACCOUNT, IMAGE_ID, &dek)
                 .unwrap_err(),
             WalIdempotencyError::Corrupt
+        );
+    }
+
+    #[test]
+    fn execution_claim_partial_schema_late_readback_and_counter_tamper_fail_closed() {
+        let (partial, partial_dek) = send_started_fixture();
+        partial
+            .execute_batch(
+                "CREATE TABLE archive_v3_wal_selected_screenshot_provider_execution_schema (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    format_version INTEGER NOT NULL CHECK(format_version=1),
+                    codec_version INTEGER NOT NULL CHECK(codec_version=1)
+                 ) STRICT;",
+            )
+            .unwrap();
+        assert_eq!(
+            prepare_selected_screenshot_provider_request(
+                &partial,
+                ACCOUNT,
+                IMAGE_ID,
+                &partial_dek,
+            )
+            .err(),
+            Some(WalIdempotencyError::Corrupt)
+        );
+
+        let (mut late, late_dek) = send_started_fixture();
+        let transaction = late.transaction().unwrap();
+        ensure_execution_claim_schema(&transaction).unwrap();
+        transaction.commit().unwrap();
+        late.execute_batch(
+            "CREATE TRIGGER corrupt_provider_execution_claim_readback
+             AFTER INSERT ON archive_v3_wal_selected_screenshot_provider_executions
+             BEGIN
+               UPDATE archive_v3_wal_selected_screenshot_provider_executions
+               SET claim_commitment=X'0101010101010101010101010101010101010101010101010101010101010101'
+               WHERE image_id=NEW.image_id;
+             END;",
+        )
+        .unwrap();
+        assert_eq!(
+            prepare_selected_screenshot_provider_request(&late, ACCOUNT, IMAGE_ID, &late_dek).err(),
+            Some(WalIdempotencyError::Corrupt)
+        );
+        assert_eq!(
+            late.query_row(
+                "SELECT COUNT(*) FROM archive_v3_wal_selected_screenshot_provider_executions",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(load_execution_claim_state(&late).unwrap(), 0);
+
+        let (tampered, tampered_dek) = send_started_fixture();
+        let request = prepare_selected_screenshot_provider_request(
+            &tampered,
+            ACCOUNT,
+            IMAGE_ID,
+            &tampered_dek,
+        )
+        .unwrap()
+        .unwrap();
+        drop(request);
+        tampered
+            .execute(
+                "UPDATE archive_v3_wal_selected_screenshot_provider_execution_state
+                 SET row_count=0 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            prepare_selected_screenshot_provider_request(
+                &tampered,
+                ACCOUNT,
+                IMAGE_ID,
+                &tampered_dek,
+            )
+            .err(),
+            Some(WalIdempotencyError::Corrupt)
         );
     }
 

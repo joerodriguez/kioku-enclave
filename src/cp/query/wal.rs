@@ -21,6 +21,7 @@ mod finalization_queue;
 mod selected_screenshot_attempt;
 mod selected_screenshot_provider;
 mod selected_screenshot_send;
+mod selected_screenshot_termination;
 mod selected_screenshot_upload;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
 pub(crate) use selected_screenshot_attempt::{
@@ -28,6 +29,9 @@ pub(crate) use selected_screenshot_attempt::{
 };
 pub(crate) use selected_screenshot_send::{
     SelectedScreenshotSendStartedLedger, SelectedScreenshotSendStartedPlan,
+};
+pub(crate) use selected_screenshot_termination::{
+    SelectedScreenshotTerminationLedger, SelectedScreenshotTerminationPlan,
 };
 pub(crate) use selected_screenshot_upload::{
     SelectedScreenshotUploadCandidateLedger, SelectedScreenshotUploadCandidatePlan,
@@ -77,6 +81,38 @@ pub(in crate::cp::query) fn prepare_selected_screenshot_send_started(
         image_id,
         plaintext_dek,
     )
+}
+
+fn ensure_no_bound_selected_screenshot_result_ledger(
+    connection: &Connection,
+    image_id: &str,
+) -> Result<()> {
+    if schema_state(connection)? == LedgerSchemaState::Absent {
+        return Ok(());
+    }
+    validate_schema_marker(connection)?;
+    let mut source = Vec::with_capacity(
+        BOUND_OPERATION_SOURCE_DOMAIN
+            .len()
+            .saturating_add(image_id.len()),
+    );
+    source.extend_from_slice(BOUND_OPERATION_SOURCE_DOMAIN);
+    source.extend_from_slice(image_id.as_bytes());
+    let operation_id =
+        WalLogicalOperationId::from_stable_source(WalOperationKind::SelectedScreenshot, &source)?;
+    let present = connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_v3_wal_selected_screenshot_operations
+             WHERE operation_id=?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    match present {
+        0 => Ok(()),
+        1 => Err(WalIdempotencyError::Precondition),
+        _ => Err(WalIdempotencyError::Corrupt),
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -425,18 +461,28 @@ impl SelectedScreenshotPlan {
             SelectedScreenshotRequestContract::UnboundV1 => Ok(None),
             SelectedScreenshotRequestContract::BoundV2 {
                 attempt_binding_commitment,
-            } => selected_screenshot_attempt::authenticate_selected_screenshot_attempt_binding(
-                connection,
-                &self.account_id,
-                &self.image_id,
-                &self.object_key,
-                self.episode_id,
-                &self.source_key,
-                &self.captured_at,
-                &self.jpeg,
-                &attempt_binding_commitment,
-            )
-            .map(Some),
+            } => {
+                let screenshot_id =
+                    selected_screenshot_attempt::authenticate_selected_screenshot_attempt_binding(
+                        connection,
+                        &self.account_id,
+                        &self.image_id,
+                        &self.object_key,
+                        self.episode_id,
+                        &self.source_key,
+                        &self.captured_at,
+                        &self.jpeg,
+                        &attempt_binding_commitment,
+                    )?;
+                selected_screenshot_termination::ensure_attempt_not_terminated(
+                    connection,
+                    &self.account_id,
+                    &self.image_id,
+                    &self.object_key,
+                    &attempt_binding_commitment,
+                )?;
+                Ok(Some(screenshot_id))
+            }
         }
     }
 }

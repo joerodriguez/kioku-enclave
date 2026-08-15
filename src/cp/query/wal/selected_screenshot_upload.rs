@@ -70,6 +70,50 @@ pub(crate) struct SelectedScreenshotUploadCandidateReceipt {
 }
 
 impl SelectedScreenshotUploadCandidateReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_terminal_facts(
+        image_id: String,
+        object_key: String,
+        attempt_binding_commitment: [u8; 32],
+        wrapped_dek_commitment: [u8; 32],
+        media_dek_binding_commitment: [u8; 32],
+        aad_commitment: [u8; 32],
+        ciphertext_length: u32,
+        ciphertext_sha256: [u8; 32],
+        candidate_binding_commitment: [u8; 32],
+    ) -> Result<Self> {
+        if !super::valid_lower_hex(&image_id, 32)
+            || object_key.is_empty()
+            || object_key.len() > MAX_OBJECT_KEY_BYTES
+            || ciphertext_length == 0
+            || usize::try_from(ciphertext_length)
+                .ok()
+                .is_none_or(|length| length > MAX_CIPHERTEXT_BYTES)
+            || [
+                attempt_binding_commitment,
+                wrapped_dek_commitment,
+                media_dek_binding_commitment,
+                aad_commitment,
+                ciphertext_sha256,
+                candidate_binding_commitment,
+            ]
+            .contains(&[0; 32])
+        {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        Ok(Self {
+            image_id,
+            object_key,
+            attempt_binding_commitment,
+            wrapped_dek_commitment,
+            media_dek_binding_commitment,
+            aad_commitment,
+            ciphertext_length,
+            ciphertext_sha256,
+            candidate_binding_commitment,
+        })
+    }
+
     pub(super) fn image_id(&self) -> &str {
         &self.image_id
     }

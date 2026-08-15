@@ -912,9 +912,10 @@ account/image/object/episode/source/time/JPEG facts, and obtains only the bound 
 It then atomically revalidates current eligibility, inserts or exactly adopts the complete local receipt
 under that screenshot ID, retains a bounded canonical response, and advances only its distinct
 1,048,576-row/512-MiB ledger. Exact post-insert lookup and every replay repeat B authentication,
-including the B child's exact local-result and source/member checks. Missing, substituted, or tampered B
-bindings, rebound screenshots, another object, cap exhaustion, late binding or ledger failure, partial
-schema, and reopen fail closed, roll back, or exactly replay. It cannot authenticate a provider upload
+including the B child's exact local-result and source/member checks. An exact C terminal also blocks
+the v2 result before any write. Missing, substituted, or tampered B bindings, rebound screenshots,
+another object, cap exhaustion, late binding or ledger failure, partial schema, and reopen fail closed,
+roll back, or exactly replay. It cannot authenticate a provider upload
 receipt, allocate a DEK or attempt, encrypt/upload/delete media, or call Store. The
 separately sealed selected-screenshot B identity now covers the pre-provider attempt half. A
 caller-fixed lowercase 128-bit attempt ID derives a subtype-separated operation identity, and the only
@@ -926,14 +927,16 @@ JPEG geometry/hash. One immediate transaction reserves the pending attempt again
 request, predecessor, binding, typed receipt, and exact-readback-validated row in a distinct
 1,048,576-row/128-MiB ledger. An exact matching local result moves those facts from pending to
 committed accounting without double-counting; any absent or inexact result leaves the permanent
-reservation fail-closed until a later authenticated C-domain settlement exists.
+reservation fail-closed unless a fully authenticated definitive-no-object C terminal releases that
+count/byte budget for a different target.
 Reuse of an attempt with changed facts is a fingerprint conflict; an alternate attempt cannot reserve
 the same source target, while a different eligible target gets a different identity. A stale or
 already-consumed target, pending-budget overbooking, rebound result screenshot, late readback mismatch,
 partial schema, permanent-row tamper, or restart fails closed or exactly replays. This B child cannot
 allocate randomness, a clock, or a DEK; access media bytes; encrypt, upload, read, list, or delete a
 provider object; call Store; launch or retry work; terminalize/release a rejected reservation; clean
-up; or acknowledge a request. The A selected-screenshot receipt now consumes this exact binding, while
+up; or acknowledge a request. The separate C child owns that terminalization. The A
+selected-screenshot receipt now consumes this exact binding, while
 the separately sealed ciphertext-candidate continuation supplies only the next durable local step.
 Its production constructor accepts the exact B binding, typed installed-media-DEK receipt, borrowed
 validated JPEG/DEK, and caller-supplied context-bound ciphertext. Before actor admission it checks the
@@ -963,9 +966,9 @@ the private WAL family; its parent receives only an opaque marker plan from a WA
 post-marker payload, loader, and ciphertext getter are now WAL-private too, and only the provider-proof
 child can consume them. It cannot enumerate work, acquire a
 key/provider, or infer an outcome. There is no
-KMS call, provider create/read, provider outcome/readback classification, C settlement,
-Store/route/launcher/task/retry/delete/list/cleanup/acknowledgement wiring. Those remain separate
-activation blockers. A separately sealed provider-neutral continuation now prepares only from the
+KMS call, provider create/read, provider outcome/readback classification,
+Store/route/launcher/task/retry/delete/list/cleanup/acknowledgement wiring. The separate inactive C
+child consumes only an exact definitive-no-object proof. A separately sealed provider-neutral continuation now prepares only from the
 exact-name, DEK-authenticated `SendStarted` payload and the exact installed wrapped DEK. Its injected
 transport receives only one conditional create and one bounded exact-name readback; it has no retry,
 list, or delete operation. An exact readback must match the object key, retained ciphertext, wrapped
@@ -977,9 +980,23 @@ same response with absence remains unknown. A precondition response without exac
 readback, a claimed create without readback, conflicting bytes/metadata, zero rejection evidence,
 and protocol or size faults become manual and retain the B reservation. Both proof commitments bind
 the complete B/candidate/DEK/AAD/ciphertext/send tuple under distinct domains, and raw provider bodies
-never cross the seam. This slice has no concrete provider implementation or production caller and
-cannot persist A or C settlement, call Store/KMS, enumerate/delete objects, allocate time/randomness,
-launch work, acknowledge a route, or activate serving. Those remain separate activation blockers. The
+never cross the seam. Before returning the sole provider request, one `BEGIN IMMEDIATE` admits a
+bounded, full-binding-derived execution claim with exact row/counter readback; duplicate preparation
+fails, and losing that owned request is manual rather than retry authority. This provider slice has no
+concrete implementation or production caller and cannot itself persist A or C settlement, call
+Store/KMS, enumerate/delete objects, allocate time/randomness, launch work, acknowledge a route, or
+activate serving. Its definitive-no-object proof is consumed only by a separately sealed C child.
+That child accepts a caller-fixed canonical observation time and, in one `BEGIN IMMEDIATE`,
+reauthenticates the exact execution claim, permanent B attempt, ciphertext candidate, `SendStarted`
+marker, rejection proof, and absence of local/A-v2 settlement before retaining a bounded unit
+terminal row. Exact replay and exact-name restart reauthenticate the entire chain without reissuing
+provider I/O. The original source target stays permanently burned, while only a fully authenticated C
+row releases its pending episode count/bytes for another target; partial, conflicting, or tampered C
+state keeps the reservation fail-closed. A-v2 settlement, new candidate admission, and provider
+request preparation all reject the terminal, so reopening cannot recreate send authority. Unknown,
+unavailable, collision, and manual outcomes cannot construct C. The C child has no provider, retry,
+Store/KMS, list/delete, clock/randomness, launcher, route, task, cleanup, acknowledgement, startup, or
+serving authority. Provider-accepted A settlement remains a separate activation blocker. The
 finalization-queue child accepts only a caller-stable 128-bit request identity fixed before actor
 admission, the exact stable account and episode, a caller-supplied canonical queue timestamp, and the
 complete eligible predecessor tuple including nullable finalization/version/error/timing facts. It
@@ -1118,12 +1135,13 @@ sealed B operation, its bounded context-bound ciphertext continuation authentica
 the installed media-DEK receipt without provider authority, and its exact-name send-start continuation
 now commits one deterministic request marker before any future provider call. The production-facing
 local A receipt consumes the exact attempt binding; the historical unbound A contract is test-only.
-Provider calls and the launcher remain absent.
+An exact definitive-no-object C terminal now reauthenticates the complete one-shot provider execution
+claim and predecessor chain, releases budget only for another target, and permanently fences local A,
+new candidate admission, and provider re-preparation. Provider calls and the launcher remain absent.
 Generic/audio/finalization Vertex begin and
 canonical media's KMS-authenticated DEK producer and encryption/provider upload handoff remain
 unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported
-are selected-screenshot KMS production, provider I/O/result settlement, and rejection/termination
-release.
+are selected-screenshot KMS production, concrete provider I/O, and provider-accepted A settlement.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK KMS
 production and upload/send boundaries, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
