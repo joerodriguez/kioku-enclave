@@ -954,6 +954,9 @@ impl X {
         substance_domain = (ROOT / "src/cp/summarizer/wal.rs").read_text(
             encoding="utf-8"
         )
+        visual_domain = (
+            ROOT / "src/cp/summarizer/wal/visual_evidence.rs"
+        ).read_text(encoding="utf-8")
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("pub(crate) mod wal;", media)
         self.assertIn(
@@ -1095,6 +1098,22 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", substance_domain)
         self.assertIn("WalIdempotencyError::Precondition", substance_domain)
         self.assertNotIn("SubstanceBackfillBatchPlan::", summarizer)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::summarizer::wal::VisualEvidenceBackfillBatchPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::summarizer::wal::VisualEvidenceBackfillBatchLedger",
+            gate,
+        )
+        self.assertIn("struct VisualEvidenceBackfillBatchPlan", visual_domain)
+        self.assertIn("struct VisualEvidenceBackfillBatchLedger", visual_domain)
+        self.assertIn(
+            "archive_v3_wal_visual_evidence_backfill_operations", visual_domain
+        )
+        self.assertIn("DomainLedgerBounds::new", visual_domain)
+        self.assertIn("WalIdempotencyError::Precondition", visual_domain)
+        self.assertNotIn("VisualEvidenceBackfillBatchPlan::", summarizer)
         self.assertNotIn("cp::summarizer::wal::", main)
         for forbidden in (
             "crate::store::Store",
@@ -1115,6 +1134,7 @@ impl X {
             self.assertNotIn(forbidden, webhook_domain)
             self.assertNotIn(forbidden, reviewer_domain)
             self.assertNotIn(forbidden, substance_domain)
+            self.assertNotIn(forbidden, visual_domain)
         for forbidden in (
             "begin_invocation(",
             "random_token_hex",
@@ -1200,6 +1220,21 @@ impl X {
             "reqwest::",
         ):
             self.assertNotIn(forbidden, substance_domain)
+        for forbidden in (
+            "reserve_vertex_output(",
+            "generate_custom(",
+            "with_user(",
+            "save_user(",
+            "random_token_hex",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+            "get_user_media(",
+            "decrypt_bound_blob(",
+            "jpeg_decoder",
+            "image::",
+        ):
+            self.assertNotIn(forbidden, visual_domain)
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")
