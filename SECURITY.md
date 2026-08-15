@@ -922,16 +922,19 @@ classification, predecessor product, outbox identity, request fingerprint, capac
 ledger commit, or restart tamper fails closed or exactly replays. The child cannot allocate a Vertex
 attempt, destination, delivery identity, handoff, or clock; invoke a model; call Store; launch work;
 send a delivery; schedule a retry; or acknowledge completion. The
-screen-storyboard-result child accepts only an already durable terminal Vertex event, its exact
-normalized provider-result commitment, caller-supplied canonical commit time, the complete leased
-screen-work/member/job/capture/media predecessor commitment, requested model, and one to twelve
-ordered frames with caller-fixed positive screenshot IDs. One transaction reauthenticates the
-attempt and every predecessor, inserts complete screenshots and screen observations, full-tuple
-settles each job and media row plus the work unit, exact-reads the final rows, and retains unit replay
+screen-storyboard-result v2 child accepts only an already durable terminal Vertex event, its exact
+normalized provider-result commitment, the permanent pre-provider binding commitment,
+caller-supplied canonical commit time, the complete leased screen-work/member/job/capture/media
+predecessor commitment, requested model, and one to twelve ordered frames with caller-fixed positive
+screenshot IDs. One transaction reauthenticates the complete attempt ledger row and typed receipt,
+requires its post-usage-stable work commitment to match the current terminal topology, reauthenticates
+every predecessor, inserts complete screenshots and screen observations, full-tuple settles each job
+and media row plus the work unit, exact-reads the final rows and newly inserted result-ledger row, and retains unit replay
 in a distinct 1,048,576-row/32-MiB ledger. A substituted attempt, changed input topology, target
 collision, time regression, capacity exhaustion, late ledger failure, partial schema, tamper, or
-restart fails closed or exactly replays. The sibling B boundary now durably records that attempt/work
-binding, but this result-v1 request does not yet consume it. This subtype accepts no person evidence and cannot create audio,
+restart fails closed or exactly replays; replay reauthenticates the permanent attempt binding. The
+historical v1 request identity and encoding remain test-covered behind a test-only constructor, while
+the production-facing constructor can create only the bound v2 request. This subtype accepts no person evidence and cannot create audio,
 person, identity, or voice rows; provider/media reads, automatic IDs, clocks, Store, launching,
 retry, and acknowledgement remain absent. The screen-attempt child is the first inactive B-domain
 identity refactor. Before provider I/O it accepts only a caller-fixed canonical attempt time, at
@@ -1029,8 +1032,9 @@ production codecs so far, together with the exact synthetic reviewer fixture and
 substance and visual-evidence backfills; every other A operation remains disabled
 pending its own separately reviewed codec and the closed launcher. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
-screen-storyboard Vertex-begin identity is the first separately sealed B operation, but its result
-integration, provider call, and launcher remain absent. Generic/audio/finalization Vertex begin and
+screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
+screen result now consumes its exact binding. The provider call and launcher remain absent.
+Generic/audio/finalization Vertex begin and
 canonical media's first DEK/provider upload handoff remain unsupported.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK first

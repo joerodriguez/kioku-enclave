@@ -223,9 +223,18 @@ separate activation blockers.
     expired or substituted work, cap exhaustion,
     late ledger failure, partial schema, tamper, and reopen fail closed or
     exactly replay; a genuinely renewed work attempt derives a new identity.
-    The result v1 child does not yet consume this binding, and media reads,
-    provider calls, clocks/random IDs, Store, worker/launcher/task/retry/
-    acknowledgement wiring remain absent.
+    The separately reviewed production-facing screen-result v2 contract now
+    consumes this binding; media reads, provider calls, clocks/random IDs,
+    Store, worker/launcher/task/retry/acknowledgement wiring remain absent.
+  - [x] Bind the inactive screen-storyboard result to the exact sealed Vertex
+    attempt: the version-2 request carries the binding commitment, reauthenticates
+    the complete permanent attempt row and typed receipt, and compares its
+    post-usage-stable work commitment to the current terminal work before any
+    result write. Replay reauthenticates the permanent binding, first apply
+    exact-reads its result ledger row before commit, and substituted work or
+    binding/ledger tamper fails closed. The historical v1 request identity and
+    encoding remain test-covered behind a test-only constructor; provider/media
+    I/O, Store, worker/launcher/task/retry/acknowledgement wiring remain absent.
   - [x] Add the inactive metadata-only screen-reference batch A-domain: the
     existing deterministic batch ID is subtype-separated from singular capture
     identity before actor admission, the complete normalized manifest vector is

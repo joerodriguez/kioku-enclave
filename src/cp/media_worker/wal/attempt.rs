@@ -293,7 +293,7 @@ impl WalLogicalDomainLedger<ScreenStoryboardAttemptPlan> for ScreenStoryboardAtt
         validate_schema_marker(connection)?;
         let row = connection
             .query_row(
-                "SELECT format_version,codec_version,request_fingerprint,
+                "SELECT operation_id,format_version,codec_version,request_fingerprint,
                         event_id,account_id,work_unit_id,predecessor_commitment,attempt_commitment,
                         requested_model,location,observed_at,binding_commitment,
                         result_bytes,result_commitment
@@ -435,6 +435,7 @@ impl WalLogicalDomainLedger<ScreenStoryboardAttemptPlan> for ScreenStoryboardAtt
 }
 
 struct StoredLedgerRow {
+    operation_id: Vec<u8>,
     format_version: i64,
     codec_version: i64,
     request_fingerprint: Vec<u8>,
@@ -454,25 +455,27 @@ struct StoredLedgerRow {
 impl StoredLedgerRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            format_version: row.get(0)?,
-            codec_version: row.get(1)?,
-            request_fingerprint: row.get(2)?,
-            event_id: row.get(3)?,
-            account_id: row.get(4)?,
-            work_unit_id: row.get(5)?,
-            predecessor_commitment: row.get(6)?,
-            attempt_commitment: row.get(7)?,
-            requested_model: row.get(8)?,
-            location: row.get(9)?,
-            observed_at: row.get(10)?,
-            binding_commitment: row.get(11)?,
-            result_bytes: row.get(12)?,
-            result_commitment: row.get(13)?,
+            operation_id: row.get(0)?,
+            format_version: row.get(1)?,
+            codec_version: row.get(2)?,
+            request_fingerprint: row.get(3)?,
+            event_id: row.get(4)?,
+            account_id: row.get(5)?,
+            work_unit_id: row.get(6)?,
+            predecessor_commitment: row.get(7)?,
+            attempt_commitment: row.get(8)?,
+            requested_model: row.get(9)?,
+            location: row.get(10)?,
+            observed_at: row.get(11)?,
+            binding_commitment: row.get(12)?,
+            result_bytes: row.get(13)?,
+            result_commitment: row.get(14)?,
         })
     }
 
     fn matches_plan(&self, plan: &ScreenStoryboardAttemptPlan) -> bool {
-        self.event_id == plan.receipt.event_id
+        self.operation_id.as_slice() == plan.operation_id.as_bytes().as_slice()
+            && self.event_id == plan.receipt.event_id
             && self.account_id == plan.account_id
             && self.work_unit_id == plan.work_unit_id
             && self.predecessor_commitment.as_slice() == plan.predecessor_commitment.as_slice()
@@ -482,6 +485,96 @@ impl StoredLedgerRow {
             && self.observed_at == plan.observed_at
             && self.binding_commitment.as_slice() == plan.receipt.binding_commitment.as_slice()
     }
+}
+
+/// Reauthenticates the permanent pre-provider binding for one terminal screen
+/// attempt. The caller receives only the stable work-attempt commitment; it
+/// cannot enumerate bindings or recover an unbound Vertex event.
+pub(in crate::cp::media_worker) fn authenticate_screen_storyboard_attempt_binding(
+    connection: &Connection,
+    account_id: &str,
+    event_id: &str,
+    work_unit_id: &str,
+    requested_model: &str,
+    binding_commitment: &[u8; 32],
+) -> Result<[u8; 32]> {
+    if schema_state(connection)? == LedgerSchemaState::Absent {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    validate_schema_marker(connection)?;
+    let row = connection
+        .query_row(
+            "SELECT operation_id,format_version,codec_version,request_fingerprint,
+                    event_id,account_id,work_unit_id,predecessor_commitment,attempt_commitment,
+                    requested_model,location,observed_at,binding_commitment,
+                    result_bytes,result_commitment
+             FROM archive_v3_wal_screen_vertex_attempt_operations
+             WHERE event_id=?1",
+            [event_id],
+            StoredLedgerRow::from_row,
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?
+        .ok_or(WalIdempotencyError::Precondition)?;
+    if row.operation_id.len() != 16
+        || row.request_fingerprint.len() != 32
+        || row.predecessor_commitment.len() != 32
+        || row.attempt_commitment.len() != 32
+        || row.binding_commitment.len() != 32
+        || row.result_commitment.len() != 32
+        || row.format_version != i64::from(WalOperationKind::format_version())
+        || row.codec_version != i64::from(WalOperationKind::VertexUsage.codec_version())
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let predecessor_commitment: [u8; 32] = row
+        .predecessor_commitment
+        .as_slice()
+        .try_into()
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
+    let attempt_commitment: [u8; 32] = row
+        .attempt_commitment
+        .as_slice()
+        .try_into()
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
+    let expected = ScreenStoryboardAttemptPlan::build(
+        None,
+        row.account_id.clone(),
+        row.work_unit_id.clone(),
+        predecessor_commitment,
+        attempt_commitment,
+        row.requested_model.clone(),
+        row.location.clone(),
+        row.observed_at.clone(),
+    )
+    .map_err(|_| WalIdempotencyError::Corrupt)?;
+    if row.operation_id.as_slice() != expected.operation_id.as_bytes().as_slice()
+        || row.event_id != expected.receipt.event_id
+        || row.binding_commitment.as_slice() != expected.receipt.binding_commitment.as_slice()
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let prepared =
+        PreparedLogicalMutation::prepare(expected).map_err(|_| WalIdempotencyError::Corrupt)?;
+    if row.request_fingerprint.as_slice()
+        != prepared
+            .request_fingerprint_for_owner()
+            .as_bytes()
+            .as_slice()
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    ScreenStoryboardAttemptLedger::lookup(connection, &prepared)?
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    if row.event_id != event_id
+        || row.account_id != account_id
+        || row.work_unit_id != work_unit_id
+        || row.requested_model != requested_model
+        || row.binding_commitment.as_slice() != binding_commitment
+    {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    Ok(attempt_commitment)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1121,6 +1214,97 @@ mod tests {
             .unwrap();
     }
 
+    fn terminalize_attempt(
+        connection: &Connection,
+        work: &str,
+        event_id: &str,
+        member_count: usize,
+    ) {
+        connection
+            .execute(
+                "UPDATE vertex_usage_events
+                 SET returned_model=?1,http_status=200,prompt_tokens=100,
+                     input_text_tokens=0,input_audio_tokens=0,input_image_tokens=100,
+                     cached_input_tokens=0,cached_input_text_tokens=0,
+                     cached_input_audio_tokens=0,cached_input_image_tokens=0,
+                     output_text_tokens=50,thought_tokens=0,total_tokens=150,
+                     outcome='metered',updated_at=?2
+                 WHERE event_id=?3 AND outcome='started'",
+                params![MODEL, ATTEMPTED_AT, event_id],
+            )
+            .unwrap();
+        let usage = serde_json::json!({
+            "work_unit_id": work,
+            "work_class": "screen",
+            "member_count": member_count,
+            "reservation_state": "reserved",
+            "reserved_output_tokens": 1024,
+            "processor_version": 1,
+            "outcome": "model_returned"
+        })
+        .to_string();
+        connection
+            .execute(
+                "UPDATE media_work_units SET usage_json=?1,updated_at=?2 WHERE id=?3",
+                params![usage, ATTEMPTED_AT, work],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE media_processing_jobs SET usage_json=?1
+                 WHERE id IN (SELECT job_id FROM media_work_members WHERE work_unit_id=?2)",
+                params![usage, work],
+            )
+            .unwrap();
+    }
+
+    fn bound_result_plan(
+        connection: &Connection,
+        work: &str,
+        receipt: &ScreenStoryboardAttemptReceipt,
+    ) -> super::super::result::ScreenStoryboardResultPlan {
+        super::super::result::ScreenStoryboardResultPlan::new(
+            ACCOUNT.to_owned(),
+            receipt.event_id().to_owned(),
+            super::super::result::current_screen_vertex_attempt_commitment(
+                connection,
+                receipt.event_id(),
+                MODEL,
+            )
+            .unwrap(),
+            receipt.binding_commitment(),
+            work.to_owned(),
+            super::super::result::current_screen_work_predecessor_commitment(connection, work)
+                .unwrap(),
+            MODEL.to_owned(),
+            "2026-08-15T15:00:04.000Z".to_owned(),
+            vec![super::super::result::ScreenStoryboardFrameResult::new(
+                "screen-event-1".to_owned(),
+                10_001,
+                "A bound screen result.".to_owned(),
+                "content".to_owned(),
+                "web_page".to_owned(),
+                "Visible bound result".to_owned(),
+                "Bound result".to_owned(),
+            )
+            .unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn execute_result(
+        connection: &mut Connection,
+        plan: super::super::result::ScreenStoryboardResultPlan,
+    ) -> std::result::Result<
+        crate::archive_v3_wal_idempotency::ExecutedLogicalMutation<
+            super::super::result::ScreenStoryboardResultPlan,
+        >,
+        WalIdempotencyError,
+    > {
+        let prepared = PreparedLogicalMutation::prepare(plan)?;
+        execute_prepared_for_owner(connection, prepared)
+    }
+
     #[test]
     fn exact_attempt_applies_once_and_replays_typed_receipt_without_rewrite() {
         let mut connection = connection();
@@ -1185,6 +1369,81 @@ mod tests {
         assert_eq!(replayed.operation_id(), operation_id);
         assert_eq!(replayed.into_validated_result().release().unwrap(), receipt);
         assert_eq!(load_ledger_state(&connection).unwrap(), (1, 114));
+    }
+
+    #[test]
+    fn bound_result_consumes_exact_attempt_and_replay_reauthenticates_it() {
+        let mut connection = connection();
+        seed_reserved_work(&connection, WORK_ONE, 1, 1);
+        let attempt = plan_at(&connection, WORK_ONE, MODEL, "us-central1", ATTEMPTED_AT);
+        let receipt = execute(&mut connection, attempt)
+            .unwrap()
+            .into_validated_result()
+            .release()
+            .unwrap();
+        terminalize_attempt(&connection, WORK_ONE, receipt.event_id(), 1);
+
+        let tampered_replay = bound_result_plan(&connection, WORK_ONE, &receipt);
+        let replay = bound_result_plan(&connection, WORK_ONE, &receipt);
+        let first = bound_result_plan(&connection, WORK_ONE, &receipt);
+        assert_eq!(
+            execute_result(&mut connection, first)
+                .unwrap()
+                .disposition(),
+            LogicalMutationDisposition::Applied
+        );
+        assert_eq!(
+            execute_result(&mut connection, replay)
+                .unwrap()
+                .disposition(),
+            LogicalMutationDisposition::Replayed
+        );
+
+        connection
+            .execute(
+                "UPDATE archive_v3_wal_screen_vertex_attempt_operations
+                 SET binding_commitment=?1 WHERE event_id=?2",
+                params![[7_u8; 32].as_slice(), receipt.event_id()],
+            )
+            .unwrap();
+        assert_eq!(
+            execute_result(&mut connection, tampered_replay)
+                .err()
+                .unwrap(),
+            WalIdempotencyError::Corrupt
+        );
+    }
+
+    #[test]
+    fn bound_result_rejects_work_substitution_after_provider_settlement() {
+        let mut connection = connection();
+        seed_reserved_work(&connection, WORK_ONE, 1, 1);
+        let attempt = plan_at(&connection, WORK_ONE, MODEL, "us-central1", ATTEMPTED_AT);
+        let receipt = execute(&mut connection, attempt)
+            .unwrap()
+            .into_validated_result()
+            .release()
+            .unwrap();
+        terminalize_attempt(&connection, WORK_ONE, receipt.event_id(), 1);
+        connection
+            .execute(
+                "UPDATE media_processing_jobs
+                 SET lease_until='2026-08-15T15:05:30.000Z'",
+                [],
+            )
+            .unwrap();
+        let substituted = bound_result_plan(&connection, WORK_ONE, &receipt);
+        assert_eq!(
+            execute_result(&mut connection, substituted).err().unwrap(),
+            WalIdempotencyError::Precondition
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM screenshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
