@@ -959,12 +959,27 @@ commit. Replay reauthenticates the candidate and may survive later exact A settl
 exact-name restart loader again requires account/image plus the borrowed plaintext DEK and returns
 only the already-retained ciphertext with a non-cloneable marker receipt after both ledgers
 reauthenticate. The pre-marker candidate type, loader, and ciphertext getter are visible only inside
-the private WAL family; its parent receives only an opaque marker plan from a WAL-owned factory, while
-only the post-marker payload/loader crosses that boundary. It cannot enumerate work, acquire a
+the private WAL family; its parent receives only an opaque marker plan from a WAL-owned factory. The
+post-marker payload, loader, and ciphertext getter are now WAL-private too, and only the provider-proof
+child can consume them. It cannot enumerate work, acquire a
 key/provider, or infer an outcome. There is no
 KMS call, provider create/read, provider outcome/readback classification, C settlement,
 Store/route/launcher/task/retry/delete/list/cleanup/acknowledgement wiring. Those remain separate
-activation blockers. The
+activation blockers. A separately sealed provider-neutral continuation now prepares only from the
+exact-name, DEK-authenticated `SendStarted` payload and the exact installed wrapped DEK. Its injected
+transport receives only one conditional create and one bounded exact-name readback; it has no retry,
+list, or delete operation. An exact readback must match the object key, retained ciphertext, wrapped
+key metadata, stable request identity, and positive provider generation before a non-cloneable
+accepted proof is minted. Only an explicitly definitive no-create response with a nonzero canonical
+evidence commitment, followed by exact absence, can mint the distinct non-cloneable rejection proof.
+An outcome-unknown or unavailable create with exact matching readback converges to acceptance; the
+same response with absence remains unknown. A precondition response without exact identical
+readback, a claimed create without readback, conflicting bytes/metadata, zero rejection evidence,
+and protocol or size faults become manual and retain the B reservation. Both proof commitments bind
+the complete B/candidate/DEK/AAD/ciphertext/send tuple under distinct domains, and raw provider bodies
+never cross the seam. This slice has no concrete provider implementation or production caller and
+cannot persist A or C settlement, call Store/KMS, enumerate/delete objects, allocate time/randomness,
+launch work, acknowledge a route, or activate serving. Those remain separate activation blockers. The
 finalization-queue child accepts only a caller-stable 128-bit request identity fixed before actor
 admission, the exact stable account and episode, a caller-supplied canonical queue timestamp, and the
 complete eligible predecessor tuple including nullable finalization/version/error/timing facts. It

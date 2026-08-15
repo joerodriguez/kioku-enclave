@@ -10,13 +10,16 @@
 //! verifies and retains the exact context-bound ciphertext candidate for that
 //! attempt without send authority. A third private child durably marks the
 //! exact candidate `SendStarted` and derives its stable request identity while
-//! owning no provider. Another private child owns an exact
+//! owning no provider. A fourth private child exposes only an injected exact
+//! create/readback seam and mints sealed success or definitive-no-object proof;
+//! it has no concrete transport or caller. Another private child owns an exact
 //! finalization-queue transition. None can call Store, launch work, invoke a
-//! provider, schedule a retry, allocate randomness or a clock, or acknowledge
-//! a request.
+//! concrete provider, schedule a retry, allocate randomness or a clock, or
+//! acknowledge a request.
 
 mod finalization_queue;
 mod selected_screenshot_attempt;
+mod selected_screenshot_provider;
 mod selected_screenshot_send;
 mod selected_screenshot_upload;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
@@ -69,20 +72,6 @@ pub(in crate::cp::query) fn prepare_selected_screenshot_send_started(
     plaintext_dek: &crate::crypto::Dek,
 ) -> Result<Option<SelectedScreenshotSendStartedPlan>> {
     selected_screenshot_send::prepare_selected_screenshot_send_started(
-        connection,
-        account_id,
-        image_id,
-        plaintext_dek,
-    )
-}
-
-pub(in crate::cp::query) fn load_authenticated_selected_screenshot_send_started(
-    connection: &Connection,
-    account_id: &str,
-    image_id: &str,
-    plaintext_dek: &crate::crypto::Dek,
-) -> Result<Option<selected_screenshot_send::AuthenticatedSelectedScreenshotSendStarted>> {
-    selected_screenshot_send::load_authenticated_selected_screenshot_send_started(
         connection,
         account_id,
         image_id,

@@ -334,13 +334,27 @@ separate activation blockers.
     requires account/image plus borrowed DEK and returns only the original
     retained ciphertext with a non-cloneable marker receipt after both ledgers
     reauthenticate. The parent receives only an opaque marker plan from a
-    WAL-owned pre-marker factory and the authenticated post-marker payload; it
-    cannot access the pre-marker ciphertext capability. Changed
+    WAL-owned pre-marker factory. Both pre-marker and post-marker ciphertext
+    payloads/loaders remain confined to the private WAL family; only the
+    provider-proof child can consume the latter. Changed
     candidate/marker/request facts, consumed first
     apply, partial schema, row/counter tamper, and late readback failure reject
     or roll back. Provider construction/I/O/readback/outcome authentication, C
     settlement, KMS production, Store/route/launcher/task/retry/delete/list/
     cleanup/acknowledgement wiring remain absent.
+  - [x] Add the inactive provider-neutral selected-screenshot outcome proof
+    boundary. It can prepare only from the exact-name, DEK-authenticated
+    `SendStarted` marker plus the exact installed wrapped DEK, then grants an
+    injected transport only one conditional create and one bounded exact-name
+    readback. Exact ciphertext, wrapped-key metadata, request identity, and a
+    positive generation mint a non-cloneable accepted proof. Only a separately
+    classified definitive no-create response followed by exact absence mints a
+    non-cloneable rejection proof. Lost/unknown/unavailable outcomes retain the
+    reservation, while collisions, malformed evidence, claimed creates without
+    exact readback, and protocol/size faults require manual handling. It never
+    retries and has no concrete transport, GCS/Store client, enumeration,
+    delete, KMS, clock/randomness, C settlement, A settlement, route, launcher,
+    task, cleanup, acknowledgement, startup, or serving wiring.
   - [x] Bind the production-facing selected-screenshot A receipt to the exact
     permanent B attempt. The version-2 request uses a distinct operation domain,
     carries the B binding commitment, reconstructs the full B row and typed
