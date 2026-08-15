@@ -210,6 +210,22 @@ separate activation blockers.
     1,048,576-row/32-MiB permanent ledger. Missing/substituted events, cap
     exhaustion, late ledger failure, and tamper fail closed. The B-domain event
     allocator and every Store/worker/launcher/provider/ack path remain absent.
+  - [x] Add the first inactive B-domain identity refactor for screen Vertex
+    invocation begin: the complete reserved/leasing work topology mints both
+    an exact predecessor and a post-usage-stable attempt commitment plus a
+    deterministic `vtx_` event ID before actor admission. The account, work,
+    both commitments, model,
+    location, and caller-fixed canonical attempt time are bound in a distinct
+    1,048,576-row/128-MiB permanent ledger and typed receipt. The same
+    transaction inserts the exact started billing event and deterministically
+    full-tuple advances its monthly coverage row. Existing-event adoption,
+    changed same-attempt requests, insufficient two-minute lease window,
+    expired or substituted work, cap exhaustion,
+    late ledger failure, partial schema, tamper, and reopen fail closed or
+    exactly replay; a genuinely renewed work attempt derives a new identity.
+    The result v1 child does not yet consume this binding, and media reads,
+    provider calls, clocks/random IDs, Store, worker/launcher/task/retry/
+    acknowledgement wiring remain absent.
   - [x] Add the inactive metadata-only screen-reference batch A-domain: the
     existing deterministic batch ID is subtype-separated from singular capture
     identity before actor admission, the complete normalized manifest vector is

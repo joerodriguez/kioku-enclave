@@ -5,8 +5,9 @@
 
 //! Inactive deterministic screen-storyboard result WAL subtype.
 //!
-//! A future B boundary must durably fix the Vertex attempt before constructing
-//! this plan. The subtype accepts only a fully leased screen work unit whose
+//! The sibling B boundary can durably fix the Vertex attempt before provider
+//! I/O, but this result-v1 contract does not yet consume that binding. The
+//! subtype accepts only a fully leased screen work unit whose
 //! provider usage has already reached a terminal result, caller-fixed row IDs,
 //! one fixed commit time, and results with no person evidence. It authenticates
 //! every work/member/job/capture/media predecessor before atomically inserting
@@ -39,6 +40,7 @@ const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 const MAX_LITERAL_BYTES: usize = 20_000;
 const MAX_VISIBLE_BYTES: usize = 100_000;
 const MAX_SALIENT_BYTES: usize = 20_000;
+const MIN_PROVIDER_ATTEMPT_WINDOW_MILLIS: i64 = 120_000;
 const ENCODED_UNIT_RESULT_BYTES: usize = 9;
 const SCHEMA_TABLE: &str = "archive_v3_wal_screen_storyboard_result_schema";
 const LEDGER_TABLE: &str = "archive_v3_wal_screen_storyboard_result_operations";
@@ -596,10 +598,59 @@ pub(in crate::cp::media_worker) fn current_screen_work_predecessor_commitment(
     Ok(load_screen_work(connection, work_unit_id)?.commitment)
 }
 
+/// Exact pre-provider state plus its stable attempt identity. The predecessor
+/// covers every authenticated field. The attempt identity excludes only the
+/// usage fields and work timestamp that the already-reviewed post-provider
+/// usage settlement is expected to replace; lease, counters, membership,
+/// inputs, and media provenance remain covered.
+pub(in crate::cp::media_worker) struct ScreenWorkAttemptCommitments {
+    predecessor: [u8; 32],
+    attempt: [u8; 32],
+}
+
+impl ScreenWorkAttemptCommitments {
+    pub(in crate::cp::media_worker) const fn predecessor(&self) -> [u8; 32] {
+        self.predecessor
+    }
+
+    pub(in crate::cp::media_worker) const fn attempt(&self) -> [u8; 32] {
+        self.attempt
+    }
+}
+
+pub(in crate::cp::media_worker) fn current_screen_work_attempt_commitments(
+    connection: &Connection,
+    work_unit_id: &str,
+    attempted_at: &str,
+) -> Result<ScreenWorkAttemptCommitments> {
+    validate_canonical_timestamp(attempted_at)?;
+    let (work, members) = load_screen_work_rows(connection, work_unit_id)?;
+    validate_screen_work_for_stage(work_unit_id, &work, &members, ScreenWorkStage::Reserved)?;
+    validate_attempt_time(attempted_at, &work, &members)?;
+    Ok(ScreenWorkAttemptCommitments {
+        predecessor: hash_screen_work(connection, work_unit_id)?,
+        attempt: hash_screen_work_attempt(connection, work_unit_id)?,
+    })
+}
+
 fn load_screen_work(
     connection: &Connection,
     work_unit_id: &str,
 ) -> Result<AuthenticatedScreenWork> {
+    let (work, members) = load_screen_work_rows(connection, work_unit_id)?;
+    validate_screen_work(work_unit_id, &work, &members)?;
+    let commitment = hash_screen_work(connection, work_unit_id)?;
+    Ok(AuthenticatedScreenWork {
+        commitment,
+        work,
+        members,
+    })
+}
+
+fn load_screen_work_rows(
+    connection: &Connection,
+    work_unit_id: &str,
+) -> Result<(StoredWork, Vec<StoredMember>)> {
     let work = connection
         .query_row(
             "SELECT work_class,processor_version,state,started_at,ended_at,
@@ -648,13 +699,7 @@ fn load_screen_work(
     {
         return Err(WalIdempotencyError::Precondition);
     }
-    validate_screen_work(work_unit_id, &work, &members)?;
-    let commitment = hash_screen_work(connection, work_unit_id)?;
-    Ok(AuthenticatedScreenWork {
-        commitment,
-        work,
-        members,
-    })
+    Ok((work, members))
 }
 
 fn stored_work_from_row(row: &Row<'_>) -> rusqlite::Result<StoredWork> {
@@ -736,6 +781,21 @@ fn validate_screen_work(
     work: &StoredWork,
     members: &[StoredMember],
 ) -> Result<()> {
+    validate_screen_work_for_stage(work_unit_id, work, members, ScreenWorkStage::Terminal)
+}
+
+#[derive(Clone, Copy)]
+enum ScreenWorkStage {
+    Reserved,
+    Terminal,
+}
+
+fn validate_screen_work_for_stage(
+    work_unit_id: &str,
+    work: &StoredWork,
+    members: &[StoredMember],
+    stage: ScreenWorkStage,
+) -> Result<()> {
     if work.work_class != "screen"
         || work.processor_version != PROCESSOR_VERSION
         || work.state != "processing"
@@ -758,7 +818,10 @@ fn validate_screen_work(
         .usage_json
         .as_deref()
         .ok_or(WalIdempotencyError::Precondition)?;
-    validate_terminal_usage(usage, work_unit_id, members.len())?;
+    match stage {
+        ScreenWorkStage::Reserved => validate_reserved_usage(usage, work_unit_id, members.len())?,
+        ScreenWorkStage::Terminal => validate_terminal_usage(usage, work_unit_id, members.len())?,
+    }
     let work_start = timestamp_millis(&work.started_at)?;
     let work_end = timestamp_millis(&work.ended_at)?;
     for (index, member) in members.iter().enumerate() {
@@ -772,6 +835,7 @@ fn validate_screen_work(
             || member.job.processor_version != PROCESSOR_VERSION
             || member.job.state != "processing"
             || member.job.attempt_count <= 0
+            || member.job.attempt_count != work.attempt_count
             || member
                 .job
                 .lease_until
@@ -828,6 +892,46 @@ fn validate_screen_work(
     Ok(())
 }
 
+fn validate_attempt_time(
+    attempted_at: &str,
+    work: &StoredWork,
+    members: &[StoredMember],
+) -> Result<()> {
+    let attempted = timestamp_millis(attempted_at)?;
+    let mut predecessors = vec![
+        work.started_at.as_str(),
+        work.ended_at.as_str(),
+        work.created_at.as_str(),
+        work.updated_at.as_str(),
+    ];
+    for member in members {
+        if member
+            .job
+            .lease_until
+            .as_deref()
+            .and_then(super::super::super::isotime::parse_epoch_millis)
+            .and_then(|lease_until| lease_until.checked_sub(attempted))
+            .is_none_or(|remaining| remaining < MIN_PROVIDER_ATTEMPT_WINDOW_MILLIS)
+        {
+            return Err(WalIdempotencyError::Precondition);
+        }
+        predecessors.extend([
+            member.capture_started_at.as_str(),
+            member.capture_ended_at.as_str(),
+            member.job.updated_at.as_str(),
+            member.media.created_at.as_str(),
+        ]);
+    }
+    if predecessors.into_iter().any(|value| {
+        timestamp_millis(value)
+            .ok()
+            .is_none_or(|millis| millis > attempted)
+    }) {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    Ok(())
+}
+
 fn validate_commit_time(
     connection: &Connection,
     plan: &ScreenStoryboardResultPlan,
@@ -870,6 +974,45 @@ fn validate_commit_time(
             .ok()
             .is_none_or(|millis| millis > committed)
     }) {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    Ok(())
+}
+
+fn validate_reserved_usage(raw: &str, work_unit_id: &str, member_count: usize) -> Result<()> {
+    if raw.len() > MAX_CONTEXT_BYTES || raw.contains('\0') {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| WalIdempotencyError::Precondition)?;
+    let Some(object) = value.as_object() else {
+        return Err(WalIdempotencyError::Precondition);
+    };
+    if object.len() != 6
+        || value
+            .get("work_unit_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(work_unit_id)
+        || value.get("work_class").and_then(serde_json::Value::as_str) != Some("screen")
+        || value
+            .get("member_count")
+            .and_then(serde_json::Value::as_u64)
+            != u64::try_from(member_count).ok()
+        || value
+            .get("reservation_state")
+            .and_then(serde_json::Value::as_str)
+            != Some("reserved")
+        || value
+            .get("reserved_output_tokens")
+            .and_then(serde_json::Value::as_i64)
+            != Some(i64::from(
+                super::super::super::vertex::MAX_SCREEN_OUTPUT_TOKENS,
+            ))
+        || value
+            .get("processor_version")
+            .and_then(serde_json::Value::as_i64)
+            != Some(PROCESSOR_VERSION)
+    {
         return Err(WalIdempotencyError::Precondition);
     }
     Ok(())
@@ -926,6 +1069,56 @@ fn hash_screen_work(connection: &Connection, work_unit_id: &str) -> Result<[u8; 
             "SELECT j.id,j.event_id,j.job_kind,j.input_revision,j.processor_version,j.state,
                     j.attempt_count,j.lease_until,j.error_code,j.model_id,j.prompt_version,
                     j.schema_version,j.usage_json,j.updated_at
+             FROM media_processing_jobs j JOIN media_work_members m ON m.job_id=j.id
+             WHERE m.work_unit_id=?1 ORDER BY m.ordinal",
+        ),
+        (
+            b"capture-events".as_slice(),
+            "SELECT e.event_id,e.device_id,e.install_id,e.capture_session_id,e.stream_id,
+                    e.stream_kind,e.sequence,e.source_wall_at,e.source_monotonic_ns,e.started_at,
+                    e.ended_at,e.timezone_id,e.utc_offset_minutes,e.clock_uncertainty_ms,
+                    e.asset_id,e.manifest_digest,e.context_json,e.media_disposition,
+                    e.canonical_event_id,e.canonical_asset_id,e.canonical_media_sha256,
+                    e.perceptual_hash,e.hamming_distance,e.pixel_change_ratio,
+                    e.context_fingerprint,e.dedupe_version,e.received_at
+             FROM capture_events e JOIN media_work_members m ON m.event_id=e.event_id
+             WHERE m.work_unit_id=?1 ORDER BY m.ordinal",
+        ),
+        (
+            b"media".as_slice(),
+            "SELECT o.asset_id,o.event_id,o.object_key,o.object_generation,o.object_backend,
+                    o.mime_type,o.codec,o.byte_length,o.sha256,o.sample_rate,o.channels,
+                    o.frame_count,o.width,o.height,o.scale,o.orientation,o.processing_state,
+                    o.retain_until,o.deleted_at,o.created_at
+             FROM media_objects o JOIN media_work_members m ON m.event_id=o.event_id
+             WHERE m.work_unit_id=?1 ORDER BY m.ordinal",
+        ),
+    ] {
+        hash_query(connection, &mut hasher, marker, query, work_unit_id)?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn hash_screen_work_attempt(connection: &Connection, work_unit_id: &str) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"archive-v3-screen-storyboard-work-attempt-v1\0");
+    for (marker, query) in [
+        (
+            b"work".as_slice(),
+            "SELECT id,work_class,processor_version,state,started_at,ended_at,
+                    reserved_output_tokens,reservation_retained,attempt_count,error_code,created_at
+             FROM media_work_units WHERE id=?1 ORDER BY id",
+        ),
+        (
+            b"members".as_slice(),
+            "SELECT work_unit_id,event_id,job_id,ordinal,window_start_ms,window_end_ms
+             FROM media_work_members WHERE work_unit_id=?1 ORDER BY ordinal",
+        ),
+        (
+            b"jobs".as_slice(),
+            "SELECT j.id,j.event_id,j.job_kind,j.input_revision,j.processor_version,j.state,
+                    j.attempt_count,j.lease_until,j.error_code,j.model_id,j.prompt_version,
+                    j.schema_version,j.updated_at
              FROM media_processing_jobs j JOIN media_work_members m ON m.job_id=j.id
              WHERE m.work_unit_id=?1 ORDER BY m.ordinal",
         ),
@@ -1724,29 +1917,32 @@ fn encode_string(output: &mut Vec<u8>, value: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::archive_v3_wal_idempotency::{
         execute_prepared_for_owner, LogicalMutationDisposition,
     };
     use tempfile::tempdir;
 
-    const ACCOUNT: &str = "11111111-1111-4111-8111-111111111111";
+    pub(in crate::cp::media_worker::wal) const ACCOUNT: &str =
+        "11111111-1111-4111-8111-111111111111";
     const VERTEX_ONE: &str = "vtx_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const VERTEX_TWO: &str = "vtx_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const WORK_ONE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    const WORK_TWO: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    const MODEL: &str = "gemini-3.5-flash";
+    pub(in crate::cp::media_worker::wal) const WORK_ONE: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    pub(in crate::cp::media_worker::wal) const WORK_TWO: &str =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    pub(in crate::cp::media_worker::wal) const MODEL: &str = "gemini-3.5-flash";
     const COMMITTED_AT: &str = "2026-08-15T15:00:03.000Z";
     const STARTED_AT: &str = "2026-08-15T15:00:00.000Z";
     const ENDED_AT: &str = "2026-08-15T15:00:01.000Z";
-    const LEASE_UNTIL: &str = "2026-08-15T15:05:00.000Z";
+    pub(in crate::cp::media_worker::wal) const LEASE_UNTIL: &str = "2026-08-15T15:05:00.000Z";
     const CREATED_AT: &str = "2026-08-15T14:59:59.000Z";
-    const UPDATED_AT: &str = "2026-08-15T15:00:02.000Z";
+    pub(in crate::cp::media_worker::wal) const UPDATED_AT: &str = "2026-08-15T15:00:02.000Z";
     const SHA_ONE: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const SHA_TWO: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
-    fn install_schema(connection: &Connection) {
+    pub(in crate::cp::media_worker::wal) fn install_schema(connection: &Connection) {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON;
@@ -1821,7 +2017,7 @@ mod tests {
             .unwrap();
     }
 
-    fn connection() -> Connection {
+    pub(super) fn connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         install_schema(&connection);
         connection
@@ -1840,7 +2036,13 @@ mod tests {
         .to_string()
     }
 
-    fn seed_work(connection: &Connection, work: &str, vertex: &str, base: i64, count: usize) {
+    pub(in crate::cp::media_worker::wal) fn seed_work(
+        connection: &Connection,
+        work: &str,
+        vertex: &str,
+        base: i64,
+        count: usize,
+    ) {
         connection
             .execute(
                 "INSERT INTO vertex_usage_events
