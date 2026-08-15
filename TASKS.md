@@ -272,7 +272,7 @@ separate activation blockers.
     exactly replay. The KMS producer that proves the wrapper/plaintext pairing,
     media encryption/upload candidate, send-start fence, provider receipt,
     Store/route/launcher/task/retry/acknowledgement wiring remain absent.
-  - [x] Add the inactive selected-screenshot receipt A-domain: a future B
+  - [x] Add the inactive historical selected-screenshot receipt A-domain: a future B
     boundary must durably choose the 128-bit opaque upload attempt and exact
     account-bound object key before provider I/O; that stable attempt derives
     the operation identity and the complete episode/source/time/JPEG receipt is
@@ -360,7 +360,7 @@ separate activation blockers.
     reservation, while collisions, malformed evidence, claimed creates without
     exact readback, and protocol/size faults require manual handling. It never
     retries and has no concrete transport, GCS/Store client, enumeration,
-    delete, KMS, clock/randomness, A settlement, route, launcher, task, cleanup,
+    delete, KMS, clock/randomness, externally callable A settlement, route, launcher, task, cleanup,
     acknowledgement, startup, or serving wiring. Its rejection proof can be
     consumed only by the separate inactive C child below.
   - [x] Add the inactive selected-screenshot definitive-no-object C settlement.
@@ -368,18 +368,18 @@ separate activation blockers.
     rejection proof plus a caller-fixed canonical observation time. One
     immediate transaction reauthenticates the exact execution claim, complete
     permanent B attempt, ciphertext candidate, `SendStarted` marker, exact
-    rejection proof, and continued absence of any local or A-v2 result before inserting a distinct
+    rejection proof, and continued absence of any local or A result before inserting a distinct
     unit-result terminal ledger with full counter CAS and exact readback.
     Exact replay and exact-name restart reauthenticate the entire chain without
     retrying the provider. The original target stays permanently burned, while
     only a fully authenticated terminal releases its episode count/bytes for a
     different target; missing, partial, conflicting, or tampered C state stays
-    reserved fail-closed. A-v2 admission, new candidate admission, and provider
+    reserved fail-closed. Provider-accepted A-v3 admission, new candidate admission, and provider
     request preparation reject the exact terminal. Unknown/unavailable/manual
     outcomes cannot construct C. It has no provider transport, retry, Store,
     KMS, list/delete, clock/randomness, route, launcher, task, cleanup,
     acknowledgement, startup, or serving wiring.
-  - [x] Bind the production-facing selected-screenshot A receipt to the exact
+  - [x] Bind the historical selected-screenshot A-v2 receipt to the exact
     permanent B attempt. The version-2 request uses a distinct operation domain,
     carries the B binding commitment, reconstructs the full B row and typed
     receipt, exact-matches every account/image/object/episode/source/time/JPEG
@@ -387,10 +387,24 @@ separate activation blockers.
     result write. Exact post-insert lookup and replay reauthenticate the B row,
     exact local result, and source/member topology. Missing, substituted, or
     tampered attempts, rebound results, and a late binding failure roll back or
-    fail closed; the historical unbound v1 constructor remains test-only.
-    Exact C termination now blocks this local A settlement. Provider-accepted
-    receipt authentication, DEK/encryption/upload, Store/route/launcher/task/
-    retry/cleanup/acknowledgement wiring remain separate reviewed slices.
+    fail closed. Exact C termination blocks this local A settlement. The
+    unbound v1 and B-only v2 constructors/contracts are now test-only.
+  - [x] Upgrade the sole production selected-screenshot A settlement to a
+    provider-accepted v3 contract. A WAL-private factory consumes the
+    non-cloneable exact positive-readback proof, derives every local fact from
+    the permanent B row, and reauthenticates B, ciphertext candidate,
+    `SendStarted`, the one-shot execution claim, positive provider generation,
+    accepted-readback commitment, and continued C absence before any local
+    write. One immediate transaction rejects unexplained pre-existing local
+    rows, inserts and exact-checks the screenshot/source/member binding, retains
+    a schema-revision-2 full typed A row, counter-CASes, reconstructs that row,
+    and exact-reads the result before commit. Exact-name restart/replay performs
+    no provider I/O and repeats the complete chain; A and C are mutually
+    exclusive, while losing the accepted proof before A commits is deliberately
+    manual/no-retry because the one-shot execution claim is already durable.
+    Typed-row/proof/local/counter tamper and late readback failure fail closed or
+    roll back. Concrete provider/KMS construction, Store/route/launcher/task/
+    retry/cleanup/acknowledgement/startup/serving wiring remain absent.
   - [x] Add the inactive caller-stable finalization-queue A-domain: an exact
     128-bit request ID plus stable account derive the opaque operation before
     actor admission, while the episode, fixed target version, caller-supplied

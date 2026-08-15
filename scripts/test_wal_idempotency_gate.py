@@ -1099,9 +1099,35 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", selected_domain)
         self.assertIn("WalIdempotencyError::Precondition", selected_domain)
         self.assertIn("selected-screenshot-result-bound-v2", selected_domain)
+        self.assertIn(
+            "selected-screenshot-provider-accepted-result-v3", selected_production
+        )
+        self.assertIn(
+            "SelectedScreenshotRequestContract::ProviderAcceptedV3",
+            selected_production,
+        )
         self.assertIn("attempt_binding_commitment", selected_production)
+        self.assertRegex(
+            selected_production,
+            r"(?m)^fn prepare_selected_screenshot_provider_accepted_result\(",
+        )
+        self.assertRegex(
+            selected_production,
+            r"(?m)^fn load_selected_screenshot_provider_accepted_result\(",
+        )
+        self.assertIn("authenticate_accepted_facts", selected_production)
+        self.assertIn("authenticate_provider_execution_claim", selected_production)
+        self.assertIn("request_version INTEGER NOT NULL", selected_production)
+        self.assertIn("provider_generation BLOB", selected_production)
+        self.assertIn("length(provider_generation)=8", selected_production)
+        self.assertIn("readback_commitment BLOB", selected_production)
+        self.assertIn("attempt_operation_id BLOB", selected_production)
+        self.assertIn("LEDGER_SCHEMA_REVISION: i64 = 2", selected_production)
         self.assertIn("fn new_unbound_v1", selected_domain)
         self.assertNotIn("fn new_unbound_v1", selected_production)
+        self.assertNotIn("\n    UnboundV1,\n", selected_production)
+        self.assertNotIn("\n    BoundV2 {\n", selected_production)
+        self.assertNotIn("pub(super) fn new(\n", selected_production)
         self.assertIn(
             "authenticate_selected_screenshot_attempt_binding",
             selected_attempt_domain,
@@ -1292,6 +1318,8 @@ impl X {
         self.assertIn(
             "authenticate_provider_execution_claim", selected_provider_domain
         )
+        self.assertIn("pub(super) fn into_parts", selected_provider_domain)
+        self.assertIn("authenticate_accepted_facts", selected_provider_production)
         self.assertIn("MAX_EXECUTION_CLAIMS", selected_provider_domain)
         self.assertIn(
             "load_authenticated_selected_screenshot_send_started",
@@ -1303,6 +1331,12 @@ impl X {
         )
         self.assertNotIn(
             "prepare_selected_screenshot_provider_request(", query
+        )
+        self.assertNotIn(
+            "prepare_selected_screenshot_provider_accepted_result(", query
+        )
+        self.assertNotIn(
+            "load_selected_screenshot_provider_accepted_result(", query
         )
         self.assertIn("mod selected_screenshot_termination;", selected_domain)
         self.assertIn(

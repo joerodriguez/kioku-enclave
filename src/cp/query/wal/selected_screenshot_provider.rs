@@ -347,6 +347,14 @@ impl SelectedScreenshotProviderAccepted {
     pub(super) const fn readback_commitment(&self) -> [u8; 32] {
         self.readback_commitment
     }
+
+    pub(super) fn into_parts(self) -> (SelectedScreenshotProviderBinding, u64, [u8; 32]) {
+        (
+            self.binding,
+            self.provider_generation,
+            self.readback_commitment,
+        )
+    }
 }
 
 impl std::fmt::Debug for SelectedScreenshotProviderAccepted {
@@ -896,6 +904,16 @@ pub(super) fn authenticate_rejected_no_object_facts(
         .ok_or(WalIdempotencyError::Corrupt)
 }
 
+pub(super) fn authenticate_accepted_facts(
+    binding: &SelectedScreenshotProviderBinding,
+    provider_generation: u64,
+    readback_commitment: &[u8; 32],
+) -> Result<()> {
+    (derive_accepted_commitment(binding, provider_generation)? == *readback_commitment)
+        .then_some(())
+        .ok_or(WalIdempotencyError::Corrupt)
+}
+
 fn hash_provider_binding(
     hasher: &mut Sha256,
     binding: &SelectedScreenshotProviderBinding,
@@ -929,22 +947,33 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::{
-        archive_v3_wal_idempotency::{execute_prepared_for_owner, PreparedLogicalMutation},
+        archive_v3_wal_idempotency::{
+            execute_prepared_for_owner, LogicalMutationDisposition, PreparedLogicalMutation,
+            WalLogicalDomainPlan,
+        },
         cp::{
             media::wal::MediaDekInstallPlan,
             query::wal::{
                 selected_screenshot_attempt::{
+                    authenticate_selected_screenshot_attempt_for_terminal,
                     authenticate_selected_screenshot_upload_predecessor,
                     SelectedScreenshotAttemptPlan,
                 },
                 selected_screenshot_send::prepare_selected_screenshot_send_started,
                 selected_screenshot_upload::SelectedScreenshotUploadCandidatePlan,
-                ValidatedJpeg,
+                SelectedScreenshotPlan, ValidatedJpeg,
             },
         },
     };
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
     use std::sync::Mutex;
+
+    use super::super::selected_screenshot_termination::prepare_selected_screenshot_termination;
+    use super::super::{
+        ensure_schema as ensure_selected_screenshot_result_schema,
+        load_selected_screenshot_provider_accepted_result,
+        prepare_selected_screenshot_provider_accepted_result,
+    };
 
     const ACCOUNT: &str = "account-1";
     const IMAGE_ID: &str = "11111111111111111111111111111111";
@@ -968,6 +997,75 @@ mod tests {
     struct FakeProvider {
         script: Mutex<Option<ProviderScript>>,
         calls: Mutex<Vec<&'static str>>,
+    }
+
+    type SubmittedProviderCreate = (String, Vec<u8>, String, String);
+
+    struct ExactAcceptProvider {
+        submitted: Mutex<Option<SubmittedProviderCreate>>,
+        calls: Mutex<Vec<&'static str>>,
+        generation: u64,
+    }
+
+    impl ExactAcceptProvider {
+        fn new() -> Self {
+            Self::with_generation(17)
+        }
+
+        fn with_generation(generation: u64) -> Self {
+            Self {
+                submitted: Mutex::new(None),
+                calls: Mutex::new(Vec::new()),
+                generation,
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SelectedScreenshotExactCreateProvider for ExactAcceptProvider {
+        async fn create_if_absent(
+            &self,
+            object_key: &str,
+            ciphertext: &[u8],
+            wrapped_dek_b64: &str,
+            send_request_id: &str,
+        ) -> std::result::Result<
+            SelectedScreenshotProviderCreateResult,
+            SelectedScreenshotProviderTransportError,
+        > {
+            self.calls.lock().unwrap().push("create");
+            *self.submitted.lock().unwrap() = Some((
+                object_key.to_owned(),
+                ciphertext.to_vec(),
+                wrapped_dek_b64.to_owned(),
+                send_request_id.to_owned(),
+            ));
+            Ok(SelectedScreenshotProviderCreateResult::Created)
+        }
+
+        async fn get_exact(
+            &self,
+            object_key: &str,
+            _max_ciphertext_bytes: usize,
+        ) -> std::result::Result<
+            Option<SelectedScreenshotProviderReadback>,
+            SelectedScreenshotProviderTransportError,
+        > {
+            self.calls.lock().unwrap().push("get");
+            let submitted = self.submitted.lock().unwrap().take().unwrap();
+            assert_eq!(submitted.0, object_key);
+            Ok(Some(SelectedScreenshotProviderReadback::new(
+                submitted.0,
+                submitted.1,
+                submitted.2,
+                submitted.3,
+                self.generation,
+            )))
+        }
     }
 
     impl FakeProvider {
@@ -1052,8 +1150,47 @@ mod tests {
         )
     }
 
+    fn duplicate_binding(
+        binding: &SelectedScreenshotProviderBinding,
+    ) -> SelectedScreenshotProviderBinding {
+        SelectedScreenshotProviderBinding::from_terminal_facts(
+            binding.account_id().to_owned(),
+            binding.image_id().to_owned(),
+            binding.object_key().to_owned(),
+            binding.candidate_request_fingerprint(),
+            binding.attempt_binding_commitment(),
+            binding.wrapped_dek_commitment(),
+            binding.media_dek_binding_commitment(),
+            binding.aad_commitment(),
+            binding.ciphertext_length(),
+            binding.ciphertext_sha256(),
+            binding.candidate_binding_commitment(),
+            binding.send_request_id().to_owned(),
+            binding.send_binding_commitment(),
+        )
+        .unwrap()
+    }
+
+    fn rejection_from_binding(
+        binding: SelectedScreenshotProviderBinding,
+    ) -> SelectedScreenshotProviderRejectedNoObject {
+        let evidence_commitment = [89; 32];
+        let rejection_commitment =
+            derive_rejected_commitment(&binding, &evidence_commitment).unwrap();
+        SelectedScreenshotProviderRejectedNoObject {
+            binding,
+            evidence_commitment,
+            rejection_commitment,
+        }
+    }
+
     fn initialized_connection() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
+        initialize(&connection);
+        connection
+    }
+
+    fn initialize(connection: &Connection) {
         connection
             .execute_batch(
                 "CREATE TABLE app_metadata(
@@ -1097,11 +1234,14 @@ mod tests {
                     VALUES (7,'screenshot',41);",
             )
             .unwrap();
-        connection
     }
 
     fn candidate_ready_fixture() -> (Connection, Dek) {
-        let mut connection = initialized_connection();
+        candidate_ready_fixture_with_connection(initialized_connection())
+    }
+
+    fn candidate_ready_fixture_with_connection(mut connection: Connection) -> (Connection, Dek) {
+        initialize_if_needed(&connection);
         let dek = Dek([7; 32]);
         let media_plan = MediaDekInstallPlan::new_for_cross_domain_test(
             ACCOUNT.to_owned(),
@@ -1181,8 +1321,35 @@ mod tests {
         (connection, dek)
     }
 
+    fn initialize_if_needed(connection: &Connection) {
+        let initialized = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='episodes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        if initialized == 0 {
+            initialize(connection);
+        }
+    }
+
     fn send_started_fixture() -> (Connection, Dek) {
         let (mut connection, dek) = candidate_ready_fixture();
+        let send_plan =
+            prepare_selected_screenshot_send_started(&connection, ACCOUNT, IMAGE_ID, &dek)
+                .unwrap()
+                .unwrap();
+        execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(send_plan).unwrap(),
+        )
+        .unwrap();
+        (connection, dek)
+    }
+
+    fn send_started_fixture_with_connection(connection: Connection) -> (Connection, Dek) {
+        let (mut connection, dek) = candidate_ready_fixture_with_connection(connection);
         let send_plan =
             prepare_selected_screenshot_send_started(&connection, ACCOUNT, IMAGE_ID, &dek)
                 .unwrap()
@@ -1435,6 +1602,364 @@ mod tests {
             SelectedScreenshotProviderOutcome::ManualRequired
         ));
         assert_eq!(protocol.calls(), vec!["create"]);
+    }
+
+    #[tokio::test]
+    async fn accepted_v3_applies_once_and_exact_name_replays_after_reopen_without_provider_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("accepted-v3.sqlite");
+        let (mut connection, dek) =
+            send_started_fixture_with_connection(Connection::open(&path).unwrap());
+        let provider = ExactAcceptProvider::with_generation(u64::MAX);
+        let request =
+            prepare_selected_screenshot_provider_request(&connection, ACCOUNT, IMAGE_ID, &dek)
+                .unwrap()
+                .unwrap();
+        let attempt = authenticate_selected_screenshot_attempt_for_terminal(
+            &connection,
+            request.binding.account_id(),
+            request.binding.image_id(),
+            request.binding.object_key(),
+            &request.binding.attempt_binding_commitment(),
+        )
+        .unwrap();
+        let outcome = execute_selected_screenshot_provider_request(&provider, request).await;
+        let SelectedScreenshotProviderOutcome::Accepted(accepted) = outcome else {
+            panic!("expected accepted provider proof")
+        };
+        let plan =
+            prepare_selected_screenshot_provider_accepted_result(&connection, accepted).unwrap();
+        let historical_v2 = SelectedScreenshotPlan::new(
+            attempt.account_id,
+            attempt.image_id,
+            attempt.object_key,
+            attempt.binding_commitment,
+            attempt.episode_id,
+            attempt.source_key,
+            attempt.captured_at,
+            attempt.jpeg,
+        )
+        .unwrap();
+        assert_ne!(plan.operation_id(), historical_v2.operation_id());
+        assert_ne!(
+            plan.canonical_request().unwrap(),
+            historical_v2.canonical_request().unwrap()
+        );
+        let applied = execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(plan).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied.disposition(), LogicalMutationDisposition::Applied);
+        assert_eq!(provider.calls(), vec!["create", "get"]);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        drop(connection);
+
+        let mut reopened = Connection::open(&path).unwrap();
+        let replay_plan =
+            load_selected_screenshot_provider_accepted_result(&reopened, ACCOUNT, IMAGE_ID)
+                .unwrap()
+                .unwrap();
+        let changes = reopened.total_changes();
+        let replayed = execute_prepared_for_owner(
+            &mut reopened,
+            PreparedLogicalMutation::prepare(replay_plan).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replayed.disposition(), LogicalMutationDisposition::Replayed);
+        assert_eq!(reopened.total_changes(), changes);
+        assert_eq!(provider.calls(), vec!["create", "get"]);
+        assert_eq!(
+            prepare_selected_screenshot_provider_request(&reopened, ACCOUNT, IMAGE_ID, &dek).err(),
+            Some(WalIdempotencyError::Precondition)
+        );
+        reopened
+            .execute(
+                "INSERT INTO screenshot_images
+                 (id,screenshot_id,episode_id,source_key,captured_at,object_key,mime_type,
+                  width,height,byte_length,sha256)
+                 VALUES (?1,41,7,'rebound:source',?2,?3,'image/jpeg',2,2,20,?4)",
+                params![
+                    "2".repeat(32),
+                    CAPTURED_AT,
+                    crate::store::selected_evidence_media_object_key(ACCOUNT, &"2".repeat(32),)
+                        .unwrap(),
+                    format!("{:x}", Sha256::digest(b"bounded-jpeg-fixture")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            load_selected_screenshot_provider_accepted_result(&reopened, ACCOUNT, IMAGE_ID).err(),
+            Some(WalIdempotencyError::Corrupt)
+        );
+        reopened
+            .execute(
+                "DELETE FROM screenshot_images WHERE id=?1",
+                ["2".repeat(32)],
+            )
+            .unwrap();
+        reopened
+            .execute(
+                "UPDATE archive_v3_wal_selected_screenshot_operations
+                 SET provider_generation=X'0000000000000012' WHERE image_id=?1",
+                [IMAGE_ID],
+            )
+            .unwrap();
+        assert_eq!(
+            load_selected_screenshot_provider_accepted_result(&reopened, ACCOUNT, IMAGE_ID).err(),
+            Some(WalIdempotencyError::Corrupt)
+        );
+        assert_eq!(provider.calls(), vec!["create", "get"]);
+    }
+
+    #[tokio::test]
+    async fn lost_accepted_proof_and_unledgered_local_result_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let lost_path = directory.path().join("lost-accepted.sqlite");
+        let (connection, dek) =
+            send_started_fixture_with_connection(Connection::open(&lost_path).unwrap());
+        let request =
+            prepare_selected_screenshot_provider_request(&connection, ACCOUNT, IMAGE_ID, &dek)
+                .unwrap()
+                .unwrap();
+        let provider = ExactAcceptProvider::new();
+        let outcome = execute_selected_screenshot_provider_request(&provider, request).await;
+        let SelectedScreenshotProviderOutcome::Accepted(accepted) = outcome else {
+            panic!("expected accepted provider proof")
+        };
+        drop(accepted);
+        assert_eq!(provider.calls(), vec!["create", "get"]);
+        drop(connection);
+        let reopened = Connection::open(&lost_path).unwrap();
+        assert!(
+            load_selected_screenshot_provider_accepted_result(&reopened, ACCOUNT, IMAGE_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            prepare_selected_screenshot_provider_request(&reopened, ACCOUNT, IMAGE_ID, &dek).err(),
+            Some(WalIdempotencyError::Precondition)
+        );
+        assert_eq!(provider.calls(), vec!["create", "get"]);
+
+        let (tampered_proof, tampered_dek) = send_started_fixture();
+        let provider = ExactAcceptProvider::new();
+        let request = prepare_selected_screenshot_provider_request(
+            &tampered_proof,
+            ACCOUNT,
+            IMAGE_ID,
+            &tampered_dek,
+        )
+        .unwrap()
+        .unwrap();
+        let SelectedScreenshotProviderOutcome::Accepted(mut accepted) =
+            execute_selected_screenshot_provider_request(&provider, request).await
+        else {
+            panic!("expected accepted provider proof")
+        };
+        accepted.provider_generation = accepted.provider_generation.saturating_add(1);
+        assert_eq!(
+            prepare_selected_screenshot_provider_accepted_result(&tampered_proof, accepted).err(),
+            Some(WalIdempotencyError::Corrupt)
+        );
+        assert_eq!(
+            tampered_proof
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+
+        let (mut collision, collision_dek) = send_started_fixture();
+        let provider = ExactAcceptProvider::new();
+        let request = prepare_selected_screenshot_provider_request(
+            &collision,
+            ACCOUNT,
+            IMAGE_ID,
+            &collision_dek,
+        )
+        .unwrap()
+        .unwrap();
+        let SelectedScreenshotProviderOutcome::Accepted(accepted) =
+            execute_selected_screenshot_provider_request(&provider, request).await
+        else {
+            panic!("expected accepted provider proof")
+        };
+        let plan =
+            prepare_selected_screenshot_provider_accepted_result(&collision, accepted).unwrap();
+        collision
+            .execute(
+                "INSERT INTO screenshot_images
+                 (id,screenshot_id,episode_id,source_key,captured_at,object_key,mime_type,
+                  width,height,byte_length,sha256)
+                 VALUES (?1,41,7,'unrelated:source',?2,?3,'image/jpeg',2,2,20,?4)",
+                params![
+                    "2".repeat(32),
+                    CAPTURED_AT,
+                    crate::store::selected_evidence_media_object_key(ACCOUNT, &"2".repeat(32),)
+                        .unwrap(),
+                    format!("{:x}", Sha256::digest(b"bounded-jpeg-fixture")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            execute_prepared_for_owner(
+                &mut collision,
+                PreparedLogicalMutation::prepare(plan).unwrap(),
+            )
+            .err(),
+            Some(WalIdempotencyError::Precondition)
+        );
+        assert_eq!(
+            collision
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type='table'
+                       AND name='archive_v3_wal_selected_screenshot_operations'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_accepted_a_and_definitive_rejection_c_are_mutually_exclusive() {
+        let (mut a_first, a_dek) = send_started_fixture();
+        let provider = ExactAcceptProvider::new();
+        let request =
+            prepare_selected_screenshot_provider_request(&a_first, ACCOUNT, IMAGE_ID, &a_dek)
+                .unwrap()
+                .unwrap();
+        let SelectedScreenshotProviderOutcome::Accepted(accepted) =
+            execute_selected_screenshot_provider_request(&provider, request).await
+        else {
+            panic!("expected accepted provider proof")
+        };
+        let rejection = rejection_from_binding(duplicate_binding(accepted.binding()));
+        let a_plan =
+            prepare_selected_screenshot_provider_accepted_result(&a_first, accepted).unwrap();
+        execute_prepared_for_owner(
+            &mut a_first,
+            PreparedLogicalMutation::prepare(a_plan).unwrap(),
+        )
+        .unwrap();
+        let c_plan = prepare_selected_screenshot_termination(
+            &a_first,
+            rejection,
+            "2026-08-15T13:00:01.000Z".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            execute_prepared_for_owner(
+                &mut a_first,
+                PreparedLogicalMutation::prepare(c_plan).unwrap(),
+            )
+            .err(),
+            Some(WalIdempotencyError::Precondition)
+        );
+
+        let (mut c_first, c_dek) = send_started_fixture();
+        let provider = ExactAcceptProvider::new();
+        let request =
+            prepare_selected_screenshot_provider_request(&c_first, ACCOUNT, IMAGE_ID, &c_dek)
+                .unwrap()
+                .unwrap();
+        let SelectedScreenshotProviderOutcome::Accepted(accepted) =
+            execute_selected_screenshot_provider_request(&provider, request).await
+        else {
+            panic!("expected accepted provider proof")
+        };
+        let rejection = rejection_from_binding(duplicate_binding(accepted.binding()));
+        let c_plan = prepare_selected_screenshot_termination(
+            &c_first,
+            rejection,
+            "2026-08-15T13:00:01.000Z".to_owned(),
+        )
+        .unwrap();
+        execute_prepared_for_owner(
+            &mut c_first,
+            PreparedLogicalMutation::prepare(c_plan).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepare_selected_screenshot_provider_accepted_result(&c_first, accepted).err(),
+            Some(WalIdempotencyError::Precondition)
+        );
+        assert_eq!(
+            c_first
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_v3_late_typed_readback_failure_rolls_back_local_result_and_ledger() {
+        let (mut connection, dek) = send_started_fixture();
+        let provider = ExactAcceptProvider::new();
+        let request =
+            prepare_selected_screenshot_provider_request(&connection, ACCOUNT, IMAGE_ID, &dek)
+                .unwrap()
+                .unwrap();
+        let SelectedScreenshotProviderOutcome::Accepted(accepted) =
+            execute_selected_screenshot_provider_request(&provider, request).await
+        else {
+            panic!("expected accepted provider proof")
+        };
+        let plan =
+            prepare_selected_screenshot_provider_accepted_result(&connection, accepted).unwrap();
+        let transaction = connection.transaction().unwrap();
+        ensure_selected_screenshot_result_schema(&transaction).unwrap();
+        transaction.commit().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER corrupt_accepted_result_readback
+                 AFTER INSERT ON archive_v3_wal_selected_screenshot_operations
+                 BEGIN
+                   UPDATE archive_v3_wal_selected_screenshot_operations
+                   SET readback_commitment=X'0101010101010101010101010101010101010101010101010101010101010101'
+                   WHERE image_id=NEW.image_id;
+                 END;",
+            )
+            .unwrap();
+        assert_eq!(
+            execute_prepared_for_owner(
+                &mut connection,
+                PreparedLogicalMutation::prepare(plan).unwrap(),
+            )
+            .err(),
+            Some(WalIdempotencyError::Corrupt)
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM archive_v3_wal_selected_screenshot_operations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
