@@ -1,14 +1,15 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 query codecs are reviewed before B boundaries, launcher, or route ownership"
+    reason = "inactive ADR-0022 query codecs are reviewed before provider, launcher, or route ownership"
 )]
 
 //! Inactive query-owned logical WAL domains.
 //!
-//! The parent owns the selected-screenshot receipt. Private children own its
-//! pre-provider stable attempt identity and an exact finalization-queue
-//! transition. None can call Store, launch work, invoke a provider, schedule a
-//! retry, allocate randomness or a clock, or acknowledge a request.
+//! The parent owns the selected-screenshot receipt and consumes its private
+//! child's permanent pre-provider attempt binding. Another private child owns
+//! an exact finalization-queue transition. None can call Store, launch work,
+//! invoke a provider, schedule a retry, allocate randomness or a clock, or
+//! acknowledge a request.
 
 mod finalization_queue;
 mod selected_screenshot_attempt;
@@ -34,7 +35,10 @@ use super::{
 };
 
 const REQUEST_V1: u16 = 1;
+const REQUEST_V2: u16 = 2;
 const REQUEST_SELECTED_SCREENSHOT: u8 = 1;
+const REQUEST_SELECTED_SCREENSHOT_BOUND_ATTEMPT: u8 = 3;
+const BOUND_OPERATION_SOURCE_DOMAIN: &[u8] = b"selected-screenshot-result-bound-v2\0";
 const RESULT_V1: u16 = 1;
 const RESULT_SELECTED_SCREENSHOT: u8 = 1;
 const SCHEMA_TABLE: &str = "archive_v3_wal_selected_screenshot_schema";
@@ -89,9 +93,11 @@ impl std::fmt::Debug for SelectedScreenshotOutcome {
 }
 
 /// Exact local half of an already durable selected-screenshot upload attempt.
-/// The image ID is the stable attempt identity and is fixed before provider I/O.
+/// Production v2 consumes the permanent B binding; historical unbound v1 is
+/// test-only.
 pub(crate) struct SelectedScreenshotPlan {
     operation_id: WalLogicalOperationId,
+    request_contract: SelectedScreenshotRequestContract,
     account_id: String,
     image_id: String,
     object_key: String,
@@ -101,9 +107,47 @@ pub(crate) struct SelectedScreenshotPlan {
     jpeg: ValidatedJpeg,
 }
 
+#[derive(Clone, Copy)]
+enum SelectedScreenshotRequestContract {
+    UnboundV1,
+    BoundV2 {
+        attempt_binding_commitment: [u8; 32],
+    },
+}
+
 impl SelectedScreenshotPlan {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        account_id: String,
+        image_id: String,
+        object_key: String,
+        attempt_binding_commitment: [u8; 32],
+        episode_id: i64,
+        source_key: String,
+        captured_at: String,
+        jpeg: ValidatedJpeg,
+    ) -> Result<Self> {
+        if attempt_binding_commitment == [0; 32] {
+            return Err(WalIdempotencyError::Malformed);
+        }
+        Self::build(
+            SelectedScreenshotRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            },
+            None,
+            account_id,
+            image_id,
+            object_key,
+            episode_id,
+            source_key,
+            captured_at,
+            jpeg,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_unbound_v1(
         account_id: String,
         image_id: String,
         object_key: String,
@@ -113,6 +157,7 @@ impl SelectedScreenshotPlan {
         jpeg: ValidatedJpeg,
     ) -> Result<Self> {
         Self::build(
+            SelectedScreenshotRequestContract::UnboundV1,
             None,
             account_id,
             image_id,
@@ -126,6 +171,7 @@ impl SelectedScreenshotPlan {
 
     #[allow(clippy::too_many_arguments)]
     fn build(
+        request_contract: SelectedScreenshotRequestContract,
         operation_id: Option<WalLogicalOperationId>,
         account_id: String,
         image_id: String,
@@ -160,15 +206,31 @@ impl SelectedScreenshotPlan {
         if object_key != expected_object_key {
             return Err(WalIdempotencyError::Malformed);
         }
-        let operation_id = match operation_id {
-            Some(value) => value,
-            None => WalLogicalOperationId::from_stable_source(
-                WalOperationKind::SelectedScreenshot,
-                image_id.as_bytes(),
-            )?,
+        let operation_id = match (request_contract, operation_id) {
+            (_, Some(value)) => value,
+            (SelectedScreenshotRequestContract::UnboundV1, None) => {
+                WalLogicalOperationId::from_stable_source(
+                    WalOperationKind::SelectedScreenshot,
+                    image_id.as_bytes(),
+                )?
+            }
+            (SelectedScreenshotRequestContract::BoundV2 { .. }, None) => {
+                let mut source = Vec::with_capacity(
+                    BOUND_OPERATION_SOURCE_DOMAIN
+                        .len()
+                        .saturating_add(image_id.len()),
+                );
+                source.extend_from_slice(BOUND_OPERATION_SOURCE_DOMAIN);
+                source.extend_from_slice(image_id.as_bytes());
+                WalLogicalOperationId::from_stable_source(
+                    WalOperationKind::SelectedScreenshot,
+                    &source,
+                )?
+            }
         };
         Ok(Self {
             operation_id,
+            request_contract,
             account_id,
             image_id,
             object_key,
@@ -192,6 +254,7 @@ impl SelectedScreenshotPlan {
         jpeg: ValidatedJpeg,
     ) -> Result<Self> {
         Self::build(
+            SelectedScreenshotRequestContract::UnboundV1,
             Some(operation_id),
             account_id,
             image_id,
@@ -249,8 +312,19 @@ impl WalLogicalDomainPlan for SelectedScreenshotPlan {
 
     fn canonical_request(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut request = Zeroizing::new(Vec::new());
-        request.extend_from_slice(&REQUEST_V1.to_be_bytes());
-        request.push(REQUEST_SELECTED_SCREENSHOT);
+        match self.request_contract {
+            SelectedScreenshotRequestContract::UnboundV1 => {
+                request.extend_from_slice(&REQUEST_V1.to_be_bytes());
+                request.push(REQUEST_SELECTED_SCREENSHOT);
+            }
+            SelectedScreenshotRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            } => {
+                request.extend_from_slice(&REQUEST_V2.to_be_bytes());
+                request.push(REQUEST_SELECTED_SCREENSHOT_BOUND_ATTEMPT);
+                request.extend_from_slice(&attempt_binding_commitment);
+            }
+        }
         append_string(&mut request, &self.account_id)?;
         append_string(&mut request, &self.image_id)?;
         append_string(&mut request, &self.object_key)?;
@@ -265,6 +339,7 @@ impl WalLogicalDomainPlan for SelectedScreenshotPlan {
     }
 
     fn apply(&self, transaction: &Transaction<'_>) -> Result<WalReplayResult> {
+        let bound_screenshot_id = self.authenticate_attempt_binding(transaction)?;
         let observed = record_screenshot_image_in_transaction(
             transaction,
             &self.image_id,
@@ -289,7 +364,9 @@ impl WalLogicalDomainPlan for SelectedScreenshotPlan {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .map_err(|_| WalIdempotencyError::Unavailable)?;
-        if screenshot_binding.0 != screenshot_binding.1 {
+        if screenshot_binding.0 != screenshot_binding.1
+            || bound_screenshot_id.is_some_and(|expected| expected != screenshot_binding.0)
+        {
             return Err(WalIdempotencyError::Precondition);
         }
         if !self.matches_stored(&stored) {
@@ -310,6 +387,28 @@ impl WalLogicalDomainPlan for SelectedScreenshotPlan {
         let outcome = decode_outcome(result)?;
         self.validate_replay(result)?;
         Ok(outcome)
+    }
+}
+
+impl SelectedScreenshotPlan {
+    fn authenticate_attempt_binding(&self, connection: &Connection) -> Result<Option<i64>> {
+        match self.request_contract {
+            SelectedScreenshotRequestContract::UnboundV1 => Ok(None),
+            SelectedScreenshotRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            } => selected_screenshot_attempt::authenticate_selected_screenshot_attempt_binding(
+                connection,
+                &self.account_id,
+                &self.image_id,
+                &self.object_key,
+                self.episode_id,
+                &self.source_key,
+                &self.captured_at,
+                &self.jpeg,
+                &attempt_binding_commitment,
+            )
+            .map(Some),
+        }
     }
 }
 
@@ -379,6 +478,9 @@ impl WalLogicalDomainLedger<SelectedScreenshotPlan> for SelectedScreenshotLedger
             return Err(WalIdempotencyError::Corrupt);
         }
         prepared.plan_for_domain_ledger().validate_replay(&result)?;
+        let _ = prepared
+            .plan_for_domain_ledger()
+            .authenticate_attempt_binding(connection)?;
         Ok(Some(result))
     }
 
@@ -431,6 +533,12 @@ impl WalLogicalDomainLedger<SelectedScreenshotPlan> for SelectedScreenshotLedger
             )
             .map_err(|_| WalIdempotencyError::Unavailable)?;
         if changed != 1 {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        let Some(stored) = Self::lookup(transaction, prepared)? else {
+            return Err(WalIdempotencyError::Corrupt);
+        };
+        if stored != result {
             return Err(WalIdempotencyError::Corrupt);
         }
         Ok(LogicalMutationResult::Applied(result))
@@ -789,7 +897,7 @@ mod tests {
         let image_id = image_seed.to_string().repeat(32);
         let object_key =
             crate::store::selected_evidence_media_object_key(ACCOUNT, &image_id).unwrap();
-        SelectedScreenshotPlan::new(
+        SelectedScreenshotPlan::new_unbound_v1(
             ACCOUNT.to_owned(),
             image_id,
             object_key,
@@ -799,6 +907,60 @@ mod tests {
             jpeg(image_seed),
         )
         .unwrap()
+    }
+
+    fn bound_plan_for(
+        image_seed: char,
+        episode_id: i64,
+        source: &str,
+        binding_commitment: [u8; 32],
+    ) -> SelectedScreenshotPlan {
+        let image_id = image_seed.to_string().repeat(32);
+        let object_key =
+            crate::store::selected_evidence_media_object_key(ACCOUNT, &image_id).unwrap();
+        SelectedScreenshotPlan::new(
+            ACCOUNT.to_owned(),
+            image_id,
+            object_key,
+            binding_commitment,
+            episode_id,
+            source.to_owned(),
+            CAPTURED.to_owned(),
+            jpeg(image_seed),
+        )
+        .unwrap()
+    }
+
+    fn reserve_attempt_binding(
+        connection: &mut Connection,
+        image_seed: char,
+        episode_id: i64,
+        source: &str,
+    ) -> ([u8; 32], WalLogicalOperationId) {
+        let image_id = image_seed.to_string().repeat(32);
+        let jpeg = jpeg(image_seed);
+        let target =
+            selected_screenshot_attempt::authenticate_selected_screenshot_upload_predecessor(
+                connection, ACCOUNT, episode_id, source, CAPTURED, &jpeg,
+            )
+            .unwrap();
+        let plan = SelectedScreenshotAttemptPlan::new(
+            ACCOUNT.to_owned(),
+            image_id,
+            episode_id,
+            source.to_owned(),
+            CAPTURED.to_owned(),
+            jpeg,
+            target,
+        )
+        .unwrap();
+        let operation_id = plan.operation_id();
+        let applied =
+            execute_prepared_for_owner(connection, PreparedLogicalMutation::prepare(plan).unwrap())
+                .unwrap();
+        assert_eq!(applied.disposition(), LogicalMutationDisposition::Applied);
+        let receipt = applied.into_validated_result().release().unwrap();
+        (receipt.binding_commitment(), operation_id)
     }
 
     fn forced_plan(
@@ -824,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_attempt_identity_is_kind_scoped_and_request_binds_every_receipt_fact() {
+    fn historical_v1_identity_is_kind_scoped_and_request_binds_every_receipt_fact() {
         let one = plan_for('a', 7, SOURCE);
         let replay = plan_for('a', 7, SOURCE);
         assert_eq!(one.operation_id(), replay.operation_id());
@@ -851,11 +1013,200 @@ mod tests {
     }
 
     #[test]
+    fn bound_v2_identity_is_distinct_from_attempt_and_historical_v1() {
+        let mut connection = connection();
+        insert_eligible(&connection, 7, 9, SOURCE);
+        let (binding, attempt_id) = reserve_attempt_binding(&mut connection, 'a', 7, SOURCE);
+        let bound = bound_plan_for('a', 7, SOURCE, binding);
+        let historical = plan_for('a', 7, SOURCE);
+        assert_ne!(bound.operation_id(), attempt_id);
+        assert_ne!(bound.operation_id(), historical.operation_id());
+        assert_ne!(
+            bound.canonical_request().unwrap(),
+            historical.canonical_request().unwrap()
+        );
+        let changed_binding = bound_plan_for('a', 7, SOURCE, [9; 32]);
+        assert_eq!(bound.operation_id(), changed_binding.operation_id());
+        assert_ne!(
+            bound.canonical_request().unwrap(),
+            changed_binding.canonical_request().unwrap()
+        );
+    }
+
+    #[test]
+    fn bound_v2_consumes_exact_attempt_and_replay_reauthenticates_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selected-bound.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        install_domain_schema(&connection);
+        insert_eligible(&connection, 7, 9, SOURCE);
+        let (binding, _) = reserve_attempt_binding(&mut connection, 'a', 7, SOURCE);
+        let first = bound_plan_for('a', 7, SOURCE, binding);
+        let replay = bound_plan_for('a', 7, SOURCE, binding);
+        let replay_after_result_tamper = bound_plan_for('a', 7, SOURCE, binding);
+        let replay_after_binding_tamper = bound_plan_for('a', 7, SOURCE, binding);
+        let applied = execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(first).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(applied.disposition(), LogicalMutationDisposition::Applied);
+        drop(connection);
+
+        let mut reopened = Connection::open(&path).unwrap();
+        let changes = reopened.total_changes();
+        let replayed = execute_prepared_for_owner(
+            &mut reopened,
+            PreparedLogicalMutation::prepare(replay).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replayed.disposition(), LogicalMutationDisposition::Replayed);
+        assert_eq!(reopened.total_changes(), changes);
+        reopened
+            .execute(
+                "UPDATE screenshot_images SET screenshot_id=10 WHERE source_key=?1",
+                [SOURCE],
+            )
+            .unwrap();
+        let error = execute_prepared_for_owner(
+            &mut reopened,
+            PreparedLogicalMutation::prepare(replay_after_result_tamper).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, WalIdempotencyError::Corrupt);
+        reopened
+            .execute(
+                "UPDATE screenshot_images SET screenshot_id=9 WHERE source_key=?1",
+                [SOURCE],
+            )
+            .unwrap();
+        reopened
+            .execute(
+                "UPDATE archive_v3_wal_selected_screenshot_attempt_operations
+                 SET binding_commitment=?1 WHERE image_id=?2",
+                params![&[7_u8; 32][..], "a".repeat(32)],
+            )
+            .unwrap();
+        let error = execute_prepared_for_owner(
+            &mut reopened,
+            PreparedLogicalMutation::prepare(replay_after_binding_tamper).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, WalIdempotencyError::Corrupt);
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn bound_v2_late_binding_failure_rolls_back_result_and_preserves_attempt() {
+        let mut connection = connection();
+        insert_eligible(&connection, 7, 9, SOURCE);
+        let (binding, _) = reserve_attempt_binding(&mut connection, 'a', 7, SOURCE);
+        connection
+            .execute_batch(
+                "CREATE TRIGGER corrupt_attempt_after_result
+                 AFTER INSERT ON screenshot_images
+                 BEGIN
+                   UPDATE archive_v3_wal_selected_screenshot_attempt_operations
+                   SET binding_commitment=randomblob(32)
+                   WHERE image_id=NEW.id;
+                 END;",
+            )
+            .unwrap();
+        let error = execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(bound_plan_for('a', 7, SOURCE, binding)).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, WalIdempotencyError::Corrupt);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        let retained: Vec<u8> = connection
+            .query_row(
+                "SELECT binding_commitment
+                 FROM archive_v3_wal_selected_screenshot_attempt_operations
+                 WHERE image_id=?1",
+                ["a".repeat(32)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained.as_slice(), binding.as_slice());
+    }
+
+    #[test]
+    fn bound_v2_rejects_missing_or_substituted_attempt_before_local_write() {
+        let mut missing = connection();
+        insert_eligible(&missing, 7, 9, SOURCE);
+        let error = execute_prepared_for_owner(
+            &mut missing,
+            PreparedLogicalMutation::prepare(bound_plan_for('a', 7, SOURCE, [1; 32])).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, WalIdempotencyError::Precondition);
+        assert_eq!(
+            missing
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+
+        let mut substituted = connection();
+        insert_eligible(&substituted, 7, 9, SOURCE);
+        let (binding, _) = reserve_attempt_binding(&mut substituted, 'a', 7, SOURCE);
+        assert_ne!(binding, [9; 32]);
+        let error = execute_prepared_for_owner(
+            &mut substituted,
+            PreparedLogicalMutation::prepare(bound_plan_for('a', 7, SOURCE, [9; 32])).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, WalIdempotencyError::Precondition);
+        assert_eq!(
+            substituted
+                .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn malformed_attempt_or_noncanonical_object_key_is_rejected_before_prepare() {
+        assert!(SelectedScreenshotPlan::new(
+            ACCOUNT.to_owned(),
+            "a".repeat(32),
+            crate::store::selected_evidence_media_object_key(ACCOUNT, &"a".repeat(32)).unwrap(),
+            [0; 32],
+            7,
+            SOURCE.to_owned(),
+            CAPTURED.to_owned(),
+            jpeg('a'),
+        )
+        .is_err());
         let error = SelectedScreenshotPlan::new(
             ACCOUNT.to_owned(),
             "A".repeat(32),
             "raw/account-1/evidence/not-the-attempt.enc".to_owned(),
+            [1; 32],
             7,
             SOURCE.to_owned(),
             CAPTURED.to_owned(),

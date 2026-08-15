@@ -938,6 +938,7 @@ impl X {
         selected_domain = (ROOT / "src/cp/query/wal.rs").read_text(
             encoding="utf-8"
         )
+        selected_production = without_cfg_test_items(selected_domain)
         selected_attempt_domain = (
             ROOT / "src/cp/query/wal/selected_screenshot_attempt.rs"
         ).read_text(encoding="utf-8")
@@ -1052,6 +1053,18 @@ impl X {
         self.assertIn("archive_v3_wal_selected_screenshot_operations", selected_domain)
         self.assertIn("DomainLedgerBounds::new", selected_domain)
         self.assertIn("WalIdempotencyError::Precondition", selected_domain)
+        self.assertIn("selected-screenshot-result-bound-v2", selected_domain)
+        self.assertIn("attempt_binding_commitment", selected_production)
+        self.assertIn("fn new_unbound_v1", selected_domain)
+        self.assertNotIn("fn new_unbound_v1", selected_production)
+        self.assertIn(
+            "authenticate_selected_screenshot_attempt_binding",
+            selected_attempt_domain,
+        )
+        self.assertIn(
+            "selected_screenshot_attempt::authenticate_selected_screenshot_attempt_binding",
+            selected_production,
+        )
         self.assertIn("mod selected_screenshot_attempt;", selected_domain)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotAttemptPlan",

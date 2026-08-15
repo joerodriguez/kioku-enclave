@@ -287,8 +287,20 @@ separate activation blockers.
     ledger capacity exhaustion, late readback failure, partial schema, tamper,
     and reopen fail closed or exactly replay. Random/clock/DEK
     allocation, media bytes, encryption/provider I/O, Store/route/launcher/task/
-    retry/cleanup/acknowledgement wiring, consumption by the A receipt, and
-    authenticated C rejection/termination release remain separate reviewed slices.
+    retry/cleanup/acknowledgement wiring and authenticated C
+    rejection/termination release remain separate reviewed slices.
+  - [x] Bind the production-facing selected-screenshot A receipt to the exact
+    permanent B attempt. The version-2 request uses a distinct operation domain,
+    carries the B binding commitment, reconstructs the full B row and typed
+    receipt, exact-matches every account/image/object/episode/source/time/JPEG
+    fact, and admits only the B-bound numeric screenshot ID before any local
+    result write. Exact post-insert lookup and replay reauthenticate the B row,
+    exact local result, and source/member topology. Missing, substituted, or
+    tampered attempts, rebound results, and a late binding failure roll back or
+    fail closed; the historical unbound v1 constructor remains test-only.
+    Provider receipt authentication, DEK/encryption/upload, C rejection and
+    termination release, Store/route/launcher/task/retry/cleanup/acknowledgement
+    wiring remain separate reviewed slices.
   - [x] Add the inactive caller-stable finalization-queue A-domain: an exact
     128-bit request ID plus stable account derive the opaque operation before
     actor admission, while the episode, fixed target version, caller-supplied
