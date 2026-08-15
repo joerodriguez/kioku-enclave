@@ -296,7 +296,21 @@ separate activation blockers.
     cap exhaustion, late ledger failure, partial schema, tamper, and reopen fail
     closed or exactly replay. Inference reservation/Vertex calls, Store/save,
     launcher/task/acknowledgement wiring, and visual-evidence backfill remain
-    absent.
+    separate.
+  - [x] Add the inactive ADR-0010 visual-evidence-backfill A-domain: each stable
+    account/cursor/phase identity fingerprints at most sixteen strictly ordered
+    eligible episodes, their exact bounded text-only screenshot evidence,
+    canonical `normal`/`none` predecessors, and validated `none`/`useful`
+    classifications. Sixteen maximum Unicode inputs fit the shared one-MiB
+    request cap. The child deterministically binds at most 120 nonduplicate
+    member screens per episode, full-tuple updates the exact next prefix,
+    advances a private cursor, and retains unit replay atomically in a distinct
+    65,536-row/576-KiB ledger. A short batch cannot skip; only an exact empty
+    tail writes the completion marker, and an exact legacy marker may be
+    adopted. Source/eligibility/membership/evidence/result changes, cursor
+    disorder, cap exhaustion, late ledger failure, partial schema, tamper, and
+    reopen fail closed or exactly replay. Pixel loading, inference reservation/
+    Vertex calls, Store/save, launcher/task/acknowledgement wiring remain absent.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.

@@ -848,11 +848,11 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly ten inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and now admits exactly eleven inactive production A-domains:
 capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
 raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
-webhook settlement, exact synthetic reviewer fixture, cursor-bound substance-backfill batch, and
-Vertex usage terminal outcome.
+webhook settlement, exact synthetic reviewer fixture, cursor-bound substance-backfill batch,
+cursor-bound visual-evidence backfill batch, and Vertex usage terminal outcome.
 Capture-session finish derives an opaque
 operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
@@ -930,8 +930,18 @@ unit replay; a short batch cannot skip a later row. Only an empty exact tail can
 historical completion marker, while a pre-existing exact marker can be adopted. Changed input,
 predecessor, cursor, result, partial schema, cap exhaustion, late ledger failure, or reopen fail
 closed or exactly replay. It cannot reserve inference, invoke Vertex, call Store/save, launch work,
-or acknowledge completion; visual-evidence backfill remains unsupported. All other production
-domain ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
+or acknowledge completion; it is separate from visual-evidence backfill. The visual-evidence child
+likewise accepts only a stable account/cursor/phase identity, but fingerprints at most sixteen exact
+eligible episodes plus each bounded text-only screenshot-evidence rendering, canonical `normal`/`none`
+predecessor, and validated `none`/`useful` result. Sixteen worst-case inputs fit the shared one-MiB
+request cap. It deterministically orders at most 120 nonduplicate member screens per episode,
+reauthenticates the exact next eligible prefix, full-tuple updates each episode, and advances its
+private cursor atomically with unit replay. A short batch cannot skip, and only an empty exact tail
+writes the historical completion marker; an exact pre-existing marker can be adopted. Changed
+episode text, eligibility, membership, screen metadata/OCR, result, cursor, schema, capacity,
+commitment, or reopen fails closed or exactly replays. It cannot load pixels, reserve or invoke
+inference, call Store/save, launch work, or acknowledge completion. All other production domain
+ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
 under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
 substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
 before actor admission, reconcile pending publication, commit the logical mutation and same-ID
@@ -948,7 +958,7 @@ and reviewer/backfill writes. Only capture-session finish, metadata-only screen-
 selected-screenshot receipt, raw-media retention settlement, provider-accepted email,
 provider-accepted APNs, definitive-success webhook settlement, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
-substance backfill; every other A operation remains disabled
+substance and visual-evidence backfills; every other A operation remains disabled
 pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and
 canonical media's first DEK/provider handoff remain B and are not admitted by those children.
 Domain B remains disabled pending explicit caller/attempt identity or

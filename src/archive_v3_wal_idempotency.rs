@@ -9,12 +9,11 @@
 //! domain. A caller cannot use a universal receipt table: it must hold a
 //! module-sealed domain plan whose distinct, bounded ledger fixes the request
 //! fingerprint, indexed resolver, and exact replay-result policy. A bounded
-//! test exemplar plus the separately reviewed capture-session-finish,
+//! test exemplar plus separately reviewed capture-session-finish,
 //! metadata-only screen-reference-batch, selected-screenshot receipt,
-//! raw-media retention settlement, provider-accepted email, provider-accepted
-//! push, and
-//! Vertex-usage-outcome children implement that contract; every other
-//! production domain remains unsealed.
+//! raw-media retention settlement, provider-accepted delivery, Vertex usage,
+//! reviewer-fixture, substance-backfill, and visual-evidence-backfill children
+//! implement that contract; every other production domain remains unsealed.
 //! This module performs only local SQLite transactions and derives opaque
 //! identifiers. It has no Store connection, launcher, publisher construction,
 //! capture, root, witness, provider, route, worker, or startup path.
@@ -445,6 +444,8 @@ impl sealed::DomainPlan for crate::cp::reviewer::wal::ReviewerFixturePlan {}
 impl sealed::DomainLedger for crate::cp::reviewer::wal::ReviewerFixtureLedger {}
 impl sealed::DomainPlan for crate::cp::summarizer::wal::SubstanceBackfillBatchPlan {}
 impl sealed::DomainLedger for crate::cp::summarizer::wal::SubstanceBackfillBatchLedger {}
+impl sealed::DomainPlan for crate::cp::summarizer::wal::VisualEvidenceBackfillBatchPlan {}
+impl sealed::DomainLedger for crate::cp::summarizer::wal::VisualEvidenceBackfillBatchLedger {}
 
 /// Opaque plan produced before actor entry. Only the private WAL owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.
