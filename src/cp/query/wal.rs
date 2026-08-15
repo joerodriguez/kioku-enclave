@@ -5,12 +5,17 @@
 
 //! Inactive query-owned logical WAL domains.
 //!
-//! The parent owns the selected-screenshot receipt. Its private child owns only
-//! an exact finalization-queue transition. Neither can call Store, launch work,
-//! invoke a provider, schedule a retry, or acknowledge a request.
+//! The parent owns the selected-screenshot receipt. Private children own its
+//! pre-provider stable attempt identity and an exact finalization-queue
+//! transition. None can call Store, launch work, invoke a provider, schedule a
+//! retry, allocate randomness or a clock, or acknowledge a request.
 
 mod finalization_queue;
+mod selected_screenshot_attempt;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
+pub(crate) use selected_screenshot_attempt::{
+    SelectedScreenshotAttemptLedger, SelectedScreenshotAttemptPlan,
+};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use zeroize::Zeroizing;

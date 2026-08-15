@@ -900,6 +900,25 @@ the canonical screenshot binding, inserts or exactly adopts the complete receipt
 canonical response, and advances only its distinct 1,048,576-row/512-MiB ledger. Another object or
 screenshot binding, cap exhaustion, late ledger failure, partial schema, tamper, and reopen fail closed
 or exactly replay. It cannot allocate a DEK or attempt, encrypt/upload/delete media, or call Store. The
+separately sealed selected-screenshot B identity now covers the pre-provider attempt half. A
+caller-fixed lowercase 128-bit attempt ID derives a subtype-separated operation identity, and the only
+accepted object key is recomputed through the account-bound evidence namespace. Before its first
+durable write, the child reauthenticates an exact predecessor commitment over screenshot membership,
+canonical capture time, eligibility classifications, current episode count/byte budget, and requested
+JPEG geometry/hash. One immediate transaction reserves the pending attempt against the episode's
+24-image/4,000-KiB budget, binds the exact numeric screenshot identity, and retains the complete
+request, predecessor, binding, typed receipt, and exact-readback-validated row in a distinct
+1,048,576-row/128-MiB ledger. An exact matching local result moves those facts from pending to
+committed accounting without double-counting; any absent or inexact result leaves the permanent
+reservation fail-closed until a later authenticated C-domain settlement exists.
+Reuse of an attempt with changed facts is a fingerprint conflict; an alternate attempt cannot reserve
+the same source target, while a different eligible target gets a different identity. A stale or
+already-consumed target, pending-budget overbooking, rebound result screenshot, late readback mismatch,
+partial schema, permanent-row tamper, or restart fails closed or exactly replays. This B child cannot
+allocate randomness, a clock, or a DEK; access media bytes; encrypt, upload, read, list, or delete a
+provider object; call Store; launch or retry work; terminalize/release a rejected reservation; clean
+up; or acknowledge a request. The A selected-screenshot receipt does not consume this binding yet, so
+that handoff and rejection/termination settlement remain separate activation blockers. The
 finalization-queue child accepts only a caller-stable 128-bit request identity fixed before actor
 admission, the exact stable account and episode, a caller-supplied canonical queue timestamp, and the
 complete eligible predecessor tuple including nullable finalization/version/error/timing facts. It
@@ -1033,9 +1052,12 @@ substance and visual-evidence backfills; every other A operation remains disable
 pending its own separately reviewed codec and the closed launcher. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
-screen result now consumes its exact binding. The provider call and launcher remain absent.
+screen result now consumes its exact binding. The selected-screenshot upload identity is a second
+sealed B operation, but its local A receipt does not consume that binding yet. Provider calls and the
+launcher remain absent.
 Generic/audio/finalization Vertex begin and
-canonical media's first DEK/provider upload handoff remain unsupported.
+canonical media's first DEK/provider upload handoff remain unsupported, as do selected-screenshot
+DEK/encryption/provider settlement and binding consumption.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK first
 write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:

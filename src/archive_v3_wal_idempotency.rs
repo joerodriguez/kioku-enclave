@@ -439,6 +439,8 @@ impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageOutcomePlan 
 impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexUsageOutcomeLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotPlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotLedger {}
+impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotAttemptPlan {}
+impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotAttemptLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::FinalizationQueueLedger {}
 impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan {}
