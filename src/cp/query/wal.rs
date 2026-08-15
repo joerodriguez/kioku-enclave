@@ -12,7 +12,10 @@
 //! exact candidate `SendStarted` and derives its stable request identity while
 //! owning no provider. A fourth private child exposes only an injected exact
 //! create/readback seam and mints sealed success or definitive-no-object proof;
-//! it has no concrete transport or caller. Another private child owns an exact
+//! it has no concrete transport or caller. The sole production A contract
+//! consumes that exact success proof and atomically retains a complete typed
+//! restart row plus the local screenshot; historical A-v1/v2 are test-only.
+//! Another private child owns an exact
 //! finalization-queue transition. None can call Store, launch work, invoke a
 //! concrete provider, schedule a retry, allocate randomness or a clock, or
 //! acknowledge a request.
@@ -55,16 +58,23 @@ use super::{
 
 const REQUEST_V1: u16 = 1;
 const REQUEST_V2: u16 = 2;
+const REQUEST_V3: u16 = 3;
 const REQUEST_SELECTED_SCREENSHOT: u8 = 1;
 const REQUEST_SELECTED_SCREENSHOT_BOUND_ATTEMPT: u8 = 3;
+const REQUEST_SELECTED_SCREENSHOT_PROVIDER_ACCEPTED: u8 = 7;
 const BOUND_OPERATION_SOURCE_DOMAIN: &[u8] = b"selected-screenshot-result-bound-v2\0";
+const PROVIDER_ACCEPTED_OPERATION_SOURCE_DOMAIN: &[u8] =
+    b"selected-screenshot-provider-accepted-result-v3\0";
 const RESULT_V1: u16 = 1;
 const RESULT_SELECTED_SCREENSHOT: u8 = 1;
 const SCHEMA_TABLE: &str = "archive_v3_wal_selected_screenshot_schema";
 const LEDGER_TABLE: &str = "archive_v3_wal_selected_screenshot_operations";
 const STATE_TABLE: &str = "archive_v3_wal_selected_screenshot_state";
+const LEDGER_SCHEMA_REVISION: i64 = 2;
 const MAX_ROWS: u32 = 1_048_576;
 const MAX_RESULT_BYTES: u64 = 512 * 1024 * 1024;
+const MIN_STORED_RESULT_BYTES: i64 = 9;
+const MAX_STORED_RESULT_BYTES: i64 = 4_105;
 const BOUNDS: DomainLedgerBounds = DomainLedgerBounds::new(MAX_ROWS, MAX_RESULT_BYTES);
 
 type Result<T> = std::result::Result<T, WalIdempotencyError>;
@@ -83,7 +93,7 @@ pub(in crate::cp::query) fn prepare_selected_screenshot_send_started(
     )
 }
 
-fn ensure_no_bound_selected_screenshot_result_ledger(
+fn ensure_no_selected_screenshot_result_ledger(
     connection: &Connection,
     image_id: &str,
 ) -> Result<()> {
@@ -91,20 +101,11 @@ fn ensure_no_bound_selected_screenshot_result_ledger(
         return Ok(());
     }
     validate_schema_marker(connection)?;
-    let mut source = Vec::with_capacity(
-        BOUND_OPERATION_SOURCE_DOMAIN
-            .len()
-            .saturating_add(image_id.len()),
-    );
-    source.extend_from_slice(BOUND_OPERATION_SOURCE_DOMAIN);
-    source.extend_from_slice(image_id.as_bytes());
-    let operation_id =
-        WalLogicalOperationId::from_stable_source(WalOperationKind::SelectedScreenshot, &source)?;
     let present = connection
         .query_row(
             "SELECT COUNT(*) FROM archive_v3_wal_selected_screenshot_operations
-             WHERE operation_id=?1",
-            [operation_id.as_bytes().as_slice()],
+             WHERE image_id=?1",
+            [image_id],
             |row| row.get::<_, i64>(0),
         )
         .map_err(|_| WalIdempotencyError::Unavailable)?;
@@ -157,9 +158,9 @@ impl std::fmt::Debug for SelectedScreenshotOutcome {
     }
 }
 
-/// Exact local half of an already durable selected-screenshot upload attempt.
-/// Production v2 consumes the permanent B binding; historical unbound v1 is
-/// test-only.
+/// Exact local half of an already provider-accepted selected-screenshot upload.
+/// Production v3 consumes the sealed positive readback proof. Historical
+/// unbound v1 and B-only v2 are test-only.
 pub(crate) struct SelectedScreenshotPlan {
     operation_id: WalLogicalOperationId,
     request_contract: SelectedScreenshotRequestContract,
@@ -172,15 +173,26 @@ pub(crate) struct SelectedScreenshotPlan {
     jpeg: ValidatedJpeg,
 }
 
-#[derive(Clone, Copy)]
 enum SelectedScreenshotRequestContract {
+    #[cfg(test)]
     UnboundV1,
+    #[cfg(test)]
     BoundV2 {
         attempt_binding_commitment: [u8; 32],
+    },
+    ProviderAcceptedV3 {
+        attempt_operation_id: WalLogicalOperationId,
+        attempt_request_fingerprint: [u8; 32],
+        screenshot_id: i64,
+        predecessor_commitment: [u8; 32],
+        provider_binding: Box<selected_screenshot_provider::SelectedScreenshotProviderBinding>,
+        provider_generation: u64,
+        readback_commitment: [u8; 32],
     },
 }
 
 impl SelectedScreenshotPlan {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         account_id: String,
@@ -271,14 +283,48 @@ impl SelectedScreenshotPlan {
         if object_key != expected_object_key {
             return Err(WalIdempotencyError::Malformed);
         }
-        let operation_id = match (request_contract, operation_id) {
+        match &request_contract {
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::UnboundV1
+            | SelectedScreenshotRequestContract::BoundV2 { .. } => {}
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+                attempt_request_fingerprint,
+                screenshot_id,
+                predecessor_commitment,
+                provider_binding,
+                provider_generation,
+                readback_commitment,
+                ..
+            } => {
+                if *attempt_request_fingerprint == [0; 32]
+                    || *screenshot_id <= 0
+                    || *predecessor_commitment == [0; 32]
+                    || *provider_generation == 0
+                    || *readback_commitment == [0; 32]
+                    || provider_binding.account_id() != account_id
+                    || provider_binding.image_id() != image_id
+                    || provider_binding.object_key() != object_key
+                {
+                    return Err(WalIdempotencyError::Malformed);
+                }
+                selected_screenshot_provider::authenticate_accepted_facts(
+                    provider_binding,
+                    *provider_generation,
+                    readback_commitment,
+                )
+                .map_err(|_| WalIdempotencyError::Malformed)?;
+            }
+        }
+        let operation_id = match (&request_contract, operation_id) {
             (_, Some(value)) => value,
+            #[cfg(test)]
             (SelectedScreenshotRequestContract::UnboundV1, None) => {
                 WalLogicalOperationId::from_stable_source(
                     WalOperationKind::SelectedScreenshot,
                     image_id.as_bytes(),
                 )?
             }
+            #[cfg(test)]
             (SelectedScreenshotRequestContract::BoundV2 { .. }, None) => {
                 let mut source = Vec::with_capacity(
                     BOUND_OPERATION_SOURCE_DOMAIN
@@ -287,6 +333,25 @@ impl SelectedScreenshotPlan {
                 );
                 source.extend_from_slice(BOUND_OPERATION_SOURCE_DOMAIN);
                 source.extend_from_slice(image_id.as_bytes());
+                WalLogicalOperationId::from_stable_source(
+                    WalOperationKind::SelectedScreenshot,
+                    &source,
+                )?
+            }
+            (
+                SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+                    attempt_operation_id,
+                    ..
+                },
+                None,
+            ) => {
+                let mut source = Vec::with_capacity(
+                    PROVIDER_ACCEPTED_OPERATION_SOURCE_DOMAIN
+                        .len()
+                        .saturating_add(attempt_operation_id.as_bytes().len()),
+                );
+                source.extend_from_slice(PROVIDER_ACCEPTED_OPERATION_SOURCE_DOMAIN);
+                source.extend_from_slice(attempt_operation_id.as_bytes());
                 WalLogicalOperationId::from_stable_source(
                     WalOperationKind::SelectedScreenshot,
                     &source,
@@ -355,12 +420,427 @@ impl SelectedScreenshotPlan {
     }
 }
 
+/// WAL-private bridge from the sealed positive provider readback into the
+/// durable local A result. It derives all local facts from the permanent B row;
+/// callers cannot substitute episode, screenshot, source, time, or JPEG facts.
+fn prepare_selected_screenshot_provider_accepted_result(
+    connection: &Connection,
+    accepted: selected_screenshot_provider::SelectedScreenshotProviderAccepted,
+) -> Result<SelectedScreenshotPlan> {
+    let (provider_binding, provider_generation, readback_commitment) = accepted.into_parts();
+    selected_screenshot_provider::authenticate_accepted_facts(
+        &provider_binding,
+        provider_generation,
+        &readback_commitment,
+    )?;
+    selected_screenshot_provider::authenticate_provider_execution_claim(
+        connection,
+        &provider_binding,
+    )?;
+    selected_screenshot_send::authenticate_selected_screenshot_send_provider_facts(
+        connection,
+        &provider_binding.send_facts(),
+    )?;
+    let attempt =
+        selected_screenshot_attempt::authenticate_selected_screenshot_attempt_for_terminal(
+            connection,
+            provider_binding.account_id(),
+            provider_binding.image_id(),
+            provider_binding.object_key(),
+            &provider_binding.attempt_binding_commitment(),
+        )?;
+    if provider_binding.account_id() != attempt.account_id
+        || provider_binding.image_id() != attempt.image_id
+        || provider_binding.object_key() != attempt.object_key
+        || provider_binding.attempt_binding_commitment() != attempt.binding_commitment
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    selected_screenshot_termination::ensure_attempt_not_terminated(
+        connection,
+        &attempt.account_id,
+        &attempt.image_id,
+        &attempt.object_key,
+        &attempt.binding_commitment,
+    )?;
+    SelectedScreenshotPlan::build(
+        SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+            attempt_operation_id: attempt.operation_id,
+            attempt_request_fingerprint: attempt.request_fingerprint,
+            screenshot_id: attempt.screenshot_id,
+            predecessor_commitment: attempt.predecessor_commitment,
+            provider_binding: Box::new(provider_binding),
+            provider_generation,
+            readback_commitment,
+        },
+        None,
+        attempt.account_id,
+        attempt.image_id,
+        attempt.object_key,
+        attempt.episode_id,
+        attempt.source_key,
+        attempt.captured_at,
+        attempt.jpeg,
+    )
+}
+
+/// Exact-name restart loader for an already durable provider-accepted A row.
+/// It reconstructs no provider request and returns only after the full typed
+/// row, predecessor chain, accepted proof, local result, and C exclusion have
+/// reauthenticated.
+fn load_selected_screenshot_provider_accepted_result(
+    connection: &Connection,
+    account_id: &str,
+    image_id: &str,
+) -> Result<Option<SelectedScreenshotPlan>> {
+    crate::store::validate_user_id(account_id).map_err(|_| WalIdempotencyError::Malformed)?;
+    if !valid_lower_hex(image_id, 32) {
+        return Err(WalIdempotencyError::Malformed);
+    }
+    if schema_state(connection)? == LedgerSchemaState::Absent {
+        return Ok(None);
+    }
+    validate_schema_marker(connection)?;
+    let result_length = connection
+        .query_row(
+            "SELECT length(result_bytes)
+             FROM archive_v3_wal_selected_screenshot_operations WHERE image_id=?1",
+            [image_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    let Some(result_length) = result_length else {
+        return Ok(None);
+    };
+    if !(MIN_STORED_RESULT_BYTES..=MAX_STORED_RESULT_BYTES).contains(&result_length) {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let row = load_selected_screenshot_row_by_image(connection, image_id)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.account_id != account_id {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let prepared = PreparedLogicalMutation::prepare(row.to_v3_plan()?)
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
+    SelectedScreenshotLedger::lookup(connection, &prepared)?.ok_or(WalIdempotencyError::Corrupt)?;
+    Ok(Some(row.to_v3_plan()?))
+}
+
+fn load_selected_screenshot_row_by_image(
+    connection: &Connection,
+    image_id: &str,
+) -> Result<Option<StoredSelectedScreenshotRow>> {
+    connection
+        .query_row(
+            "SELECT operation_id,format_version,codec_version,request_version,request_subtype,
+                    request_fingerprint,account_id,image_id,object_key,episode_id,screenshot_id,
+                    source_key,captured_at,width,height,byte_length,sha256,
+                    attempt_operation_id,attempt_request_fingerprint,predecessor_commitment,
+                    attempt_binding_commitment,candidate_request_fingerprint,
+                    wrapped_dek_commitment,media_dek_binding_commitment,aad_commitment,
+                    ciphertext_length,ciphertext_sha256,candidate_binding_commitment,
+                    send_request_id,send_binding_commitment,provider_generation,
+                    readback_commitment,result_bytes,result_commitment
+             FROM archive_v3_wal_selected_screenshot_operations WHERE image_id=?1",
+            [image_id],
+            StoredSelectedScreenshotRow::from_row,
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)
+}
+
 pub(crate) struct SelectedScreenshotLedger;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LedgerSchemaState {
     Absent,
     Present,
+}
+
+struct StoredSelectedScreenshotRow {
+    operation_id: Vec<u8>,
+    format_version: i64,
+    codec_version: i64,
+    request_version: i64,
+    request_subtype: i64,
+    request_fingerprint: Vec<u8>,
+    account_id: String,
+    image_id: String,
+    object_key: String,
+    episode_id: i64,
+    screenshot_id: i64,
+    source_key: String,
+    captured_at: String,
+    width: i32,
+    height: i32,
+    byte_length: i64,
+    sha256: String,
+    attempt_operation_id: Option<Vec<u8>>,
+    attempt_request_fingerprint: Option<Vec<u8>>,
+    predecessor_commitment: Option<Vec<u8>>,
+    attempt_binding_commitment: Option<Vec<u8>>,
+    candidate_request_fingerprint: Option<Vec<u8>>,
+    wrapped_dek_commitment: Option<Vec<u8>>,
+    media_dek_binding_commitment: Option<Vec<u8>>,
+    aad_commitment: Option<Vec<u8>>,
+    ciphertext_length: Option<i64>,
+    ciphertext_sha256: Option<Vec<u8>>,
+    candidate_binding_commitment: Option<Vec<u8>>,
+    send_request_id: Option<String>,
+    send_binding_commitment: Option<Vec<u8>>,
+    provider_generation: Option<Vec<u8>>,
+    readback_commitment: Option<Vec<u8>>,
+    result_bytes: Vec<u8>,
+    result_commitment: Vec<u8>,
+}
+
+impl StoredSelectedScreenshotRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            operation_id: row.get(0)?,
+            format_version: row.get(1)?,
+            codec_version: row.get(2)?,
+            request_version: row.get(3)?,
+            request_subtype: row.get(4)?,
+            request_fingerprint: row.get(5)?,
+            account_id: row.get(6)?,
+            image_id: row.get(7)?,
+            object_key: row.get(8)?,
+            episode_id: row.get(9)?,
+            screenshot_id: row.get(10)?,
+            source_key: row.get(11)?,
+            captured_at: row.get(12)?,
+            width: row.get(13)?,
+            height: row.get(14)?,
+            byte_length: row.get(15)?,
+            sha256: row.get(16)?,
+            attempt_operation_id: row.get(17)?,
+            attempt_request_fingerprint: row.get(18)?,
+            predecessor_commitment: row.get(19)?,
+            attempt_binding_commitment: row.get(20)?,
+            candidate_request_fingerprint: row.get(21)?,
+            wrapped_dek_commitment: row.get(22)?,
+            media_dek_binding_commitment: row.get(23)?,
+            aad_commitment: row.get(24)?,
+            ciphertext_length: row.get(25)?,
+            ciphertext_sha256: row.get(26)?,
+            candidate_binding_commitment: row.get(27)?,
+            send_request_id: row.get(28)?,
+            send_binding_commitment: row.get(29)?,
+            provider_generation: row.get(30)?,
+            readback_commitment: row.get(31)?,
+            result_bytes: row.get(32)?,
+            result_commitment: row.get(33)?,
+        })
+    }
+
+    fn request_identity(&self) -> Result<(u16, u8)> {
+        Ok((
+            u16::try_from(self.request_version).map_err(|_| WalIdempotencyError::Corrupt)?,
+            u8::try_from(self.request_subtype).map_err(|_| WalIdempotencyError::Corrupt)?,
+        ))
+    }
+
+    fn matches_plan(&self, plan: &SelectedScreenshotPlan) -> Result<bool> {
+        let request_identity = plan.request_identity();
+        if self.operation_id.as_slice() != plan.operation_id.as_bytes().as_slice()
+            || self.request_identity()? != request_identity
+            || self.account_id != plan.account_id
+            || self.image_id != plan.image_id
+            || self.object_key != plan.object_key
+            || self.episode_id != plan.episode_id
+            || self.source_key != plan.source_key
+            || self.captured_at != plan.captured_at
+            || self.width != plan.jpeg.width
+            || self.height != plan.jpeg.height
+            || self.byte_length != plan.jpeg.byte_length
+            || self.sha256 != plan.jpeg.sha256
+        {
+            return Ok(false);
+        }
+        match &plan.request_contract {
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::UnboundV1 => Ok(self.v3_fields_absent()),
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            } => Ok(self.attempt_binding_commitment.as_deref()
+                == Some(attempt_binding_commitment.as_slice())
+                && self.other_v3_fields_absent()),
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+                attempt_operation_id,
+                attempt_request_fingerprint,
+                screenshot_id,
+                predecessor_commitment,
+                provider_binding,
+                provider_generation,
+                readback_commitment,
+            } => Ok(self.screenshot_id == *screenshot_id
+                && self.attempt_operation_id.as_deref()
+                    == Some(attempt_operation_id.as_bytes().as_slice())
+                && self.attempt_request_fingerprint.as_deref()
+                    == Some(attempt_request_fingerprint.as_slice())
+                && self.predecessor_commitment.as_deref()
+                    == Some(predecessor_commitment.as_slice())
+                && self.attempt_binding_commitment.as_deref()
+                    == Some(provider_binding.attempt_binding_commitment().as_slice())
+                && self.candidate_request_fingerprint.as_deref()
+                    == Some(provider_binding.candidate_request_fingerprint().as_slice())
+                && self.wrapped_dek_commitment.as_deref()
+                    == Some(provider_binding.wrapped_dek_commitment().as_slice())
+                && self.media_dek_binding_commitment.as_deref()
+                    == Some(provider_binding.media_dek_binding_commitment().as_slice())
+                && self.aad_commitment.as_deref()
+                    == Some(provider_binding.aad_commitment().as_slice())
+                && self.ciphertext_length == Some(i64::from(provider_binding.ciphertext_length()))
+                && self.ciphertext_sha256.as_deref()
+                    == Some(provider_binding.ciphertext_sha256().as_slice())
+                && self.candidate_binding_commitment.as_deref()
+                    == Some(provider_binding.candidate_binding_commitment().as_slice())
+                && self.send_request_id.as_deref() == Some(provider_binding.send_request_id())
+                && self.send_binding_commitment.as_deref()
+                    == Some(provider_binding.send_binding_commitment().as_slice())
+                && self.provider_generation.as_deref()
+                    == Some(provider_generation.to_be_bytes().as_slice())
+                && self.readback_commitment.as_deref() == Some(readback_commitment.as_slice())),
+        }
+    }
+
+    fn v3_fields_absent(&self) -> bool {
+        self.attempt_operation_id.is_none()
+            && self.attempt_request_fingerprint.is_none()
+            && self.predecessor_commitment.is_none()
+            && self.attempt_binding_commitment.is_none()
+            && self.other_v3_fields_absent()
+    }
+
+    fn other_v3_fields_absent(&self) -> bool {
+        self.candidate_request_fingerprint.is_none()
+            && self.wrapped_dek_commitment.is_none()
+            && self.media_dek_binding_commitment.is_none()
+            && self.aad_commitment.is_none()
+            && self.ciphertext_length.is_none()
+            && self.ciphertext_sha256.is_none()
+            && self.candidate_binding_commitment.is_none()
+            && self.send_request_id.is_none()
+            && self.send_binding_commitment.is_none()
+            && self.provider_generation.is_none()
+            && self.readback_commitment.is_none()
+    }
+
+    fn to_v3_plan(&self) -> Result<SelectedScreenshotPlan> {
+        if self.request_identity()? != (REQUEST_V3, REQUEST_SELECTED_SCREENSHOT_PROVIDER_ACCEPTED) {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        let attempt_operation_id =
+            WalLogicalOperationId::from_bytes(required_array_16(&self.attempt_operation_id)?)
+                .map_err(|_| WalIdempotencyError::Corrupt)?;
+        let attempt_request_fingerprint = required_array_32(&self.attempt_request_fingerprint)?;
+        let predecessor_commitment = required_array_32(&self.predecessor_commitment)?;
+        let attempt_binding_commitment = required_array_32(&self.attempt_binding_commitment)?;
+        let candidate_request_fingerprint = required_array_32(&self.candidate_request_fingerprint)?;
+        let wrapped_dek_commitment = required_array_32(&self.wrapped_dek_commitment)?;
+        let media_dek_binding_commitment = required_array_32(&self.media_dek_binding_commitment)?;
+        let aad_commitment = required_array_32(&self.aad_commitment)?;
+        let ciphertext_length =
+            u32::try_from(self.ciphertext_length.ok_or(WalIdempotencyError::Corrupt)?)
+                .map_err(|_| WalIdempotencyError::Corrupt)?;
+        let ciphertext_sha256 = required_array_32(&self.ciphertext_sha256)?;
+        let candidate_binding_commitment = required_array_32(&self.candidate_binding_commitment)?;
+        let send_request_id = self
+            .send_request_id
+            .clone()
+            .ok_or(WalIdempotencyError::Corrupt)?;
+        let send_binding_commitment = required_array_32(&self.send_binding_commitment)?;
+        let provider_generation = u64::from_be_bytes(required_array_8(&self.provider_generation)?);
+        let readback_commitment = required_array_32(&self.readback_commitment)?;
+        let provider_binding =
+            selected_screenshot_provider::SelectedScreenshotProviderBinding::from_terminal_facts(
+                self.account_id.clone(),
+                self.image_id.clone(),
+                self.object_key.clone(),
+                candidate_request_fingerprint,
+                attempt_binding_commitment,
+                wrapped_dek_commitment,
+                media_dek_binding_commitment,
+                aad_commitment,
+                ciphertext_length,
+                ciphertext_sha256,
+                candidate_binding_commitment,
+                send_request_id,
+                send_binding_commitment,
+            )?;
+        SelectedScreenshotPlan::build(
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+                attempt_operation_id,
+                attempt_request_fingerprint,
+                screenshot_id: self.screenshot_id,
+                predecessor_commitment,
+                provider_binding: Box::new(provider_binding),
+                provider_generation,
+                readback_commitment,
+            },
+            None,
+            self.account_id.clone(),
+            self.image_id.clone(),
+            self.object_key.clone(),
+            self.episode_id,
+            self.source_key.clone(),
+            self.captured_at.clone(),
+            ValidatedJpeg {
+                width: self.width,
+                height: self.height,
+                byte_length: self.byte_length,
+                sha256: self.sha256.clone(),
+            },
+        )
+        .map_err(|_| WalIdempotencyError::Corrupt)
+    }
+}
+
+fn required_array_16(value: &Option<Vec<u8>>) -> Result<[u8; 16]> {
+    value
+        .as_deref()
+        .ok_or(WalIdempotencyError::Corrupt)?
+        .try_into()
+        .map_err(|_| WalIdempotencyError::Corrupt)
+}
+
+fn required_array_8(value: &Option<Vec<u8>>) -> Result<[u8; 8]> {
+    value
+        .as_deref()
+        .ok_or(WalIdempotencyError::Corrupt)?
+        .try_into()
+        .map_err(|_| WalIdempotencyError::Corrupt)
+}
+
+fn required_array_32(value: &Option<Vec<u8>>) -> Result<[u8; 32]> {
+    value
+        .as_deref()
+        .ok_or(WalIdempotencyError::Corrupt)?
+        .try_into()
+        .map_err(|_| WalIdempotencyError::Corrupt)
+}
+
+impl SelectedScreenshotPlan {
+    const fn request_identity(&self) -> (u16, u8) {
+        match &self.request_contract {
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::UnboundV1 => {
+                (REQUEST_V1, REQUEST_SELECTED_SCREENSHOT)
+            }
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::BoundV2 { .. } => {
+                (REQUEST_V2, REQUEST_SELECTED_SCREENSHOT_BOUND_ATTEMPT)
+            }
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 { .. } => {
+                (REQUEST_V3, REQUEST_SELECTED_SCREENSHOT_PROVIDER_ACCEPTED)
+            }
+        }
+    }
 }
 
 impl WalLogicalDomainPlan for SelectedScreenshotPlan {
@@ -377,17 +857,38 @@ impl WalLogicalDomainPlan for SelectedScreenshotPlan {
 
     fn canonical_request(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut request = Zeroizing::new(Vec::new());
-        match self.request_contract {
+        match &self.request_contract {
+            #[cfg(test)]
             SelectedScreenshotRequestContract::UnboundV1 => {
                 request.extend_from_slice(&REQUEST_V1.to_be_bytes());
                 request.push(REQUEST_SELECTED_SCREENSHOT);
             }
+            #[cfg(test)]
             SelectedScreenshotRequestContract::BoundV2 {
                 attempt_binding_commitment,
             } => {
                 request.extend_from_slice(&REQUEST_V2.to_be_bytes());
                 request.push(REQUEST_SELECTED_SCREENSHOT_BOUND_ATTEMPT);
-                request.extend_from_slice(&attempt_binding_commitment);
+                request.extend_from_slice(attempt_binding_commitment);
+            }
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+                attempt_operation_id,
+                attempt_request_fingerprint,
+                screenshot_id,
+                predecessor_commitment,
+                provider_binding,
+                provider_generation,
+                readback_commitment,
+            } => {
+                request.extend_from_slice(&REQUEST_V3.to_be_bytes());
+                request.push(REQUEST_SELECTED_SCREENSHOT_PROVIDER_ACCEPTED);
+                request.extend_from_slice(attempt_operation_id.as_bytes());
+                request.extend_from_slice(attempt_request_fingerprint);
+                request.extend_from_slice(&screenshot_id.to_be_bytes());
+                request.extend_from_slice(predecessor_commitment);
+                append_provider_binding(&mut request, provider_binding)?;
+                request.extend_from_slice(&provider_generation.to_be_bytes());
+                request.extend_from_slice(readback_commitment);
             }
         }
         append_string(&mut request, &self.account_id)?;
@@ -405,6 +906,32 @@ impl WalLogicalDomainPlan for SelectedScreenshotPlan {
 
     fn apply(&self, transaction: &Transaction<'_>) -> Result<WalReplayResult> {
         let bound_screenshot_id = self.authenticate_attempt_binding(transaction)?;
+        if matches!(
+            self.request_contract,
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 { .. }
+        ) {
+            let exact_screenshot_id = bound_screenshot_id.ok_or(WalIdempotencyError::Corrupt)?;
+            let local = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM screenshot_images
+                     WHERE id=?1 OR source_key=?2 OR object_key=?3 OR screenshot_id=?4",
+                    params![
+                        self.image_id,
+                        self.source_key,
+                        self.object_key,
+                        exact_screenshot_id,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| WalIdempotencyError::Unavailable)?;
+            if local != 0 {
+                return Err(if local == 1 {
+                    WalIdempotencyError::Precondition
+                } else {
+                    WalIdempotencyError::Corrupt
+                });
+            }
+        }
         let observed = record_screenshot_image_in_transaction(
             transaction,
             &self.image_id,
@@ -457,8 +984,10 @@ impl WalLogicalDomainPlan for SelectedScreenshotPlan {
 
 impl SelectedScreenshotPlan {
     fn authenticate_attempt_binding(&self, connection: &Connection) -> Result<Option<i64>> {
-        match self.request_contract {
+        match &self.request_contract {
+            #[cfg(test)]
             SelectedScreenshotRequestContract::UnboundV1 => Ok(None),
+            #[cfg(test)]
             SelectedScreenshotRequestContract::BoundV2 {
                 attempt_binding_commitment,
             } => {
@@ -472,18 +1001,101 @@ impl SelectedScreenshotPlan {
                         &self.source_key,
                         &self.captured_at,
                         &self.jpeg,
-                        &attempt_binding_commitment,
+                        attempt_binding_commitment,
                     )?;
                 selected_screenshot_termination::ensure_attempt_not_terminated(
                     connection,
                     &self.account_id,
                     &self.image_id,
                     &self.object_key,
-                    &attempt_binding_commitment,
+                    attempt_binding_commitment,
                 )?;
                 Ok(Some(screenshot_id))
             }
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+                attempt_operation_id,
+                attempt_request_fingerprint,
+                screenshot_id,
+                predecessor_commitment,
+                provider_binding,
+                provider_generation,
+                readback_commitment,
+            } => {
+                let attempt = selected_screenshot_attempt::authenticate_selected_screenshot_attempt_for_terminal(
+                    connection,
+                    &self.account_id,
+                    &self.image_id,
+                    &self.object_key,
+                    &provider_binding.attempt_binding_commitment(),
+                )?;
+                if attempt.operation_id != *attempt_operation_id
+                    || attempt.request_fingerprint != *attempt_request_fingerprint
+                    || attempt.account_id != self.account_id
+                    || attempt.image_id != self.image_id
+                    || attempt.object_key != self.object_key
+                    || attempt.episode_id != self.episode_id
+                    || attempt.screenshot_id != *screenshot_id
+                    || attempt.source_key != self.source_key
+                    || attempt.captured_at != self.captured_at
+                    || attempt.jpeg != self.jpeg
+                    || attempt.predecessor_commitment != *predecessor_commitment
+                    || attempt.binding_commitment != provider_binding.attempt_binding_commitment()
+                    || provider_binding.account_id() != self.account_id
+                    || provider_binding.image_id() != self.image_id
+                    || provider_binding.object_key() != self.object_key
+                {
+                    return Err(WalIdempotencyError::Corrupt);
+                }
+                selected_screenshot_send::authenticate_selected_screenshot_send_provider_facts(
+                    connection,
+                    &provider_binding.send_facts(),
+                )?;
+                selected_screenshot_provider::authenticate_provider_execution_claim(
+                    connection,
+                    provider_binding,
+                )?;
+                selected_screenshot_provider::authenticate_accepted_facts(
+                    provider_binding,
+                    *provider_generation,
+                    readback_commitment,
+                )?;
+                selected_screenshot_termination::ensure_attempt_not_terminated(
+                    connection,
+                    &self.account_id,
+                    &self.image_id,
+                    &self.object_key,
+                    &attempt.binding_commitment,
+                )?;
+                Ok(Some(*screenshot_id))
+            }
         }
+    }
+
+    fn authenticate_v3_local_uniqueness(&self, connection: &Connection) -> Result<()> {
+        let screenshot_id = match &self.request_contract {
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::UnboundV1
+            | SelectedScreenshotRequestContract::BoundV2 { .. } => return Ok(()),
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 { screenshot_id, .. } => {
+                screenshot_id
+            }
+        };
+        let matches = connection
+            .query_row(
+                "SELECT COUNT(*) FROM screenshot_images
+                 WHERE id=?1 OR source_key=?2 OR object_key=?3 OR screenshot_id=?4",
+                params![
+                    self.image_id,
+                    self.source_key,
+                    self.object_key,
+                    screenshot_id,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| WalIdempotencyError::Unavailable)?;
+        (matches == 1)
+            .then_some(())
+            .ok_or(WalIdempotencyError::Corrupt)
     }
 }
 
@@ -510,37 +1122,53 @@ impl WalLogicalDomainLedger<SelectedScreenshotPlan> for SelectedScreenshotLedger
             return Ok(None);
         }
         validate_schema_marker(connection)?;
-        let row = connection
+        let result_length = connection
             .query_row(
-                "SELECT format_version,codec_version,request_fingerprint,
-                        result_bytes,result_commitment
+                "SELECT length(result_bytes)
                  FROM archive_v3_wal_selected_screenshot_operations
                  WHERE operation_id=?1",
                 [prepared.operation_id_for_owner().as_bytes().as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                    ))
-                },
+                |row| row.get::<_, i64>(0),
             )
             .optional()
             .map_err(|_| WalIdempotencyError::Unavailable)?;
-        let Some((format, codec, fingerprint, encoded, commitment)) = row else {
+        let Some(result_length) = result_length else {
+            return Ok(None);
+        };
+        if !(MIN_STORED_RESULT_BYTES..=MAX_STORED_RESULT_BYTES).contains(&result_length) {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        let row = connection
+            .query_row(
+                "SELECT operation_id,format_version,codec_version,request_version,request_subtype,
+                        request_fingerprint,account_id,image_id,object_key,episode_id,screenshot_id,
+                        source_key,captured_at,width,height,byte_length,sha256,
+                        attempt_operation_id,attempt_request_fingerprint,predecessor_commitment,
+                        attempt_binding_commitment,candidate_request_fingerprint,
+                        wrapped_dek_commitment,media_dek_binding_commitment,aad_commitment,
+                        ciphertext_length,ciphertext_sha256,candidate_binding_commitment,
+                        send_request_id,send_binding_commitment,provider_generation,
+                        readback_commitment,result_bytes,result_commitment
+                 FROM archive_v3_wal_selected_screenshot_operations
+                 WHERE operation_id=?1",
+                [prepared.operation_id_for_owner().as_bytes().as_slice()],
+                StoredSelectedScreenshotRow::from_row,
+            )
+            .optional()
+            .map_err(|_| WalIdempotencyError::Unavailable)?;
+        let Some(row) = row else {
             return Ok(None);
         };
         let kind = WalOperationKind::SelectedScreenshot;
-        if format != i64::from(WalOperationKind::format_version())
-            || codec != i64::from(kind.codec_version())
-            || fingerprint.len() != 32
-            || commitment.len() != 32
+        if row.format_version != i64::from(WalOperationKind::format_version())
+            || row.codec_version != i64::from(kind.codec_version())
+            || row.request_fingerprint.len() != 32
+            || row.result_commitment.len() != 32
+            || row.result_bytes.len() > MAX_ENCODED_REPLAY_RESULT_BYTES
         {
             return Err(WalIdempotencyError::Corrupt);
         }
-        if fingerprint.as_slice()
+        if row.request_fingerprint.as_slice()
             != prepared
                 .request_fingerprint_for_owner()
                 .as_bytes()
@@ -548,14 +1176,20 @@ impl WalLogicalDomainLedger<SelectedScreenshotPlan> for SelectedScreenshotLedger
         {
             return Err(WalIdempotencyError::FingerprintConflict);
         }
-        let result = WalReplayResult::decode(kind, &encoded)?;
-        if commitment.as_slice() != result.commitment(kind)?.as_slice() {
+        if !row.matches_plan(prepared.plan_for_domain_ledger())? {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        let result = WalReplayResult::decode(kind, &row.result_bytes)?;
+        if row.result_commitment.as_slice() != result.commitment(kind)?.as_slice() {
             return Err(WalIdempotencyError::Corrupt);
         }
         prepared.plan_for_domain_ledger().validate_replay(&result)?;
         let _ = prepared
             .plan_for_domain_ledger()
             .authenticate_attempt_binding(connection)?;
+        prepared
+            .plan_for_domain_ledger()
+            .authenticate_v3_local_uniqueness(connection)?;
         Ok(Some(result))
     }
 
@@ -576,20 +1210,135 @@ impl WalLogicalDomainLedger<SelectedScreenshotPlan> for SelectedScreenshotLedger
         prepared.plan_for_domain_ledger().validate_replay(&result)?;
         let encoded = result.encode(kind)?;
         let commitment = result.commitment(kind)?;
+        let plan = prepared.plan_for_domain_ledger();
+        let screenshot_id = transaction
+            .query_row(
+                "SELECT screenshot_id FROM screenshot_images WHERE id=?1",
+                [plan.image_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| WalIdempotencyError::Corrupt)?;
+        let (request_version, request_subtype) = plan.request_identity();
+        type V3StoredFields = (
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        );
+        let v3: V3StoredFields = match &plan.request_contract {
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::UnboundV1 => (
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None,
+            ),
+            #[cfg(test)]
+            SelectedScreenshotRequestContract::BoundV2 {
+                attempt_binding_commitment,
+            } => (
+                None,
+                None,
+                None,
+                Some(attempt_binding_commitment.to_vec()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            SelectedScreenshotRequestContract::ProviderAcceptedV3 {
+                attempt_operation_id,
+                attempt_request_fingerprint,
+                predecessor_commitment,
+                provider_binding,
+                provider_generation,
+                readback_commitment,
+                ..
+            } => (
+                Some(attempt_operation_id.as_bytes().to_vec()),
+                Some(attempt_request_fingerprint.to_vec()),
+                Some(predecessor_commitment.to_vec()),
+                Some(provider_binding.attempt_binding_commitment().to_vec()),
+                Some(provider_binding.candidate_request_fingerprint().to_vec()),
+                Some(provider_binding.wrapped_dek_commitment().to_vec()),
+                Some(provider_binding.media_dek_binding_commitment().to_vec()),
+                Some(provider_binding.aad_commitment().to_vec()),
+                Some(i64::from(provider_binding.ciphertext_length())),
+                Some(provider_binding.ciphertext_sha256().to_vec()),
+                Some(provider_binding.candidate_binding_commitment().to_vec()),
+                Some(provider_binding.send_request_id().to_owned()),
+                Some(provider_binding.send_binding_commitment().to_vec()),
+                Some(provider_generation.to_be_bytes().to_vec()),
+                Some(readback_commitment.to_vec()),
+            ),
+        };
         transaction
             .execute(
                 "INSERT INTO archive_v3_wal_selected_screenshot_operations
-                 (operation_id,format_version,codec_version,request_fingerprint,
-                  result_bytes,result_commitment)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                 (operation_id,format_version,codec_version,request_version,request_subtype,
+                  request_fingerprint,account_id,image_id,object_key,episode_id,screenshot_id,
+                  source_key,captured_at,width,height,byte_length,sha256,
+                  attempt_operation_id,attempt_request_fingerprint,predecessor_commitment,
+                  attempt_binding_commitment,candidate_request_fingerprint,
+                  wrapped_dek_commitment,media_dek_binding_commitment,aad_commitment,
+                  ciphertext_length,ciphertext_sha256,candidate_binding_commitment,
+                  send_request_id,send_binding_commitment,provider_generation,
+                  readback_commitment,result_bytes,result_commitment)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
+                         ?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,
+                         ?33,?34)",
                 params![
                     prepared.operation_id_for_owner().as_bytes().as_slice(),
                     i64::from(WalOperationKind::format_version()),
                     i64::from(kind.codec_version()),
+                    i64::from(request_version),
+                    i64::from(request_subtype),
                     prepared
                         .request_fingerprint_for_owner()
                         .as_bytes()
                         .as_slice(),
+                    plan.account_id,
+                    plan.image_id,
+                    plan.object_key,
+                    plan.episode_id,
+                    screenshot_id,
+                    plan.source_key,
+                    plan.captured_at,
+                    plan.jpeg.width,
+                    plan.jpeg.height,
+                    plan.jpeg.byte_length,
+                    plan.jpeg.sha256,
+                    v3.0,
+                    v3.1,
+                    v3.2,
+                    v3.3,
+                    v3.4,
+                    v3.5,
+                    v3.6,
+                    v3.7,
+                    v3.8,
+                    v3.9,
+                    v3.10,
+                    v3.11,
+                    v3.12,
+                    v3.13,
+                    v3.14,
                     encoded.as_slice(),
                     commitment.as_slice(),
                 ],
@@ -630,6 +1379,26 @@ fn append_string(destination: &mut Vec<u8>, value: &str) -> Result<()> {
     let length = u16::try_from(value.len()).map_err(|_| WalIdempotencyError::Limit)?;
     destination.extend_from_slice(&length.to_be_bytes());
     destination.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn append_provider_binding(
+    destination: &mut Vec<u8>,
+    binding: &selected_screenshot_provider::SelectedScreenshotProviderBinding,
+) -> Result<()> {
+    append_string(destination, binding.account_id())?;
+    append_string(destination, binding.image_id())?;
+    append_string(destination, binding.object_key())?;
+    destination.extend_from_slice(&binding.candidate_request_fingerprint());
+    destination.extend_from_slice(&binding.attempt_binding_commitment());
+    destination.extend_from_slice(&binding.wrapped_dek_commitment());
+    destination.extend_from_slice(&binding.media_dek_binding_commitment());
+    destination.extend_from_slice(&binding.aad_commitment());
+    destination.extend_from_slice(&binding.ciphertext_length().to_be_bytes());
+    destination.extend_from_slice(&binding.ciphertext_sha256());
+    destination.extend_from_slice(&binding.candidate_binding_commitment());
+    append_string(destination, binding.send_request_id())?;
+    destination.extend_from_slice(&binding.send_binding_commitment());
     Ok(())
 }
 
@@ -810,18 +1579,114 @@ fn ensure_schema(transaction: &Transaction<'_>) -> Result<()> {
                 .execute_batch(
                     "CREATE TABLE archive_v3_wal_selected_screenshot_schema (
                         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                        format_version INTEGER NOT NULL CHECK(format_version=1),
+                        format_version INTEGER NOT NULL CHECK(format_version=2),
                         codec_version INTEGER NOT NULL CHECK(codec_version=1)
                      ) STRICT;
                      CREATE TABLE archive_v3_wal_selected_screenshot_operations (
                         operation_id BLOB PRIMARY KEY NOT NULL,
                         format_version INTEGER NOT NULL CHECK(format_version=1),
                         codec_version INTEGER NOT NULL CHECK(codec_version=1),
+                        request_version INTEGER NOT NULL,
+                        request_subtype INTEGER NOT NULL,
                         request_fingerprint BLOB NOT NULL,
+                        account_id TEXT NOT NULL,
+                        image_id TEXT NOT NULL UNIQUE,
+                        object_key TEXT NOT NULL UNIQUE,
+                        episode_id INTEGER NOT NULL,
+                        screenshot_id INTEGER NOT NULL,
+                        source_key TEXT NOT NULL UNIQUE,
+                        captured_at TEXT NOT NULL,
+                        width INTEGER NOT NULL,
+                        height INTEGER NOT NULL,
+                        byte_length INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        attempt_operation_id BLOB,
+                        attempt_request_fingerprint BLOB,
+                        predecessor_commitment BLOB,
+                        attempt_binding_commitment BLOB,
+                        candidate_request_fingerprint BLOB,
+                        wrapped_dek_commitment BLOB,
+                        media_dek_binding_commitment BLOB,
+                        aad_commitment BLOB,
+                        ciphertext_length INTEGER,
+                        ciphertext_sha256 BLOB,
+                        candidate_binding_commitment BLOB,
+                        send_request_id TEXT,
+                        send_binding_commitment BLOB,
+                        provider_generation BLOB,
+                        readback_commitment BLOB,
                         result_bytes BLOB NOT NULL,
                         result_commitment BLOB NOT NULL,
                         CHECK(length(operation_id)=16 AND operation_id<>zeroblob(16)),
                         CHECK(length(request_fingerprint)=32 AND request_fingerprint<>zeroblob(32)),
+                        CHECK(length(account_id) BETWEEN 1 AND 128),
+                        CHECK(length(image_id)=32),
+                        CHECK(length(object_key) BETWEEN 1 AND 512),
+                        CHECK(episode_id>0 AND screenshot_id>0),
+                        CHECK(length(source_key) BETWEEN 1 AND 4096),
+                        CHECK(length(captured_at) BETWEEN 1 AND 4096),
+                        CHECK(width BETWEEN 1 AND 16384 AND height BETWEEN 1 AND 16384),
+                        CHECK(byte_length BETWEEN 1 AND 4194304),
+                        CHECK(length(sha256)=64),
+                        CHECK(
+                          (request_version=1 AND request_subtype=1
+                           AND attempt_operation_id IS NULL
+                           AND attempt_request_fingerprint IS NULL
+                           AND predecessor_commitment IS NULL
+                           AND attempt_binding_commitment IS NULL
+                           AND candidate_request_fingerprint IS NULL
+                           AND wrapped_dek_commitment IS NULL
+                           AND media_dek_binding_commitment IS NULL
+                           AND aad_commitment IS NULL AND ciphertext_length IS NULL
+                           AND ciphertext_sha256 IS NULL
+                           AND candidate_binding_commitment IS NULL
+                           AND send_request_id IS NULL AND send_binding_commitment IS NULL
+                           AND provider_generation IS NULL AND readback_commitment IS NULL)
+                          OR
+                          (request_version=2 AND request_subtype=3
+                           AND attempt_operation_id IS NULL
+                           AND attempt_request_fingerprint IS NULL
+                           AND predecessor_commitment IS NULL
+                           AND length(attempt_binding_commitment)=32
+                           AND attempt_binding_commitment<>zeroblob(32)
+                           AND candidate_request_fingerprint IS NULL
+                           AND wrapped_dek_commitment IS NULL
+                           AND media_dek_binding_commitment IS NULL
+                           AND aad_commitment IS NULL AND ciphertext_length IS NULL
+                           AND ciphertext_sha256 IS NULL
+                           AND candidate_binding_commitment IS NULL
+                           AND send_request_id IS NULL AND send_binding_commitment IS NULL
+                           AND provider_generation IS NULL AND readback_commitment IS NULL)
+                          OR
+                          (request_version=3 AND request_subtype=7
+                           AND length(attempt_operation_id)=16
+                           AND attempt_operation_id<>zeroblob(16)
+                           AND length(attempt_request_fingerprint)=32
+                           AND attempt_request_fingerprint<>zeroblob(32)
+                           AND length(predecessor_commitment)=32
+                           AND predecessor_commitment<>zeroblob(32)
+                           AND length(attempt_binding_commitment)=32
+                           AND attempt_binding_commitment<>zeroblob(32)
+                           AND length(candidate_request_fingerprint)=32
+                           AND candidate_request_fingerprint<>zeroblob(32)
+                           AND length(wrapped_dek_commitment)=32
+                           AND wrapped_dek_commitment<>zeroblob(32)
+                           AND length(media_dek_binding_commitment)=32
+                           AND media_dek_binding_commitment<>zeroblob(32)
+                           AND length(aad_commitment)=32 AND aad_commitment<>zeroblob(32)
+                           AND ciphertext_length>0
+                           AND length(ciphertext_sha256)=32
+                           AND ciphertext_sha256<>zeroblob(32)
+                           AND length(candidate_binding_commitment)=32
+                           AND candidate_binding_commitment<>zeroblob(32)
+                           AND length(send_request_id)=64
+                           AND length(send_binding_commitment)=32
+                           AND send_binding_commitment<>zeroblob(32)
+                           AND length(provider_generation)=8
+                           AND provider_generation<>zeroblob(8)
+                           AND length(readback_commitment)=32
+                           AND readback_commitment<>zeroblob(32))
+                        ),
                         CHECK(length(result_bytes) BETWEEN 9 AND 4105),
                         CHECK(length(result_commitment)=32 AND result_commitment<>zeroblob(32))
                      ) STRICT, WITHOUT ROWID;
@@ -831,7 +1696,7 @@ fn ensure_schema(transaction: &Transaction<'_>) -> Result<()> {
                         result_bytes INTEGER NOT NULL CHECK(result_bytes BETWEEN 0 AND 536870912)
                      ) STRICT;
                      INSERT INTO archive_v3_wal_selected_screenshot_schema
-                        (singleton,format_version,codec_version) VALUES (1,1,1);
+                        (singleton,format_version,codec_version) VALUES (1,2,1);
                      INSERT INTO archive_v3_wal_selected_screenshot_state
                         (singleton,row_count,result_bytes) VALUES (1,0,0);",
                 )
@@ -853,7 +1718,7 @@ fn validate_schema_marker(connection: &Connection) -> Result<()> {
         .map_err(|_| WalIdempotencyError::Corrupt)?;
     if marker
         != Some((
-            i64::from(WalOperationKind::format_version()),
+            LEDGER_SCHEMA_REVISION,
             i64::from(WalOperationKind::SelectedScreenshot.codec_version()),
         ))
     {
@@ -877,6 +1742,19 @@ fn load_ledger_state(connection: &Connection) -> Result<(u32, u64)> {
     let row_count = u32::try_from(state.0).map_err(|_| WalIdempotencyError::Corrupt)?;
     let result_bytes = u64::try_from(state.1).map_err(|_| WalIdempotencyError::Corrupt)?;
     if row_count > MAX_ROWS || result_bytes > MAX_RESULT_BYTES {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let actual = connection
+        .query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(result_bytes)),0)
+             FROM archive_v3_wal_selected_screenshot_operations",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
+    if actual.0 != i64::from(row_count)
+        || actual.1 != i64::try_from(result_bytes).map_err(|_| WalIdempotencyError::Corrupt)?
+    {
         return Err(WalIdempotencyError::Corrupt);
     }
     Ok((row_count, result_bytes))
@@ -1450,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn row_cap_is_checked_before_domain_insert_but_existing_replay_survives() {
+    fn forged_row_cap_counter_fails_closed_before_replay_or_new_insert() {
         let mut connection = connection();
         insert_eligible(&connection, 7, 9, SOURCE);
         insert_eligible(&connection, 8, 10, "device-1:screen-2");
@@ -1465,19 +2343,20 @@ mod tests {
                 [i64::from(MAX_ROWS)],
             )
             .unwrap();
-        let replay = execute_prepared_for_owner(
+        let replay_error = execute_prepared_for_owner(
             &mut connection,
             PreparedLogicalMutation::prepare(forced_plan(1, 'a', 7, SOURCE)).unwrap(),
         )
+        .err()
         .unwrap();
-        assert_eq!(replay.disposition(), LogicalMutationDisposition::Replayed);
+        assert_eq!(replay_error, WalIdempotencyError::Corrupt);
         let error = execute_prepared_for_owner(
             &mut connection,
             PreparedLogicalMutation::prepare(forced_plan(2, 'b', 8, "device-1:screen-2")).unwrap(),
         )
         .err()
         .unwrap();
-        assert_eq!(error, WalIdempotencyError::Limit);
+        assert_eq!(error, WalIdempotencyError::Corrupt);
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| row
@@ -1488,7 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn result_byte_cap_is_checked_before_domain_insert() {
+    fn forged_result_byte_cap_counter_fails_closed_before_domain_insert() {
         let mut connection = connection();
         insert_eligible(&connection, 7, 9, SOURCE);
         let transaction = connection.transaction().unwrap();
@@ -1506,7 +2385,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(error, WalIdempotencyError::Limit);
+        assert_eq!(error, WalIdempotencyError::Corrupt);
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM screenshot_images", [], |row| row

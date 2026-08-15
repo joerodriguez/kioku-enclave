@@ -549,7 +549,7 @@ fn authenticate_predecessors(
         });
     }
     if let Err(error) =
-        super::ensure_no_bound_selected_screenshot_result_ledger(connection, &plan.attempt.image_id)
+        super::ensure_no_selected_screenshot_result_ledger(connection, &plan.attempt.image_id)
     {
         return Err(
             if terminal_exists && error == WalIdempotencyError::Precondition {
