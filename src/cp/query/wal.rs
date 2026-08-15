@@ -1,16 +1,16 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 selected-screenshot codec is reviewed before its B attempt boundary, launcher, or route ownership"
+    reason = "inactive ADR-0022 query codecs are reviewed before B boundaries, launcher, or route ownership"
 )]
 
-//! Inactive selected-screenshot logical WAL domain.
+//! Inactive query-owned logical WAL domains.
 //!
-//! A future B-domain upload attempt must durably choose the opaque image ID,
-//! exact account-bound object key, and authenticated media facts before any
-//! provider send. This child can only record that exact pre-existing attempt
-//! into the user database and its own bounded replay ledger. It cannot obtain
-//! a DEK, encrypt or upload bytes, call Store, launch work, or acknowledge a
-//! request.
+//! The parent owns the selected-screenshot receipt. Its private child owns only
+//! an exact finalization-queue transition. Neither can call Store, launch work,
+//! invoke a provider, schedule a retry, or acknowledge a request.
+
+mod finalization_queue;
+pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use zeroize::Zeroizing;

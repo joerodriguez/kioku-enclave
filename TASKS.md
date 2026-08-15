@@ -231,6 +231,18 @@ separate activation blockers.
     schema, result tamper, and reopen all fail closed or exactly replay. The
     media-DEK allocator, encryption/upload attempt, Store/route/launcher/provider/
     task/ack path, and cleanup remain absent.
+  - [x] Add the inactive caller-stable finalization-queue A-domain: an exact
+    128-bit request ID plus stable account derive the opaque operation before
+    actor admission, while the episode, fixed target version, caller-supplied
+    canonical queue timestamp, and complete predecessor status/error/attempt/
+    schedule/timestamp tuple form the request fingerprint. Only a supported
+    non-current, non-queued predecessor can full-tuple transition to `queued`;
+    retry outcome and schedule fields clear in the same transaction as unit
+    replay in a distinct 1,048,576-row/32-MiB ledger. Changed rows, request-ID
+    reuse, time regression, cap exhaustion, late ledger failure, partial schema,
+    tamper, and reopen fail closed or exactly replay. Request/clock allocation,
+    finalizer scheduling/invocation, Store/route/launcher/task/acknowledgement
+    wiring, and retry-state mutation remain absent.
   - [x] Add the inactive raw-media retention-settlement A-domain: the stable
     account/event identity derives one opaque operation before actor admission,
     while the exact account-bound object key, bucket-local generation/backend,
