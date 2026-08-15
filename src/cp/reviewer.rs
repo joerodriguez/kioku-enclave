@@ -4,6 +4,8 @@
 //! exact image-baked reviewer UID and email. It lives in the same encrypted,
 //! per-user SQLite blob as ordinary Kioku data and contains no real user data.
 
+pub(crate) mod wal;
+
 use std::sync::Arc;
 
 use crate::{error::Result, store::Store};
@@ -195,6 +197,7 @@ mod tests {
                 assert_eq!(episodes, 4);
                 assert!(launch.contains("August 19"));
                 assert_eq!(renewal, "https://example.com/renewal");
+                assert!(wal::fixture_is_exact(conn));
                 Ok(())
             })
             .await
