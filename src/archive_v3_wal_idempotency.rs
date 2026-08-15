@@ -443,6 +443,8 @@ impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSentPlan {}
 impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSentLedger {}
 impl sealed::DomainPlan for crate::cp::reviewer::wal::ReviewerFixturePlan {}
 impl sealed::DomainLedger for crate::cp::reviewer::wal::ReviewerFixtureLedger {}
+impl sealed::DomainPlan for crate::cp::summarizer::wal::SubstanceBackfillBatchPlan {}
+impl sealed::DomainLedger for crate::cp::summarizer::wal::SubstanceBackfillBatchLedger {}
 
 /// Opaque plan produced before actor entry. Only the private WAL owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.
