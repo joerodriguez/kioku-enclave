@@ -1121,9 +1121,10 @@ substituted results, and unsupported response shapes fail closed. It must derive
 before actor admission, reconcile pending publication, commit the logical mutation and same-ID
 capture, exact-read immutable uploads, CAS/reconcile the witness, and settle publication before
 acknowledging the retained result. Cancellation after local commit and before settlement poisons
-that actor until durable reconciliation. The production codecs have no Store, route, launcher,
-worker, provider, task, runtime-policy, or acknowledgement connection, and introduce no detached
-publication.
+that actor until durable reconciliation. The production codecs have no direct Store, route,
+external-launcher, worker, provider, task, runtime-policy, or acknowledgement connection, and
+introduce no detached publication. A private inactive composition owner now accepts only sealed
+prepared plans and retains the sole archive actor; it is not callable outside the WAL-owner family.
 
 The reviewed operation inventory is deliberately asymmetric. Stable portable domain A contains
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
@@ -1135,8 +1136,9 @@ raw-media retention settlement, provider-accepted email,
 provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue,
 exact finalization commit, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
-substance and visual-evidence backfills; every other A operation remains disabled
-pending its own separately reviewed codec and the closed launcher. In particular, screen person
+substance and visual-evidence backfills; these are the complete reviewed A set for this inactive
+gate. Every other semantic A operation remains disabled pending its own separately reviewed codec
+and activation adapter. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
 screen result now consumes its exact binding. The selected-screenshot upload identity is a second
@@ -1147,12 +1149,13 @@ local A-v3 receipt consumes the exact accepted provider proof and full predecess
 unbound v1 and B-only v2 A contracts are test-only.
 An exact definitive-no-object C terminal now reauthenticates the complete one-shot provider execution
 claim and predecessor chain, releases budget only for another target, and permanently fences local A,
-new candidate admission, and provider re-preparation. Provider calls and the launcher remain absent.
+new candidate admission, and provider re-preparation. Concrete provider calls and every external
+launcher caller remain absent.
 Generic/audio/finalization Vertex begin and
 canonical media's KMS-authenticated DEK producer and encryption/provider upload handoff remain
 unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported
-are selected-screenshot KMS production, a concrete provider adapter, and launcher ownership of the
-reviewed proof-to-A transition.
+are selected-screenshot KMS production, a concrete provider adapter, and the future domain adapter
+that would supply the reviewed proof-to-A transition to the private archive launcher.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK KMS
 production and upload/send boundaries, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
@@ -1248,12 +1251,16 @@ logical-publication comparison row, advances the owner binding, and only then pe
 recovered staging owner to reset capture generation. The runtime gives this child only an
 exact-name immutable create/get capability; enumerate and delete authority never cross the handoff.
 
-This publisher remains unreachable: there is no production logical-operation codec, launcher,
-Store factory, startup/config/route/health call, acknowledgement surface, provider list/delete, or
-deployment path. It cannot serve the archive, acknowledge a domain result, delete objects, or
-create a second runtime. Production Store constructors remain LegacySnapshot and the test-only
-`WalLogicalOnly` gate remains unchanged. Activation still requires separately reviewed domain
-codecs and the single-archive maintenance launcher.
+This publisher and its private launcher remain unreachable. The launcher consumes only a
+non-cloneable completed maintenance handoff, re-reads the exact terminal Control record carrying
+the full-parity commitment, and owns one heterogeneous sealed-plan actor; the publisher retains
+that parity evidence for its lifetime. There is no external caller, Store factory,
+startup/config/route/health call, acknowledgement surface, provider list/delete, or deployment
+path. Neither component can serve the archive, acknowledge a domain result, delete objects, or
+create a second runtime. Production Store constructors remain `LegacySnapshot` and the test-only
+`WalLogicalOnly` gate remains unchanged. Activation still requires the separately reviewed live
+domain/provider adapters, advisory shadow integration, release evidence, and explicit canary/cloud
+authorization listed in `docs/adr/0022-activation-readiness.md`.
 
 Root objects are explicitly named as candidates. Crashes and CAS races may leave more
 than one immutable candidate for a sequence; none has authority unless the independent

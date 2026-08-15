@@ -81,9 +81,8 @@ use crate::{
         CaptureRegistration, CaptureRegistry, OwnedCapturedDrain, RegisteredCaptureVfs,
     },
     archive_v3_wal_idempotency::{
-        execute_prepared_for_owner, lookup_prepared_for_owner, LogicalMutationDisposition,
-        PreparedLogicalMutation, PreparedLookup, ValidatedWalLogicalResult, WalIdempotencyError,
-        WalLogicalDomainPlan,
+        ErasedPreparedLogicalMutation, ErasedPreparedLookup, ErasedValidatedWalLogicalResult,
+        LogicalMutationDisposition, WalIdempotencyError,
     },
     archive_v3_wal_owner::{
         WalOperationIdentity, WalOwnerAttempt, WalOwnerContext, WalOwnerError, WalOwnerInstanceId,
@@ -933,18 +932,18 @@ impl crate::archive_v3_shadow_checkpoint::OwnedCheckpointSource for WalOwnerChec
     }
 }
 
-pub(crate) enum WalStoreApply<P: WalLogicalDomainPlan> {
+pub(crate) enum WalStoreApply {
     Applied {
         context: Box<WalOwnerContext>,
         drain: OwnedCapturedDrain,
-        result: ValidatedWalLogicalResult<P>,
+        result: ErasedValidatedWalLogicalResult,
     },
-    Replayed(ValidatedWalLogicalResult<P>),
+    Replayed(ErasedValidatedWalLogicalResult),
 }
 
-pub(crate) enum WalStoreReplay<P: WalLogicalDomainPlan> {
-    Absent(PreparedLogicalMutation<P>),
-    Present(ValidatedWalLogicalResult<P>),
+pub(crate) enum WalStoreReplay {
+    Absent(Box<dyn ErasedPreparedLogicalMutation>),
+    Present(ErasedValidatedWalLogicalResult),
 }
 
 impl SingleArchiveWalStoreOwner {
@@ -1005,10 +1004,10 @@ impl SingleArchiveWalStoreOwner {
     /// encrypted Control and freshly authenticated the provider head. A
     /// locally committed but unsettled operation retains exactly one captured
     /// commit, so it cannot take this path.
-    pub(crate) fn lookup_settled_replay<P: WalLogicalDomainPlan>(
+    pub(crate) fn lookup_settled_replay(
         &mut self,
-        prepared: PreparedLogicalMutation<P>,
-    ) -> std::result::Result<WalStoreReplay<P>, WalOwnerError> {
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
+    ) -> std::result::Result<WalStoreReplay, WalOwnerError> {
         if self.poisoned {
             return Err(WalOwnerError::Poisoned);
         }
@@ -1022,15 +1021,19 @@ impl SingleArchiveWalStoreOwner {
         connection
             .pragma_update(None, "query_only", true)
             .map_err(|_| WalOwnerError::Corrupt)?;
-        let result = lookup_prepared_for_owner(connection, prepared);
+        let result = prepared.lookup_for_owner(connection);
         let after = database_mutation_fingerprint(connection);
         let restore = connection.pragma_update(None, "query_only", false);
         let capture_empty = registration.completed_len() == 0;
         match (result, after, restore, capture_empty) {
-            (Ok(PreparedLookup::Present(result)), Ok(after), Ok(()), true) if after == before => {
+            (Ok(ErasedPreparedLookup::Present(result)), Ok(after), Ok(()), true)
+                if after == before =>
+            {
                 Ok(WalStoreReplay::Present(result))
             }
-            (Ok(PreparedLookup::Absent(prepared)), Ok(after), Ok(()), true) if after == before => {
+            (Ok(ErasedPreparedLookup::Absent(prepared)), Ok(after), Ok(()), true)
+                if after == before =>
+            {
                 Ok(WalStoreReplay::Absent(prepared))
             }
             (Err(WalIdempotencyError::FingerprintConflict), Ok(after), Ok(()), true)
@@ -1045,11 +1048,11 @@ impl SingleArchiveWalStoreOwner {
         }
     }
 
-    pub(crate) fn apply_prepared<P: WalLogicalDomainPlan>(
+    pub(crate) fn apply_prepared(
         &mut self,
-        prepared: PreparedLogicalMutation<P>,
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
         attempt: WalOwnerAttempt,
-    ) -> std::result::Result<WalStoreApply<P>, WalOwnerError> {
+    ) -> std::result::Result<WalStoreApply, WalOwnerError> {
         if self.poisoned {
             return Err(WalOwnerError::Poisoned);
         }
@@ -1061,12 +1064,10 @@ impl SingleArchiveWalStoreOwner {
             self.poison();
             return Err(WalOwnerError::Conflict);
         }
-        let identity: WalOperationIdentity = prepared.identity_for_owner();
-        let execution = execute_prepared_for_owner(
-            self.connection.as_mut().ok_or(WalOwnerError::Poisoned)?,
-            prepared,
-        )
-        .map_err(|_| WalOwnerError::Conflict)?;
+        let identity = WalOperationIdentity::from_erased_prepared(prepared.as_ref());
+        let execution = prepared
+            .execute_for_owner(self.connection.as_mut().ok_or(WalOwnerError::Poisoned)?)
+            .map_err(|_| WalOwnerError::Conflict)?;
         if execution.kind() != identity.kind()
             || execution.operation_id() != identity.operation_id()
             || execution.request_fingerprint() != identity.request_fingerprint()
@@ -1103,12 +1104,12 @@ impl SingleArchiveWalStoreOwner {
         }
     }
 
-    fn take_exact_captured<P: WalLogicalDomainPlan>(
+    fn take_exact_captured(
         &mut self,
         identity: WalOperationIdentity,
         attempt: WalOwnerAttempt,
-        result: ValidatedWalLogicalResult<P>,
-    ) -> std::result::Result<WalStoreApply<P>, WalOwnerError> {
+        result: ErasedValidatedWalLogicalResult,
+    ) -> std::result::Result<WalStoreApply, WalOwnerError> {
         let registration = self.registration.as_ref().ok_or(WalOwnerError::Poisoned)?;
         let lease =
             match registration.begin_exact_one_drain(attempt.session_id(), attempt.attempt_id()) {

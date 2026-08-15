@@ -7,11 +7,13 @@
 //! protocol. The owner accepts only a sealed domain plan, runs its exact
 //! domain row and mutation in one SQLite `BEGIN IMMEDIATE`, and retains the
 //! resulting capture until encrypted control durably authenticates witness
-//! settlement. Its private child consumes the maintenance handoff to provide
-//! publication and mandatory checkpoint recovery, but there is no production
-//! domain codec, launcher, route, startup, Store-registry, configuration,
-//! acknowledgement, deletion, list, or cloud construction path.
+//! settlement. Its private launcher consumes the parity-certified maintenance
+//! handoff, owns one heterogeneous sealed-plan actor, and composes the private
+//! publisher plus mandatory checkpoint recovery. There is no external caller,
+//! route, startup, Store-registry, configuration, acknowledgement, deletion,
+//! list, or cloud construction path.
 
+mod launcher;
 mod publisher;
 
 pub(crate) use publisher::{
@@ -21,6 +23,7 @@ pub(crate) use publisher::{
 };
 
 use std::{
+    any::Any,
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -46,8 +49,8 @@ use crate::{
     archive_v3_shadow_wal::MAX_WAL_SEGMENTS_PER_COMMIT,
     archive_v3_sqlite_vfs::{CaptureStreamId, OwnedCapturedDrain},
     archive_v3_wal_idempotency::{
-        PreparedLogicalMutation, WalLogicalDomainPlan, WalLogicalOperationId, WalOperationKind,
-        WalRequestFingerprint,
+        ErasedPreparedLogicalMutation, ErasedValidatedWalLogicalResult, PreparedLogicalMutation,
+        WalLogicalDomainPlan, WalLogicalOperationId, WalOperationKind, WalRequestFingerprint,
     },
     archive_v3_witness::{
         AuthenticatedWalRootAdvance, DeletionState, MigrationState, RootCommitment, RootReference,
@@ -325,6 +328,14 @@ impl WalOperationIdentity {
 
     pub(crate) const fn request_fingerprint(&self) -> WalRequestFingerprint {
         self.request_fingerprint
+    }
+
+    pub(crate) fn from_erased_prepared(prepared: &dyn ErasedPreparedLogicalMutation) -> Self {
+        Self {
+            kind: prepared.kind_for_owner(),
+            operation_id: prepared.operation_id_for_owner(),
+            request_fingerprint: prepared.request_fingerprint_for_owner(),
+        }
     }
 
     pub(crate) fn from_control_parts(
@@ -1661,7 +1672,7 @@ pub(crate) struct WalCheckpointSettlement {
 }
 
 impl WalCheckpointSettlement {
-    async fn into_lane<P: WalLogicalDomainPlan>(self) -> Result<WalStoreLane<P>> {
+    async fn into_lane(self) -> Result<WalStoreLane> {
         WalStoreLane::spawn_authenticated(self.staged, self.binding, self.capture).await
     }
 }
@@ -1672,28 +1683,28 @@ impl fmt::Debug for WalCheckpointSettlement {
     }
 }
 
-struct WalOwnerCommand<P: WalLogicalDomainPlan> {
-    prepared: PreparedLogicalMutation<P>,
-    response: oneshot::Sender<Result<P::Output>>,
+struct WalOwnerCommand {
+    prepared: Box<dyn ErasedPreparedLogicalMutation>,
+    response: oneshot::Sender<Result<Box<dyn Any + Send>>>,
 }
 
-enum WalOwnerMessage<P: WalLogicalDomainPlan> {
-    Apply(WalOwnerCommand<P>),
+enum WalOwnerMessage {
+    Apply(WalOwnerCommand),
     #[cfg(test)]
     CheckpointedPlaintext {
         response: oneshot::Sender<Result<Vec<u8>>>,
     },
 }
 
-enum WalStoreLaneCommand<P: WalLogicalDomainPlan> {
+enum WalStoreLaneCommand {
     Lookup {
-        prepared: PreparedLogicalMutation<P>,
-        response: oneshot::Sender<Result<crate::store::WalStoreReplay<P>>>,
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
+        response: oneshot::Sender<Result<crate::store::WalStoreReplay>>,
     },
     Apply {
-        prepared: PreparedLogicalMutation<P>,
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
         attempt: Box<WalOwnerAttempt>,
-        response: oneshot::Sender<Result<crate::store::WalStoreApply<P>>>,
+        response: oneshot::Sender<Result<crate::store::WalStoreApply>>,
     },
     Advance {
         context: Box<WalOwnerContext>,
@@ -1717,15 +1728,15 @@ enum WalStoreLaneCommand<P: WalLogicalDomainPlan> {
 /// Dedicated blocking lane. The writable SQLite connection and VFS capture
 /// registration never enter a Tokio worker; only sealed commands and opaque
 /// results cross this boundary.
-struct WalStoreLane<P: WalLogicalDomainPlan> {
-    sender: std::sync::mpsc::Sender<WalStoreLaneCommand<P>>,
+struct WalStoreLane {
+    sender: std::sync::mpsc::Sender<WalStoreLaneCommand>,
     binding: WalOwnerStoreBinding,
     instance_id: WalOwnerInstanceId,
     poisoned: Arc<AtomicBool>,
     _thread: std::thread::JoinHandle<()>,
 }
 
-impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
+impl WalStoreLane {
     fn spawn(store: crate::store::SingleArchiveWalStoreOwner) -> Result<Self> {
         let binding = store.binding().clone();
         let instance_id = store.instance_id();
@@ -1822,8 +1833,8 @@ impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
 
     async fn lookup(
         &self,
-        prepared: PreparedLogicalMutation<P>,
-    ) -> Result<crate::store::WalStoreReplay<P>> {
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
+    ) -> Result<crate::store::WalStoreReplay> {
         let (response, result) = oneshot::channel();
         self.sender
             .send(WalStoreLaneCommand::Lookup { prepared, response })
@@ -1833,9 +1844,9 @@ impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
 
     async fn apply(
         &self,
-        prepared: PreparedLogicalMutation<P>,
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
         attempt: WalOwnerAttempt,
-    ) -> Result<crate::store::WalStoreApply<P>> {
+    ) -> Result<crate::store::WalStoreApply> {
         let (response, result) = oneshot::channel();
         self.sender
             .send(WalStoreLaneCommand::Apply {
@@ -1898,9 +1909,9 @@ impl<P: WalLogicalDomainPlan> WalStoreLane<P> {
     }
 }
 
-fn run_wal_store_lane<P: WalLogicalDomainPlan>(
+fn run_wal_store_lane(
     mut store: crate::store::SingleArchiveWalStoreOwner,
-    receiver: std::sync::mpsc::Receiver<WalStoreLaneCommand<P>>,
+    receiver: std::sync::mpsc::Receiver<WalStoreLaneCommand>,
     thread_poisoned: Arc<AtomicBool>,
 ) {
     while let Ok(command) = receiver.recv() {
@@ -1968,22 +1979,29 @@ fn run_wal_store_lane<P: WalLogicalDomainPlan>(
 /// Non-cloneable handle owning the actor queue and task. A submitted plan is
 /// moved into the queue before awaiting its response; cancellation of that
 /// caller therefore cannot cancel post-commit publication work.
-pub(crate) struct WalOwnerHandle<P: WalLogicalDomainPlan> {
-    sender: mpsc::Sender<WalOwnerMessage<P>>,
+pub(crate) struct WalOwnerHandle {
+    sender: mpsc::Sender<WalOwnerMessage>,
     _task: tokio::task::JoinHandle<()>,
 }
 
-impl<P: WalLogicalDomainPlan> WalOwnerHandle<P> {
-    pub(crate) async fn submit(&self, prepared: PreparedLogicalMutation<P>) -> Result<P::Output> {
+impl WalOwnerHandle {
+    pub(crate) async fn submit<P: WalLogicalDomainPlan>(
+        &self,
+        prepared: PreparedLogicalMutation<P>,
+    ) -> Result<P::Output> {
         let (response, result) = oneshot::channel();
         self.sender
             .send(WalOwnerMessage::Apply(WalOwnerCommand {
-                prepared,
+                prepared: Box::new(prepared),
                 response,
             }))
             .await
             .map_err(|_| WalOwnerError::Poisoned)?;
-        result.await.map_err(|_| WalOwnerError::Poisoned)?
+        let output = result.await.map_err(|_| WalOwnerError::Poisoned)??;
+        output
+            .downcast::<P::Output>()
+            .map(|output| *output)
+            .map_err(|_| WalOwnerError::Corrupt)
     }
 
     #[cfg(test)]
@@ -1997,7 +2015,7 @@ impl<P: WalLogicalDomainPlan> WalOwnerHandle<P> {
     }
 }
 
-impl<P: WalLogicalDomainPlan> fmt::Debug for WalOwnerHandle<P> {
+impl fmt::Debug for WalOwnerHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("WalOwnerHandle(<opaque>)")
     }
@@ -2005,24 +2023,21 @@ impl<P: WalLogicalDomainPlan> fmt::Debug for WalOwnerHandle<P> {
 
 /// Sole local actor. It owns the writable staged SQLite connection, capture
 /// registration, and one publication authority. It is intentionally private.
-struct SingleArchiveWalOwner<P, A>
+struct SingleArchiveWalOwner<A>
 where
-    P: WalLogicalDomainPlan,
     A: WalPublicationAuthority,
 {
-    store: WalStoreLane<P>,
+    store: WalStoreLane,
     control: Arc<dyn WalOwnerControl>,
     publication: Arc<A>,
     // The maintenance handoff's SQLite-backed admission fence is Send but
     // deliberately not Sync. The sole actor owns it for its entire lifetime;
     // it never enters the shareable publication authority or crosses an API.
     _store_fence: Option<crate::store::StoreWalAuthorityFence>,
-    _plan: std::marker::PhantomData<P>,
 }
 
-impl<P, A> SingleArchiveWalOwner<P, A>
+impl<A> SingleArchiveWalOwner<A>
 where
-    P: WalLogicalDomainPlan,
     A: WalPublicationAuthority,
 {
     async fn take_checkpoint_source_with_lease_maintenance(
@@ -2057,7 +2072,7 @@ where
         store: crate::store::SingleArchiveWalStoreOwner,
         control: Arc<dyn WalOwnerControl>,
         publication: Arc<A>,
-    ) -> WalOwnerHandle<P> {
+    ) -> WalOwnerHandle {
         match WalStoreLane::spawn(store) {
             Ok(store) => Self::spawn_lane(store, control, publication),
             Err(_) => Self::spawn_failed(),
@@ -2065,27 +2080,26 @@ where
     }
 
     fn spawn_lane(
-        store: WalStoreLane<P>,
+        store: WalStoreLane,
         control: Arc<dyn WalOwnerControl>,
         publication: Arc<A>,
-    ) -> WalOwnerHandle<P> {
+    ) -> WalOwnerHandle {
         Self::spawn_lane_with_fence(store, control, publication, None)
     }
 
     fn spawn_lane_with_fence(
-        store: WalStoreLane<P>,
+        store: WalStoreLane,
         control: Arc<dyn WalOwnerControl>,
         publication: Arc<A>,
         store_fence: Option<crate::store::StoreWalAuthorityFence>,
-    ) -> WalOwnerHandle<P> {
-        let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage<P>>(MAX_WAL_OWNER_COMMANDS);
+    ) -> WalOwnerHandle {
+        let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage>(MAX_WAL_OWNER_COMMANDS);
         let task = tokio::spawn(async move {
             let mut owner = Self {
                 store,
                 control,
                 publication,
                 _store_fence: store_fence,
-                _plan: std::marker::PhantomData,
             };
             while let Some(message) = receiver.recv().await {
                 match message {
@@ -2110,8 +2124,8 @@ where
         }
     }
 
-    fn spawn_failed() -> WalOwnerHandle<P> {
-        let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage<P>>(MAX_WAL_OWNER_COMMANDS);
+    fn spawn_failed() -> WalOwnerHandle {
+        let (sender, mut receiver) = mpsc::channel::<WalOwnerMessage>(MAX_WAL_OWNER_COMMANDS);
         let task = tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 match command {
@@ -2131,7 +2145,10 @@ where
         }
     }
 
-    async fn apply_one(&mut self, prepared: PreparedLogicalMutation<P>) -> Result<P::Output> {
+    async fn apply_one(
+        &mut self,
+        prepared: Box<dyn ErasedPreparedLogicalMutation>,
+    ) -> Result<Box<dyn Any + Send>> {
         if self
             .publication
             .checkpoint_pending(self.store.binding())
@@ -2146,7 +2163,7 @@ where
             self.store = settlement.into_lane().await?;
             self.require_fresh_head().await?;
         }
-        let identity = prepared.identity_for_owner();
+        let identity = WalOperationIdentity::from_erased_prepared(prepared.as_ref());
         let admission = self
             .control
             .inspect_operation(self.store.binding(), identity)
@@ -2243,7 +2260,8 @@ where
         self.require_fresh_head().await?;
         let applied = self.store.apply(prepared, attempt.clone()).await?;
         match applied {
-            crate::store::WalStoreApply::Replayed(_) => {
+            crate::store::WalStoreApply::Replayed(result) => {
+                drop(result);
                 self.store.poison();
                 Err(WalOwnerError::Conflict)
             }
@@ -2271,7 +2289,7 @@ where
         &mut self,
         identity: WalOperationIdentity,
         mut attempt: WalOwnerAttempt,
-    ) -> Result<P::Output> {
+    ) -> Result<Box<dyn Any + Send>> {
         let candidate = attempt.candidate().cloned().ok_or(WalOwnerError::Corrupt)?;
         if attempt.stage() == WalPublicationStage::CandidateReady {
             attempt = self
@@ -2299,8 +2317,8 @@ where
         context: WalOwnerContext,
         drain: OwnedCapturedDrain,
         attempt: WalOwnerAttempt,
-        result: crate::archive_v3_wal_idempotency::ValidatedWalLogicalResult<P>,
-    ) -> Result<P::Output> {
+        result: ErasedValidatedWalLogicalResult,
+    ) -> Result<Box<dyn Any + Send>> {
         let commit = drain.exact_commit(&context).map_err(|_| {
             self.store.poison();
             WalOwnerError::Capture
@@ -2359,16 +2377,6 @@ where
     }
 }
 
-impl<P: WalLogicalDomainPlan> PreparedLogicalMutation<P> {
-    pub(crate) fn identity_for_owner(&self) -> WalOperationIdentity {
-        WalOperationIdentity {
-            kind: self.kind_for_owner(),
-            operation_id: self.operation_id_for_owner(),
-            request_fingerprint: self.request_fingerprint_for_owner(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2396,7 +2404,7 @@ mod tests {
     };
 
     #[derive(Clone)]
-    struct TestPlan {
+    struct TestPlan<const FAMILY: u8 = 0> {
         kind: WalOperationKind,
         operation_id: WalLogicalOperationId,
         value: Vec<u8>,
@@ -2444,13 +2452,13 @@ mod tests {
         ReturnSubstitutedResult,
     }
 
-    struct TestLedger;
+    struct TestLedger<const FAMILY: u8>;
 
-    impl archive_v3_wal_idempotency::sealed::DomainPlan for TestPlan {}
-    impl archive_v3_wal_idempotency::sealed::DomainLedger for TestLedger {}
+    impl<const FAMILY: u8> archive_v3_wal_idempotency::sealed::DomainPlan for TestPlan<FAMILY> {}
+    impl<const FAMILY: u8> archive_v3_wal_idempotency::sealed::DomainLedger for TestLedger<FAMILY> {}
 
-    impl WalLogicalDomainPlan for TestPlan {
-        type Ledger = TestLedger;
+    impl<const FAMILY: u8> WalLogicalDomainPlan for TestPlan<FAMILY> {
+        type Ledger = TestLedger<FAMILY>;
         type Output = Vec<u8>;
 
         fn kind(&self) -> WalOperationKind {
@@ -2511,10 +2519,10 @@ mod tests {
         }
     }
 
-    impl WalLogicalDomainLedger<TestPlan> for TestLedger {
+    impl<const FAMILY: u8> WalLogicalDomainLedger<TestPlan<FAMILY>> for TestLedger<FAMILY> {
         fn lookup(
             connection: &rusqlite::Connection,
-            prepared: &PreparedLogicalMutation<TestPlan>,
+            prepared: &PreparedLogicalMutation<TestPlan<FAMILY>>,
         ) -> std::result::Result<Option<WalReplayResult>, WalIdempotencyError> {
             match prepared.plan_for_domain_ledger().lookup_attack {
                 LookupAttack::None => {}
@@ -2576,7 +2584,7 @@ mod tests {
 
         fn resolve_or_apply(
             transaction: &Transaction<'_>,
-            prepared: &PreparedLogicalMutation<TestPlan>,
+            prepared: &PreparedLogicalMutation<TestPlan<FAMILY>>,
         ) -> std::result::Result<LogicalMutationResult, WalIdempotencyError> {
             if let Some(result) = Self::lookup(transaction, prepared)? {
                 return Ok(LogicalMutationResult::Replayed(result));
@@ -2613,6 +2621,23 @@ mod tests {
         value: &[u8],
     ) -> PreparedLogicalMutation<TestPlan> {
         PreparedLogicalMutation::prepare(TestPlan {
+            kind,
+            operation_id: WalLogicalOperationId::from_bytes([id; 16]).unwrap(),
+            value: value.to_vec(),
+            fail: false,
+            lookup_attack: LookupAttack::None,
+            stall: None,
+            apply_count: None,
+        })
+        .unwrap()
+    }
+
+    fn alternate_plan(
+        kind: WalOperationKind,
+        id: u8,
+        value: &[u8],
+    ) -> PreparedLogicalMutation<TestPlan<1>> {
+        PreparedLogicalMutation::prepare(TestPlan::<1> {
             kind,
             operation_id: WalLogicalOperationId::from_bytes([id; 16]).unwrap(),
             value: value.to_vec(),
@@ -3423,7 +3448,7 @@ mod tests {
                 crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding.clone())
                     .unwrap();
             store.stall_checkpoint_for_wal_owner_test(Arc::clone(&stall));
-            let lane = WalStoreLane::<TestPlan>::spawn(store).unwrap();
+            let lane = WalStoreLane::spawn(store).unwrap();
             let publication = Arc::new(
                 FakePublication::new(successor).with_checkpoint_observation(retained, observed),
             );
@@ -3432,7 +3457,6 @@ mod tests {
                 control: Arc::new(FakeControl::new()),
                 publication: Arc::clone(&publication),
                 _store_fence: None,
-                _plan: std::marker::PhantomData,
             };
             let task = tokio::spawn(async move {
                 let result = owner.take_checkpoint_source_with_lease_maintenance().await;
@@ -3699,7 +3723,7 @@ mod tests {
         let (entered_sender, entered) = oneshot::channel();
         let (release, release_receiver) = std::sync::mpsc::channel();
         let construction = tokio::spawn(async move {
-            WalStoreLane::<TestPlan>::spawn_with_builder(move || {
+            WalStoreLane::spawn_with_builder(move || {
                 let _ = entered_sender.send(());
                 release_receiver
                     .recv()
@@ -3795,7 +3819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_domain_replay_is_kind_scoped_across_intervening_publication() {
+    async fn one_owner_serializes_distinct_plan_types_and_kind_scoped_replay() {
         let (current, next) = authoritative_records();
         let next_next = next.with_candidate_root_for_test(
             RootReference::new(4, ObjectId::from_bytes([15; 16]), [16; 32]),
@@ -3827,7 +3851,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .submit(plan_kind(
+                .submit(alternate_plan(
                     WalOperationKind::CaptureSessionFinish,
                     72,
                     b"kind-b",

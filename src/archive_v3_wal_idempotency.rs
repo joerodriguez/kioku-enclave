@@ -31,7 +31,7 @@
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
-use std::{fmt, sync::atomic::AtomicBool};
+use std::{any::Any, fmt, sync::atomic::AtomicBool};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -640,6 +640,148 @@ pub(crate) fn lookup_prepared_for_owner<P: WalLogicalDomainPlan>(
 pub(crate) enum PreparedLookup<P: WalLogicalDomainPlan> {
     Absent(PreparedLogicalMutation<P>),
     Present(ValidatedWalLogicalResult<P>),
+}
+
+mod erased_sealed {
+    pub(crate) trait PreparedMutation {}
+    pub(crate) trait ValidatedResult {}
+}
+
+/// Object-safe owner boundary for the closed set of sealed logical plans.
+///
+/// Type erasure happens only after a domain has produced a fully prepared
+/// mutation. It lets one archive actor serialize different reviewed domains
+/// without exposing a generic SQL closure, ledger selector, or result codec.
+pub(crate) trait ErasedPreparedLogicalMutation:
+    erased_sealed::PreparedMutation + Send + 'static
+{
+    fn kind_for_owner(&self) -> WalOperationKind;
+    fn operation_id_for_owner(&self) -> WalLogicalOperationId;
+    fn request_fingerprint_for_owner(&self) -> WalRequestFingerprint;
+
+    fn lookup_for_owner(self: Box<Self>, connection: &Connection) -> Result<ErasedPreparedLookup>;
+
+    fn execute_for_owner(
+        self: Box<Self>,
+        connection: &mut Connection,
+    ) -> Result<ErasedExecutedLogicalMutation>;
+}
+
+trait ErasedValidatedResult: erased_sealed::ValidatedResult + Send {
+    fn release_boxed(self: Box<Self>) -> Result<Box<dyn Any + Send>>;
+}
+
+impl<P: WalLogicalDomainPlan> erased_sealed::ValidatedResult for ValidatedWalLogicalResult<P> {}
+
+impl<P: WalLogicalDomainPlan> ErasedValidatedResult for ValidatedWalLogicalResult<P> {
+    fn release_boxed(self: Box<Self>) -> Result<Box<dyn Any + Send>> {
+        Ok(Box::new(ValidatedWalLogicalResult::release(*self)?))
+    }
+}
+
+/// Opaque validated result whose originating plan retains sole decoding
+/// authority. The launcher may only return it to the typed submitter.
+pub(crate) struct ErasedValidatedWalLogicalResult {
+    inner: Box<dyn ErasedValidatedResult>,
+}
+
+impl ErasedValidatedWalLogicalResult {
+    fn new<P: WalLogicalDomainPlan>(result: ValidatedWalLogicalResult<P>) -> Self {
+        Self {
+            inner: Box::new(result),
+        }
+    }
+
+    pub(crate) fn release(self) -> Result<Box<dyn Any + Send>> {
+        self.inner.release_boxed()
+    }
+}
+
+impl fmt::Debug for ErasedValidatedWalLogicalResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ErasedValidatedWalLogicalResult(<opaque>)")
+    }
+}
+
+pub(crate) enum ErasedPreparedLookup {
+    Absent(Box<dyn ErasedPreparedLogicalMutation>),
+    Present(ErasedValidatedWalLogicalResult),
+}
+
+pub(crate) struct ErasedExecutedLogicalMutation {
+    kind: WalOperationKind,
+    operation_id: WalLogicalOperationId,
+    request_fingerprint: WalRequestFingerprint,
+    disposition: LogicalMutationDisposition,
+    result: ErasedValidatedWalLogicalResult,
+}
+
+impl ErasedExecutedLogicalMutation {
+    pub(crate) const fn kind(&self) -> WalOperationKind {
+        self.kind
+    }
+
+    pub(crate) const fn operation_id(&self) -> WalLogicalOperationId {
+        self.operation_id
+    }
+
+    pub(crate) const fn request_fingerprint(&self) -> WalRequestFingerprint {
+        self.request_fingerprint
+    }
+
+    pub(crate) const fn disposition(&self) -> LogicalMutationDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn into_validated_result(self) -> ErasedValidatedWalLogicalResult {
+        self.result
+    }
+}
+
+impl<P: WalLogicalDomainPlan> erased_sealed::PreparedMutation for PreparedLogicalMutation<P> {}
+
+impl<P: WalLogicalDomainPlan> ErasedPreparedLogicalMutation for PreparedLogicalMutation<P> {
+    fn kind_for_owner(&self) -> WalOperationKind {
+        PreparedLogicalMutation::kind_for_owner(self)
+    }
+
+    fn operation_id_for_owner(&self) -> WalLogicalOperationId {
+        PreparedLogicalMutation::operation_id_for_owner(self)
+    }
+
+    fn request_fingerprint_for_owner(&self) -> WalRequestFingerprint {
+        PreparedLogicalMutation::request_fingerprint_for_owner(self)
+    }
+
+    fn lookup_for_owner(self: Box<Self>, connection: &Connection) -> Result<ErasedPreparedLookup> {
+        match lookup_prepared_for_owner(connection, *self)? {
+            PreparedLookup::Absent(prepared) => {
+                Ok(ErasedPreparedLookup::Absent(Box::new(prepared)))
+            }
+            PreparedLookup::Present(result) => Ok(ErasedPreparedLookup::Present(
+                ErasedValidatedWalLogicalResult::new(result),
+            )),
+        }
+    }
+
+    fn execute_for_owner(
+        self: Box<Self>,
+        connection: &mut Connection,
+    ) -> Result<ErasedExecutedLogicalMutation> {
+        let executed = execute_prepared_for_owner(connection, *self)?;
+        let kind = executed.kind();
+        let operation_id = executed.operation_id();
+        let request_fingerprint = executed.request_fingerprint();
+        let disposition = executed.disposition();
+        let result = ErasedValidatedWalLogicalResult::new(executed.into_validated_result());
+        Ok(ErasedExecutedLogicalMutation {
+            kind,
+            operation_id,
+            request_fingerprint,
+            disposition,
+            result,
+        })
+    }
 }
 
 #[cfg(test)]

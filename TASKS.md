@@ -190,9 +190,9 @@ separate activation blockers.
   owner-binding transitions; checkpoint-stage-aware source heartbeats that do
   no lease mutation after candidate/send admission; and exact witnessed
   recovery through a create/get-only provider capability. It remains private
-  and has no domain codec, launcher, route, startup, config, list/delete, or
+  and has no external launcher caller, route, startup, config, list/delete, or
   serving path.
-- [ ] Implement separately reviewed production A-domain codecs and launcher
+- [x] Implement separately reviewed production A-domain codecs and launcher
   ownership; refactor B domains with stable attempt identity; keep C domains
   fail-closed before enabling the Store policy outside tests.
   - [x] Add the first inactive production A-domain for capture-session finish:
@@ -528,9 +528,20 @@ separate activation blockers.
     disorder, cap exhaustion, late ledger failure, partial schema, tamper, and
     reopen fail closed or exactly replay. Pixel loading, inference reservation/
     Vertex calls, Store/save, launcher/task/acknowledgement wiring remain absent.
-  - [ ] Convert the remaining reviewed A domains, add the single-archive
+  - [x] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
-    and retain structural C rejection before activation review.
+    and retain structural C rejection before activation review. The private
+    launcher consumes only the parity-certified maintenance handoff, re-reads
+    its exact terminal Control row, and owns one non-cloneable actor whose
+    sealed type-erased queue serializes different reviewed plan types without a
+    generic SQL/result escape. It has no caller or startup/Store/route/config/
+    acknowledgement/provider-list/provider-delete/cloud/deployment authority.
+  - [x] Complete the inactive activation-readiness review in
+    `docs/adr/0022-activation-readiness.md`. Production remains explicitly
+    blocked on live advisory shadow integration, complete enabled-domain and
+    provider/KMS adapters, runtime ownership/Store policy/acknowledgement
+    wiring, signed capacity/security evidence, restart/delete/export/schema
+    drills, and an operator-authorized canary/cloud change.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 
