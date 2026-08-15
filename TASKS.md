@@ -259,6 +259,19 @@ separate activation blockers.
     acknowledgement. DEK allocation/loading, media bytes, encryption/provider
     I/O, billing, Store/route/launcher/task/ack wiring, and the authenticating B
     handoff remain absent.
+  - [x] Add the inactive media-DEK installation half of the canonical upload B
+    boundary. A future KMS adapter must supply one bounded canonical wrapped
+    value together with the plaintext DEK it represents; the plan retains no
+    plaintext key and derives a keyed account/wrapper binding before actor
+    admission. One immediate transaction first-writer-wins installs or exact-
+    adopts `wrapped_media_dek`, exact-reads it, and commits a subtype-separated
+    request, commitment-only typed receipt, and a distinct one-row/1-KiB
+    permanent ledger. A changed candidate conflicts, another account cannot
+    consume the per-database slot, and wrapper/schema/ledger/counter tamper,
+    capacity, late readback failure, and reopen fail closed, roll back, or
+    exactly replay. The KMS producer that proves the wrapper/plaintext pairing,
+    media encryption/upload candidate, send-start fence, provider receipt,
+    Store/route/launcher/task/retry/acknowledgement wiring remain absent.
   - [x] Add the inactive selected-screenshot receipt A-domain: a future B
     boundary must durably choose the 128-bit opaque upload attempt and exact
     account-bound object key before provider I/O; that stable attempt derives
