@@ -275,6 +275,16 @@ separate activation blockers.
     reopen fail closed or exactly replay. Signing/sending, subscription lookup
     or disablement, retry allocation/timing, Store/worker/launcher/task/
     acknowledgement wiring remain absent.
+  - [x] Add the inactive exact reviewer-fixture A-domain: the image-baked
+    reviewer account UUID plus fixture version derive one opaque operation
+    before actor admission. The complete fixed synthetic audio, utterance,
+    screenshot, episode, membership, brief, watermark, and marker families are
+    inserted or exactly adopted in one transaction with a distinct 64-row/
+    576-byte permanent replay ledger. Fixed-ID collisions, changed or extra
+    fixture membership, a conflicting marker, cap exhaustion, late ledger
+    failure, partial schema, tamper, and reopen fail closed or exactly replay.
+    Reviewer authentication, Store/save, route/launcher/task/acknowledgement
+    wiring and the unrelated substance/visual backfill subtypes remain absent.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.

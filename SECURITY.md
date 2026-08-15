@@ -848,10 +848,10 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly eight inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and now admits exactly nine inactive production A-domains:
 capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
 raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
-webhook settlement, and Vertex usage terminal outcome.
+webhook settlement, exact synthetic reviewer fixture, and Vertex usage terminal outcome.
 Capture-session finish derives an opaque
 operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
@@ -913,7 +913,15 @@ binding, pending/retry attempt, nullable due time, prior response/error, timesta
 and fixed sent time form the fingerprint. It full-row-CASes only that predecessor to `sent` or adopts
 only the identical terminal row, with unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot
 sign or send, load or disable a subscription, retry, call Store, launch work, or acknowledge delivery.
-All other production domain ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
+The reviewer-fixture child accepts only the complete fixed synthetic archive for an already
+authenticated stable reviewer account. Its fixture-version/account pair derives the operation
+identity. It inserts or exactly adopts every fixed audio, utterance, screenshot, episode,
+membership, final-brief, watermark, and marker row, authenticates the complete semantic fixture
+before the marker or ledger can commit, and retains unit replay in a distinct 64-row/576-byte
+ledger. Conflicting fixed IDs, altered content, or extra fixture membership fail closed. It cannot
+authenticate a reviewer, call Store/save, enter the reviewer route, launch work, or acknowledge a
+request; the substance and visual-evidence backfill subtypes remain unsupported. All other
+production domain ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
 under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
 substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
 before actor admission, reconcile pending publication, commit the logical mutation and same-ID
@@ -929,7 +937,8 @@ media-work results, Vertex usage outcomes, existing-key webhook/email/push trans
 and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch,
 selected-screenshot receipt, raw-media retention settlement, provider-accepted email,
 provider-accepted APNs, definitive-success webhook settlement, and Vertex terminal outcome have
-production codecs so far; every other A operation remains disabled
+production codecs so far, together with the exact synthetic reviewer fixture; every other A
+operation remains disabled
 pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and
 canonical media's first DEK/provider handoff remain B and are not admitted by those children.
 Domain B remains disabled pending explicit caller/attempt identity or
