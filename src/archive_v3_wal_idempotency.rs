@@ -433,6 +433,8 @@ impl sealed::DomainPlan for crate::cp::media::wal::CaptureSessionFinishPlan {}
 impl sealed::DomainLedger for crate::cp::media::wal::CaptureSessionFinishLedger {}
 impl sealed::DomainPlan for crate::cp::media::wal::CanonicalCaptureEventPlan {}
 impl sealed::DomainLedger for crate::cp::media::wal::CanonicalCaptureEventLedger {}
+impl sealed::DomainPlan for crate::cp::media::wal::MediaDekInstallPlan {}
+impl sealed::DomainLedger for crate::cp::media::wal::MediaDekInstallLedger {}
 impl sealed::DomainPlan for crate::cp::media::wal::MediaReferenceBatchPlan {}
 impl sealed::DomainLedger for crate::cp::media::wal::MediaReferenceBatchLedger {}
 impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageOutcomePlan {}

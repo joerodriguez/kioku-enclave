@@ -930,6 +930,10 @@ impl X {
         capture_event_domain = (
             ROOT / "src/cp/media/wal/capture_event.rs"
         ).read_text(encoding="utf-8")
+        media_dek_domain = (
+            ROOT / "src/cp/media/wal/media_dek.rs"
+        ).read_text(encoding="utf-8")
+        media_dek_production = without_cfg_test_items(media_dek_domain)
         model_usage = (ROOT / "src/cp/model_usage.rs").read_text(encoding="utf-8")
         vertex_domain = (ROOT / "src/cp/model_usage/wal.rs").read_text(
             encoding="utf-8"
@@ -1022,6 +1026,27 @@ impl X {
         self.assertIn("DomainLedgerBounds::new", capture_event_domain)
         self.assertIn("WalIdempotencyError::Precondition", capture_event_domain)
         self.assertNotIn("CanonicalCaptureEventPlan::", media)
+        self.assertIn("mod media_dek;", domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media::wal::MediaDekInstallPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media::wal::MediaDekInstallLedger",
+            gate,
+        )
+        self.assertIn("struct MediaDekInstallPlan", media_dek_domain)
+        self.assertIn("struct MediaDekInstallLedger", media_dek_domain)
+        self.assertIn(
+            "archive_v3_wal_media_dek_install_operations", media_dek_domain
+        )
+        self.assertIn("media-dek-install-v1", media_dek_domain)
+        self.assertIn("MAX_ROWS: u32 = 1", media_dek_domain)
+        self.assertIn("DomainLedgerBounds::new", media_dek_domain)
+        self.assertIn("HmacSha256::new_from_slice", media_dek_domain)
+        self.assertIn("wrapped_dek_commitment", media_dek_domain)
+        self.assertIn("validate_installed_value", media_dek_domain)
+        self.assertNotIn("MediaDekInstallPlan::", media)
         self.assertNotIn("cp::media::wal::", main)
         self.assertIn("pub(crate) mod wal;", model_usage)
         self.assertIn(
@@ -1318,6 +1343,7 @@ impl X {
         ):
             self.assertNotIn(forbidden, domain)
             self.assertNotIn(forbidden, capture_event_domain)
+            self.assertNotIn(forbidden, media_dek_production)
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, selected_attempt_domain)
@@ -1354,6 +1380,23 @@ impl X {
             "reqwest::",
         ):
             self.assertNotIn(forbidden, capture_event_domain)
+        for forbidden in (
+            "KmsClient",
+            "generate_and_wrap_dek",
+            "load_dek(",
+            "encrypt_bound_blob",
+            "put_user_media",
+            "get_media(",
+            "delete_media(",
+            "list_objects",
+            "thread_rng",
+            "SystemTime",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, media_dek_production)
         for forbidden in (
             "generate_and_wrap_dek",
             "encrypt_bound_blob",

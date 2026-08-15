@@ -7,13 +7,16 @@
 //!
 //! The parent converts capture-session finish into one closed request/result
 //! codec and distinct permanent ledger. Private children separately cover the
-//! local receipt for an already durable canonical-media upload and the
-//! deterministic metadata-only screen-reference batch. None has Store, route,
-//! launcher, provider, task, or acknowledgement authority.
+//! local receipt for an already durable canonical-media upload, first-writer-
+//! wins installation of a future KMS-supplied media DEK, and the deterministic
+//! metadata-only screen-reference batch. None has Store, route, launcher,
+//! provider, KMS, task, or acknowledgement authority.
 
 mod capture_event;
+mod media_dek;
 mod reference_batch;
 pub(crate) use capture_event::{CanonicalCaptureEventLedger, CanonicalCaptureEventPlan};
+pub(crate) use media_dek::{MediaDekInstallLedger, MediaDekInstallPlan};
 pub(crate) use reference_batch::{MediaReferenceBatchLedger, MediaReferenceBatchPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};

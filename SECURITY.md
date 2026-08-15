@@ -879,7 +879,18 @@ preconditions, every new/duplicate row, contiguous stream acknowledgement, bound
 and its distinct 1,048,576-row/512-MiB ledger commit atomically. Missing or changed canonical evidence,
 a changed manifest under the same batch ID, cap exhaustion, late ledger failure, partial schema, and
 tamper roll back or fail closed; exact replay survives reopen. Canonical media upload remains outside
-this child behind its disabled B-domain media-DEK/provider handoff. The canonical-capture child
+this child behind its disabled B-domain media-DEK/provider handoff. The first local half of that
+handoff is now separately sealed: a future KMS boundary must supply one bounded canonical wrapped
+value together with the plaintext media DEK it represents. Before actor admission the child derives
+a keyed binding over the account and wrapped-value commitment, then retains no plaintext key. One
+`BEGIN IMMEDIATE` exact-adopts an already installed identical `wrapped_media_dek` or installs it
+first-writer-wins, exact-reads the value, and commits a subtype-separated request, commitment-only
+typed receipt, and a distinct one-row/1-KiB permanent ledger. A different candidate or account,
+partial schema, capacity exhaustion, late readback/ledger failure, row/result/counter tamper, and
+reopen fail closed, roll back, or exactly replay. The receipt does not expose the wrapped value.
+This child does not itself prove a KMS wrapper/plaintext pairing, call KMS, encrypt or retain media,
+invoke a provider or Store, launch work, allocate a clock/retry/identity, or acknowledge a request;
+its production KMS producer and every upload/send/provider settlement remain absent. The canonical-capture child
 accepts only the local database receipt for a future B boundary that has already encrypted and durably
 uploaded the exact canonical media. It subtype-separates the caller-stable event ID before actor
 admission and fingerprints the account, complete normalized manifest, exact derived account-bound
@@ -1062,11 +1073,12 @@ screen result now consumes its exact binding. The selected-screenshot upload ide
 sealed B operation, and the production-facing local A receipt now consumes its exact binding; the
 historical unbound A contract is test-only. Provider calls and the launcher remain absent.
 Generic/audio/finalization Vertex begin and
-canonical media's first DEK/provider upload handoff remain unsupported, as do selected-screenshot
+canonical media's KMS-authenticated DEK producer and encryption/provider upload handoff remain
+unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported are selected-screenshot
 DEK/encryption/provider settlement and rejection/termination release.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
-semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK first
-write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
+semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK KMS
+production and upload/send boundaries, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
 purge, source-keyless legacy ingest, retired episode mutations, arbitrary Store SQL, and account
 deletion. A structural source inventory pins every production Store mutation/save call (including
 qualified forms), every factory definition/call and Store literal, every persistence-policy
