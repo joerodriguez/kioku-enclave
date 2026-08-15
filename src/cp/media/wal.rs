@@ -6,11 +6,14 @@
 //! Inactive WAL logical-operation codecs owned by Cloud Capture.
 //!
 //! The parent converts capture-session finish into one closed request/result
-//! codec and distinct permanent ledger. Its private child separately converts
-//! the deterministic metadata-only screen-reference batch. Neither has Store,
-//! route, launcher, provider, task, or acknowledgement authority.
+//! codec and distinct permanent ledger. Private children separately cover the
+//! local receipt for an already durable canonical-media upload and the
+//! deterministic metadata-only screen-reference batch. None has Store, route,
+//! launcher, provider, task, or acknowledgement authority.
 
+mod capture_event;
 mod reference_batch;
+pub(crate) use capture_event::{CanonicalCaptureEventLedger, CanonicalCaptureEventPlan};
 pub(crate) use reference_batch::{MediaReferenceBatchLedger, MediaReferenceBatchPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};

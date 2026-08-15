@@ -918,6 +918,9 @@ impl X {
         gate = (ROOT / "src/archive_v3_wal_idempotency.rs").read_text(encoding="utf-8")
         media = (ROOT / "src/cp/media.rs").read_text(encoding="utf-8")
         domain = (ROOT / "src/cp/media/wal.rs").read_text(encoding="utf-8")
+        capture_event_domain = (
+            ROOT / "src/cp/media/wal/capture_event.rs"
+        ).read_text(encoding="utf-8")
         model_usage = (ROOT / "src/cp/model_usage.rs").read_text(encoding="utf-8")
         vertex_domain = (ROOT / "src/cp/model_usage/wal.rs").read_text(
             encoding="utf-8"
@@ -980,6 +983,25 @@ impl X {
         self.assertIn("MAX_CAPTURE_SESSION_FINISH_ROWS", domain)
         self.assertIn("DomainLedgerBounds::new", domain)
         self.assertIn("WalIdempotencyError::Precondition", domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media::wal::CanonicalCaptureEventPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media::wal::CanonicalCaptureEventLedger",
+            gate,
+        )
+        self.assertIn("struct CanonicalCaptureEventPlan", capture_event_domain)
+        self.assertIn("struct CanonicalCaptureEventLedger", capture_event_domain)
+        self.assertIn(
+            "archive_v3_wal_canonical_capture_event_operations",
+            capture_event_domain,
+        )
+        self.assertIn("canonical-capture-event-v1", capture_event_domain)
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", capture_event_domain)
+        self.assertIn("DomainLedgerBounds::new", capture_event_domain)
+        self.assertIn("WalIdempotencyError::Precondition", capture_event_domain)
+        self.assertNotIn("CanonicalCaptureEventPlan::", media)
         self.assertNotIn("cp::media::wal::", main)
         self.assertIn("pub(crate) mod wal;", model_usage)
         self.assertIn(
@@ -1191,6 +1213,7 @@ impl X {
             "delete_exact",
         ):
             self.assertNotIn(forbidden, domain)
+            self.assertNotIn(forbidden, capture_event_domain)
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, finalization_queue_domain)
@@ -1210,6 +1233,21 @@ impl X {
             "save_user(",
         ):
             self.assertNotIn(forbidden, vertex_domain)
+        for forbidden in (
+            "generate_and_wrap_dek",
+            "load_or_create_media_dek",
+            "encrypt_bound_blob",
+            "put_user_media",
+            "get_media",
+            "delete_object",
+            "list_objects",
+            "reserve_recording_delivery",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, capture_event_domain)
         for forbidden in (
             "generate_and_wrap_dek",
             "encrypt_bound_blob",

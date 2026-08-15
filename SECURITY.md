@@ -848,8 +848,8 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly fourteen inactive production A-domains:
-capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
+test-only 64-row/262,720-byte exemplar and now admits exactly fifteen inactive production A-domains:
+capture-session finish, local canonical-capture receipt, metadata-only screen-reference batch, selected-screenshot receipt,
 caller-stable finalization queue, exact finalization commit, screen-storyboard result without person evidence,
 raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
 webhook settlement, exact synthetic reviewer fixture, cursor-bound substance-backfill batch,
@@ -877,7 +877,20 @@ preconditions, every new/duplicate row, contiguous stream acknowledgement, bound
 and its distinct 1,048,576-row/512-MiB ledger commit atomically. Missing or changed canonical evidence,
 a changed manifest under the same batch ID, cap exhaustion, late ledger failure, partial schema, and
 tamper roll back or fail closed; exact replay survives reopen. Canonical media upload remains outside
-this child behind its disabled B-domain media-DEK/provider handoff. The selected-screenshot child
+this child behind its disabled B-domain media-DEK/provider handoff. The canonical-capture child
+accepts only the local database receipt for a future B boundary that has already encrypted and durably
+uploaded the exact canonical media. It subtype-separates the caller-stable event ID before actor
+admission and fingerprints the account, complete normalized manifest, exact derived account-bound
+object key, and positive provider generation. It rejects any pre-existing event, stream-sequence,
+asset, object, or processing-job target that lacks its ledger, authenticates any existing session and
+stream binding, then atomically commits the session, stream, event, media, browser, pending job,
+contiguous stream acknowledgement, bounded canonical response, and distinct
+1,048,576-row/512-MiB ledger. A changed generation under the same event ID is a fingerprint conflict;
+parent mismatch, collision, capacity exhaustion, or late ledger failure rolls back without consuming
+the identity; exact replay survives reopen and a later gap-filling event advances the acknowledgement.
+The child cannot allocate/load a media DEK, accept media bytes, encrypt/upload/read/delete/list provider
+objects, reserve billing, call Store, launch work, schedule a task, or acknowledge a request. The future
+B handoff that authenticates the exact provider receipt remains absent. The selected-screenshot child
 likewise accepts only the local receipt half of an already durable B-domain upload attempt. Its opaque
 128-bit image ID derives the operation identity; the exact account-bound object key, episode/source/time,
 and validated JPEG geometry/hash form the request fingerprint. It atomically revalidates eligibility and
@@ -989,7 +1002,8 @@ publication.
 The reviewed operation inventory is deliberately asymmetric. Stable portable domain A contains
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
-and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch,
+and reviewer/backfill writes. Only capture-session finish, local canonical-capture receipt,
+metadata-only screen-reference batch,
 selected-screenshot receipt, screen-storyboard result without person evidence,
 raw-media retention settlement, provider-accepted email,
 provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue,
@@ -998,7 +1012,7 @@ production codecs so far, together with the exact synthetic reviewer fixture and
 substance and visual-evidence backfills; every other A operation remains disabled
 pending its own separately reviewed codec and the closed launcher. In particular, screen person
 evidence and every audio/person/identity/voice media-work result remain unsupported. Vertex invocation begin and
-canonical media's first DEK/provider handoff remain B and are not admitted by those children.
+canonical media's first DEK/provider upload handoff remain B and are not admitted by those children.
 Domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, Vertex begin, media-DEK first
 write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:

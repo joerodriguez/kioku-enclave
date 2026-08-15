@@ -220,6 +220,20 @@ separate activation blockers.
     partial schema, tamper, and reopen all fail closed or exactly replay. Canonical
     media upload and its B-domain DEK/provider handoff remain unsupported, and no
     Store/route/launcher/provider/task/ack path is connected.
+  - [x] Add the inactive local canonical-capture receipt A-domain: the stable
+    caller event ID is subtype-separated before actor admission, while the
+    account, complete normalized manifest, exact derived account-bound object
+    key, and positive provider generation already fixed by a future B upload
+    handoff form the request fingerprint. It rejects unledgered target adoption,
+    authenticates existing session/stream bindings, and atomically commits every
+    local session/stream/event/media/browser/pending-job row, contiguous stream
+    acknowledgement, bounded canonical response, and a distinct
+    1,048,576-row/512-MiB permanent ledger. Changed receipts, parent mismatch,
+    collisions, capacity exhaustion, late ledger failure, partial schema, and
+    reopen fail closed or exactly replay; a later gap-filling event advances the
+    acknowledgement. DEK allocation/loading, media bytes, encryption/provider
+    I/O, billing, Store/route/launcher/task/ack wiring, and the authenticating B
+    handoff remain absent.
   - [x] Add the inactive selected-screenshot receipt A-domain: a future B
     boundary must durably choose the 128-bit opaque upload attempt and exact
     account-bound object key before provider I/O; that stable attempt derives
