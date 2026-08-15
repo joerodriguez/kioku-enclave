@@ -26,6 +26,8 @@
 //! The Vertex call sends text outside the TEE (documented caveat — see
 //! [`super::vertex`]).
 
+pub(crate) mod wal;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -284,7 +284,19 @@ separate activation blockers.
     fixture membership, a conflicting marker, cap exhaustion, late ledger
     failure, partial schema, tamper, and reopen fail closed or exactly replay.
     Reviewer authentication, Store/save, route/launcher/task/acknowledgement
-    wiring and the unrelated substance/visual backfill subtypes remain absent.
+    wiring and the unrelated backfill subtypes remain absent from this fixture.
+  - [x] Add the inactive ADR-0009 substance-backfill A-domain: each stable
+    account/cursor/phase identity fingerprints one bounded, strictly ordered
+    next prefix of exact rendered episode inputs, predecessor substance values,
+    and validated classifications. The child reauthenticates and updates that
+    prefix, advances a private cursor, and retains unit replay atomically in a
+    distinct 65,536-row/576-KiB ledger. A short batch cannot skip a later row;
+    only an exact empty tail writes the completion marker, and an exact legacy
+    marker may be adopted. Changed source/predecessor/result, cursor disorder,
+    cap exhaustion, late ledger failure, partial schema, tamper, and reopen fail
+    closed or exactly replay. Inference reservation/Vertex calls, Store/save,
+    launcher/task/acknowledgement wiring, and visual-evidence backfill remain
+    absent.
   - [ ] Convert the remaining reviewed A domains, add the single-archive
     launcher owner, refactor every B dependency around stable attempt identity,
     and retain structural C rejection before activation review.
