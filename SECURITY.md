@@ -848,9 +848,9 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly thirteen inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and now admits exactly fourteen inactive production A-domains:
 capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
-caller-stable finalization queue, exact finalization commit,
+caller-stable finalization queue, exact finalization commit, screen-storyboard result without person evidence,
 raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
 webhook settlement, exact synthetic reviewer fixture, cursor-bound substance-backfill batch,
 cursor-bound visual-evidence backfill batch, and Vertex usage terminal outcome.
@@ -907,6 +907,18 @@ classification, predecessor product, outbox identity, request fingerprint, capac
 ledger commit, or restart tamper fails closed or exactly replays. The child cannot allocate a Vertex
 attempt, destination, delivery identity, handoff, or clock; invoke a model; call Store; launch work;
 send a delivery; schedule a retry; or acknowledge completion. The
+screen-storyboard-result child accepts only an already durable terminal Vertex event, its exact
+normalized provider-result commitment, caller-supplied canonical commit time, the complete leased
+screen-work/member/job/capture/media predecessor commitment, requested model, and one to twelve
+ordered frames with caller-fixed positive screenshot IDs. One transaction reauthenticates the
+attempt and every predecessor, inserts complete screenshots and screen observations, full-tuple
+settles each job and media row plus the work unit, exact-reads the final rows, and retains unit replay
+in a distinct 1,048,576-row/32-MiB ledger. A substituted attempt, changed input topology, target
+collision, time regression, capacity exhaustion, late ledger failure, partial schema, tamper, or
+restart fails closed or exactly replays. The future B boundary must durably bind the attempt to this
+work before constructing the plan. This subtype accepts no person evidence and cannot create audio,
+person, identity, or voice rows; provider/media reads, automatic IDs, clocks, Store, launching,
+retry, and acknowledgement remain absent. The
 retention child likewise accepts only the local receipt half of an already settled exact provider
 deletion. Its account/event pair derives the stable operation identity, while the exact account-bound
 object key, bucket-local generation/provenance, plaintext hash, retention deadline, eligible predecessor
@@ -978,12 +990,14 @@ The reviewed operation inventory is deliberately asymmetric. Stable portable dom
 capture events and session finish, selected screenshots, finalization queue/commit, deterministic
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
 and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch,
-selected-screenshot receipt, raw-media retention settlement, provider-accepted email,
+selected-screenshot receipt, screen-storyboard result without person evidence,
+raw-media retention settlement, provider-accepted email,
 provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue,
 exact finalization commit, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
 substance and visual-evidence backfills; every other A operation remains disabled
-pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and
+pending its own separately reviewed codec and the closed launcher. In particular, screen person
+evidence and every audio/person/identity/voice media-work result remain unsupported. Vertex invocation begin and
 canonical media's first DEK/provider handoff remain B and are not admitted by those children.
 Domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, Vertex begin, media-DEK first

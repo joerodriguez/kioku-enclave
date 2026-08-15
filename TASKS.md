@@ -258,6 +258,22 @@ separate activation blockers.
     ledger failure, partial schema, tamper, and reopen fail closed or exactly
     replay. Vertex/destination/delivery/handoff/clock allocation, model/provider
     calls, Store, worker/launcher/task/retry/acknowledgement wiring remain absent.
+  - [x] Add the first inactive deterministic media-work-result subtype for
+    screen storyboards without person evidence: an already durable terminal
+    Vertex event derives the opaque operation before actor admission, while its
+    exact normalized provider-result facts, caller-supplied canonical commit
+    time, complete leased work/member/job/capture/media predecessor, requested
+    model, caller-fixed screenshot IDs, and bounded ordered screen product form
+    the request fingerprint. One transaction reauthenticates all of those
+    facts, inserts only the exact screenshots and observations, full-tuple
+    settles every job/media row and the work unit, exact-reads the complete
+    result, and retains unit replay in a distinct 1,048,576-row/32-MiB ledger.
+    Attempt/work/result substitution, auto IDs, time regression, target
+    collisions, capacity, late ledger failure, partial schema, tamper, and
+    reopen fail closed or exactly replay. The B boundary that durably binds the
+    attempt to this work, provider/media reads, Store, launcher/task/retry/
+    acknowledgement wiring, screen person evidence, and every audio/person/
+    identity/voice result remain absent.
   - [x] Add the inactive raw-media retention-settlement A-domain: the stable
     account/event identity derives one opaque operation before actor admission,
     while the exact account-bound object key, bucket-local generation/backend,

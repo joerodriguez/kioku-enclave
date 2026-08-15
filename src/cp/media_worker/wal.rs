@@ -1,15 +1,20 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 retention codec is reviewed before its deletion boundary, launcher, or worker ownership"
+    reason = "inactive ADR-0022 media-worker codecs are reviewed before their external boundaries, launcher, or worker ownership"
 )]
 
-//! Inactive raw-media retention settlement WAL domain.
+//! Inactive media-worker WAL domains.
 //!
 //! A future deletion boundary must authenticate and settle the exact retained
 //! provider object before constructing this plan. The plan can only mark the
 //! matching local media row pruned and retain a permanent exact replay receipt.
 //! It cannot read, list, delete, or otherwise reach a provider, call Store,
-//! launch work, or acknowledge retention completion.
+//! launch work, or acknowledge retention completion. The private result child
+//! covers only screen storyboards without person evidence; audio and every
+//! person/identity/voice mutation remain unsupported.
+
+pub(super) mod result;
+pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;

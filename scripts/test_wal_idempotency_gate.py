@@ -939,6 +939,10 @@ impl X {
         retention_domain = (ROOT / "src/cp/media_worker/wal.rs").read_text(
             encoding="utf-8"
         )
+        result_domain = (ROOT / "src/cp/media_worker/wal/result.rs").read_text(
+            encoding="utf-8"
+        )
+        result_production = result_domain.split("#[cfg(test)]", 1)[0]
         email_worker = (ROOT / "src/cp/email_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -1044,6 +1048,25 @@ impl X {
         self.assertNotIn("FinalizationCommitPlan::", finalizer)
         self.assertNotIn("cp::finalizer::wal::", main)
         self.assertIn("pub(crate) mod wal;", media_worker)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardResultPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardResultLedger",
+            gate,
+        )
+        self.assertIn("pub(super) mod result;", retention_domain)
+        self.assertIn("struct ScreenStoryboardResultPlan", result_domain)
+        self.assertIn("struct ScreenStoryboardResultLedger", result_domain)
+        self.assertIn(
+            "archive_v3_wal_screen_storyboard_result_operations", result_domain
+        )
+        self.assertIn("screen-storyboard-no-people-v1", result_domain)
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", result_domain)
+        self.assertIn("DomainLedgerBounds::new", result_domain)
+        self.assertIn("WalIdempotencyError::Precondition", result_domain)
+        self.assertNotIn("ScreenStoryboardResultPlan::", media_worker)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan",
             gate,
@@ -1172,6 +1195,7 @@ impl X {
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, finalization_commit_domain)
+            self.assertNotIn(forbidden, result_domain)
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, email_domain)
             self.assertNotIn(forbidden, push_domain)
@@ -1238,6 +1262,29 @@ impl X {
             "std::time::",
         ):
             self.assertNotIn(forbidden, retention_domain)
+        for forbidden in (
+            "strftime(",
+            "SystemTime",
+            "random_token_hex",
+            "new_uuid(",
+            "begin_invocation(",
+            "generate_custom(",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+            "INSERT INTO utterances",
+            "INSERT INTO identity_evidence",
+            "INSERT INTO person_name_claims",
+            "INSERT INTO people",
+            "INSERT INTO voice_",
+            "UPDATE identity_evidence",
+            "UPDATE person_name_claims",
+            "UPDATE people",
+            "UPDATE voice_",
+        ):
+            self.assertNotIn(forbidden, result_production)
         for forbidden in (
             "transport.send(",
             "update_email_delivery_state(",
