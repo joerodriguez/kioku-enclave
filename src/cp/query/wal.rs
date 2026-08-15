@@ -8,17 +8,23 @@
 //! The parent owns the selected-screenshot receipt and consumes its private
 //! child's permanent pre-provider attempt binding. A second private child
 //! verifies and retains the exact context-bound ciphertext candidate for that
-//! attempt without send authority. Another private child owns an exact
+//! attempt without send authority. A third private child durably marks the
+//! exact candidate `SendStarted` and derives its stable request identity while
+//! owning no provider. Another private child owns an exact
 //! finalization-queue transition. None can call Store, launch work, invoke a
 //! provider, schedule a retry, allocate randomness or a clock, or acknowledge
 //! a request.
 
 mod finalization_queue;
 mod selected_screenshot_attempt;
+mod selected_screenshot_send;
 mod selected_screenshot_upload;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
 pub(crate) use selected_screenshot_attempt::{
     SelectedScreenshotAttemptLedger, SelectedScreenshotAttemptPlan,
+};
+pub(crate) use selected_screenshot_send::{
+    SelectedScreenshotSendStartedLedger, SelectedScreenshotSendStartedPlan,
 };
 pub(crate) use selected_screenshot_upload::{
     SelectedScreenshotUploadCandidateLedger, SelectedScreenshotUploadCandidatePlan,
@@ -55,6 +61,34 @@ const MAX_RESULT_BYTES: u64 = 512 * 1024 * 1024;
 const BOUNDS: DomainLedgerBounds = DomainLedgerBounds::new(MAX_ROWS, MAX_RESULT_BYTES);
 
 type Result<T> = std::result::Result<T, WalIdempotencyError>;
+
+pub(in crate::cp::query) fn prepare_selected_screenshot_send_started(
+    connection: &Connection,
+    account_id: &str,
+    image_id: &str,
+    plaintext_dek: &crate::crypto::Dek,
+) -> Result<Option<SelectedScreenshotSendStartedPlan>> {
+    selected_screenshot_send::prepare_selected_screenshot_send_started(
+        connection,
+        account_id,
+        image_id,
+        plaintext_dek,
+    )
+}
+
+pub(in crate::cp::query) fn load_authenticated_selected_screenshot_send_started(
+    connection: &Connection,
+    account_id: &str,
+    image_id: &str,
+    plaintext_dek: &crate::crypto::Dek,
+) -> Result<Option<selected_screenshot_send::AuthenticatedSelectedScreenshotSendStarted>> {
+    selected_screenshot_send::load_authenticated_selected_screenshot_send_started(
+        connection,
+        account_id,
+        image_id,
+        plaintext_dek,
+    )
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SelectedScreenshotOutcome {
