@@ -848,9 +848,9 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly twelve inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and now admits exactly thirteen inactive production A-domains:
 capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
-caller-stable finalization queue,
+caller-stable finalization queue, exact finalization commit,
 raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
 webhook settlement, exact synthetic reviewer fixture, cursor-bound substance-backfill batch,
 cursor-bound visual-evidence backfill batch, and Vertex usage terminal outcome.
@@ -893,7 +893,20 @@ timestamp, in the same transaction as unit replay in a distinct 1,048,576-row/32
 finalization, queued/processing or unknown predecessor, changed tuple, reused identity with another
 request, cap exhaustion, late ledger failure, partial schema, tamper, and reopen fail closed or exactly
 replay. It cannot allocate the request identity or a clock, schedule a retry, invoke or launch the
-finalizer, call Store, or acknowledge the route. The
+finalizer, call Store, or acknowledge the route. The finalization-commit child accepts only an
+already durable 68-byte Vertex event identity, a commitment to its exact terminal provider-result
+facts, plus caller-supplied canonical commit time and
+already-fixed webhook/email/push identities. It fingerprints the complete episode finalization
+predecessor, exact utterance/screenshot membership, a domain-separated commitment to the entire
+prior brief/screen product, the complete normalized new brief and canonical nonduplicate-screen
+product, and every initial outbox fact. One transaction reauthenticates all of those facts,
+full-tuple replaces the brief/screen product, inserts only preallocated initial outbox rows, preserves
+the original timestamp on regeneration, full-tuple completes the episode, exact-reads the complete
+result, and retains unit replay in a distinct 1,048,576-row/32-MiB ledger. Membership, duplicate
+classification, predecessor product, outbox identity, request fingerprint, capacity, schema, late
+ledger commit, or restart tamper fails closed or exactly replays. The child cannot allocate a Vertex
+attempt, destination, delivery identity, handoff, or clock; invoke a model; call Store; launch work;
+send a delivery; schedule a retry; or acknowledge completion. The
 retention child likewise accepts only the local receipt half of an already settled exact provider
 deletion. Its account/event pair derives the stable operation identity, while the exact account-bound
 object key, bucket-local generation/provenance, plaintext hash, retention deadline, eligible predecessor
@@ -966,8 +979,8 @@ capture events and session finish, selected screenshots, finalization queue/comm
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
 and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch,
 selected-screenshot receipt, raw-media retention settlement, provider-accepted email,
-provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue, and
-Vertex terminal outcome have
+provider-accepted APNs, definitive-success webhook settlement, caller-stable finalization queue,
+exact finalization commit, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
 substance and visual-evidence backfills; every other A operation remains disabled
 pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and

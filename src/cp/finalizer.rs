@@ -10,6 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tracing::{info, warn};
 
+mod wal;
+pub(crate) use wal::{FinalizationCommitLedger, FinalizationCommitPlan};
+
 // Version 5 atomically generates the brief and semantic results for every
 // canonical screen from one holistic episode-analysis call.
 pub(crate) const FINALIZATION_VERSION: i32 = crate::store::EPISODE_FINALIZATION_VERSION;
