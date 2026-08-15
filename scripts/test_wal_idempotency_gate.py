@@ -953,6 +953,10 @@ impl X {
             ROOT / "src/cp/query/wal/selected_screenshot_upload.rs"
         ).read_text(encoding="utf-8")
         selected_upload_production = without_cfg_test_items(selected_upload_domain)
+        selected_send_domain = (
+            ROOT / "src/cp/query/wal/selected_screenshot_send.rs"
+        ).read_text(encoding="utf-8")
+        selected_send_production = without_cfg_test_items(selected_send_domain)
         finalization_queue_domain = (
             ROOT / "src/cp/query/wal/finalization_queue.rs"
         ).read_text(encoding="utf-8")
@@ -1164,11 +1168,72 @@ impl X {
             "load_authenticated_selected_screenshot_upload_candidate",
             selected_upload_domain,
         )
+        self.assertIn(
+            "pub(super) struct AuthenticatedSelectedScreenshotUploadCandidate",
+            selected_upload_production,
+        )
+        self.assertIn(
+            "pub(super) fn load_authenticated_selected_screenshot_upload_candidate",
+            selected_upload_production,
+        )
+        self.assertIn("pub(super) fn ciphertext", selected_upload_production)
+        self.assertNotIn(
+            "pub(in crate::cp::query) struct AuthenticatedSelectedScreenshotUploadCandidate",
+            selected_upload_production,
+        )
         self.assertIn("SELECT length(ciphertext),length(result_bytes)", selected_upload_domain)
         self.assertNotIn("SelectedScreenshotUploadCandidatePlan::", query)
         self.assertNotIn(
             "load_authenticated_selected_screenshot_upload_candidate(", query
         )
+        self.assertIn("mod selected_screenshot_send;", selected_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotSendStartedPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotSendStartedLedger",
+            gate,
+        )
+        self.assertIn("struct SelectedScreenshotSendStartedPlan", selected_send_domain)
+        self.assertIn("struct SelectedScreenshotSendStartedLedger", selected_send_domain)
+        self.assertIn(
+            "archive_v3_wal_selected_screenshot_send_started",
+            selected_send_domain,
+        )
+        self.assertIn("selected-screenshot-send-started-v1", selected_send_domain)
+        self.assertIn("SEND_REQUEST_ID_DOMAIN", selected_send_domain)
+        self.assertIn("SEND_BINDING_DOMAIN", selected_send_domain)
+        self.assertIn(
+            "authenticate_selected_screenshot_upload_candidate",
+            selected_send_domain,
+        )
+        self.assertIn(
+            "load_authenticated_selected_screenshot_send_started",
+            selected_send_domain,
+        )
+        self.assertIn(
+            "prepare_selected_screenshot_send_started", selected_send_domain
+        )
+        self.assertIn(
+            "pub(in crate::cp::query) struct AuthenticatedSelectedScreenshotSendStarted",
+            selected_send_production,
+        )
+        self.assertIn(
+            "fn load_authenticated_selected_screenshot_send_started(",
+            selected_production,
+        )
+        self.assertIn(
+            "fn prepare_selected_screenshot_send_started(",
+            selected_production,
+        )
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", selected_send_domain)
+        self.assertIn("DomainLedgerBounds::new", selected_send_domain)
+        self.assertNotIn("SelectedScreenshotSendStartedPlan::", query)
+        self.assertNotIn(
+            "load_authenticated_selected_screenshot_send_started(", query
+        )
+        self.assertNotIn("prepare_selected_screenshot_send_started(", query)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan",
             gate,
@@ -1391,6 +1456,7 @@ impl X {
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, selected_attempt_domain)
             self.assertNotIn(forbidden, selected_upload_production)
+            self.assertNotIn(forbidden, selected_send_production)
             self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, finalization_commit_domain)
             self.assertNotIn(forbidden, attempt_domain)
@@ -1490,6 +1556,31 @@ impl X {
             "record_screenshot_image_in_transaction(",
         ):
             self.assertNotIn(forbidden, selected_upload_production)
+        for forbidden in (
+            "KmsClient",
+            "generate_and_wrap_dek",
+            "load_dek(",
+            "encrypt_bound_blob",
+            "create_if_absent(",
+            "put_user_media",
+            "get_media(",
+            "delete_media(",
+            "list_objects",
+            "GcsClient",
+            "ExactImmutableObjectBackend",
+            "random_token_hex",
+            "thread_rng",
+            "SystemTime",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+            "record_screenshot_image_in_transaction(",
+            "DefinitivelyRejected",
+            "OutcomeUnknown",
+        ):
+            self.assertNotIn(forbidden, selected_send_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

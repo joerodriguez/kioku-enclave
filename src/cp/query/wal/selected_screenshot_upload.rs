@@ -70,16 +70,40 @@ pub(crate) struct SelectedScreenshotUploadCandidateReceipt {
 }
 
 impl SelectedScreenshotUploadCandidateReceipt {
-    pub(in crate::cp::query) fn image_id(&self) -> &str {
+    pub(super) fn image_id(&self) -> &str {
         &self.image_id
     }
 
-    pub(in crate::cp::query) fn object_key(&self) -> &str {
+    pub(super) fn object_key(&self) -> &str {
         &self.object_key
     }
 
-    pub(in crate::cp::query) const fn candidate_binding_commitment(&self) -> [u8; 32] {
+    pub(super) const fn candidate_binding_commitment(&self) -> [u8; 32] {
         self.candidate_binding_commitment
+    }
+
+    pub(super) const fn attempt_binding_commitment(&self) -> [u8; 32] {
+        self.attempt_binding_commitment
+    }
+
+    pub(super) const fn wrapped_dek_commitment(&self) -> [u8; 32] {
+        self.wrapped_dek_commitment
+    }
+
+    pub(super) const fn media_dek_binding_commitment(&self) -> [u8; 32] {
+        self.media_dek_binding_commitment
+    }
+
+    pub(super) const fn aad_commitment(&self) -> [u8; 32] {
+        self.aad_commitment
+    }
+
+    pub(super) const fn ciphertext_length(&self) -> u32 {
+        self.ciphertext_length
+    }
+
+    pub(super) const fn ciphertext_sha256(&self) -> [u8; 32] {
+        self.ciphertext_sha256
     }
 }
 
@@ -107,7 +131,7 @@ pub(crate) struct SelectedScreenshotUploadCandidatePlan {
 
 impl SelectedScreenshotUploadCandidatePlan {
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::cp::query) fn new(
+    pub(super) fn new(
         account_id: String,
         image_id: String,
         object_key: String,
@@ -476,17 +500,27 @@ impl WalLogicalDomainLedger<SelectedScreenshotUploadCandidatePlan>
 /// Exact restart payload for one caller-named candidate. Loading requires the
 /// plaintext DEK so the stored keyed binding and AEAD are revalidated; there is
 /// no enumeration or provider capability on this type.
-pub(in crate::cp::query) struct AuthenticatedSelectedScreenshotUploadCandidate {
+pub(super) struct AuthenticatedSelectedScreenshotUploadCandidate {
+    account_id: String,
+    request_fingerprint: [u8; 32],
     receipt: SelectedScreenshotUploadCandidateReceipt,
     ciphertext: Zeroizing<Vec<u8>>,
 }
 
 impl AuthenticatedSelectedScreenshotUploadCandidate {
-    pub(in crate::cp::query) fn receipt(&self) -> &SelectedScreenshotUploadCandidateReceipt {
+    pub(super) fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub(super) const fn request_fingerprint(&self) -> [u8; 32] {
+        self.request_fingerprint
+    }
+
+    pub(super) fn receipt(&self) -> &SelectedScreenshotUploadCandidateReceipt {
         &self.receipt
     }
 
-    pub(in crate::cp::query) fn ciphertext(&self) -> &[u8] {
+    pub(super) fn ciphertext(&self) -> &[u8] {
         self.ciphertext.as_slice()
     }
 }
@@ -500,7 +534,7 @@ impl std::fmt::Debug for AuthenticatedSelectedScreenshotUploadCandidate {
 /// Exact-name restart loader. The caller supplies the already selected account
 /// and attempt ID plus the KMS-authenticated plaintext DEK; this function cannot
 /// discover candidates or obtain a key/provider on its own.
-pub(in crate::cp::query) fn load_authenticated_selected_screenshot_upload_candidate(
+pub(super) fn load_authenticated_selected_screenshot_upload_candidate(
     connection: &Connection,
     account_id: &str,
     image_id: &str,
@@ -589,13 +623,126 @@ pub(in crate::cp::query) fn load_authenticated_selected_screenshot_upload_candid
     .map_err(|_| WalIdempotencyError::Corrupt)?;
     let prepared =
         PreparedLogicalMutation::prepare(plan).map_err(|_| WalIdempotencyError::Corrupt)?;
+    let request_fingerprint = *prepared.request_fingerprint_for_owner().as_bytes();
     let result = SelectedScreenshotUploadCandidateLedger::lookup(connection, &prepared)?
         .ok_or(WalIdempotencyError::Corrupt)?;
     let receipt = decode_receipt(&result)?;
     Ok(Some(AuthenticatedSelectedScreenshotUploadCandidate {
+        account_id: account_id.to_owned(),
+        request_fingerprint,
         receipt,
         ciphertext: Zeroizing::new(row.ciphertext),
     }))
+}
+
+/// Reauthenticates the exact permanent candidate against the fingerprint and
+/// keyed receipt captured by the exact-name DEK-bearing loader. This helper
+/// exposes no ciphertext and cannot discover another candidate.
+pub(super) fn authenticate_selected_screenshot_upload_candidate(
+    connection: &Connection,
+    account_id: &str,
+    expected_request_fingerprint: &[u8; 32],
+    expected_receipt: &SelectedScreenshotUploadCandidateReceipt,
+    require_unconsumed: bool,
+) -> Result<()> {
+    crate::store::validate_user_id(account_id).map_err(|_| WalIdempotencyError::Malformed)?;
+    if account_id.len() > MAX_ACCOUNT_ID_BYTES
+        || expected_request_fingerprint == &[0; 32]
+        || !super::valid_lower_hex(expected_receipt.image_id(), 32)
+    {
+        return Err(WalIdempotencyError::Malformed);
+    }
+    if schema_state(connection)? == LedgerSchemaState::Absent {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    validate_schema_marker(connection)?;
+    let Some((ciphertext_length, result_length)) = connection
+        .query_row(
+            "SELECT length(ciphertext),length(result_bytes)
+             FROM archive_v3_wal_selected_screenshot_upload_candidates
+             WHERE image_id=?1",
+            [expected_receipt.image_id()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?
+    else {
+        return Err(WalIdempotencyError::Precondition);
+    };
+    validate_encoded_lengths(ciphertext_length, result_length)?;
+    let row = connection
+        .query_row(
+            "SELECT operation_id,format_version,codec_version,request_fingerprint,
+                    account_id,image_id,object_key,episode_id,source_key,captured_at,
+                    width,height,plaintext_length,plaintext_sha256,
+                    attempt_binding_commitment,wrapped_dek_commitment,
+                    media_dek_binding_commitment,aad_commitment,
+                    ciphertext_length,ciphertext_sha256,candidate_binding_commitment,
+                    ciphertext,result_bytes,result_commitment
+             FROM archive_v3_wal_selected_screenshot_upload_candidates
+             WHERE image_id=?1",
+            [expected_receipt.image_id()],
+            StoredCandidateRow::from_row,
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    validate_stored_candidate_shape(&row)?;
+    if row.account_id != account_id
+        || row.request_fingerprint.as_slice() != expected_request_fingerprint
+    {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let media_dek_receipt = MediaDekInstallReceipt::from_stored_commitments(
+        array_32(&row.wrapped_dek_commitment)?,
+        array_32(&row.media_dek_binding_commitment)?,
+    )?;
+    let receipt = SelectedScreenshotUploadCandidateReceipt {
+        image_id: row.image_id.clone(),
+        object_key: row.object_key.clone(),
+        attempt_binding_commitment: array_32(&row.attempt_binding_commitment)?,
+        wrapped_dek_commitment: array_32(&row.wrapped_dek_commitment)?,
+        media_dek_binding_commitment: array_32(&row.media_dek_binding_commitment)?,
+        aad_commitment: array_32(&row.aad_commitment)?,
+        ciphertext_length: u32::try_from(row.ciphertext_length)
+            .map_err(|_| WalIdempotencyError::Corrupt)?,
+        ciphertext_sha256: array_32(&row.ciphertext_sha256)?,
+        candidate_binding_commitment: array_32(&row.candidate_binding_commitment)?,
+    };
+    if &receipt != expected_receipt {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    let plan = SelectedScreenshotUploadCandidatePlan {
+        operation_id: derive_operation_id(&row.image_id)?,
+        account_id: row.account_id,
+        image_id: row.image_id,
+        object_key: row.object_key,
+        episode_id: row.episode_id,
+        source_key: row.source_key,
+        captured_at: row.captured_at,
+        jpeg: ValidatedJpeg {
+            width: row.width,
+            height: row.height,
+            byte_length: row.plaintext_length,
+            sha256: row.plaintext_sha256,
+        },
+        media_dek_receipt,
+        ciphertext: Zeroizing::new(row.ciphertext),
+        receipt,
+    };
+    let prepared =
+        PreparedLogicalMutation::prepare(plan).map_err(|_| WalIdempotencyError::Corrupt)?;
+    if prepared.request_fingerprint_for_owner().as_bytes() != expected_request_fingerprint {
+        return Err(WalIdempotencyError::Corrupt);
+    }
+    if require_unconsumed {
+        authenticate_predecessors(connection, prepared.plan_for_domain_ledger(), true)?;
+    }
+    let result = SelectedScreenshotUploadCandidateLedger::lookup(connection, &prepared)?
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    (&decode_receipt(&result)? == expected_receipt)
+        .then_some(())
+        .ok_or(WalIdempotencyError::Corrupt)
 }
 
 #[allow(clippy::too_many_arguments)]

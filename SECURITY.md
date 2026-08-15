@@ -949,9 +949,22 @@ roll back. A private exact-name restart loader first preflights stored ciphertex
 requires the already selected account/attempt and borrowed plaintext DEK, exact-decrypts/re-hashes the
 row, reconstructs the keyed plan, and returns only that named ciphertext and typed receipt; it cannot
 enumerate candidates. This verifies an in-memory candidate; it neither proves that KMS produced the wrapped/plain
-pair nor authorizes a send. There is no KMS call, provider create/read, durable send-start marker,
-provider outcome/readback classification, C settlement, Store/route/launcher/task/retry/delete/list/
-cleanup/acknowledgement wiring. Those remain separate activation blockers. The
+pair nor contacts a provider. A separately sealed send-start child can be constructed only from that
+exact-name DEK-authenticated candidate. It derives one deterministic 256-bit send request identity
+and a domain-separated commitment over the exact account/image/object, candidate request
+fingerprint, B/DEK/AAD/ciphertext commitments, and request identity. One `BEGIN IMMEDIATE` requires
+the exact candidate plus an unconsumed B attempt on first apply, inserts a distinct permanent
+`SendStarted` row, full-counter-CASes a 1,048,576-row/256-MiB-result ledger, and exact-reads it before
+commit. Replay reauthenticates the candidate and may survive later exact A settlement. Its private
+exact-name restart loader again requires account/image plus the borrowed plaintext DEK and returns
+only the already-retained ciphertext with a non-cloneable marker receipt after both ledgers
+reauthenticate. The pre-marker candidate type, loader, and ciphertext getter are visible only inside
+the private WAL family; its parent receives only an opaque marker plan from a WAL-owned factory, while
+only the post-marker payload/loader crosses that boundary. It cannot enumerate work, acquire a
+key/provider, or infer an outcome. There is no
+KMS call, provider create/read, provider outcome/readback classification, C settlement,
+Store/route/launcher/task/retry/delete/list/cleanup/acknowledgement wiring. Those remain separate
+activation blockers. The
 finalization-queue child accepts only a caller-stable 128-bit request identity fixed before actor
 admission, the exact stable account and episode, a caller-supplied canonical queue timestamp, and the
 complete eligible predecessor tuple including nullable finalization/version/error/timing facts. It
@@ -1087,13 +1100,14 @@ evidence and every audio/person/identity/voice media-work result remain unsuppor
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
 screen result now consumes its exact binding. The selected-screenshot upload identity is a second
 sealed B operation, its bounded context-bound ciphertext continuation authenticates that attempt and
-the installed media-DEK receipt without send authority, and the production-facing local A receipt now
-consumes the exact attempt binding; the historical unbound A contract is test-only. Provider calls and
-the launcher remain absent.
+the installed media-DEK receipt without provider authority, and its exact-name send-start continuation
+now commits one deterministic request marker before any future provider call. The production-facing
+local A receipt consumes the exact attempt binding; the historical unbound A contract is test-only.
+Provider calls and the launcher remain absent.
 Generic/audio/finalization Vertex begin and
 canonical media's KMS-authenticated DEK producer and encryption/provider upload handoff remain
 unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported
-are selected-screenshot KMS production, send-start/provider settlement, and rejection/termination
+are selected-screenshot KMS production, provider I/O/result settlement, and rejection/termination
 release.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK KMS

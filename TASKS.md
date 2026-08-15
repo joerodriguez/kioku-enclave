@@ -317,9 +317,30 @@ separate activation blockers.
     reconstructs the complete candidate, and returns only that named ciphertext
     and receipt. Changed bytes/key/AAD/predecessors, consumed first apply, cap
     exhaustion, partial schema, row/counter tamper, and late readback failure
-    reject or roll back. KMS production, send-start, provider
+    reject or roll back. Its authenticated payload/loader/ciphertext getter are
+    confined to the private WAL family. KMS production, send-start, provider
     I/O/readback/outcome, C settlement, Store/route/launcher/task/retry/delete/
     list/cleanup/acknowledgement wiring remain absent.
+  - [x] Add the inactive selected-screenshot `SendStarted` continuation. Its
+    constructor accepts only the private exact-name candidate payload that was
+    reauthenticated with the borrowed media DEK. It derives one deterministic
+    256-bit send request ID and a separate binding over the exact candidate
+    fingerprint, B/DEK/AAD/ciphertext commitments, object, and account. One
+    immediate transaction requires the exact candidate and an unconsumed B
+    attempt on first apply, inserts the marker and complete binding in a
+    distinct 1,048,576-row/256-MiB-result ledger, full-counter-CASes, and
+    exact-reads before commit. Replay reauthenticates the candidate and may
+    survive later matching A settlement. A private exact-name restart loader
+    requires account/image plus borrowed DEK and returns only the original
+    retained ciphertext with a non-cloneable marker receipt after both ledgers
+    reauthenticate. The parent receives only an opaque marker plan from a
+    WAL-owned pre-marker factory and the authenticated post-marker payload; it
+    cannot access the pre-marker ciphertext capability. Changed
+    candidate/marker/request facts, consumed first
+    apply, partial schema, row/counter tamper, and late readback failure reject
+    or roll back. Provider construction/I/O/readback/outcome authentication, C
+    settlement, KMS production, Store/route/launcher/task/retry/delete/list/
+    cleanup/acknowledgement wiring remain absent.
   - [x] Bind the production-facing selected-screenshot A receipt to the exact
     permanent B attempt. The version-2 request uses a distinct operation domain,
     carries the B binding commitment, reconstructs the full B row and typed
