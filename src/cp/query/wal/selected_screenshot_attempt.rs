@@ -673,6 +673,48 @@ pub(in crate::cp::query) fn authenticate_selected_screenshot_attempt_binding(
     Ok(row.screenshot_id)
 }
 
+/// Candidate preparation authenticates the same permanent B binding but must
+/// still precede any exact local A settlement. A committed matching A row is a
+/// valid later state for ordinary B replay, not permission to prepare another
+/// provider candidate.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::cp::query) fn authenticate_unconsumed_selected_screenshot_attempt(
+    connection: &Connection,
+    account_id: &str,
+    image_id: &str,
+    object_key: &str,
+    episode_id: i64,
+    source_key: &str,
+    captured_at: &str,
+    jpeg: &ValidatedJpeg,
+    binding_commitment: &[u8; 32],
+) -> Result<i64> {
+    let screenshot_id = authenticate_selected_screenshot_attempt_binding(
+        connection,
+        account_id,
+        image_id,
+        object_key,
+        episode_id,
+        source_key,
+        captured_at,
+        jpeg,
+        binding_commitment,
+    )?;
+    let matches = connection
+        .query_row(
+            "SELECT COUNT(*) FROM screenshot_images
+             WHERE source_key=?1 OR id=?2 OR object_key=?3",
+            params![source_key, image_id, object_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    match matches {
+        0 => Ok(screenshot_id),
+        1 => Err(WalIdempotencyError::Precondition),
+        _ => Err(WalIdempotencyError::Corrupt),
+    }
+}
+
 pub(in crate::cp::query) fn authenticate_selected_screenshot_upload_predecessor(
     connection: &Connection,
     account_id: &str,

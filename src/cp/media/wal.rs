@@ -16,6 +16,7 @@ mod capture_event;
 mod media_dek;
 mod reference_batch;
 pub(crate) use capture_event::{CanonicalCaptureEventLedger, CanonicalCaptureEventPlan};
+pub(in crate::cp) use media_dek::{authenticate_media_dek_install_receipt, MediaDekInstallReceipt};
 pub(crate) use media_dek::{MediaDekInstallLedger, MediaDekInstallPlan};
 pub(crate) use reference_batch::{MediaReferenceBatchLedger, MediaReferenceBatchPlan};
 

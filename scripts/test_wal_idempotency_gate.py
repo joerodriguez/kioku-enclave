@@ -949,6 +949,10 @@ impl X {
         selected_attempt_production = without_cfg_test_items(
             selected_attempt_domain
         )
+        selected_upload_domain = (
+            ROOT / "src/cp/query/wal/selected_screenshot_upload.rs"
+        ).read_text(encoding="utf-8")
+        selected_upload_production = without_cfg_test_items(selected_upload_domain)
         finalization_queue_domain = (
             ROOT / "src/cp/query/wal/finalization_queue.rs"
         ).read_text(encoding="utf-8")
@@ -1126,6 +1130,45 @@ impl X {
             "WalIdempotencyError::Precondition", selected_attempt_domain
         )
         self.assertNotIn("SelectedScreenshotAttemptPlan::", query)
+        self.assertIn("mod selected_screenshot_upload;", selected_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotUploadCandidatePlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotUploadCandidateLedger",
+            gate,
+        )
+        self.assertIn("struct SelectedScreenshotUploadCandidatePlan", selected_upload_domain)
+        self.assertIn("struct SelectedScreenshotUploadCandidateLedger", selected_upload_domain)
+        self.assertIn(
+            "archive_v3_wal_selected_screenshot_upload_candidates",
+            selected_upload_domain,
+        )
+        self.assertIn(
+            "selected-screenshot-upload-candidate-v1", selected_upload_domain
+        )
+        self.assertIn("CANDIDATE_BINDING_DOMAIN", selected_upload_domain)
+        self.assertIn("HmacSha256::new_from_slice", selected_upload_domain)
+        self.assertIn("decrypt_bound_blob", selected_upload_production)
+        self.assertIn(
+            "authenticate_unconsumed_selected_screenshot_attempt",
+            selected_upload_domain,
+        )
+        self.assertIn(
+            "authenticate_media_dek_install_receipt", selected_upload_domain
+        )
+        self.assertIn("MAX_RETAINED_CIPHERTEXT_BYTES", selected_upload_domain)
+        self.assertIn("ciphertext BLOB NOT NULL", selected_upload_domain)
+        self.assertIn(
+            "load_authenticated_selected_screenshot_upload_candidate",
+            selected_upload_domain,
+        )
+        self.assertIn("SELECT length(ciphertext),length(result_bytes)", selected_upload_domain)
+        self.assertNotIn("SelectedScreenshotUploadCandidatePlan::", query)
+        self.assertNotIn(
+            "load_authenticated_selected_screenshot_upload_candidate(", query
+        )
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan",
             gate,
@@ -1347,6 +1390,7 @@ impl X {
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, selected_attempt_domain)
+            self.assertNotIn(forbidden, selected_upload_production)
             self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, finalization_commit_domain)
             self.assertNotIn(forbidden, attempt_domain)
@@ -1426,6 +1470,26 @@ impl X {
             "record_screenshot_image_in_transaction(",
         ):
             self.assertNotIn(forbidden, selected_attempt_production)
+        for forbidden in (
+            "KmsClient",
+            "generate_and_wrap_dek",
+            "load_dek(",
+            "encrypt_bound_blob",
+            "put_user_media",
+            "get_media(",
+            "delete_media(",
+            "list_objects",
+            "random_token_hex",
+            "thread_rng",
+            "SystemTime",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+            "record_screenshot_image_in_transaction(",
+        ):
+            self.assertNotIn(forbidden, selected_upload_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

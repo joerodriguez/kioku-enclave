@@ -54,12 +54,37 @@ pub(crate) struct MediaDekInstallReceipt {
 }
 
 impl MediaDekInstallReceipt {
-    pub(super) const fn wrapped_dek_commitment(&self) -> [u8; 32] {
+    pub(in crate::cp) fn from_stored_commitments(
+        wrapped_dek_commitment: [u8; 32],
+        binding_commitment: [u8; 32],
+    ) -> Result<Self> {
+        if wrapped_dek_commitment == [0; 32] || binding_commitment == [0; 32] {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        Ok(Self {
+            wrapped_dek_commitment,
+            binding_commitment,
+        })
+    }
+
+    pub(in crate::cp) const fn wrapped_dek_commitment(&self) -> [u8; 32] {
         self.wrapped_dek_commitment
     }
 
-    pub(super) const fn binding_commitment(&self) -> [u8; 32] {
+    pub(in crate::cp) const fn binding_commitment(&self) -> [u8; 32] {
         self.binding_commitment
+    }
+
+    pub(in crate::cp) fn validate_plaintext_dek(
+        &self,
+        account_id: &str,
+        plaintext_dek: &Dek,
+    ) -> Result<()> {
+        let expected =
+            derive_binding_commitment(plaintext_dek, account_id, &self.wrapped_dek_commitment)?;
+        (expected == self.binding_commitment)
+            .then_some(())
+            .ok_or(WalIdempotencyError::Precondition)
     }
 }
 
@@ -75,6 +100,15 @@ pub(crate) struct MediaDekInstallPlan {
 
 impl MediaDekInstallPlan {
     pub(super) fn new(
+        account_id: String,
+        wrapped_dek_b64: String,
+        plaintext_dek: &Dek,
+    ) -> Result<Self> {
+        Self::build(None, account_id, wrapped_dek_b64, plaintext_dek)
+    }
+
+    #[cfg(test)]
+    pub(in crate::cp) fn new_for_cross_domain_test(
         account_id: String,
         wrapped_dek_b64: String,
         plaintext_dek: &Dek,
@@ -126,6 +160,30 @@ impl MediaDekInstallPlan {
         })
     }
 
+    fn from_stored(
+        account_id: String,
+        wrapped_dek_b64: String,
+        receipt: MediaDekInstallReceipt,
+    ) -> Result<Self> {
+        crate::store::validate_user_id(&account_id).map_err(|_| WalIdempotencyError::Corrupt)?;
+        if account_id.len() > MAX_ACCOUNT_ID_BYTES {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        validate_wrapped_dek(&wrapped_dek_b64).map_err(|_| WalIdempotencyError::Corrupt)?;
+        let wrapped_dek_commitment: [u8; 32] = Sha256::digest(wrapped_dek_b64.as_bytes()).into();
+        if wrapped_dek_commitment != receipt.wrapped_dek_commitment
+            || receipt.binding_commitment == [0; 32]
+        {
+            return Err(WalIdempotencyError::Corrupt);
+        }
+        Ok(Self {
+            operation_id: derive_operation_id(&account_id)?,
+            account_id,
+            wrapped_dek_b64: Zeroizing::new(wrapped_dek_b64),
+            receipt,
+        })
+    }
+
     #[cfg(test)]
     fn with_operation_id(
         operation_id: WalLogicalOperationId,
@@ -140,6 +198,26 @@ impl MediaDekInstallPlan {
             plaintext_dek,
         )
     }
+}
+
+/// Reauthenticates the one exact installed media-DEK receipt without exposing
+/// the wrapped value or any KMS/decryption authority to a sibling domain.
+pub(in crate::cp) fn authenticate_media_dek_install_receipt(
+    connection: &Connection,
+    account_id: &str,
+    receipt: &MediaDekInstallReceipt,
+) -> Result<()> {
+    if schema_state(connection)? == LedgerSchemaState::Absent {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    validate_schema_marker(connection)?;
+    let wrapped_dek_b64 = load_wrapped_dek(connection)?.ok_or(WalIdempotencyError::Precondition)?;
+    let plan = MediaDekInstallPlan::from_stored(account_id.to_owned(), wrapped_dek_b64, *receipt)?;
+    let prepared =
+        PreparedLogicalMutation::prepare(plan).map_err(|_| WalIdempotencyError::Corrupt)?;
+    MediaDekInstallLedger::lookup(connection, &prepared)?
+        .map(|_| ())
+        .ok_or(WalIdempotencyError::Corrupt)
 }
 
 impl Drop for MediaDekInstallPlan {

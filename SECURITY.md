@@ -934,8 +934,24 @@ partial schema, permanent-row tamper, or restart fails closed or exactly replays
 allocate randomness, a clock, or a DEK; access media bytes; encrypt, upload, read, list, or delete a
 provider object; call Store; launch or retry work; terminalize/release a rejected reservation; clean
 up; or acknowledge a request. The A selected-screenshot receipt now consumes this exact binding, while
-DEK/encryption/provider handoff and rejection/termination settlement remain separate activation
-blockers. The
+the separately sealed ciphertext-candidate continuation supplies only the next durable local step.
+Its production constructor accepts the exact B binding, typed installed-media-DEK receipt, borrowed
+validated JPEG/DEK, and caller-supplied context-bound ciphertext. Before actor admission it checks the
+plaintext hash/length, proves that the same borrowed DEK derives the installation binding, exact-
+decrypts the ciphertext under the account/object media AAD, and derives a second keyed commitment over
+the complete attempt, DEK, JPEG, AAD, and ciphertext facts. The plan retains no plaintext or DEK. One
+`BEGIN IMMEDIATE` requires the exact unconsumed B attempt and exact installed-DEK ledger, inserts only
+the encrypted bytes and commitments, advances exact row/result/ciphertext counters under fixed
+1,048,576-row/128-MiB/512-MiB caps, and exact-reads the row before commit. Exact replay reauthenticates
+both predecessors and may survive a later matching A settlement; changed bytes/key/AAD, a consumed
+first apply, cap exhaustion, partial schema, row/counter tamper, and late readback failure reject or
+roll back. A private exact-name restart loader first preflights stored ciphertext/result lengths, then
+requires the already selected account/attempt and borrowed plaintext DEK, exact-decrypts/re-hashes the
+row, reconstructs the keyed plan, and returns only that named ciphertext and typed receipt; it cannot
+enumerate candidates. This verifies an in-memory candidate; it neither proves that KMS produced the wrapped/plain
+pair nor authorizes a send. There is no KMS call, provider create/read, durable send-start marker,
+provider outcome/readback classification, C settlement, Store/route/launcher/task/retry/delete/list/
+cleanup/acknowledgement wiring. Those remain separate activation blockers. The
 finalization-queue child accepts only a caller-stable 128-bit request identity fixed before actor
 admission, the exact stable account and episode, a caller-supplied canonical queue timestamp, and the
 complete eligible predecessor tuple including nullable finalization/version/error/timing facts. It
@@ -1070,12 +1086,15 @@ pending its own separately reviewed codec and the closed launcher. In particular
 evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
 screen-storyboard Vertex-begin identity is the first separately sealed B operation, and the inactive
 screen result now consumes its exact binding. The selected-screenshot upload identity is a second
-sealed B operation, and the production-facing local A receipt now consumes its exact binding; the
-historical unbound A contract is test-only. Provider calls and the launcher remain absent.
+sealed B operation, its bounded context-bound ciphertext continuation authenticates that attempt and
+the installed media-DEK receipt without send authority, and the production-facing local A receipt now
+consumes the exact attempt binding; the historical unbound A contract is test-only. Provider calls and
+the launcher remain absent.
 Generic/audio/finalization Vertex begin and
 canonical media's KMS-authenticated DEK producer and encryption/provider upload handoff remain
-unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported are selected-screenshot
-DEK/encryption/provider settlement and rejection/termination release.
+unsupported; only the inactive first-writer-wins local DEK installation half exists. Also unsupported
+are selected-screenshot KMS production, send-start/provider settlement, and rejection/termination
+release.
 The rest of domain B remains disabled pending explicit caller/attempt identity or
 semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK KMS
 production and upload/send boundaries, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
