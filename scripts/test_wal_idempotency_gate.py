@@ -957,6 +957,12 @@ impl X {
             ROOT / "src/cp/query/wal/selected_screenshot_send.rs"
         ).read_text(encoding="utf-8")
         selected_send_production = without_cfg_test_items(selected_send_domain)
+        selected_provider_domain = (
+            ROOT / "src/cp/query/wal/selected_screenshot_provider.rs"
+        ).read_text(encoding="utf-8")
+        selected_provider_production = without_cfg_test_items(
+            selected_provider_domain
+        )
         finalization_queue_domain = (
             ROOT / "src/cp/query/wal/finalization_queue.rs"
         ).read_text(encoding="utf-8")
@@ -1216,12 +1222,12 @@ impl X {
             "prepare_selected_screenshot_send_started", selected_send_domain
         )
         self.assertIn(
-            "pub(in crate::cp::query) struct AuthenticatedSelectedScreenshotSendStarted",
+            "pub(super) struct AuthenticatedSelectedScreenshotSendStarted",
             selected_send_production,
         )
         self.assertIn(
-            "fn load_authenticated_selected_screenshot_send_started(",
-            selected_production,
+            "pub(super) fn load_authenticated_selected_screenshot_send_started(",
+            selected_send_production,
         )
         self.assertIn(
             "fn prepare_selected_screenshot_send_started(",
@@ -1233,7 +1239,54 @@ impl X {
         self.assertNotIn(
             "load_authenticated_selected_screenshot_send_started(", query
         )
+        self.assertNotIn(
+            "fn load_authenticated_selected_screenshot_send_started(",
+            selected_production,
+        )
         self.assertNotIn("prepare_selected_screenshot_send_started(", query)
+        self.assertIn("mod selected_screenshot_provider;", selected_domain)
+        self.assertIn(
+            "trait SelectedScreenshotExactCreateProvider",
+            selected_provider_domain,
+        )
+        self.assertIn(
+            "enum SelectedScreenshotProviderCreateResult",
+            selected_provider_domain,
+        )
+        self.assertIn(
+            "enum SelectedScreenshotProviderOutcome", selected_provider_domain
+        )
+        self.assertIn(
+            "struct SelectedScreenshotProviderAccepted", selected_provider_domain
+        )
+        self.assertIn(
+            "struct SelectedScreenshotProviderRejectedNoObject",
+            selected_provider_domain,
+        )
+        self.assertIn(
+            "prepare_selected_screenshot_provider_request",
+            selected_provider_domain,
+        )
+        self.assertIn(
+            "execute_selected_screenshot_provider_request",
+            selected_provider_domain,
+        )
+        self.assertIn("create_if_absent(", selected_provider_domain)
+        self.assertIn("get_exact(", selected_provider_domain)
+        self.assertIn("max_ciphertext_bytes", selected_provider_domain)
+        self.assertIn("ACCEPTED_BINDING_DOMAIN", selected_provider_domain)
+        self.assertIn("REJECTED_BINDING_DOMAIN", selected_provider_domain)
+        self.assertIn(
+            "load_authenticated_selected_screenshot_send_started",
+            selected_provider_domain,
+        )
+        self.assertNotIn(
+            "impl SelectedScreenshotExactCreateProvider for",
+            selected_provider_production,
+        )
+        self.assertNotIn(
+            "prepare_selected_screenshot_provider_request(", query
+        )
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan",
             gate,
@@ -1457,6 +1510,7 @@ impl X {
             self.assertNotIn(forbidden, selected_attempt_domain)
             self.assertNotIn(forbidden, selected_upload_production)
             self.assertNotIn(forbidden, selected_send_production)
+            self.assertNotIn(forbidden, selected_provider_production)
             self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, finalization_commit_domain)
             self.assertNotIn(forbidden, attempt_domain)
@@ -1581,6 +1635,30 @@ impl X {
             "OutcomeUnknown",
         ):
             self.assertNotIn(forbidden, selected_send_production)
+        for forbidden in (
+            "crate::store::Store",
+            "GcsClient",
+            "ExactImmutableObjectBackend",
+            "put_user_media",
+            "get_media(",
+            "delete_media(",
+            "delete_object",
+            "list_objects",
+            "list_object_versions",
+            "KmsClient",
+            "generate_and_wrap_dek",
+            "load_dek(",
+            "random_token_hex",
+            "thread_rng",
+            "SystemTime",
+            "std::time::",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "reqwest::",
+            "record_screenshot_image_in_transaction(",
+        ):
+            self.assertNotIn(forbidden, selected_provider_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

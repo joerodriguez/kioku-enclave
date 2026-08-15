@@ -85,6 +85,40 @@ impl SelectedScreenshotSendStartedReceipt {
     pub(in crate::cp::query) const fn send_binding_commitment(&self) -> [u8; 32] {
         self.send_binding_commitment
     }
+
+    pub(super) fn provider_facts(&self) -> SelectedScreenshotSendProviderFacts<'_> {
+        SelectedScreenshotSendProviderFacts {
+            account_id: &self.account_id,
+            image_id: &self.image_id,
+            object_key: &self.object_key,
+            candidate_request_fingerprint: self.candidate_request_fingerprint,
+            attempt_binding_commitment: self.attempt_binding_commitment,
+            wrapped_dek_commitment: self.wrapped_dek_commitment,
+            media_dek_binding_commitment: self.media_dek_binding_commitment,
+            aad_commitment: self.aad_commitment,
+            ciphertext_length: self.ciphertext_length,
+            ciphertext_sha256: self.ciphertext_sha256,
+            candidate_binding_commitment: self.candidate_binding_commitment,
+            send_request_id: &self.send_request_id,
+            send_binding_commitment: self.send_binding_commitment,
+        }
+    }
+}
+
+pub(super) struct SelectedScreenshotSendProviderFacts<'a> {
+    pub(super) account_id: &'a str,
+    pub(super) image_id: &'a str,
+    pub(super) object_key: &'a str,
+    pub(super) candidate_request_fingerprint: [u8; 32],
+    pub(super) attempt_binding_commitment: [u8; 32],
+    pub(super) wrapped_dek_commitment: [u8; 32],
+    pub(super) media_dek_binding_commitment: [u8; 32],
+    pub(super) aad_commitment: [u8; 32],
+    pub(super) ciphertext_length: u32,
+    pub(super) ciphertext_sha256: [u8; 32],
+    pub(super) candidate_binding_commitment: [u8; 32],
+    pub(super) send_request_id: &'a str,
+    pub(super) send_binding_commitment: [u8; 32],
 }
 
 impl std::fmt::Debug for SelectedScreenshotSendStartedReceipt {
@@ -399,17 +433,17 @@ impl WalLogicalDomainLedger<SelectedScreenshotSendStartedPlan>
 /// Exact send-ready payload for one caller-named marker. The ciphertext is
 /// returned only after both the candidate and `SendStarted` ledgers have been
 /// reauthenticated with the caller's already obtained plaintext DEK.
-pub(in crate::cp::query) struct AuthenticatedSelectedScreenshotSendStarted {
+pub(super) struct AuthenticatedSelectedScreenshotSendStarted {
     receipt: SelectedScreenshotSendStartedReceipt,
     ciphertext: Zeroizing<Vec<u8>>,
 }
 
 impl AuthenticatedSelectedScreenshotSendStarted {
-    pub(in crate::cp::query) fn receipt(&self) -> &SelectedScreenshotSendStartedReceipt {
+    pub(super) fn receipt(&self) -> &SelectedScreenshotSendStartedReceipt {
         &self.receipt
     }
 
-    pub(in crate::cp::query) fn ciphertext(&self) -> &[u8] {
+    pub(super) fn ciphertext(&self) -> &[u8] {
         self.ciphertext.as_slice()
     }
 }
