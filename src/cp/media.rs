@@ -3119,6 +3119,27 @@ pub fn record_source_event_with_generation(
     object_key: &str,
     object_generation: Option<i64>,
 ) -> Result<RecordOutcome> {
+    let tx = conn.unchecked_transaction()?;
+    let outcome = record_source_event_in_transaction(
+        &tx,
+        account_id,
+        manifest,
+        manifest_digest,
+        object_key,
+        object_generation,
+    )?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+fn record_source_event_in_transaction(
+    conn: &Connection,
+    account_id: &str,
+    manifest: &CaptureEventManifest,
+    manifest_digest: &str,
+    object_key: &str,
+    object_generation: Option<i64>,
+) -> Result<RecordOutcome> {
     manifest.validate()?;
     if manifest.media_disposition != MediaDisposition::Canonical {
         return Err(EnclaveError::InvalidRequest(
@@ -3156,8 +3177,7 @@ pub fn record_source_event_with_generation(
         ));
     }
 
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO capture_sessions \
          (id, device_id, install_id, started_at, last_event_at, schema_version, ended_at) \
          VALUES (?1,?2,?3,?4,?5,2,CASE WHEN ?6 THEN ?5 ELSE NULL END) \
@@ -3174,7 +3194,7 @@ pub fn record_source_event_with_generation(
             manifest.session_finished.unwrap_or(false)
         ],
     )?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO capture_streams \
          (id, capture_session_id, device_id, stream_kind) VALUES (?1,?2,?3,?4) \
          ON CONFLICT(id) DO NOTHING",
@@ -3190,7 +3210,7 @@ pub fn record_source_event_with_generation(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
-    let event_insert = tx.execute(
+    let event_insert = conn.execute(
         "INSERT INTO capture_events \
          (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
           source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes, \
@@ -3224,7 +3244,7 @@ pub fn record_source_event_with_generation(
         }
         return Err(error.into());
     }
-    tx.execute(
+    conn.execute(
         "INSERT INTO media_objects \
          (asset_id,event_id,object_key,object_generation,object_backend,mime_type,codec,byte_length,sha256,sample_rate,channels, \
           frame_count,width,height,scale,orientation,retain_until) \
@@ -3248,20 +3268,19 @@ pub fn record_source_event_with_generation(
             super::isotime::add_seconds(&manifest.ended_at, 30.0 * 86_400.0)
         ],
     )?;
-    record_browser_observation(&tx, manifest)?;
+    record_browser_observation(conn, manifest)?;
     let job_kind = if manifest.stream_kind.is_audio() {
         "gemini_audio"
     } else {
         "gemini_screen"
     };
-    tx.execute(
+    conn.execute(
         "INSERT INTO media_processing_jobs \
          (event_id,job_kind,input_revision,processor_version,state) \
          VALUES (?1,?2,?3,1,'pending')",
         params![manifest.event_id, job_kind, manifest_digest],
     )?;
-    advance_contiguous_ack(&tx, &manifest.stream_id)?;
-    tx.commit()?;
+    advance_contiguous_ack(conn, &manifest.stream_id)?;
     Ok(RecordOutcome::Created)
 }
 
