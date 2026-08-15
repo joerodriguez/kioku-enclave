@@ -963,6 +963,12 @@ impl X {
         selected_provider_production = without_cfg_test_items(
             selected_provider_domain
         )
+        selected_termination_domain = (
+            ROOT / "src/cp/query/wal/selected_screenshot_termination.rs"
+        ).read_text(encoding="utf-8")
+        selected_termination_production = without_cfg_test_items(
+            selected_termination_domain
+        )
         finalization_queue_domain = (
             ROOT / "src/cp/query/wal/finalization_queue.rs"
         ).read_text(encoding="utf-8")
@@ -1276,6 +1282,17 @@ impl X {
         self.assertIn("max_ciphertext_bytes", selected_provider_domain)
         self.assertIn("ACCEPTED_BINDING_DOMAIN", selected_provider_domain)
         self.assertIn("REJECTED_BINDING_DOMAIN", selected_provider_domain)
+        self.assertIn("EXECUTION_CLAIM_DOMAIN", selected_provider_domain)
+        self.assertIn(
+            "archive_v3_wal_selected_screenshot_provider_executions",
+            selected_provider_domain,
+        )
+        self.assertIn("TransactionBehavior::Immediate", selected_provider_domain)
+        self.assertIn("claim_provider_execution", selected_provider_domain)
+        self.assertIn(
+            "authenticate_provider_execution_claim", selected_provider_domain
+        )
+        self.assertIn("MAX_EXECUTION_CLAIMS", selected_provider_domain)
         self.assertIn(
             "load_authenticated_selected_screenshot_send_started",
             selected_provider_domain,
@@ -1287,6 +1304,67 @@ impl X {
         self.assertNotIn(
             "prepare_selected_screenshot_provider_request(", query
         )
+        self.assertIn("mod selected_screenshot_termination;", selected_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotTerminationPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotTerminationLedger",
+            gate,
+        )
+        self.assertIn(
+            "struct SelectedScreenshotTerminationPlan", selected_termination_domain
+        )
+        self.assertIn(
+            "struct SelectedScreenshotTerminationLedger", selected_termination_domain
+        )
+        self.assertIn(
+            "archive_v3_wal_selected_screenshot_terminations",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "selected-screenshot-upload-termination-v1",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "SelectedScreenshotProviderRejectedNoObject",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "authenticate_selected_screenshot_attempt_for_terminal",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "authenticate_selected_screenshot_send_provider_facts",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "authenticate_rejected_no_object_facts",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "authenticate_provider_execution_claim",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "load_selected_screenshot_termination_plan",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "authenticated_episode_release_totals",
+            selected_termination_domain,
+        )
+        self.assertIn(
+            "selected_screenshot_termination::ensure_attempt_not_terminated",
+            selected_production,
+        )
+        self.assertIn(
+            "selected_screenshot_termination::authenticated_episode_release_totals",
+            selected_attempt_production,
+        )
+        self.assertNotIn("SelectedScreenshotTerminationPlan::", query)
+        self.assertNotIn("prepare_selected_screenshot_termination(", query)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan",
             gate,
@@ -1511,6 +1589,7 @@ impl X {
             self.assertNotIn(forbidden, selected_upload_production)
             self.assertNotIn(forbidden, selected_send_production)
             self.assertNotIn(forbidden, selected_provider_production)
+            self.assertNotIn(forbidden, selected_termination_production)
             self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, finalization_commit_domain)
             self.assertNotIn(forbidden, attempt_domain)
@@ -1659,6 +1738,36 @@ impl X {
             "record_screenshot_image_in_transaction(",
         ):
             self.assertNotIn(forbidden, selected_provider_production)
+        for forbidden in (
+            "crate::store::Store",
+            "GcsClient",
+            "ExactImmutableObjectBackend",
+            "create_if_absent(",
+            "get_exact(",
+            "prepare_selected_screenshot_provider_request(",
+            "execute_selected_screenshot_provider_request(",
+            "put_user_media",
+            "get_media(",
+            "delete_media(",
+            "delete_object",
+            "list_objects",
+            "list_object_versions",
+            "KmsClient",
+            "generate_and_wrap_dek",
+            "load_dek(",
+            "encrypt_bound_blob",
+            "decrypt_bound_blob",
+            "random_token_hex",
+            "thread_rng",
+            "SystemTime",
+            "std::time::",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "reqwest::",
+            "record_screenshot_image_in_transaction(",
+        ):
+            self.assertNotIn(forbidden, selected_termination_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

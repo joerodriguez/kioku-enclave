@@ -57,6 +57,22 @@ pub(in crate::cp::query) struct SelectedScreenshotAttemptTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SelectedScreenshotAttemptFacts {
+    pub(super) operation_id: WalLogicalOperationId,
+    pub(super) request_fingerprint: [u8; 32],
+    pub(super) account_id: String,
+    pub(super) image_id: String,
+    pub(super) object_key: String,
+    pub(super) episode_id: i64,
+    pub(super) screenshot_id: i64,
+    pub(super) source_key: String,
+    pub(super) captured_at: String,
+    pub(super) jpeg: ValidatedJpeg,
+    pub(super) predecessor_commitment: [u8; 32],
+    pub(super) binding_commitment: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SelectedScreenshotAttemptReceipt {
     image_id: String,
     object_key: String,
@@ -569,22 +585,16 @@ impl StoredLedgerRow {
     }
 }
 
-/// Reauthenticates one permanent pre-provider selected-screenshot attempt for
-/// its exact local result. The caller receives only the bound numeric
-/// screenshot identity; it cannot enumerate attempts or recover an unrelated
-/// object capability.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::cp::query) fn authenticate_selected_screenshot_attempt_binding(
+/// Reconstructs and authenticates the complete permanent B attempt without
+/// granting result-write or provider authority. Terminal settlement uses this
+/// exact named binding and cannot enumerate unrelated attempts.
+pub(super) fn authenticate_selected_screenshot_attempt_for_terminal(
     connection: &Connection,
     account_id: &str,
     image_id: &str,
     object_key: &str,
-    episode_id: i64,
-    source_key: &str,
-    captured_at: &str,
-    jpeg: &ValidatedJpeg,
     binding_commitment: &[u8; 32],
-) -> Result<i64> {
+) -> Result<SelectedScreenshotAttemptFacts> {
     if schema_state(connection)? == LedgerSchemaState::Absent {
         return Err(WalIdempotencyError::Precondition);
     }
@@ -614,13 +624,14 @@ pub(in crate::cp::query) fn authenticate_selected_screenshot_attempt_binding(
     {
         return Err(WalIdempotencyError::Corrupt);
     }
+    let predecessor_commitment = row
+        .predecessor_commitment
+        .as_slice()
+        .try_into()
+        .map_err(|_| WalIdempotencyError::Corrupt)?;
     let target = SelectedScreenshotAttemptTarget {
         screenshot_id: row.screenshot_id,
-        predecessor_commitment: row
-            .predecessor_commitment
-            .as_slice()
-            .try_into()
-            .map_err(|_| WalIdempotencyError::Corrupt)?,
+        predecessor_commitment,
     };
     let expected = SelectedScreenshotAttemptPlan::build(
         None,
@@ -659,18 +670,66 @@ pub(in crate::cp::query) fn authenticate_selected_screenshot_attempt_binding(
     if row.account_id != account_id
         || row.image_id != image_id
         || row.object_key != object_key
-        || row.episode_id != episode_id
-        || row.source_key != source_key
-        || row.captured_at != captured_at
-        || row.width != jpeg.width
-        || row.height != jpeg.height
-        || row.byte_length != jpeg.byte_length
-        || row.sha256 != jpeg.sha256
         || row.binding_commitment.as_slice() != binding_commitment
     {
         return Err(WalIdempotencyError::Precondition);
     }
-    Ok(row.screenshot_id)
+    Ok(SelectedScreenshotAttemptFacts {
+        operation_id: prepared.operation_id_for_owner(),
+        request_fingerprint: *prepared.request_fingerprint_for_owner().as_bytes(),
+        account_id: row.account_id,
+        image_id: row.image_id,
+        object_key: row.object_key,
+        episode_id: row.episode_id,
+        screenshot_id: row.screenshot_id,
+        source_key: row.source_key,
+        captured_at: row.captured_at,
+        jpeg: ValidatedJpeg {
+            width: row.width,
+            height: row.height,
+            byte_length: row.byte_length,
+            sha256: row.sha256,
+        },
+        predecessor_commitment,
+        binding_commitment: row
+            .binding_commitment
+            .as_slice()
+            .try_into()
+            .map_err(|_| WalIdempotencyError::Corrupt)?,
+    })
+}
+
+/// Reauthenticates one permanent pre-provider selected-screenshot attempt for
+/// its exact local result. The caller receives only the bound numeric
+/// screenshot identity; it cannot enumerate attempts or recover an unrelated
+/// object capability.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::cp::query) fn authenticate_selected_screenshot_attempt_binding(
+    connection: &Connection,
+    account_id: &str,
+    image_id: &str,
+    object_key: &str,
+    episode_id: i64,
+    source_key: &str,
+    captured_at: &str,
+    jpeg: &ValidatedJpeg,
+    binding_commitment: &[u8; 32],
+) -> Result<i64> {
+    let facts = authenticate_selected_screenshot_attempt_for_terminal(
+        connection,
+        account_id,
+        image_id,
+        object_key,
+        binding_commitment,
+    )?;
+    if facts.episode_id != episode_id
+        || facts.source_key != source_key
+        || facts.captured_at != captured_at
+        || facts.jpeg != *jpeg
+    {
+        return Err(WalIdempotencyError::Precondition);
+    }
+    Ok(facts.screenshot_id)
 }
 
 /// Candidate preparation authenticates the same permanent B binding but must
@@ -698,6 +757,13 @@ pub(in crate::cp::query) fn authenticate_unconsumed_selected_screenshot_attempt(
         source_key,
         captured_at,
         jpeg,
+        binding_commitment,
+    )?;
+    super::selected_screenshot_termination::ensure_attempt_not_terminated(
+        connection,
+        account_id,
+        image_id,
+        object_key,
         binding_commitment,
     )?;
     let matches = connection
@@ -922,7 +988,7 @@ fn validate_episode_budget_reservation(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .map_err(|_| WalIdempotencyError::Unavailable)?;
-    let (pending_count, pending_bytes) = connection
+    let (reserved_count, reserved_bytes) = connection
         .query_row(
             "SELECT COUNT(*),COALESCE(SUM(a.byte_length),0)
              FROM archive_v3_wal_selected_screenshot_attempt_operations a
@@ -945,9 +1011,26 @@ fn validate_episode_budget_reservation(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .map_err(|_| WalIdempotencyError::Unavailable)?;
-    if committed_count < 0 || committed_bytes < 0 || pending_count < 0 || pending_bytes < 0 {
+    let (released_count, released_bytes) =
+        super::selected_screenshot_termination::authenticated_episode_release_totals(
+            connection,
+            plan.episode_id,
+        )?;
+    if committed_count < 0
+        || committed_bytes < 0
+        || reserved_count < 0
+        || reserved_bytes < 0
+        || released_count < 0
+        || released_bytes < 0
+    {
         return Err(WalIdempotencyError::Corrupt);
     }
+    let pending_count = reserved_count
+        .checked_sub(released_count)
+        .ok_or(WalIdempotencyError::Corrupt)?;
+    let pending_bytes = reserved_bytes
+        .checked_sub(released_bytes)
+        .ok_or(WalIdempotencyError::Corrupt)?;
     let projected_count = committed_count
         .checked_add(pending_count)
         .and_then(|count| count.checked_add(1))
