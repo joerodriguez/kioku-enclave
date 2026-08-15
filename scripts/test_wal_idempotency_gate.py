@@ -929,6 +929,10 @@ impl X {
         finalization_queue_domain = (
             ROOT / "src/cp/query/wal/finalization_queue.rs"
         ).read_text(encoding="utf-8")
+        finalizer = (ROOT / "src/cp/finalizer.rs").read_text(encoding="utf-8")
+        finalization_commit_domain = (
+            ROOT / "src/cp/finalizer/wal.rs"
+        ).read_text(encoding="utf-8")
         media_worker = (ROOT / "src/cp/media_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -1021,6 +1025,24 @@ impl X {
         self.assertIn("WalIdempotencyError::Precondition", finalization_queue_domain)
         self.assertNotIn("FinalizationQueuePlan::", query)
         self.assertNotIn("cp::query::wal::", main)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::finalizer::FinalizationCommitLedger",
+            gate,
+        )
+        self.assertIn("struct FinalizationCommitPlan", finalization_commit_domain)
+        self.assertIn("struct FinalizationCommitLedger", finalization_commit_domain)
+        self.assertIn(
+            "archive_v3_wal_finalization_commit_operations",
+            finalization_commit_domain,
+        )
+        self.assertIn("DomainLedgerBounds::new", finalization_commit_domain)
+        self.assertIn("WalIdempotencyError::Precondition", finalization_commit_domain)
+        self.assertNotIn("FinalizationCommitPlan::", finalizer)
+        self.assertNotIn("cp::finalizer::wal::", main)
         self.assertIn("pub(crate) mod wal;", media_worker)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan",
@@ -1149,6 +1171,7 @@ impl X {
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, finalization_queue_domain)
+            self.assertNotIn(forbidden, finalization_commit_domain)
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, email_domain)
             self.assertNotIn(forbidden, push_domain)
@@ -1188,6 +1211,23 @@ impl X {
             "reqwest::",
         ):
             self.assertNotIn(forbidden, finalization_queue_domain)
+        for forbidden in (
+            "strftime(",
+            "SystemTime",
+            "random_token_hex",
+            "new_uuid(",
+            "generate_custom(",
+            "begin_invocation(",
+            "list_webhook_subscriptions(",
+            "get_email_preference(",
+            "list_push_installations(",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, finalization_commit_domain)
         for forbidden in (
             "delete_retained_media(",
             "delete_object",

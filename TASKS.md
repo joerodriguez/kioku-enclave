@@ -243,6 +243,21 @@ separate activation blockers.
     tamper, and reopen fail closed or exactly replay. Request/clock allocation,
     finalizer scheduling/invocation, Store/route/launcher/task/acknowledgement
     wiring, and retry-state mutation remain absent.
+  - [x] Add the inactive exact finalization-commit A-domain: the already durable
+    Vertex event ID derives the opaque operation before actor admission, while
+    the exact terminal provider-result facts are authenticated and their
+    commitment, a caller-supplied canonical commit time, complete episode finalization tuple,
+    exact utterance/screenshot membership, prior brief/screen-product commitment,
+    normalized new brief and canonical screen product, and every preallocated
+    initial webhook/email/push row form the request fingerprint. One transaction
+    reauthenticates those facts, atomically replaces the complete product,
+    inserts only the already-fixed initial outboxes, preserves original time on
+    regeneration, full-tuple completes the episode, exact-reads the result, and
+    retains unit replay in a distinct 1,048,576-row/32-MiB ledger. Changed
+    membership/product/duplicate/outbox facts, attempt reuse, capacity, late
+    ledger failure, partial schema, tamper, and reopen fail closed or exactly
+    replay. Vertex/destination/delivery/handoff/clock allocation, model/provider
+    calls, Store, worker/launcher/task/retry/acknowledgement wiring remain absent.
   - [x] Add the inactive raw-media retention-settlement A-domain: the stable
     account/event identity derives one opaque operation before actor admission,
     while the exact account-bound object key, bucket-local generation/backend,
