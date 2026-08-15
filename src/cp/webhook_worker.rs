@@ -5,6 +5,8 @@
 //! pins a public IP for every attempt, does not follow redirects, and never
 //! logs an endpoint, payload, signature, or response body.
 
+pub(crate) mod wal;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
