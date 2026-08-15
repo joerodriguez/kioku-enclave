@@ -940,6 +940,12 @@ impl X {
         )
         push = (ROOT / "src/cp/push.rs").read_text(encoding="utf-8")
         push_domain = (ROOT / "src/cp/push/wal.rs").read_text(encoding="utf-8")
+        webhook_worker = (ROOT / "src/cp/webhook_worker.rs").read_text(
+            encoding="utf-8"
+        )
+        webhook_domain = (ROOT / "src/cp/webhook_worker/wal.rs").read_text(
+            encoding="utf-8"
+        )
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("pub(crate) mod wal;", media)
         self.assertIn(
@@ -1032,6 +1038,22 @@ impl X {
         self.assertIn("WalIdempotencyError::Precondition", push_domain)
         self.assertNotIn("PushAcceptedPlan::", push)
         self.assertNotIn("cp::push::wal::", main)
+        self.assertIn("pub(crate) mod wal;", webhook_worker)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSentPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSentLedger",
+            gate,
+        )
+        self.assertIn("struct WebhookSentPlan", webhook_domain)
+        self.assertIn("struct WebhookSentLedger", webhook_domain)
+        self.assertIn("archive_v3_wal_webhook_sent_operations", webhook_domain)
+        self.assertIn("DomainLedgerBounds::new", webhook_domain)
+        self.assertIn("WalIdempotencyError::Precondition", webhook_domain)
+        self.assertNotIn("WebhookSentPlan::", webhook_worker)
+        self.assertNotIn("cp::webhook_worker::wal::", main)
         for forbidden in (
             "crate::store::Store",
             "Store::new",
@@ -1048,6 +1070,7 @@ impl X {
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, email_domain)
             self.assertNotIn(forbidden, push_domain)
+            self.assertNotIn(forbidden, webhook_domain)
         for forbidden in (
             "begin_invocation(",
             "random_token_hex",
@@ -1099,6 +1122,19 @@ impl X {
             "std::time::",
         ):
             self.assertNotIn(forbidden, push_domain)
+        for forbidden in (
+            "send_signed(",
+            "set_delivery_state(",
+            "next_delivery(",
+            "get_webhook_subscription(",
+            "disable_webhook_subscription(",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, webhook_domain)
 
     def test_wal_owner_and_private_publisher_are_unwired(self) -> None:
         owner = (ROOT / "src/archive_v3_wal_owner.rs").read_text(encoding="utf-8")

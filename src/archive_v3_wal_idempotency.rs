@@ -439,6 +439,8 @@ impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan {}
 impl sealed::DomainLedger for crate::cp::email_worker::wal::EmailAcceptedLedger {}
 impl sealed::DomainPlan for crate::cp::push::wal::PushAcceptedPlan {}
 impl sealed::DomainLedger for crate::cp::push::wal::PushAcceptedLedger {}
+impl sealed::DomainPlan for crate::cp::webhook_worker::wal::WebhookSentPlan {}
+impl sealed::DomainLedger for crate::cp::webhook_worker::wal::WebhookSentLedger {}
 
 /// Opaque plan produced before actor entry. Only the private WAL owner
 /// may consume it; callers cannot obtain its ID, fingerprint, SQL, or result.

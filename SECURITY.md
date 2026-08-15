@@ -848,10 +848,10 @@ nonzero caller-stable operation IDs, version/domain-separated request fingerprin
 canonical replay results. Its sealed plans require each supported domain to own canonicalization,
 mutation SQL, a distinct hard-bounded row family, an exact indexed lookup, and replay validation;
 there is no universal receipt table, table selector, or lifetime scan. The sealed contract retains a
-test-only 64-row/262,720-byte exemplar and now admits exactly seven inactive production A-domains:
+test-only 64-row/262,720-byte exemplar and now admits exactly eight inactive production A-domains:
 capture-session finish, metadata-only screen-reference batch, selected-screenshot receipt,
-raw-media retention settlement, provider-accepted email, provider-accepted APNs, and Vertex usage
-terminal outcome.
+raw-media retention settlement, provider-accepted email, provider-accepted APNs, definitive-success
+webhook settlement, and Vertex usage terminal outcome.
 Capture-session finish derives an opaque
 operation ID from the validated caller-stable
 session ID before actor admission, owns a versioned binary request and exact finish receipt, and
@@ -905,8 +905,15 @@ exact episode/installation/version/handoff/collapse binding, pending/retry attem
 timestamps, definitive 200 status, and fixed acceptance time form the fingerprint. It full-row-CASes
 only that predecessor to accepted or adopts only the identical terminal row, including the terminal
 `next_attempt_at`, with unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot send, retry,
-mutate an installation, call Store, launch work, or acknowledge delivery. All other production domain ledgers
-remain absent and unsupported. A future owner must commit a domain row and its mutation
+mutate an installation, call Store, launch work, or acknowledge delivery. The webhook child accepts
+only the local settlement half of a
+definitive HTTP 2xx for an already durable outbox event. The exact `evt_` identity is fixed before
+I/O, sent as `webhook-id`, and derives the operation identity; the exact episode/subscription/version
+binding, pending/retry attempt, nullable due time, prior response/error, timestamps, accepted status,
+and fixed sent time form the fingerprint. It full-row-CASes only that predecessor to `sent` or adopts
+only the identical terminal row, with unit replay in a distinct 1,048,576-row/32-MiB ledger. It cannot
+sign or send, load or disable a subscription, retry, call Store, launch work, or acknowledge delivery.
+All other production domain ledgers remain absent and unsupported. A future owner must commit a domain row and its mutation
 under the same `BEGIN IMMEDIATE`; fingerprint reuse, unknown versions/domains, malformed or
 substituted results, and unsupported response shapes fail closed. It must derive ID and fingerprint
 before actor admission, reconcile pending publication, commit the logical mutation and same-ID
@@ -921,8 +928,8 @@ capture events and session finish, selected screenshots, finalization queue/comm
 media-work results, Vertex usage outcomes, existing-key webhook/email/push transitions, retention,
 and reviewer/backfill writes. Only capture-session finish, metadata-only screen-reference batch,
 selected-screenshot receipt, raw-media retention settlement, provider-accepted email,
-provider-accepted APNs, and Vertex terminal outcome have production codecs so far; every other A
-operation remains disabled
+provider-accepted APNs, definitive-success webhook settlement, and Vertex terminal outcome have
+production codecs so far; every other A operation remains disabled
 pending its own separately reviewed codec and the closed launcher. Vertex invocation begin and
 canonical media's first DEK/provider handoff remain B and are not admitted by those children.
 Domain B remains disabled pending explicit caller/attempt identity or
