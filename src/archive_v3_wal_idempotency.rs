@@ -11,9 +11,10 @@
 //! fingerprint, indexed resolver, and exact replay-result policy. A bounded
 //! test exemplar plus separately reviewed capture-session-finish,
 //! metadata-only screen-reference-batch, selected-screenshot receipt,
-//! raw-media retention settlement, provider-accepted delivery, Vertex usage,
-//! reviewer-fixture, substance-backfill, and visual-evidence-backfill children
-//! implement that contract; every other production domain remains unsealed.
+//! caller-stable finalization queue, raw-media retention settlement,
+//! provider-accepted delivery, Vertex usage, reviewer-fixture,
+//! substance-backfill, and visual-evidence-backfill children implement that
+//! contract; every other production domain remains unsealed.
 //! This module performs only local SQLite transactions and derives opaque
 //! identifiers. It has no Store connection, launcher, publisher construction,
 //! capture, root, witness, provider, route, worker, or startup path.
@@ -432,6 +433,8 @@ impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageOutcomePlan 
 impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexUsageOutcomeLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotPlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotLedger {}
+impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan {}
+impl sealed::DomainLedger for crate::cp::query::wal::FinalizationQueueLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::RetentionSettlementLedger {}
 impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan {}

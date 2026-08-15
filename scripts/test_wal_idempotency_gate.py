@@ -926,6 +926,9 @@ impl X {
         selected_domain = (ROOT / "src/cp/query/wal.rs").read_text(
             encoding="utf-8"
         )
+        finalization_queue_domain = (
+            ROOT / "src/cp/query/wal/finalization_queue.rs"
+        ).read_text(encoding="utf-8")
         media_worker = (ROOT / "src/cp/media_worker.rs").read_text(
             encoding="utf-8"
         )
@@ -1000,6 +1003,23 @@ impl X {
         self.assertIn("archive_v3_wal_selected_screenshot_operations", selected_domain)
         self.assertIn("DomainLedgerBounds::new", selected_domain)
         self.assertIn("WalIdempotencyError::Precondition", selected_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::FinalizationQueueLedger",
+            gate,
+        )
+        self.assertIn("struct FinalizationQueuePlan", finalization_queue_domain)
+        self.assertIn("struct FinalizationQueueLedger", finalization_queue_domain)
+        self.assertIn(
+            "archive_v3_wal_finalization_queue_operations",
+            finalization_queue_domain,
+        )
+        self.assertIn("DomainLedgerBounds::new", finalization_queue_domain)
+        self.assertIn("WalIdempotencyError::Precondition", finalization_queue_domain)
+        self.assertNotIn("FinalizationQueuePlan::", query)
         self.assertNotIn("cp::query::wal::", main)
         self.assertIn("pub(crate) mod wal;", media_worker)
         self.assertIn(
@@ -1128,6 +1148,7 @@ impl X {
             self.assertNotIn(forbidden, domain)
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
+            self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, email_domain)
             self.assertNotIn(forbidden, push_domain)
@@ -1153,6 +1174,20 @@ impl X {
             "tokio::spawn",
         ):
             self.assertNotIn(forbidden, selected_domain)
+        for forbidden in (
+            "strftime(",
+            "SystemTime",
+            "random_token_hex",
+            "new_uuid(",
+            "finalize_user_episode(",
+            "reserve_finalizer_output(",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, finalization_queue_domain)
         for forbidden in (
             "delete_retained_media(",
             "delete_object",
