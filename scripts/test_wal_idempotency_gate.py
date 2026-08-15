@@ -938,6 +938,12 @@ impl X {
         selected_domain = (ROOT / "src/cp/query/wal.rs").read_text(
             encoding="utf-8"
         )
+        selected_attempt_domain = (
+            ROOT / "src/cp/query/wal/selected_screenshot_attempt.rs"
+        ).read_text(encoding="utf-8")
+        selected_attempt_production = without_cfg_test_items(
+            selected_attempt_domain
+        )
         finalization_queue_domain = (
             ROOT / "src/cp/query/wal/finalization_queue.rs"
         ).read_text(encoding="utf-8")
@@ -1046,6 +1052,42 @@ impl X {
         self.assertIn("archive_v3_wal_selected_screenshot_operations", selected_domain)
         self.assertIn("DomainLedgerBounds::new", selected_domain)
         self.assertIn("WalIdempotencyError::Precondition", selected_domain)
+        self.assertIn("mod selected_screenshot_attempt;", selected_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotAttemptPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotAttemptLedger",
+            gate,
+        )
+        self.assertIn("struct SelectedScreenshotAttemptPlan", selected_attempt_domain)
+        self.assertIn("struct SelectedScreenshotAttemptLedger", selected_attempt_domain)
+        self.assertIn(
+            "archive_v3_wal_selected_screenshot_attempt_operations",
+            selected_attempt_domain,
+        )
+        self.assertIn(
+            "authenticate_selected_screenshot_upload_predecessor",
+            selected_attempt_domain,
+        )
+        self.assertIn("source_key TEXT NOT NULL UNIQUE", selected_attempt_domain)
+        self.assertIn(
+            "screenshot_id INTEGER NOT NULL CHECK(screenshot_id>0)",
+            selected_attempt_domain,
+        )
+        self.assertIn("MAX_EPISODE_IMAGES", selected_attempt_domain)
+        self.assertIn("MAX_EPISODE_IMAGE_BYTES", selected_attempt_domain)
+        self.assertIn("AND NOT EXISTS (", selected_attempt_domain)
+        self.assertIn(
+            "selected-screenshot-upload-attempt-v1", selected_attempt_domain
+        )
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", selected_attempt_domain)
+        self.assertIn("DomainLedgerBounds::new", selected_attempt_domain)
+        self.assertIn(
+            "WalIdempotencyError::Precondition", selected_attempt_domain
+        )
+        self.assertNotIn("SelectedScreenshotAttemptPlan::", query)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan",
             gate,
@@ -1265,6 +1307,7 @@ impl X {
             self.assertNotIn(forbidden, capture_event_domain)
             self.assertNotIn(forbidden, vertex_domain)
             self.assertNotIn(forbidden, selected_domain)
+            self.assertNotIn(forbidden, selected_attempt_domain)
             self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, finalization_commit_domain)
             self.assertNotIn(forbidden, attempt_domain)
@@ -1309,6 +1352,24 @@ impl X {
             "tokio::spawn",
         ):
             self.assertNotIn(forbidden, selected_domain)
+        for forbidden in (
+            "generate_and_wrap_dek",
+            "load_dek(",
+            "install_media_dek_candidate(",
+            "encrypt_bound_blob",
+            "put_user_media",
+            "get_media(",
+            "delete_media(",
+            "random_token_hex",
+            "thread_rng",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+            "record_screenshot_image_in_transaction(",
+        ):
+            self.assertNotIn(forbidden, selected_attempt_production)
         for forbidden in (
             "strftime(",
             "SystemTime",

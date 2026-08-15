@@ -270,6 +270,25 @@ separate activation blockers.
     schema, result tamper, and reopen all fail closed or exactly replay. The
     media-DEK allocator, encryption/upload attempt, Store/route/launcher/provider/
     task/ack path, and cleanup remain absent.
+  - [x] Add the inactive selected-screenshot upload-attempt B identity: one
+    caller-fixed 128-bit opaque attempt ID derives a subtype-separated operation
+    identity and exact account-bound object key before provider I/O. A
+    domain-separated predecessor commits the complete eligible screenshot
+    membership/classification, episode image budget, requested time, and JPEG
+    geometry/hash; one immediate transaction reserves pending count/bytes against
+    the 24-image/4,000-KiB episode limits and settles the full request, exact
+    numeric screenshot identity, permanent binding, typed receipt, and a distinct
+    1,048,576-row/128-MiB replay ledger. Exact local consumption transfers the
+    accounting from pending to committed without double-counting; an absent or
+    inexact result remains reserved fail-closed. Same-attempt
+    changes conflict, an alternate attempt cannot reserve the same target, a
+    different eligible target receives a different identity, and
+    stale/consumed targets, budget overbooking, rebound screenshot identities,
+    ledger capacity exhaustion, late readback failure, partial schema, tamper,
+    and reopen fail closed or exactly replay. Random/clock/DEK
+    allocation, media bytes, encryption/provider I/O, Store/route/launcher/task/
+    retry/cleanup/acknowledgement wiring, consumption by the A receipt, and
+    authenticated C rejection/termination release remain separate reviewed slices.
   - [x] Add the inactive caller-stable finalization-queue A-domain: an exact
     128-bit request ID plus stable account derive the opaque operation before
     actor admission, while the episode, fixed target version, caller-supplied

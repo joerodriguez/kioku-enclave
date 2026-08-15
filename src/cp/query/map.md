@@ -5,4 +5,4 @@ or obtain Store, provider, task, acknowledgement, or launcher authority.
 
 | File | Role |
 |---|---|
-| [`wal.rs`](wal/map.md) | Closed selected-screenshot receipt codec and private finalization-queue child, each with a distinct bounded permanent exact-replay ledger. A future B boundary must durably choose the opaque screenshot upload attempt before provider I/O. The queue child accepts only a caller-stable request and exact predecessor; neither is route/launcher wired. |
+| [`wal.rs`](wal/map.md) | Closed selected-screenshot receipt codec plus private selected-screenshot-attempt and finalization-queue children, each with a distinct bounded permanent exact-replay ledger. The B attempt child consumes a caller-fixed opaque identity, reauthenticates the exact eligible screenshot ID, derives the account-bound object key, and atomically reserves pending episode count/bytes before any future provider I/O; the A receipt does not consume that binding and C rejection cannot release it yet. The queue child accepts only a caller-stable request and exact predecessor. None is route/launcher wired. |
