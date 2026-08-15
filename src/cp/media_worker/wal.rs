@@ -9,11 +9,15 @@
 //! provider object before constructing this plan. The plan can only mark the
 //! matching local media row pruned and retain a permanent exact replay receipt.
 //! It cannot read, list, delete, or otherwise reach a provider, call Store,
-//! launch work, or acknowledge retention completion. The private result child
-//! covers only screen storyboards without person evidence; audio and every
-//! person/identity/voice mutation remain unsupported.
+//! launch work, or acknowledge retention completion. A private B child fixes
+//! stable screen Vertex attempt identity and billing intent before provider I/O;
+//! the private result child covers only screen storyboards without person
+//! evidence and does not yet consume that binding. Audio and every person/
+//! identity/voice mutation remain unsupported.
 
+pub(super) mod attempt;
 pub(super) mod result;
+pub(crate) use attempt::{ScreenStoryboardAttemptLedger, ScreenStoryboardAttemptPlan};
 pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};

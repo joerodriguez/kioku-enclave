@@ -124,7 +124,10 @@ impl WalOperationKind {
     const fn permits_canonical_response(self) -> bool {
         matches!(
             self,
-            Self::MediaCaptureEvent | Self::CaptureSessionFinish | Self::SelectedScreenshot
+            Self::MediaCaptureEvent
+                | Self::CaptureSessionFinish
+                | Self::SelectedScreenshot
+                | Self::VertexUsage
         )
     }
 
@@ -442,6 +445,8 @@ impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan {}
 impl sealed::DomainLedger for crate::cp::finalizer::FinalizationCommitLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardResultPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardResultLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardAttemptPlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardAttemptLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::RetentionSettlementLedger {}
 impl sealed::DomainPlan for crate::cp::email_worker::wal::EmailAcceptedPlan {}
@@ -932,6 +937,9 @@ mod tests {
         assert!(
             WalReplayResult::canonical_response(WalOperationKind::FinalizationCommit, vec![1])
                 .is_err()
+        );
+        assert!(
+            WalReplayResult::canonical_response(WalOperationKind::VertexUsage, vec![1]).is_ok()
         );
         assert!(WalReplayResult::canonical_response(
             WalOperationKind::MediaCaptureEvent,

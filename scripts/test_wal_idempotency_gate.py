@@ -942,6 +942,10 @@ impl X {
         retention_domain = (ROOT / "src/cp/media_worker/wal.rs").read_text(
             encoding="utf-8"
         )
+        attempt_domain = (
+            ROOT / "src/cp/media_worker/wal/attempt.rs"
+        ).read_text(encoding="utf-8")
+        attempt_production = attempt_domain.split("#[cfg(test)]", 1)[0]
         result_domain = (ROOT / "src/cp/media_worker/wal/result.rs").read_text(
             encoding="utf-8"
         )
@@ -1079,6 +1083,28 @@ impl X {
             gate,
         )
         self.assertIn("pub(super) mod result;", retention_domain)
+        self.assertIn("pub(super) mod attempt;", retention_domain)
+        self.assertIn(
+            "impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardAttemptPlan",
+            gate,
+        )
+        self.assertIn(
+            "impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardAttemptLedger",
+            gate,
+        )
+        self.assertIn("struct ScreenStoryboardAttemptPlan", attempt_domain)
+        self.assertIn("struct ScreenStoryboardAttemptLedger", attempt_domain)
+        self.assertIn(
+            "archive_v3_wal_screen_vertex_attempt_operations", attempt_domain
+        )
+        self.assertIn("predecessor_commitment BLOB NOT NULL", attempt_domain)
+        self.assertIn("current_screen_work_attempt_commitments", attempt_domain)
+        self.assertIn("MIN_PROVIDER_ATTEMPT_WINDOW_MILLIS", result_domain)
+        self.assertIn("screen-storyboard-vertex-attempt-v1", attempt_domain)
+        self.assertIn("MAX_ROWS: u32 = 1_048_576", attempt_domain)
+        self.assertIn("DomainLedgerBounds::new", attempt_domain)
+        self.assertIn("WalIdempotencyError::Precondition", attempt_domain)
+        self.assertNotIn("ScreenStoryboardAttemptPlan::", media_worker)
         self.assertIn("struct ScreenStoryboardResultPlan", result_domain)
         self.assertIn("struct ScreenStoryboardResultLedger", result_domain)
         self.assertIn(
@@ -1218,6 +1244,7 @@ impl X {
             self.assertNotIn(forbidden, selected_domain)
             self.assertNotIn(forbidden, finalization_queue_domain)
             self.assertNotIn(forbidden, finalization_commit_domain)
+            self.assertNotIn(forbidden, attempt_domain)
             self.assertNotIn(forbidden, result_domain)
             self.assertNotIn(forbidden, retention_domain)
             self.assertNotIn(forbidden, email_domain)
@@ -1290,6 +1317,21 @@ impl X {
             "reqwest::",
         ):
             self.assertNotIn(forbidden, finalization_commit_domain)
+        for forbidden in (
+            "SystemTime",
+            "random_token_hex",
+            "thread_rng",
+            "begin_invocation(",
+            "generate_custom(",
+            "get_media(",
+            "decrypt_bound_blob",
+            "with_user(",
+            "save_user(",
+            "tokio::spawn",
+            "std::time::",
+            "reqwest::",
+        ):
+            self.assertNotIn(forbidden, attempt_production)
         for forbidden in (
             "delete_retained_media(",
             "delete_object",

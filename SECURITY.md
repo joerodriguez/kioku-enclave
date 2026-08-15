@@ -862,8 +862,10 @@ reserves the maximum result before its first domain write, uses the operation pr
 replay, and full-tuple updates its authenticated row/byte counters. An absent session is a failed
 precondition that rolls back the new schema and consumes no identity; a late ledger failure rolls
 back the session update; a committed replay survives process reopen without another write. The
-Vertex usage child accepts only the exact 68-byte vtx event ID that the still-disabled B-domain
-allocator must durably create before provider I/O. Its closed request codec distinguishes normalized
+Vertex usage terminal child accepts only the exact 68-byte vtx event ID that a separately reviewed
+B-domain allocator must durably create before provider I/O. The first such allocator now exists only
+for inactive screen-storyboard attempts; generic, audio, and finalization begin remain disabled. Its
+closed request codec distinguishes normalized
 metered/usage-missing response facts, ambiguous status, and not-billed status; the event-derived
 operation ID makes a substituted terminal outcome a fingerprint conflict. It transitions only an
 existing started row or exactly adopts the same pre-existing terminal facts, refreshes coverage only
@@ -928,10 +930,25 @@ attempt and every predecessor, inserts complete screenshots and screen observati
 settles each job and media row plus the work unit, exact-reads the final rows, and retains unit replay
 in a distinct 1,048,576-row/32-MiB ledger. A substituted attempt, changed input topology, target
 collision, time regression, capacity exhaustion, late ledger failure, partial schema, tamper, or
-restart fails closed or exactly replays. The future B boundary must durably bind the attempt to this
-work before constructing the plan. This subtype accepts no person evidence and cannot create audio,
+restart fails closed or exactly replays. The sibling B boundary now durably records that attempt/work
+binding, but this result-v1 request does not yet consume it. This subtype accepts no person evidence and cannot create audio,
 person, identity, or voice rows; provider/media reads, automatic IDs, clocks, Store, launching,
-retry, and acknowledgement remain absent. The
+retry, and acknowledgement remain absent. The screen-attempt child is the first inactive B-domain
+identity refactor. Before provider I/O it accepts only a caller-fixed canonical attempt time, at
+least the fixed two-minute provider lease window, and both an exact predecessor commitment and a
+post-usage-stable attempt commitment for the complete reserved screen work/member/job/capture/media
+topology. The account, work, stable attempt identity, billing-safe model, fixed location, and time
+derive a deterministic 68-byte Vertex event ID plus a distinct complete binding commitment. One
+transaction rejects unledgered event adoption, inserts the exact `started` billing row, recomputes
+and full-tuple advances the event month coverage while preserving loss count, and retains every
+binding fact plus a typed response in its own 1,048,576-row/128-MiB ledger. Same-attempt request
+substitution conflicts; a renewed attempt changes the lease/counter commitment and event identity.
+Missing, expired, terminal, or changed work, capacity exhaustion, late ledger failure, partial
+schema, binding/domain tamper, and reopen all roll back, fail closed, or exactly replay. The attempt
+hash excludes only the usage fields and work update time that the existing post-provider usage
+settlement is expected to replace; lease, counters, membership, captures, and media provenance
+remain covered. The child does not read media, invoke a model, allocate a clock or random ID, call
+Store, launch/retry work, or acknowledge completion. The
 retention child likewise accepts only the local receipt half of an already settled exact provider
 deletion. Its account/event pair derives the stable operation identity, while the exact account-bound
 object key, bucket-local generation/provenance, plaintext hash, retention deadline, eligible predecessor
@@ -1011,10 +1028,12 @@ exact finalization commit, and Vertex terminal outcome have
 production codecs so far, together with the exact synthetic reviewer fixture and cursor-bound
 substance and visual-evidence backfills; every other A operation remains disabled
 pending its own separately reviewed codec and the closed launcher. In particular, screen person
-evidence and every audio/person/identity/voice media-work result remain unsupported. Vertex invocation begin and
-canonical media's first DEK/provider upload handoff remain B and are not admitted by those children.
-Domain B remains disabled pending explicit caller/attempt identity or
-semantic refactoring: leases and failure/retry counters or times, Vertex begin, media-DEK first
+evidence and every audio/person/identity/voice media-work result remain unsupported. The inactive
+screen-storyboard Vertex-begin identity is the first separately sealed B operation, but its result
+integration, provider call, and launcher remain absent. Generic/audio/finalization Vertex begin and
+canonical media's first DEK/provider upload handoff remain unsupported.
+The rest of domain B remains disabled pending explicit caller/attempt identity or
+semantic refactoring: leases and failure/retry counters or times, other Vertex begin, media-DEK first
 write, summarizer auto-ID creation, and cross-control webhook deletion. Domain C remains disabled:
 purge, source-keyless legacy ingest, retired episode mutations, arbitrary Store SQL, and account
 deletion. A structural source inventory pins every production Store mutation/save call (including
