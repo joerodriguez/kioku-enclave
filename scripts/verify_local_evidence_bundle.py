@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
@@ -110,6 +111,11 @@ def main() -> None:
     parser.add_argument("--expected-gcs-media-bucket", default="kioku-joerodriguez-enclave-media")
     parser.add_argument("--expected-gcs-legacy-media-bucket", default="kioku-joerodriguez-enclave-indexes")
     parser.add_argument("--config", type=Path)
+    parser.add_argument(
+        "--source-archive",
+        type=Path,
+        help="optional immutable Git archive whose bytes must match the signed source_archive_sha256 claim",
+    )
     parser.add_argument("--archive-witness-probe-config", type=Path, default=ROOT / "config/archive-witness-probe.json")
     parser.add_argument("--archive-v3-shadow-runtime-config", type=Path, default=ROOT / "config/archive-v3-shadow-runtime.json")
     arguments = parser.parse_args()
@@ -146,6 +152,21 @@ def main() -> None:
             fail(f"signed evidence {field} differs from checked source")
     if arguments.config is not None and sha256_bytes(local_build_evidence.read_regular_bytes(arguments.config, "configuration")) != evidence["config_sha256"]:
         fail("signed evidence config hash differs from the selected local configuration")
+    if "source_archive_sha256" in evidence:
+        if arguments.source_archive is not None:
+            archive_bytes = local_build_evidence.read_regular_bytes(arguments.source_archive, "source archive")
+        else:
+            archived = subprocess.run(
+                ["git", "archive", "--format=tar", evidence["source_commit"]],
+                cwd=ROOT,
+                capture_output=True,
+                check=False,
+            )
+            if archived.returncode:
+                fail("cannot materialize the signed source archive for verification")
+            archive_bytes = archived.stdout
+        if sha256_bytes(archive_bytes) != evidence["source_archive_sha256"]:
+            fail("signed evidence source archive hash differs from the selected immutable archive")
 
     try:
         metadata = json.loads(metadata_bytes)

@@ -29,6 +29,9 @@ class LocalEvidenceTests(unittest.TestCase):
         self,
         directory: Path,
         *,
+        source_archive_sha256: str | None = None,
+        expected_sbom_sha256: str | None = None,
+        expected_scan_sha256: str | None = None,
         buckets: tuple[str, str, str] = (
             "kioku-production-indexes",
             "kioku-production-media",
@@ -73,19 +76,25 @@ class LocalEvidenceTests(unittest.TestCase):
             "archive_v3_witness_database_id": "", "archive_v3_archive_binding_commitment": "",
         }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
         evidence = directory / "enclave-local-build-evidence.json"
+        create_command = [
+            "python3", str(EVIDENCE), "create", "--output", str(evidence),
+            "--repository", "https://github.com/owner/repository", "--tag", "v1.2.3",
+            "--commit", COMMIT, "--image-uri", image_repository + ":release",
+            "--image-digest-uri", image_repository + "@" + DIGEST, "--image-digest", DIGEST,
+            "--config", str(config), "--dockerfile", str(ROOT / "Dockerfile"),
+            "--cargo-lock", str(ROOT / "Cargo.lock"), "--release-metadata", str(metadata),
+            "--sbom", str(sbom), "--scan", str(scan),
+            "--expected-sbom-sha256", expected_sbom_sha256 or hashlib.sha256(sbom.read_bytes()).hexdigest(),
+            "--expected-scan-sha256", expected_scan_sha256 or hashlib.sha256(scan.read_bytes()).hexdigest(),
+            "--tool-version", "docker=27.0", "--tool-version", "syft=1.0",
+            "--created-at", "2026-08-13T12:00:00Z", "--completed-at", "2026-08-13T12:01:00Z",
+        ]
+        if source_archive_sha256 is not None:
+            create_command.extend(["--source-archive-sha256", source_archive_sha256])
         subprocess.run(
-            [
-                "python3", str(EVIDENCE), "create", "--output", str(evidence),
-                "--repository", "https://github.com/owner/repository", "--tag", "v1.2.3",
-                "--commit", COMMIT, "--image-uri", image_repository + ":release",
-                "--image-digest-uri", image_repository + "@" + DIGEST, "--image-digest", DIGEST,
-                "--config", str(config), "--dockerfile", str(ROOT / "Dockerfile"),
-                "--cargo-lock", str(ROOT / "Cargo.lock"), "--release-metadata", str(metadata),
-                "--sbom", str(sbom), "--scan", str(scan),
-                "--tool-version", "docker=27.0", "--tool-version", "syft=1.0",
-                "--created-at", "2026-08-13T12:00:00Z", "--completed-at", "2026-08-13T12:01:00Z",
-            ], check=True, cwd=ROOT,
+            create_command, check=True, cwd=ROOT,
         )
+        self.assertEqual(stat.S_IMODE(evidence.stat().st_mode), 0o600)
         signature = directory / "enclave-local-build-evidence.sig"
         subprocess.run(
             ["python3", str(EVIDENCE), "sign", "--manifest", str(evidence), "--signature", str(signature), "--private-key", str(private)],
@@ -131,6 +140,14 @@ class LocalEvidenceTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("exact mode 0600", completed.stderr)
 
+    def test_create_requires_scan_receipt_asset_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.create_bundle(
+                    Path(temporary),
+                    expected_sbom_sha256="0" * 64,
+                )
+
     def test_bundle_verifier_binds_metadata_sbom_scan_source_and_digest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -148,6 +165,15 @@ class LocalEvidenceTests(unittest.TestCase):
             completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(json.loads(completed.stdout)["metadata"]["image_digest"], DIGEST)
+            original_sbom = (directory / "enclave-sbom.spdx.json").read_bytes()
+            (directory / "enclave-sbom.spdx.json").write_text(
+                '{"spdxVersion":"SPDX-2.3","packages":[]}\n',
+                encoding="utf-8",
+            )
+            replaced_sbom = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertNotEqual(replaced_sbom.returncode, 0)
+            self.assertIn("exact enclave-sbom.spdx.json bytes", replaced_sbom.stderr)
+            (directory / "enclave-sbom.spdx.json").write_bytes(original_sbom)
             deployment_directory = directory / "deployment-contract"
             deployment_directory.mkdir()
             _, _, deployment_public, deployment_fingerprint = self.create_bundle(
@@ -176,6 +202,36 @@ class LocalEvidenceTests(unittest.TestCase):
             self.assertNotEqual(tampered.returncode, 0)
             self.assertIn("exact enclave-release.json bytes", tampered.stderr)
 
+    def test_source_archive_hash_is_signed_and_bundle_verifier_rechecks_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            archive = directory / "source.tar"
+            archive.write_bytes(b"immutable source archive\n")
+            archive_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+            self.create_bundle(directory, source_archive_sha256=archive_hash)
+            command = [
+                "python3", str(BUNDLE_VERIFIER), "--evidence-dir", str(directory),
+                "--public-key", str(directory / "public.pem"),
+                "--expected-public-key-sha256", "",
+                "--repository", "owner/repository", "--tag", "v1.2.3", "--commit", COMMIT,
+                "--image-repository", "us-central1-docker.pkg.dev/kioku-joerodriguez/kioku/kioku-enclave",
+                "--expected-gcs-bucket", "kioku-production-indexes",
+                "--expected-gcs-media-bucket", "kioku-production-media",
+                "--expected-gcs-legacy-media-bucket", "kioku-production-indexes",
+                "--config", str(directory / "local.env"), "--source-archive", str(archive),
+            ]
+            fingerprint = subprocess.run(
+                ["python3", str(EVIDENCE), "fingerprint", "--public-key", str(directory / "public.pem")],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            command[command.index("--expected-public-key-sha256") + 1] = fingerprint
+            accepted = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            archive.write_bytes(b"tampered source archive\n")
+            rejected = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("source archive hash", rejected.stderr)
+
     def test_fake_github_apply_publishes_only_after_evidence_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -191,6 +247,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "if [[ \"$1 $2\" == 'rev-parse HEAD' || \"$1 $2\" == 'rev-parse origin/main' ]]; then echo '" + COMMIT + "'; exit 0; fi\n"
                 "if [[ \"$1 $2 $3\" == 'rev-parse -q --verify' ]]; then exit 0; fi\n"
                 "if [[ \"$1 $2 $3\" == 'rev-list -n 1' ]]; then echo '" + COMMIT + "'; exit 0; fi\n"
+                "if [[ \"$1 $2\" == 'archive --format=tar' ]]; then : > \"${3#--output=}\"; exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'verify-tag --raw' ]]; then echo '[GNUPG:] VALIDSIG " + ("d" * 40) + "'; exit 0; fi\n"
                 "if [[ \"$1 $2\" == 'push origin' ]]; then exit 0; fi\n"
                 "echo \"unexpected fake git: $*\" >&2; exit 97\n",
@@ -203,8 +260,13 @@ class LocalEvidenceTests(unittest.TestCase):
                 "if [[ \"$1\" == api ]]; then echo true; exit 0; fi\n"
                 "if [[ \"$1 $2 $3\" == 'release view v1.2.3' ]]; then\n"
                 "  if [[ -f \"$FAKE_GH_STATE\" ]]; then echo '{\"isDraft\":false,\"isImmutable\":true,\"isPrerelease\":false,\"assets\":[{\"name\":\"enclave-local-build-evidence.json\"},{\"name\":\"enclave-local-build-evidence.sig\"},{\"name\":\"enclave-release.json\"},{\"name\":\"enclave-sbom.spdx.json\"},{\"name\":\"enclave-scan.json\"}]}' ; exit 0; fi\n"
-                "  exit 1\nfi\n"
+                "  echo 'release not found' >&2; exit 1\nfi\n"
                 "if [[ \"$1 $2\" == 'release create' ]]; then touch \"$FAKE_GH_STATE\"; exit 0; fi\n"
+                "if [[ \"$1 $2\" == 'release download' ]]; then\n"
+                "  pattern= dir=\n"
+                "  while [[ $# -gt 0 ]]; do case \"$1\" in --pattern) pattern=\"$2\"; shift 2;; --dir) dir=\"$2\"; shift 2;; *) shift;; esac; done\n"
+                "  cp \"$FAKE_EVIDENCE_DIR/$pattern\" \"$dir/$pattern\"; exit 0\n"
+                "fi\n"
                 "exit 98\n",
                 encoding="utf-8",
             )
@@ -224,6 +286,7 @@ class LocalEvidenceTests(unittest.TestCase):
                 "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256": fingerprint,
                 "FAKE_GH_LOG": str(directory / "gh.log"),
                 "FAKE_GH_STATE": str(directory / "gh-state"),
+                "FAKE_EVIDENCE_DIR": str(directory),
                 "FAKE_GCLOUD_LOG": str(directory / "gcloud.log"),
             }
             completed = subprocess.run(

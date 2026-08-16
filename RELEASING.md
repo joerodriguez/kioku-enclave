@@ -31,6 +31,16 @@ evidence is instead a canonical record signed with an independently pinned Ed255
 - Authenticate `gcloud` as the reviewed human operator. The human may impersonate the
   push-only builder only for registry publication; no service-account JSON key is used.
 
+The accepted native-builder baseline on 2026-08-15 completed the full test/audit/build/
+SBOM/scan gate in 10m34s for the final cold cache-key seed and 5m04s on a
+documentation-only cross-commit warm path. The temporary Git archive
+transport normalizes member timestamps before BuildKit consumes it, while retaining the
+original archive digest in evidence. The source commit time is likewise bound in signed
+evidence rather than supplied as a global Docker build argument, so a documentation or
+release-tooling commit does not invalidate byte-identical toolchain, model, dependency,
+or application layers. Treat a
+regression to uncached stable layers as a failed release-performance acceptance check.
+
 For the one-time hosted-to-local migration, reconstruct the exact production values from
 the immutable image currently pinned by deployment. This avoids guessing the former
 GitHub secret values and never prints them:

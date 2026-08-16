@@ -63,6 +63,35 @@ surfaces.
   service account, KMS key, buckets, hostname, and attestation binding that have no
   production data access. The operator has retired that isolated runtime; production is
   now the only active owner evaluation environment.
+- The ADR-0033 native enclave path requires a probed Linux/amd64 builder whose reviewed
+  Buildx name and exactly one nested worker's Docker
+  identity and transport (TLS CA or SSH host key, with strict SSH known-hosts
+  enforcement) match an operator-reviewed pin,
+  plus a bounded free-space/cache reserve and an immutable Git source archive. Runtime
+  configuration crosses to Docker only through a mode-0600 BuildKit secret consumed by
+  the final assembly stage; a non-secret `CONFIG_SHA256` is declared only in that late
+  stage and must match both the secret and assembled file. The same configuration bytes
+  are snapshotted once and their hash is carried into build and evidence claims. The
+  native builder emits an OCI archive, scans that exact artifact with a fresh/valid
+  checksum- and source-bound advisory database before cloud authentication, quarantines and
+  rehashes those bytes, and promotes them by exact manifest digest with Skopeo
+  `--digestfile`/`--preserve-digests`. The OCI quarantine is fsynced, reopened read-only,
+  validated, unlinked, and passed to Skopeo through an inherited `/dev/fd` descriptor; the
+  selected worker's full identity/transport binding
+  is revalidated after build before its receipt is accepted. A mode-0600
+  run lock and content-addressed receipts reject symlink/output poisoning and rehash
+  artifacts and scan outputs before resume; evidence creation requires the scan receipt's
+  SBOM/scan hashes and the release verifier reopens those exact assets. If native hardware is unavailable, the
+  emulated fallback uses the same exact OCI artifact and digest-preserving promotion, but
+  requires explicit opt-in and a separate release-tag confirmation; it is explicitly
+  labeled and is not treated as a warm-release claim.
+  The free-space check is itself a no-network, no-cache BuildKit probe bound to the exact
+  named Buildx builder; a default-daemon `docker run` result cannot satisfy it.
+- New signed local-build evidence carries an additive `source_archive_sha256` predicate;
+  historical evidence schema 1 remains readable, while bundle verification can rehash
+  the exact archive. A detached frozen release commit is accepted only through the
+  cryptographically verified coordinator-advancement receipt interface; absent that
+  receipt, release tooling retains exact local-main/origin-main tip parity.
 - Production selection accepts only the reviewed `shadow` and `enforce` billing modes.
   The selected mode is preserved in schema-9 release metadata, and a fresh release
   rechecks that it matches the external operator configuration used for the image. A later
@@ -1781,8 +1810,10 @@ packages. All compilation and scanning occurs before the named operator requests
 short-lived push-only credentials. Canonical evidence binds the exact tag/commit, image
 digest, configuration and input/output hashes, tools, and time; it is signed with a
 separate mode-0600 Ed25519 key and verified against an externally pinned public-key
-fingerprint. The sole publisher, `scripts/release.sh`, verifies both the tag-signing key and
-that evidence before any release or rollout mutation.
+fingerprint. The two reviewed publication interfaces, standalone `scripts/release.sh` and the
+frozen coordinator's `scripts/release_train_enclave.py publish` adapter, verify both the
+tag-signing key and that evidence before any release or rollout mutation. The adapter also
+binds the coordinator plan, detached source, and exact artifact receipt.
 
 GitHub Actions, hosted CodeQL, and dependency review are disabled. This removes a hosted
 runner and its recurring cost, but also removes centralized CodeQL alerts and an

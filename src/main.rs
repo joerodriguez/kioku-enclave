@@ -46,6 +46,9 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use axum::{
     extract::{Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
@@ -208,6 +211,117 @@ mod tls;
 /// variable from accidentally enabling test credentials.
 pub(crate) fn test_mode_enabled() -> bool {
     cfg!(debug_assertions) && std::env::var("ENCLAVE_TEST_MODE").as_deref() == Ok("1")
+}
+
+const BAKED_IMAGE_CONFIGURATION_KEYS: &[&str] = &[
+    "KIOKU_BUILD_PROFILE",
+    "KMS_PROJECT",
+    "KMS_LOCATION",
+    "KMS_KEY_RING",
+    "KMS_KEY",
+    "GCS_BUCKET",
+    "GCS_MEDIA_BUCKET",
+    "GCS_LEGACY_MEDIA_BUCKET",
+    "RUN_SA_EMAIL",
+    "ENCLAVE_AUDIENCE",
+    "ATTEST_STS_AUDIENCE",
+    "GOOGLE_DESKTOP_CLIENT_ID",
+    "GOOGLE_IOS_CLIENT_ID",
+    "GOOGLE_WEB_CLIENT_ID",
+    "APPLE_TEAM_ID",
+    "APPLE_KEY_ID",
+    "APPLE_IOS_CLIENT_ID",
+    "APPLE_MACOS_CLIENT_ID",
+    "APPLE_WEB_CLIENT_ID",
+    "APNS_TEAM_ID",
+    "APNS_PRODUCTION_KEY_ID",
+    "APNS_SANDBOX_KEY_ID",
+    "ALLOWED_EMAILS",
+    "ADMIN_USER_IDS",
+    "BASE_URL",
+    "WEB_ORIGIN",
+    "BILLING_SERVICE_URL",
+    "BILLING_SERVICE_AUDIENCE",
+    "BILLING_ENFORCEMENT_MODE",
+    "REVIEWER_AUTH_API_KEY",
+    "REVIEWER_AUTH_UID",
+    "REVIEWER_AUTH_EMAIL",
+    "VERTEX_PROJECT",
+    "VERTEX_LOCATION",
+    "VERTEX_MODEL",
+    "ENCLAVE_ACME",
+    "ENCLAVE_ACME_DIRECTORY",
+    "ENCLAVE_ACME_CONTACT",
+    "ARCHIVE_WITNESS_SHADOW_MODE",
+    "ARCHIVE_WITNESS_PROJECT_ID",
+    "ARCHIVE_WITNESS_PROJECT_NUMBER",
+    "ARCHIVE_WITNESS_DATABASE_ID",
+    "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
+    "ARCHIVE_V3_ARCHIVE_BUCKET",
+    "ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER",
+    "ARCHIVE_V3_REGISTRY_KMS_VERSION",
+    "ARCHIVE_V3_WITNESS_PROJECT_ID",
+    "ARCHIVE_V3_WITNESS_PROJECT_NUMBER",
+    "ARCHIVE_V3_WITNESS_DATABASE_ID",
+    "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
+];
+
+/// Load the allowlisted image configuration assembled by the final Docker
+/// stage. The file is deliberately parsed as data rather than sourced as shell
+/// and is read before any provider/client construction. `PORT` and explicit
+/// test-only variables remain process environment inputs; all security
+/// configuration comes from the image file and overwrites ambient values.
+fn load_baked_image_configuration() {
+    let configured_path = std::env::var_os("KIOKU_BAKED_CONFIG");
+    if let Some(value) = configured_path.as_deref() {
+        if value != std::ffi::OsStr::new("/kioku-config") {
+            panic!("KIOKU_BAKED_CONFIG must name the fixed baked image path");
+        }
+    }
+    let path = configured_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/kioku-config"));
+    let metadata = std::fs::symlink_metadata(&path)
+        .unwrap_or_else(|error| panic!("baked image configuration is unavailable: {error}"));
+    if !metadata.file_type().is_file() {
+        panic!("baked image configuration must be a regular file");
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        panic!("baked image configuration must not be group/world accessible");
+    }
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("baked image configuration cannot be read: {error}"));
+    let mut seen = Vec::with_capacity(BAKED_IMAGE_CONFIGURATION_KEYS.len());
+    for (line_number, line) in contents.lines().enumerate() {
+        let Some((name, value)) = line.split_once('=') else {
+            panic!("invalid baked image configuration line {}", line_number + 1);
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || value.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            panic!("invalid baked image configuration line {}", line_number + 1);
+        }
+        if !BAKED_IMAGE_CONFIGURATION_KEYS.contains(&name) || seen.contains(&name) {
+            panic!(
+                "invalid baked image configuration key at line {}",
+                line_number + 1
+            );
+        }
+        std::env::set_var(name, value);
+        seen.push(name);
+    }
+    if seen.len() != BAKED_IMAGE_CONFIGURATION_KEYS.len()
+        || BAKED_IMAGE_CONFIGURATION_KEYS
+            .iter()
+            .any(|name| !seen.contains(name))
+    {
+        panic!("baked image configuration is incomplete");
+    }
 }
 
 use crate::store::{GcpGcsClient, Store};
@@ -543,8 +657,20 @@ async fn handle_attestation(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    load_baked_image_configuration();
+    // Do not let Tokio create worker threads before the image-baked security
+    // configuration has been parsed and installed. The Tokio main attribute
+    // constructs the runtime before entering the
+    // function body, which would make that ordering implicit and too late.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("construct Tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let args = std::env::args().collect::<Vec<_>>();
     if args.get(1).map(String::as_str) == Some("--measure-voice-eval-similarity") {
         let spec_path = args.get(2).expect(
