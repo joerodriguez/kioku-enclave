@@ -171,6 +171,12 @@ surfaces.
   exact provider-trusted post-expiry higher-fence reacquire. No root publication, Store/VFS
   capture, acknowledgement, startup, route, task, or serving authority is
   added; owner-only capture/comparison remains required before a live canary.
+  The first Store-side prerequisite now narrows the existing inactive capture
+  injection to one exact validated user. Its sole selector constructor is
+  test-only: production constructors still install no VFS, the advisory owner
+  cannot obtain it, and unrelated users always use the unchanged legacy open.
+  This is not yet the owner handoff or comparison worker and grants no canary
+  or acknowledgement authority.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness

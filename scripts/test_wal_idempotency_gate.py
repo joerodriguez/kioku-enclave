@@ -15,7 +15,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 EXPECTED_STORE_CALL_COUNT = 151
 EXPECTED_STORE_CALL_SHA256 = "b558be76d3a94f57c0f96ba2658570c94d84f939283447100be370d433ac0d82"
 EXPECTED_STORE_SURFACE_COUNT = 15
-EXPECTED_STORE_SURFACE_SHA256 = "3abb7ccb5ae7ef2470b99a0de068af22ad64134d741c9bf2f0ebfdf6e431c54c"
+EXPECTED_STORE_SURFACE_SHA256 = "7366cedbcd4910c69eb899bf5660373207df14879ed02ec9eeb15ec004082df0"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::main#0::Store::new_with_media_and_legacy#0",
@@ -36,7 +36,7 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
     }
 )
 EXPECTED_POLICY_SITE_COUNT = 41
-EXPECTED_POLICY_SITE_SHA256 = "3f01dfb0975431289a72111b4e23a77f527b1c7105d60f134de4742cf89f9e60"
+EXPECTED_POLICY_SITE_SHA256 = "24ca52f865f9b51053a2ff727a6f1da5edd9dbcd08dc892f31813681fccf639e"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -2033,6 +2033,7 @@ impl X {
         advisory_production = without_cfg_test_items(advisory)
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         store = (ROOT / "src/store.rs").read_text(encoding="utf-8")
+        store_production = without_cfg_test_items(store)
         query = (ROOT / "src/cp/query.rs").read_text(encoding="utf-8")
         runtime = (ROOT / "src/archive_v3_shadow_runtime.rs").read_text(
             encoding="utf-8"
@@ -2066,6 +2067,17 @@ impl X {
         self.assertIn("maintain_exact_advisory_owner_lease", witness)
         self.assertNotIn("archive_v3_advisory_owner::", store)
         self.assertNotIn("archive_v3_advisory_owner::", query)
+        self.assertIn(
+            "pub(crate) struct StoreShadowCaptureSelection", store_production
+        )
+        self.assertIn(
+            "shadow_capture: Option<StoreShadowCaptureSelection>", store_production
+        )
+        self.assertIn("fn capture_for_user(&self, user_id: &str)", store_production)
+        self.assertIn("selection.capture_for_user(user_id)", store_production)
+        self.assertNotIn("StoreShadowCaptureSelection::for_test", store_production)
+        self.assertNotIn("Option<Arc<StoreShadowCapture>>", store_production)
+        self.assertNotIn("StoreShadowCaptureSelection", main)
         for forbidden in (
             "crate::store::",
             "StoreShadowCapture",

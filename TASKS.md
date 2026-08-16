@@ -562,6 +562,12 @@ separate activation blockers.
     inert until it performs the exact post-expiry higher-fence reacquire. Root advance,
     Store/VFS capture, acknowledgement, startup/task/route wiring, and
     deployment remain absent; owner-only capture/comparison is next.
+  - [x] Narrow the inactive Store capture injection to one exact validated
+    user. The selection has no production constructor, every production Store
+    remains capture-disabled, unrelated users never enter the named VFS, and
+    capture failure still falls back to the unchanged legacy open. A separate
+    reviewed advisory-owner handoff and independent comparison worker remain
+    required before any canary.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 
