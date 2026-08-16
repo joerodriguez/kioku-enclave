@@ -77,6 +77,11 @@ reviewed activation change and production evidence**.
 | Recovery/lifecycle drills | Unit/integration fault coverage, no production drill | Before Phase 1, exercise the advisory import/release/resume/capture/comparison/settlement/retirement/restart/rollback and legacy-no-impact paths on the exact image. Before Phase 2, exercise uncertain provider response, checkpoint/compaction, export, deletion, schema migration, rollback/roll-forward, orphan retention, and forensic legacy-read rules for the authoritative configuration. |
 | Cloud/deployment | No mutation performed; checked profiles are off, the witness infrastructure is transport-probe-only, active image roll is quarantined, and archive-specific telemetry is absent. | Review exact archive GCS, registry-KMS, authoritative-witness creation/adoption/backup/restore and IAM; add the locked canary lane and content-free telemetry; then obtain explicit operator authorization for the named resources, image, subject, monitoring, and rollback window. |
 
+The inactive resumed-canary locus now has an exact `Prepared -> Aborted`
+terminal that retires only its exact capture and is mutually exclusive with
+successful comparison. This is not yet a complete controller stop policy:
+pre-owner and released-before-resume cleanup remain absent and fail closed.
+
 ## Required order
 
 1. Collect exact-image Phase-1 security, strict tmpfs-size, advisory restart/rollback/no-impact,

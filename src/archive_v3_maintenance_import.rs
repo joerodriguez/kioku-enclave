@@ -3798,8 +3798,9 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn real_sqlite_import_stops_advisory_reopens_and_fences_authority() {
+    async fn run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
+        abort_after_mismatch: bool,
+    ) {
         use crate::{
             cp::control_store::ControlStore,
             error::EnclaveError,
@@ -4473,22 +4474,88 @@ mod tests {
             Some(exact_capture_count + later_capture_count),
             "a parity mismatch cannot settle or lose the selected prefix"
         );
-        resumed_owner
-            .delete_uncaptured_metadata_for_test("advisory-uncaptured")
+        if abort_after_mismatch {
+            let resumed_owner = Arc::try_unwrap(resumed_owner)
+                .expect("comparison tasks released the sole owner reference");
+            control
+                .set_advisory_abort_finalize_fault_for_test(true)
+                .await
+                .unwrap();
+            let abort_started = Arc::new(tokio::sync::Semaphore::new(0));
+            let abort_caller = tokio::spawn({
+                let abort_started = Arc::clone(&abort_started);
+                async move {
+                    resumed_owner
+                        .abort_with_started_for_test(
+                            crate::archive_v3_advisory_owner::AdvisoryAbortReason::ComparisonMismatch,
+                            abort_started,
+                        )
+                        .await
+                }
+            });
+            abort_started
+                .acquire()
+                .await
+                .expect("abort owner start semaphore remains open")
+                .forget();
+            abort_caller.abort();
+            let _ = abort_caller.await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if control
+                        .advisory_abort_stage_for_test(operation_id)
+                        .await
+                        .unwrap()
+                        == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap();
-        let resumed_owner = Arc::try_unwrap(resumed_owner)
-            .expect("comparison tasks released the sole owner reference");
-        let settled_owner = resumed_owner.settle_comparison_for_test().await.unwrap();
-        assert_eq!(
-            format!("{settled_owner:?}"),
-            "SettledSingleArchiveAdvisoryOwner(<inactive>)"
-        );
-        assert!(settled_owner.capture_is_retired_for_test().await);
-        settled_owner
-            .reconcile_capture_retirement_for_test()
+            .expect("a failed final readback must retain the durable Prepared terminal");
+            control
+                .set_advisory_abort_finalize_fault_for_test(false)
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if control
+                        .advisory_abort_stage_for_test(operation_id)
+                        .await
+                        .unwrap()
+                        == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap();
+            .expect("caller cancellation must not interrupt the owned abort terminal");
+        } else {
+            resumed_owner
+                .delete_uncaptured_metadata_for_test("advisory-uncaptured")
+                .await
+                .unwrap();
+            resumed_owner
+                .persist_comparison_without_retirement_for_test()
+                .await
+                .unwrap();
+            let resumed_owner = Arc::try_unwrap(resumed_owner)
+                .expect("comparison tasks released the sole owner reference");
+            let settled_owner = resumed_owner.settle_comparison_for_test().await.unwrap();
+            assert_eq!(
+                format!("{settled_owner:?}"),
+                "SettledSingleArchiveAdvisoryOwner(<inactive>)"
+            );
+            assert!(settled_owner.capture_is_retired_for_test().await);
+            settled_owner
+                .reconcile_capture_retirement_for_test()
+                .await
+                .unwrap();
+        }
         store
             .with_user(&user.id, |connection| {
                 connection.execute(
@@ -4499,7 +4566,6 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(settled_owner.capture_is_retired_for_test().await);
 
         // Selecting the later authority importer against a completed advisory
         // terminal fails closed. A separately reviewed Phase-2 transition
@@ -4532,6 +4598,16 @@ mod tests {
             legacy_gcs.get_object(&marker_name).await,
             Err(EnclaveError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_import_stops_advisory_reopens_and_fences_authority() {
+        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(false).await;
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_advisory_mismatch_abort_survives_caller_cancellation() {
+        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(true).await;
     }
 
     #[tokio::test]

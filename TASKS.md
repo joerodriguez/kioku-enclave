@@ -688,6 +688,15 @@ separate activation blockers.
     a lost local result; partial/substituted states fail closed. The legacy
     connection remains open and later writes remain authoritative without
     capture.
+  - [x] Add the first inactive durable abort slice for an already-resumed
+    canary. Control persists the exact released-owner predecessor and fixed
+    stop/mismatch reason before Store retirement; only the opaque exact-target
+    retirement proof finalizes `Aborted`. Comparison and abort exclude one
+    another, restart is fenced, late readback rolls back, and finalized rows
+    reopen exactly. A retained `Prepared` row fails closed because the
+    process-local retirement proof is not reconstructible yet. Pre-owner,
+    released-before-resume, and prepared-abort recovery remain required before
+    the one-shot controller can be composed.
   - [x] Add the inactive one-shot advisory canary admission contract. One
     encrypted-Control row binds the exact private user/archive/import,
     maintenance/source/parity commitments, released witness, release-image

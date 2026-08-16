@@ -21,10 +21,16 @@
 //! opaque cancellation-safe capture prefix; it cannot inspect or settle it.
 //! Its private comparison child may durably consume only a successful opaque
 //! result into a one-shot Control terminal, never a Store drain or user result.
+//! A separate resumed-only abort child records Control intent before exact
+//! capture retirement and finalizes only from the opaque retirement proof.
+//! Earlier abort loci and restart recovery of an unfinished abort remain
+//! intentionally absent, so this module is still not a production controller.
 
+mod abort;
 mod canary;
 mod canary_trust;
 mod comparison;
+pub(crate) use abort::{AdvisoryAbortReason, AdvisoryAbortStage, AdvisoryAbortTerminal};
 pub(crate) use canary::AdvisoryCanaryScope;
 #[allow(
     unused_imports,
@@ -34,6 +40,9 @@ pub(crate) use canary_trust::{
     verify_pinned_advisory_canary_authorization, VerifiedAdvisoryCanaryAuthorization,
 };
 pub(crate) use comparison::{AdvisoryComparisonEvidence, AdvisoryComparisonSettlement};
+
+#[derive(Clone, Copy)]
+pub(crate) struct AdvisoryAbortContext(());
 
 use std::{fmt, sync::Arc};
 
@@ -1362,6 +1371,28 @@ pub(crate) trait AdvisoryOwnerControl: Send + Sync {
         owner: &BoundAdvisoryOwner,
         release: &AdvisoryRelease,
     ) -> Result<Option<AdvisoryComparisonSettlement>>;
+
+    async fn prepare_advisory_abort(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+        reason: AdvisoryAbortReason,
+    ) -> Result<AdvisoryAbortTerminal>;
+
+    async fn load_advisory_abort(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+    ) -> Result<Option<AdvisoryAbortTerminal>>;
+
+    async fn finalize_advisory_abort(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        prepared: &AdvisoryAbortTerminal,
+        retired: &crate::store::StoreAdvisoryCaptureRetired,
+    ) -> Result<AdvisoryAbortTerminal>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1452,6 +1483,15 @@ struct LocallyResumedSingleArchiveAdvisoryOwner {
 struct SettledSingleArchiveAdvisoryOwner {
     _owner: LocallyResumedSingleArchiveAdvisoryOwner,
     _settlement: AdvisoryComparisonSettlement,
+    _retired: crate::store::StoreAdvisoryCaptureRetired,
+}
+
+/// Terminal inactive owner after a resumed-canary stop or comparison mismatch
+/// is durable and the exact Store capture has been retired. It carries no
+/// restart, acknowledgement, provider, route, or authority-conversion API.
+struct AbortedSingleArchiveAdvisoryOwner {
+    _owner: LocallyResumedSingleArchiveAdvisoryOwner,
+    _abort: AdvisoryAbortTerminal,
     _retired: crate::store::StoreAdvisoryCaptureRetired,
 }
 
@@ -1827,6 +1867,19 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
     /// lost Control responses and owner restarts never run a second comparison.
     async fn settle_comparison(self) -> Result<SettledSingleArchiveAdvisoryOwner> {
         comparison::reauthenticate_boundary(&self).await?;
+        if self
+            ._owner
+            ._control
+            .load_advisory_abort(
+                AdvisoryOwnerRuntimeContext(()),
+                &self._owner._bound,
+                &self._release,
+            )
+            .await?
+            .is_some()
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
         let settlement = match self
             ._owner
             ._control
@@ -1861,6 +1914,92 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
         Ok(SettledSingleArchiveAdvisoryOwner {
             _owner: self,
             _settlement: settlement,
+            _retired: retired,
+        })
+    }
+
+    /// Consume a locally resumed canary into a durable stop terminal. Control
+    /// records the exact predecessor before the owned Store retirement task;
+    /// only the opaque exact-target proof can advance it to `Aborted`.
+    async fn abort_resumed(
+        self,
+        reason: AdvisoryAbortReason,
+    ) -> Result<AbortedSingleArchiveAdvisoryOwner> {
+        tokio::spawn(async move { self.abort_resumed_owned(reason).await })
+            .await
+            .map_err(|_| AdvisoryOwnerError::Publication)?
+    }
+
+    async fn abort_resumed_owned(
+        self,
+        reason: AdvisoryAbortReason,
+    ) -> Result<AbortedSingleArchiveAdvisoryOwner> {
+        comparison::reauthenticate_boundary(&self).await?;
+        let retained = self
+            ._owner
+            ._control
+            .load_advisory_abort(
+                AdvisoryOwnerRuntimeContext(()),
+                &self._owner._bound,
+                &self._release,
+            )
+            .await?;
+        let prepared = match retained {
+            Some(retained) => {
+                if retained.reason() != reason {
+                    return Err(AdvisoryOwnerError::Conflict);
+                }
+                retained
+            }
+            None => {
+                self._owner
+                    ._control
+                    .prepare_advisory_abort(
+                        AdvisoryOwnerRuntimeContext(()),
+                        &self._owner._bound,
+                        &self._release,
+                        reason,
+                    )
+                    .await?
+            }
+        };
+        let prepared_stage = prepared.stage();
+        let retired = loop {
+            match self
+                ._resumed_target
+                .retire_advisory_capture_for_abort(&prepared)
+                .await
+                .map_err(map_advisory_store_error)
+            {
+                Ok(retired) => break retired,
+                Err(AdvisoryOwnerError::Publication) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let terminal = if prepared_stage == AdvisoryAbortStage::Aborted {
+            prepared
+        } else {
+            loop {
+                match self
+                    ._owner
+                    ._control
+                    .finalize_advisory_abort(AdvisoryOwnerRuntimeContext(()), &prepared, &retired)
+                    .await
+                {
+                    Ok(terminal) => break terminal,
+                    Err(AdvisoryOwnerError::Persistence) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        comparison::reauthenticate_boundary(&self).await?;
+        Ok(AbortedSingleArchiveAdvisoryOwner {
+            _owner: self,
+            _abort: terminal,
             _retired: retired,
         })
     }
@@ -1899,6 +2038,12 @@ impl fmt::Debug for SettledSingleArchiveAdvisoryOwner {
     }
 }
 
+impl fmt::Debug for AbortedSingleArchiveAdvisoryOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AbortedSingleArchiveAdvisoryOwner(<inactive>)")
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct AdvisoryOwnerTestHandle(SingleArchiveAdvisoryOwner);
 
@@ -1910,6 +2055,9 @@ pub(crate) struct LocallyResumedAdvisoryOwnerTestHandle(LocallyResumedSingleArch
 
 #[cfg(test)]
 pub(crate) struct SettledAdvisoryOwnerTestHandle(SettledSingleArchiveAdvisoryOwner);
+
+#[cfg(test)]
+pub(crate) struct AbortedAdvisoryOwnerTestHandle(AbortedSingleArchiveAdvisoryOwner);
 
 #[cfg(test)]
 impl AdvisoryOwnerTestHandle {
@@ -2096,6 +2244,43 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
             .await
             .map(SettledAdvisoryOwnerTestHandle)
     }
+
+    pub(crate) async fn persist_comparison_without_retirement_for_test(&self) -> Result<()> {
+        let evidence = self.0.compare_captured_prefix().await?;
+        self.0
+            ._owner
+            ._control
+            .settle_advisory_comparison(
+                AdvisoryOwnerRuntimeContext(()),
+                &self.0._owner._bound,
+                &self.0._release,
+                evidence,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn abort_for_test(
+        self,
+        reason: AdvisoryAbortReason,
+    ) -> Result<AbortedAdvisoryOwnerTestHandle> {
+        self.0
+            .abort_resumed(reason)
+            .await
+            .map(AbortedAdvisoryOwnerTestHandle)
+    }
+
+    pub(crate) async fn abort_with_started_for_test(
+        self,
+        reason: AdvisoryAbortReason,
+        started: Arc<tokio::sync::Semaphore>,
+    ) -> Result<AbortedAdvisoryOwnerTestHandle> {
+        let task = tokio::spawn(async move { self.0.abort_resumed_owned(reason).await });
+        started.add_permits(1);
+        task.await
+            .map_err(|_| AdvisoryOwnerError::Publication)?
+            .map(AbortedAdvisoryOwnerTestHandle)
+    }
 }
 
 #[cfg(test)]
@@ -2127,6 +2312,13 @@ impl fmt::Debug for SettledAdvisoryOwnerTestHandle {
 }
 
 #[cfg(test)]
+impl fmt::Debug for AbortedAdvisoryOwnerTestHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
 impl SettledAdvisoryOwnerTestHandle {
     pub(crate) async fn capture_is_retired_for_test(&self) -> bool {
         self.0
@@ -2142,6 +2334,32 @@ impl SettledAdvisoryOwnerTestHandle {
             ._owner
             ._resumed_target
             .retire_advisory_capture(&self.0._settlement)
+            .await
+            .map(|_| ())
+            .map_err(map_advisory_store_error)
+    }
+}
+
+#[cfg(test)]
+impl AbortedAdvisoryOwnerTestHandle {
+    pub(crate) async fn capture_is_retired_for_test(&self) -> bool {
+        self.0
+            ._owner
+            ._resumed_target
+            .captured_commit_count_for_test()
+            .await
+            .is_none()
+    }
+
+    pub(crate) fn stage_for_test(&self) -> AdvisoryAbortStage {
+        self.0._abort.stage()
+    }
+
+    pub(crate) async fn reconcile_capture_retirement_for_test(&self) -> Result<()> {
+        self.0
+            ._owner
+            ._resumed_target
+            .retire_advisory_capture_for_abort(&self.0._abort)
             .await
             .map(|_| ())
             .map_err(map_advisory_store_error)
