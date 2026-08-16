@@ -667,7 +667,17 @@ separate activation blockers.
     prefix and later queued bytes. Exact already-retired state reconciles after
     a lost local result; partial/substituted states fail closed. The legacy
     connection remains open and later writes remain authoritative without
-    capture. Explicit operator canary scope, acknowledgement,
+    capture.
+  - [x] Add the inactive one-shot advisory canary admission contract. One
+    encrypted-Control row binds the exact private user/archive/import,
+    maintenance/source/parity commitments, released witness, release-image
+    digest, and operator-statement commitment. Its full-tuple
+    `authorized -> consumed` CAS is atomic with the first advisory-owner
+    reservation; reopen accepts only that exact scope/owner pair, while absent,
+    substituted, partial, corrupt, or reused scopes fail closed. Authorization
+    alone is inert. Production issuance remains intentionally absent until a
+    reviewed signature trust root and independently attested image identity
+    exist. Acknowledgement,
     launcher/startup/route/config, cloud, deployment, and serving authority
     remain next.
 

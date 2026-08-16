@@ -4030,8 +4030,17 @@ mod tests {
             ._terminal_witness
             .exact_active_lease_for_owner(owner_id)
             .is_err());
+        let canary = control
+            .authorize_advisory_canary_for_test(
+                operation_id,
+                &advisory._terminal_witness,
+                [0xa1; 32],
+                [0xa2; 32],
+            )
+            .await
+            .unwrap();
         let mut first_owner =
-            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(advisory)
+            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(advisory, canary)
                 .await
                 .unwrap();
         assert_eq!(
@@ -4052,10 +4061,16 @@ mod tests {
         // Reopening from the second parity-certified handoff exact-loads the
         // durable bound row. It must not advance the witness fence or issue a
         // second owner acquisition.
-        let reopened_owner =
-            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(restart)
-                .await
-                .unwrap();
+        let reopened_canary = control
+            .load_advisory_canary_for_test(operation_id)
+            .await
+            .unwrap();
+        let reopened_owner = crate::archive_v3_advisory_owner::start_advisory_owner_for_test(
+            restart,
+            reopened_canary,
+        )
+        .await
+        .unwrap();
         assert!(!reopened_owner.may_heartbeat());
         assert!(reopened_owner.has_exact_capture_target(&user.id, archive_id, operation_id));
         assert_eq!(
@@ -4154,13 +4169,19 @@ mod tests {
         // marker read, delete, list, or owner-witness mutation.
         legacy_gcs.reset_operation_counts();
         let live_gets_before_reopen = legacy_gcs.live_get_count();
-        let release_reopened =
-            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(release_restart)
-                .await
-                .unwrap()
-                .release_legacy_fence()
-                .await
-                .unwrap();
+        let release_canary = control
+            .load_advisory_canary_for_test(operation_id)
+            .await
+            .unwrap();
+        let release_reopened = crate::archive_v3_advisory_owner::start_advisory_owner_for_test(
+            release_restart,
+            release_canary,
+        )
+        .await
+        .unwrap()
+        .release_legacy_fence()
+        .await
+        .unwrap();
         assert!(release_reopened.is_released());
         assert_eq!(legacy_gcs.operation_counts(), (0, 0));
         assert_eq!(legacy_gcs.live_get_count(), live_gets_before_reopen);
@@ -4187,16 +4208,23 @@ mod tests {
             .replace_current_for_test(second_heartbeat.clone())
             .unwrap();
 
+        let resume_canary = control
+            .load_advisory_canary_for_test(operation_id)
+            .await
+            .unwrap();
         let resumed_owner = Arc::new(
-            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(resume_restart)
-                .await
-                .unwrap()
-                .release_legacy_fence()
-                .await
-                .unwrap()
-                .resume_local_admission()
-                .await
-                .unwrap(),
+            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(
+                resume_restart,
+                resume_canary,
+            )
+            .await
+            .unwrap()
+            .release_legacy_fence()
+            .await
+            .unwrap()
+            .resume_local_admission()
+            .await
+            .unwrap(),
         );
         assert!(resumed_owner.has_exact_resumed_target(&user.id, archive_id, operation_id));
         assert_eq!(legacy_gcs.operation_counts(), (0, 0));

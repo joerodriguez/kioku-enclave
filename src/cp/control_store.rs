@@ -30,10 +30,10 @@ use crate::{
         ObjectRole,
     },
     archive_v3_advisory_owner::{
-        AdvisoryComparisonEvidence, AdvisoryComparisonSettlement, AdvisoryFenceAbsence,
-        AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError, AdvisoryOwnerId,
-        AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease, AdvisoryReleaseStage,
-        BoundAdvisoryOwner,
+        AdvisoryCanaryScope, AdvisoryComparisonEvidence, AdvisoryComparisonSettlement,
+        AdvisoryFenceAbsence, AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError,
+        AdvisoryOwnerId, AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease,
+        AdvisoryReleaseStage, BoundAdvisoryOwner,
     },
     archive_v3_inventory_coordinator::{
         pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
@@ -529,6 +529,59 @@ CREATE TABLE IF NOT EXISTS archive_v3_maintenance_import_artifacts (
     UNIQUE (archive_id, operation_id, attempt, object_id),
     FOREIGN KEY (archive_id, operation_id, attempt)
         REFERENCES archive_v3_maintenance_import_attempts(archive_id, operation_id, attempt)
+);
+-- One exact, operator-selected Phase-1 canary admission. The authorization is
+-- inert until its full tuple is atomically consumed by the first advisory
+-- owner reservation. Production issuance is intentionally absent until a
+-- trusted operator-statement verifier and exact image attestation exist.
+CREATE TABLE IF NOT EXISTS archive_v3_advisory_canary_scopes (
+    scope_id BLOB PRIMARY KEY CHECK(length(scope_id)=16 AND scope_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    user_id TEXT NOT NULL UNIQUE REFERENCES archive_bindings(user_id),
+    archive_id BLOB NOT NULL UNIQUE REFERENCES archive_bindings(archive_id)
+        CHECK(length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    maintenance_operation_id BLOB NOT NULL UNIQUE
+        CHECK(length(maintenance_operation_id)=16 AND maintenance_operation_id!=zeroblob(16)),
+    maintenance_operation_commitment BLOB NOT NULL
+        CHECK(length(maintenance_operation_commitment)=32
+              AND maintenance_operation_commitment!=zeroblob(32)),
+    source_commitment BLOB NOT NULL
+        CHECK(length(source_commitment)=32 AND source_commitment!=zeroblob(32)),
+    parity_commitment BLOB NOT NULL
+        CHECK(length(parity_commitment)=32 AND parity_commitment!=zeroblob(32)),
+    terminal_witness_hash BLOB NOT NULL
+        CHECK(length(terminal_witness_hash)=32 AND terminal_witness_hash!=zeroblob(32)),
+    release_image_digest BLOB NOT NULL
+        CHECK(length(release_image_digest)=32 AND release_image_digest!=zeroblob(32)),
+    operator_statement_commitment BLOB NOT NULL
+        CHECK(length(operator_statement_commitment)=32
+              AND operator_statement_commitment!=zeroblob(32)),
+    state TEXT NOT NULL CHECK(state IN ('authorized','consumed')),
+    consumed_owner_id BLOB CHECK(
+        consumed_owner_id IS NULL
+        OR (length(consumed_owner_id)=16 AND consumed_owner_id!=zeroblob(16))
+    ),
+    consumed_owner_commitment BLOB CHECK(
+        consumed_owner_commitment IS NULL
+        OR (length(consumed_owner_commitment)=32
+            AND consumed_owner_commitment!=zeroblob(32))
+    ),
+    authorization_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(authorization_commitment)=32
+              AND authorization_commitment!=zeroblob(32)),
+    commitment BLOB NOT NULL CHECK(length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK(revision IN (1,2)),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (archive_id,maintenance_operation_id)
+        REFERENCES archive_v3_maintenance_imports(archive_id,operation_id),
+    CHECK(
+        (state='authorized' AND revision=1 AND consumed_owner_id IS NULL
+         AND consumed_owner_commitment IS NULL
+         AND authorization_commitment=commitment)
+        OR (state='consumed' AND revision=2 AND consumed_owner_id IS NOT NULL
+            AND consumed_owner_commitment IS NOT NULL
+            AND authorization_commitment!=commitment)
+    )
 );
 -- Phase-1-only advisory ShadowWal owner acquisition. This table is separate
 -- from WalAuthoritative ownership and retains only exact comparison facts.
@@ -9101,6 +9154,358 @@ fn advisory_owner_stage_as_db(value: AdvisoryOwnerStage) -> &'static str {
     }
 }
 
+const ADVISORY_CANARY_SCOPE_COMMITMENT_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-canary-scope/v1\0";
+
+struct AdvisoryCanaryTerminalFacts {
+    user_id: String,
+    archive_id: ArchiveId,
+    operation_commitment: [u8; 32],
+    source_commitment: [u8; 32],
+    parity_commitment: [u8; 32],
+    terminal_witness_hash: [u8; 32],
+}
+
+fn advisory_canary_scope_commitment(
+    scope_id: &[u8; 16],
+    operation_id: MaintenanceImportOperationId,
+    terminal: &AdvisoryCanaryTerminalFacts,
+    release_image_digest: &[u8; 32],
+    operator_statement_commitment: &[u8; 32],
+    revision: u64,
+    consumed: Option<(AdvisoryOwnerId, [u8; 32])>,
+) -> Result<[u8; 32]> {
+    let user_length = u64::try_from(terminal.user_id.len())
+        .map_err(|_| EnclaveError::Store("advisory canary user is too long".into()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_CANARY_SCOPE_COMMITMENT_DOMAIN);
+    hasher.update(1_u16.to_be_bytes());
+    hasher.update(scope_id);
+    hasher.update(user_length.to_be_bytes());
+    hasher.update(terminal.user_id.as_bytes());
+    hasher.update(terminal.archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(terminal.operation_commitment);
+    hasher.update(terminal.source_commitment);
+    hasher.update(terminal.parity_commitment);
+    hasher.update(terminal.terminal_witness_hash);
+    hasher.update(release_image_digest);
+    hasher.update(operator_statement_commitment);
+    hasher.update(revision.to_be_bytes());
+    match consumed {
+        None => hasher.update([0]),
+        Some((owner_id, owner_commitment)) => {
+            hasher.update([1]);
+            hasher.update(owner_id.as_bytes());
+            hasher.update(owner_commitment);
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn advisory_canary_terminal_facts_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<AdvisoryCanaryTerminalFacts> {
+    authenticate_advisory_owner_terminal_conn(conn, operation_id, expected)?;
+    type TerminalRow = (String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    let row: TerminalRow = conn.query_row(
+        "SELECT i.user_id,i.archive_id,i.operation_commitment,
+                i.source_commitment,i.parity_commitment
+         FROM archive_v3_maintenance_imports i
+         JOIN archive_bindings b
+           ON b.user_id=i.user_id AND b.archive_id=i.archive_id
+         WHERE i.operation_id=?1 AND i.stage='parity_verified'
+           AND b.state='active_legacy'",
+        [operation_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let archive_id = ArchiveId::from_bytes(fixed_blob::<16>(&row.1, "advisory canary archive")?);
+    if archive_id != expected.archive_id() {
+        return Err(EnclaveError::Conflict(
+            "advisory canary terminal changed".into(),
+        ));
+    }
+    Ok(AdvisoryCanaryTerminalFacts {
+        user_id: row.0,
+        archive_id,
+        operation_commitment: fixed_blob::<32>(&row.2, "advisory canary maintenance commitment")?,
+        source_commitment: fixed_blob::<32>(&row.3, "advisory canary source commitment")?,
+        parity_commitment: fixed_blob::<32>(&row.4, "advisory canary parity commitment")?,
+        terminal_witness_hash: Sha256::digest(expected.encode()).into(),
+    })
+}
+
+struct LoadedAdvisoryCanaryScope {
+    scope_id: [u8; 16],
+    terminal: AdvisoryCanaryTerminalFacts,
+    release_image_digest: [u8; 32],
+    operator_statement_commitment: [u8; 32],
+    authorization_commitment: [u8; 32],
+    consumed: Option<(AdvisoryOwnerId, [u8; 32])>,
+    commitment: [u8; 32],
+}
+
+fn load_advisory_canary_scope_conn(
+    conn: &Connection,
+    canary: &AdvisoryCanaryScope,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<LoadedAdvisoryCanaryScope> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let (scope_id, operation_id, image, statement, capability_commitment) =
+        canary.control_view(token);
+    let terminal = advisory_canary_terminal_facts_conn(conn, operation_id, expected)?;
+    type ScopeRow = (
+        i64,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    );
+    let row: ScopeRow = conn.query_row(
+        "SELECT format_version,user_id,archive_id,maintenance_operation_id,
+                maintenance_operation_commitment,source_commitment,parity_commitment,
+                terminal_witness_hash,release_image_digest,operator_statement_commitment,
+                state,consumed_owner_id,consumed_owner_commitment,
+                authorization_commitment,commitment,revision
+         FROM archive_v3_advisory_canary_scopes WHERE scope_id=?1",
+        [scope_id.as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+                row.get(14)?,
+                row.get(15)?,
+            ))
+        },
+    )?;
+    let authorization_commitment = fixed_blob::<32>(&row.13, "advisory canary authorization")?;
+    if row.0 != 1
+        || row.1 != terminal.user_id
+        || row.2.as_slice() != terminal.archive_id.as_bytes()
+        || row.3.as_slice() != operation_id.as_bytes()
+        || row.4.as_slice() != terminal.operation_commitment
+        || row.5.as_slice() != terminal.source_commitment
+        || row.6.as_slice() != terminal.parity_commitment
+        || row.7.as_slice() != terminal.terminal_witness_hash
+        || row.8.as_slice() != image
+        || row.9.as_slice() != statement
+        || authorization_commitment != *capability_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory canary scope changed".into(),
+        ));
+    }
+    let expected_authorization = advisory_canary_scope_commitment(
+        scope_id,
+        operation_id,
+        &terminal,
+        image,
+        statement,
+        1,
+        None,
+    )?;
+    if authorization_commitment != expected_authorization {
+        return Err(EnclaveError::Store(
+            "advisory canary authorization is corrupt".into(),
+        ));
+    }
+    let consumed = match (row.10.as_str(), row.11, row.12, row.15) {
+        ("authorized", None, None, 1) => None,
+        ("consumed", Some(owner_id), Some(owner_commitment), 2) => Some((
+            AdvisoryOwnerId::from_control_bytes(
+                token,
+                fixed_blob::<16>(&owner_id, "advisory canary consumed owner")?,
+            )
+            .map_err(map_advisory_owner_error)?,
+            fixed_blob::<32>(
+                &owner_commitment,
+                "advisory canary consumed owner commitment",
+            )?,
+        )),
+        _ => {
+            return Err(EnclaveError::Store(
+                "advisory canary state is corrupt".into(),
+            ))
+        }
+    };
+    let revision = if consumed.is_some() { 2 } else { 1 };
+    let commitment = fixed_blob::<32>(&row.14, "advisory canary commitment")?;
+    let expected_commitment = advisory_canary_scope_commitment(
+        scope_id,
+        operation_id,
+        &terminal,
+        image,
+        statement,
+        revision,
+        consumed,
+    )?;
+    if commitment != expected_commitment {
+        return Err(EnclaveError::Store(
+            "advisory canary commitment is corrupt".into(),
+        ));
+    }
+    Ok(LoadedAdvisoryCanaryScope {
+        scope_id: *scope_id,
+        terminal,
+        release_image_digest: *image,
+        operator_statement_commitment: *statement,
+        authorization_commitment,
+        consumed,
+        commitment,
+    })
+}
+
+#[cfg(test)]
+fn load_advisory_canary_capability_for_test_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<AdvisoryCanaryScope> {
+    let row: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT scope_id,release_image_digest,operator_statement_commitment,
+                authorization_commitment
+         FROM archive_v3_advisory_canary_scopes
+         WHERE maintenance_operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    AdvisoryCanaryScope::from_control(
+        AdvisoryOwnerPersistenceContext(()),
+        fixed_blob::<16>(&row.0, "advisory canary scope ID")?,
+        operation_id,
+        fixed_blob::<32>(&row.1, "advisory canary release image")?,
+        fixed_blob::<32>(&row.2, "advisory canary operator statement")?,
+        fixed_blob::<32>(&row.3, "advisory canary authorization")?,
+    )
+    .map_err(map_advisory_owner_error)
+}
+
+#[cfg(test)]
+fn authorize_advisory_canary_for_test_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+    release_image_digest: [u8; 32],
+    operator_statement_commitment: [u8; 32],
+) -> Result<(AdvisoryCanaryScope, bool)> {
+    if release_image_digest == [0; 32] || operator_statement_commitment == [0; 32] {
+        return Err(EnclaveError::InvalidRequest(
+            "advisory canary test evidence must be nonzero".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let terminal = advisory_canary_terminal_facts_conn(&tx, operation_id, expected)?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_canary_scopes
+                       WHERE maintenance_operation_id=?1)",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        let retained = load_advisory_canary_capability_for_test_conn(&tx, operation_id)?;
+        let loaded = load_advisory_canary_scope_conn(&tx, &retained, expected)?;
+        if loaded.release_image_digest != release_image_digest
+            || loaded.operator_statement_commitment != operator_statement_commitment
+        {
+            return Err(EnclaveError::Conflict(
+                "advisory canary authorization changed".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((retained, false));
+    }
+    let mut scope_id = [0; 16];
+    for _ in 0..16 {
+        OsRng.fill_bytes(&mut scope_id);
+        if scope_id != [0; 16] {
+            break;
+        }
+    }
+    if scope_id == [0; 16] {
+        return Err(EnclaveError::Store(
+            "advisory canary scope ID is unavailable".into(),
+        ));
+    }
+    let authorization_commitment = advisory_canary_scope_commitment(
+        &scope_id,
+        operation_id,
+        &terminal,
+        &release_image_digest,
+        &operator_statement_commitment,
+        1,
+        None,
+    )?;
+    if tx.execute(
+        "INSERT INTO archive_v3_advisory_canary_scopes
+         (scope_id,format_version,user_id,archive_id,maintenance_operation_id,
+          maintenance_operation_commitment,source_commitment,parity_commitment,
+          terminal_witness_hash,release_image_digest,operator_statement_commitment,
+          state,consumed_owner_id,consumed_owner_commitment,
+          authorization_commitment,commitment,revision)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
+                 'authorized',NULL,NULL,?11,?11,1)",
+        rusqlite::params![
+            scope_id.as_slice(),
+            terminal.user_id,
+            terminal.archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            terminal.operation_commitment.as_slice(),
+            terminal.source_commitment.as_slice(),
+            terminal.parity_commitment.as_slice(),
+            terminal.terminal_witness_hash.as_slice(),
+            release_image_digest.as_slice(),
+            operator_statement_commitment.as_slice(),
+            authorization_commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory canary authorization raced".into(),
+        ));
+    }
+    let capability = load_advisory_canary_capability_for_test_conn(&tx, operation_id)?;
+    let loaded = load_advisory_canary_scope_conn(&tx, &capability, expected)?;
+    if loaded.consumed.is_some() || loaded.commitment != authorization_commitment {
+        return Err(EnclaveError::Conflict(
+            "advisory canary authorization readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((capability, true))
+}
+
 fn advisory_release_stage_from_db(value: &str) -> Result<AdvisoryReleaseStage> {
     match value {
         "prepared" => Ok(AdvisoryReleaseStage::Prepared),
@@ -9317,13 +9722,21 @@ fn load_retained_advisory_owner_conn(
     load_bound_advisory_owner_conn(conn, operation_id, &observed)
 }
 
-fn reserve_advisory_owner_conn(
+fn reserve_advisory_owner_with_canary_conn(
     conn: &Connection,
+    canary: &AdvisoryCanaryScope,
     operation_id: MaintenanceImportOperationId,
     expected: &crate::archive_v3_witness::WitnessRecord,
 ) -> Result<(AdvisoryOwnerReservation, bool)> {
     let tx = conn.unchecked_transaction()?;
     authenticate_advisory_owner_terminal_conn(&tx, operation_id, expected)?;
+    let scope = load_advisory_canary_scope_conn(&tx, canary, expected)?;
+    let (_, scope_operation_id, _, _, _) = canary.control_view(AdvisoryOwnerPersistenceContext(()));
+    if scope_operation_id != operation_id {
+        return Err(EnclaveError::Conflict(
+            "advisory canary operation changed".into(),
+        ));
+    }
     if tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_owners WHERE archive_id=?1)",
         [expected.archive_id().as_bytes().as_slice()],
@@ -9331,15 +9744,34 @@ fn reserve_advisory_owner_conn(
     )? != 0
     {
         let retained = load_advisory_owner_reservation_conn(&tx, expected.archive_id())?;
-        let (retained_operation, _, retained_expected, _, _, _) =
+        let (retained_operation, retained_owner, retained_expected, _, _, _) =
             retained.control_view(AdvisoryOwnerPersistenceContext(()));
         if retained_operation != operation_id || retained_expected != expected {
             return Err(EnclaveError::Conflict(
                 "advisory owner terminal changed".into(),
             ));
         }
+        let initial = AdvisoryOwnerReservation::new_for_control(
+            AdvisoryOwnerPersistenceContext(()),
+            retained_operation,
+            retained_owner,
+            retained_expected.clone(),
+        )
+        .map_err(map_advisory_owner_error)?;
+        let (_, _, _, _, _, initial_commitment) =
+            initial.control_view(AdvisoryOwnerPersistenceContext(()));
+        if scope.consumed != Some((retained_owner, initial_commitment)) {
+            return Err(EnclaveError::Conflict(
+                "advisory canary consumption changed".into(),
+            ));
+        }
         tx.commit()?;
         return Ok((retained, false));
+    }
+    if scope.consumed.is_some() {
+        return Err(EnclaveError::Conflict(
+            "advisory canary is already consumed".into(),
+        ));
     }
     let token = AdvisoryOwnerPersistenceContext(());
     let owner_id = AdvisoryOwnerId::random_for_control(token).map_err(map_advisory_owner_error)?;
@@ -9347,6 +9779,50 @@ fn reserve_advisory_owner_conn(
         AdvisoryOwnerReservation::new_for_control(token, operation_id, owner_id, expected.clone())
             .map_err(map_advisory_owner_error)?;
     let (_, _, expected, revision, stage, commitment) = reserved.control_view(token);
+    let consumed_scope_commitment = advisory_canary_scope_commitment(
+        &scope.scope_id,
+        operation_id,
+        &scope.terminal,
+        &scope.release_image_digest,
+        &scope.operator_statement_commitment,
+        2,
+        Some((owner_id, commitment)),
+    )?;
+    if tx.execute(
+        "UPDATE archive_v3_advisory_canary_scopes
+         SET state='consumed',consumed_owner_id=?1,consumed_owner_commitment=?2,
+             commitment=?3,revision=2,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE scope_id=?4 AND format_version=1 AND user_id=?5 AND archive_id=?6
+           AND maintenance_operation_id=?7 AND maintenance_operation_commitment=?8
+           AND source_commitment=?9 AND parity_commitment=?10
+           AND terminal_witness_hash=?11 AND release_image_digest=?12
+           AND operator_statement_commitment=?13 AND state='authorized'
+           AND consumed_owner_id IS NULL AND consumed_owner_commitment IS NULL
+           AND authorization_commitment=?14 AND commitment=?15 AND revision=1",
+        rusqlite::params![
+            owner_id.as_bytes().as_slice(),
+            commitment.as_slice(),
+            consumed_scope_commitment.as_slice(),
+            scope.scope_id.as_slice(),
+            scope.terminal.user_id,
+            scope.terminal.archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            scope.terminal.operation_commitment.as_slice(),
+            scope.terminal.source_commitment.as_slice(),
+            scope.terminal.parity_commitment.as_slice(),
+            scope.terminal.terminal_witness_hash.as_slice(),
+            scope.release_image_digest.as_slice(),
+            scope.operator_statement_commitment.as_slice(),
+            scope.authorization_commitment.as_slice(),
+            scope.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory canary consumption raced".into(),
+        ));
+    }
     if tx.execute(
         "INSERT INTO archive_v3_advisory_owners
          (archive_id,format_version,maintenance_operation_id,owner_id,expected_witness,
@@ -9374,8 +9850,30 @@ fn reserve_advisory_owner_conn(
             "advisory owner reserve readback changed".into(),
         ));
     }
+    let consumed_scope = load_advisory_canary_scope_conn(&tx, canary, expected)?;
+    if consumed_scope.consumed != Some((owner_id, commitment)) {
+        return Err(EnclaveError::Conflict(
+            "advisory canary consumption readback changed".into(),
+        ));
+    }
     tx.commit()?;
     Ok((loaded, true))
+}
+
+#[cfg(test)]
+fn reserve_advisory_owner_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<(AdvisoryOwnerReservation, bool)> {
+    let (canary, _) = authorize_advisory_canary_for_test_conn(
+        conn,
+        operation_id,
+        expected,
+        [0x91; 32],
+        [0x92; 32],
+    )?;
+    reserve_advisory_owner_with_canary_conn(conn, &canary, operation_id, expected)
 }
 
 fn mark_advisory_owner_send_started_conn(
@@ -15912,6 +16410,35 @@ impl ControlStore {
     }
 
     #[cfg(test)]
+    pub(crate) async fn authorize_advisory_canary_for_test(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        expected: &crate::archive_v3_witness::WitnessRecord,
+        release_image_digest: [u8; 32],
+        operator_statement_commitment: [u8; 32],
+    ) -> Result<AdvisoryCanaryScope> {
+        self.write_owned_if_changed(|conn| {
+            authorize_advisory_canary_for_test_conn(
+                conn,
+                operation_id,
+                expected,
+                release_image_digest,
+                operator_statement_commitment,
+            )
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn load_advisory_canary_for_test(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<AdvisoryCanaryScope> {
+        self.read(|conn| load_advisory_canary_capability_for_test_conn(conn, operation_id))
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn replace_advisory_release_commitment_for_test(
         &self,
         archive_id: ArchiveId,
@@ -20234,14 +20761,15 @@ impl WalOwnerControl for ControlStore {
 
 #[async_trait::async_trait]
 impl AdvisoryOwnerControl for ControlStore {
-    async fn reserve_advisory_owner(
+    async fn reserve_advisory_owner_with_canary(
         &self,
         _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        canary: &AdvisoryCanaryScope,
         operation_id: MaintenanceImportOperationId,
         expected: &crate::archive_v3_witness::WitnessRecord,
     ) -> std::result::Result<AdvisoryOwnerReservation, AdvisoryOwnerError> {
         self.write_owned_if_changed(|conn| {
-            reserve_advisory_owner_conn(conn, operation_id, expected)
+            reserve_advisory_owner_with_canary_conn(conn, canary, operation_id, expected)
         })
         .await
         .map_err(map_advisory_persistence_error)
@@ -24584,6 +25112,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advisory_canary_lost_flush_and_concurrent_first_reserve_reopen_exactly() {
+        use crate::{
+            archive_v3_witness::InMemoryWitness,
+            store::tests::{FakeGcs, FakeKms},
+        };
+
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let user = control
+            .upsert_user("canary-lost-response-subject", "canary-lost@example.com")
+            .await
+            .unwrap();
+        control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let maintenance = control
+            .write(|conn| {
+                let fixture = seed_maintenance_shadow_send_unknown(conn)?;
+                reconcile_maintenance_witness_conn(
+                    conn,
+                    fixture.operation_id,
+                    MaintenanceImportStage::ShadowSendUnknown,
+                    &fixture.shadow,
+                )?;
+                persist_maintenance_parity_conn(
+                    conn,
+                    fixture.operation_id,
+                    fixture.source,
+                    &fixture.shadow,
+                    [0x91; 32],
+                )?;
+                Ok(fixture)
+            })
+            .await
+            .unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(maintenance.shadow.encode()),
+            maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+            .unwrap();
+        let canary = control
+            .authorize_advisory_canary_for_test(
+                maintenance.operation_id,
+                &released,
+                [0x9a; 32],
+                [0x9b; 32],
+            )
+            .await
+            .unwrap();
+        gcs.fail_next_put_after_commit(EnclaveError::Gcs(
+            "simulated lost canary reserve response".into(),
+        ));
+        let first = control
+            .write_owned_if_changed(|conn| {
+                reserve_advisory_owner_with_canary_conn(
+                    conn,
+                    &canary,
+                    maintenance.operation_id,
+                    &released,
+                )
+            })
+            .await
+            .unwrap();
+        drop(control);
+        let reopened = ControlStore::new(kms.clone(), gcs.clone());
+        let reopened_canary = reopened
+            .load_advisory_canary_for_test(maintenance.operation_id)
+            .await
+            .unwrap();
+        let replayed = reopened
+            .write_owned_if_changed(|conn| {
+                reserve_advisory_owner_with_canary_conn(
+                    conn,
+                    &reopened_canary,
+                    maintenance.operation_id,
+                    &released,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            first.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+
+        let concurrent_gcs = Arc::new(FakeGcs::new());
+        let seed = ControlStore::new(kms.clone(), concurrent_gcs.clone());
+        let user = seed
+            .upsert_user("canary-concurrent-subject", "canary-concurrent@example.com")
+            .await
+            .unwrap();
+        seed.prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let concurrent_maintenance = seed
+            .write(|conn| {
+                let fixture = seed_maintenance_shadow_send_unknown(conn)?;
+                reconcile_maintenance_witness_conn(
+                    conn,
+                    fixture.operation_id,
+                    MaintenanceImportStage::ShadowSendUnknown,
+                    &fixture.shadow,
+                )?;
+                persist_maintenance_parity_conn(
+                    conn,
+                    fixture.operation_id,
+                    fixture.source,
+                    &fixture.shadow,
+                    [0x91; 32],
+                )?;
+                Ok(fixture)
+            })
+            .await
+            .unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(concurrent_maintenance.shadow.encode()),
+            concurrent_maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let concurrent_released = release_provider
+            .release_exact_maintenance_advisory(
+                &concurrent_maintenance.shadow,
+                concurrent_maintenance.owner_id,
+            )
+            .unwrap();
+        seed.authorize_advisory_canary_for_test(
+            concurrent_maintenance.operation_id,
+            &concurrent_released,
+            [0x9c; 32],
+            [0x9d; 32],
+        )
+        .await
+        .unwrap();
+        drop(seed);
+
+        let first_control = ControlStore::new(kms.clone(), concurrent_gcs.clone());
+        let second_control = ControlStore::new(kms.clone(), concurrent_gcs.clone());
+        let first_canary = first_control
+            .load_advisory_canary_for_test(concurrent_maintenance.operation_id)
+            .await
+            .unwrap();
+        let second_canary = second_control
+            .load_advisory_canary_for_test(concurrent_maintenance.operation_id)
+            .await
+            .unwrap();
+        let (first_result, second_result) = tokio::join!(
+            first_control.write_owned_if_changed(|conn| {
+                reserve_advisory_owner_with_canary_conn(
+                    conn,
+                    &first_canary,
+                    concurrent_maintenance.operation_id,
+                    &concurrent_released,
+                )
+            }),
+            second_control.write_owned_if_changed(|conn| {
+                reserve_advisory_owner_with_canary_conn(
+                    conn,
+                    &second_canary,
+                    concurrent_maintenance.operation_id,
+                    &concurrent_released,
+                )
+            }),
+        );
+        assert_eq!(
+            usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+            1,
+            "two independently preloaded authorized generations must not both mint owners"
+        );
+        drop(first_control);
+        drop(second_control);
+
+        let final_control = ControlStore::new(kms, concurrent_gcs);
+        let final_canary = final_control
+            .load_advisory_canary_for_test(concurrent_maintenance.operation_id)
+            .await
+            .unwrap();
+        let final_owner = final_control
+            .write_owned_if_changed(|conn| {
+                reserve_advisory_owner_with_canary_conn(
+                    conn,
+                    &final_canary,
+                    concurrent_maintenance.operation_id,
+                    &concurrent_released,
+                )
+            })
+            .await
+            .unwrap();
+        let final_view = final_owner.control_view(AdvisoryOwnerPersistenceContext::for_test());
+        for raced in [first_result, second_result].into_iter().flatten() {
+            assert_eq!(
+                raced.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+                final_view,
+                "every reported racing success must be the exact durable owner"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unchanged_google_reauthentication_fails_closed_on_archive_state() {
         use crate::store::tests::{FakeGcs, FakeKms};
 
@@ -28761,6 +29492,287 @@ mod tests {
     }
 
     #[test]
+    fn advisory_canary_is_inert_until_atomically_consumed_with_exact_owner() {
+        use crate::archive_v3_witness::InMemoryWitness;
+
+        let conn = account_conn();
+        let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(maintenance.shadow.encode()),
+            maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+            .unwrap();
+        let token = AdvisoryOwnerPersistenceContext::for_test();
+        let absent = AdvisoryCanaryScope::from_control(
+            token,
+            [0x71; 16],
+            maintenance.operation_id,
+            [0x72; 32],
+            [0x73; 32],
+            [0x74; 32],
+        )
+        .unwrap();
+        assert!(reserve_advisory_owner_with_canary_conn(
+            &conn,
+            &absent,
+            maintenance.operation_id,
+            &released,
+        )
+        .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_owners",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+
+        let (canary, changed) = authorize_advisory_canary_for_test_conn(
+            &conn,
+            maintenance.operation_id,
+            &released,
+            [0x75; 32],
+            [0x76; 32],
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM archive_v3_advisory_canary_scopes",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "authorized"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_owners",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "authorization alone must have no owner effect"
+        );
+
+        let (reserved, changed) = reserve_advisory_owner_with_canary_conn(
+            &conn,
+            &canary,
+            maintenance.operation_id,
+            &released,
+        )
+        .unwrap();
+        assert!(changed);
+        let consumed: (String, Vec<u8>, Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT state,consumed_owner_id,consumed_owner_commitment,revision
+                 FROM archive_v3_advisory_canary_scopes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let (_, owner_id, _, _, _, owner_commitment) = reserved.control_view(token);
+        assert_eq!(consumed.0, "consumed");
+        assert_eq!(consumed.1.as_slice(), owner_id.as_bytes());
+        assert_eq!(consumed.2.as_slice(), owner_commitment);
+        assert_eq!(consumed.3, 2);
+
+        let reopened =
+            load_advisory_canary_capability_for_test_conn(&conn, maintenance.operation_id).unwrap();
+        let (replayed, changed) = reserve_advisory_owner_with_canary_conn(
+            &conn,
+            &reopened,
+            maintenance.operation_id,
+            &released,
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(replayed.control_view(token), reserved.control_view(token));
+
+        let (scope_id, _, _, statement, authorization) = reopened.control_view(token);
+        let substituted = AdvisoryCanaryScope::from_control(
+            token,
+            *scope_id,
+            maintenance.operation_id,
+            [0x77; 32],
+            *statement,
+            *authorization,
+        )
+        .unwrap();
+        assert!(reserve_advisory_owner_with_canary_conn(
+            &conn,
+            &substituted,
+            maintenance.operation_id,
+            &released,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn advisory_canary_rejects_every_terminal_tuple_tamper_before_owner_insert() {
+        use crate::archive_v3_witness::InMemoryWitness;
+
+        for mutation in [
+            "UPDATE archive_v3_advisory_canary_scopes SET user_id='tampered-user'",
+            "UPDATE archive_v3_advisory_canary_scopes SET archive_id=x'81818181818181818181818181818181'",
+            "UPDATE archive_v3_advisory_canary_scopes SET maintenance_operation_id=x'82828282828282828282828282828282'",
+            "UPDATE archive_v3_advisory_canary_scopes SET maintenance_operation_commitment=x'8383838383838383838383838383838383838383838383838383838383838383'",
+            "UPDATE archive_v3_advisory_canary_scopes SET source_commitment=x'8484848484848484848484848484848484848484848484848484848484848484'",
+            "UPDATE archive_v3_advisory_canary_scopes SET parity_commitment=x'8585858585858585858585858585858585858585858585858585858585858585'",
+            "UPDATE archive_v3_advisory_canary_scopes SET terminal_witness_hash=x'8686868686868686868686868686868686868686868686868686868686868686'",
+            "UPDATE archive_v3_advisory_canary_scopes SET operator_statement_commitment=x'8787878787878787878787878787878787878787878787878787878787878787'",
+            "UPDATE archive_v3_advisory_canary_scopes SET authorization_commitment=x'8888888888888888888888888888888888888888888888888888888888888888',commitment=x'8888888888888888888888888888888888888888888888888888888888888888'",
+            "UPDATE archive_v3_advisory_canary_scopes SET commitment=x'8989898989898989898989898989898989898989898989898989898989898989'",
+        ] {
+            let conn = account_conn();
+            let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+            let release_provider = InMemoryWitness::from_provider_record_at_tick(
+                Some(maintenance.shadow.encode()),
+                maintenance.shadow.last_server_tick() + 1,
+            )
+            .unwrap();
+            let released = release_provider
+                .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+                .unwrap();
+            let (canary, _) = authorize_advisory_canary_for_test_conn(
+                &conn,
+                maintenance.operation_id,
+                &released,
+                [0x7a; 32],
+                [0x7b; 32],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            conn.execute_batch(mutation).unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+                .unwrap();
+            assert!(reserve_advisory_owner_with_canary_conn(
+                &conn,
+                &canary,
+                maintenance.operation_id,
+                &released,
+            )
+            .is_err());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_advisory_owners",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "tampered scope must not create an owner: {mutation}"
+            );
+        }
+
+        let conn = account_conn();
+        let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(maintenance.shadow.encode()),
+            maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+            .unwrap();
+        let (canary, _) = authorize_advisory_canary_for_test_conn(
+            &conn,
+            maintenance.operation_id,
+            &released,
+            [0x7c; 32],
+            [0x7d; 32],
+        )
+        .unwrap();
+        let substituted_witness =
+            released.with_deletion_for_test(crate::archive_v3_witness::DeletionState::Tombstoned);
+        assert!(reserve_advisory_owner_with_canary_conn(
+            &conn,
+            &canary,
+            maintenance.operation_id,
+            &substituted_witness,
+        )
+        .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_owners",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn advisory_canary_partial_pairs_and_rearm_fail_closed() {
+        use crate::archive_v3_witness::InMemoryWitness;
+
+        for remove_owner in [false, true] {
+            let conn = account_conn();
+            let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+            let release_provider = InMemoryWitness::from_provider_record_at_tick(
+                Some(maintenance.shadow.encode()),
+                maintenance.shadow.last_server_tick() + 1,
+            )
+            .unwrap();
+            let released = release_provider
+                .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+                .unwrap();
+            let (canary, _) = authorize_advisory_canary_for_test_conn(
+                &conn,
+                maintenance.operation_id,
+                &released,
+                [0x8a; 32],
+                [0x8b; 32],
+            )
+            .unwrap();
+            reserve_advisory_owner_with_canary_conn(
+                &conn,
+                &canary,
+                maintenance.operation_id,
+                &released,
+            )
+            .unwrap();
+            if remove_owner {
+                conn.execute("DELETE FROM archive_v3_advisory_owners", [])
+                    .unwrap();
+            } else {
+                conn.execute(
+                    "UPDATE archive_v3_advisory_canary_scopes
+                     SET state='authorized',consumed_owner_id=NULL,
+                         consumed_owner_commitment=NULL,
+                         commitment=authorization_commitment,revision=1",
+                    [],
+                )
+                .unwrap();
+            }
+            assert!(reserve_advisory_owner_with_canary_conn(
+                &conn,
+                &canary,
+                maintenance.operation_id,
+                &released,
+            )
+            .is_err());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_advisory_owners",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                i64::from(!remove_owner)
+            );
+        }
+    }
+
+    #[test]
     fn advisory_owner_late_reserve_readback_failure_rolls_back() {
         use crate::archive_v3_witness::InMemoryWitness;
 
@@ -28793,6 +29805,56 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM archive_v3_advisory_canary_scopes",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "authorized",
+            "failed owner insertion must roll back canary consumption"
+        );
+
+        conn.execute_batch(
+            "DROP TRIGGER corrupt_advisory_owner_after_insert;
+             CREATE TRIGGER corrupt_advisory_canary_after_owner_insert
+             AFTER INSERT ON archive_v3_advisory_owners
+             BEGIN
+               UPDATE archive_v3_advisory_canary_scopes
+               SET commitment=x'9393939393939393939393939393939393939393939393939393939393939393'
+               WHERE maintenance_operation_id=NEW.maintenance_operation_id;
+             END;",
+        )
+        .unwrap();
+        let canary =
+            load_advisory_canary_capability_for_test_conn(&conn, maintenance.operation_id).unwrap();
+        assert!(reserve_advisory_owner_with_canary_conn(
+            &conn,
+            &canary,
+            maintenance.operation_id,
+            &released,
+        )
+        .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_owners",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "late scope readback corruption must roll back owner insertion"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM archive_v3_advisory_canary_scopes",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "authorized"
         );
     }
 

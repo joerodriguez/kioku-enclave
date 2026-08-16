@@ -5,7 +5,8 @@
 
 //! Inactive, Phase-1-only owner lease lifecycle for one advisory `ShadowWal`
 //! archive. The state machine authenticates the parity-certified maintenance
-//! handoff, durably reserves one random owner, records `SendStarted` before the
+//! handoff and one exact operator-selected canary capability, atomically
+//! consumes that scope while reserving one random owner, records `SendStarted` before the
 //! initial witness transaction, and adopts only exact one-step acquisition,
 //! heartbeat, or post-expiry reacquire successors. It is deliberately separate
 //! from the `WalAuthoritative` publisher. It retains one sealed exact-user
@@ -21,7 +22,9 @@
 //! Its private comparison child may durably consume only a successful opaque
 //! result into a one-shot Control terminal, never a Store drain or user result.
 
+mod canary;
 mod comparison;
+pub(crate) use canary::AdvisoryCanaryScope;
 pub(crate) use comparison::{AdvisoryComparisonEvidence, AdvisoryComparisonSettlement};
 
 use std::{fmt, sync::Arc};
@@ -1268,9 +1271,10 @@ fn advisory_owner_commitment(
 
 #[async_trait]
 pub(crate) trait AdvisoryOwnerControl: Send + Sync {
-    async fn reserve_advisory_owner(
+    async fn reserve_advisory_owner_with_canary(
         &self,
         token: AdvisoryOwnerRuntimeContext,
+        canary: &AdvisoryCanaryScope,
         operation_id: MaintenanceImportOperationId,
         expected: &WitnessRecord,
     ) -> Result<AdvisoryOwnerReservation>;
@@ -1444,7 +1448,10 @@ struct SettledSingleArchiveAdvisoryOwner {
 }
 
 impl SingleArchiveAdvisoryOwner {
-    async fn start(handoff: CompletedAdvisoryShadowHandoff) -> Result<Self> {
+    async fn start(
+        handoff: CompletedAdvisoryShadowHandoff,
+        canary: AdvisoryCanaryScope,
+    ) -> Result<Self> {
         let CompletedAdvisoryShadowHandoffView {
             runtime,
             terminal_witness,
@@ -1465,16 +1472,17 @@ impl SingleArchiveAdvisoryOwner {
                 &terminal_witness,
             )
             .map_err(|_| AdvisoryOwnerError::Conflict)?;
-        let runtime = runtime
-            .into_advisory_owner(AdvisoryOwnerRuntimeContext(()))
-            .map_err(|_| AdvisoryOwnerError::Publication)?;
         let reserved = control
-            .reserve_advisory_owner(
+            .reserve_advisory_owner_with_canary(
                 AdvisoryOwnerRuntimeContext(()),
+                &canary,
                 operation_id,
                 &terminal_witness,
             )
             .await?;
+        let runtime = runtime
+            .into_advisory_owner(AdvisoryOwnerRuntimeContext(()))
+            .map_err(|_| AdvisoryOwnerError::Publication)?;
         let (bound, may_heartbeat) = if reserved.stage() == AdvisoryOwnerStage::Bound {
             let retained = control
                 .load_retained_advisory_owner(AdvisoryOwnerRuntimeContext(()), operation_id)
@@ -2135,8 +2143,9 @@ impl SettledAdvisoryOwnerTestHandle {
 #[cfg(test)]
 pub(crate) async fn start_advisory_owner_for_test(
     handoff: CompletedAdvisoryShadowHandoff,
+    canary: AdvisoryCanaryScope,
 ) -> Result<AdvisoryOwnerTestHandle> {
-    SingleArchiveAdvisoryOwner::start(handoff)
+    SingleArchiveAdvisoryOwner::start(handoff, canary)
         .await
         .map(AdvisoryOwnerTestHandle)
 }
