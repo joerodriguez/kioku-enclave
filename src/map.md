@@ -9,10 +9,13 @@ configured webhook events use the separate webhook boundary.
 
 The inactive ADR-0022 Phase-1 advisory owner now also has a private
 `archive_v3_advisory_owner/canary.rs` capability and `canary_trust.rs` verifier:
-its opaque exact scope is consumed atomically with the first owner reservation,
-and only a two-root signed operator/image proof can reach Control's issuer. The
-checked-in roots remain deliberately invalid and there is no production caller,
-configuration, or attestation adapter.
+its opaque exact scope and separate runtime-precondition row are consumed
+atomically with the first owner reservation. A three-root operator/image/
+deployment-observer proof fixes Phase 1 to no authoritative mutations, legacy-
+only acknowledgements, an exact maintenance window and zero serving replicas,
+plus content-free monitoring/rollback commitments. The checked-in roots remain
+deliberately invalid and there is no production caller, configuration, trusted-
+time/live-state observer, or attestation adapter.
 
 | File | Role |
 |---|---|

@@ -681,15 +681,22 @@ separate activation blockers.
     exact archive/import/maintenance/source/parity/released-witness/image
     tuple. One Ed25519 root authenticates it; an independently controlled
     second root authenticates an image assertion bound to the exact signed
-    statement proof and digest. Only the resulting non-cloneable value can
-    enter Control's transactional exact-row issuer. Roots must be nonzero and
-    distinct; checked-in production anchors deliberately remain invalid and
-    no signing key, environment/config override, live attestation adapter, or
-    caller exists.
-  - [ ] Populate separately controlled operator and image-attestation public
-    roots, review the live Confidential Space claim/nonce verifier that may
-    sign the image assertion, and bind that exact adapter into a separately
-    authorized inactive launcher. Acknowledgement,
+    statement proof and digest. A third pairwise-distinct deployment-observer
+    root authenticates the constant empty Phase-1 authoritative-mutation set,
+    legacy-only acknowledgements, an exact maintenance-window/deployment/
+    challenge tuple, zero serving replicas, and content-free monitoring/
+    rollback policy commitments. Control inserts a separate exact precondition
+    row with the scope, then consumes and binds both rows to the first
+    owner in one transaction; `SendStarted` reauthenticates that relation.
+    Roots must be nonzero and pairwise distinct; checked-in production anchors
+    deliberately remain invalid and no signing key, environment/config
+    override, live observer/attestation adapter, or caller exists.
+  - [ ] Populate separately controlled operator, image-attestation, and
+    deployment-observer public roots; review live Confidential Space claim/
+    nonce and fresh deployment-state adapters; prove the launcher holds the
+    maintenance window and zero-serving condition across import and owner
+    admission; and deploy the exact monitoring and rollback policies whose
+    commitments are signed. Acknowledgement,
     launcher/startup/route/config, cloud, deployment, and serving authority
     remain next.
 
