@@ -1102,7 +1102,6 @@ def image_coordinates(
 def docker_build_arguments(
     configuration: dict[str, str],
     profile: str,
-    source_date_epoch: int,
     *,
     config_sha256: str,
 ) -> list[str]:
@@ -1111,10 +1110,7 @@ def docker_build_arguments(
     # disclose the selected configuration.
     if not re.fullmatch(r"[0-9a-f]{64}", config_sha256):
         raise PipelineError("image configuration hash must be a lowercase sha256")
-    argument_names = (
-        ("SOURCE_DATE_EPOCH", str(source_date_epoch)),
-        ("CONFIG_SHA256", config_sha256),
-    )
+    argument_names = (("CONFIG_SHA256", config_sha256),)
     result: list[str] = []
     for name, value in argument_names:
         result.extend(["--build-arg", f"{name}={value}"])
@@ -2381,7 +2377,6 @@ def main() -> None:
                         *docker_build_arguments(
                             configuration,
                             arguments.profile,
-                            source_date_epoch,
                             config_sha256=image_config_sha256,
                         ),
                         "--secret", f"id=kioku-config,src={config_secret}",

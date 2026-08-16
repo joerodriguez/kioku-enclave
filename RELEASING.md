@@ -34,8 +34,10 @@ evidence is instead a canonical record signed with an independently pinned Ed255
 The accepted native-builder baseline on 2026-08-15 completed the full test/audit/build/
 SBOM/scan gate in 10m10s from a cold image cache and 5m11s warm. The temporary Git archive
 transport normalizes member timestamps before BuildKit consumes it, while retaining the
-original archive digest in evidence, so a documentation or release-tooling commit does not
-invalidate byte-identical toolchain, model, dependency, or application layers. Treat a
+original archive digest in evidence. The source commit time is likewise bound in signed
+evidence rather than supplied as a global Docker build argument, so a documentation or
+release-tooling commit does not invalidate byte-identical toolchain, model, dependency,
+or application layers. Treat a
 regression to uncached stable layers as a failed release-performance acceptance check.
 
 For the one-time hosted-to-local migration, reconstruct the exact production values from

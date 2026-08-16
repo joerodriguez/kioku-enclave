@@ -432,7 +432,6 @@ capability: startup does not construct it and it performs no provider I/O.
 
 ```sh
 docker build --platform linux/amd64 \
-  --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
   --build-arg KMS_PROJECT=my-project \
   --build-arg KMS_LOCATION=us-central1 \
   --build-arg KMS_KEY_RING=my-keyring \

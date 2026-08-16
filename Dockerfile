@@ -4,9 +4,9 @@
 # ---------------------
 # To make builds more repeatable and auditable (not yet bit-for-bit reproducible):
 #   1. The builder image and model revision are pinned below.
-#   2. Pass the source commit timestamp to BuildKit only for the final image
-#      metadata layer. It must not precede the reusable tool/model/dependency
-#      layers or it needlessly invalidates their cache.
+#   2. Record the source commit timestamp in signed build evidence, not as a
+#      Docker build argument. BuildKit treats changing build arguments as a
+#      global cache input even when the Dockerfile declares them late.
 #   3. Build with --locked so Cargo.lock is authoritative.
 #   4. Consider vendoring deps (cargo vendor) so the build is fully offline
 #      and the source tree is the complete input — a remaining hardening item.
@@ -44,14 +44,12 @@
 # ARCHIVE_V3_WITNESS_PROJECT_ID ARCHIVE_V3_WITNESS_PROJECT_NUMBER
 # ARCHIVE_V3_WITNESS_DATABASE_ID ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT.
 #
-# Required build args (source metadata and a non-secret config-content hash;
-# CONFIG_SHA256 is declared only in the late image-config stage):
-#   SOURCE_DATE_EPOCH     source timestamp used only by the final metadata layer
+# Required build args (a non-secret config-content hash; CONFIG_SHA256 is
+# declared only in the late image-config stage):
 #   CONFIG_SHA256         SHA-256 of the exact BuildKit secret bytes
 #
 # Example build command:
 #   docker build \
-#     --build-arg SOURCE_DATE_EPOCH=<source-commit-unix-timestamp> \
 #     --build-arg CONFIG_SHA256=<sha256-of-/secure/kioku-runtime.env> \
 #     --secret id=kioku-config,src=/secure/kioku-runtime.env \
 #     -t kioku-enclave:local .
@@ -150,9 +148,9 @@ RUN --mount=type=secret,id=kioku-config,required \
 # ── Stage 3: minimal runtime ──────────────────────────────────────────────────
 FROM scratch
 
-# Source time is metadata-only and is declared after all reusable build layers.
-ARG SOURCE_DATE_EPOCH
-LABEL org.opencontainers.image.created=${SOURCE_DATE_EPOCH}
+# Source commit and time remain bound by signed evidence. They are deliberately
+# absent from Docker's global build-argument namespace so unchanged image bytes
+# can reuse the exact same BuildKit records across release-tooling commits.
 
 # No CA certificate file needed: reqwest is built with rustls-tls-webpki-roots
 # which compiles the Mozilla root CA bundle directly into the binary.  A

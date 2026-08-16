@@ -309,6 +309,7 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertTrue(any(argument.startswith("type=oci,dest=") for argument in build))
         self.assertNotIn("--load", build)
         self.assertTrue(any(argument.startswith("CONFIG_SHA256=") for argument in build))
+        self.assertFalse(any(argument.startswith("SOURCE_DATE_EPOCH=") for argument in build))
         self.assertIn("--secret", build)
         self.assertIn("id=kioku-config,src=", " ".join(build))
         self.assertNotIn("GCS_LEGACY_MEDIA_BUCKET=", " ".join(build))
