@@ -9210,6 +9210,26 @@ fn load_bound_advisory_owner_conn(
     .map_err(map_advisory_owner_error)
 }
 
+fn load_retained_advisory_owner_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<BoundAdvisoryOwner> {
+    let observed: Vec<u8> = conn.query_row(
+        "SELECT observed_witness FROM archive_v3_advisory_owners
+         WHERE maintenance_operation_id=?1 AND format_version=1 AND stage='bound'",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let observed = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &observed,
+        "advisory owner observed witness",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid advisory owner observed witness".into()))?;
+    load_bound_advisory_owner_conn(conn, operation_id, &observed)
+}
+
 fn reserve_advisory_owner_conn(
     conn: &Connection,
     operation_id: MaintenanceImportOperationId,
@@ -9356,7 +9376,7 @@ fn bind_advisory_owner_conn(
     }
     let bound = BoundAdvisoryOwner::bind_for_control(token, reserved, observed.clone(), lease)
         .map_err(map_advisory_owner_error)?;
-    let (_, _, _, _, _, next_revision, next_commitment) = bound.control_view(token);
+    let (_, _, _, _, _, _, next_revision, next_commitment) = bound.control_view(token);
     if tx.execute(
         "UPDATE archive_v3_advisory_owners
          SET lease_predecessor_witness=?1,observed_witness=?2,stage='bound',
@@ -9389,6 +9409,117 @@ fn bind_advisory_owner_conn(
     if loaded.control_view(token) != bound.control_view(token) {
         return Err(EnclaveError::Conflict(
             "advisory owner exact readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn persist_advisory_owner_successor_conn(
+    conn: &Connection,
+    previous: &crate::archive_v3_witness::WitnessRecord,
+    observed: &crate::archive_v3_witness::WitnessRecord,
+    lease: crate::archive_v3_witness::WitnessLease,
+) -> Result<(BoundAdvisoryOwner, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let tx = conn.unchecked_transaction()?;
+    let (stored_operation, stored_observed): (Vec<u8>, Vec<u8>) = tx.query_row(
+        "SELECT maintenance_operation_id,observed_witness FROM archive_v3_advisory_owners
+         WHERE archive_id=?1 AND format_version=1 AND stage='bound'",
+        [observed.archive_id().as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&stored_operation, "advisory owner maintenance operation")?,
+    )
+    .map_err(maintenance_store_error)?;
+    if stored_observed.as_slice() == observed.encode().as_slice() {
+        let already = load_bound_advisory_owner_conn(&tx, operation_id, observed)?;
+        let (_, already_owner, _, predecessor, next_observed, stored_lease, _, _) =
+            already.control_view(token);
+        let exact_lease = observed
+            .exact_advisory_owner_heartbeat_from(previous, already_owner.as_bytes())
+            .or_else(|_| {
+                observed.exact_advisory_owner_reacquire_from(previous, already_owner.as_bytes())
+            });
+        if predecessor != previous
+            || next_observed != observed
+            || exact_lease.ok() != Some(lease)
+            || stored_lease != lease
+        {
+            return Err(EnclaveError::Conflict(
+                "advisory owner exact lease successor changed".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((already, false));
+    }
+    let retained_observed = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &stored_observed,
+        "advisory owner retained observed witness",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid advisory owner observed witness".into()))?;
+    if &retained_observed != previous {
+        return Err(EnclaveError::Conflict(
+            "advisory owner lease predecessor changed".into(),
+        ));
+    }
+    let retained = load_bound_advisory_owner_conn(&tx, operation_id, previous)?;
+    let next = BoundAdvisoryOwner::successor_for_control(
+        token,
+        &retained,
+        previous.clone(),
+        observed.clone(),
+        lease,
+    )
+    .map_err(map_advisory_owner_error)?;
+    let (
+        operation_id,
+        owner_id,
+        expected,
+        old_predecessor,
+        old_observed,
+        _,
+        old_revision,
+        old_commitment,
+    ) = retained.control_view(token);
+    let (_, _, _, predecessor, next_observed, _, revision, commitment) = next.control_view(token);
+    if tx.execute(
+        "UPDATE archive_v3_advisory_owners
+         SET lease_predecessor_witness=?1,observed_witness=?2,commitment=?3,revision=?4,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?5 AND format_version=1 AND maintenance_operation_id=?6
+           AND owner_id=?7 AND expected_witness=?8 AND lease_predecessor_witness=?9
+           AND observed_witness=?10 AND stage='bound' AND commitment=?11 AND revision=?12",
+        rusqlite::params![
+            predecessor.encode().as_slice(),
+            next_observed.encode().as_slice(),
+            commitment.as_slice(),
+            i64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("advisory owner revision overflow".into()))?,
+            observed.archive_id().as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            owner_id.as_bytes().as_slice(),
+            expected.encode().as_slice(),
+            old_predecessor.encode().as_slice(),
+            old_observed.encode().as_slice(),
+            old_commitment.as_slice(),
+            i64::try_from(old_revision)
+                .map_err(|_| EnclaveError::Store("advisory owner revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory owner lease successor raced".into(),
+        ));
+    }
+    let loaded = load_bound_advisory_owner_conn(&tx, operation_id, observed)?;
+    if loaded.control_view(token) != next.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory owner successor readback changed".into(),
         ));
     }
     tx.commit()?;
@@ -19378,6 +19509,30 @@ impl AdvisoryOwnerControl for ControlStore {
             .await
             .map_err(map_advisory_persistence_error)
     }
+
+    async fn load_retained_advisory_owner(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        operation_id: MaintenanceImportOperationId,
+    ) -> std::result::Result<BoundAdvisoryOwner, AdvisoryOwnerError> {
+        self.read(|conn| load_retained_advisory_owner_conn(conn, operation_id))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
+
+    async fn persist_advisory_owner_successor(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        previous: &crate::archive_v3_witness::WitnessRecord,
+        observed: &crate::archive_v3_witness::WitnessRecord,
+        lease: crate::archive_v3_witness::WitnessLease,
+    ) -> std::result::Result<BoundAdvisoryOwner, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            persist_advisory_owner_successor_conn(conn, previous, observed, lease)
+        })
+        .await
+        .map_err(map_advisory_persistence_error)
+    }
 }
 
 #[async_trait::async_trait]
@@ -27364,7 +27519,7 @@ mod tests {
         assert_eq!(
             bound
                 .control_view(AdvisoryOwnerPersistenceContext::for_test())
-                .3,
+                .4,
             &observed
         );
         let (replayed_bound, changed) =
@@ -27381,8 +27536,41 @@ mod tests {
             bound.control_view(AdvisoryOwnerPersistenceContext::for_test())
         );
 
-        let substituted = observed
-            .with_next_fencing_epoch_for_test(observed.root().root().sequence().saturating_add(10));
+        let renewed = observed.renewed_maintenance_lease_for_test();
+        let renewed_lease = renewed
+            .exact_advisory_owner_heartbeat_from(&observed, owner.as_bytes())
+            .unwrap();
+        let (renewed_bound, changed) =
+            persist_advisory_owner_successor_conn(&conn, &observed, &renewed, renewed_lease)
+                .unwrap();
+        assert!(changed);
+        let (replayed_renewal, changed) =
+            persist_advisory_owner_successor_conn(&conn, &observed, &renewed, renewed_lease)
+                .unwrap();
+        assert!(!changed);
+        assert_eq!(
+            replayed_renewal.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            renewed_bound.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+
+        let reacquired = renewed.reacquired_maintenance_lease_for_test();
+        let reacquired_lease = reacquired
+            .exact_advisory_owner_reacquire_from(&renewed, owner.as_bytes())
+            .unwrap();
+        let (reacquired_bound, changed) =
+            persist_advisory_owner_successor_conn(&conn, &renewed, &reacquired, reacquired_lease)
+                .unwrap();
+        assert!(changed);
+        assert_eq!(
+            load_retained_advisory_owner_conn(&conn, maintenance.operation_id)
+                .unwrap()
+                .control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            reacquired_bound.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+
+        let substituted = reacquired.with_next_fencing_epoch_for_test(
+            reacquired.root().root().sequence().saturating_add(10),
+        );
         assert!(
             load_bound_advisory_owner_conn(&conn, maintenance.operation_id, &substituted).is_err()
         );
@@ -27394,9 +27582,34 @@ mod tests {
             )
         )
         .is_err());
+        conn.execute_batch(
+            "CREATE TRIGGER corrupt_advisory_owner_successor
+             AFTER UPDATE ON archive_v3_advisory_owners
+             WHEN NEW.revision=6
+             BEGIN
+               UPDATE archive_v3_advisory_owners
+               SET commitment=zeroblob(32)
+               WHERE archive_id=NEW.archive_id;
+             END;",
+        )
+        .unwrap();
+        let later = reacquired.renewed_maintenance_lease_for_test();
+        let later_lease = later
+            .exact_advisory_owner_heartbeat_from(&reacquired, owner.as_bytes())
+            .unwrap();
+        assert!(
+            persist_advisory_owner_successor_conn(&conn, &reacquired, &later, later_lease,)
+                .is_err()
+        );
+        assert_eq!(
+            load_retained_advisory_owner_conn(&conn, maintenance.operation_id)
+                .unwrap()
+                .control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            reacquired_bound.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
         assert_eq!(
             conn.query_row(
-                "SELECT count(*) FROM archive_v3_advisory_owners WHERE stage='bound' AND revision=3",
+                "SELECT count(*) FROM archive_v3_advisory_owners WHERE stage='bound' AND revision=5",
                 [],
                 |row| row.get::<_, i64>(0),
             )

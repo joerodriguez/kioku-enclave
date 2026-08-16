@@ -19,7 +19,8 @@
 //! The sealed owner has two type-separated consumers: an advisory importer
 //! that can stop only at verified ShadowWal, and the later authority importer.
 //! The advisory handoff may then be consumed by a second token-gated view that
-//! exposes only exact witness read/acquire. None has a startup caller.
+//! exposes only exact witness read/acquire/same-owner-maintain. None has a
+//! startup caller.
 
 use std::{fmt, sync::Arc};
 
@@ -325,9 +326,9 @@ impl ArchiveV3ShadowRuntimeBundle {
     }
 }
 
-/// Consuming Phase-1 runtime view. It exposes only exact witness read/acquire;
-/// immutable objects, registries, roots, deletion, and provider coordinates
-/// remain unreachable.
+/// Consuming Phase-1 runtime view. It exposes only exact witness read,
+/// acquire, and same-owner maintain; immutable objects, registries, roots,
+/// deletion, and provider coordinates remain unreachable.
 pub(crate) struct AdvisoryOwnerRuntimeOwner {
     bundle: ArchiveV3ShadowRuntimeBundle,
 }
@@ -360,6 +361,36 @@ impl AdvisoryOwnerRuntimeOwner {
     > {
         self.witness()
             .acquire_owner_lease(&expected, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn maintain_advisory_owner_lease_unresolved(
+        &self,
+        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        previous: WitnessRecord,
+        owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> Result<
+        (WitnessRecord, WitnessLease),
+        crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
+    > {
+        self.witness()
+            .maintain_owner_lease(&previous, owner, duration_ticks)
+            .await
+    }
+
+    pub(crate) async fn reacquire_advisory_owner_lease_unresolved(
+        &self,
+        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        previous: WitnessRecord,
+        owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> Result<
+        (WitnessRecord, WitnessLease),
+        crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
+    > {
+        self.witness()
+            .reacquire_owner_lease(&previous, owner, duration_ticks)
             .await
     }
 }

@@ -856,6 +856,87 @@ impl WitnessRecord {
         Ok(lease)
     }
 
+    /// Authenticate one live Phase-1 advisory-owner heartbeat. Trusted time
+    /// and lease expiry may move forward at the same fence; every archive,
+    /// graph, registry, migration, deletion, and owner field remains exact.
+    pub(crate) fn exact_advisory_owner_heartbeat_from(
+        &self,
+        previous: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let previous_lease = previous.exact_active_lease_for_owner(owner)?;
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.valid()
+            || !previous.valid()
+            || self.archive_id != previous.archive_id
+            || self.database_epoch != previous.database_epoch
+            || self.database_epoch_generation != previous.database_epoch_generation
+            || self.predecessor != previous.predecessor
+            || self.root != previous.root
+            || self.registry != previous.registry
+            || self.current_fencing_epoch != previous.current_fencing_epoch
+            || self.next_fencing_epoch != previous.next_fencing_epoch
+            || self.last_server_tick < previous.last_server_tick
+            || self.lease_expires_at_tick < previous.lease_expires_at_tick
+            || lease.fencing_epoch != previous_lease.fencing_epoch
+            || self.migration != MigrationState::ShadowWal
+            || previous.migration != MigrationState::ShadowWal
+            || self.deletion != DeletionState::Active
+            || previous.deletion != DeletionState::Active
+            || self.deletion_fencing_epoch != previous.deletion_fencing_epoch
+            || self.deletion_worker_id != previous.deletion_worker_id
+            || self.deletion_operation_id != previous.deletion_operation_id
+            || self.deletion_evidence != previous.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
+    /// Authenticate the sole Phase-1 advisory-owner takeover after the exact
+    /// retained lease expired. Only trusted time, expiry, and the canonical
+    /// next fence pair may advance; root publication remains impossible.
+    pub(crate) fn exact_advisory_owner_reacquire_from(
+        &self,
+        previous: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let previous_lease = previous.exact_active_lease_for_owner(owner)?;
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !self.valid()
+            || !previous.valid()
+            || self.archive_id != previous.archive_id
+            || self.database_epoch != previous.database_epoch
+            || self.database_epoch_generation != previous.database_epoch_generation
+            || self.predecessor != previous.predecessor
+            || self.root != previous.root
+            || self.registry != previous.registry
+            || self.current_fencing_epoch != previous.next_fencing_epoch
+            || self.next_fencing_epoch
+                != self
+                    .current_fencing_epoch
+                    .checked_add(1)
+                    .ok_or(WitnessError::Fenced)?
+            || self.last_server_tick < previous.lease_expires_at_tick
+            || self.last_server_tick <= previous.last_server_tick
+            || self.lease_expires_at_tick <= previous.lease_expires_at_tick
+            || lease.fencing_epoch <= previous_lease.fencing_epoch
+            || self.migration != MigrationState::ShadowWal
+            || previous.migration != MigrationState::ShadowWal
+            || self.deletion != DeletionState::Active
+            || previous.deletion != DeletionState::Active
+            || self.deletion_fencing_epoch != previous.deletion_fencing_epoch
+            || self.deletion_worker_id != previous.deletion_worker_id
+            || self.deletion_operation_id != previous.deletion_operation_id
+            || self.deletion_evidence != previous.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
     /// Validate a fresh current ordinary-root descendant against the durable
     /// owner acquisition. Root and trusted tick may advance; the complete
     /// owner lease, archive/database/key lineage, predecessor, registry,
@@ -2670,6 +2751,106 @@ impl InMemoryWitness {
         current.lease_expires_at_tick = expires_at_tick;
         let lease = current.exact_active_lease_for_owner(owner)?;
         current.exact_advisory_owner_acquire_from(expected, owner.as_bytes())?;
+        Ok((current.clone(), lease))
+    }
+
+    /// Phase-1 advisory heartbeat/reacquire transaction. The provider's
+    /// trusted transaction tick decides whether the current fence is retained
+    /// or the expired owner is reacquired at the canonical next fence.
+    pub(crate) fn maintain_exact_advisory_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: ObjectId,
+        duration: u64,
+    ) -> Result<(WitnessRecord, WitnessLease)> {
+        if !nonzero_id(owner.as_bytes())
+            || duration == 0
+            || previous.deletion != DeletionState::Active
+            || previous.migration != MigrationState::ShadowWal
+            || previous.owner_id != Some(owner)
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&previous.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        if current != previous {
+            return Err(WitnessError::CompareFailed);
+        }
+        let now = self.now(current)?;
+        if now >= previous.lease_expires_at_tick {
+            let expires_at_tick = expiry(now, duration)?;
+            let fencing_epoch = current.next_fencing_epoch;
+            current.current_fencing_epoch = fencing_epoch;
+            current.next_fencing_epoch = fencing_epoch
+                .checked_add(1)
+                .ok_or(WitnessError::Malformed)?;
+            current.owner_id = Some(owner);
+            current.lease_expires_at_tick = expires_at_tick;
+        } else {
+            let remaining = previous
+                .lease_expires_at_tick
+                .checked_sub(now)
+                .ok_or(WitnessError::Malformed)?;
+            if remaining <= duration / 2 {
+                let next_expiry = expiry(now, duration)?;
+                if next_expiry > current.lease_expires_at_tick {
+                    current.lease_expires_at_tick = next_expiry;
+                }
+            }
+        }
+        let lease = current.exact_active_lease_for_owner(owner)?;
+        if current.current_fencing_epoch == previous.current_fencing_epoch {
+            current.exact_advisory_owner_heartbeat_from(previous, owner.as_bytes())?;
+        } else {
+            current.exact_advisory_owner_reacquire_from(previous, owner.as_bytes())?;
+        }
+        Ok((current.clone(), lease))
+    }
+
+    /// Fresh-process advisory takeover. It never retains or heartbeats the
+    /// old fence: the exact prior lease must be expired at the provider's
+    /// trusted transaction tick before the canonical next fence is issued.
+    pub(crate) fn reacquire_exact_advisory_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: ObjectId,
+        duration: u64,
+    ) -> Result<(WitnessRecord, WitnessLease)> {
+        if !nonzero_id(owner.as_bytes())
+            || duration == 0
+            || previous.deletion != DeletionState::Active
+            || previous.migration != MigrationState::ShadowWal
+            || previous.owner_id != Some(owner)
+        {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&previous.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        if current != previous {
+            return Err(WitnessError::CompareFailed);
+        }
+        let now = self.now(current)?;
+        if now < previous.lease_expires_at_tick {
+            return Err(WitnessError::Fenced);
+        }
+        let expires_at_tick = expiry(now, duration)?;
+        let fencing_epoch = current.next_fencing_epoch;
+        current.current_fencing_epoch = fencing_epoch;
+        current.next_fencing_epoch = fencing_epoch
+            .checked_add(1)
+            .ok_or(WitnessError::Malformed)?;
+        current.owner_id = Some(owner);
+        current.lease_expires_at_tick = expires_at_tick;
+        let lease = current.exact_active_lease_for_owner(owner)?;
+        current.exact_advisory_owner_reacquire_from(previous, owner.as_bytes())?;
         Ok((current.clone(), lease))
     }
 
@@ -5326,6 +5507,52 @@ mod tests {
                 .unwrap(),
             lease
         );
+        let heartbeat_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(acquired.encode()),
+            acquired.last_server_tick + 1,
+        )
+        .unwrap();
+        let (heartbeat, heartbeat_lease) = heartbeat_provider
+            .maintain_exact_advisory_owner_lease(&acquired, owner, 20)
+            .unwrap();
+        assert_eq!(
+            heartbeat
+                .exact_advisory_owner_heartbeat_from(&acquired, owner.as_bytes())
+                .unwrap(),
+            heartbeat_lease
+        );
+        assert!(heartbeat
+            .with_migration_for_test(MigrationState::WalAuthoritative)
+            .exact_advisory_owner_heartbeat_from(&acquired, owner.as_bytes())
+            .is_err());
+
+        let premature = InMemoryWitness::from_provider_record_at_tick(
+            Some(heartbeat.encode()),
+            heartbeat.last_server_tick + 1,
+        )
+        .unwrap();
+        assert!(premature
+            .reacquire_exact_advisory_owner_lease(&heartbeat, owner, 20)
+            .is_err());
+
+        let reacquire_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(heartbeat.encode()),
+            heartbeat.lease_expires_at_tick,
+        )
+        .unwrap();
+        let (reacquired, reacquired_lease) = reacquire_provider
+            .reacquire_exact_advisory_owner_lease(&heartbeat, owner, 20)
+            .unwrap();
+        assert_eq!(
+            reacquired
+                .exact_advisory_owner_reacquire_from(&heartbeat, owner.as_bytes())
+                .unwrap(),
+            reacquired_lease
+        );
+        assert!(reacquired
+            .with_next_fencing_epoch_for_test(reacquired.next_fencing_epoch + 1)
+            .exact_advisory_owner_reacquire_from(&heartbeat, owner.as_bytes())
+            .is_err());
         assert!(acquired
             .with_next_fencing_epoch_for_test(acquired.next_fencing_epoch + 1)
             .exact_advisory_owner_acquire_from(&released, owner.as_bytes())
