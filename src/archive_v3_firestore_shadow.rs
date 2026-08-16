@@ -252,6 +252,25 @@ impl MaintenanceImportWitnessProvider for FirestoreShadowWitness {
             })
     }
 
+    async fn release_advisory_lease_unresolved(
+        &self,
+        retained: WitnessRecord,
+        owner: crate::archive_v3::ObjectId,
+    ) -> Result<(), MaintenanceWitnessCommitError> {
+        self.witness
+            .release_exact_maintenance_advisory_unresolved_async(retained, owner)
+            .await
+            .map_err(|error| match error {
+                FirestoreWitnessCommitError::Rejected(_) => MaintenanceWitnessCommitError::Rejected,
+                FirestoreWitnessCommitError::Failed(_) => {
+                    MaintenanceWitnessCommitError::DefinitelyFailed
+                }
+                FirestoreWitnessCommitError::OutcomeUnknown => {
+                    MaintenanceWitnessCommitError::OutcomeUnknown
+                }
+            })
+    }
+
     async fn advance_migration_unresolved(
         &self,
         expected: WitnessRecord,

@@ -3,7 +3,8 @@
     reason = "inactive ADR-0022 maintenance import is compiled and tested before any external launcher or serving wiring"
 )]
 
-//! Inactive, single-archive ADR-0022 maintenance importer.
+//! Inactive, single-archive ADR-0022 maintenance importer and Phase-1
+//! advisory-shadow bootstrap.
 //!
 //! This module is the sole owner of the maintenance state machine. It accepts
 //! only a sealed image-bound runtime, an encrypted-control plan, and a
@@ -11,7 +12,9 @@
 //! result, delete operation, prefix listing, or production policy switch.
 //! Every provider-visible candidate is durable before send and every ambiguous
 //! send is reconciled from the exact witness record before another candidate
-//! can exist.
+//! can exist. A type-separated advisory owner stops after full parity at
+//! ShadowWal, releases only that exact maintenance lease, drops every Store
+//! admission guard, and cannot request the later WalAuthoritative transition.
 
 use std::{
     fmt,
@@ -756,6 +759,12 @@ pub(crate) trait MaintenanceImportWitnessProvider: Send + Sync {
         owner: ObjectId,
     ) -> Result<(), MaintenanceWitnessCommitError>;
 
+    async fn release_advisory_lease_unresolved(
+        &self,
+        retained: WitnessRecord,
+        owner: ObjectId,
+    ) -> Result<(), MaintenanceWitnessCommitError>;
+
     async fn advance_migration_unresolved(
         &self,
         expected: WitnessRecord,
@@ -882,6 +891,24 @@ pub(crate) struct SingleArchiveMaintenanceImporter {
     plan: AuthenticatedMaintenanceImportPlan,
 }
 
+/// Type-separated Phase-1 owner. It can stop only at independently verified
+/// ShadowWal and has no method that can request the WalAuthoritative
+/// transition.
+pub(crate) struct SingleArchiveAdvisoryShadowImporter {
+    inner: SingleArchiveMaintenanceImporter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceImportTarget {
+    AdvisoryShadow,
+    WalAuthoritative,
+}
+
+enum CompletedMaintenanceImport {
+    Advisory(Box<CompletedAdvisoryShadowHandoff>),
+    WalAuthoritative(Box<CompletedMaintenanceWalHandoff>),
+}
+
 impl SingleArchiveMaintenanceImporter {
     #[allow(
         clippy::too_many_arguments,
@@ -949,12 +976,19 @@ impl SingleArchiveMaintenanceImporter {
     pub(crate) async fn run(
         self,
     ) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
-        tokio::spawn(self.run_owned())
+        let completed = tokio::spawn(self.run_owned(MaintenanceImportTarget::WalAuthoritative))
             .await
-            .map_err(|_| MaintenanceImportError::Unavailable)?
+            .map_err(|_| MaintenanceImportError::Unavailable)??;
+        match completed {
+            CompletedMaintenanceImport::WalAuthoritative(handoff) => Ok(*handoff),
+            CompletedMaintenanceImport::Advisory(_) => Err(MaintenanceImportError::Corrupt),
+        }
     }
 
-    async fn run_owned(self) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
+    async fn run_owned(
+        self,
+        target: MaintenanceImportTarget,
+    ) -> Result<CompletedMaintenanceImport, MaintenanceImportError> {
         let Self {
             archive_id,
             archive_binding,
@@ -979,6 +1013,16 @@ impl SingleArchiveMaintenanceImporter {
             .map_err(|_| MaintenanceImportError::Corrupt)?;
         let mut record = persistence.load_exact(operation_id).await?;
         if record.stage == MaintenanceImportStage::ManualRequired {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        if target == MaintenanceImportTarget::AdvisoryShadow
+            && matches!(
+                record.stage,
+                MaintenanceImportStage::AuthoritativeUploading
+                    | MaintenanceImportStage::AuthoritativeSendUnknown
+                    | MaintenanceImportStage::WalAuthoritative
+            )
+        {
             return Err(MaintenanceImportError::Conflict);
         }
 
@@ -1205,6 +1249,24 @@ impl SingleArchiveMaintenanceImporter {
             )
             .await?;
         }
+        if target == MaintenanceImportTarget::AdvisoryShadow
+            && record.stage == MaintenanceImportStage::ParityVerified
+        {
+            return finish_advisory_import(
+                &record,
+                persistence.as_ref(),
+                witness.as_ref(),
+                owner_id,
+                archive_id,
+                source,
+                pinned,
+                runtime,
+                archive_binding,
+                control,
+            )
+            .await
+            .map(|handoff| CompletedMaintenanceImport::Advisory(Box::new(handoff)));
+        }
         if record.stage == MaintenanceImportStage::WalAuthoritative {
             return finish_offline_import(
                 &record,
@@ -1218,7 +1280,8 @@ impl SingleArchiveMaintenanceImporter {
                 archive_binding,
                 control,
             )
-            .await;
+            .await
+            .map(|handoff| CompletedMaintenanceImport::WalAuthoritative(Box::new(handoff)));
         }
 
         current = witness
@@ -1284,6 +1347,22 @@ impl SingleArchiveMaintenanceImporter {
 
         if record.stage != MaintenanceImportStage::ParityVerified {
             return Err(MaintenanceImportError::Corrupt);
+        }
+        if target == MaintenanceImportTarget::AdvisoryShadow {
+            return finish_advisory_import(
+                &record,
+                persistence.as_ref(),
+                witness.as_ref(),
+                owner_id,
+                archive_id,
+                source,
+                pinned,
+                runtime,
+                archive_binding,
+                control,
+            )
+            .await
+            .map(|handoff| CompletedMaintenanceImport::Advisory(Box::new(handoff)));
         }
         let renewed = witness
             .read_current_exact(archive_id)
@@ -1395,6 +1474,73 @@ impl SingleArchiveMaintenanceImporter {
             control,
         )
         .await
+        .map(|handoff| CompletedMaintenanceImport::WalAuthoritative(Box::new(handoff)))
+    }
+}
+
+impl SingleArchiveAdvisoryShadowImporter {
+    pub(crate) fn from_maintenance_importer(inner: SingleArchiveMaintenanceImporter) -> Self {
+        Self { inner }
+    }
+
+    /// Run only through the Phase-1 advisory terminal. Dropping the caller
+    /// cannot detach a witness mutation or scratch owner because the complete
+    /// state machine remains in one owned task.
+    pub(crate) async fn run(
+        self,
+    ) -> Result<CompletedAdvisoryShadowHandoff, MaintenanceImportError> {
+        let completed = tokio::spawn(
+            self.inner
+                .run_owned(MaintenanceImportTarget::AdvisoryShadow),
+        )
+        .await
+        .map_err(|_| MaintenanceImportError::Unavailable)??;
+        match completed {
+            CompletedMaintenanceImport::Advisory(handoff) => Ok(*handoff),
+            CompletedMaintenanceImport::WalAuthoritative(_) => Err(MaintenanceImportError::Corrupt),
+        }
+    }
+}
+
+/// Non-cloneable Phase-1 terminal handoff. It proves the exact legacy source
+/// and independently recovered ShadowWal root matched before the maintenance
+/// lease was released. It carries no Store fence, serving policy,
+/// acknowledgement, route, or WalAuthoritative conversion.
+pub(crate) struct CompletedAdvisoryShadowHandoff {
+    _runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+    _terminal_witness: WitnessRecord,
+    _archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    _parity: CompletedAdvisoryShadowParityEvidence,
+    _control: Arc<crate::cp::control_store::ControlStore>,
+}
+
+/// Opaque proof retained only by the advisory handoff. The future live
+/// shadow owner must re-read this exact Control row and witness before it can
+/// obtain any capture or publication capability.
+pub(crate) struct CompletedAdvisoryShadowParityEvidence {
+    terminal_control: MaintenanceImportRecord,
+}
+
+impl CompletedAdvisoryShadowParityEvidence {
+    fn from_terminal(
+        terminal_control: MaintenanceImportRecord,
+        source: MaintenanceSourceBinding,
+        terminal_witness: &WitnessRecord,
+    ) -> Result<Self, MaintenanceImportError> {
+        validate_advisory_parity_evidence(&terminal_control, source, terminal_witness)?;
+        Ok(Self { terminal_control })
+    }
+}
+
+impl fmt::Debug for CompletedAdvisoryShadowHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletedAdvisoryShadowHandoff(<advisory>)")
+    }
+}
+
+impl fmt::Debug for CompletedAdvisoryShadowParityEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletedAdvisoryShadowParityEvidence(<opaque>)")
     }
 }
 
@@ -1598,6 +1744,52 @@ async fn resume_retained_send(
     clippy::too_many_arguments,
     reason = "explicit authenticated terminal handoff tuple; grouping would obscure exact binding"
 )]
+async fn finish_advisory_import(
+    expected_durable: &MaintenanceImportRecord,
+    persistence: &dyn MaintenanceImportPersistence,
+    witness: &dyn MaintenanceImportWitnessProvider,
+    owner_id: ObjectId,
+    archive_id: ArchiveId,
+    source: MaintenanceSourceBinding,
+    pinned: crate::store::PinnedLegacySnapshot,
+    runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+    archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    control: Arc<crate::cp::control_store::ControlStore>,
+) -> Result<CompletedAdvisoryShadowHandoff, MaintenanceImportError> {
+    let durable = persistence
+        .load_exact(expected_durable.operation_id)
+        .await?;
+    validate_exact_advisory_control(expected_durable, &durable, source)?;
+    let released =
+        authenticate_and_release_advisory_witness(&durable, witness, owner_id, archive_id).await?;
+    pinned
+        .exact_generation_revalidation()
+        .verify()
+        .await
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    let exact_durable = persistence
+        .load_exact(expected_durable.operation_id)
+        .await?;
+    validate_exact_advisory_control(&durable, &exact_durable, source)?;
+    let parity =
+        CompletedAdvisoryShadowParityEvidence::from_terminal(exact_durable, source, &released)?;
+    // Dropping the pinned source scrubs its DB/WAL/SHM family and releases all
+    // legacy Store admission guards. Unlike the authoritative handoff, Phase
+    // 1 deliberately transfers no long-lived Store fence.
+    drop(pinned);
+    Ok(CompletedAdvisoryShadowHandoff {
+        _runtime: runtime,
+        _terminal_witness: released,
+        _archive_binding: archive_binding,
+        _parity: parity,
+        _control: control,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit authenticated terminal handoff tuple; grouping would obscure exact binding"
+)]
 async fn finish_offline_import(
     expected_durable: &MaintenanceImportRecord,
     persistence: &dyn MaintenanceImportPersistence,
@@ -1638,6 +1830,130 @@ async fn finish_offline_import(
         control,
         store_fence,
     })
+}
+
+fn validate_advisory_parity_evidence(
+    terminal_control: &MaintenanceImportRecord,
+    source: MaintenanceSourceBinding,
+    terminal_witness: &WitnessRecord,
+) -> Result<(), MaintenanceImportError> {
+    if terminal_control.stage() != MaintenanceImportStage::ParityVerified
+        || terminal_control.source() != Some(source)
+        || terminal_control.parity_commitment.is_none()
+        || terminal_control.authoritative_candidate_record()?.is_some()
+        || terminal_witness.archive_id() != terminal_control.archive_id
+        || terminal_witness.deletion() != DeletionState::Active
+        || terminal_witness.migration() != MigrationState::ShadowWal
+    {
+        return Err(MaintenanceImportError::Corrupt);
+    }
+    let retained_terminal = terminal_control
+        .witnessed_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    if terminal_witness
+        .exact_maintenance_advisory_or_release_from(&retained_terminal, terminal_control.owner_id)
+        .map_err(|_| MaintenanceImportError::Conflict)?
+    {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    let retained_candidate = terminal_control
+        .shadow_candidate_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    let retained_root = RecoveryRoot::from_exact_active_record(&retained_candidate)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    let terminal_root = RecoveryRoot::from_exact_active_record(terminal_witness)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    if terminal_root != retained_root {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    Ok(())
+}
+
+fn validate_exact_advisory_control(
+    expected: &MaintenanceImportRecord,
+    observed: &MaintenanceImportRecord,
+    source: MaintenanceSourceBinding,
+) -> Result<(), MaintenanceImportError> {
+    if observed != expected
+        || observed.stage() != MaintenanceImportStage::ParityVerified
+        || observed.source() != Some(source)
+        || observed.parity_commitment.is_none()
+        || observed.authoritative_candidate_record()?.is_some()
+    {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    Ok(())
+}
+
+async fn authenticate_and_release_advisory_witness(
+    durable: &MaintenanceImportRecord,
+    witness: &dyn MaintenanceImportWitnessProvider,
+    owner_id: ObjectId,
+    archive_id: ArchiveId,
+) -> Result<WitnessRecord, MaintenanceImportError> {
+    if durable.stage() != MaintenanceImportStage::ParityVerified
+        || durable.parity_commitment.is_none()
+        || durable.authoritative_candidate_record()?.is_some()
+    {
+        return Err(MaintenanceImportError::Corrupt);
+    }
+    let retained_terminal = durable
+        .witnessed_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    let retained_candidate = durable
+        .shadow_candidate_record()?
+        .ok_or(MaintenanceImportError::Corrupt)?;
+    let retained_root = RecoveryRoot::from_exact_active_record(&retained_candidate)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    let terminal = witness
+        .read_current_exact(archive_id)
+        .await
+        .map_err(|_| MaintenanceImportError::Unavailable)?;
+    require_active_migration(&terminal, archive_id, MigrationState::ShadowWal)?;
+    let terminal_requires_release = terminal
+        .exact_maintenance_advisory_or_release_from(&retained_terminal, owner_id)
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    let terminal_root = RecoveryRoot::from_exact_active_record(&terminal)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    if terminal_root != retained_root {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    let release_outcome = if terminal_requires_release {
+        Some(
+            witness
+                .release_advisory_lease_unresolved(retained_terminal.clone(), owner_id)
+                .await,
+        )
+    } else {
+        None
+    };
+    let released = witness
+        .read_current_exact(archive_id)
+        .await
+        .map_err(|_| MaintenanceImportError::Unavailable)?;
+    require_active_migration(&released, archive_id, MigrationState::ShadowWal)?;
+    let released_requires_release = released
+        .exact_maintenance_advisory_or_release_from(&retained_terminal, owner_id)
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    let released_root = RecoveryRoot::from_exact_active_record(&released)
+        .map_err(|_| MaintenanceImportError::Corrupt)?;
+    if released_root != retained_root {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    if released_requires_release {
+        return Err(match release_outcome {
+            Some(Err(MaintenanceWitnessCommitError::DefinitelyFailed)) => {
+                MaintenanceImportError::Unavailable
+            }
+            Some(Err(MaintenanceWitnessCommitError::OutcomeUnknown)) | Some(Ok(())) => {
+                MaintenanceImportError::OutcomeUnknown
+            }
+            Some(Err(MaintenanceWitnessCommitError::Rejected)) | None => {
+                MaintenanceImportError::Conflict
+            }
+        });
+    }
+    Ok(released)
 }
 
 fn validate_terminal_parity_evidence(
@@ -2255,6 +2571,17 @@ mod tests {
                 .map_err(|_| MaintenanceWitnessCommitError::Rejected)
         }
 
+        async fn release_advisory_lease_unresolved(
+            &self,
+            retained: WitnessRecord,
+            owner: ObjectId,
+        ) -> Result<(), MaintenanceWitnessCommitError> {
+            self.0
+                .release_exact_maintenance_advisory(&retained, owner)
+                .map(|_| ())
+                .map_err(|_| MaintenanceWitnessCommitError::Rejected)
+        }
+
         async fn advance_migration_unresolved(
             &self,
             expected: WitnessRecord,
@@ -2421,6 +2748,33 @@ mod tests {
         .unwrap()
     }
 
+    fn advisory_record(fixture: &MigrationFixture) -> MaintenanceImportRecord {
+        MaintenanceImportRecord::from_control_persistence(
+            crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+            MaintenanceImportStage::ParityVerified,
+            fixture.archive_id,
+            fixture.operation_id,
+            fixture.owner_id,
+            1,
+            ShadowAttemptId::from_bytes([12; 16]),
+            1,
+            [13; 32],
+            Some(crate::store::MaintenanceTentativeSource {
+                base_generation: 1,
+                plaintext_hash: [0x31; 32],
+                plaintext_len: 4096,
+                sqlite_schema_version: 0,
+                wrapped_dek_commitment: [0x32; 32],
+            }),
+            Some(fixture.source),
+            Some(fixture.candidate.encode().to_vec()),
+            Some(fixture.candidate.encode().to_vec()),
+            Some([0x45; 32]),
+            None,
+        )
+        .unwrap()
+    }
+
     #[derive(Clone, Copy)]
     enum SendBehavior {
         CommitThenUnknown,
@@ -2491,6 +2845,28 @@ mod tests {
                 .unwrap();
                 *self.current.lock().unwrap() = local
                     .release_exact_maintenance_terminal(&retained, owner)
+                    .unwrap();
+                return Err(MaintenanceWitnessCommitError::OutcomeUnknown);
+            }
+            Err(MaintenanceWitnessCommitError::DefinitelyFailed)
+        }
+
+        async fn release_advisory_lease_unresolved(
+            &self,
+            retained: WitnessRecord,
+            owner: ObjectId,
+        ) -> Result<(), MaintenanceWitnessCommitError> {
+            self.revokes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.revoke_succeeds {
+                let current = self.current.lock().unwrap().clone();
+                let local = InMemoryWitness::from_provider_record_at_tick(
+                    Some(current.encode()),
+                    retained.last_server_tick().saturating_add(1),
+                )
+                .unwrap();
+                *self.current.lock().unwrap() = local
+                    .release_exact_maintenance_advisory(&retained, owner)
                     .unwrap();
                 return Err(MaintenanceWitnessCommitError::OutcomeUnknown);
             }
@@ -2966,6 +3342,96 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn advisory_handoff_releases_only_exact_shadow_wal_and_reopens_without_resend() {
+        let fixture = migration_fixture();
+        let durable = advisory_record(&fixture);
+        assert!(validate_exact_advisory_control(&durable, &durable, fixture.source).is_ok());
+
+        let failed = FakeWitness {
+            current: Mutex::new(fixture.candidate.clone()),
+            reads: AtomicUsize::new(0),
+            revokes: AtomicUsize::new(0),
+            sends: AtomicUsize::new(0),
+            behavior: SendBehavior::DefinitelyFailed,
+            revoke_succeeds: false,
+        };
+        assert!(matches!(
+            authenticate_and_release_advisory_witness(
+                &durable,
+                &failed,
+                fixture.owner_id,
+                fixture.archive_id,
+            )
+            .await,
+            Err(MaintenanceImportError::Unavailable)
+        ));
+        assert_eq!(failed.revokes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(failed.sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A lost release response is resolved only by the exact fresh
+        // no-owner ShadowWal record. Reopen observes that same terminal and
+        // performs no second mutation.
+        let lost_success = FakeWitness {
+            current: Mutex::new(fixture.candidate.clone()),
+            reads: AtomicUsize::new(0),
+            revokes: AtomicUsize::new(0),
+            sends: AtomicUsize::new(0),
+            behavior: SendBehavior::DefinitelyFailed,
+            revoke_succeeds: true,
+        };
+        let released = authenticate_and_release_advisory_witness(
+            &durable,
+            &lost_success,
+            fixture.owner_id,
+            fixture.archive_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(released.migration(), MigrationState::ShadowWal);
+        assert!(!released
+            .exact_maintenance_advisory_or_release_from(&fixture.candidate, fixture.owner_id)
+            .unwrap());
+        assert!(validate_advisory_parity_evidence(&durable, fixture.source, &released).is_ok());
+        let reads_before = lost_success.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let reopened = authenticate_and_release_advisory_witness(
+            &durable,
+            &lost_success,
+            fixture.owner_id,
+            fixture.archive_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened, released);
+        assert_eq!(
+            lost_success
+                .revokes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            lost_success.reads.load(std::sync::atomic::Ordering::SeqCst),
+            reads_before + 2
+        );
+        assert_eq!(
+            lost_success.sends.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        // Type/state separation is bidirectional: an advisory terminal is not
+        // an authority terminal and an authority record is not releasable by
+        // the advisory predicate.
+        assert!(released
+            .exact_maintenance_terminal_or_release_from(&fixture.candidate, fixture.owner_id)
+            .is_err());
+        let authoritative = fixture
+            .candidate
+            .with_migration_for_test(MigrationState::WalAuthoritative);
+        assert!(authoritative
+            .exact_maintenance_advisory_or_release_from(&fixture.candidate, fixture.owner_id)
+            .is_err());
+    }
+
     #[test]
     fn source_and_parity_commitments_are_exact_and_schema_zero_is_valid() {
         let fixture = migration_fixture();
@@ -3101,7 +3567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_sqlite_import_reaches_two_exact_zero_wal_roots_and_stays_offline() {
+    async fn real_sqlite_import_stops_advisory_reopens_and_fences_authority() {
         use crate::{
             cp::control_store::ControlStore,
             store::{tests::FakeGcs, tests::FakeKms, Store},
@@ -3229,22 +3695,224 @@ mod tests {
             plan,
         )
         .unwrap();
-        let handoff = importer.run().await.unwrap();
+        let advisory = SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(importer)
+            .run()
+            .await
+            .unwrap();
         assert_eq!(
-            format!("{handoff:?}"),
-            "CompletedMaintenanceWalHandoff(<offline>)"
+            format!("{advisory:?}"),
+            "CompletedAdvisoryShadowHandoff(<advisory>)"
         );
+        assert_eq!(
+            advisory._terminal_witness.migration(),
+            MigrationState::ShadowWal
+        );
+        assert_eq!(advisory._terminal_witness.root().root().sequence(), 1);
+        assert!(advisory
+            ._terminal_witness
+            .exact_active_lease_for_owner(owner_id)
+            .is_err());
+        assert_eq!(
+            advisory._parity.terminal_control.stage(),
+            MaintenanceImportStage::ParityVerified
+        );
+        drop(advisory);
+
+        // The advisory handoff releases every process-local Store guard. An
+        // advisory restart reacquires and revalidates the exact legacy source,
+        // observes the already-released witness, and remints no authority.
+        let restart_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let restart = SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(
+            SingleArchiveMaintenanceImporter::from_test_components(
+                archive_id,
+                Arc::clone(&objects),
+                Arc::clone(&registry_provider),
+                witness.clone(),
+                Arc::clone(&control),
+                Arc::clone(&store),
+                restart_plan,
+            )
+            .unwrap(),
+        )
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(
+            restart._terminal_witness.migration(),
+            MigrationState::ShadowWal
+        );
+        assert_eq!(restart._terminal_witness.root().root().sequence(), 1);
+        assert!(restart
+            ._terminal_witness
+            .exact_active_lease_for_owner(owner_id)
+            .is_err());
+        drop(restart);
+
+        // Selecting the later authority importer against a completed advisory
+        // terminal fails closed. A separately reviewed Phase-2 transition
+        // must define how it acquires new authority; the advisory type cannot
+        // silently continue into R2.
+        let authority_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let authority = SingleArchiveMaintenanceImporter::from_test_components(
+            archive_id,
+            objects,
+            registry_provider,
+            witness,
+            control,
+            store,
+            authority_plan,
+        )
+        .unwrap()
+        .run()
+        .await;
+        assert!(matches!(authority, Err(MaintenanceImportError::Conflict)));
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_authority_import_still_reaches_two_exact_roots_offline() {
+        use crate::{
+            cp::control_store::ControlStore,
+            store::{tests::FakeGcs, tests::FakeKms, Store},
+        };
+
+        let control = Arc::new(ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
+        let user = control
+            .upsert_user("maintenance-authority-e2e", "authority@example.com")
+            .await
+            .unwrap();
+        let plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let archive_id = plan.archive_id;
+        let owner_id = plan.owner_id;
+
+        let legacy_gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs));
+        store
+            .with_user(&user.id, |connection| {
+                connection.execute(
+                    "INSERT INTO app_metadata(key,value) VALUES('authority-e2e','exact')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(&user.id).await.unwrap();
+
+        let database_epoch = DatabaseEpoch::from_bytes([0x82; 16]);
+        let key_epoch = KeyEpoch::from_bytes([0x83; 16]);
+        let registry_object_id = ObjectId::from_bytes([0x84; 16]);
+        let wrapped = b"authority-registry-envelope".to_vec();
+        let registry_context = KeyRegistryContext::new(archive_id, KeyKind::Archive, key_epoch);
+        let plaintext = KeyRegistryPlaintext::encode_archive(
+            &registry_context,
+            &ArchiveDek::from_bytes([0x85; 32]),
+        )
+        .unwrap()
+        .to_vec();
+        let registries = Arc::new(TestRegistry {
+            object_id: registry_object_id,
+            wrapped: wrapped.clone(),
+            plaintext,
+        });
+        let cipher = resolve_archive_cipher(
+            &registry_context,
+            registry_object_id,
+            Sha256::digest(&wrapped).into(),
+            registries.as_ref(),
+        )
+        .await
+        .unwrap();
+        let backend = Arc::new(InMemoryImmutableBackend::new());
+        let initial_root_id = ObjectId::from_bytes([0x86; 16]);
+        let initial_context = ObjectContext::new(
+            archive_id,
+            database_epoch,
+            key_epoch,
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: 0 },
+            initial_root_id,
+            None,
+        )
+        .unwrap();
+        let initial_root = ArchiveRoot {
+            root_seq: 0,
+            parent: None,
+            database_epoch,
+            key_epoch,
+            owner_fencing_epoch: 0,
+            sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
+            logical_file_length: 0,
+            user_schema_version: 0,
+            storage_format_version: ARCHIVE_FORMAT_VERSION,
+            wal_generation: 0,
+            wal_commit_count: 0,
+            wal_segment_count: 0,
+            wal_tail_bytes: 0,
+            checkpoint_root: None,
+            extent_tree_root: None,
+            wal_commit_tail: None,
+        };
+        let initial_envelope = cipher
+            .seal(&initial_context, &initial_root.encode().unwrap())
+            .unwrap();
+        backend
+            .create_if_absent(initial_context.object_key(), initial_envelope.clone())
+            .await
+            .unwrap();
+        let witness = InMemoryWitness::with_incrementing_clock_for_test(1);
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive_id,
+                database_epoch,
+                RootCommitment::genesis(
+                    database_epoch,
+                    key_epoch,
+                    RootReference::new(0, initial_root_id, initial_envelope.hash()),
+                ),
+                KeyRegistryReference::new(
+                    key_epoch,
+                    0,
+                    registry_object_id,
+                    Sha256::digest(&wrapped).into(),
+                ),
+            ))
+            .unwrap();
+        let witness = Arc::new(InMemoryMaintenanceWitness(witness));
+        let objects: Arc<dyn ImmutableObjectBackend> = backend;
+        let registry_provider: Arc<dyn ExactKeyRegistryProvider> = registries;
+        let handoff = SingleArchiveMaintenanceImporter::from_test_components(
+            archive_id,
+            Arc::clone(&objects),
+            Arc::clone(&registry_provider),
+            witness.clone(),
+            Arc::clone(&control),
+            Arc::clone(&store),
+            plan,
+        )
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
         assert!(handoff.store_fence.scratch_family_absent_for_test());
         let terminal = witness.read_current_exact(archive_id).await.unwrap();
         assert_eq!(terminal.migration(), MigrationState::WalAuthoritative);
         assert_eq!(terminal.root().root().sequence(), 2);
         assert_eq!(terminal.root().parent().unwrap().sequence(), 1);
-        assert_eq!(terminal.archive_id(), archive_id);
         assert!(terminal.exact_active_lease_for_owner(owner_id).is_err());
 
-        // The handoff, not the importer, now owns the process-local lifecycle
-        // and actor admission guards. A second transition cannot start while
-        // it is retained, even though its plaintext family is already gone.
         let blocked_plan = control
             .prepare_archive_v3_maintenance_import(&user.id)
             .await
@@ -3255,9 +3923,6 @@ mod tests {
             .await
             .is_err());
 
-        // Dropping the unconsumed handoff releases only process-local guards;
-        // durable/provider fences remain closed. Terminal restart must still
-        // reacquire and authenticate the exact pinned source before reminting.
         drop(handoff);
         let restart_plan = control
             .prepare_archive_v3_maintenance_import(&user.id)
@@ -3285,19 +3950,6 @@ mod tests {
             .is_err());
         let owner_view =
             restart.into_wal_owner(crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test());
-        assert_eq!(
-            format!("{:?}", owner_view.runtime),
-            "ArchiveV3ShadowRuntimeBundle(<inactive>)"
-        );
-        assert_eq!(
-            format!("{:?}", owner_view.archive_binding),
-            "DurableSingleArchiveBinding(<opaque>)"
-        );
-        assert_eq!(
-            owner_view.terminal_witness.migration(),
-            MigrationState::WalAuthoritative
-        );
-        assert!(owner_view.store_fence.scratch_family_absent_for_test());
         let retained_terminal = MaintenanceImportPersistence::load_exact(
             owner_view.control.as_ref(),
             owner_view.parity.operation_id_for_wal_owner(
@@ -3315,10 +3967,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            format!("{:?}", owner_view.parity),
-            "CompletedMaintenanceParityEvidence(<opaque>)"
+            owner_view.terminal_witness.migration(),
+            MigrationState::WalAuthoritative
         );
-        let _retained_authority = (owner_view.parity, owner_view.control);
+        assert!(owner_view.store_fence.scratch_family_absent_for_test());
     }
 
     #[test]
@@ -3330,6 +3982,8 @@ mod tests {
             concat!("impl Clone", " for AuthenticatedMaintenanceImportPlan"),
             concat!("impl Clone", " for CompletedMaintenanceWalHandoff"),
             concat!("impl Copy", " for CompletedMaintenanceWalHandoff"),
+            concat!("impl Clone", " for CompletedAdvisoryShadowHandoff"),
+            concat!("impl Copy", " for CompletedAdvisoryShadowHandoff"),
             concat!("pub(crate) fn user_", "id"),
             concat!("pub(crate) fn archive_", "id"),
             concat!("pub(crate) fn terminal_", "witness"),
@@ -3352,7 +4006,10 @@ mod tests {
         ] {
             assert!(!main.contains(forbidden), "production wiring: {forbidden}");
         }
-        assert!(source.contains(concat!("tokio::spawn(self.run_", "owned())")));
+        assert!(source.contains(concat!("tokio::spawn(self.run_", "owned(")));
+        assert!(source.contains(concat!("MaintenanceImportTarget::Advisory", "Shadow")));
+        assert!(source.contains(concat!("release_advisory_lease_", "unresolved")));
+        assert!(source.contains(concat!("exact_maintenance_advisory_or_", "release_from")));
         assert!(source.contains(concat!("into_wal_", "owner(")));
         assert!(source.contains(concat!("WalOwnerStore", "Context")));
         assert_eq!(
@@ -3362,7 +4019,7 @@ mod tests {
                     "operation_id)\n        .await?"
                 ))
                 .count(),
-            2
+            4
         );
         assert!(source.contains(concat!("exact_maintenance_terminal_or_", "release_from")));
         assert!(source.contains(concat!("release_terminal_lease_", "unresolved")));
