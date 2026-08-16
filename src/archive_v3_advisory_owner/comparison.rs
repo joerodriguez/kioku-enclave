@@ -180,6 +180,18 @@ impl AdvisoryComparisonSettlement {
             commitment: self.commitment,
         }
     }
+
+    pub(crate) fn authenticate_store_target(
+        &self,
+        _token: crate::store::StoreAdvisoryRetirementContext,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: crate::archive_v3_maintenance_import::MaintenanceImportOperationId,
+    ) -> Result<()> {
+        if self.archive_id != archive_id || self.operation_id != operation_id {
+            return Err(super::AdvisoryOwnerError::Conflict);
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

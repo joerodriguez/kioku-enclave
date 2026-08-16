@@ -4451,13 +4451,27 @@ mod tests {
             .unwrap();
         let resumed_owner = Arc::try_unwrap(resumed_owner)
             .expect("comparison tasks released the sole owner reference");
+        let settled_owner = resumed_owner.settle_comparison_for_test().await.unwrap();
         assert_eq!(
-            format!(
-                "{:?}",
-                resumed_owner.settle_comparison_for_test().await.unwrap()
-            ),
+            format!("{settled_owner:?}"),
             "SettledSingleArchiveAdvisoryOwner(<inactive>)"
         );
+        assert!(settled_owner.capture_is_retired_for_test().await);
+        settled_owner
+            .reconcile_capture_retirement_for_test()
+            .await
+            .unwrap();
+        store
+            .with_user(&user.id, |connection| {
+                connection.execute(
+                    "INSERT OR REPLACE INTO app_metadata(key,value) VALUES(?1,?2)",
+                    ["advisory-after-retirement", "legacy-still-authoritative"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(settled_owner.capture_is_retired_for_test().await);
 
         // Selecting the later authority importer against a completed advisory
         // terminal fails closed. A separately reviewed Phase-2 transition

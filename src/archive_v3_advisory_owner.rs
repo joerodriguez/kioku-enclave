@@ -1433,12 +1433,14 @@ struct LocallyResumedSingleArchiveAdvisoryOwner {
 }
 
 /// One-shot inactive Phase-1 comparison terminal. The exact successful
-/// comparison is durable in Control and restart-loadable, while the nested
-/// owner and Store target are unreachable. It has no acknowledgement,
-/// publication, provider, route, or authority-conversion operation.
+/// comparison is durable in Control and restart-loadable, and the exact Store
+/// capture is retired before construction, while the nested owner and target
+/// are unreachable. It has no acknowledgement, publication, provider, route,
+/// or authority-conversion operation.
 struct SettledSingleArchiveAdvisoryOwner {
     _owner: LocallyResumedSingleArchiveAdvisoryOwner,
     _settlement: AdvisoryComparisonSettlement,
+    _retired: crate::store::StoreAdvisoryCaptureRetired,
 }
 
 impl SingleArchiveAdvisoryOwner {
@@ -1834,9 +1836,16 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
             }
         };
         comparison::reauthenticate_boundary(&self).await?;
+        let retired = self
+            ._resumed_target
+            .retire_advisory_capture(&settlement)
+            .await
+            .map_err(map_advisory_store_error)?;
+        comparison::reauthenticate_boundary(&self).await?;
         Ok(SettledSingleArchiveAdvisoryOwner {
             _owner: self,
             _settlement: settlement,
+            _retired: retired,
         })
     }
 }
@@ -2098,6 +2107,28 @@ impl fmt::Debug for LocallyResumedAdvisoryOwnerTestHandle {
 impl fmt::Debug for SettledAdvisoryOwnerTestHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
+impl SettledAdvisoryOwnerTestHandle {
+    pub(crate) async fn capture_is_retired_for_test(&self) -> bool {
+        self.0
+            ._owner
+            ._resumed_target
+            .captured_commit_count_for_test()
+            .await
+            .is_none()
+    }
+
+    pub(crate) async fn reconcile_capture_retirement_for_test(&self) -> Result<()> {
+        self.0
+            ._owner
+            ._resumed_target
+            .retire_advisory_capture(&self.0._settlement)
+            .await
+            .map(|_| ())
+            .map_err(map_advisory_store_error)
     }
 }
 
