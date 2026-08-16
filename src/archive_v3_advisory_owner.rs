@@ -9,14 +9,15 @@
 //! initial witness transaction, and adopts only exact one-step acquisition,
 //! heartbeat, or post-expiry reacquire successors. It is deliberately separate
 //! from the `WalAuthoritative` publisher. It retains one sealed exact-user
-//! Store target and exposes no drain, root, object, cipher, acknowledgement,
+//! Store target and exposes no comparison, root, object, cipher, acknowledgement,
 //! route, task, configuration, or serving capability. A separate inactive
 //! release path lets only that target observe and delete its one permanent
 //! marker after Control durably freezes the owner. Provider confirmation leaves
 //! local gates closed; a second consuming terminal transition freshly
 //! reauthenticates witness and Control state before atomically installing one
 //! exact-user capture selection and reopening both gates together. The opaque
-//! result retains no database or drain operation in this slice.
+//! result retains no database operation. The resumed owner can select only an
+//! opaque cancellation-safe capture prefix; it cannot inspect or settle it.
 
 use std::{fmt, sync::Arc};
 
@@ -1398,7 +1399,7 @@ struct ReleasedSingleArchiveAdvisoryOwner {
 /// Terminal inactive owner after the exact provider and both process-local
 /// legacy fences are released. The nested owner remains unreachable, and the
 /// Store result retains only the installed exact-user capture registry and has
-/// no connection, drain, acknowledgement, or serving API.
+/// no connection, comparison, settlement, acknowledgement, or serving API.
 struct LocallyResumedSingleArchiveAdvisoryOwner {
     _owner: SingleArchiveAdvisoryOwner,
     _release: AdvisoryRelease,
@@ -1750,6 +1751,18 @@ impl ReleasedSingleArchiveAdvisoryOwner {
     }
 }
 
+impl LocallyResumedSingleArchiveAdvisoryOwner {
+    /// Borrow the terminal owner to select the exact queued capture prefix.
+    /// The returned Store value is opaque and cancellation restores the
+    /// prefix; comparison and settlement are intentionally absent here.
+    async fn begin_capture_drain(&self) -> Result<crate::store::StoreAdvisoryCapturedDrain> {
+        self._resumed_target
+            .begin_advisory_capture_drain()
+            .await
+            .map_err(map_advisory_store_error)
+    }
+}
+
 fn map_advisory_store_error(error: crate::error::EnclaveError) -> AdvisoryOwnerError {
     match error {
         crate::error::EnclaveError::Auth(_)
@@ -1920,6 +1933,12 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
             ._resumed_target
             .captured_commit_count_for_test()
             .await
+    }
+
+    pub(crate) async fn begin_capture_drain_for_test(
+        &self,
+    ) -> Result<crate::store::StoreAdvisoryCapturedDrain> {
+        self.0.begin_capture_drain().await
     }
 }
 
