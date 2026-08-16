@@ -30,9 +30,10 @@ use crate::{
         ObjectRole,
     },
     archive_v3_advisory_owner::{
-        AdvisoryFenceAbsence, AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError,
-        AdvisoryOwnerId, AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease,
-        AdvisoryReleaseStage, BoundAdvisoryOwner,
+        AdvisoryComparisonEvidence, AdvisoryComparisonSettlement, AdvisoryFenceAbsence,
+        AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError, AdvisoryOwnerId,
+        AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease, AdvisoryReleaseStage,
+        BoundAdvisoryOwner,
     },
     archive_v3_inventory_coordinator::{
         pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
@@ -605,6 +606,29 @@ CREATE TABLE IF NOT EXISTS archive_v3_advisory_releases (
             AND marker_name_commitment IS NOT NULL AND marker_generation IS NOT NULL
             AND marker_observation_commitment IS NOT NULL AND absence_commitment IS NOT NULL)
     )
+);
+-- One-shot, content-free successful Phase-1 comparison result. The row binds
+-- the exact released advisory owner to one opaque parity commitment. It does
+-- not contain captured bytes and grants no acknowledgement, Store, provider,
+-- publication, or authority-conversion capability.
+CREATE TABLE IF NOT EXISTS archive_v3_advisory_comparisons (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_v3_advisory_releases(archive_id)
+        CHECK(length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    maintenance_operation_id BLOB NOT NULL UNIQUE
+        CHECK(length(maintenance_operation_id)=16 AND maintenance_operation_id!=zeroblob(16)),
+    owner_id BLOB NOT NULL UNIQUE CHECK(length(owner_id)=16 AND owner_id!=zeroblob(16)),
+    owner_witness BLOB NOT NULL CHECK(length(owner_witness)=724),
+    owner_revision INTEGER NOT NULL CHECK(owner_revision>0),
+    owner_commitment BLOB NOT NULL
+        CHECK(length(owner_commitment)=32 AND owner_commitment!=zeroblob(32)),
+    release_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(release_commitment)=32 AND release_commitment!=zeroblob(32)),
+    evidence_commitment BLOB NOT NULL
+        CHECK(length(evidence_commitment)=32 AND evidence_commitment!=zeroblob(32)),
+    commitment BLOB NOT NULL CHECK(length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK(revision=1),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 -- Inactive single-owner WAL publication protocol. These rows contain only
 -- content-free authenticated bindings and immutable-object facts. They never
@@ -10010,6 +10034,199 @@ fn mark_advisory_fence_released_conn(
     if loaded.control_view(token) != next_view {
         return Err(EnclaveError::Conflict(
             "advisory release absence readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn load_advisory_comparison_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<AdvisoryComparisonSettlement> {
+    type AdvisoryComparisonRow = (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    );
+    let row: AdvisoryComparisonRow = conn.query_row(
+        "SELECT format_version,maintenance_operation_id,owner_id,owner_witness,
+                owner_revision,owner_commitment,release_commitment,evidence_commitment,
+                commitment,revision
+         FROM archive_v3_advisory_comparisons WHERE archive_id=?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        },
+    )?;
+    if row.0 != 1 || row.9 != 1 {
+        return Err(EnclaveError::Store(
+            "unsupported advisory comparison format".into(),
+        ));
+    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&row.1, "advisory comparison operation ID")?,
+    )
+    .map_err(maintenance_store_error)?;
+    let owner_id = AdvisoryOwnerId::from_control_bytes(
+        token,
+        fixed_blob::<16>(&row.2, "advisory comparison owner ID")?,
+    )
+    .map_err(map_advisory_owner_error)?;
+    let owner_witness = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &row.3,
+        "advisory comparison owner witness",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid advisory comparison owner witness".into()))?;
+    let settlement = AdvisoryComparisonSettlement::from_control(
+        token,
+        archive_id,
+        operation_id,
+        owner_id,
+        owner_witness,
+        u64::try_from(row.4)
+            .map_err(|_| EnclaveError::Store("invalid advisory comparison revision".into()))?,
+        fixed_blob::<32>(&row.5, "advisory comparison owner commitment")?,
+        fixed_blob::<32>(&row.6, "advisory comparison release commitment")?,
+        fixed_blob::<32>(&row.7, "advisory comparison evidence commitment")?,
+        fixed_blob::<32>(&row.8, "advisory comparison commitment")?,
+    )
+    .map_err(map_advisory_owner_error)?;
+    let view = settlement.control_view(token);
+    let release = load_advisory_release_conn(conn, archive_id)?;
+    let release_view = release.control_view(token);
+    if release_view.stage != AdvisoryReleaseStage::Released
+        || view.operation_id != release_view.operation_id
+        || view.owner_id != release_view.owner_id
+        || view.owner_witness != release_view.owner_witness
+        || view.owner_revision != release_view.owner_revision
+        || view.owner_commitment != release_view.owner_commitment
+        || view.release_commitment != release_view.commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory comparison predecessor changed".into(),
+        ));
+    }
+    Ok(settlement)
+}
+
+fn load_optional_advisory_comparison_conn(
+    conn: &Connection,
+    owner: &BoundAdvisoryOwner,
+    release: &AdvisoryRelease,
+) -> Result<Option<AdvisoryComparisonSettlement>> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let retained_release = load_optional_advisory_release_conn(conn, owner)?
+        .ok_or_else(|| EnclaveError::Conflict("advisory comparison release is absent".into()))?;
+    if retained_release.control_view(token) != release.control_view(token)
+        || retained_release.control_view(token).stage != AdvisoryReleaseStage::Released
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory comparison release changed".into(),
+        ));
+    }
+    let archive_id = release.control_view(token).archive_id;
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_comparisons WHERE archive_id=?1)",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    exists
+        .then(|| load_advisory_comparison_conn(conn, archive_id))
+        .transpose()
+}
+
+fn settle_advisory_comparison_conn(
+    conn: &Connection,
+    owner: &BoundAdvisoryOwner,
+    release: &AdvisoryRelease,
+    evidence: AdvisoryComparisonEvidence,
+) -> Result<(AdvisoryComparisonSettlement, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let tx = conn.unchecked_transaction()?;
+    let retained_release = load_optional_advisory_release_conn(&tx, owner)?
+        .ok_or_else(|| EnclaveError::Conflict("advisory comparison release is absent".into()))?;
+    if retained_release.control_view(token) != release.control_view(token)
+        || retained_release.control_view(token).stage != AdvisoryReleaseStage::Released
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory comparison release changed".into(),
+        ));
+    }
+    let expected = AdvisoryComparisonSettlement::from_evidence_for_control(
+        token,
+        owner,
+        &retained_release,
+        evidence,
+    )
+    .map_err(map_advisory_owner_error)?;
+    let expected_view = expected.control_view(token);
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_comparisons WHERE archive_id=?1)",
+        [expected_view.archive_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        let retained = load_advisory_comparison_conn(&tx, expected_view.archive_id)?;
+        if retained != expected {
+            return Err(EnclaveError::Conflict(
+                "advisory comparison already settled differently".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((retained, false));
+    }
+    if tx.execute(
+        "INSERT INTO archive_v3_advisory_comparisons
+         (archive_id,format_version,maintenance_operation_id,owner_id,owner_witness,
+          owner_revision,owner_commitment,release_commitment,evidence_commitment,
+          commitment,revision)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,1)",
+        rusqlite::params![
+            expected_view.archive_id.as_bytes().as_slice(),
+            expected_view.operation_id.as_bytes().as_slice(),
+            expected_view.owner_id.as_bytes().as_slice(),
+            expected_view.owner_witness.encode().as_slice(),
+            i64::try_from(expected_view.owner_revision).map_err(|_| EnclaveError::Store(
+                "advisory comparison owner revision overflow".into()
+            ))?,
+            expected_view.owner_commitment.as_slice(),
+            expected_view.release_commitment.as_slice(),
+            expected_view.evidence_commitment.as_slice(),
+            expected_view.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory comparison settlement raced".into(),
+        ));
+    }
+    let loaded = load_advisory_comparison_conn(&tx, expected_view.archive_id)?;
+    if loaded != expected {
+        return Err(EnclaveError::Conflict(
+            "advisory comparison settlement readback changed".into(),
         ));
     }
     tx.commit()?;
@@ -20134,6 +20351,31 @@ impl AdvisoryOwnerControl for ControlStore {
         .await
         .map_err(map_advisory_persistence_error)
     }
+
+    async fn settle_advisory_comparison(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+        evidence: AdvisoryComparisonEvidence,
+    ) -> std::result::Result<AdvisoryComparisonSettlement, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            settle_advisory_comparison_conn(conn, owner, release, evidence)
+        })
+        .await
+        .map_err(map_advisory_persistence_error)
+    }
+
+    async fn load_advisory_comparison(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+    ) -> std::result::Result<Option<AdvisoryComparisonSettlement>, AdvisoryOwnerError> {
+        self.read(|conn| load_optional_advisory_comparison_conn(conn, owner, release))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
 }
 
 #[async_trait::async_trait]
@@ -28211,6 +28453,79 @@ mod tests {
                 .unwrap()
                 .control_view(token)
                 == released.control_view(token)
+        );
+    }
+
+    #[test]
+    fn advisory_comparison_settlement_reopens_exactly_and_rolls_back_late_corruption() {
+        let conn = account_conn();
+        let bound = bound_advisory_owner_fixture(&conn);
+        let token = AdvisoryOwnerPersistenceContext::for_test();
+        let marker_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let authority = advisory_fence_authority(&conn);
+        let (prepared, _) = prepare_advisory_release_conn(&conn, &bound).unwrap();
+        let too_early = AdvisoryComparisonEvidence::for_control_test([0x80; 32]).unwrap();
+        assert!(settle_advisory_comparison_conn(&conn, &bound, &prepared, too_early).is_err());
+        let observation = AdvisoryFenceObservation::for_test(
+            &prepared,
+            &marker_name,
+            &authority,
+            "kioku-identity-rebind-fence-v1",
+            11,
+        )
+        .unwrap();
+        let (delete_started, _) =
+            mark_advisory_fence_delete_started_conn(&conn, &prepared, &observation).unwrap();
+        let absence = AdvisoryFenceAbsence::for_test(&delete_started, &marker_name).unwrap();
+        let (released, _) =
+            mark_advisory_fence_released_conn(&conn, &delete_started, &absence).unwrap();
+        assert!(
+            load_optional_advisory_comparison_conn(&conn, &bound, &released)
+                .unwrap()
+                .is_none()
+        );
+
+        let evidence = AdvisoryComparisonEvidence::for_control_test([0x81; 32]).unwrap();
+        let (settled, changed) =
+            settle_advisory_comparison_conn(&conn, &bound, &released, evidence).unwrap();
+        assert!(changed);
+        let settled_view = settled.control_view(token);
+        assert_eq!(settled_view.evidence_commitment, [0x81; 32]);
+        let reopened = load_optional_advisory_comparison_conn(&conn, &bound, &released)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened, settled);
+
+        let replay_evidence = AdvisoryComparisonEvidence::for_control_test([0x81; 32]).unwrap();
+        let (replayed, changed) =
+            settle_advisory_comparison_conn(&conn, &bound, &released, replay_evidence).unwrap();
+        assert!(!changed);
+        assert_eq!(replayed, settled);
+        let conflicting = AdvisoryComparisonEvidence::for_control_test([0x82; 32]).unwrap();
+        assert!(settle_advisory_comparison_conn(&conn, &bound, &released, conflicting).is_err());
+
+        conn.execute_batch(
+            "DELETE FROM archive_v3_advisory_comparisons;
+             CREATE TRIGGER corrupt_advisory_comparison_after_insert
+             AFTER INSERT ON archive_v3_advisory_comparisons
+             BEGIN
+               UPDATE archive_v3_advisory_comparisons
+               SET evidence_commitment=x'8383838383838383838383838383838383838383838383838383838383838383'
+               WHERE archive_id=NEW.archive_id;
+             END;",
+        )
+        .unwrap();
+        let late = AdvisoryComparisonEvidence::for_control_test([0x84; 32]).unwrap();
+        assert!(settle_advisory_comparison_conn(&conn, &bound, &released, late).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_comparisons",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "late exact-readback failure must roll back the terminal row"
         );
     }
 

@@ -9,8 +9,8 @@
 //! initial witness transaction, and adopts only exact one-step acquisition,
 //! heartbeat, or post-expiry reacquire successors. It is deliberately separate
 //! from the `WalAuthoritative` publisher. It retains one sealed exact-user
-//! Store target and exposes no comparison, root, object, cipher, acknowledgement,
-//! route, task, configuration, or serving capability. A separate inactive
+//! Store target and exposes no root, object, cipher, acknowledgement, route,
+//! task, configuration, or serving capability. A separate inactive
 //! release path lets only that target observe and delete its one permanent
 //! marker after Control durably freezes the owner. Provider confirmation leaves
 //! local gates closed; a second consuming terminal transition freshly
@@ -18,8 +18,11 @@
 //! exact-user capture selection and reopening both gates together. The opaque
 //! result retains no database operation. The resumed owner can select only an
 //! opaque cancellation-safe capture prefix; it cannot inspect or settle it.
+//! Its private comparison child may durably consume only a successful opaque
+//! result into a one-shot Control terminal, never a Store drain or user result.
 
 mod comparison;
+pub(crate) use comparison::{AdvisoryComparisonEvidence, AdvisoryComparisonSettlement};
 
 use std::{fmt, sync::Arc};
 
@@ -1332,6 +1335,21 @@ pub(crate) trait AdvisoryOwnerControl: Send + Sync {
         delete_started: &AdvisoryRelease,
         absence: &AdvisoryFenceAbsence,
     ) -> Result<AdvisoryRelease>;
+
+    async fn settle_advisory_comparison(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+        evidence: AdvisoryComparisonEvidence,
+    ) -> Result<AdvisoryComparisonSettlement>;
+
+    async fn load_advisory_comparison(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+    ) -> Result<Option<AdvisoryComparisonSettlement>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1412,6 +1430,15 @@ struct LocallyResumedSingleArchiveAdvisoryOwner {
     _owner: SingleArchiveAdvisoryOwner,
     _release: AdvisoryRelease,
     _resumed_target: crate::store::StoreAdvisoryResumedTarget,
+}
+
+/// One-shot inactive Phase-1 comparison terminal. The exact successful
+/// comparison is durable in Control and restart-loadable, while the nested
+/// owner and Store target are unreachable. It has no acknowledgement,
+/// publication, provider, route, or authority-conversion operation.
+struct SettledSingleArchiveAdvisoryOwner {
+    _owner: LocallyResumedSingleArchiveAdvisoryOwner,
+    _settlement: AdvisoryComparisonSettlement,
 }
 
 impl SingleArchiveAdvisoryOwner {
@@ -1776,6 +1803,42 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
     async fn compare_captured_prefix(&self) -> Result<comparison::AdvisoryComparisonEvidence> {
         comparison::compare_captured_prefix(self).await
     }
+
+    /// Consume the one-shot advisory owner into an exact durable comparison
+    /// terminal. A retained row is exact-loaded before any new local work, so
+    /// lost Control responses and owner restarts never run a second comparison.
+    async fn settle_comparison(self) -> Result<SettledSingleArchiveAdvisoryOwner> {
+        comparison::reauthenticate_boundary(&self).await?;
+        let settlement = match self
+            ._owner
+            ._control
+            .load_advisory_comparison(
+                AdvisoryOwnerRuntimeContext(()),
+                &self._owner._bound,
+                &self._release,
+            )
+            .await?
+        {
+            Some(retained) => retained,
+            None => {
+                let evidence = self.compare_captured_prefix().await?;
+                self._owner
+                    ._control
+                    .settle_advisory_comparison(
+                        AdvisoryOwnerRuntimeContext(()),
+                        &self._owner._bound,
+                        &self._release,
+                        evidence,
+                    )
+                    .await?
+            }
+        };
+        comparison::reauthenticate_boundary(&self).await?;
+        Ok(SettledSingleArchiveAdvisoryOwner {
+            _owner: self,
+            _settlement: settlement,
+        })
+    }
 }
 
 fn map_advisory_store_error(error: crate::error::EnclaveError) -> AdvisoryOwnerError {
@@ -1805,6 +1868,12 @@ impl fmt::Debug for LocallyResumedSingleArchiveAdvisoryOwner {
     }
 }
 
+impl fmt::Debug for SettledSingleArchiveAdvisoryOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SettledSingleArchiveAdvisoryOwner(<inactive>)")
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct AdvisoryOwnerTestHandle(SingleArchiveAdvisoryOwner);
 
@@ -1813,6 +1882,9 @@ pub(crate) struct ReleasedAdvisoryOwnerTestHandle(ReleasedSingleArchiveAdvisoryO
 
 #[cfg(test)]
 pub(crate) struct LocallyResumedAdvisoryOwnerTestHandle(LocallyResumedSingleArchiveAdvisoryOwner);
+
+#[cfg(test)]
+pub(crate) struct SettledAdvisoryOwnerTestHandle(SettledSingleArchiveAdvisoryOwner);
 
 #[cfg(test)]
 impl AdvisoryOwnerTestHandle {
@@ -1982,6 +2054,23 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
             .write_uncaptured_metadata_for_test(key, value)
             .await
     }
+
+    pub(crate) async fn delete_uncaptured_metadata_for_test(
+        &self,
+        key: &str,
+    ) -> crate::error::Result<()> {
+        self.0
+            ._resumed_target
+            .delete_uncaptured_metadata_for_test(key)
+            .await
+    }
+
+    pub(crate) async fn settle_comparison_for_test(self) -> Result<SettledAdvisoryOwnerTestHandle> {
+        self.0
+            .settle_comparison()
+            .await
+            .map(SettledAdvisoryOwnerTestHandle)
+    }
 }
 
 #[cfg(test)]
@@ -2000,6 +2089,13 @@ impl fmt::Debug for ReleasedAdvisoryOwnerTestHandle {
 
 #[cfg(test)]
 impl fmt::Debug for LocallyResumedAdvisoryOwnerTestHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for SettledAdvisoryOwnerTestHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }

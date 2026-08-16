@@ -2556,8 +2556,65 @@ impl X {
         self.assertNotIn(
             "pub(crate) async fn compare_captured_prefix", advisory_production
         )
+        self.assertIn("async fn settle_comparison(self)", advisory_production)
+        self.assertNotIn(
+            "pub(crate) async fn settle_comparison", advisory_production
+        )
+        settlement_start = advisory_production.index(
+            "async fn settle_comparison(self)"
+        )
+        settlement_end = advisory_production.index(
+            "fn map_advisory_store_error", settlement_start
+        )
+        settlement_owner = advisory_production[settlement_start:settlement_end]
+        for required in (
+            "reauthenticate_boundary(&self).await?",
+            "load_advisory_comparison",
+            "settle_advisory_comparison",
+            "SettledSingleArchiveAdvisoryOwner",
+        ):
+            self.assertIn(required, settlement_owner)
+        self.assertEqual(
+            settlement_owner.count("reauthenticate_boundary(&self).await?"), 2
+        )
+        for forbidden in (
+            "acknowledge_result",
+            "create_if_absent",
+            ".put_object(",
+            "list_objects",
+            ".enumerate(",
+            "delete_exact",
+            "delete_object",
+            "Store::new",
+            ".with_user(",
+            "tokio::spawn",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, settlement_owner)
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS archive_v3_advisory_comparisons",
+            control,
+        )
+        self.assertIn("fn load_advisory_comparison_conn", control)
+        self.assertIn("fn settle_advisory_comparison_conn", control)
+        self.assertIn("load_optional_advisory_release_conn(&tx, owner)", control)
+        self.assertIn("load_advisory_comparison_conn(&tx", control)
         self.assertIn("async fn compare_captured_prefix(", comparison_production)
-        self.assertNotIn("pub(crate)", comparison_production)
+        self.assertNotIn("pub fn", comparison_production)
+        self.assertIn(
+            "pub(crate) struct AdvisoryComparisonEvidence", comparison_production
+        )
+        self.assertIn(
+            "pub(crate) struct AdvisoryComparisonSettlement", comparison_production
+        )
+        self.assertIn(
+            "ADVISORY_COMPARISON_SETTLEMENT_DOMAIN", comparison_production
+        )
+        self.assertIn("fn from_evidence_for_control", comparison_production)
+        self.assertIn("fn from_control", comparison_production)
+        self.assertIn("fn control_view", comparison_production)
+        self.assertNotIn("pub(crate) fn new", comparison_production)
+        self.assertNotIn("pub(crate) fn commitment", comparison_production)
         self.assertIn("reauthenticate_boundary(owner).await?", comparison_production)
         self.assertEqual(
             comparison_production.count("reauthenticate_boundary(owner).await?"),
@@ -2579,6 +2636,9 @@ impl X {
             "std::env::",
         ):
             self.assertNotIn(forbidden, comparison_production)
+        for active_parent in (main, query, store_production, maintenance_production):
+            self.assertNotIn("settle_comparison(", active_parent)
+            self.assertNotIn("settle_advisory_comparison(", active_parent)
         self.assertEqual(
             maintenance_production.count(
                 ".ensure_advisory_release_absent(operation_id)"

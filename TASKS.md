@@ -649,9 +649,19 @@ separate activation blockers.
     error, cancellation, or lost result while the registration remains live.
     Fault regressions cover pre/post source, release, and witness changes,
     capture-lineage substitution/gaps/reordering, parity mismatch, retirement,
-    caller cancellation, and primary/recovered staging cleanup. Durable comparison settlement,
-    restart reconciliation, acknowledgement, launcher/startup/route/config,
-    cloud, deployment, and serving authority remain next.
+    caller cancellation, and primary/recovered staging cleanup.
+  - [x] Add the inactive one-shot durable comparison settlement. Encrypted
+    Control accepts only the private successful evidence, binds it to the exact
+    released owner/witness/revision/commitments, exact-reads the inserted row
+    before commit, and exact-loads a retained terminal before any repeat local
+    work after a lost response or owner restart. A changed evidence tuple
+    conflicts and late readback failure rolls back atomically. The owner is
+    consumed into a terminal type with no second comparison operation. This
+    records only the comparison result: it does not settle the restored VFS
+    drain, acknowledge a user operation, publish, or change authority.
+    Explicit canary scope, capture-retirement policy, acknowledgement,
+    launcher/startup/route/config, cloud, deployment, and serving authority
+    remain next.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

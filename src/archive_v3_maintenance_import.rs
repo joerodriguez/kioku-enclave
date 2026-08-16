@@ -4432,18 +4432,6 @@ mod tests {
         .await
         .expect("the cancellation-owned worker must eventually restore the prefix");
 
-        assert_eq!(
-            resumed_owner
-                .compare_captured_prefix_for_test()
-                .await
-                .unwrap(),
-            "AdvisoryComparisonEvidence(<opaque>)"
-        );
-        assert_eq!(
-            resumed_owner.captured_commit_count_for_test().await,
-            Some(exact_capture_count + later_capture_count),
-            "comparison evidence cannot settle the selected prefix"
-        );
         resumed_owner
             .write_uncaptured_metadata_for_test("advisory-uncaptured", "outside-capture-vfs")
             .await
@@ -4456,6 +4444,19 @@ mod tests {
             resumed_owner.captured_commit_count_for_test().await,
             Some(exact_capture_count + later_capture_count),
             "a parity mismatch cannot settle or lose the selected prefix"
+        );
+        resumed_owner
+            .delete_uncaptured_metadata_for_test("advisory-uncaptured")
+            .await
+            .unwrap();
+        let resumed_owner = Arc::try_unwrap(resumed_owner)
+            .expect("comparison tasks released the sole owner reference");
+        assert_eq!(
+            format!(
+                "{:?}",
+                resumed_owner.settle_comparison_for_test().await.unwrap()
+            ),
+            "SettledSingleArchiveAdvisoryOwner(<inactive>)"
         );
 
         // Selecting the later authority importer against a completed advisory
