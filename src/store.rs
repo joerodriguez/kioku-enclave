@@ -706,6 +706,30 @@ pub(crate) struct StorePreparedAdvisoryAbortAbsent {
     _lifecycle_guard: OwnedMutexGuard<()>,
 }
 
+/// Read-only admission for stopping one exact released advisory owner before
+/// local resume. It retains the exact-user lifecycle lock across Control's
+/// durable `Prepared` write and conveys no Store mutation capability itself.
+pub(crate) struct StoreReleasedAbortAdmission {
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    release_commitment: [u8; 32],
+    user_commitment: [u8; 32],
+    commitment: [u8; 32],
+    _lifecycle_guard: OwnedMutexGuard<()>,
+}
+
+/// Opaque proof that one exact released-before-resume abort reopened both
+/// local legacy gates without installing capture. The lifecycle lock remains
+/// owned through Control's final full-chain readback.
+pub(crate) struct StoreReleasedAbortRestored {
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    prepared_commitment: [u8; 32],
+    user_commitment: [u8; 32],
+    commitment: [u8; 32],
+    _lifecycle_guard: OwnedMutexGuard<()>,
+}
+
 impl StoreAdvisoryCaptureRetired {
     pub(crate) fn commitment_for_advisory_abort(
         &self,
@@ -754,6 +778,80 @@ impl StorePreparedAdvisoryAbortAbsent {
     }
 }
 
+impl StoreReleasedAbortAdmission {
+    pub(crate) fn authenticate_for_advisory_abort(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryAbortContext,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        release_commitment: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        let expected = released_abort_admission_commitment(
+            archive_id,
+            operation_id,
+            release_commitment,
+            self.user_commitment,
+        );
+        if self.archive_id != archive_id
+            || self.operation_id != operation_id
+            || self.release_commitment != release_commitment
+            || self.commitment != expected
+        {
+            return Err(EnclaveError::Conflict(
+                "released advisory abort admission changed".into(),
+            ));
+        }
+        Ok(self.commitment)
+    }
+}
+
+impl StoreReleasedAbortRestored {
+    pub(crate) fn commitment_for_advisory_abort(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryAbortContext,
+        prepared: &crate::archive_v3_advisory_owner::AdvisoryAbortTerminal,
+    ) -> Result<[u8; 32]> {
+        prepared
+            .authenticate_store_target(
+                StoreAdvisoryRetirementContext(()),
+                self.archive_id,
+                self.operation_id,
+            )
+            .map_err(|_| EnclaveError::Conflict("released abort target changed".into()))?;
+        let expected = advisory_abort_absent_commitment(
+            self.archive_id,
+            self.operation_id,
+            self.prepared_commitment,
+            self.user_commitment,
+        );
+        if prepared.locus()
+            != crate::archive_v3_advisory_owner::AdvisoryAbortLocus::ReleasedBeforeResume
+            || self.prepared_commitment != prepared.prepared_commitment_for_store()
+            || self.commitment != expected
+        {
+            return Err(EnclaveError::Conflict(
+                "released advisory abort restoration changed".into(),
+            ));
+        }
+        Ok(self.commitment)
+    }
+}
+
+fn released_abort_admission_commitment(
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    release_commitment: [u8; 32],
+    user_commitment: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku/archive-v3/advisory-released-abort-admission/v1\0");
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(release_commitment);
+    hasher.update(user_commitment);
+    hasher.finalize().into()
+}
+
 fn advisory_abort_absent_user_commitment(user_id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"kioku/archive-v3/advisory-abort-absent-user/v1\0");
@@ -786,6 +884,62 @@ impl StoreAdvisoryCaptureRetired {
         Self {
             archive_id,
             operation_id,
+        }
+    }
+}
+
+#[cfg(test)]
+impl StoreReleasedAbortAdmission {
+    pub(crate) fn for_advisory_abort_test(
+        user_id: &str,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        release_commitment: [u8; 32],
+    ) -> Self {
+        let user_commitment = advisory_abort_absent_user_commitment(user_id);
+        let commitment = released_abort_admission_commitment(
+            archive_id,
+            operation_id,
+            release_commitment,
+            user_commitment,
+        );
+        Self {
+            archive_id,
+            operation_id,
+            release_commitment,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: Arc::new(tokio::sync::Mutex::new(()))
+                .try_lock_owned()
+                .expect("isolated released-abort test lifecycle is available"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl StoreReleasedAbortRestored {
+    pub(crate) fn for_advisory_abort_test(
+        user_id: &str,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        prepared_commitment: [u8; 32],
+    ) -> Self {
+        let user_commitment = advisory_abort_absent_user_commitment(user_id);
+        let commitment = advisory_abort_absent_commitment(
+            archive_id,
+            operation_id,
+            prepared_commitment,
+            user_commitment,
+        );
+        Self {
+            archive_id,
+            operation_id,
+            prepared_commitment,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: Arc::new(tokio::sync::Mutex::new(()))
+                .try_lock_owned()
+                .expect("isolated released-abort test lifecycle is available"),
         }
     }
 }
@@ -1951,6 +2105,176 @@ impl StoreAdvisoryCaptureTarget {
             user_id: self._user_id.clone(),
             archive_id: self._archive_id,
             operation_id: self._operation_id,
+        })
+    }
+
+    /// Read-only admission for an exact released-before-resume abort. Both
+    /// local gates must still be blocked and no handle, write, or selector may
+    /// exist. The lifecycle guard is transferred into the opaque admission so
+    /// the subsequent durable Control prepare and Store restore cannot race a
+    /// normal resume.
+    pub(crate) async fn preflight_released_advisory_abort(
+        &self,
+        released: &AdvisoryRelease,
+        lifecycle: StoreAdvisoryReleaseLifecycle,
+    ) -> Result<StoreReleasedAbortAdmission> {
+        let (_, stage) = self.exact_marker_name_and_stage(released)?;
+        if stage != AdvisoryReleaseStoreStage::Released
+            || lifecycle.user_id != self._user_id
+            || lifecycle.archive_id != self._archive_id
+            || lifecycle.operation_id != self._operation_id
+        {
+            return Err(EnclaveError::Conflict(
+                "released advisory abort admission changed".into(),
+            ));
+        }
+        let StoreAdvisoryReleaseLifecycle {
+            _guard: lifecycle_guard,
+            ..
+        } = lifecycle;
+        let registry = self._store.registry.lock().await;
+        let barrier = self
+            ._store
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        let selection =
+            self._store.shadow_capture.read().map_err(|_| {
+                EnclaveError::Store("advisory capture selection unavailable".into())
+            })?;
+        let registry_blocked = registry.blocked_users.contains(&self._user_id);
+        let content_blocked = barrier.blocked_users.contains(&self._user_id);
+        if !registry_blocked
+            || !content_blocked
+            || registry.open_users.contains_key(&self._user_id)
+            || barrier
+                .active_writes
+                .get(&self._user_id)
+                .copied()
+                .unwrap_or(0)
+                != 0
+            || selection.is_some()
+        {
+            return Err(EnclaveError::Conflict(
+                "released advisory abort is not locally admissible".into(),
+            ));
+        }
+        let user_commitment = advisory_abort_absent_user_commitment(&self._user_id);
+        let release_commitment = released.commitment_for_store(StoreMaintenanceContext(()));
+        let commitment = released_abort_admission_commitment(
+            self._archive_id,
+            self._operation_id,
+            release_commitment,
+            user_commitment,
+        );
+        Ok(StoreReleasedAbortAdmission {
+            archive_id: self._archive_id,
+            operation_id: self._operation_id,
+            release_commitment,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: lifecycle_guard,
+        })
+    }
+
+    /// Consume a durable released-locus `Prepared` abort and atomically reopen
+    /// both local legacy gates without creating capture or opening a database.
+    /// Exact already-open state reconciles a lost local result while partial
+    /// gates, any handle/write/selector, or a substituted admission fail closed.
+    pub(crate) async fn restore_released_advisory_local_admission_without_capture(
+        &self,
+        prepared: &crate::archive_v3_advisory_owner::AdvisoryAbortTerminal,
+        admission: StoreReleasedAbortAdmission,
+    ) -> Result<StoreReleasedAbortRestored> {
+        if prepared.locus()
+            != crate::archive_v3_advisory_owner::AdvisoryAbortLocus::ReleasedBeforeResume
+        {
+            return Err(EnclaveError::Conflict(
+                "released advisory abort locus changed".into(),
+            ));
+        }
+        prepared
+            .authenticate_store_target(
+                StoreAdvisoryRetirementContext(()),
+                self._archive_id,
+                self._operation_id,
+            )
+            .map_err(|_| EnclaveError::Conflict("released abort target changed".into()))?;
+        let expected_admission = released_abort_admission_commitment(
+            self._archive_id,
+            self._operation_id,
+            admission.release_commitment,
+            admission.user_commitment,
+        );
+        if admission.archive_id != self._archive_id
+            || admission.operation_id != self._operation_id
+            || admission.commitment != expected_admission
+        {
+            return Err(EnclaveError::Conflict(
+                "released advisory abort admission changed".into(),
+            ));
+        }
+        let StoreReleasedAbortAdmission {
+            release_commitment: _,
+            user_commitment,
+            commitment: _,
+            _lifecycle_guard: lifecycle_guard,
+            ..
+        } = admission;
+        let mut registry = self._store.registry.lock().await;
+        let mut barrier = self
+            ._store
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        let selection =
+            self._store.shadow_capture.read().map_err(|_| {
+                EnclaveError::Store("advisory capture selection unavailable".into())
+            })?;
+        let registry_blocked = registry.blocked_users.contains(&self._user_id);
+        let content_blocked = barrier.blocked_users.contains(&self._user_id);
+        if registry_blocked != content_blocked
+            || registry.open_users.contains_key(&self._user_id)
+            || barrier
+                .active_writes
+                .get(&self._user_id)
+                .copied()
+                .unwrap_or(0)
+                != 0
+            || selection.is_some()
+        {
+            return Err(EnclaveError::Conflict(
+                "released advisory abort local state changed".into(),
+            ));
+        }
+        if registry_blocked {
+            registry.blocked_users.remove(&self._user_id);
+            barrier.blocked_users.remove(&self._user_id);
+        }
+        let changed = registry_blocked;
+        let prepared_commitment = prepared.prepared_commitment_for_store();
+        let commitment = advisory_abort_absent_commitment(
+            self._archive_id,
+            self._operation_id,
+            prepared_commitment,
+            user_commitment,
+        );
+        drop(selection);
+        drop(barrier);
+        drop(registry);
+        if changed {
+            self._store.content_write_barrier.changed.notify_waiters();
+            self._store.registry_changed.notify_waiters();
+        }
+        Ok(StoreReleasedAbortRestored {
+            archive_id: self._archive_id,
+            operation_id: self._operation_id,
+            prepared_commitment,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: lifecycle_guard,
         })
     }
 

@@ -3803,6 +3803,12 @@ mod tests {
         ComparisonReplay,
         AbortCancellation,
         AbortRestartRecovery,
+        ReleasedAbort,
+        ReleasedAbortCancellation,
+        ReleasedAbortRestartRecovery,
+        ReleasedAbortLostPrepareResponse,
+        ReleasedAbortWinsResumeRace,
+        ReleasedResumeWinsAbortRace,
     }
 
     async fn run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
@@ -3814,10 +3820,8 @@ mod tests {
             store::{tests::FakeGcs, tests::FakeKms, GcsClient, Store},
         };
 
-        let control = Arc::new(ControlStore::new(
-            Arc::new(FakeKms),
-            Arc::new(FakeGcs::new()),
-        ));
+        let control_gcs = Arc::new(FakeGcs::new());
+        let control = Arc::new(ControlStore::new(Arc::new(FakeKms), control_gcs.clone()));
         let user = control
             .upsert_user("maintenance-import-e2e", "maintenance@example.com")
             .await
@@ -4014,21 +4018,44 @@ mod tests {
             .prepare_archive_v3_maintenance_import(&user.id)
             .await
             .unwrap();
-        let resume_restart = SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(
-            SingleArchiveMaintenanceImporter::from_test_components(
-                archive_id,
-                Arc::clone(&objects),
-                Arc::clone(&registry_provider),
-                witness.clone(),
-                Arc::clone(&control),
-                Arc::clone(&store),
-                resume_restart_plan,
+        let mut resume_restart = Some(
+            SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(
+                SingleArchiveMaintenanceImporter::from_test_components(
+                    archive_id,
+                    Arc::clone(&objects),
+                    Arc::clone(&registry_provider),
+                    witness.clone(),
+                    Arc::clone(&control),
+                    Arc::clone(&store),
+                    resume_restart_plan,
+                )
+                .unwrap(),
             )
+            .run()
+            .await
             .unwrap(),
-        )
-        .run()
-        .await
-        .unwrap();
+        );
+        let race_restart_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let mut race_restart = Some(
+            SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(
+                SingleArchiveMaintenanceImporter::from_test_components(
+                    archive_id,
+                    Arc::clone(&objects),
+                    Arc::clone(&registry_provider),
+                    witness.clone(),
+                    Arc::clone(&control),
+                    Arc::clone(&store),
+                    race_restart_plan,
+                )
+                .unwrap(),
+            )
+            .run()
+            .await
+            .unwrap(),
+        );
         assert_eq!(
             restart._terminal_witness.migration(),
             MigrationState::ShadowWal
@@ -4216,13 +4243,263 @@ mod tests {
             .replace_current_for_test(second_heartbeat.clone())
             .unwrap();
 
+        if matches!(
+            terminal_mode,
+            AdvisoryTerminalTestMode::ReleasedAbort
+                | AdvisoryTerminalTestMode::ReleasedAbortCancellation
+                | AdvisoryTerminalTestMode::ReleasedAbortRestartRecovery
+                | AdvisoryTerminalTestMode::ReleasedAbortLostPrepareResponse
+                | AdvisoryTerminalTestMode::ReleasedAbortWinsResumeRace
+                | AdvisoryTerminalTestMode::ReleasedResumeWinsAbortRace
+        ) {
+            let canary = control
+                .load_advisory_canary_for_test(operation_id)
+                .await
+                .unwrap();
+            let released = crate::archive_v3_advisory_owner::start_advisory_owner_for_test(
+                resume_restart.take().unwrap(),
+                canary,
+            )
+            .await
+            .unwrap()
+            .release_legacy_fence()
+            .await
+            .unwrap();
+            let rival = if matches!(
+                terminal_mode,
+                AdvisoryTerminalTestMode::ReleasedAbortWinsResumeRace
+                    | AdvisoryTerminalTestMode::ReleasedResumeWinsAbortRace
+            ) {
+                let rival_canary = control
+                    .load_advisory_canary_for_test(operation_id)
+                    .await
+                    .unwrap();
+                Some(
+                    crate::archive_v3_advisory_owner::start_advisory_owner_for_test(
+                        race_restart.take().unwrap(),
+                        rival_canary,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            legacy_gcs.reset_operation_counts();
+            if matches!(
+                terminal_mode,
+                AdvisoryTerminalTestMode::ReleasedAbortWinsResumeRace
+            ) {
+                let stale_resume = tokio::spawn(async move {
+                    rival
+                        .unwrap()
+                        .release_legacy_fence()
+                        .await?
+                        .resume_local_admission()
+                        .await
+                        .map(|_| ())
+                });
+                tokio::task::yield_now().await;
+                assert!(!stale_resume.is_finished());
+                released
+                    .prepare_released_abort_for_restart_test()
+                    .await
+                    .unwrap();
+                assert!(
+                    stale_resume.await.unwrap().is_err(),
+                    "durable Prepared abort must fence a stale resume"
+                );
+                assert!(matches!(
+                    store.with_user(&user.id, |_| Ok(())).await,
+                    Err(EnclaveError::Auth(_))
+                ));
+                drop(store);
+                let restarted = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs.clone()));
+                assert_eq!(
+                    crate::archive_v3_advisory_owner::reconcile_prepared_abort_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        operation_id,
+                    )
+                    .await
+                    .unwrap(),
+                    crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted
+                );
+                restarted.with_user(&user.id, |_| Ok(())).await.unwrap();
+                assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+                return;
+            } else if matches!(
+                terminal_mode,
+                AdvisoryTerminalTestMode::ReleasedResumeWinsAbortRace
+            ) {
+                let stale_abort = tokio::spawn(async move {
+                    rival
+                        .unwrap()
+                        .release_legacy_fence()
+                        .await?
+                        .abort_released_for_test(
+                            crate::archive_v3_advisory_owner::AdvisoryAbortReason::StopRequested,
+                        )
+                        .await
+                        .map(|_| ())
+                });
+                tokio::task::yield_now().await;
+                assert!(!stale_abort.is_finished());
+                let resumed = released.resume_local_admission().await.unwrap();
+                assert!(
+                    stale_abort.await.unwrap().is_err(),
+                    "installed capture must fence a stale released abort"
+                );
+                assert_eq!(
+                    control
+                        .advisory_abort_stage_for_test(operation_id)
+                        .await
+                        .unwrap(),
+                    None,
+                    "losing released abort must not write Control"
+                );
+                let aborted = resumed
+                    .abort_for_test(
+                        crate::archive_v3_advisory_owner::AdvisoryAbortReason::StopRequested,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    aborted.stage_for_test(),
+                    crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted
+                );
+            } else if matches!(
+                terminal_mode,
+                AdvisoryTerminalTestMode::ReleasedAbortRestartRecovery
+            ) {
+                released
+                    .prepare_released_abort_for_restart_test()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    control
+                        .advisory_abort_stage_for_test(operation_id)
+                        .await
+                        .unwrap(),
+                    Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared)
+                );
+                assert!(matches!(
+                    store.with_user(&user.id, |_| Ok(())).await,
+                    Err(EnclaveError::Auth(_))
+                ));
+                drop(store);
+                let restarted = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs.clone()));
+                assert_eq!(
+                    crate::archive_v3_advisory_owner::reconcile_prepared_abort_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        operation_id,
+                    )
+                    .await
+                    .unwrap(),
+                    crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted
+                );
+                restarted.with_user(&user.id, |_| Ok(())).await.unwrap();
+                assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+                return;
+            } else if matches!(
+                terminal_mode,
+                AdvisoryTerminalTestMode::ReleasedAbortCancellation
+            ) {
+                control
+                    .set_advisory_abort_finalize_fault_for_test(true)
+                    .await
+                    .unwrap();
+                let caller = tokio::spawn(async move {
+                    released
+                        .abort_released_for_test(
+                            crate::archive_v3_advisory_owner::AdvisoryAbortReason::StopRequested,
+                        )
+                        .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if control
+                            .advisory_abort_stage_for_test(operation_id)
+                            .await
+                            .unwrap()
+                            == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("released abort must durably prepare before local restoration");
+                caller.abort();
+                let _ = caller.await;
+                control
+                    .set_advisory_abort_finalize_fault_for_test(false)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if control
+                            .advisory_abort_stage_for_test(operation_id)
+                            .await
+                            .unwrap()
+                            == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("caller cancellation must not strand released abort Prepared");
+            } else {
+                if matches!(
+                    terminal_mode,
+                    AdvisoryTerminalTestMode::ReleasedAbortLostPrepareResponse
+                ) {
+                    control_gcs.fail_next_put_after_commit(EnclaveError::Gcs(
+                        "lost released-abort prepare response".into(),
+                    ));
+                }
+                let aborted = released
+                    .abort_released_for_test(
+                        crate::archive_v3_advisory_owner::AdvisoryAbortReason::StopRequested,
+                    )
+                    .await
+                    .unwrap();
+                assert!(aborted.is_aborted());
+                assert!(aborted.retained_local_restoration());
+            }
+            assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+            store
+                .with_user(&user.id, |connection| {
+                    connection.execute(
+                        "INSERT OR REPLACE INTO app_metadata(key,value) VALUES(?1,?2)",
+                        ["released-abort", "legacy-open-without-capture"],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let content_lease = store.acquire_content_write(&user.id).await.unwrap();
+            drop(content_lease);
+            assert!(matches!(
+                control
+                    .prepare_archive_v3_maintenance_import(&user.id)
+                    .await,
+                Err(EnclaveError::Conflict(_))
+            ));
+            return;
+        }
+
         let resume_canary = control
             .load_advisory_canary_for_test(operation_id)
             .await
             .unwrap();
         let resumed_owner = Arc::new(
             crate::archive_v3_advisory_owner::start_advisory_owner_for_test(
-                resume_restart,
+                resume_restart.take().unwrap(),
                 resume_canary,
             )
             .await
@@ -4789,6 +5066,22 @@ mod tests {
                     .unwrap();
                 store
             }
+            AdvisoryTerminalTestMode::ReleasedAbort => unreachable!("handled before resume"),
+            AdvisoryTerminalTestMode::ReleasedAbortCancellation => {
+                unreachable!("handled before resume")
+            }
+            AdvisoryTerminalTestMode::ReleasedAbortRestartRecovery => {
+                unreachable!("handled before resume")
+            }
+            AdvisoryTerminalTestMode::ReleasedAbortLostPrepareResponse => {
+                unreachable!("handled before resume")
+            }
+            AdvisoryTerminalTestMode::ReleasedAbortWinsResumeRace => {
+                unreachable!("handled before resume")
+            }
+            AdvisoryTerminalTestMode::ReleasedResumeWinsAbortRace => {
+                unreachable!("handled before resume")
+            }
         };
         store
             .with_user(&user.id, |connection| {
@@ -4834,28 +5127,67 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn real_sqlite_import_stops_advisory_reopens_and_fences_authority() {
-        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
-            AdvisoryTerminalTestMode::ComparisonReplay,
-        )
-        .await;
+    fn run_advisory_terminal_test(mode: AdvisoryTerminalTestMode) {
+        std::thread::Builder::new()
+            .name("advisory-terminal-e2e".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(mode),
+                    );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
-    #[tokio::test]
-    async fn real_sqlite_advisory_mismatch_abort_survives_caller_cancellation() {
-        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
-            AdvisoryTerminalTestMode::AbortCancellation,
-        )
-        .await;
+    #[test]
+    fn real_sqlite_import_stops_advisory_reopens_and_fences_authority() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::ComparisonReplay);
     }
 
-    #[tokio::test]
-    async fn real_sqlite_prepared_abort_reconciles_after_process_local_state_is_lost() {
-        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
-            AdvisoryTerminalTestMode::AbortRestartRecovery,
-        )
-        .await;
+    #[test]
+    fn real_sqlite_advisory_mismatch_abort_survives_caller_cancellation() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::AbortCancellation);
+    }
+
+    #[test]
+    fn real_sqlite_prepared_abort_reconciles_after_process_local_state_is_lost() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::AbortRestartRecovery);
+    }
+
+    #[test]
+    fn real_sqlite_released_abort_reopens_without_capture_or_provider_io() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedAbort);
+    }
+
+    #[test]
+    fn real_sqlite_released_abort_survives_caller_cancellation() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedAbortCancellation);
+    }
+
+    #[test]
+    fn real_sqlite_released_prepared_abort_reconciles_after_restart() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedAbortRestartRecovery);
+    }
+
+    #[test]
+    fn real_sqlite_released_abort_reconciles_lost_prepare_response() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedAbortLostPrepareResponse);
+    }
+
+    #[test]
+    fn real_sqlite_released_abort_wins_against_stale_resume() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedAbortWinsResumeRace);
+    }
+
+    #[test]
+    fn real_sqlite_released_resume_wins_against_stale_abort() {
+        run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedResumeWinsAbortRace);
     }
 
     #[tokio::test]

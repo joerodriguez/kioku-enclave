@@ -693,8 +693,8 @@ separate activation blockers.
     stop/mismatch reason before Store retirement; only the opaque exact-target
     retirement proof finalizes `Aborted`. Comparison and abort exclude one
     another, restart is fenced, late readback rolls back, and finalized rows
-    reopen exactly. Pre-owner and released-before-resume cleanup remain
-    required before the one-shot controller can be composed.
+    reopen exactly. Pre-owner and released-before-resume cleanup were left for
+    separately reviewed slices.
   - [x] Add private restart reconciliation for a retained resumed-canary
     `Prepared` abort. Encrypted Control reauthenticates the exact
     release/owner/maintenance chain and comparison absence; the
@@ -703,6 +703,17 @@ separate activation blockers.
     lifecycle guard through the final full-tuple CAS. The worker is
     cancellation-owned, exact `Aborted` replay is read-only, a live/partial or
     substituted Store state fails closed, and no production caller exists.
+  - [x] Add the inactive released-before-local-resume abort locus. The existing
+    one-row abort ledger now durably distinguishes historical resumed-capture
+    cleanup from released-gate restoration while preserving old commitment
+    bytes through an additive defaulted migration. A read-only Store preflight
+    retains the exact-user lifecycle guard; Control records the exact released
+    `Prepared` row before Store atomically reopens both blocked legacy gates
+    without capture; only the resulting opaque restoration proof can finalize
+    `Aborted`. Normal resume checks abort absence before Store mutation under
+    the same lifecycle, restart uses the existing exact local-absence proof,
+    and no production caller or provider operation exists. Pre-owner marker
+    and gate cleanup remains required before controller composition.
   - [x] Add the inactive one-shot advisory canary admission contract. One
     encrypted-Control row binds the exact private user/archive/import,
     maintenance/source/parity commitments, released witness, release-image

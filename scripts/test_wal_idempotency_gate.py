@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 29
-EXPECTED_WORKER_SPAWN_SHA256 = "04e0653cae9f48cc7538b14c9e7e7261d0c5e67375bd5b8babcbc1f90e25caf6"
+EXPECTED_WORKER_SPAWN_COUNT = 30
+EXPECTED_WORKER_SPAWN_SHA256 = "203920718f21b3b659c2519980039fcdf45729d1a748197bb56e56835b2022da"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2408,11 +2408,21 @@ impl X {
             "fn map_advisory_store_error", local_start
         )
         local_owner = advisory_production[local_start:local_end]
-        self.assertIn("read_advisory_owner_current_exact", local_owner)
-        self.assertIn("current != *owner._bound.observed()", local_owner)
-        self.assertIn("load_advisory_release", local_owner)
-        self.assertIn("retained != release", local_owner)
+        reauth_start = advisory_production.index(
+            "async fn reauthenticate_boundary(&self)"
+        )
+        reauth_owner = advisory_production[reauth_start:local_start]
+        self.assertIn("read_advisory_owner_current_exact", reauth_owner)
+        self.assertIn("current != *self._owner._bound.observed()", reauth_owner)
+        self.assertIn("load_advisory_release", reauth_owner)
+        self.assertIn("retained != self._release", reauth_owner)
+        self.assertIn("self.reauthenticate_boundary().await?", local_owner)
+        self.assertIn("load_advisory_abort", local_owner)
         self.assertIn(".resume_advisory_local_admission", local_owner)
+        self.assertLess(
+            local_owner.index("load_advisory_abort"),
+            local_owner.index(".resume_advisory_local_admission"),
+        )
         self.assertIn("async fn begin_capture_drain(", advisory_production)
         self.assertNotIn(
             "pub(crate) async fn begin_capture_drain", advisory_production
@@ -2437,7 +2447,9 @@ impl X {
         retirement_start = executor.index(
             "pub(crate) async fn retire_advisory_capture"
         )
-        provider_executor = executor[:resume_start]
+        provider_executor = executor[
+            executor.index("fn exact_marker_name_and_stage"):resume_start
+        ]
         local_executor = executor[resume_start:drain_start]
         drain_executor = executor[drain_start:retirement_start]
         retirement_executor = executor[retirement_start:]
@@ -2963,6 +2975,128 @@ impl X {
             "std::env::",
         ):
             self.assertNotIn(forbidden, abort_owner)
+
+        released_abort_start = advisory_production.index(
+            "async fn abort_before_local_resume("
+        )
+        released_abort_end = advisory_production.index(
+            "impl LocallyResumedSingleArchiveAdvisoryOwner", released_abort_start
+        )
+        released_abort_owner = advisory_production[
+            released_abort_start:released_abort_end
+        ]
+        for required in (
+            "tokio::spawn(async move",
+            "self.reauthenticate_boundary().await?",
+            "preflight_released_advisory_abort(&release, lifecycle)",
+            "prepare_released_advisory_abort(",
+            "restore_released_advisory_local_admission_without_capture",
+            "finalize_released_advisory_abort(",
+            "AdvisoryAbortLocus::ReleasedBeforeResume",
+            "AdvisoryAbortReason::StopRequested",
+            "Err(AdvisoryOwnerError::Persistence)",
+        ):
+            self.assertIn(required, released_abort_owner)
+        released_preflight = released_abort_owner.index(
+            "preflight_released_advisory_abort"
+        )
+        released_prepare = released_abort_owner.index(
+            "prepare_released_advisory_abort"
+        )
+        released_restore = released_abort_owner.index(
+            "restore_released_advisory_local_admission_without_capture"
+        )
+        released_finalize = released_abort_owner.index(
+            "finalize_released_advisory_abort"
+        )
+        self.assertLess(released_preflight, released_prepare)
+        self.assertLess(released_prepare, released_restore)
+        self.assertLess(released_restore, released_finalize)
+        self.assertEqual(
+            released_abort_owner.count("Err(AdvisoryOwnerError::Persistence)"),
+            2,
+        )
+        prepare_retry = released_abort_owner.rfind(
+            "let prepared = loop", 0, released_restore
+        )
+        prepare_persistence = released_abort_owner.index(
+            "Err(AdvisoryOwnerError::Persistence)", released_prepare
+        )
+        self.assertLess(prepare_retry, released_prepare)
+        self.assertLess(released_prepare, prepare_persistence)
+        self.assertLess(prepare_persistence, released_restore)
+        finalize_retry = released_abort_owner.rfind(
+            "let terminal = loop", released_restore, released_finalize
+        )
+        finalize_persistence = released_abort_owner.index(
+            "Err(AdvisoryOwnerError::Persistence)", released_finalize
+        )
+        self.assertLess(finalize_retry, released_finalize)
+        self.assertLess(released_finalize, finalize_persistence)
+        for forbidden in (
+            "acknowledge_result",
+            "create_if_absent",
+            ".put_object(",
+            "list_objects",
+            ".enumerate(",
+            "delete_exact",
+            "delete_object",
+            "Store::new",
+            ".with_user(",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, released_abort_owner)
+
+        released_preflight_start = store_production.index(
+            "pub(crate) async fn preflight_released_advisory_abort"
+        )
+        released_restore_start = store_production.index(
+            "pub(crate) async fn restore_released_advisory_local_admission_without_capture",
+            released_preflight_start,
+        )
+        released_store_end = store_production.index(
+            "fn exact_marker_name_and_stage", released_restore_start
+        )
+        released_preflight_store = store_production[
+            released_preflight_start:released_restore_start
+        ]
+        released_restore_store = store_production[
+            released_restore_start:released_store_end
+        ]
+        for required in (
+            "!registry_blocked",
+            "!content_blocked",
+            "registry.open_users.contains_key",
+            "active_writes",
+            "selection.is_some()",
+            "StoreReleasedAbortAdmission",
+            "_lifecycle_guard: lifecycle_guard",
+        ):
+            self.assertIn(required, released_preflight_store)
+        for required in (
+            "AdvisoryAbortLocus::ReleasedBeforeResume",
+            "registry_blocked != content_blocked",
+            "registry.blocked_users.remove",
+            "barrier.blocked_users.remove",
+            "content_write_barrier.changed.notify_waiters",
+            "registry_changed.notify_waiters",
+            "StoreReleasedAbortRestored",
+            "_lifecycle_guard: lifecycle_guard",
+        ):
+            self.assertIn(required, released_restore_store)
+        for forbidden in (
+            "StoreShadowCapture::",
+            "*selection =",
+            ".register(",
+            "open_db(",
+            ".with_user(",
+            "create_if_absent",
+            ".put_object(",
+            ".enumerate(",
+            "delete_object",
+            "acknowledge_result",
+        ):
+            self.assertNotIn(forbidden, released_preflight_store + released_restore_store)
         self.assertIn(
             "CREATE TABLE IF NOT EXISTS archive_v3_advisory_comparisons",
             control,
@@ -2972,6 +3106,11 @@ impl X {
         self.assertIn(
             "CREATE TABLE IF NOT EXISTS archive_v3_advisory_aborts", control
         )
+        self.assertIn(
+            "locus TEXT NOT NULL DEFAULT 'resumed_capture'", control
+        )
+        self.assertIn("fn migrate_advisory_abort_locus", control_production)
+        self.assertNotIn("archive_v3_advisory_release_aborts", control)
         self.assertIn("fn load_advisory_abort_conn", control)
         self.assertIn("fn prepare_advisory_abort_conn", control)
         self.assertIn("fn finalize_advisory_abort_conn", control)
@@ -3039,11 +3178,15 @@ impl X {
             self.assertNotIn(forbidden, comparison_production)
         for required in (
             'b"kioku/archive-v3/advisory-resumed-abort/v1\\0"',
+            'b"kioku/archive-v3/advisory-released-before-resume-abort/v1\\0"',
+            "pub(crate) enum AdvisoryAbortLocus",
             "pub(crate) enum AdvisoryAbortReason",
             "pub(crate) enum AdvisoryAbortStage",
             "pub(crate) struct AdvisoryAbortTerminal",
             "fn prepared_for_control",
+            "fn prepared_released_for_control",
             "fn aborted_for_control",
+            "fn aborted_released_for_control",
             "fn from_control",
             "fn authenticate_store_target",
         ):
@@ -3068,6 +3211,71 @@ impl X {
             "#[derive(PartialEq, Eq)]\npub(crate) struct AdvisoryAbortTerminal",
             abort_production,
         )
+        released_proof_start = store_production.index(
+            "/// Read-only admission for stopping one exact released advisory owner"
+        )
+        released_proof_end = store_production.index(
+            "impl StoreAdvisoryCaptureRetired", released_proof_start
+        )
+        released_proofs = store_production[released_proof_start:released_proof_end]
+        for required in (
+            "pub(crate) struct StoreReleasedAbortAdmission",
+            "pub(crate) struct StoreReleasedAbortRestored",
+            "_lifecycle_guard: OwnedMutexGuard<()>",
+        ):
+            self.assertIn(required, released_proofs)
+        for forbidden in ("derive(Clone", "derive(Copy", "Serialize", "Deserialize"):
+            self.assertNotIn(forbidden, released_proofs)
+        self.assertIn(
+            'b"kioku/archive-v3/advisory-released-abort-admission/v1\\0"',
+            store_production,
+        )
+        self.assertIn(
+            'b"kioku/archive-v3/advisory-abort-local-absence/v1\\0"',
+            store_production,
+        )
+
+        released_prepare_start = control_production.index(
+            "fn prepare_released_advisory_abort_conn"
+        )
+        released_finalize_start = control_production.index(
+            "fn finalize_released_advisory_abort_conn", released_prepare_start
+        )
+        released_finalize_end = control_production.index(
+            "fn finalize_advisory_abort_recovery_conn", released_prepare_start
+        )
+        released_prepare_control = control_production[
+            released_prepare_start:released_finalize_start
+        ]
+        released_control = control_production[
+            released_prepare_start:released_finalize_end
+        ]
+        for required in (
+            "prepared_released_for_control",
+            "load_advisory_abort_recovery_conn(&tx",
+            "aborted_released_for_control",
+            "locus=?10",
+            "prepared_view.locus.as_db()",
+            "released advisory abort final readback changed",
+        ):
+            self.assertIn(required, released_control)
+        self.assertGreaterEqual(
+            released_prepare_control.count("load_advisory_abort_recovery_conn(&tx"),
+            2,
+        )
+        self.assertGreaterEqual(
+            released_prepare_control.count("AdvisoryAbortRecoveryState::Prepared"),
+            2,
+        )
+        retained_recovery = released_prepare_control.index(
+            "released advisory abort retained recovery changed"
+        )
+        retained_exact = released_prepare_control.index(
+            "retained.terminal_for_control(token) != &expected"
+        )
+        retained_commit = released_prepare_control.index("tx.commit()?", retained_exact)
+        self.assertLess(retained_recovery, retained_exact)
+        self.assertLess(retained_exact, retained_commit)
         for required in (
             "pub(crate) struct PreparedAdvisoryAbortRecovery",
             "pub(crate) enum AdvisoryAbortRecoveryState",
@@ -3220,7 +3428,8 @@ impl X {
             "load_advisory_abort_recovery_conn(&tx",
             "stage='prepared'",
             "retirement_commitment IS NULL",
-            "commitment=?11 AND revision=1",
+            "locus=?10 AND reason=?11",
+            "commitment=?12 AND revision=1",
             "AdvisoryAbortRecoveryState::Aborted(loaded)",
             "tx.commit()?",
         ):
@@ -3281,6 +3490,9 @@ impl X {
             self.assertNotIn(forbidden, provider_executor)
         advisory_without_owned_abort_spawn = advisory_production.replace(
             "tokio::spawn(async move { self.abort_resumed_owned(reason).await })", ""
+        ).replace(
+            "tokio::spawn(async move { self.abort_before_local_resume_owned(reason).await })",
+            "",
         )
         for forbidden in (
             "StoreShadowCapture",

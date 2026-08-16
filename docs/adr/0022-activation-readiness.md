@@ -77,13 +77,15 @@ reviewed activation change and production evidence**.
 | Recovery/lifecycle drills | Unit/integration fault coverage, no production drill | Before Phase 1, exercise the advisory import/release/resume/capture/comparison/settlement/retirement/restart/rollback and legacy-no-impact paths on the exact image. Before Phase 2, exercise uncertain provider response, checkpoint/compaction, export, deletion, schema migration, rollback/roll-forward, orphan retention, and forensic legacy-read rules for the authoritative configuration. |
 | Cloud/deployment | No mutation performed; checked profiles are off, the witness infrastructure is transport-probe-only, active image roll is quarantined, and archive-specific telemetry is absent. | Review exact archive GCS, registry-KMS, authoritative-witness creation/adoption/backup/restore and IAM; add the locked canary lane and content-free telemetry; then obtain explicit operator authorization for the named resources, image, subject, monitoring, and rollback window. |
 
-The inactive resumed-canary locus now has an exact `Prepared -> Aborted`
-terminal that retires only its exact capture and is mutually exclusive with
-successful comparison. A private restart worker can also finish a retained
+The inactive resumed-canary and released-before-local-resume loci now share one
+exact `Prepared -> Aborted` terminal. The first retires only its exact capture;
+the second durably prepares before atomically reopening the paired legacy gates
+without capture. Both are mutually exclusive with successful comparison, and
+normal resume checks abort absence under the same exact-user lifecycle. A private restart worker can also finish a retained
 `Prepared` row only after the controller-owned Store proves process-local
 capture absence while holding the exact-user lifecycle guard. This is not yet
-a complete controller stop policy: pre-owner and released-before-resume cleanup
-remain absent and fail closed.
+a complete controller stop policy: pre-owner marker/gate cleanup remains absent
+and fails closed.
 
 ## Required order
 
