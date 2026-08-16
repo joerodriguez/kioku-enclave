@@ -370,7 +370,10 @@ archive-v3 release gate.
 
 `eval/capacity/archive-v3-capacity-evidence-v2.schema.json` and
 `eval/capacity/archive-v3-capacity-policy-v2.template.json` define a restricted-JCS,
-preauthorization-only Phase-1 contract. The verifier itself fixes 32 GiB, exact three-year
+preauthorization-only 32-GiB contract. Despite the historical `phase1` string in its contract ID,
+this is not Phase-1 canary eligibility: that advisory path separately requires the database plus
+worst-case WAL/SQLite/model working set to remain below 4 GiB and below 25% of measured VM memory.
+The verifier itself fixes 32 GiB, exact three-year
 workloads/screen ratios, every ADR metric context and workload/fault/test scenario,
 paired 1-GiB/32-GiB raw write traces with derived amplification, ANN coverage, and
 conditional provider-recovery deletion.

@@ -20,6 +20,10 @@ verifier fixes Phase 1 to no authoritative mutations, legacy-only acknowledgemen
 zero serving replicas in one exact maintenance window. All checked-in public-key anchors
 remain deliberately invalid and there is no live attestation/deployment observer or caller
 pending the separate activation review.
+The final operational handoff is recorded in
+[`docs/adr/0022-production-activation-runbook.md`](docs/adr/0022-production-activation-runbook.md):
+it keeps the one-archive, empty-mutation advisory canary separate from Phase-2 authority and an
+eventual Phase-3/4/5 all-user rollout, and grants no cloud or deployment permission.
 
 ## Where it sits
 

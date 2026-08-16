@@ -229,15 +229,14 @@ surfaces.
   retained predecessor and full-tuple-CASed into encrypted Control; an unknown
   response is adopted only from that exact one-step successor. Restart merely
   exact-loads/adopts without heartbeat authority; it remains inert until an
-  exact provider-trusted post-expiry higher-fence reacquire. No root publication, Store/VFS
-  capture, acknowledgement, startup, route, task, or serving authority is
-  added; owner-only capture/comparison remains required before a live canary.
-  The first Store-side prerequisite now narrows the existing inactive capture
-  injection to one exact validated user. Its sole selector constructor is
-  test-only: production constructors still install no VFS, the advisory owner
-  cannot obtain it, and unrelated users always use the unchanged legacy open.
-  This is not yet the owner handoff or comparison worker and grants no canary
-  or acknowledgement authority.
+  exact provider-trusted post-expiry higher-fence reacquire. No root publication,
+  acknowledgement, startup, route, task, or serving authority is added. The
+  completed inactive owner-only capture/comparison boundary described below
+  remains private and production-unconstructible.
+  Store capture injection is narrowed to one exact validated user. Production
+  constructors still install no VFS, the advisory path receives a selector only
+  through its sealed exact target, and unrelated users always use the unchanged
+  legacy open. This grants no live canary or acknowledgement authority.
   The parity-certified advisory terminal now also converts its freshly
   revalidated pinned source into one non-cloneable Store target. That target
   binds the exact Store, user, archive, import operation, and source while
@@ -246,8 +245,9 @@ surfaces.
   clear the permanent provider fence or Store/barrier blocked state. The owner
   can retain this opaque target and consume it only through the inactive exact-
   marker release and local-resume path. The terminal resume now installs one
-  exact-user capture selector before reopening either local gate, but still
-  exposes no drain operation, general Store access, comparison, or live caller.
+  exact-user capture selector before reopening either local gate. Its later
+  opaque drain and comparison operations are available only through the private
+  owner path described below; it exposes no general Store access or live caller.
   A separate inactive Control row now binds `Prepared -> DeleteStarted -> Released`
   to the exact parity terminal, exact bound advisory-owner witness/revision/commitment,
   and maintenance-fence commitment. Preparing that row permanently fences further
