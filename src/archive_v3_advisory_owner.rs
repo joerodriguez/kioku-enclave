@@ -21,10 +21,9 @@
 //! opaque cancellation-safe capture prefix; it cannot inspect or settle it.
 //! Its private comparison child may durably consume only a successful opaque
 //! result into a one-shot Control terminal, never a Store drain or user result.
-//! A separate resumed-only abort child records Control intent before exact
-//! capture retirement and finalizes only from the opaque retirement proof.
-//! Earlier abort loci remain intentionally absent. A separate private worker
-//! can reconcile an unfinished resumed abort only from exact Control state and
+//! A separate abort child records Control intent before either exact capture
+//! retirement or released-gate restoration and finalizes only from an opaque
+//! Store proof. A separate private worker can reconcile an unfinished abort only from exact Control state and
 //! read-only absence on the controller-owned Store; neither path is wired.
 
 mod abort;
@@ -33,8 +32,8 @@ mod canary;
 mod canary_trust;
 mod comparison;
 pub(crate) use abort::{
-    AdvisoryAbortReason, AdvisoryAbortRecoveryState, AdvisoryAbortStage, AdvisoryAbortTerminal,
-    PreparedAdvisoryAbortRecovery,
+    AdvisoryAbortLocus, AdvisoryAbortReason, AdvisoryAbortRecoveryState, AdvisoryAbortStage,
+    AdvisoryAbortTerminal, PreparedAdvisoryAbortRecovery,
 };
 pub(crate) use canary::AdvisoryCanaryScope;
 #[allow(
@@ -932,6 +931,13 @@ impl AdvisoryRelease {
             }
         }
     }
+
+    pub(crate) fn commitment_for_store(
+        &self,
+        _token: crate::store::StoreMaintenanceContext,
+    ) -> [u8; 32] {
+        self.commitment
+    }
 }
 
 impl fmt::Debug for AdvisoryRelease {
@@ -1385,6 +1391,14 @@ pub(crate) trait AdvisoryOwnerControl: Send + Sync {
         reason: AdvisoryAbortReason,
     ) -> Result<AdvisoryAbortTerminal>;
 
+    async fn prepare_released_advisory_abort(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+        admission: &crate::store::StoreReleasedAbortAdmission,
+    ) -> Result<AdvisoryAbortTerminal>;
+
     async fn load_advisory_abort(
         &self,
         token: AdvisoryOwnerRuntimeContext,
@@ -1403,6 +1417,13 @@ pub(crate) trait AdvisoryOwnerControl: Send + Sync {
         token: AdvisoryOwnerRuntimeContext,
         prepared: &AdvisoryAbortTerminal,
         retired: &crate::store::StoreAdvisoryCaptureRetired,
+    ) -> Result<AdvisoryAbortTerminal>;
+
+    async fn finalize_released_advisory_abort(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        prepared: &AdvisoryAbortTerminal,
+        restored: &crate::store::StoreReleasedAbortRestored,
     ) -> Result<AdvisoryAbortTerminal>;
 
     async fn finalize_advisory_abort_recovery(
@@ -1511,6 +1532,17 @@ struct AbortedSingleArchiveAdvisoryOwner {
     _owner: LocallyResumedSingleArchiveAdvisoryOwner,
     _abort: AdvisoryAbortTerminal,
     _retired: crate::store::StoreAdvisoryCaptureRetired,
+}
+
+/// Terminal inactive owner after a stop at the released-before-local-resume
+/// boundary. The paired legacy gates are open without advisory capture, and
+/// the exact abort is durable. It exposes no provider, acknowledgement,
+/// restart, route, or authority-conversion operation.
+struct AbortedReleasedSingleArchiveAdvisoryOwner {
+    _owner: SingleArchiveAdvisoryOwner,
+    _release: AdvisoryRelease,
+    _abort: AdvisoryAbortTerminal,
+    _local_restored: Option<crate::store::StoreReleasedAbortRestored>,
 }
 
 impl SingleArchiveAdvisoryOwner {
@@ -1821,15 +1853,172 @@ impl SingleArchiveAdvisoryOwner {
 }
 
 impl ReleasedSingleArchiveAdvisoryOwner {
+    async fn reauthenticate_boundary(&self) -> Result<()> {
+        let current = self
+            ._owner
+            ._runtime
+            .read_advisory_owner_current_exact(
+                &AdvisoryOwnerRuntimeContext(()),
+                self._owner._bound.observed().archive_id(),
+            )
+            .await
+            .map_err(|_| AdvisoryOwnerError::Publication)?;
+        if current != *self._owner._bound.observed() {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let retained = self
+            ._owner
+            ._control
+            .load_advisory_release(AdvisoryOwnerRuntimeContext(()), &self._owner._bound)
+            .await?
+            .ok_or(AdvisoryOwnerError::Conflict)?;
+        if retained.stage != AdvisoryReleaseStage::Released || retained != self._release {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        Ok(())
+    }
+
     /// Consume the provider-terminal owner into a process-local resumed
     /// state. A fresh exact witness and Control release read are required
     /// while the same Store lifecycle gate remains continuously owned.
     async fn resume_local_admission(self) -> Result<LocallyResumedSingleArchiveAdvisoryOwner> {
+        self.reauthenticate_boundary().await?;
+        if self
+            ._owner
+            ._control
+            .load_advisory_abort(
+                AdvisoryOwnerRuntimeContext(()),
+                &self._owner._bound,
+                &self._release,
+            )
+            .await?
+            .is_some()
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
         let Self {
             _owner: owner,
             _release: release,
             _release_lifecycle_guard: lifecycle,
         } = self;
+        let resumed_target = owner
+            ._capture_target
+            .resume_advisory_local_admission(&release, lifecycle)
+            .await
+            .map_err(map_advisory_store_error)?;
+        Ok(LocallyResumedSingleArchiveAdvisoryOwner {
+            _owner: owner,
+            _release: release,
+            _resumed_target: resumed_target,
+        })
+    }
+
+    /// Consume a provider-released owner into a durable stop terminal without
+    /// ever installing capture. Control records `Prepared` before the paired
+    /// local legacy gates reopen. Caller cancellation cannot cancel the owned
+    /// transition, and only persistence errors are retried after local work.
+    async fn abort_before_local_resume(
+        self,
+        reason: AdvisoryAbortReason,
+    ) -> Result<AbortedReleasedSingleArchiveAdvisoryOwner> {
+        tokio::spawn(async move { self.abort_before_local_resume_owned(reason).await })
+            .await
+            .map_err(|_| AdvisoryOwnerError::Publication)?
+    }
+
+    async fn abort_before_local_resume_owned(
+        self,
+        reason: AdvisoryAbortReason,
+    ) -> Result<AbortedReleasedSingleArchiveAdvisoryOwner> {
+        if reason != AdvisoryAbortReason::StopRequested {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        self.reauthenticate_boundary().await?;
+        let retained = self
+            ._owner
+            ._control
+            .load_advisory_abort(
+                AdvisoryOwnerRuntimeContext(()),
+                &self._owner._bound,
+                &self._release,
+            )
+            .await?;
+        if let Some(retained) = retained {
+            if retained.locus() != AdvisoryAbortLocus::ReleasedBeforeResume
+                || retained.reason() != reason
+                || retained.stage() != AdvisoryAbortStage::Aborted
+            {
+                return Err(AdvisoryOwnerError::Conflict);
+            }
+            self.reauthenticate_boundary().await?;
+            let Self {
+                _owner,
+                _release,
+                _release_lifecycle_guard: _,
+            } = self;
+            return Ok(AbortedReleasedSingleArchiveAdvisoryOwner {
+                _owner,
+                _release,
+                _abort: retained,
+                _local_restored: None,
+            });
+        }
+        let Self {
+            _owner: owner,
+            _release: release,
+            _release_lifecycle_guard: lifecycle,
+        } = self;
+        let admission = owner
+            ._capture_target
+            .preflight_released_advisory_abort(&release, lifecycle)
+            .await
+            .map_err(map_advisory_store_error)?;
+        let prepared = loop {
+            match owner
+                ._control
+                .prepare_released_advisory_abort(
+                    AdvisoryOwnerRuntimeContext(()),
+                    &owner._bound,
+                    &release,
+                    &admission,
+                )
+                .await
+            {
+                Ok(prepared) => break prepared,
+                Err(AdvisoryOwnerError::Persistence) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if prepared.locus() != AdvisoryAbortLocus::ReleasedBeforeResume
+            || prepared.reason() != reason
+            || prepared.stage() != AdvisoryAbortStage::Prepared
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let restored = owner
+            ._capture_target
+            .restore_released_advisory_local_admission_without_capture(&prepared, admission)
+            .await
+            .map_err(map_advisory_store_error)?;
+        let terminal = loop {
+            match owner
+                ._control
+                .finalize_released_advisory_abort(
+                    AdvisoryOwnerRuntimeContext(()),
+                    &prepared,
+                    &restored,
+                )
+                .await
+            {
+                Ok(terminal) => break terminal,
+                Err(AdvisoryOwnerError::Persistence) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let current = owner
             ._runtime
             .read_advisory_owner_current_exact(
@@ -1841,23 +2030,19 @@ impl ReleasedSingleArchiveAdvisoryOwner {
         if current != *owner._bound.observed() {
             return Err(AdvisoryOwnerError::Conflict);
         }
-        let retained = owner
+        let retained_release = owner
             ._control
             .load_advisory_release(AdvisoryOwnerRuntimeContext(()), &owner._bound)
             .await?
             .ok_or(AdvisoryOwnerError::Conflict)?;
-        if retained.stage != AdvisoryReleaseStage::Released || retained != release {
+        if retained_release != release || retained_release.stage != AdvisoryReleaseStage::Released {
             return Err(AdvisoryOwnerError::Conflict);
         }
-        let resumed_target = owner
-            ._capture_target
-            .resume_advisory_local_admission(&retained, lifecycle)
-            .await
-            .map_err(map_advisory_store_error)?;
-        Ok(LocallyResumedSingleArchiveAdvisoryOwner {
+        Ok(AbortedReleasedSingleArchiveAdvisoryOwner {
             _owner: owner,
-            _release: retained,
-            _resumed_target: resumed_target,
+            _release: release,
+            _abort: terminal,
+            _local_restored: Some(restored),
         })
     }
 }
@@ -2062,6 +2247,12 @@ impl fmt::Debug for AbortedSingleArchiveAdvisoryOwner {
     }
 }
 
+impl fmt::Debug for AbortedReleasedSingleArchiveAdvisoryOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AbortedReleasedSingleArchiveAdvisoryOwner(<inactive>)")
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct AdvisoryOwnerTestHandle(SingleArchiveAdvisoryOwner);
 
@@ -2076,6 +2267,9 @@ pub(crate) struct SettledAdvisoryOwnerTestHandle(SettledSingleArchiveAdvisoryOwn
 
 #[cfg(test)]
 pub(crate) struct AbortedAdvisoryOwnerTestHandle(AbortedSingleArchiveAdvisoryOwner);
+
+#[cfg(test)]
+pub(crate) struct AbortedReleasedAdvisoryOwnerTestHandle(AbortedReleasedSingleArchiveAdvisoryOwner);
 
 #[cfg(test)]
 impl AdvisoryOwnerTestHandle {
@@ -2190,6 +2384,45 @@ impl ReleasedAdvisoryOwnerTestHandle {
             .resume_local_admission()
             .await
             .map(LocallyResumedAdvisoryOwnerTestHandle)
+    }
+
+    pub(crate) async fn abort_released_for_test(
+        self,
+        reason: AdvisoryAbortReason,
+    ) -> Result<AbortedReleasedAdvisoryOwnerTestHandle> {
+        self.0
+            .abort_before_local_resume(reason)
+            .await
+            .map(AbortedReleasedAdvisoryOwnerTestHandle)
+    }
+
+    pub(crate) async fn prepare_released_abort_for_restart_test(self) -> Result<()> {
+        self.0.reauthenticate_boundary().await?;
+        let ReleasedSingleArchiveAdvisoryOwner {
+            _owner: owner,
+            _release: release,
+            _release_lifecycle_guard: lifecycle,
+        } = self.0;
+        let admission = owner
+            ._capture_target
+            .preflight_released_advisory_abort(&release, lifecycle)
+            .await
+            .map_err(map_advisory_store_error)?;
+        let prepared = owner
+            ._control
+            .prepare_released_advisory_abort(
+                AdvisoryOwnerRuntimeContext(()),
+                &owner._bound,
+                &release,
+                &admission,
+            )
+            .await?;
+        if prepared.locus() != AdvisoryAbortLocus::ReleasedBeforeResume
+            || prepared.stage() != AdvisoryAbortStage::Prepared
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        Ok(())
     }
 }
 
@@ -2435,6 +2668,24 @@ impl fmt::Debug for SettledAdvisoryOwnerTestHandle {
 
 #[cfg(test)]
 impl fmt::Debug for AbortedAdvisoryOwnerTestHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
+impl AbortedReleasedAdvisoryOwnerTestHandle {
+    pub(crate) fn is_aborted(&self) -> bool {
+        self.0._abort.stage() == AdvisoryAbortStage::Aborted
+    }
+
+    pub(crate) fn retained_local_restoration(&self) -> bool {
+        self.0._local_restored.is_some()
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for AbortedReleasedAdvisoryOwnerTestHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }

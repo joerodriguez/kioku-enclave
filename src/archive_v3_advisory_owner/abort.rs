@@ -1,11 +1,10 @@
-//! Owner-private durable abort terminal for a locally resumed Phase-1 canary.
+//! Owner-private durable abort terminal for a released Phase-1 canary.
 //!
-//! This first abort slice deliberately covers only the state in which the
-//! exact legacy Store admission gates have already reopened with advisory WAL
-//! capture installed. Control records `Prepared` before Store retirement, and
-//! records `Aborted` only after either an opaque exact-target retirement proof
-//! or the distinct restart-only proof that the exact local capture state is
-//! absent while its user lifecycle remains held. The terminal is mutually
+//! Control distinguishes the already-resumed capture locus from the released-
+//! before-resume locus without changing the historical resumed commitment
+//! bytes. It records `Prepared` before Store mutation and records `Aborted`
+//! only after an opaque exact-target retirement, released-gate restoration, or
+//! restart-only local-absence proof while its user lifecycle remains held. The terminal is mutually
 //! exclusive with successful comparison settlement and
 //! grants no provider, acknowledgement, database, launcher, list, or delete
 //! authority.
@@ -18,6 +17,32 @@ use super::{
 };
 
 const ADVISORY_ABORT_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/advisory-resumed-abort/v1\0";
+const RELEASED_ADVISORY_ABORT_COMMITMENT_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-released-before-resume-abort/v1\0";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum AdvisoryAbortLocus {
+    ResumedCapture = 1,
+    ReleasedBeforeResume = 2,
+}
+
+impl AdvisoryAbortLocus {
+    pub(crate) const fn as_db(self) -> &'static str {
+        match self {
+            Self::ResumedCapture => "resumed_capture",
+            Self::ReleasedBeforeResume => "released_before_resume",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "resumed_capture" => Ok(Self::ResumedCapture),
+            "released_before_resume" => Ok(Self::ReleasedBeforeResume),
+            _ => Err(AdvisoryOwnerError::Corrupt),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -76,6 +101,7 @@ pub(crate) struct AdvisoryAbortTerminal {
     owner_revision: u64,
     owner_commitment: [u8; 32],
     release_commitment: [u8; 32],
+    locus: AdvisoryAbortLocus,
     reason: AdvisoryAbortReason,
     stage: AdvisoryAbortStage,
     retirement_commitment: Option<[u8; 32]>,
@@ -109,6 +135,7 @@ pub(crate) struct AdvisoryAbortControlView<'a> {
     pub(crate) owner_revision: u64,
     pub(crate) owner_commitment: [u8; 32],
     pub(crate) release_commitment: [u8; 32],
+    pub(crate) locus: AdvisoryAbortLocus,
     pub(crate) reason: AdvisoryAbortReason,
     pub(crate) stage: AdvisoryAbortStage,
     pub(crate) retirement_commitment: Option<[u8; 32]>,
@@ -122,6 +149,10 @@ impl AdvisoryAbortTerminal {
 
     pub(crate) const fn stage(&self) -> AdvisoryAbortStage {
         self.stage
+    }
+
+    pub(crate) const fn locus(&self) -> AdvisoryAbortLocus {
+        self.locus
     }
 
     pub(crate) fn prepared_for_control(
@@ -151,6 +182,7 @@ impl AdvisoryAbortTerminal {
             owner_revision,
             owner_commitment,
             release_view.commitment,
+            AdvisoryAbortLocus::ResumedCapture,
             reason,
             AdvisoryAbortStage::Prepared,
             None,
@@ -164,8 +196,55 @@ impl AdvisoryAbortTerminal {
             owner_revision,
             owner_commitment,
             release_view.commitment,
+            AdvisoryAbortLocus::ResumedCapture,
             reason,
             AdvisoryAbortStage::Prepared,
+            None,
+            commitment,
+        )
+    }
+
+    pub(crate) fn prepared_released_for_control(
+        token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        owner: &BoundAdvisoryOwner,
+        release: &AdvisoryRelease,
+        admission: &crate::store::StoreReleasedAbortAdmission,
+    ) -> Result<Self> {
+        let prepared =
+            Self::prepared_for_control(token, owner, release, AdvisoryAbortReason::StopRequested)?;
+        admission
+            .authenticate_for_advisory_abort(
+                AdvisoryAbortContext(()),
+                prepared.archive_id,
+                prepared.operation_id,
+                prepared.release_commitment,
+            )
+            .map_err(|_| AdvisoryOwnerError::Conflict)?;
+        let commitment = advisory_abort_commitment(
+            prepared.archive_id,
+            prepared.operation_id,
+            prepared.owner_id,
+            &prepared.owner_witness,
+            prepared.owner_revision,
+            prepared.owner_commitment,
+            prepared.release_commitment,
+            AdvisoryAbortLocus::ReleasedBeforeResume,
+            prepared.reason,
+            prepared.stage,
+            None,
+        );
+        Self::from_control(
+            token,
+            prepared.archive_id,
+            prepared.operation_id,
+            prepared.owner_id,
+            prepared.owner_witness,
+            prepared.owner_revision,
+            prepared.owner_commitment,
+            prepared.release_commitment,
+            AdvisoryAbortLocus::ReleasedBeforeResume,
+            prepared.reason,
+            prepared.stage,
             None,
             commitment,
         )
@@ -177,6 +256,7 @@ impl AdvisoryAbortTerminal {
         retired: &crate::store::StoreAdvisoryCaptureRetired,
     ) -> Result<Self> {
         if prepared.stage != AdvisoryAbortStage::Prepared
+            || prepared.locus != AdvisoryAbortLocus::ResumedCapture
             || prepared.retirement_commitment.is_some()
         {
             return Err(AdvisoryOwnerError::Conflict);
@@ -196,6 +276,7 @@ impl AdvisoryAbortTerminal {
             prepared.owner_revision,
             prepared.owner_commitment,
             prepared.release_commitment,
+            prepared.locus,
             prepared.reason,
             AdvisoryAbortStage::Aborted,
             Some(retirement_commitment),
@@ -209,9 +290,55 @@ impl AdvisoryAbortTerminal {
             prepared.owner_revision,
             prepared.owner_commitment,
             prepared.release_commitment,
+            prepared.locus,
             prepared.reason,
             AdvisoryAbortStage::Aborted,
             Some(retirement_commitment),
+            commitment,
+        )
+    }
+
+    pub(crate) fn aborted_released_for_control(
+        token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        prepared: &Self,
+        restored: &crate::store::StoreReleasedAbortRestored,
+    ) -> Result<Self> {
+        if prepared.stage != AdvisoryAbortStage::Prepared
+            || prepared.locus != AdvisoryAbortLocus::ReleasedBeforeResume
+            || prepared.reason != AdvisoryAbortReason::StopRequested
+            || prepared.retirement_commitment.is_some()
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let local_terminal_commitment = restored
+            .commitment_for_advisory_abort(AdvisoryAbortContext(()), prepared)
+            .map_err(|_| AdvisoryOwnerError::Conflict)?;
+        let commitment = advisory_abort_commitment(
+            prepared.archive_id,
+            prepared.operation_id,
+            prepared.owner_id,
+            &prepared.owner_witness,
+            prepared.owner_revision,
+            prepared.owner_commitment,
+            prepared.release_commitment,
+            prepared.locus,
+            prepared.reason,
+            AdvisoryAbortStage::Aborted,
+            Some(local_terminal_commitment),
+        );
+        Self::from_control(
+            token,
+            prepared.archive_id,
+            prepared.operation_id,
+            prepared.owner_id,
+            prepared.owner_witness.clone(),
+            prepared.owner_revision,
+            prepared.owner_commitment,
+            prepared.release_commitment,
+            prepared.locus,
+            prepared.reason,
+            AdvisoryAbortStage::Aborted,
+            Some(local_terminal_commitment),
             commitment,
         )
     }
@@ -238,6 +365,7 @@ impl AdvisoryAbortTerminal {
             prepared.owner_revision,
             prepared.owner_commitment,
             prepared.release_commitment,
+            prepared.locus,
             prepared.reason,
             AdvisoryAbortStage::Aborted,
             Some(retirement_commitment),
@@ -251,6 +379,7 @@ impl AdvisoryAbortTerminal {
             prepared.owner_revision,
             prepared.owner_commitment,
             prepared.release_commitment,
+            prepared.locus,
             prepared.reason,
             AdvisoryAbortStage::Aborted,
             Some(retirement_commitment),
@@ -268,6 +397,7 @@ impl AdvisoryAbortTerminal {
         owner_revision: u64,
         owner_commitment: [u8; 32],
         release_commitment: [u8; 32],
+        locus: AdvisoryAbortLocus,
         reason: AdvisoryAbortReason,
         stage: AdvisoryAbortStage,
         retirement_commitment: Option<[u8; 32]>,
@@ -280,6 +410,8 @@ impl AdvisoryAbortTerminal {
             || owner_commitment == [0; 32]
             || release_commitment == [0; 32]
             || retirement_commitment.is_some_and(|value| value == [0; 32])
+            || (locus == AdvisoryAbortLocus::ReleasedBeforeResume
+                && reason != AdvisoryAbortReason::StopRequested)
             || (stage == AdvisoryAbortStage::Prepared && retirement_commitment.is_some())
             || (stage == AdvisoryAbortStage::Aborted && retirement_commitment.is_none())
         {
@@ -293,6 +425,7 @@ impl AdvisoryAbortTerminal {
             owner_revision,
             owner_commitment,
             release_commitment,
+            locus,
             reason,
             stage,
             retirement_commitment,
@@ -308,6 +441,7 @@ impl AdvisoryAbortTerminal {
             owner_revision,
             owner_commitment,
             release_commitment,
+            locus,
             reason,
             stage,
             retirement_commitment,
@@ -327,6 +461,7 @@ impl AdvisoryAbortTerminal {
             owner_revision: self.owner_revision,
             owner_commitment: self.owner_commitment,
             release_commitment: self.release_commitment,
+            locus: self.locus,
             reason: self.reason,
             stage: self.stage,
             retirement_commitment: self.retirement_commitment,
@@ -344,6 +479,10 @@ impl AdvisoryAbortTerminal {
             return Err(AdvisoryOwnerError::Conflict);
         }
         Ok(())
+    }
+
+    pub(crate) const fn prepared_commitment_for_store(&self) -> [u8; 32] {
+        self.commitment
     }
 }
 
@@ -399,12 +538,16 @@ fn advisory_abort_commitment(
     owner_revision: u64,
     owner_commitment: [u8; 32],
     release_commitment: [u8; 32],
+    locus: AdvisoryAbortLocus,
     reason: AdvisoryAbortReason,
     stage: AdvisoryAbortStage,
     retirement_commitment: Option<[u8; 32]>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(ADVISORY_ABORT_COMMITMENT_DOMAIN);
+    hasher.update(match locus {
+        AdvisoryAbortLocus::ResumedCapture => ADVISORY_ABORT_COMMITMENT_DOMAIN,
+        AdvisoryAbortLocus::ReleasedBeforeResume => RELEASED_ADVISORY_ABORT_COMMITMENT_DOMAIN,
+    });
     hasher.update(1_u16.to_be_bytes());
     hasher.update(archive_id.as_bytes());
     hasher.update(operation_id.as_bytes());
@@ -413,6 +556,9 @@ fn advisory_abort_commitment(
     hasher.update(owner_revision.to_be_bytes());
     hasher.update(owner_commitment);
     hasher.update(release_commitment);
+    if locus == AdvisoryAbortLocus::ReleasedBeforeResume {
+        hasher.update([locus as u8]);
+    }
     hasher.update([reason as u8, stage as u8]);
     match retirement_commitment {
         Some(value) => {
