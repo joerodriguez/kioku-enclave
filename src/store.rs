@@ -232,10 +232,11 @@ pub struct Store {
     /// connection, while deletion can still atomically close admission and
     /// wait for every admitted writer to settle.
     content_write_barrier: Arc<ContentWriteBarrier>,
-    /// Inactive exact-user local-only injection. Every production constructor
-    /// stores `None`; no startup/config/provider path can select a user or
-    /// install the capture VFS.
-    shadow_capture: Option<StoreShadowCaptureSelection>,
+    /// Inactive exact-user local-only selection. Every production constructor
+    /// stores `None`; only the consuming advisory release transition may
+    /// install one selection while both local admission gates are still
+    /// closed. No startup/config/provider path can select a user.
+    shadow_capture: StdRwLock<Option<StoreShadowCaptureSelection>>,
     persistence_policy: StorePersistencePolicy,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
@@ -264,19 +265,18 @@ pub(crate) struct StoreShadowCapture {
     vfs_name: CString,
 }
 
-/// Exact one-user capture selection. Production cannot construct this first
-/// inactive seam: the only constructor is test-only, and the Store applies it
-/// only when the validated user identity matches byte-for-byte. A separately
-/// reviewed advisory-owner handoff must become its sole production producer
-/// before any Phase-1 canary can use it.
+/// Exact one-user capture selection. Store construction can inject it only in
+/// tests; the sole production mutation is the consuming advisory-owner resume
+/// transition while both exact-user gates are closed. The Store applies it
+/// only when the validated user identity matches byte-for-byte.
 pub(crate) struct StoreShadowCaptureSelection {
     user_id: UserId,
     capture: Arc<StoreShadowCapture>,
 }
 
 impl StoreShadowCaptureSelection {
-    fn capture_for_user(&self, user_id: &str) -> Option<&StoreShadowCapture> {
-        (self.user_id == user_id).then_some(self.capture.as_ref())
+    fn capture_for_user(&self, user_id: &str) -> Option<Arc<StoreShadowCapture>> {
+        (self.user_id == user_id).then(|| Arc::clone(&self.capture))
     }
 
     #[cfg(test)]
@@ -310,6 +310,20 @@ impl StoreShadowCapture {
         // cross-thread Store adapter.
         drop(vfs);
         Ok(Self { registry, vfs_name })
+    }
+
+    fn shared_for_advisory_owner() -> Result<Arc<Self>> {
+        static CAPTURE: std::sync::OnceLock<std::result::Result<Arc<StoreShadowCapture>, ()>> =
+            std::sync::OnceLock::new();
+        CAPTURE
+            .get_or_init(|| {
+                StoreShadowCapture::install("kioku-advisory-owner-capture-v1")
+                    .map(Arc::new)
+                    .map_err(|_| ())
+            })
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|()| EnclaveError::Store("advisory capture VFS installation failed".into()))
     }
 
     fn register(&self, path: &Path) -> Result<CaptureRegistration> {
@@ -607,9 +621,9 @@ pub(crate) struct StoreWalAuthorityFence {
 }
 
 /// Non-cloneable exact-user Store target retained by the inactive Phase-1
-/// advisory owner. Its Store handle and identity tuple are private, and this
-/// slice exposes no capture, connection, acknowledgement, or serving
-/// operation. Only a freshly revalidated pinned maintenance source can mint
+/// advisory owner. Its Store handle and identity tuple are private, and it
+/// exposes only the exact terminal marker release and atomic capture-install/
+/// local-resume operation. Only a freshly revalidated pinned maintenance source can mint
 /// it after its scratch family is scrubbed. The owned maintenance guards are
 /// dropped, but the fail-closed Store/barrier blocks and permanent provider
 /// fence deliberately remain. Its mutation surfaces authenticate a Control-
@@ -635,15 +649,18 @@ pub(crate) struct StoreAdvisoryReleaseLifecycle {
     operation_id: MaintenanceImportOperationId,
 }
 
-/// Inactive proof that the exact released advisory target reopened both local
-/// admission gates together. It carries no connection, capture selector,
-/// provider, acknowledgement, task, or serving operation.
+/// Inactive proof that the exact released advisory target installed its
+/// exact-user capture selection before reopening both local admission gates.
+/// It retains the capture registry for a separately reviewed owner-only drain,
+/// but carries no connection, provider, acknowledgement, task, or serving
+/// operation.
 pub(crate) struct StoreAdvisoryResumedTarget {
     _store: Arc<Store>,
     _user_id: UserId,
     _archive_id: crate::archive_v3::ArchiveId,
     _operation_id: MaintenanceImportOperationId,
     _source: MaintenanceSourceBinding,
+    _capture: Arc<StoreShadowCapture>,
 }
 
 #[cfg(test)]
@@ -1815,10 +1832,12 @@ impl StoreAdvisoryCaptureTarget {
         }
     }
 
-    /// Reopen both process-local legacy admission gates only for the exact
-    /// terminal release while continuously owning the user's lifecycle lock.
-    /// The two gate locks are held together, so no caller can observe a
-    /// half-resumed Store. There is no provider or local database I/O.
+    /// Install the exact-user capture selection and reopen both process-local
+    /// legacy admission gates only for the exact terminal release while
+    /// continuously owning the user's lifecycle lock. The capture selection
+    /// and both gate locks are held together, so no caller can open a legacy
+    /// handle in the gap or observe a half-resumed Store. There is no provider
+    /// or local database I/O.
     pub(crate) async fn resume_advisory_local_admission(
         &self,
         released: &AdvisoryRelease,
@@ -1835,6 +1854,7 @@ impl StoreAdvisoryCaptureTarget {
             ));
         }
 
+        let capture = StoreShadowCapture::shared_for_advisory_owner()?;
         let mut registry = self._store.registry.lock().await;
         let mut barrier = self
             ._store
@@ -1842,6 +1862,10 @@ impl StoreAdvisoryCaptureTarget {
             .state
             .lock()
             .expect("content barrier poisoned");
+        let mut selection =
+            self._store.shadow_capture.write().map_err(|_| {
+                EnclaveError::Store("advisory capture selection unavailable".into())
+            })?;
         let registry_blocked = registry.blocked_users.contains(&self._user_id);
         let content_blocked = barrier.blocked_users.contains(&self._user_id);
         if registry_blocked != content_blocked
@@ -1857,8 +1881,25 @@ impl StoreAdvisoryCaptureTarget {
                 "advisory local release gates changed".into(),
             ));
         }
+        match selection.as_ref() {
+            Some(retained)
+                if retained.user_id == self._user_id
+                    && Arc::ptr_eq(&retained.capture, &capture) => {}
+            Some(_) => {
+                return Err(EnclaveError::Conflict(
+                    "advisory capture selection changed".into(),
+                ));
+            }
+            None => {
+                *selection = Some(StoreShadowCaptureSelection {
+                    user_id: self._user_id.clone(),
+                    capture: Arc::clone(&capture),
+                });
+            }
+        }
         registry.blocked_users.remove(&self._user_id);
         barrier.blocked_users.remove(&self._user_id);
+        drop(selection);
         drop(barrier);
         drop(registry);
         self._store.content_write_barrier.changed.notify_waiters();
@@ -1870,6 +1911,7 @@ impl StoreAdvisoryCaptureTarget {
             _archive_id: self._archive_id,
             _operation_id: self._operation_id,
             _source: self._source,
+            _capture: capture,
         })
     }
 }
@@ -1899,6 +1941,23 @@ impl StoreAdvisoryResumedTarget {
         self._user_id == user_id
             && self._archive_id == archive_id
             && self._operation_id == operation_id
+    }
+
+    pub(crate) async fn captured_commit_count_for_test(&self) -> Option<usize> {
+        let actor = {
+            let registry = self._store.registry.lock().await;
+            Arc::clone(&registry.open_users.get(&self._user_id)?.actor)
+        };
+        let state = actor.state.lock().await;
+        let registration = state
+            .handle
+            .as_ref()?
+            ._shadow_capture_registration
+            .as_ref()?;
+        self._capture
+            .registry
+            .contains_stream_for_test(registration.stream_id())
+            .then(|| registration.completed_len())
     }
 }
 
@@ -2590,7 +2649,7 @@ impl Store {
             registry_changed: Arc::new(Notify::new()),
             lifecycle_gates: Mutex::new(HashMap::new()),
             content_write_barrier: Arc::new(ContentWriteBarrier::default()),
-            shadow_capture,
+            shadow_capture: StdRwLock::new(shadow_capture),
             persistence_policy,
             kms,
             gcs,
@@ -5069,11 +5128,14 @@ impl Store {
 
         // Write plaintext to a temp file and open it with rusqlite
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
+        let selected_capture = self.shadow_capture.read().ok().and_then(|selection| {
+            selection
+                .as_ref()
+                .and_then(|selection| selection.capture_for_user(user_id))
+        });
         let (conn, shadow_capture_registration, migration_dirty) = match open_db(
             &temp_path,
-            self.shadow_capture
-                .as_ref()
-                .and_then(|selection| selection.capture_for_user(user_id)),
+            selected_capture.as_deref(),
             self.persistence_policy,
         ) {
             Ok(opened) => opened,
@@ -11861,7 +11923,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exact_user_shadow_capture_excludes_others_and_retires_on_eviction_and_deletion() {
         let ordinary = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
-        assert!(ordinary.shadow_capture.is_none());
+        assert!(ordinary.shadow_capture.read().unwrap().is_none());
 
         let capture = StoreShadowCapture::shared_for_test();
         let gcs = Arc::new(FakeGcs::new());

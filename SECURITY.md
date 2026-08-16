@@ -220,8 +220,9 @@ surfaces.
   owned maintenance guards before the advisory owner receives it. It does not
   clear the permanent provider fence or Store/barrier blocked state. The owner
   can retain this opaque target and consume it only through the inactive exact-
-  marker release and local-resume path: there is still no selector conversion,
-  capture/drain operation, general Store access, comparison, or live caller.
+  marker release and local-resume path. The terminal resume now installs one
+  exact-user capture selector before reopening either local gate, but still
+  exposes no drain operation, general Store access, comparison, or live caller.
   A separate inactive Control row now binds `Prepared -> DeleteStarted -> Released`
   to the exact parity terminal, exact bound advisory-owner witness/revision/commitment,
   and maintenance-fence commitment. Preparing that row permanently fences further
@@ -244,11 +245,15 @@ surfaces.
   provider operation. Before maintenance closes either local gate it now first
   acquires the same lifecycle lock and repeats the terminal-release absence check;
   a stale waiter therefore cannot reblock Store after release. Only the consuming
-  terminal owner can reopen both local gates, while holding their registry/barrier
+  terminal owner can install the single bounded advisory capture VFS and exact-user
+  selector before reopening both local gates, while holding their registry/barrier
   locks together and requiring no open handle or active raw writer. A partial gate
-  state fails closed. The resulting opaque target cannot list, get, put, delete,
-  open a database, install capture, retry an owner lease, acknowledge, launch,
-  serve, or mutate cloud/deployment configuration.
+  or conflicting selector fails closed, so no legacy handle can open in an
+  uncaptured transition gap. Unrelated users remain on the ordinary VFS, and a
+  named-open failure preserves the legacy result but yields no future comparison
+  authority. The resulting opaque target cannot drain, list, get, put, delete,
+  open a database, retry an owner lease, acknowledge, launch, serve, or mutate
+  cloud/deployment configuration.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness
@@ -821,10 +826,9 @@ ControlStore expose no raw pages-to-seal method, so a create-ahead-only subset, 
 alternate split cannot bypass the authenticated union. No Store, startup,
 runtime, route, cloud implementation, credential source, or deployment configuration constructs
 either component.
-The shadow module
-is bounded synchronous capture state only: no
-SQLite VFS is registered, and capture failure cannot alter the legacy Store result.
-The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its image tail is zeroized before a nonzero truncate, and reset, fault, stream-retirement, and queue-drop paths zeroize raw image/header bytes; queued captures independently zeroize on drop. Each exact canonical path is bound to a fresh random nonzero process-local stream identity for the full lifetime of one Store SQLite connection, rather than to a shorter publication attempt. An exclusive lease binds the already-observed queue prefix to one nonzero session/attempt: cancellation leaves that prefix queued, settlement detaches only that prefix, later captures remain queued, settled attempt identities cannot be reused, and a hard 1,024-settlement cap forces a fresh connection rather than unbounded replay metadata. Closing the connection precedes registration retirement; retirement invalidates outstanding leases, and a restarted connection receives a fresh stream identity. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. Every live Store constructor remains capture-disabled. Only a crate-private injected Store seam can register the exact private temp path before opening it through the named VFS and retain the registration immediately after the connection in drop order. Startup does not install or inject that seam, and there is no provider, witness, archive binding, post-PUT handoff, route, health, admission, runtime replay, recovery, export, deletion, or authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, multi-attempt connection lifetime, exclusive/cancelled/exact-prefix drains, retirement/restart isolation, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
+The shadow module is bounded synchronous capture state only, and capture failure
+cannot alter the legacy Store result.
+The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its image tail is zeroized before a nonzero truncate, and reset, fault, stream-retirement, and queue-drop paths zeroize raw image/header bytes; queued captures independently zeroize on drop. Each exact canonical path is bound to a fresh random nonzero process-local stream identity for the full lifetime of one Store SQLite connection, rather than to a shorter publication attempt. An exclusive lease binds the already-observed queue prefix to one nonzero session/attempt: cancellation leaves that prefix queued, settlement detaches only that prefix, later captures remain queued, settled attempt identities cannot be reused, and a hard 1,024-settlement cap forces a fresh connection rather than unbounded replay metadata. Closing the connection precedes registration retirement; retirement invalidates outstanding leases, and a restarted connection receives a fresh stream identity. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. Every live Store constructor remains capture-disabled. The inactive advisory terminal may install one shared bounded VFS and exact-user selector while both local gates are closed; the crate-private test injection remains separate. Either seam registers the exact private temp path before opening it through the named VFS and retains the registration immediately after the connection in drop order. Startup does not install or inject either seam, and there is no drain/comparison worker, provider, route, health, runtime replay, recovery, export, deletion, or serving authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, multi-attempt connection lifetime, exclusive/cancelled/exact-prefix drains, retirement/restart isolation, post-handle `ATTACH` safety, and synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries with the bundled default VFS; it does not establish every platform or custom parent VFS.
 
 `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first

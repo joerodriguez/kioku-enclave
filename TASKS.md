@@ -607,10 +607,14 @@ separate activation blockers.
     unchanged ShadowWal witness and full terminal Control row, and asks Store to
     clear the registry and raw-content gates while holding both gate locks. A
     partial gate state, open handle, active raw writer, changed witness, changed
-    release, or wrong target fails closed. Exact reopen is idempotent and performs
-    no provider/database I/O. The returned opaque target has no Store connection,
-    capture selector, provider, acknowledgement, task, route, startup, serving,
-    cloud, or deployment authority; owner-only capture/drain/comparison is next.
+    release, or wrong target fails closed. Before either gate reopens, Store
+    installs the single shared bounded VFS and one exact-user selector while
+    holding both gate locks, so no legacy handle can open in an uncaptured gap;
+    unrelated users remain on the ordinary VFS and capture-open failure still
+    preserves legacy behavior. The returned opaque target retains only that
+    exact capture registry and has no Store connection, drain, provider,
+    acknowledgement, task, route, startup, serving, cloud, or deployment
+    authority; owner-only drain/comparison is next.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

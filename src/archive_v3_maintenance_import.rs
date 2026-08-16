@@ -4201,7 +4201,36 @@ mod tests {
         assert_eq!(legacy_gcs.live_get_count(), live_gets_before_reopen);
         let content_lease = store.acquire_content_write(&user.id).await.unwrap();
         drop(content_lease);
-        store.with_user(&user.id, |_| Ok(())).await.unwrap();
+        store
+            .with_user(&user.id, |connection| {
+                connection.execute(
+                    "INSERT OR REPLACE INTO app_metadata(key,value) VALUES(?1,?2)",
+                    ["advisory-capture", "exact-user"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let exact_capture_count = resumed_owner
+            .captured_commit_count_for_test()
+            .await
+            .expect("resumed exact user must open through capture VFS");
+        assert!(exact_capture_count > 0);
+        store
+            .with_user("advisory-capture-unselected", |connection| {
+                connection.execute(
+                    "INSERT INTO app_metadata(key,value) VALUES(?1,?2)",
+                    ["advisory-capture", "unselected-user"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(exact_capture_count),
+            "an unrelated user must never enter the advisory capture stream"
+        );
 
         // Selecting the later authority importer against a completed advisory
         // terminal fails closed. A separately reviewed Phase-2 transition

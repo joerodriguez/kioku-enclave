@@ -1,17 +1,18 @@
 #![allow(
     dead_code,
-    reason = "inactive ADR-0022 WAL shadow capture state is compiled and tested before VFS wiring"
+    reason = "inactive ADR-0022 WAL shadow capture state remains unwired to a comparison worker"
 )]
 
 //! Synchronous, bounded WAL capture state for ADR-0022 shadow mode.
 //!
-//! A future journal-capture VFS calls [`WalCaptureState::observe_write`] only
+//! The opt-in journal-capture VFS calls [`WalCaptureState::observe_write`] only
 //! after its underlying `xWrite` succeeds, calls [`WalCaptureState::observe_sync`]
 //! with the underlying `xSync` result, and mirrors `xTruncate` through
 //! [`WalCaptureState::observe_truncate`].  This module deliberately performs no
 //! filesystem, SQLite callback registration, async, provider, witness, or Store
-//! work.  Capture failure is diagnostic and disposable: it cannot be returned
-//! through the legacy VFS operation or affect the authoritative whole-blob save.
+//! work itself. Capture failure is diagnostic and disposable: it cannot be
+//! returned through the legacy VFS operation or affect the authoritative
+//! whole-blob save.
 
 use std::collections::VecDeque;
 

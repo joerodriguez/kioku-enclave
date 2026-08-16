@@ -15,7 +15,7 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 EXPECTED_STORE_CALL_COUNT = 151
 EXPECTED_STORE_CALL_SHA256 = "b558be76d3a94f57c0f96ba2658570c94d84f939283447100be370d433ac0d82"
 EXPECTED_STORE_SURFACE_COUNT = 15
-EXPECTED_STORE_SURFACE_SHA256 = "b6daaf17ce2e20d4d3c4364d9dd8021fbec9237063ffacab79b5697be7247c0f"
+EXPECTED_STORE_SURFACE_SHA256 = "549c5d4e4bc03ced1604b868ef0ed9bb37a126eab20d7ef1816ce5ff33944f9b"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -36,7 +36,7 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
     }
 )
 EXPECTED_POLICY_SITE_COUNT = 41
-EXPECTED_POLICY_SITE_SHA256 = "24ca52f865f9b51053a2ff727a6f1da5edd9dbcd08dc892f31813681fccf639e"
+EXPECTED_POLICY_SITE_SHA256 = "8188d67b5cf5eeecf02cf9ac2a2991a12718edb3120179a4efd32f0713c01125"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -2075,12 +2075,19 @@ impl X {
             "pub(crate) struct StoreShadowCaptureSelection", store_production
         )
         self.assertIn(
-            "shadow_capture: Option<StoreShadowCaptureSelection>", store_production
+            "shadow_capture: StdRwLock<Option<StoreShadowCaptureSelection>>",
+            store_production,
         )
         self.assertIn("fn capture_for_user(&self, user_id: &str)", store_production)
         self.assertIn("selection.capture_for_user(user_id)", store_production)
         self.assertNotIn("StoreShadowCaptureSelection::for_test", store_production)
-        self.assertNotIn("Option<Arc<StoreShadowCapture>>", store_production)
+        self.assertIn(
+            "fn shared_for_advisory_owner() -> Result<Arc<Self>>",
+            store_production,
+        )
+        self.assertNotIn(
+            "pub(crate) fn shared_for_advisory_owner", store_production
+        )
         self.assertNotIn("StoreShadowCaptureSelection", main)
         self.assertEqual(
             advisory_production.count("crate::store::StoreAdvisoryCaptureTarget"), 1
@@ -2177,6 +2184,16 @@ impl X {
         self.assertIn("registry_blocked != content_blocked", local_executor)
         self.assertIn("registry.open_users.contains_key", local_executor)
         self.assertIn(".active_writes", local_executor)
+        self.assertIn(
+            "StoreShadowCapture::shared_for_advisory_owner()", local_executor
+        )
+        self.assertIn(".shadow_capture", local_executor)
+        self.assertIn(".write()", local_executor)
+        self.assertIn("Arc::ptr_eq", local_executor)
+        self.assertLess(
+            local_executor.index(".shadow_capture"),
+            local_executor.index("blocked_users.remove"),
+        )
         self.assertEqual(local_executor.count("blocked_users.remove"), 2)
         self.assertIn("StoreAdvisoryResumedTarget", local_executor)
         for forbidden in (
@@ -2187,7 +2204,9 @@ impl X {
             ".with_user(",
             "CaptureRegistration",
             "CaptureRegistry",
-            "StoreShadowCapture",
+            "open_db(",
+            ".register(",
+            "begin_drain",
             "acknowledge_result",
             "tokio::spawn",
             "std::env::",

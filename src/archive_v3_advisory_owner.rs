@@ -9,13 +9,14 @@
 //! initial witness transaction, and adopts only exact one-step acquisition,
 //! heartbeat, or post-expiry reacquire successors. It is deliberately separate
 //! from the `WalAuthoritative` publisher. It retains one sealed exact-user
-//! Store target and exposes no capture, root, object, cipher, acknowledgement,
+//! Store target and exposes no drain, root, object, cipher, acknowledgement,
 //! route, task, configuration, or serving capability. A separate inactive
 //! release path lets only that target observe and delete its one permanent
 //! marker after Control durably freezes the owner. Provider confirmation leaves
 //! local gates closed; a second consuming terminal transition freshly
-//! reauthenticates witness and Control state before reopening both gates
-//! together and returning only an opaque inactive target.
+//! reauthenticates witness and Control state before atomically installing one
+//! exact-user capture selection and reopening both gates together. The opaque
+//! result retains no database or drain operation in this slice.
 
 use std::{fmt, sync::Arc};
 
@@ -1396,7 +1397,8 @@ struct ReleasedSingleArchiveAdvisoryOwner {
 
 /// Terminal inactive owner after the exact provider and both process-local
 /// legacy fences are released. The nested owner remains unreachable, and the
-/// Store result has no capture, connection, acknowledgement, or serving API.
+/// Store result retains only the installed exact-user capture registry and has
+/// no connection, drain, acknowledgement, or serving API.
 struct LocallyResumedSingleArchiveAdvisoryOwner {
     _owner: SingleArchiveAdvisoryOwner,
     _release: AdvisoryRelease,
@@ -1911,6 +1913,13 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
         self.0
             ._resumed_target
             .exact_identity_for_test(user_id, archive_id, operation_id)
+    }
+
+    pub(crate) async fn captured_commit_count_for_test(&self) -> Option<usize> {
+        self.0
+            ._resumed_target
+            .captured_commit_count_for_test()
+            .await
     }
 }
 
