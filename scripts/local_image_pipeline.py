@@ -1626,12 +1626,18 @@ def scan_database_identity() -> dict[str, object]:
     identity = parsed.get("version") or parsed.get("schemaVersion")
     if identity is None:
         raise PipelineError("Grype vulnerability database identity is missing")
-    checksum = parsed.get("checksum")
-    if not isinstance(checksum, str) or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", checksum):
-        raise PipelineError("Grype vulnerability database checksum is missing or invalid")
     source = parsed.get("source") or parsed.get("url") or parsed.get("from")
     if not isinstance(source, str) or not re.fullmatch(r"https://grype\.anchore\.io/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+", source):
         raise PipelineError("Grype vulnerability database source identity is missing or untrusted")
+    checksum = parsed.get("checksum")
+    if checksum is None:
+        # Grype's v6 status schema binds the archive checksum in the trusted
+        # database URL rather than exposing a top-level checksum field.
+        checksums = urllib.parse.parse_qs(urllib.parse.urlparse(source).query).get("checksum", [])
+        if len(checksums) == 1:
+            checksum = checksums[0]
+    if not isinstance(checksum, str) or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", checksum):
+        raise PipelineError("Grype vulnerability database checksum is missing or invalid")
     return {"version": identity, "built": built, "valid": True, "checksum": checksum, "source": source}
 
 

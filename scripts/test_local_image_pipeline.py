@@ -553,6 +553,27 @@ class LocalImagePipelineTests(unittest.TestCase):
         finally:
             pipeline.run = original_run
 
+    def test_grype_v6_database_accepts_checksum_bound_in_trusted_source_url(self) -> None:
+        pipeline = load_pipeline()
+        original_run = pipeline.run
+        checksum = "b" * 64
+        status = {
+            "valid": True,
+            "schemaVersion": "v6.1.9",
+            "from": (
+                "https://grype.anchore.io/databases/v6/vulnerability-db.tar.zst"
+                f"?checksum=sha256%3A{checksum}"
+            ),
+            "built": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            pipeline.run = lambda command, **kwargs: SimpleNamespace(stdout=json.dumps(status) + "\n")
+            identity = pipeline.scan_database_identity()
+        finally:
+            pipeline.run = original_run
+        self.assertEqual(identity["checksum"], f"sha256:{checksum}")
+        self.assertEqual(identity["source"], status["from"])
+
     def test_remote_builder_disk_probe_is_pinned_and_rejects_low_space(self) -> None:
         pipeline = load_pipeline()
         total = 100 * 1024**3
