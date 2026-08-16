@@ -23,8 +23,16 @@
 //! result into a one-shot Control terminal, never a Store drain or user result.
 
 mod canary;
+mod canary_trust;
 mod comparison;
 pub(crate) use canary::AdvisoryCanaryScope;
+#[allow(
+    unused_imports,
+    reason = "inactive canary verifier remains unwired until activation review"
+)]
+pub(crate) use canary_trust::{
+    verify_pinned_advisory_canary_authorization, VerifiedAdvisoryCanaryAuthorization,
+};
 pub(crate) use comparison::{AdvisoryComparisonEvidence, AdvisoryComparisonSettlement};
 
 use std::{fmt, sync::Arc};

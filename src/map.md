@@ -8,9 +8,11 @@ leave the TEE through the documented Vertex inference boundary, while explicitly
 configured webhook events use the separate webhook boundary.
 
 The inactive ADR-0022 Phase-1 advisory owner now also has a private
-`archive_v3_advisory_owner/canary.rs` child: its opaque exact scope is consumed
-atomically with the first owner reservation. Production issuance remains absent
-until operator-signature trust roots and independent image attestation are reviewed.
+`archive_v3_advisory_owner/canary.rs` capability and `canary_trust.rs` verifier:
+its opaque exact scope is consumed atomically with the first owner reservation,
+and only a two-root signed operator/image proof can reach Control's issuer. The
+checked-in roots remain deliberately invalid and there is no production caller,
+configuration, or attestation adapter.
 
 | File | Role |
 |---|---|

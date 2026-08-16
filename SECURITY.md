@@ -195,9 +195,13 @@ surfaces.
   `Authorized -> Consumed` scope CAS and first random advisory-owner insert
   share one transaction; either both persist or neither does. Reopen accepts
   only the consumed scope linked to the exact retained initial reservation.
-  Production scope issuance is deliberately unconstructible until a reviewed
-  operator-signature trust root and independently authenticated image digest
-  exist; tests alone may issue fixtures. The launcher then reserves the owner in a
+  A private verifier now requires a scope-unique canonical operator statement
+  signed by one Ed25519 root and a second-root image assertion binding that
+  exact statement proof to the same release digest. Encrypted Control alone
+  may turn the resulting non-cloneable value into the exact one-row scope, with
+  transactional exact replay. The two roots must be nonzero and distinct, but
+  the checked-in production roots are deliberately invalid and no live
+  attestation adapter or caller exists; tests alone may issue fixtures. The launcher then reserves the owner in a
   dedicated table, and durably advances `Reserved -> SendStarted` before the
   exact witness CAS. Response loss grants no retry under a new identity: only
   the exact expected owner and canonical next fence may be adopted, after

@@ -1,8 +1,8 @@
 //! Opaque one-shot admission capability for one inactive Phase-1 advisory
-//! owner. Production issuance is intentionally absent: a future issuer must
-//! first authenticate an operator statement and an independently attested
-//! release image. Encrypted Control may reconstruct the capability, while
-//! tests may mint exact fixtures.
+//! owner. A separate private child now verifies an exact operator statement
+//! and independent release-image assertion before encrypted Control may issue
+//! this capability. Production roots remain intentionally unset and there is
+//! no live caller, while tests may mint exact fixtures.
 
 use std::fmt;
 
