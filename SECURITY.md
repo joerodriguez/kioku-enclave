@@ -158,11 +158,19 @@ surfaces.
   the exact expected owner and canonical next fence may be adopted, after
   which Control full-tuple-CASes and exact-readbacks `Bound`. A second opaque
   handoff exact-loads that same row and unchanged witness without another CAS.
-  The runtime view exposes only exact witness read/acquire and cannot reach
+  The runtime view exposes only exact witness read/acquire/same-owner-maintain and cannot reach
   archive objects, registries, roots, ciphers, Store/VFS capture, routes,
-  acknowledgements, tasks, configuration, or serving. This slice deliberately
-  adds no heartbeat, expiry reacquire, root publication, or capture authority;
-  those remain required before a live advisory canary.
+  acknowledgements, tasks, configuration, or serving. A private lease-only
+  lifecycle lets the already-running non-cloneable owner
+  may retain or heartbeat the exact same ShadowWal fence, or reacquire the same
+  owner at the canonical next fence only after the provider's trusted tick
+  reaches expiry. Each changed successor is authenticated against the exact
+  retained predecessor and full-tuple-CASed into encrypted Control; an unknown
+  response is adopted only from that exact one-step successor. Restart merely
+  exact-loads/adopts without heartbeat authority; it remains inert until an
+  exact provider-trusted post-expiry higher-fence reacquire. No root publication, Store/VFS
+  capture, acknowledgement, startup, route, task, or serving authority is
+  added; owner-only capture/comparison remains required before a live canary.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness

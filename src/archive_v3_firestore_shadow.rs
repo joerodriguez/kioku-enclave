@@ -184,6 +184,54 @@ impl AdvisoryOwnerWitnessProvider for FirestoreShadowWitness {
                 }
             })
     }
+
+    async fn maintain_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), AdvisoryOwnerCommitError> {
+        self.witness
+            .maintain_exact_advisory_owner_lease_unresolved_async(
+                previous.clone(),
+                crate::archive_v3::ObjectId::from_bytes(*owner.as_bytes()),
+                duration_ticks,
+            )
+            .await
+            .map_err(|error| match error {
+                FirestoreWitnessCommitError::Rejected(_) => AdvisoryOwnerCommitError::Rejected,
+                FirestoreWitnessCommitError::Failed(_) => {
+                    AdvisoryOwnerCommitError::DefinitelyFailed
+                }
+                FirestoreWitnessCommitError::OutcomeUnknown => {
+                    AdvisoryOwnerCommitError::OutcomeUnknown
+                }
+            })
+    }
+
+    async fn reacquire_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), AdvisoryOwnerCommitError> {
+        self.witness
+            .reacquire_exact_advisory_owner_lease_unresolved_async(
+                previous.clone(),
+                crate::archive_v3::ObjectId::from_bytes(*owner.as_bytes()),
+                duration_ticks,
+            )
+            .await
+            .map_err(|error| match error {
+                FirestoreWitnessCommitError::Rejected(_) => AdvisoryOwnerCommitError::Rejected,
+                FirestoreWitnessCommitError::Failed(_) => {
+                    AdvisoryOwnerCommitError::DefinitelyFailed
+                }
+                FirestoreWitnessCommitError::OutcomeUnknown => {
+                    AdvisoryOwnerCommitError::OutcomeUnknown
+                }
+            })
+    }
 }
 
 #[async_trait]

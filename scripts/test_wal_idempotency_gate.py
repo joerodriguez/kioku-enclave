@@ -2054,8 +2054,16 @@ impl X {
         self.assertIn("MigrationState::ShadowWal", advisory_production)
         self.assertNotIn("MigrationState::WalAuthoritative", advisory_production)
         self.assertIn("exact_advisory_owner_acquire_from", advisory_production)
+        self.assertIn("exact_advisory_owner_heartbeat_from", advisory_production)
+        self.assertIn("exact_advisory_owner_reacquire_from", advisory_production)
+        self.assertIn("async fn maintain_lease(&mut self)", advisory_production)
+        self.assertIn("may_heartbeat: bool", advisory_production)
+        self.assertIn("reacquire_advisory_owner_lease_unresolved", advisory_production)
+        self.assertIn("persist_advisory_owner_successor", advisory_production)
         self.assertIn("into_advisory_owner", runtime)
+        self.assertIn("maintain_advisory_owner_lease_unresolved", runtime)
         self.assertIn("is_exact_unleased_advisory_terminal", witness)
+        self.assertIn("maintain_exact_advisory_owner_lease", witness)
         self.assertNotIn("archive_v3_advisory_owner::", store)
         self.assertNotIn("archive_v3_advisory_owner::", query)
         for forbidden in (
@@ -2067,6 +2075,8 @@ impl X {
             "tokio::spawn",
             "std::env::",
             "acknowledge_result(",
+            "advance_root",
+            "RootAdvance",
         ):
             self.assertNotIn(forbidden, advisory_production)
 

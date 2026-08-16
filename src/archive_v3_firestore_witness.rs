@@ -844,6 +844,64 @@ mod tests {
             .exact_advisory_owner_acquire_from(&released, owner.as_bytes())
             .is_ok());
 
+        let heartbeat_lost = Arc::new(FakeTransport::new(
+            Some(committed.encode()),
+            [CommitOutcome::LostResponse],
+        ));
+        heartbeat_lost.0.lock().unwrap().time = "2026-01-02T03:04:07.123Z".to_owned();
+        assert!(matches!(
+            witness(heartbeat_lost.clone())
+                .maintain_exact_advisory_owner_lease_unresolved_async(committed.clone(), owner, 60,)
+                .await,
+            Err(FirestoreWitnessCommitError::OutcomeUnknown)
+        ));
+        let heartbeat = WitnessRecord::decode(
+            &heartbeat_lost
+                .0
+                .lock()
+                .unwrap()
+                .record
+                .expect("heartbeat record"),
+        )
+        .unwrap();
+        assert!(heartbeat
+            .exact_advisory_owner_heartbeat_from(&committed, owner.as_bytes())
+            .is_ok());
+
+        let premature = Arc::new(FakeTransport::new(
+            Some(heartbeat.encode()),
+            [CommitOutcome::Ok],
+        ));
+        premature.0.lock().unwrap().time = "2026-01-02T03:04:08.123Z".to_owned();
+        assert!(matches!(
+            witness(premature.clone())
+                .reacquire_exact_advisory_owner_lease_unresolved_async(
+                    heartbeat.clone(),
+                    owner,
+                    60,
+                )
+                .await,
+            Err(FirestoreWitnessCommitError::Rejected(_))
+        ));
+        assert_eq!(premature.0.lock().unwrap().commits, 0);
+
+        let reacquiring = Arc::new(FakeTransport::new(
+            Some(heartbeat.encode()),
+            [CommitOutcome::Ok],
+        ));
+        reacquiring.0.lock().unwrap().time = "2026-01-02T03:06:30.123Z".to_owned();
+        let reacquired = witness(reacquiring)
+            .reacquire_exact_advisory_owner_lease_unresolved_async(heartbeat.clone(), owner, 60)
+            .await;
+        assert!(reacquired.is_ok());
+        let (reacquired, lease) = reacquired.ok().unwrap();
+        assert_eq!(
+            reacquired
+                .exact_advisory_owner_reacquire_from(&heartbeat, owner.as_bytes())
+                .unwrap(),
+            lease
+        );
+
         let authoritative = released
             .with_migration_for_test(crate::archive_v3_witness::MigrationState::WalAuthoritative);
         let rejected = Arc::new(FakeTransport::new(
@@ -3160,6 +3218,61 @@ impl FirestoreWitness {
         let outcome = self
             .update_unresolved(expected.archive_id(), |local| {
                 local.acquire_exact_advisory_owner_lease(&expected, owner, duration_ticks)
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(value) => Ok(value),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    /// Phase-1 advisory-owner heartbeat/reacquire transaction. Commit
+    /// ambiguity remains unresolved for exact Control-side fresh-read
+    /// adoption; this method grants no root mutation operation.
+    pub(crate) async fn maintain_exact_advisory_owner_lease_unresolved_async(
+        &self,
+        previous: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(previous.archive_id(), |local| {
+                local.maintain_exact_advisory_owner_lease(&previous, owner, duration_ticks)
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(value) => Ok(value),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    /// Fresh-process Phase-1 takeover. Unlike maintain, this transition can
+    /// only issue the canonical higher fence after provider-trusted expiry.
+    pub(crate) async fn reacquire_exact_advisory_owner_lease_unresolved_async(
+        &self,
+        previous: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(previous.archive_id(), |local| {
+                local.reacquire_exact_advisory_owner_lease(&previous, owner, duration_ticks)
             })
             .await
             .map_err(|error| match error {

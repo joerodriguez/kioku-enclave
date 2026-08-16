@@ -2587,7 +2587,9 @@ mod tests {
     struct InMemoryMaintenanceWitness {
         inner: InMemoryWitness,
         advisory_acquires: std::sync::atomic::AtomicUsize,
+        advisory_maintains: std::sync::atomic::AtomicUsize,
         advisory_outcome_unknown_once: std::sync::atomic::AtomicBool,
+        advisory_maintain_outcome_unknown_once: std::sync::atomic::AtomicBool,
     }
 
     impl InMemoryMaintenanceWitness {
@@ -2595,7 +2597,9 @@ mod tests {
             Self {
                 inner,
                 advisory_acquires: std::sync::atomic::AtomicUsize::new(0),
+                advisory_maintains: std::sync::atomic::AtomicUsize::new(0),
                 advisory_outcome_unknown_once: std::sync::atomic::AtomicBool::new(false),
+                advisory_maintain_outcome_unknown_once: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -2603,7 +2607,9 @@ mod tests {
             Self {
                 inner,
                 advisory_acquires: std::sync::atomic::AtomicUsize::new(0),
+                advisory_maintains: std::sync::atomic::AtomicUsize::new(0),
                 advisory_outcome_unknown_once: std::sync::atomic::AtomicBool::new(true),
+                advisory_maintain_outcome_unknown_once: std::sync::atomic::AtomicBool::new(true),
             }
         }
     }
@@ -2749,6 +2755,55 @@ mod tests {
             } else {
                 Ok(value)
             }
+        }
+
+        async fn maintain_owner_lease(
+            &self,
+            previous: &WitnessRecord,
+            owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
+            duration_ticks: u64,
+        ) -> std::result::Result<
+            (WitnessRecord, WitnessLease),
+            crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
+        > {
+            let value = self
+                .inner
+                .maintain_exact_advisory_owner_lease(
+                    previous,
+                    ObjectId::from_bytes(*owner.as_bytes()),
+                    duration_ticks,
+                )
+                .map_err(|_| {
+                    crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError::Rejected
+                })?;
+            self.advisory_maintains
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .advisory_maintain_outcome_unknown_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError::OutcomeUnknown)
+            } else {
+                Ok(value)
+            }
+        }
+
+        async fn reacquire_owner_lease(
+            &self,
+            previous: &WitnessRecord,
+            owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
+            duration_ticks: u64,
+        ) -> std::result::Result<
+            (WitnessRecord, WitnessLease),
+            crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
+        > {
+            self.inner
+                .reacquire_exact_advisory_owner_lease(
+                    previous,
+                    ObjectId::from_bytes(*owner.as_bytes()),
+                    duration_ticks,
+                )
+                .map_err(|_| crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError::Rejected)
         }
     }
 
@@ -3891,16 +3946,23 @@ mod tests {
             ._terminal_witness
             .exact_active_lease_for_owner(owner_id)
             .is_err());
-        let first_owner = crate::archive_v3_advisory_owner::start_advisory_owner_for_test(advisory)
-            .await
-            .unwrap();
+        let mut first_owner =
+            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(advisory)
+                .await
+                .unwrap();
         assert_eq!(
             format!("{first_owner:?}"),
             "SingleArchiveAdvisoryOwner(<inactive>)"
         );
+        assert!(first_owner.may_heartbeat());
         let first_bound = witness.read_current_exact(archive_id).await.unwrap();
         assert_eq!(first_bound.migration(), MigrationState::ShadowWal);
         assert!(first_bound.exact_active_lease_for_owner(owner_id).is_err());
+        first_owner.maintain_lease().await.unwrap();
+        let heartbeated = witness.read_current_exact(archive_id).await.unwrap();
+        assert!(heartbeated.last_server_tick() > first_bound.last_server_tick());
+        assert_eq!(heartbeated.root(), first_bound.root());
+        assert_eq!(heartbeated.migration(), MigrationState::ShadowWal);
         drop(first_owner);
 
         // Reopening from the second parity-certified handoff exact-loads the
@@ -3910,13 +3972,20 @@ mod tests {
             crate::archive_v3_advisory_owner::start_advisory_owner_for_test(restart)
                 .await
                 .unwrap();
+        assert!(!reopened_owner.may_heartbeat());
         assert_eq!(
             witness.read_current_exact(archive_id).await.unwrap(),
-            first_bound
+            heartbeated
         );
         assert_eq!(
             witness
                 .advisory_acquires
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            witness
+                .advisory_maintains
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );

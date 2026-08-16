@@ -550,8 +550,18 @@ separate activation blockers.
     send. The consuming runtime exposes witness read/acquire only; Store,
     capture, object/cipher access, lease succession, acknowledgements,
     startup/config/routes/tasks, provider list/delete, and deployment remain
-    absent. Exact advisory renewal/reacquire is the next prerequisite before
-    an owner-only Store capture can be reviewed.
+    absent at that boundary. The exact lease lifecycle is added separately
+    below before any owner-only Store capture is reviewed.
+  - [x] Add the inactive advisory-owner lease lifecycle. The live non-cloneable
+    owner alone may ask the witness to retain/heartbeat its exact ShadowWal
+    fence or, only after the provider's trusted tick reaches expiry, reacquire
+    the same owner at the canonical next fence. Encrypted Control authenticates
+    the immutable parity terminal plus the exact one-step predecessor/successor,
+    full-tuple-CASes the row, and adopts an ambiguous committed successor on
+    restart. A reopened process cannot heartbeat the old fence and remains
+    inert until it performs the exact post-expiry higher-fence reacquire. Root advance,
+    Store/VFS capture, acknowledgement, startup/task/route wiring, and
+    deployment remain absent; owner-only capture/comparison is next.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

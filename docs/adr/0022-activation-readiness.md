@@ -25,8 +25,12 @@ claim production evidence.
 - A separate private Phase-1 launcher now consumes only that advisory handoff. Encrypted Control
   reserves one random advisory owner and durably records `SendStarted` before the exact ShadowWal
   witness acquisition. A lost response is adopted only from the exact owner/fence successor, and
-  reopen exact-loads the same bound row without a second provider mutation. This capability has no
-  renewal, reacquire, capture, object, Store, acknowledgement, task, or startup operation yet.
+  reopen exact-loads the same bound row without a second provider mutation. The live owner may now
+  heartbeat the same exact fence or reacquire only after provider-trusted expiry; every one-step
+  successor is exact-adopted and full-tuple-CASed in Control, while a restarted process cannot
+  heartbeat the old fence and remains inert until exact post-expiry higher-fence reacquisition.
+  This capability still has no capture, root, object, Store, acknowledgement, task, or startup
+  operation.
 - One private actor serializes the complete reviewed twenty-one-plan A/B/C set. Type erasure occurs
   only after sealed plan preparation, exposes neither generic SQL nor a ledger selector, and returns
   a result only to the matching typed submitter after durable witness settlement.
@@ -43,10 +47,10 @@ reviewed activation change and production evidence**.
 
 | Boundary | Current state | Required before activation |
 |---|---|---|
-| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap and an inactive exact initial advisory-owner acquisition exist; no live caller, selector, lease succession, or post-bootstrap capture owner | Explicit owner-only canary scope; legacy remains sole authority; shadow failure cannot alter latency, response, retry, or stored legacy result; independently recovered parity is measured and retained. |
+| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap plus inactive exact advisory-owner acquisition/heartbeat/expiry-reacquire exist; no live caller, selector, or post-bootstrap capture owner | Add owner-only capture/comparison, then require an explicit canary scope; legacy remains sole authority; shadow failure cannot alter latency, response, retry, or stored legacy result; independently recovered parity is measured and retained. |
 | Enabled mutation set | Reviewed sealed subset only | Select an exact canary operation allowlist. Every enabled path must supply its stable identity and typed plan; unsupported audio/person/identity/voice, screen-person, generic/audio/finalization Vertex-begin, and other unreviewed semantics stay disabled or receive their own review first. |
 | External attempts | Provider-neutral seams only where reviewed | For any enabled provider-writing domain, construct only the reviewed KMS/provider adapter and preserve durable B send identity, one-shot execution, exact readback, C definitive-rejection, and manual handling of ambiguity. |
-| Runtime ownership | Private inactive Phase-1 initial owner and separate authoritative launcher; advisory release cannot enter the existing authority importer | Add exact advisory heartbeat/expiry succession before capture, then prove one archive/one owner, maintenance-window and zero-serving-replica preconditions, restart ownership, a distinct exact Phase-2 authority acquisition, drain/handoff behavior, and no second Store/runtime authority. |
+| Runtime ownership | Private inactive Phase-1 lease-lifecycle owner and separate authoritative launcher; advisory release cannot enter the existing authority importer | Add owner-only capture, then prove one archive/one owner, maintenance-window and zero-serving-replica preconditions, restart ownership, a distinct exact Phase-2 authority acquisition, drain/handoff behavior, and no second Store/runtime authority. |
 | Store and acknowledgement | Production remains `LegacySnapshot` | A separately reviewed policy/route/worker change must keep Phase 1 advisory. Phase 2 may acknowledge only after immutable WAL plus witness durability and exact replay; no local SQLite commit alone may authorize success. |
 | Release evidence | Local correctness gates only | Populate trusted release-policy anchors; collect signed image-bound capacity/security evidence; satisfy the ADR's I/O, latency, memory, cost, concurrency, and integrity thresholds. |
 | Recovery/lifecycle drills | Unit/integration fault coverage, no production drill | Exercise restart, uncertain response, checkpoint/compaction, export, deletion, schema migration, rollback/roll-forward, orphan retention, and forensic legacy-read rules on the release image. |

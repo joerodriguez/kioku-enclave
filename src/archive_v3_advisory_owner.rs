@@ -3,13 +3,14 @@
     reason = "inactive ADR-0022 Phase-1 advisory owner is compiled before Store/startup wiring"
 )]
 
-//! Inactive, Phase-1-only owner bootstrap for one advisory `ShadowWal`
+//! Inactive, Phase-1-only owner lease lifecycle for one advisory `ShadowWal`
 //! archive. The state machine authenticates the parity-certified maintenance
 //! handoff, durably reserves one random owner, records `SendStarted` before the
-//! witness transaction, and adopts only the exact lost-response successor.
-//! It is deliberately separate from the `WalAuthoritative` publisher and
-//! exposes no Store, capture, object, cipher, acknowledgement, route, task,
-//! configuration, or serving capability.
+//! initial witness transaction, and adopts only exact one-step acquisition,
+//! heartbeat, or post-expiry reacquire successors. It is deliberately separate
+//! from the `WalAuthoritative` publisher and exposes no Store, capture, root,
+//! object, cipher, acknowledgement, route, task, configuration, or serving
+//! capability.
 
 use std::{fmt, sync::Arc};
 
@@ -175,18 +176,33 @@ impl AdvisoryOwnerReservation {
         persisted_commitment: [u8; 32],
     ) -> Result<Self> {
         let (predecessor, observed) = lineage;
+        let valid_lineage = match (predecessor, observed) {
+            (None, None) => stage != AdvisoryOwnerStage::Bound,
+            (Some(predecessor), Some(observed)) => {
+                stage == AdvisoryOwnerStage::Bound
+                    && if predecessor == &expected {
+                        observed
+                            .exact_advisory_owner_acquire_from(predecessor, owner_id.as_bytes())
+                            .is_ok()
+                    } else {
+                        observed
+                            .exact_advisory_owner_heartbeat_from(predecessor, owner_id.as_bytes())
+                            .or_else(|_| {
+                                observed.exact_advisory_owner_reacquire_from(
+                                    predecessor,
+                                    owner_id.as_bytes(),
+                                )
+                            })
+                            .is_ok()
+                    }
+            }
+            _ => false,
+        };
         if revision == 0
             || expected.deletion() != DeletionState::Active
             || expected.migration() != MigrationState::ShadowWal
             || !expected.is_exact_unleased_advisory_terminal()
-            || predecessor.is_some() != observed.is_some()
-            || (stage == AdvisoryOwnerStage::Bound) != observed.is_some()
-            || observed.is_some_and(|value| {
-                predecessor != Some(&expected)
-                    || value
-                        .exact_advisory_owner_acquire_from(&expected, owner_id.as_bytes())
-                        .is_err()
-            })
+            || !valid_lineage
         {
             return Err(AdvisoryOwnerError::Corrupt);
         }
@@ -248,12 +264,13 @@ impl fmt::Debug for AdvisoryOwnerReservation {
     }
 }
 
-/// Non-cloneable exact initial advisory owner lease. No renewal or root
-/// mutation method exists in this slice.
+/// Non-cloneable exact advisory owner lease. It can be advanced only through
+/// the private same-owner lifecycle path and grants no root mutation.
 pub(crate) struct BoundAdvisoryOwner {
     operation_id: MaintenanceImportOperationId,
     owner_id: AdvisoryOwnerId,
     expected: WitnessRecord,
+    predecessor: WitnessRecord,
     observed: WitnessRecord,
     lease: WitnessLease,
     revision: u64,
@@ -314,9 +331,19 @@ impl BoundAdvisoryOwner {
         revision: u64,
         persisted_commitment: [u8; 32],
     ) -> Result<Self> {
-        let lease = observed
-            .exact_advisory_owner_acquire_from(&predecessor, owner_id.as_bytes())
-            .map_err(|_| AdvisoryOwnerError::Conflict)?;
+        if !expected.is_exact_unleased_advisory_terminal() {
+            return Err(AdvisoryOwnerError::Corrupt);
+        }
+        let lease = if predecessor == expected {
+            observed.exact_advisory_owner_acquire_from(&predecessor, owner_id.as_bytes())
+        } else {
+            observed
+                .exact_advisory_owner_heartbeat_from(&predecessor, owner_id.as_bytes())
+                .or_else(|_| {
+                    observed.exact_advisory_owner_reacquire_from(&predecessor, owner_id.as_bytes())
+                })
+        }
+        .map_err(|_| AdvisoryOwnerError::Conflict)?;
         let commitment = advisory_owner_commitment(
             operation_id,
             owner_id,
@@ -326,22 +353,63 @@ impl BoundAdvisoryOwner {
             Some(&predecessor),
             Some(&observed),
         );
-        if predecessor != expected
-            || revision == 0
-            || commitment == [0; 32]
-            || commitment != persisted_commitment
-        {
+        if revision == 0 || commitment == [0; 32] || commitment != persisted_commitment {
             return Err(AdvisoryOwnerError::Corrupt);
         }
         Ok(Self {
             operation_id,
             owner_id,
             expected,
+            predecessor,
             observed,
             lease,
             revision,
             commitment,
         })
+    }
+
+    pub(crate) fn successor_for_control(
+        token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        retained: &Self,
+        predecessor: WitnessRecord,
+        observed: WitnessRecord,
+        lease: WitnessLease,
+    ) -> Result<Self> {
+        if predecessor != retained.observed
+            || (observed
+                .exact_advisory_owner_heartbeat_from(&predecessor, retained.owner_id.as_bytes())
+                .ok()
+                != Some(lease)
+                && observed
+                    .exact_advisory_owner_reacquire_from(&predecessor, retained.owner_id.as_bytes())
+                    .ok()
+                    != Some(lease))
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let revision = retained
+            .revision
+            .checked_add(1)
+            .ok_or(AdvisoryOwnerError::Corrupt)?;
+        let commitment = advisory_owner_commitment(
+            retained.operation_id,
+            retained.owner_id,
+            &retained.expected,
+            revision,
+            AdvisoryOwnerStage::Bound,
+            Some(&predecessor),
+            Some(&observed),
+        );
+        Self::from_control_persisted(
+            token,
+            retained.operation_id,
+            retained.owner_id,
+            retained.expected.clone(),
+            predecessor,
+            observed,
+            revision,
+            commitment,
+        )
     }
 
     pub(crate) fn control_view(
@@ -352,6 +420,7 @@ impl BoundAdvisoryOwner {
         AdvisoryOwnerId,
         &WitnessRecord,
         &WitnessRecord,
+        &WitnessRecord,
         WitnessLease,
         u64,
         [u8; 32],
@@ -360,11 +429,20 @@ impl BoundAdvisoryOwner {
             self.operation_id,
             self.owner_id,
             &self.expected,
+            &self.predecessor,
             &self.observed,
             self.lease,
             self.revision,
             self.commitment,
         )
+    }
+
+    const fn owner_id(&self) -> AdvisoryOwnerId {
+        self.owner_id
+    }
+
+    fn observed(&self) -> &WitnessRecord {
+        &self.observed
     }
 }
 
@@ -435,6 +513,20 @@ pub(crate) trait AdvisoryOwnerControl: Send + Sync {
         operation_id: MaintenanceImportOperationId,
         observed: &WitnessRecord,
     ) -> Result<BoundAdvisoryOwner>;
+
+    async fn load_retained_advisory_owner(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<BoundAdvisoryOwner>;
+
+    async fn persist_advisory_owner_successor(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        previous: &WitnessRecord,
+        observed: &WitnessRecord,
+        lease: WitnessLease,
+    ) -> Result<BoundAdvisoryOwner>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,6 +549,20 @@ pub(crate) trait AdvisoryOwnerWitnessProvider: Send + Sync {
         owner: AdvisoryOwnerId,
         duration_ticks: u64,
     ) -> std::result::Result<(WitnessRecord, WitnessLease), AdvisoryOwnerCommitError>;
+
+    async fn maintain_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), AdvisoryOwnerCommitError>;
+
+    async fn reacquire_owner_lease(
+        &self,
+        previous: &WitnessRecord,
+        owner: AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), AdvisoryOwnerCommitError>;
 }
 
 /// Token available only inside this module. It prevents the provider bundle
@@ -473,6 +579,7 @@ struct SingleArchiveAdvisoryOwner {
     _archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
     _parity: crate::archive_v3_maintenance_import::CompletedAdvisoryShadowParityEvidence,
     _bound: BoundAdvisoryOwner,
+    may_heartbeat: bool,
 }
 
 impl SingleArchiveAdvisoryOwner {
@@ -506,7 +613,10 @@ impl SingleArchiveAdvisoryOwner {
                 &terminal_witness,
             )
             .await?;
-        let bound = if reserved.stage() == AdvisoryOwnerStage::Bound {
+        let (bound, may_heartbeat) = if reserved.stage() == AdvisoryOwnerStage::Bound {
+            let retained = control
+                .load_retained_advisory_owner(AdvisoryOwnerRuntimeContext(()), operation_id)
+                .await?;
             let current = runtime
                 .read_advisory_owner_current_exact(
                     &AdvisoryOwnerRuntimeContext(()),
@@ -514,9 +624,31 @@ impl SingleArchiveAdvisoryOwner {
                 )
                 .await
                 .map_err(|_| AdvisoryOwnerError::Publication)?;
-            control
-                .load_bound_advisory_owner(AdvisoryOwnerRuntimeContext(()), operation_id, &current)
-                .await?
+            if current == *retained.observed() {
+                (retained, false)
+            } else {
+                let lease = current
+                    .exact_advisory_owner_heartbeat_from(
+                        retained.observed(),
+                        retained.owner_id().as_bytes(),
+                    )
+                    .or_else(|_| {
+                        current.exact_advisory_owner_reacquire_from(
+                            retained.observed(),
+                            retained.owner_id().as_bytes(),
+                        )
+                    })
+                    .map_err(|_| AdvisoryOwnerError::Conflict)?;
+                let bound = control
+                    .persist_advisory_owner_successor(
+                        AdvisoryOwnerRuntimeContext(()),
+                        retained.observed(),
+                        &current,
+                        lease,
+                    )
+                    .await?;
+                (bound, false)
+            }
         } else {
             let reserved = control
                 .mark_advisory_owner_send_started(AdvisoryOwnerRuntimeContext(()), &reserved)
@@ -571,9 +703,10 @@ impl SingleArchiveAdvisoryOwner {
                     }
                 }
             };
-            control
+            let bound = control
                 .bind_advisory_owner(AdvisoryOwnerRuntimeContext(()), &reserved, &observed, lease)
-                .await?
+                .await?;
+            (bound, true)
         };
         Ok(Self {
             _runtime: runtime,
@@ -581,7 +714,99 @@ impl SingleArchiveAdvisoryOwner {
             _archive_binding: archive_binding,
             _parity: parity,
             _bound: bound,
+            may_heartbeat,
         })
+    }
+
+    /// Maintain only the already-bound advisory lease. Same-fence heartbeat
+    /// and post-expiry higher-fence reacquire are the only accepted provider
+    /// outcomes; restart recovery adopts the same exact one-step successor.
+    async fn maintain_lease(&mut self) -> Result<()> {
+        let previous = self._bound.observed().clone();
+        let owner = self._bound.owner_id();
+        let mut observed = self
+            ._runtime
+            .read_advisory_owner_current_exact(
+                &AdvisoryOwnerRuntimeContext(()),
+                previous.archive_id(),
+            )
+            .await
+            .map_err(|_| AdvisoryOwnerError::Publication)?;
+        let provider_transition_started = observed == previous;
+        if provider_transition_started {
+            let transition = if self.may_heartbeat {
+                self._runtime
+                    .maintain_advisory_owner_lease_unresolved(
+                        &AdvisoryOwnerRuntimeContext(()),
+                        previous.clone(),
+                        owner,
+                        ADVISORY_OWNER_LEASE_TICKS,
+                    )
+                    .await
+            } else {
+                self._runtime
+                    .reacquire_advisory_owner_lease_unresolved(
+                        &AdvisoryOwnerRuntimeContext(()),
+                        previous.clone(),
+                        owner,
+                        ADVISORY_OWNER_LEASE_TICKS,
+                    )
+                    .await
+            };
+            match transition {
+                Ok((next, _)) => observed = next,
+                Err(AdvisoryOwnerCommitError::OutcomeUnknown) => {
+                    observed = self
+                        ._runtime
+                        .read_advisory_owner_current_exact(
+                            &AdvisoryOwnerRuntimeContext(()),
+                            previous.archive_id(),
+                        )
+                        .await
+                        .map_err(|_| AdvisoryOwnerError::Publication)?;
+                }
+                Err(AdvisoryOwnerCommitError::Rejected) => {
+                    return Err(AdvisoryOwnerError::Conflict)
+                }
+                Err(AdvisoryOwnerCommitError::DefinitelyFailed) => {
+                    return Err(AdvisoryOwnerError::Publication)
+                }
+            }
+        }
+        if observed == previous {
+            return if self.may_heartbeat {
+                Ok(())
+            } else {
+                Err(AdvisoryOwnerError::Conflict)
+            };
+        }
+        let lease = observed
+            .exact_advisory_owner_heartbeat_from(&previous, owner.as_bytes())
+            .or_else(|_| observed.exact_advisory_owner_reacquire_from(&previous, owner.as_bytes()))
+            .map_err(|_| AdvisoryOwnerError::Conflict)?;
+        self._bound = self
+            ._control
+            .persist_advisory_owner_successor(
+                AdvisoryOwnerRuntimeContext(()),
+                &previous,
+                &observed,
+                lease,
+            )
+            .await?;
+        if !provider_transition_started {
+            self.may_heartbeat = false;
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        if !self.may_heartbeat {
+            if observed
+                .exact_advisory_owner_reacquire_from(&previous, owner.as_bytes())
+                .is_err()
+            {
+                return Err(AdvisoryOwnerError::Conflict);
+            }
+            self.may_heartbeat = true;
+        }
+        Ok(())
     }
 }
 
@@ -592,8 +817,31 @@ impl fmt::Debug for SingleArchiveAdvisoryOwner {
 }
 
 #[cfg(test)]
+pub(crate) struct AdvisoryOwnerTestHandle(SingleArchiveAdvisoryOwner);
+
+#[cfg(test)]
+impl AdvisoryOwnerTestHandle {
+    pub(crate) async fn maintain_lease(&mut self) -> Result<()> {
+        self.0.maintain_lease().await
+    }
+
+    pub(crate) const fn may_heartbeat(&self) -> bool {
+        self.0.may_heartbeat
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for AdvisoryOwnerTestHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn start_advisory_owner_for_test(
     handoff: CompletedAdvisoryShadowHandoff,
-) -> Result<impl fmt::Debug> {
-    SingleArchiveAdvisoryOwner::start(handoff).await
+) -> Result<AdvisoryOwnerTestHandle> {
+    SingleArchiveAdvisoryOwner::start(handoff)
+        .await
+        .map(AdvisoryOwnerTestHandle)
 }
