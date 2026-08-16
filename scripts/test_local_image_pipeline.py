@@ -574,6 +574,24 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertEqual(identity["checksum"], f"sha256:{checksum}")
         self.assertEqual(identity["source"], status["from"])
 
+    def test_source_snapshot_transport_timestamps_are_content_stable(self) -> None:
+        pipeline = load_pipeline()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            context = Path(temporary_directory) / "context"
+            nested = context / "src"
+            nested.mkdir(parents=True)
+            source = nested / "main.rs"
+            source.write_text("fn main() {}\n")
+            os.utime(source, (1_000_000, 1_000_000))
+            os.utime(nested, (2_000_000, 2_000_000))
+            os.utime(context, (3_000_000, 3_000_000))
+
+            pipeline.normalize_source_snapshot_timestamps(context)
+
+            self.assertEqual(source.stat().st_mtime_ns, 0)
+            self.assertEqual(nested.stat().st_mtime_ns, 0)
+            self.assertEqual(context.stat().st_mtime_ns, 0)
+
     def test_remote_builder_disk_probe_is_pinned_and_rejects_low_space(self) -> None:
         pipeline = load_pipeline()
         total = 100 * 1024**3

@@ -943,6 +943,19 @@ def immutable_source_archive_digest(commit: str) -> str:
     return hashlib.sha256(completed.stdout).hexdigest()
 
 
+def normalize_source_snapshot_timestamps(context: Path) -> None:
+    """Remove commit-wide archive mtimes from BuildKit's reusable cache keys."""
+    # `git archive` stamps every member with the commit timestamp. BuildKit can
+    # consequently miss otherwise byte-identical COPY/cache records after a
+    # script-only commit. The attested archive digest remains the source-of-
+    # truth; this extracted tree is only a private transport representation.
+    for directory, directories, files in os.walk(context, topdown=False, followlinks=False):
+        parent = Path(directory)
+        for name in (*files, *directories):
+            os.utime(parent / name, ns=(0, 0), follow_symlinks=False)
+        os.utime(parent, ns=(0, 0), follow_symlinks=False)
+
+
 @contextmanager
 def source_snapshot(commit: str, *, expected_archive_digest: str | None = None):
     """Yield a Docker context materialized only from the attested Git commit."""
@@ -960,6 +973,10 @@ def source_snapshot(commit: str, *, expected_archive_digest: str | None = None):
                 source.extractall(context, filter="data")
         except (OSError, tarfile.TarError) as error:
             raise PipelineError("could not materialize the immutable source snapshot") from error
+        try:
+            normalize_source_snapshot_timestamps(context)
+        except OSError as error:
+            raise PipelineError("could not normalize the immutable source snapshot") from error
         # Keep the exact archive beside the extracted context for the whole
         # build. It is removed with the private temporary directory only after
         # BuildKit has consumed the immutable snapshot.
