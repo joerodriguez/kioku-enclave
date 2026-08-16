@@ -17,6 +17,9 @@ use async_trait::async_trait;
 
 use crate::{
     archive_v3::ArchiveId,
+    archive_v3_advisory_owner::{
+        AdvisoryOwnerCommitError, AdvisoryOwnerId, AdvisoryOwnerWitnessProvider,
+    },
     archive_v3_firestore_auth::FirestoreWitnessAttestationBearer,
     archive_v3_firestore_http::FirestoreWitnessRestTransport,
     archive_v3_firestore_witness::{
@@ -143,6 +146,43 @@ impl FirestoreShadowWitness {
 impl fmt::Debug for FirestoreShadowWitness {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FirestoreShadowWitness(<inactive>)")
+    }
+}
+
+#[async_trait]
+impl AdvisoryOwnerWitnessProvider for FirestoreShadowWitness {
+    async fn read_current_exact(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<WitnessRecord, WitnessError> {
+        self.witness
+            .read_current_async(archive_id)
+            .await?
+            .ok_or(WitnessError::MissingArchive)
+    }
+
+    async fn acquire_owner_lease(
+        &self,
+        expected: &WitnessRecord,
+        owner: AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> Result<(WitnessRecord, WitnessLease), AdvisoryOwnerCommitError> {
+        self.witness
+            .acquire_exact_advisory_owner_lease_unresolved_async(
+                expected.clone(),
+                crate::archive_v3::ObjectId::from_bytes(*owner.as_bytes()),
+                duration_ticks,
+            )
+            .await
+            .map_err(|error| match error {
+                FirestoreWitnessCommitError::Rejected(_) => AdvisoryOwnerCommitError::Rejected,
+                FirestoreWitnessCommitError::Failed(_) => {
+                    AdvisoryOwnerCommitError::DefinitelyFailed
+                }
+                FirestoreWitnessCommitError::OutcomeUnknown => {
+                    AdvisoryOwnerCommitError::OutcomeUnknown
+                }
+            })
     }
 }
 

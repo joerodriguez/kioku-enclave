@@ -799,6 +799,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advisory_owner_acquire_preserves_ambiguity_and_shadow_wal_boundary() {
+        let trusted_tick = firestore_read_time_tick(TIME).unwrap();
+        let local = InMemoryWitness::from_provider_record_at_tick(None, trusted_tick).unwrap();
+        let initial = local.bootstrap_at_tick(bootstrap(), trusted_tick).unwrap();
+        let importer = ObjectId::from_bytes(id(8));
+        local
+            .acquire_lease(
+                initial.archive_id(),
+                initial.database_epoch(),
+                initial.registry().key_epoch(),
+                importer,
+                60,
+            )
+            .unwrap();
+        let retained = local
+            .read_current(initial.archive_id())
+            .unwrap()
+            .unwrap()
+            .with_migration_for_test(crate::archive_v3_witness::MigrationState::ShadowWal);
+        let release = InMemoryWitness::from_provider_record_at_tick(
+            Some(retained.encode()),
+            retained.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release
+            .release_exact_maintenance_advisory(&retained, importer)
+            .unwrap();
+        let owner = ObjectId::from_bytes(id(32));
+
+        let lost = Arc::new(FakeTransport::new(
+            Some(released.encode()),
+            [CommitOutcome::LostResponse],
+        ));
+        lost.0.lock().unwrap().time = "2026-01-02T03:04:06.123Z".to_owned();
+        assert!(matches!(
+            witness(lost.clone())
+                .acquire_exact_advisory_owner_lease_unresolved_async(released.clone(), owner, 60,)
+                .await,
+            Err(FirestoreWitnessCommitError::OutcomeUnknown)
+        ));
+        let committed = WitnessRecord::decode(&lost.0.lock().unwrap().record.unwrap()).unwrap();
+        assert!(committed
+            .exact_advisory_owner_acquire_from(&released, owner.as_bytes())
+            .is_ok());
+
+        let authoritative = released
+            .with_migration_for_test(crate::archive_v3_witness::MigrationState::WalAuthoritative);
+        let rejected = Arc::new(FakeTransport::new(
+            Some(authoritative.encode()),
+            [CommitOutcome::Ok],
+        ));
+        rejected.0.lock().unwrap().time = "2026-01-02T03:04:07.123Z".to_owned();
+        assert!(matches!(
+            witness(rejected.clone())
+                .acquire_exact_advisory_owner_lease_unresolved_async(authoritative, owner, 60)
+                .await,
+            Err(FirestoreWitnessCommitError::Rejected(_))
+        ));
+        assert_eq!(rejected.0.lock().unwrap().commits, 0);
+    }
+
+    #[tokio::test]
     async fn commit_started_bootstrap_pre_marker_failures_are_definitely_unsent() {
         let transport = Arc::new(FakeTransport::new(None, []));
         transport.fail_next(FailureStage::BatchGet);
@@ -3070,6 +3132,34 @@ impl FirestoreWitness {
         let outcome = self
             .update_unresolved(expected.archive_id(), |local| {
                 local.acquire_exact_wal_owner_lease(&expected, owner, duration_ticks)
+            })
+            .await
+            .map_err(|error| match error {
+                FirestoreUpdateError::Rejected(error) => {
+                    FirestoreWitnessCommitError::Rejected(error)
+                }
+                FirestoreUpdateError::Failed(error) => FirestoreWitnessCommitError::Failed(error),
+            })?;
+        match outcome {
+            FirestoreUpdateOutcome::Committed(value) => Ok(value),
+            FirestoreUpdateOutcome::OutcomeUnknown { .. } => {
+                Err(FirestoreWitnessCommitError::OutcomeUnknown)
+            }
+        }
+    }
+
+    /// Phase-1 advisory-owner-only exact acquire. Commit ambiguity remains
+    /// unresolved so encrypted Control can adopt only the exact fresh
+    /// `ShadowWal` successor under its durable owner ID.
+    pub(crate) async fn acquire_exact_advisory_owner_lease_unresolved_async(
+        &self,
+        expected: WitnessRecord,
+        owner: ObjectId,
+        duration_ticks: u64,
+    ) -> std::result::Result<(WitnessRecord, WitnessLease), FirestoreWitnessCommitError> {
+        let outcome = self
+            .update_unresolved(expected.archive_id(), |local| {
+                local.acquire_exact_advisory_owner_lease(&expected, owner, duration_ticks)
             })
             .await
             .map_err(|error| match error {

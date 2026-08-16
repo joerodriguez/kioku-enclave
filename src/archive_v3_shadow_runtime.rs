@@ -10,14 +10,16 @@
 //! is synchronous and performs no provider request. The graph remains pending
 //! until it consumes one opaque durable control-store archive binding whose
 //! domain-separated commitment exactly matches the image-baked deployment
-//! claim. Every capability remains behind private fields: there is no handle,
-//! getter, callback, task, worker, operation, acknowledgement, persistent-state/VFS hook,
-//! route, health signal, admission input, or deletion driver. The GCS
+//! claim. Before a typed consuming transition, every capability remains behind
+//! private fields: there is no handle, getter, callback, task, worker,
+//! acknowledgement, persistent-state/VFS hook, route, health signal,
+//! admission input, or deletion driver. The GCS
 //! hard-delete gate is permanently false until a later independently audited
 //! slice supplies authenticated lifecycle evidence.
 //! The sealed owner has two type-separated consumers: an advisory importer
 //! that can stop only at verified ShadowWal, and the later authority importer.
-//! Neither has a startup caller.
+//! The advisory handoff may then be consumed by a second token-gated view that
+//! exposes only exact witness read/acquire. None has a startup caller.
 
 use std::{fmt, sync::Arc};
 
@@ -189,6 +191,8 @@ pub(crate) struct ArchiveV3ShadowRuntimeBundle {
     registries: Arc<dyn ExactKeyRegistryProvider>,
     _witness: Arc<dyn ShadowCheckpointWitnessProvider>,
     maintenance_witness: Option<Arc<dyn MaintenanceImportWitnessProvider>>,
+    advisory_owner_witness:
+        Option<Arc<dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider>>,
     wal_owner_witness: Option<Arc<FirestoreShadowWitness>>,
 }
 
@@ -227,12 +231,16 @@ impl ArchiveV3ShadowRuntimeBundle {
             FirestoreShadowWitness::new(witness_config)
                 .map_err(|_| ArchiveV3ShadowRuntimeConstructionError::Unavailable)?,
         );
+        let advisory_owner_witness: Arc<
+            dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider,
+        > = witness.clone();
         Ok(Self {
             objects,
             _roots: Arc::new(GcsArchiveV3RootProvider::new(Arc::clone(&transport))),
             registries: Arc::new(GcsArchiveV3RegistryProvider::new(transport, registry_kms)),
             _witness: witness.clone(),
             maintenance_witness: Some(witness.clone()),
+            advisory_owner_witness: Some(advisory_owner_witness),
             wal_owner_witness: Some(witness),
         })
     }
@@ -244,6 +252,7 @@ impl ArchiveV3ShadowRuntimeBundle {
             registries: components.registries,
             _witness: components.witness,
             maintenance_witness: None,
+            advisory_owner_witness: None,
             wal_owner_witness: None,
         }
     }
@@ -280,19 +289,84 @@ impl ArchiveV3ShadowRuntimeBundle {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_maintenance_test_components(
+    pub(crate) fn from_maintenance_test_components<W>(
         objects: Arc<dyn ImmutableObjectBackend>,
         registries: Arc<dyn ExactKeyRegistryProvider>,
-        witness: Arc<dyn MaintenanceImportWitnessProvider>,
-    ) -> Self {
+        witness: Arc<W>,
+    ) -> Self
+    where
+        W: MaintenanceImportWitnessProvider
+            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
+            + 'static,
+    {
+        let maintenance_witness: Arc<dyn MaintenanceImportWitnessProvider> = witness.clone();
+        let advisory_owner_witness: Arc<
+            dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider,
+        > = witness;
         Self {
             objects,
             _roots: Arc::new(UnavailableRootProvider),
             registries,
             _witness: Arc::new(UnavailableShadowWitnessProvider),
-            maintenance_witness: Some(witness),
+            maintenance_witness: Some(maintenance_witness),
+            advisory_owner_witness: Some(advisory_owner_witness),
             wal_owner_witness: None,
         }
+    }
+
+    pub(crate) fn into_advisory_owner(
+        self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+    ) -> Result<AdvisoryOwnerRuntimeOwner, ArchiveV3ShadowRuntimeConstructionError> {
+        if self.advisory_owner_witness.is_none() {
+            return Err(ArchiveV3ShadowRuntimeConstructionError::Unavailable);
+        }
+        Ok(AdvisoryOwnerRuntimeOwner { bundle: self })
+    }
+}
+
+/// Consuming Phase-1 runtime view. It exposes only exact witness read/acquire;
+/// immutable objects, registries, roots, deletion, and provider coordinates
+/// remain unreachable.
+pub(crate) struct AdvisoryOwnerRuntimeOwner {
+    bundle: ArchiveV3ShadowRuntimeBundle,
+}
+
+impl AdvisoryOwnerRuntimeOwner {
+    fn witness(&self) -> &dyn crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider {
+        self.bundle
+            .advisory_owner_witness
+            .as_deref()
+            .expect("validated by consuming constructor")
+    }
+
+    pub(crate) async fn read_advisory_owner_current_exact(
+        &self,
+        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        archive_id: ArchiveId,
+    ) -> Result<WitnessRecord, WitnessError> {
+        self.witness().read_current_exact(archive_id).await
+    }
+
+    pub(crate) async fn acquire_advisory_owner_lease_unresolved(
+        &self,
+        _token: &crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        expected: WitnessRecord,
+        owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
+        duration_ticks: u64,
+    ) -> Result<
+        (WitnessRecord, WitnessLease),
+        crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
+    > {
+        self.witness()
+            .acquire_owner_lease(&expected, owner, duration_ticks)
+            .await
+    }
+}
+
+impl fmt::Debug for AdvisoryOwnerRuntimeOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdvisoryOwnerRuntimeOwner(<inactive>)")
     }
 }
 
@@ -968,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn source_exposes_no_runtime_operation_or_live_wiring() {
+    fn source_exposes_only_token_gated_operations_and_no_live_wiring() {
         let source = include_str!("archive_v3_shadow_runtime.rs");
         let main = include_str!("main.rs");
         let control = include_str!("cp/control_store.rs");
@@ -1011,6 +1085,9 @@ mod tests {
         }
         assert!(source.contains(concat!("impl SealedSingleArchiveWal", "Runtime {")));
         assert!(source.contains("fn into_advisory_shadow_importer("));
+        assert!(source.contains("fn into_advisory_owner("));
+        assert!(source.contains("read_advisory_owner_current_exact("));
+        assert!(source.contains("acquire_advisory_owner_lease_unresolved("));
         assert!(source.contains("fn into_maintenance_importer("));
         let factory = source
             .find("fn from_control_store(")
@@ -1033,6 +1110,7 @@ mod tests {
             "DurableSingleArchiveBinding::from_control_store",
             "SealedSingleArchiveWalRuntime",
             "into_advisory_shadow_importer",
+            "into_advisory_owner",
         ] {
             assert!(!main.contains(forbidden), "live wiring: {forbidden}");
         }

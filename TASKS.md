@@ -542,6 +542,16 @@ separate activation blockers.
     provider/KMS adapters, runtime ownership/Store policy/acknowledgement
     wiring, signed capacity/security evidence, restart/delete/export/schema
     drills, and an operator-authorized canary/cloud change.
+  - [x] Add the first inactive Phase-1 live-owner boundary without reusing
+    WalAuthoritative state. A separate encrypted-Control row binds the exact
+    `ParityVerified` operation and released ShadowWal witness to one random
+    advisory owner, persists `SendStarted` before Firestore, adopts only its
+    exact lost-response fence successor, and exact-reopens without a second
+    send. The consuming runtime exposes witness read/acquire only; Store,
+    capture, object/cipher access, lease succession, acknowledgements,
+    startup/config/routes/tasks, provider list/delete, and deployment remain
+    absent. Exact advisory renewal/reacquire is the next prerequisite before
+    an owner-only Store capture can be reviewed.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 
