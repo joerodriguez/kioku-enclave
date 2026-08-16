@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 28
-EXPECTED_WORKER_SPAWN_SHA256 = "ae7415dc6b84ad1d2a357c9a9b2f42077a732b5f866ffc2aa88b5dbe2f500f55"
+EXPECTED_WORKER_SPAWN_COUNT = 29
+EXPECTED_WORKER_SPAWN_SHA256 = "04e0653cae9f48cc7538b14c9e7e7261d0c5e67375bd5b8babcbc1f90e25caf6"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2074,17 +2074,23 @@ impl X {
             ROOT / "src/archive_v3_advisory_owner/abort.rs"
         ).read_text(encoding="utf-8")
         abort_production = without_cfg_test_items(abort)
+        abort_reconcile = (
+            ROOT / "src/archive_v3_advisory_owner/abort_reconcile.rs"
+        ).read_text(encoding="utf-8")
+        abort_reconcile_production = without_cfg_test_items(abort_reconcile)
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
         self.assertNotIn("archive_v3_advisory_owner::", main)
         self.assertIn("mod comparison;", advisory_production)
         self.assertIn("mod abort;", advisory_production)
+        self.assertIn("mod abort_reconcile;", advisory_production)
         self.assertIn("mod canary;", advisory_production)
         self.assertIn("mod canary_trust;", advisory_production)
         self.assertNotIn("pub mod canary", advisory_production)
         self.assertNotIn("pub mod canary_trust", advisory_production)
         self.assertNotIn("pub mod comparison", advisory_production)
         self.assertNotIn("pub mod abort", advisory_production)
+        self.assertNotIn("pub mod abort_reconcile", advisory_production)
         self.assertIn("struct SingleArchiveAdvisoryOwner", advisory_production)
         self.assertNotIn(
             "pub(crate) struct SingleArchiveAdvisoryOwner", advisory_production
@@ -3062,9 +3068,171 @@ impl X {
             "#[derive(PartialEq, Eq)]\npub(crate) struct AdvisoryAbortTerminal",
             abort_production,
         )
+        for required in (
+            "pub(crate) struct PreparedAdvisoryAbortRecovery",
+            "pub(crate) enum AdvisoryAbortRecoveryState",
+            "fn aborted_from_recovery_for_control",
+            'b"kioku/archive-v3/advisory-abort-absent-user/v1\\0"',
+            'b"kioku/archive-v3/advisory-abort-local-absence/v1\\0"',
+        ):
+            self.assertIn(required, abort_production + store_production)
+        prepared_recovery_start = abort_production.index(
+            "/// Opaque restart capability reconstructed only by encrypted Control"
+        )
+        prepared_recovery_end = abort_production.index(
+            "pub(crate) enum AdvisoryAbortRecoveryState", prepared_recovery_start
+        )
+        prepared_recovery_definition = abort_production[
+            prepared_recovery_start:prepared_recovery_end
+        ]
+        for forbidden in ("derive(Clone", "derive(Copy", "Serialize", "Deserialize"):
+            self.assertNotIn(forbidden, prepared_recovery_definition)
+        for required in (
+            "load_advisory_abort_recovery",
+            "prove_prepared_advisory_abort_local_absence(&recovery)",
+            "finalize_advisory_abort_recovery",
+            "tokio::spawn(async move",
+            "Err(AdvisoryOwnerError::Persistence)",
+            "Err(AdvisoryOwnerError::Publication)",
+        ):
+            self.assertIn(required, abort_reconcile_production)
+        recovery_load = abort_reconcile_production.index(
+            "load_advisory_abort_recovery"
+        )
+        recovery_absence = abort_reconcile_production.index(
+            "prove_prepared_advisory_abort_local_absence(&recovery)"
+        )
+        recovery_finalize = abort_reconcile_production.index(
+            "finalize_advisory_abort_recovery"
+        )
+        self.assertLess(recovery_load, recovery_absence)
+        self.assertLess(recovery_absence, recovery_finalize)
+        for forbidden in (
+            "Store::new",
+            ".with_user(",
+            "open_db(",
+            "create_if_absent",
+            ".put_object(",
+            "list_objects",
+            ".enumerate(",
+            "delete_exact",
+            "delete_object",
+            "acknowledge_result",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, abort_reconcile_production)
+
+        absence_start = store_production.index(
+            "pub(crate) async fn prove_prepared_advisory_abort_local_absence"
+        )
+        absence_end = store_production.index(
+            "async fn retire_advisory_capture_owned", absence_start
+        )
+        absence_worker = store_production[absence_start:absence_end]
+        for required in (
+            "lock_user_lifecycle(&user_id).await?",
+            "let registry = self.registry.lock().await",
+            "content_write_barrier",
+            "blocked_users.contains(&user_id)",
+            "active_writes.get(&user_id)",
+            "selection.is_some()",
+            "open.status == OpenStatus::Open",
+            "handle._shadow_capture_registration.is_some()",
+            "StorePreparedAdvisoryAbortAbsent",
+            "_lifecycle_guard: lifecycle_guard",
+        ):
+            self.assertIn(required, absence_worker)
+        absence_proof_start = store_production.index(
+            "/// Opaque proof that the controller-owned Store has no process-local capture"
+        )
+        absence_proof_end = store_production.index(
+            "impl StoreAdvisoryCaptureRetired", absence_proof_start
+        )
+        absence_proof_definition = store_production[
+            absence_proof_start:absence_proof_end
+        ]
+        self.assertIn(
+            "pub(crate) struct StorePreparedAdvisoryAbortAbsent",
+            absence_proof_definition,
+        )
+        self.assertIn(
+            "_lifecycle_guard: OwnedMutexGuard<()>", absence_proof_definition
+        )
+        for forbidden in ("derive(Clone", "derive(Copy", "Serialize", "Deserialize"):
+            self.assertNotIn(forbidden, absence_proof_definition)
+        self.assertLess(
+            absence_worker.index("lock_user_lifecycle(&user_id).await?"),
+            absence_worker.index("let registry = self.registry.lock().await"),
+        )
+        for forbidden in (
+            "Store::new",
+            ".with_user(",
+            "open_db(",
+            "*selection =",
+            ".take()",
+            "blocked_users.remove",
+            "notify_waiters",
+            ".register(",
+            "create_if_absent",
+            ".put_object(",
+            ".enumerate(",
+            "delete_object",
+            "acknowledge_result",
+        ):
+            self.assertNotIn(forbidden, absence_worker)
+
+        recovery_control_start = control_production.index(
+            "fn load_advisory_abort_recovery_conn"
+        )
+        recovery_control_end = control_production.index(
+            "fn prepare_advisory_abort_conn", recovery_control_start
+        )
+        recovery_control = control_production[
+            recovery_control_start:recovery_control_end
+        ]
+        for required in (
+            "load_advisory_abort_conn(conn, archive_id)",
+            "load_advisory_comparison_conn(conn, archive_id)",
+            "load_retained_advisory_owner_conn(conn, operation_id)",
+            "load_advisory_canary_capability_conn(conn, operation_id)",
+            "load_advisory_canary_scope_conn(conn, &canary, expected)",
+            "load_advisory_activation_preconditions_conn(",
+            "AdvisoryOwnerReservation::new_for_control(",
+            "scope.consumed != Some((owner_id, initial_commitment))",
+            "preconditions.consumed != Some((owner_id, initial_commitment))",
+            "archive_v3_maintenance_imports",
+            "JOIN archive_bindings",
+            "i.stage='parity_verified'",
+            "b.state='active_legacy'",
+            "PreparedAdvisoryAbortRecovery::from_control",
+        ):
+            self.assertIn(required, recovery_control)
+        recovery_finalize_start = control_production.index(
+            "fn finalize_advisory_abort_recovery_conn"
+        )
+        recovery_finalize_end = control_production.index(
+            "fn map_wal_persistence_error", recovery_finalize_start
+        )
+        recovery_finalize_control = control_production[
+            recovery_finalize_start:recovery_finalize_end
+        ]
+        for required in (
+            "load_advisory_abort_recovery_conn(&tx",
+            "stage='prepared'",
+            "retirement_commitment IS NULL",
+            "commitment=?11 AND revision=1",
+            "AdvisoryAbortRecoveryState::Aborted(loaded)",
+            "tx.commit()?",
+        ):
+            self.assertIn(required, recovery_finalize_control)
+        self.assertGreaterEqual(
+            recovery_finalize_control.count("load_advisory_abort_recovery_conn(&tx"),
+            2,
+        )
         for active_parent in (main, query, store_production, maintenance_production):
             self.assertNotIn("settle_comparison(", active_parent)
             self.assertNotIn("settle_advisory_comparison(", active_parent)
+            self.assertNotIn("reconcile_prepared_abort(", active_parent)
         for active_parent in (main, query, maintenance_production):
             self.assertNotIn("abort_resumed(", active_parent)
             self.assertNotIn("prepare_advisory_abort(", active_parent)

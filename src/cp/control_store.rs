@@ -30,11 +30,12 @@ use crate::{
         ObjectRole,
     },
     archive_v3_advisory_owner::{
-        AdvisoryAbortReason, AdvisoryAbortStage, AdvisoryAbortTerminal, AdvisoryCanaryScope,
-        AdvisoryComparisonEvidence, AdvisoryComparisonSettlement, AdvisoryFenceAbsence,
-        AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError, AdvisoryOwnerId,
-        AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease, AdvisoryReleaseStage,
-        BoundAdvisoryOwner, VerifiedAdvisoryCanaryAuthorization,
+        AdvisoryAbortReason, AdvisoryAbortRecoveryState, AdvisoryAbortStage, AdvisoryAbortTerminal,
+        AdvisoryCanaryScope, AdvisoryComparisonEvidence, AdvisoryComparisonSettlement,
+        AdvisoryFenceAbsence, AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError,
+        AdvisoryOwnerId, AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease,
+        AdvisoryReleaseStage, BoundAdvisoryOwner, PreparedAdvisoryAbortRecovery,
+        VerifiedAdvisoryCanaryAuthorization,
     },
     archive_v3_inventory_coordinator::{
         pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
@@ -11517,6 +11518,90 @@ fn load_optional_advisory_abort_conn(
     load_advisory_abort_conn(conn, archive_id).map(Some)
 }
 
+fn load_advisory_abort_recovery_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<Option<AdvisoryAbortRecoveryState>> {
+    let archive_id = conn
+        .query_row(
+            "SELECT archive_id FROM archive_v3_advisory_aborts
+             WHERE maintenance_operation_id=?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|value| {
+            fixed_blob::<16>(&value, "advisory abort recovery archive").map(ArchiveId::from_bytes)
+        })
+        .transpose()?;
+    let Some(archive_id) = archive_id else {
+        return Ok(None);
+    };
+    let terminal = load_advisory_abort_conn(conn, archive_id)?;
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_comparisons WHERE archive_id=?1)",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        let _ = load_advisory_comparison_conn(conn, archive_id)?;
+        return Err(EnclaveError::Conflict(
+            "advisory comparison conflicts with abort recovery".into(),
+        ));
+    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    if terminal.control_view(token).operation_id != operation_id {
+        return Err(EnclaveError::Conflict(
+            "advisory abort recovery operation changed".into(),
+        ));
+    }
+    let retained_owner = load_retained_advisory_owner_conn(conn, operation_id)?;
+    let (_, owner_id, expected, _, observed, _, _, _) = retained_owner.control_view(token);
+    if expected.archive_id() != archive_id || observed != terminal.control_view(token).owner_witness
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory abort recovery owner changed".into(),
+        ));
+    }
+    let canary = load_advisory_canary_capability_conn(conn, operation_id)?;
+    let scope = load_advisory_canary_scope_conn(conn, &canary, expected)?;
+    let preconditions = load_advisory_activation_preconditions_conn(conn, &scope, operation_id)?;
+    let initial =
+        AdvisoryOwnerReservation::new_for_control(token, operation_id, owner_id, expected.clone())
+            .map_err(map_advisory_owner_error)?;
+    let (_, _, _, _, _, initial_commitment) = initial.control_view(token);
+    if scope.consumed != Some((owner_id, initial_commitment))
+        || preconditions.consumed != Some((owner_id, initial_commitment))
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory abort recovery admission changed".into(),
+        ));
+    }
+    let user_id: String = conn.query_row(
+        "SELECT i.user_id
+         FROM archive_v3_maintenance_imports i
+         JOIN archive_bindings b
+           ON b.user_id=i.user_id AND b.archive_id=i.archive_id
+         WHERE i.archive_id=?1 AND i.operation_id=?2
+           AND i.format_version=1 AND i.stage='parity_verified'
+           AND b.state='active_legacy'",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    match terminal.control_view(token).stage {
+        AdvisoryAbortStage::Prepared => {
+            PreparedAdvisoryAbortRecovery::from_control(token, user_id, terminal)
+                .map(AdvisoryAbortRecoveryState::Prepared)
+                .map(Some)
+                .map_err(map_advisory_owner_error)
+        }
+        AdvisoryAbortStage::Aborted => Ok(Some(AdvisoryAbortRecoveryState::Aborted(terminal))),
+    }
+}
+
 fn prepare_advisory_abort_conn(
     conn: &Connection,
     owner: &BoundAdvisoryOwner,
@@ -11668,6 +11753,86 @@ fn finalize_advisory_abort_conn(
     if loaded != next {
         return Err(EnclaveError::Conflict(
             "advisory abort final readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn finalize_advisory_abort_recovery_conn(
+    conn: &Connection,
+    recovery: &PreparedAdvisoryAbortRecovery,
+    absence: &crate::store::StorePreparedAdvisoryAbortAbsent,
+) -> Result<(AdvisoryAbortTerminal, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let prepared = recovery.terminal_for_control(token);
+    let next = AdvisoryAbortTerminal::aborted_from_recovery_for_control(token, recovery, absence)
+        .map_err(map_advisory_owner_error)?;
+    let prepared_view = prepared.control_view(token);
+    let next_view = next.control_view(token);
+    let tx = conn.unchecked_transaction()?;
+    let retained = load_advisory_abort_recovery_conn(&tx, prepared_view.operation_id)?
+        .ok_or_else(|| EnclaveError::Conflict("advisory abort recovery disappeared".into()))?;
+    match retained {
+        AdvisoryAbortRecoveryState::Aborted(current) => {
+            if current != next {
+                return Err(EnclaveError::Conflict(
+                    "advisory abort recovery result changed".into(),
+                ));
+            }
+            tx.commit()?;
+            return Ok((current, false));
+        }
+        AdvisoryAbortRecoveryState::Prepared(current) => {
+            if current.terminal_for_control(token) != prepared {
+                return Err(EnclaveError::Conflict(
+                    "advisory abort recovery predecessor changed".into(),
+                ));
+            }
+        }
+    }
+    if tx.execute(
+        "UPDATE archive_v3_advisory_aborts
+         SET stage='aborted',retirement_commitment=?1,commitment=?2,revision=2,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?3 AND format_version=1 AND maintenance_operation_id=?4
+           AND owner_id=?5 AND owner_witness=?6 AND owner_revision=?7
+           AND owner_commitment=?8 AND release_commitment=?9 AND reason=?10
+           AND stage='prepared' AND retirement_commitment IS NULL
+           AND commitment=?11 AND revision=1",
+        rusqlite::params![
+            next_view
+                .retirement_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            next_view.commitment.as_slice(),
+            prepared_view.archive_id.as_bytes().as_slice(),
+            prepared_view.operation_id.as_bytes().as_slice(),
+            prepared_view.owner_id.as_bytes().as_slice(),
+            prepared_view.owner_witness.encode().as_slice(),
+            i64::try_from(prepared_view.owner_revision).map_err(|_| EnclaveError::Store(
+                "advisory abort recovery owner revision overflow".into()
+            ))?,
+            prepared_view.owner_commitment.as_slice(),
+            prepared_view.release_commitment.as_slice(),
+            prepared_view.reason.as_db(),
+            prepared_view.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory abort recovery finalize raced".into(),
+        ));
+    }
+    let loaded = load_advisory_abort_recovery_conn(&tx, prepared_view.operation_id)?;
+    let Some(AdvisoryAbortRecoveryState::Aborted(loaded)) = loaded else {
+        return Err(EnclaveError::Conflict(
+            "advisory abort recovery final readback changed".into(),
+        ));
+    };
+    if loaded != next {
+        return Err(EnclaveError::Conflict(
+            "advisory abort recovery final readback changed".into(),
         ));
     }
     tx.commit()?;
@@ -17441,6 +17606,35 @@ impl ControlStore {
     }
 
     #[cfg(test)]
+    pub(crate) async fn set_advisory_abort_recovery_admission_fault_for_test(
+        &self,
+        enabled: bool,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            if enabled {
+                conn.execute_batch(
+                    "CREATE TRIGGER rearm_advisory_abort_scope_after_finalize_for_test
+                     AFTER UPDATE OF stage ON archive_v3_advisory_aborts
+                     WHEN NEW.stage='aborted'
+                     BEGIN
+                       UPDATE archive_v3_advisory_canary_scopes
+                       SET state='authorized',consumed_owner_id=NULL,
+                           consumed_owner_commitment=NULL,
+                           commitment=authorization_commitment,revision=1
+                       WHERE maintenance_operation_id=NEW.maintenance_operation_id;
+                     END;",
+                )?;
+            } else {
+                conn.execute_batch(
+                    "DROP TRIGGER rearm_advisory_abort_scope_after_finalize_for_test;",
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn replace_advisory_release_commitment_for_test(
         &self,
         archive_id: ArchiveId,
@@ -17489,6 +17683,62 @@ impl ControlStore {
             {
                 return Err(EnclaveError::Conflict(
                     "maintenance source test mutation missed".into(),
+                ));
+            }
+            Ok(stored)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_maintenance_parity_commitment_for_test(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        replacement: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        self.write(move |conn| {
+            let stored: Vec<u8> = conn.query_row(
+                "SELECT parity_commitment FROM archive_v3_maintenance_imports
+                 WHERE operation_id=?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            let stored = fixed_blob::<32>(&stored, "maintenance parity commitment")?;
+            if conn.execute(
+                "UPDATE archive_v3_maintenance_imports SET parity_commitment=?1
+                 WHERE operation_id=?2",
+                rusqlite::params![replacement.as_slice(), operation_id.as_bytes().as_slice()],
+            )? != 1
+            {
+                return Err(EnclaveError::Conflict(
+                    "maintenance parity test mutation missed".into(),
+                ));
+            }
+            Ok(stored)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_archive_binding_state_for_test(
+        &self,
+        archive_id: ArchiveId,
+        replacement: &str,
+    ) -> Result<String> {
+        let replacement = replacement.to_owned();
+        self.write(move |conn| {
+            let stored: String = conn.query_row(
+                "SELECT state FROM archive_bindings WHERE archive_id=?1",
+                [archive_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            if conn.execute(
+                "UPDATE archive_bindings SET state=?1 WHERE archive_id=?2",
+                rusqlite::params![replacement, archive_id.as_bytes().as_slice()],
+            )? != 1
+            {
+                return Err(EnclaveError::Conflict(
+                    "archive binding test mutation missed".into(),
                 ));
             }
             Ok(stored)
@@ -21932,6 +22182,16 @@ impl AdvisoryOwnerControl for ControlStore {
             .map_err(map_advisory_persistence_error)
     }
 
+    async fn load_advisory_abort_recovery(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        operation_id: MaintenanceImportOperationId,
+    ) -> std::result::Result<Option<AdvisoryAbortRecoveryState>, AdvisoryOwnerError> {
+        self.read(move |conn| load_advisory_abort_recovery_conn(conn, operation_id))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
+
     async fn finalize_advisory_abort(
         &self,
         _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
@@ -21941,6 +22201,19 @@ impl AdvisoryOwnerControl for ControlStore {
         self.write_owned_if_changed(|conn| finalize_advisory_abort_conn(conn, prepared, retired))
             .await
             .map_err(map_advisory_persistence_error)
+    }
+
+    async fn finalize_advisory_abort_recovery(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        recovery: &PreparedAdvisoryAbortRecovery,
+        absence: &crate::store::StorePreparedAdvisoryAbortAbsent,
+    ) -> std::result::Result<AdvisoryAbortTerminal, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            finalize_advisory_abort_recovery_conn(conn, recovery, absence)
+        })
+        .await
+        .map_err(map_advisory_persistence_error)
     }
 }
 
@@ -30468,6 +30741,102 @@ mod tests {
             release_view.operation_id,
         );
         assert!(finalize_advisory_abort_conn(&conn, &prepared, &wrong_retirement).is_err());
+    }
+
+    #[test]
+    fn advisory_abort_recovery_requires_the_exact_consumed_admission() {
+        let conn = account_conn();
+        let (bound, released) = released_advisory_owner_fixture(&conn);
+        let token = AdvisoryOwnerPersistenceContext::for_test();
+        let (operation_id, owner_id, expected, _, _, _, _, _) = bound.control_view(token);
+        prepare_advisory_abort_conn(&conn, &bound, &released, AdvisoryAbortReason::StopRequested)
+            .unwrap();
+        assert!(matches!(
+            load_advisory_abort_recovery_conn(&conn, operation_id).unwrap(),
+            Some(AdvisoryAbortRecoveryState::Prepared(_))
+        ));
+
+        let canary = load_advisory_canary_capability_conn(&conn, operation_id).unwrap();
+        let scope = load_advisory_canary_scope_conn(&conn, &canary, expected).unwrap();
+        let preconditions =
+            load_advisory_activation_preconditions_conn(&conn, &scope, operation_id).unwrap();
+        let initial = AdvisoryOwnerReservation::new_for_control(
+            token,
+            operation_id,
+            owner_id,
+            expected.clone(),
+        )
+        .unwrap();
+        let (_, _, _, _, _, initial_commitment) = initial.control_view(token);
+        assert_eq!(scope.consumed, Some((owner_id, initial_commitment)));
+        assert_eq!(preconditions.consumed, Some((owner_id, initial_commitment)));
+
+        conn.execute(
+            "UPDATE archive_v3_advisory_canary_scopes
+             SET state='authorized',consumed_owner_id=NULL,
+                 consumed_owner_commitment=NULL,
+                 commitment=authorization_commitment,revision=1",
+            [],
+        )
+        .unwrap();
+        assert!(load_advisory_abort_recovery_conn(&conn, operation_id).is_err());
+        conn.execute(
+            "UPDATE archive_v3_advisory_canary_scopes
+             SET state='consumed',consumed_owner_id=?1,
+                 consumed_owner_commitment=?2,commitment=?3,revision=2",
+            rusqlite::params![
+                owner_id.as_bytes().as_slice(),
+                initial_commitment.as_slice(),
+                scope.commitment.as_slice(),
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE archive_v3_advisory_activation_preconditions
+             SET state='authorized',consumed_owner_id=NULL,
+                 consumed_owner_commitment=NULL,
+                 commitment=authorization_commitment,revision=1",
+            [],
+        )
+        .unwrap();
+        assert!(load_advisory_abort_recovery_conn(&conn, operation_id).is_err());
+        conn.execute(
+            "UPDATE archive_v3_advisory_activation_preconditions
+             SET state='consumed',consumed_owner_id=?1,
+                 consumed_owner_commitment=?2,commitment=?3,revision=2",
+            rusqlite::params![
+                owner_id.as_bytes().as_slice(),
+                initial_commitment.as_slice(),
+                preconditions.commitment.as_slice(),
+            ],
+        )
+        .unwrap();
+
+        let substituted_owner_commitment = [0xd1; 32];
+        let substituted_scope_commitment = advisory_canary_scope_commitment(
+            &scope.scope_id,
+            operation_id,
+            &scope.terminal,
+            (
+                &scope.release_image_digest,
+                &scope.operator_statement_commitment,
+                &scope.activation_preconditions_commitment,
+            ),
+            2,
+            Some((owner_id, substituted_owner_commitment)),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_advisory_canary_scopes
+             SET consumed_owner_commitment=?1,commitment=?2",
+            rusqlite::params![
+                substituted_owner_commitment.as_slice(),
+                substituted_scope_commitment.as_slice(),
+            ],
+        )
+        .unwrap();
+        assert!(load_advisory_abort_recovery_conn(&conn, operation_id).is_err());
     }
 
     #[test]

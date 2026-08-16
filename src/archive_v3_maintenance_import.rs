@@ -3798,8 +3798,15 @@ mod tests {
         ));
     }
 
+    #[derive(Clone, Copy)]
+    enum AdvisoryTerminalTestMode {
+        ComparisonReplay,
+        AbortCancellation,
+        AbortRestartRecovery,
+    }
+
     async fn run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
-        abort_after_mismatch: bool,
+        terminal_mode: AdvisoryTerminalTestMode,
     ) {
         use crate::{
             cp::control_store::ControlStore,
@@ -4474,88 +4481,315 @@ mod tests {
             Some(exact_capture_count + later_capture_count),
             "a parity mismatch cannot settle or lose the selected prefix"
         );
-        if abort_after_mismatch {
-            let resumed_owner = Arc::try_unwrap(resumed_owner)
-                .expect("comparison tasks released the sole owner reference");
-            control
-                .set_advisory_abort_finalize_fault_for_test(true)
+        let store = match terminal_mode {
+            AdvisoryTerminalTestMode::AbortCancellation => {
+                let resumed_owner = Arc::try_unwrap(resumed_owner)
+                    .expect("comparison tasks released the sole owner reference");
+                control
+                    .set_advisory_abort_finalize_fault_for_test(true)
+                    .await
+                    .unwrap();
+                let abort_started = Arc::new(tokio::sync::Semaphore::new(0));
+                let abort_caller = tokio::spawn({
+                    let abort_started = Arc::clone(&abort_started);
+                    async move {
+                        resumed_owner
+                            .abort_with_started_for_test(
+                                crate::archive_v3_advisory_owner::AdvisoryAbortReason::ComparisonMismatch,
+                                abort_started,
+                            )
+                            .await
+                    }
+                });
+                abort_started
+                    .acquire()
+                    .await
+                    .expect("abort owner start semaphore remains open")
+                    .forget();
+                abort_caller.abort();
+                let _ = abort_caller.await;
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if control
+                            .advisory_abort_stage_for_test(operation_id)
+                            .await
+                            .unwrap()
+                            == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("a failed final readback must retain the durable Prepared terminal");
+                control
+                    .set_advisory_abort_finalize_fault_for_test(false)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if control
+                            .advisory_abort_stage_for_test(operation_id)
+                            .await
+                            .unwrap()
+                            == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("caller cancellation must not interrupt the owned abort terminal");
+                store
+            }
+            AdvisoryTerminalTestMode::AbortRestartRecovery => {
+                let resumed_owner = Arc::try_unwrap(resumed_owner)
+                    .expect("comparison tasks released the sole owner reference");
+                resumed_owner
+                    .prepare_abort_for_restart_test(
+                        crate::archive_v3_advisory_owner::AdvisoryAbortReason::ComparisonMismatch,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    control
+                        .advisory_abort_stage_for_test(operation_id)
+                        .await
+                        .unwrap(),
+                    Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared)
+                );
+                assert!(
+                    crate::archive_v3_advisory_owner::reconcile_prepared_abort_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&store),
+                        operation_id,
+                    )
+                    .await
+                    .is_err(),
+                    "restart reconciliation must not accept a still-live capture selector"
+                );
+                drop(store);
+                let restarted = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs.clone()));
+                let wrong_operation = MaintenanceImportOperationId::from_control(
+                    crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+                    [0xf1; 16],
+                )
+                .unwrap();
+                assert!(
+                    crate::archive_v3_advisory_owner::prove_prepared_abort_absence_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        wrong_operation,
+                    )
+                    .await
+                    .is_err()
+                );
+
+                let retained_source = control
+                    .replace_maintenance_source_commitment_for_test(operation_id, [0xf2; 32])
+                    .await
+                    .unwrap();
+                assert!(
+                    crate::archive_v3_advisory_owner::prove_prepared_abort_absence_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        operation_id,
+                    )
+                    .await
+                    .is_err()
+                );
+                control
+                    .replace_maintenance_source_commitment_for_test(operation_id, retained_source)
+                    .await
+                    .unwrap();
+
+                let retained_parity = control
+                    .replace_maintenance_parity_commitment_for_test(operation_id, [0xf3; 32])
+                    .await
+                    .unwrap();
+                assert!(
+                    crate::archive_v3_advisory_owner::prove_prepared_abort_absence_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        operation_id,
+                    )
+                    .await
+                    .is_err()
+                );
+                control
+                    .replace_maintenance_parity_commitment_for_test(operation_id, retained_parity)
+                    .await
+                    .unwrap();
+
+                let retained_binding = control
+                    .replace_archive_binding_state_for_test(archive_id, "tombstoned")
+                    .await
+                    .unwrap();
+                assert!(
+                    crate::archive_v3_advisory_owner::prove_prepared_abort_absence_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        operation_id,
+                    )
+                    .await
+                    .is_err()
+                );
+                control
+                    .replace_archive_binding_state_for_test(archive_id, &retained_binding)
+                    .await
+                    .unwrap();
+
+                crate::archive_v3_advisory_owner::prove_prepared_abort_absence_for_test(
+                    Arc::clone(&control),
+                    Arc::clone(&restarted),
+                    operation_id,
+                )
                 .await
                 .unwrap();
-            let abort_started = Arc::new(tokio::sync::Semaphore::new(0));
-            let abort_caller = tokio::spawn({
-                let abort_started = Arc::clone(&abort_started);
-                async move {
-                    resumed_owner
-                        .abort_with_started_for_test(
-                            crate::archive_v3_advisory_owner::AdvisoryAbortReason::ComparisonMismatch,
-                            abort_started,
+                restarted.with_user(&user.id, |_| Ok(())).await.unwrap();
+                crate::archive_v3_advisory_owner::prove_prepared_abort_absence_for_test(
+                    Arc::clone(&control),
+                    Arc::clone(&restarted),
+                    operation_id,
+                )
+                .await
+                .unwrap();
+                let active_write = restarted.acquire_content_write(&user.id).await.unwrap();
+                assert!(
+                    crate::archive_v3_advisory_owner::prove_prepared_abort_absence_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        operation_id,
+                    )
+                    .await
+                    .is_err(),
+                    "an active legacy write must prevent local-absence proof minting"
+                );
+                drop(active_write);
+                control
+                    .set_advisory_abort_finalize_fault_for_test(true)
+                    .await
+                    .unwrap();
+                assert!(crate::archive_v3_advisory_owner::finalize_prepared_abort_recovery_once_for_test(
+                    Arc::clone(&control),
+                    Arc::clone(&restarted),
+                    operation_id,
+                )
+                .await
+                .is_err());
+                assert_eq!(
+                    control
+                        .advisory_abort_stage_for_test(operation_id)
+                        .await
+                        .unwrap(),
+                    Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared),
+                    "late recovery readback corruption must roll back to Prepared"
+                );
+                control
+                    .set_advisory_abort_finalize_fault_for_test(false)
+                    .await
+                    .unwrap();
+                control
+                    .set_advisory_abort_recovery_admission_fault_for_test(true)
+                    .await
+                    .unwrap();
+                assert!(crate::archive_v3_advisory_owner::finalize_prepared_abort_recovery_once_for_test(
+                    Arc::clone(&control),
+                    Arc::clone(&restarted),
+                    operation_id,
+                )
+                .await
+                .is_err());
+                assert_eq!(
+                    control
+                        .advisory_abort_stage_for_test(operation_id)
+                        .await
+                        .unwrap(),
+                    Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared),
+                    "late admission rearm must roll back the abort CAS"
+                );
+                control
+                    .set_advisory_abort_recovery_admission_fault_for_test(false)
+                    .await
+                    .unwrap();
+                let recovery_guard = restarted.lock_user_lifecycle(&user.id).await.unwrap();
+                let recovery_started = Arc::new(tokio::sync::Semaphore::new(0));
+                let recovery_caller = tokio::spawn({
+                    let control = Arc::clone(&control);
+                    let restarted = Arc::clone(&restarted);
+                    let recovery_started = Arc::clone(&recovery_started);
+                    async move {
+                        crate::archive_v3_advisory_owner::reconcile_prepared_abort_with_started_for_test(
+                            control,
+                            restarted,
+                            operation_id,
+                            recovery_started,
                         )
                         .await
-                }
-            });
-            abort_started
-                .acquire()
-                .await
-                .expect("abort owner start semaphore remains open")
-                .forget();
-            abort_caller.abort();
-            let _ = abort_caller.await;
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if control
-                        .advisory_abort_stage_for_test(operation_id)
-                        .await
-                        .unwrap()
-                        == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Prepared)
-                    {
-                        break;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("a failed final readback must retain the durable Prepared terminal");
-            control
-                .set_advisory_abort_finalize_fault_for_test(false)
-                .await
-                .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if control
-                        .advisory_abort_stage_for_test(operation_id)
-                        .await
-                        .unwrap()
-                        == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted)
-                    {
-                        break;
+                });
+                recovery_started
+                    .acquire()
+                    .await
+                    .expect("restart recovery semaphore remains open")
+                    .forget();
+                recovery_caller.abort();
+                let _ = recovery_caller.await;
+                drop(recovery_guard);
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if control
+                            .advisory_abort_stage_for_test(operation_id)
+                            .await
+                            .unwrap()
+                            == Some(crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("caller cancellation must not interrupt the owned abort terminal");
-        } else {
-            resumed_owner
-                .delete_uncaptured_metadata_for_test("advisory-uncaptured")
+                })
                 .await
-                .unwrap();
-            resumed_owner
-                .persist_comparison_without_retirement_for_test()
-                .await
-                .unwrap();
-            let resumed_owner = Arc::try_unwrap(resumed_owner)
-                .expect("comparison tasks released the sole owner reference");
-            let settled_owner = resumed_owner.settle_comparison_for_test().await.unwrap();
-            assert_eq!(
-                format!("{settled_owner:?}"),
-                "SettledSingleArchiveAdvisoryOwner(<inactive>)"
-            );
-            assert!(settled_owner.capture_is_retired_for_test().await);
-            settled_owner
-                .reconcile_capture_retirement_for_test()
-                .await
-                .unwrap();
-        }
+                .expect("caller cancellation must not interrupt restart reconciliation");
+                assert_eq!(
+                    crate::archive_v3_advisory_owner::reconcile_prepared_abort_for_test(
+                        Arc::clone(&control),
+                        Arc::clone(&restarted),
+                        operation_id,
+                    )
+                    .await
+                    .unwrap(),
+                    crate::archive_v3_advisory_owner::AdvisoryAbortStage::Aborted,
+                    "exact Aborted replay must perform no second Store mutation"
+                );
+                restarted
+            }
+            AdvisoryTerminalTestMode::ComparisonReplay => {
+                resumed_owner
+                    .delete_uncaptured_metadata_for_test("advisory-uncaptured")
+                    .await
+                    .unwrap();
+                resumed_owner
+                    .persist_comparison_without_retirement_for_test()
+                    .await
+                    .unwrap();
+                let resumed_owner = Arc::try_unwrap(resumed_owner)
+                    .expect("comparison tasks released the sole owner reference");
+                let settled_owner = resumed_owner.settle_comparison_for_test().await.unwrap();
+                assert_eq!(
+                    format!("{settled_owner:?}"),
+                    "SettledSingleArchiveAdvisoryOwner(<inactive>)"
+                );
+                assert!(settled_owner.capture_is_retired_for_test().await);
+                settled_owner
+                    .reconcile_capture_retirement_for_test()
+                    .await
+                    .unwrap();
+                store
+            }
+        };
         store
             .with_user(&user.id, |connection| {
                 connection.execute(
@@ -4602,12 +4836,26 @@ mod tests {
 
     #[tokio::test]
     async fn real_sqlite_import_stops_advisory_reopens_and_fences_authority() {
-        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(false).await;
+        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
+            AdvisoryTerminalTestMode::ComparisonReplay,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn real_sqlite_advisory_mismatch_abort_survives_caller_cancellation() {
-        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(true).await;
+        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
+            AdvisoryTerminalTestMode::AbortCancellation,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_prepared_abort_reconciles_after_process_local_state_is_lost() {
+        run_real_sqlite_import_stops_advisory_reopens_and_fences_authority(
+            AdvisoryTerminalTestMode::AbortRestartRecovery,
+        )
+        .await;
     }
 
     #[tokio::test]

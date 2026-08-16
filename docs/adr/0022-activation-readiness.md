@@ -79,8 +79,11 @@ reviewed activation change and production evidence**.
 
 The inactive resumed-canary locus now has an exact `Prepared -> Aborted`
 terminal that retires only its exact capture and is mutually exclusive with
-successful comparison. This is not yet a complete controller stop policy:
-pre-owner and released-before-resume cleanup remain absent and fail closed.
+successful comparison. A private restart worker can also finish a retained
+`Prepared` row only after the controller-owned Store proves process-local
+capture absence while holding the exact-user lifecycle guard. This is not yet
+a complete controller stop policy: pre-owner and released-before-resume cleanup
+remain absent and fail closed.
 
 ## Required order
 

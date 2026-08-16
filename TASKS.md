@@ -693,10 +693,16 @@ separate activation blockers.
     stop/mismatch reason before Store retirement; only the opaque exact-target
     retirement proof finalizes `Aborted`. Comparison and abort exclude one
     another, restart is fenced, late readback rolls back, and finalized rows
-    reopen exactly. A retained `Prepared` row fails closed because the
-    process-local retirement proof is not reconstructible yet. Pre-owner,
-    released-before-resume, and prepared-abort recovery remain required before
-    the one-shot controller can be composed.
+    reopen exactly. Pre-owner and released-before-resume cleanup remain
+    required before the one-shot controller can be composed.
+  - [x] Add private restart reconciliation for a retained resumed-canary
+    `Prepared` abort. Encrypted Control reauthenticates the exact
+    release/owner/maintenance chain and comparison absence; the
+    controller-owned Store then proves paired gates are unblocked and selector
+    plus exact-user capture registration are absent while retaining the user
+    lifecycle guard through the final full-tuple CAS. The worker is
+    cancellation-owned, exact `Aborted` replay is read-only, a live/partial or
+    substituted Store state fails closed, and no production caller exists.
   - [x] Add the inactive one-shot advisory canary admission contract. One
     encrypted-Control row binds the exact private user/archive/import,
     maintenance/source/parity commitments, released witness, release-image

@@ -869,12 +869,18 @@ comparison-mismatch reason, records `Prepared` before any Store change, retires
 only the exact selector/registration in a cancellation-owned task, and records
 `Aborted` only from the resulting opaque exact-target proof. Full-tuple CAS and
 exact readback make late corruption roll back; finalized rows reopen exactly.
-The in-process transition is cancellation-owned, but a retained `Prepared` row
-fails closed because the process-local retirement proof is not reconstructible
-after a process loss. Abort and successful comparison are mutually exclusive,
-and abort prevents owner restart. This slice does not claim prepared-abort
-recovery, cleanup before owner admission, or cleanup between provider release
-and local resume; those loci remain prerequisites for the controller.
+The in-process transition is cancellation-owned. After process loss, a private
+cancellation-owned reconciler may exact-load only a retained `Prepared` row,
+reauthenticate its release/owner/maintenance chain and comparison absence, and
+ask the controller-owned Store only for a read-only proof that both local gates
+are unblocked and no selector or exact-user capture registration exists. The
+proof retains the exact-user lifecycle guard through the full-tuple Control CAS
+and has a separate user-private commitment domain from live retirement. A live
+selector or registration must use the original owner-held path and makes the
+restart reconciler fail closed. Abort and successful comparison are mutually
+exclusive, and abort prevents owner restart. Neither reconciler has a
+production caller. Cleanup before owner admission and between provider release
+and local resume remain prerequisites for the controller.
 
 `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
