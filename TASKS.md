@@ -568,6 +568,13 @@ separate activation blockers.
     capture failure still falls back to the unchanged legacy open. A separate
     reviewed advisory-owner handoff and independent comparison worker remain
     required before any canary.
+  - [x] Carry a sealed exact Store/user/archive/import target from the freshly
+    revalidated advisory maintenance terminal into the private advisory owner.
+    Minting it scrubs scratch and drops the owned maintenance guards, while the
+    permanent provider fence and Store/barrier blocked state remain fail-closed.
+    Its Store handle and identity fields stay private and it has no operation
+    or selector conversion. A durable advisory-release protocol, capture
+    installation, and comparison remain separate inactive reviews.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

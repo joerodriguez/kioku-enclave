@@ -143,8 +143,11 @@ surfaces.
   `ParityVerified` Control row, requires the fresh Active+ShadowWal witness to be the retained
   same-fence record or its sole lease-release successor, releases only the importer owner/expiry,
   rereads the exact no-owner ShadowWal record, revalidates the pinned legacy generation again,
-  then scrubs DB/WAL/SHM and drops every Store admission guard. Its opaque handoff carries no
-  Store fence, acknowledgement, serving policy, route, capture, or WalAuthoritative conversion.
+  then scrubs DB/WAL/SHM and drops its owned Store guard values. The permanent
+  legacy provider fence and process-local Store/barrier blocks deliberately
+  remain fail-closed; a separate durable advisory-release protocol is required
+  before legacy serving can resume. Its opaque handoff carries no Store fence,
+  acknowledgement, serving policy, route, capture, or WalAuthoritative conversion.
   A higher-fence, changed-root/registry, changed-migration, deletion, or ambiguous unreconciled
   record fails closed. The existing authority importer is a distinct type and
   direct continuation through it after this lease release is rejected; Phase 2
@@ -177,6 +180,15 @@ surfaces.
   cannot obtain it, and unrelated users always use the unchanged legacy open.
   This is not yet the owner handoff or comparison worker and grants no canary
   or acknowledgement authority.
+  The parity-certified advisory terminal now also converts its freshly
+  revalidated pinned source into one non-cloneable Store target. That target
+  binds the exact Store, user, archive, import operation, and source while
+  keeping every field private; the conversion scrubs scratch and drops its
+  owned maintenance guards before the advisory owner receives it. It does not
+  clear the permanent provider fence or Store/barrier blocked state. The owner
+  can only retain this opaque target: there is still no advisory-release,
+  selector conversion, capture/drain operation, general Store access,
+  comparison, or live caller.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness

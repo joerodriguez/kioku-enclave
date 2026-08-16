@@ -594,6 +594,22 @@ pub(crate) struct StoreWalAuthorityFence {
     _pinned: PinnedLegacySnapshot,
 }
 
+/// Non-cloneable exact-user Store target retained by the inactive Phase-1
+/// advisory owner. Its Store handle and identity tuple are private, and this
+/// slice exposes no capture, connection, mutation, acknowledgement, or
+/// serving operation. Only a freshly revalidated pinned maintenance source
+/// can mint it after its scratch family is scrubbed. The owned maintenance
+/// guards are dropped, but the fail-closed Store/barrier blocks and permanent
+/// provider fence deliberately remain until a reviewed advisory-release
+/// protocol can restore legacy authority atomically.
+pub(crate) struct StoreAdvisoryCaptureTarget {
+    _store: Arc<Store>,
+    _user_id: UserId,
+    _archive_id: crate::archive_v3::ArchiveId,
+    _operation_id: MaintenanceImportOperationId,
+    _source: MaintenanceSourceBinding,
+}
+
 #[cfg(test)]
 impl StoreWalAuthorityFence {
     pub(crate) fn scratch_family_absent_for_test(&self) -> bool {
@@ -1514,6 +1530,42 @@ impl PinnedLegacySnapshot {
         }
         Ok(StoreWalAuthorityFence { _pinned: self })
     }
+
+    pub(crate) fn into_advisory_capture_target(
+        self,
+        _token: crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext,
+        expected_source: MaintenanceSourceBinding,
+    ) -> Result<StoreAdvisoryCaptureTarget> {
+        if self.source != expected_source
+            || self._plan.archive_id != self._archive_id
+            || self._plan.operation_id != self._operation_id
+        {
+            return Err(EnclaveError::Conflict(
+                "maintenance advisory capture target changed".into(),
+            ));
+        }
+        remove_temp_db_files(&self.path);
+        if self.path.exists()
+            || sqlite_sidecar_path(&self.path, "-wal").exists()
+            || sqlite_sidecar_path(&self.path, "-shm").exists()
+        {
+            return Err(EnclaveError::Store(
+                "maintenance advisory scratch cleanup failed".into(),
+            ));
+        }
+        let target = StoreAdvisoryCaptureTarget {
+            _store: Arc::clone(&self._store),
+            _user_id: self._plan.user_id.clone(),
+            _archive_id: self._archive_id,
+            _operation_id: self._operation_id,
+            _source: self.source,
+        };
+        // Drop releases the owned lifecycle/actor guards before the advisory
+        // owner can receive the target. Fail-closed Store/barrier blocked state
+        // and the permanent provider fence deliberately remain in place.
+        drop(self);
+        Ok(target)
+    }
 }
 
 impl MaintenanceGenerationRevalidation {
@@ -1573,6 +1625,26 @@ impl std::fmt::Debug for PinnedLegacySnapshot {
 impl std::fmt::Debug for StoreWalAuthorityFence {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("StoreWalAuthorityFence(<opaque>)")
+    }
+}
+
+impl std::fmt::Debug for StoreAdvisoryCaptureTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreAdvisoryCaptureTarget(<opaque-inactive>)")
+    }
+}
+
+#[cfg(test)]
+impl StoreAdvisoryCaptureTarget {
+    pub(crate) fn exact_identity_for_test(
+        &self,
+        user_id: &str,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> bool {
+        self._user_id == user_id
+            && self._archive_id == archive_id
+            && self._operation_id == operation_id
     }
 }
 
@@ -14257,10 +14329,11 @@ pub(crate) mod tests {
         let object_name = gcs_object_name(user_id);
         assert_eq!(gcs.exact_generation_count(&object_name), 1);
 
+        let plan = maintenance_test_plan(user_id);
         let mut transition = store
             .begin_archive_maintenance(
                 crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
-                maintenance_test_plan(user_id),
+                plan,
             )
             .await
             .unwrap();
@@ -14283,10 +14356,32 @@ pub(crate) mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         std::fs::write(&wal, b"plaintext-sidecar").unwrap();
         std::fs::write(&shm, b"plaintext-sidecar").unwrap();
-        drop(pinned);
+        let target = pinned
+            .into_advisory_capture_target(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                source,
+            )
+            .unwrap();
+        let operation_id = MaintenanceImportOperationId::from_control(
+            crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+            [0x62; 16],
+        )
+        .unwrap();
+        assert!(target.exact_identity_for_test(
+            user_id,
+            crate::archive_v3::ArchiveId::from_bytes([0x61; 16]),
+            operation_id,
+        ));
         assert!(!path.exists());
         assert!(!wal.exists());
         assert!(!shm.exists());
+        // A target is not release authority. Until a separately reviewed
+        // durable advisory-release protocol exists, the Store and content
+        // barrier remain fail-closed for this identity.
+        assert!(matches!(
+            store.with_user(user_id, |_| Ok(())).await,
+            Err(EnclaveError::Auth(_))
+        ));
         assert_eq!(gcs.exact_generation_count(&object_name), 2);
     }
 

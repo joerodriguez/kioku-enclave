@@ -8,7 +8,8 @@
 //! handoff, durably reserves one random owner, records `SendStarted` before the
 //! initial witness transaction, and adopts only exact one-step acquisition,
 //! heartbeat, or post-expiry reacquire successors. It is deliberately separate
-//! from the `WalAuthoritative` publisher and exposes no Store, capture, root,
+//! from the `WalAuthoritative` publisher. It retains one sealed exact-user
+//! Store target but cannot inspect or operate it, and exposes no capture, root,
 //! object, cipher, acknowledgement, route, task, configuration, or serving
 //! capability.
 
@@ -578,6 +579,7 @@ struct SingleArchiveAdvisoryOwner {
     _control: Arc<crate::cp::control_store::ControlStore>,
     _archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
     _parity: crate::archive_v3_maintenance_import::CompletedAdvisoryShadowParityEvidence,
+    _capture_target: crate::store::StoreAdvisoryCaptureTarget,
     _bound: BoundAdvisoryOwner,
     may_heartbeat: bool,
 }
@@ -590,6 +592,7 @@ impl SingleArchiveAdvisoryOwner {
             archive_binding,
             parity,
             control,
+            store_capture_target,
         } = handoff.into_advisory_owner(AdvisoryOwnerRuntimeContext(()));
         let operation_id = parity.operation_id_for_advisory_owner(AdvisoryOwnerRuntimeContext(()));
         let terminal_control =
@@ -713,6 +716,7 @@ impl SingleArchiveAdvisoryOwner {
             _control: control,
             _archive_binding: archive_binding,
             _parity: parity,
+            _capture_target: store_capture_target,
             _bound: bound,
             may_heartbeat,
         })
@@ -827,6 +831,17 @@ impl AdvisoryOwnerTestHandle {
 
     pub(crate) const fn may_heartbeat(&self) -> bool {
         self.0.may_heartbeat
+    }
+
+    pub(crate) fn has_exact_capture_target(
+        &self,
+        user_id: &str,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> bool {
+        self.0
+            ._capture_target
+            .exact_identity_for_test(user_id, archive_id, operation_id)
     }
 }
 
