@@ -1152,7 +1152,7 @@ fn valid_advisory_fence_authority(authority: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn advisory_fence_authority_commitment(
+pub(crate) fn advisory_fence_authority_commitment(
     archive_id: ArchiveId,
     operation_id: MaintenanceImportOperationId,
     authority: &str,

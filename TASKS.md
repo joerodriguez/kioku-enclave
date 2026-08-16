@@ -834,6 +834,10 @@ repository, construct the runtime at startup, or enable any user-visible behavio
   acknowledgement/serving/capture surface, or WalAuthoritative conversion; the
   existing R2 importer remains a separate type path and is deliberately fenced
   after advisory lease release pending a reviewed Phase-2 authority acquisition.
+- [x] Added pre-owner durable abort and cleanup: reconciles GCS provider marker deletion
+  to fresh NotFound, durably transitions Control import stage to ManualRequired under exclusive
+  user lifecycle lock asserting absence of any advisory owner or release row, and safely unblocks
+  local legacy Store gates without installing capture or opening DB handles.
 - [x] Kept the result offline and non-serving. The importer is obtainable only by
   consuming the sealed image-bound runtime and a non-cloneable encrypted-control plan;
   there is no main/startup/Store constructor call, route, worker, environment/config

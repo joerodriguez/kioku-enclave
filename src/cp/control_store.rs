@@ -455,7 +455,7 @@ CREATE TABLE IF NOT EXISTS archive_v3_maintenance_imports (
     CHECK ((tentative_generation IS NULL) = (tentative_plaintext_len IS NULL)),
     CHECK ((tentative_generation IS NULL) = (tentative_schema_version IS NULL)),
     CHECK ((tentative_generation IS NULL) = (tentative_wrapped_dek_commitment IS NULL)),
-    CHECK ((stage = 'prepared') = (tentative_generation IS NULL)),
+    CHECK (stage = 'manual_required' OR ((stage = 'prepared') = (tentative_generation IS NULL))),
     CHECK ((source_generation IS NULL) = (source_plaintext_hash IS NULL)),
     CHECK ((source_generation IS NULL) = (source_plaintext_len IS NULL)),
     CHECK ((source_generation IS NULL) = (source_schema_version IS NULL)),
@@ -465,14 +465,15 @@ CREATE TABLE IF NOT EXISTS archive_v3_maintenance_imports (
     CHECK ((witness_record IS NULL) = (lease_expiry IS NULL)),
     CHECK ((shadow_candidate IS NULL) = (shadow_candidate_hash IS NULL)),
     CHECK ((authoritative_candidate IS NULL) = (authoritative_candidate_hash IS NULL)),
-    CHECK ((stage IN ('prepared','fencing')) = (source_generation IS NULL)),
-    CHECK ((stage IN ('prepared','fencing','legacy_pinned')) = (witness_record IS NULL)),
+    CHECK (stage = 'manual_required' OR ((stage IN ('prepared','fencing')) = (source_generation IS NULL))),
+    CHECK (stage = 'manual_required' OR ((stage IN ('prepared','fencing','legacy_pinned')) = (witness_record IS NULL))),
     CHECK (
         (stage IN ('prepared','fencing','legacy_pinned') AND shadow_candidate IS NULL)
         OR stage = 'shadow_uploading'
         OR (stage IN ('shadow_send_unknown','shadow_wal','parity_verified',
                       'authoritative_uploading','authoritative_send_unknown',
-                      'wal_authoritative','manual_required') AND shadow_candidate IS NOT NULL)
+                      'wal_authoritative') AND shadow_candidate IS NOT NULL)
+        OR stage = 'manual_required'
     ),
     CHECK (
         (stage IN ('prepared','fencing','legacy_pinned','shadow_uploading',
@@ -8703,6 +8704,97 @@ fn persist_maintenance_parity_conn(
         ));
     }
     maintenance_import_record_conn(conn, operation_id)
+}
+
+fn abort_pre_owner_maintenance_import_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<(MaintenanceImportRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_owners WHERE maintenance_operation_id=?1)",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        return Err(EnclaveError::Conflict(
+            "cannot pre-owner abort an operation that has an advisory owner".into(),
+        ));
+    }
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_releases WHERE maintenance_operation_id=?1)",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        return Err(EnclaveError::Conflict(
+            "cannot pre-owner abort an operation that has an advisory release".into(),
+        ));
+    }
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_aborts WHERE maintenance_operation_id=?1)",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        return Err(EnclaveError::Conflict(
+            "cannot pre-owner abort an operation that has an advisory abort row".into(),
+        ));
+    }
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_comparisons WHERE maintenance_operation_id=?1)",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        return Err(EnclaveError::Conflict(
+            "cannot pre-owner abort an operation that has an advisory comparison".into(),
+        ));
+    }
+    let record = maintenance_import_record_conn(&tx, operation_id)?;
+    if record.stage() == MaintenanceImportStage::ManualRequired {
+        tx.commit()?;
+        return Ok((record, false));
+    }
+    if !matches!(
+        record.stage(),
+        MaintenanceImportStage::Prepared
+            | MaintenanceImportStage::Fencing
+            | MaintenanceImportStage::LegacyPinned
+            | MaintenanceImportStage::ShadowUploading
+            | MaintenanceImportStage::ShadowSendUnknown
+            | MaintenanceImportStage::ShadowWal
+            | MaintenanceImportStage::ParityVerified
+    ) {
+        return Err(EnclaveError::Conflict(
+            "maintenance stage is not pre-owner admissible for pre-owner abort".into(),
+        ));
+    }
+    let updated = tx.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET stage='manual_required',revision=revision+1,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?2",
+        rusqlite::params![operation_id.as_bytes().as_slice(), record.stage().as_db(),],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "pre-owner abort maintenance CAS changed".into(),
+        ));
+    }
+    let _ = tx.execute(
+        "UPDATE archive_v3_maintenance_import_attempts SET state='manual_required'
+         WHERE operation_id=?1 AND state='active'",
+        [operation_id.as_bytes().as_slice()],
+    )?;
+    let loaded = maintenance_import_record_conn(&tx, operation_id)?;
+    if loaded.stage() != MaintenanceImportStage::ManualRequired {
+        return Err(EnclaveError::Conflict(
+            "pre-owner abort readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
 }
 
 type MaintenanceArtifactAuthority = (ArchiveId, MaintenanceImportOperationId, u32, ObjectId);
@@ -21991,6 +22083,17 @@ impl MaintenanceImportPersistence for ControlStore {
         .map_err(map_maintenance_persistence_error)
     }
 
+    async fn abort_pre_owner(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        self.write_owned_if_changed(move |conn| {
+            abort_pre_owner_maintenance_import_conn(conn, operation_id)
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
     async fn persist_candidate_before_send(
         &self,
         operation_id: MaintenanceImportOperationId,
@@ -31205,6 +31308,49 @@ mod tests {
             finalize_released_advisory_abort_conn(&conn, &prepared, &restored).unwrap();
         assert!(!changed);
         assert!(replayed == aborted);
+    }
+
+    #[test]
+    fn advisory_pre_owner_abort_requires_absence_of_owner_and_releases_and_is_idempotent() {
+        let conn = account_conn();
+        let (plan, created) = maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        assert!(created);
+        let (_, _, operation_id, _) = plan.components_for_test();
+
+        // 1. In Prepared stage, pre-owner abort succeeds
+        let (aborted, changed) =
+            abort_pre_owner_maintenance_import_conn(&conn, operation_id).unwrap();
+        assert!(changed);
+        assert_eq!(aborted.stage(), MaintenanceImportStage::ManualRequired);
+
+        // 2. Replay is idempotent
+        let (replayed, changed) =
+            abort_pre_owner_maintenance_import_conn(&conn, operation_id).unwrap();
+        assert!(!changed);
+        assert_eq!(replayed, aborted);
+
+        // 3. If an advisory owner exists, pre-owner abort must fail
+        let conn2 = account_conn();
+        let (bound, released) = released_advisory_owner_fixture(&conn2);
+        let token = AdvisoryOwnerPersistenceContext::for_test();
+        let (op2, _, _, _, _, _, _, _) = bound.control_view(token);
+        assert!(matches!(
+            abort_pre_owner_maintenance_import_conn(&conn2, op2),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // 4. If an advisory abort exists, pre-owner abort must fail
+        prepare_advisory_abort_conn(
+            &conn2,
+            &bound,
+            &released,
+            AdvisoryAbortReason::StopRequested,
+        )
+        .unwrap();
+        assert!(matches!(
+            abort_pre_owner_maintenance_import_conn(&conn2, op2),
+            Err(EnclaveError::Conflict(_))
+        ));
     }
 
     #[test]

@@ -328,6 +328,18 @@ impl AuthenticatedMaintenanceImportPlan {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn components_for_test(
+        &self,
+    ) -> (&str, ArchiveId, MaintenanceImportOperationId, &str) {
+        (
+            &self.user_id,
+            self.archive_id,
+            self.operation_id,
+            &self.fence_authority,
+        )
+    }
+
     pub(crate) fn into_store_view(
         self,
         _token: crate::store::StoreMaintenanceContext,
@@ -448,67 +460,71 @@ impl MaintenanceImportRecord {
                 .as_ref()
                 .is_some_and(|bytes| bytes.is_empty())
             || parity_commitment.as_ref().is_some_and(zero)
-            || ((stage == MaintenanceImportStage::Prepared) != tentative.is_none())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::Prepared | MaintenanceImportStage::Fencing
-            ) != source.is_none())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::Prepared
-                    | MaintenanceImportStage::Fencing
-                    | MaintenanceImportStage::LegacyPinned
-            ) != witness_bytes.is_none())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::Prepared
-                    | MaintenanceImportStage::Fencing
-                    | MaintenanceImportStage::LegacyPinned
-            ) && shadow_candidate.is_some())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::ShadowSendUnknown
-                    | MaintenanceImportStage::ShadowWal
-                    | MaintenanceImportStage::ParityVerified
-                    | MaintenanceImportStage::AuthoritativeUploading
-                    | MaintenanceImportStage::AuthoritativeSendUnknown
-                    | MaintenanceImportStage::WalAuthoritative
-                    | MaintenanceImportStage::ManualRequired
-            ) && shadow_candidate.is_none())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::Prepared
-                    | MaintenanceImportStage::Fencing
-                    | MaintenanceImportStage::LegacyPinned
-                    | MaintenanceImportStage::ShadowUploading
-                    | MaintenanceImportStage::ShadowSendUnknown
-                    | MaintenanceImportStage::ShadowWal
-            ) && parity_commitment.is_some())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::ParityVerified
-                    | MaintenanceImportStage::AuthoritativeUploading
-                    | MaintenanceImportStage::AuthoritativeSendUnknown
-                    | MaintenanceImportStage::WalAuthoritative
-            ) && parity_commitment.is_none())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::Prepared
-                    | MaintenanceImportStage::Fencing
-                    | MaintenanceImportStage::LegacyPinned
-                    | MaintenanceImportStage::ShadowUploading
-                    | MaintenanceImportStage::ShadowSendUnknown
-                    | MaintenanceImportStage::ShadowWal
-                    | MaintenanceImportStage::ParityVerified
-            ) && authoritative_candidate.is_some())
-            || (matches!(
-                stage,
-                MaintenanceImportStage::AuthoritativeUploading
-                    | MaintenanceImportStage::AuthoritativeSendUnknown
-                    | MaintenanceImportStage::WalAuthoritative
-            ) && authoritative_candidate.is_none())
+            || (stage != MaintenanceImportStage::ManualRequired
+                && (((stage == MaintenanceImportStage::Prepared) != tentative.is_none())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::Prepared | MaintenanceImportStage::Fencing
+                    ) != source.is_none())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::Prepared
+                            | MaintenanceImportStage::Fencing
+                            | MaintenanceImportStage::LegacyPinned
+                    ) != witness_bytes.is_none())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::Prepared
+                            | MaintenanceImportStage::Fencing
+                            | MaintenanceImportStage::LegacyPinned
+                    ) && shadow_candidate.is_some())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::ShadowSendUnknown
+                            | MaintenanceImportStage::ShadowWal
+                            | MaintenanceImportStage::ParityVerified
+                            | MaintenanceImportStage::AuthoritativeUploading
+                            | MaintenanceImportStage::AuthoritativeSendUnknown
+                            | MaintenanceImportStage::WalAuthoritative
+                    ) && shadow_candidate.is_none())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::Prepared
+                            | MaintenanceImportStage::Fencing
+                            | MaintenanceImportStage::LegacyPinned
+                            | MaintenanceImportStage::ShadowUploading
+                            | MaintenanceImportStage::ShadowSendUnknown
+                            | MaintenanceImportStage::ShadowWal
+                    ) && parity_commitment.is_some())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::ParityVerified
+                            | MaintenanceImportStage::AuthoritativeUploading
+                            | MaintenanceImportStage::AuthoritativeSendUnknown
+                            | MaintenanceImportStage::WalAuthoritative
+                    ) && parity_commitment.is_none())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::Prepared
+                            | MaintenanceImportStage::Fencing
+                            | MaintenanceImportStage::LegacyPinned
+                            | MaintenanceImportStage::ShadowUploading
+                            | MaintenanceImportStage::ShadowSendUnknown
+                            | MaintenanceImportStage::ShadowWal
+                            | MaintenanceImportStage::ParityVerified
+                    ) && authoritative_candidate.is_some())
+                    || (matches!(
+                        stage,
+                        MaintenanceImportStage::AuthoritativeUploading
+                            | MaintenanceImportStage::AuthoritativeSendUnknown
+                            | MaintenanceImportStage::WalAuthoritative
+                    ) && authoritative_candidate.is_none())))
             || (stage == MaintenanceImportStage::ManualRequired
-                && (authoritative_candidate.is_some() != parity_commitment.is_some()))
+                && ((authoritative_candidate.is_some() && parity_commitment.is_none())
+                    || (parity_commitment.is_some() && shadow_candidate.is_none())
+                    || (shadow_candidate.is_some() && witness_bytes.is_none())
+                    || (witness_bytes.is_some() && source.is_none())
+                    || (source.is_some() && tentative.is_none())))
         {
             return Err(MaintenanceImportError::Corrupt);
         }
@@ -877,6 +893,11 @@ pub(crate) trait MaintenanceImportPersistence: ShadowObjectInventory + Send + Sy
         expected_stage: MaintenanceImportStage,
     ) -> Result<MaintenanceImportRecord, MaintenanceImportError>;
 
+    async fn abort_pre_owner(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<MaintenanceImportRecord, MaintenanceImportError>;
+
     async fn persist_candidate_before_send(
         &self,
         operation_id: MaintenanceImportOperationId,
@@ -1000,6 +1021,41 @@ impl SingleArchiveMaintenanceImporter {
             store,
             plan,
         })
+    }
+
+    /// Abort a pre-owner maintenance import operation: validates Store state,
+    /// reconciles GCS provider marker deletion to fresh NotFound, durably transitions
+    /// Control maintenance import stage to ManualRequired, and restores Store legacy gates.
+    pub(crate) async fn abort_pre_owner(
+        store: &Arc<crate::store::Store>,
+        control: &Arc<crate::cp::control_store::ControlStore>,
+        user_id: &str,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        fence_authority: &str,
+    ) -> Result<(), MaintenanceImportError> {
+        let admission = store
+            .preflight_pre_owner_advisory_abort(
+                MaintenanceCoordinatorContext(()),
+                user_id,
+                archive_id,
+                operation_id,
+                fence_authority,
+            )
+            .await
+            .map_err(|_| MaintenanceImportError::Conflict)?;
+        control.abort_pre_owner(operation_id).await?;
+        let restored = store
+            .restore_pre_owner_advisory_local_admission(
+                MaintenanceCoordinatorContext(()),
+                admission,
+            )
+            .await
+            .map_err(|_| MaintenanceImportError::Conflict)?;
+        let _ = restored
+            .authenticate(MaintenanceCoordinatorContext(()), archive_id, operation_id)
+            .map_err(|_| MaintenanceImportError::Conflict)?;
+        Ok(())
     }
 
     /// Run the complete offline import in one owned task. Dropping the caller
@@ -3276,6 +3332,19 @@ mod tests {
             ))
         }
 
+        async fn abort_pre_owner(
+            &self,
+            _operation_id: MaintenanceImportOperationId,
+        ) -> Result<MaintenanceImportRecord, MaintenanceImportError> {
+            self.manuals
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(record(
+                &self.fixture,
+                MaintenanceImportStage::ManualRequired,
+                &self.fixture.current,
+            ))
+        }
+
         async fn persist_candidate_before_send(
             &self,
             _operation_id: MaintenanceImportOperationId,
@@ -5188,6 +5257,97 @@ mod tests {
     #[test]
     fn real_sqlite_released_resume_wins_against_stale_abort() {
         run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedResumeWinsAbortRace);
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_pre_owner_abort_cleans_marker_and_restores_legacy_access() {
+        use crate::{
+            cp::control_store::ControlStore,
+            store::{tests::FakeGcs, tests::FakeKms, GcsClient, Store},
+        };
+
+        let control_gcs = Arc::new(FakeGcs::new());
+        let control = Arc::new(ControlStore::new(Arc::new(FakeKms), control_gcs.clone()));
+        let user = control
+            .upsert_user("pre-owner-e2e", "preowner@example.com")
+            .await
+            .unwrap();
+        let plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let (_, archive_id, operation_id, fence_authority) = plan.components_for_test();
+        let fence_authority = fence_authority.to_string();
+
+        let legacy_gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs.clone()));
+        store
+            .with_user(&user.id, |connection| {
+                connection.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
+                    ["2026-08-13T12:00:00Z", "pre-owner-legacy-data"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(&user.id).await.unwrap();
+
+        // 1. Begin maintenance and fence
+        let admission = store
+            .acquire_archive_maintenance_admission(MaintenanceCoordinatorContext::for_test(), plan)
+            .await
+            .unwrap();
+        let mut transition = admission.begin().await;
+        let tentative = transition.tentative_source().await.unwrap();
+        let _ = control
+            .persist_fencing(operation_id, tentative)
+            .await
+            .unwrap();
+        let pinned = match transition.fence_and_pin(tentative).await.unwrap() {
+            crate::store::MaintenanceFenceAndPin::Pinned(pinned) => pinned,
+            _ => panic!("unexpected rebase"),
+        };
+        let _ = control
+            .persist_pinned_source(operation_id, pinned.source_binding())
+            .await
+            .unwrap();
+        drop(pinned);
+
+        // Marker exists on GCS and Store gates are blocked
+        let marker_name = store.identity_rebind_fence_object_name(&user.id).unwrap();
+        assert!(legacy_gcs.get_object(&marker_name).await.is_ok());
+        assert!(store.with_user(&user.id, |_| Ok(())).await.is_err());
+
+        // 2. Perform pre-owner abort
+        SingleArchiveMaintenanceImporter::abort_pre_owner(
+            &store,
+            &control,
+            &user.id,
+            archive_id,
+            operation_id,
+            &fence_authority,
+        )
+        .await
+        .unwrap();
+
+        // 3. Verify marker is deleted from GCS and Store gates are unblocked
+        assert!(matches!(
+            legacy_gcs.get_object(&marker_name).await,
+            Err(crate::error::EnclaveError::NotFound)
+        ));
+        store
+            .with_user(&user.id, |connection| {
+                connection.execute(
+                    "INSERT INTO app_metadata(key,value) VALUES('pre-owner-aborted','clean')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let write_lease = store.acquire_content_write(&user.id).await.unwrap();
+        drop(write_lease);
     }
 
     #[tokio::test]

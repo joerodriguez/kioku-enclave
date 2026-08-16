@@ -730,6 +730,33 @@ pub(crate) struct StoreReleasedAbortRestored {
     _lifecycle_guard: OwnedMutexGuard<()>,
 }
 
+/// Read-only admission for stopping one exact pre-owner maintenance operation.
+/// It verifies GCS provider marker absence/deletion and retains the exact-user
+/// lifecycle lock across Control's durable abort write.
+#[allow(dead_code)]
+pub(crate) struct StorePreOwnerAbortAdmission {
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    user_id: UserId,
+    fence_authority_commitment: [u8; 32],
+    user_commitment: [u8; 32],
+    commitment: [u8; 32],
+    _lifecycle_guard: OwnedMutexGuard<()>,
+}
+
+/// Opaque proof that one exact pre-owner abort reopened both local legacy
+/// gates without installing capture. The lifecycle lock remains owned through
+/// completion.
+#[allow(dead_code)]
+pub(crate) struct StorePreOwnerAbortRestored {
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    user_id: UserId,
+    user_commitment: [u8; 32],
+    commitment: [u8; 32],
+    _lifecycle_guard: OwnedMutexGuard<()>,
+}
+
 impl StoreAdvisoryCaptureRetired {
     pub(crate) fn commitment_for_advisory_abort(
         &self,
@@ -837,6 +864,49 @@ impl StoreReleasedAbortRestored {
     }
 }
 
+#[allow(dead_code)]
+impl StorePreOwnerAbortRestored {
+    pub(crate) fn commitment(&self) -> [u8; 32] {
+        self.commitment
+    }
+
+    pub(crate) fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub(crate) const fn archive_id(&self) -> crate::archive_v3::ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn authenticate(
+        &self,
+        _token: crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<[u8; 32]> {
+        if self.archive_id != archive_id || self.operation_id != operation_id {
+            return Err(EnclaveError::Conflict(
+                "pre-owner abort restored target changed".into(),
+            ));
+        }
+        let expected = pre_owner_abort_restored_commitment(
+            self.archive_id,
+            self.operation_id,
+            self.user_commitment,
+        );
+        if self.commitment != expected {
+            return Err(EnclaveError::Conflict(
+                "pre-owner abort restoration changed".into(),
+            ));
+        }
+        Ok(self.commitment)
+    }
+}
+
 fn released_abort_admission_commitment(
     archive_id: crate::archive_v3::ArchiveId,
     operation_id: MaintenanceImportOperationId,
@@ -871,6 +941,42 @@ fn advisory_abort_absent_commitment(
     hasher.update(archive_id.as_bytes());
     hasher.update(operation_id.as_bytes());
     hasher.update(prepared_commitment);
+    hasher.update(user_commitment);
+    hasher.finalize().into()
+}
+
+fn pre_owner_abort_user_commitment(user_id: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku/archive-v3/pre-owner-abort-user/v1\0");
+    hasher.update((user_id.len() as u64).to_be_bytes());
+    hasher.update(user_id.as_bytes());
+    hasher.finalize().into()
+}
+
+fn pre_owner_abort_admission_commitment(
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    fence_authority_commitment: [u8; 32],
+    user_commitment: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku/archive-v3/pre-owner-abort-admission/v1\0");
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(fence_authority_commitment);
+    hasher.update(user_commitment);
+    hasher.finalize().into()
+}
+
+fn pre_owner_abort_restored_commitment(
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    user_commitment: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku/archive-v3/pre-owner-abort-restored/v1\0");
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
     hasher.update(user_commitment);
     hasher.finalize().into()
 }
@@ -4969,6 +5075,169 @@ impl Store {
             store: Arc::clone(self),
             plan,
             lifecycle_guard,
+        })
+    }
+
+    /// Read-only admission for an exact pre-owner abort. Both local gates must
+    /// still be blocked (or both unblocked), no handle, write, or selector may
+    /// exist, and the exact GCS provider marker must be reconciled to fresh NotFound.
+    /// The lifecycle guard is transferred into the opaque admission.
+    pub(crate) async fn preflight_pre_owner_advisory_abort(
+        &self,
+        _token: crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext,
+        user_id: &str,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        fence_authority: &str,
+    ) -> Result<StorePreOwnerAbortAdmission> {
+        validate_user_id(user_id)?;
+        if !valid_legacy_fence_authority(fence_authority) {
+            return Err(EnclaveError::Conflict(
+                "invalid pre-owner fence authority".into(),
+            ));
+        }
+        let lifecycle_guard = self.lock_user_lifecycle(user_id).await?;
+        let marker_name = self.identity_rebind_fence_object_name(user_id)?;
+        match self.gcs.get_object(&marker_name).await {
+            Ok(marker) => {
+                if marker.ciphertext != fence_authority.as_bytes() {
+                    return Err(EnclaveError::Conflict(
+                        "pre-owner fence marker authority changed".into(),
+                    ));
+                }
+                let delete_result = self
+                    .gcs
+                    .delete_object_generation(&marker_name, marker.generation)
+                    .await;
+                match self.gcs.get_object(&marker_name).await {
+                    Err(EnclaveError::NotFound) => {}
+                    Ok(_) => {
+                        return Err(delete_result.err().unwrap_or_else(|| {
+                            EnclaveError::Conflict(
+                                "pre-owner fence marker remained after deletion".into(),
+                            )
+                        }));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(EnclaveError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let registry = self.registry.lock().await;
+        let barrier = self
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        let selection = self
+            .shadow_capture
+            .read()
+            .map_err(|_| EnclaveError::Store("advisory capture selection unavailable".into()))?;
+        let registry_blocked = registry.blocked_users.contains(user_id);
+        let content_blocked = barrier.blocked_users.contains(user_id);
+        if registry_blocked != content_blocked
+            || registry.open_users.contains_key(user_id)
+            || barrier.active_writes.get(user_id).copied().unwrap_or(0) != 0
+            || selection.is_some()
+        {
+            return Err(EnclaveError::Conflict(
+                "pre-owner abort is not locally admissible".into(),
+            ));
+        }
+        let user_commitment = pre_owner_abort_user_commitment(user_id);
+        let fence_authority_commitment =
+            crate::archive_v3_advisory_owner::advisory_fence_authority_commitment(
+                archive_id,
+                operation_id,
+                fence_authority,
+            );
+        let commitment = pre_owner_abort_admission_commitment(
+            archive_id,
+            operation_id,
+            fence_authority_commitment,
+            user_commitment,
+        );
+        Ok(StorePreOwnerAbortAdmission {
+            archive_id,
+            operation_id,
+            user_id: user_id.to_string(),
+            fence_authority_commitment,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: lifecycle_guard,
+        })
+    }
+
+    /// Consume a pre-owner abort admission and atomically reopen both local
+    /// legacy gates without creating capture or opening a database.
+    pub(crate) async fn restore_pre_owner_advisory_local_admission(
+        &self,
+        _token: crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext,
+        admission: StorePreOwnerAbortAdmission,
+    ) -> Result<StorePreOwnerAbortRestored> {
+        let expected_commitment = pre_owner_abort_admission_commitment(
+            admission.archive_id,
+            admission.operation_id,
+            admission.fence_authority_commitment,
+            admission.user_commitment,
+        );
+        if admission.commitment != expected_commitment {
+            return Err(EnclaveError::Conflict(
+                "pre-owner abort admission changed".into(),
+            ));
+        }
+        let StorePreOwnerAbortAdmission {
+            archive_id,
+            operation_id,
+            user_id,
+            fence_authority_commitment: _,
+            user_commitment,
+            commitment: _,
+            _lifecycle_guard: lifecycle_guard,
+        } = admission;
+        let mut registry = self.registry.lock().await;
+        let mut barrier = self
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        let selection = self
+            .shadow_capture
+            .read()
+            .map_err(|_| EnclaveError::Store("advisory capture selection unavailable".into()))?;
+        let registry_blocked = registry.blocked_users.contains(&user_id);
+        let content_blocked = barrier.blocked_users.contains(&user_id);
+        if registry_blocked != content_blocked
+            || registry.open_users.contains_key(&user_id)
+            || barrier.active_writes.get(&user_id).copied().unwrap_or(0) != 0
+            || selection.is_some()
+        {
+            return Err(EnclaveError::Conflict(
+                "pre-owner abort local state changed".into(),
+            ));
+        }
+        if registry_blocked {
+            registry.blocked_users.remove(&user_id);
+            barrier.blocked_users.remove(&user_id);
+        }
+        let changed = registry_blocked;
+        drop(selection);
+        drop(barrier);
+        drop(registry);
+        if changed {
+            self.content_write_barrier.changed.notify_waiters();
+            self.registry_changed.notify_waiters();
+        }
+        let commitment =
+            pre_owner_abort_restored_commitment(archive_id, operation_id, user_commitment);
+        Ok(StorePreOwnerAbortRestored {
+            archive_id,
+            operation_id,
+            user_id,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: lifecycle_guard,
         })
     }
 
@@ -13377,6 +13646,122 @@ pub(crate) mod tests {
                 .is_some(),
             "a substituted selector must not consume the retained registration"
         );
+    }
+
+    #[tokio::test]
+    async fn pre_owner_abort_reconciles_marker_absence_and_unblocks_gates() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
+        let user_id = "pre-owner-abort-user";
+        let archive_id = crate::archive_v3::ArchiveId::from_bytes([0xb1; 16]);
+        let operation_id =
+            crate::archive_v3_maintenance_import::MaintenanceImportOperationId::random_for_control(
+                crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+            );
+        let fence_authority =
+            "archive_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Block gates and put marker
+        store.block_content_writes_for_deletion(user_id).await;
+        {
+            let mut registry = store.registry.lock().await;
+            registry.blocked_users.insert(user_id.to_string());
+        }
+        let marker_name = store.identity_rebind_fence_object_name(user_id).unwrap();
+        gcs.put_object(&marker_name, fence_authority.as_bytes(), "test-dek", 0)
+            .await
+            .unwrap();
+
+        // Preflight deletes marker and returns admission
+        let admission = store
+            .preflight_pre_owner_advisory_abort(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                user_id,
+                archive_id,
+                operation_id,
+                fence_authority,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            gcs.get_object(&marker_name).await,
+            Err(EnclaveError::NotFound)
+        ));
+
+        // Restore unblocks both gates
+        let restored = store
+            .restore_pre_owner_advisory_local_admission(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                admission,
+            )
+            .await
+            .unwrap();
+        drop(restored);
+
+        // Verify gates are unblocked and normal access works
+        store.with_user(user_id, |_| Ok(())).await.unwrap();
+        let write_lease = store.acquire_content_write(user_id).await.unwrap();
+        drop(write_lease);
+    }
+
+    #[tokio::test]
+    async fn pre_owner_abort_rejects_mismatched_marker_or_unclean_store() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
+        let user_id = "pre-owner-abort-mismatch";
+        let archive_id = crate::archive_v3::ArchiveId::from_bytes([0xb2; 16]);
+        let operation_id =
+            crate::archive_v3_maintenance_import::MaintenanceImportOperationId::random_for_control(
+                crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+            );
+        let correct_authority =
+            "archive_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let wrong_authority =
+            "archive_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        // Put mismatched marker
+        let marker_name = store.identity_rebind_fence_object_name(user_id).unwrap();
+        gcs.put_object(&marker_name, wrong_authority.as_bytes(), "test-dek", 0)
+            .await
+            .unwrap();
+
+        // Must reject mismatched marker authority
+        let result = store
+            .preflight_pre_owner_advisory_abort(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                user_id,
+                archive_id,
+                operation_id,
+                correct_authority,
+            )
+            .await;
+        assert!(matches!(result, Err(EnclaveError::Conflict(_))));
+
+        // Overwrite with matching marker
+        gcs.put_object(&marker_name, correct_authority.as_bytes(), "test-dek", 1)
+            .await
+            .unwrap();
+
+        // If local barrier has active write, must reject
+        {
+            let mut barrier = store.content_write_barrier.state.lock().unwrap();
+            barrier.active_writes.insert(user_id.to_string(), 1);
+        }
+        let result = store
+            .preflight_pre_owner_advisory_abort(
+                crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
+                user_id,
+                archive_id,
+                operation_id,
+                correct_authority,
+            )
+            .await;
+        assert!(matches!(result, Err(EnclaveError::Conflict(_))));
+        {
+            let mut barrier = store.content_write_barrier.state.lock().unwrap();
+            barrier.active_writes.remove(user_id);
+        }
     }
 
     #[tokio::test]
