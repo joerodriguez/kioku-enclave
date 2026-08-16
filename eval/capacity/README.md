@@ -107,11 +107,14 @@ does not download, encrypt, upload, or use production content. Its report is exp
 `release_evidence: false` and `archive_v3_authority: false`; signed-image/backend/VFS/
 witness/fault/lifecycle/cache/concurrency evidence remains a separate future release gate.
 
-## Inactive signed Phase-1 evidence contract
+## Inactive signed 32-GiB evidence contract
 
 `archive-v3-capacity-policy-v2.template.json` and
 `archive-v3-capacity-evidence-v2.schema.json` describe an **inactive** 32-GiB/three-year
-preauthorization format. The template is intentionally unusable: its signer, evaluator,
+preauthorization format. Its historical contract ID contains `phase1`, but it is not the
+Phase-1 canary-size gate: that path separately requires the database plus worst-case
+WAL/SQLite/model working set below 4 GiB and below 25% of measured VM memory. The template
+is intentionally unusable: its signer, evaluator,
 time-source, and verifier hashes are placeholders. The JSON Schema is a public shape
 companion; `scripts/verify_archive_v3_capacity_report.py` is the normative semantic
 contract.

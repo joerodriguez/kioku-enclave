@@ -538,10 +538,30 @@ separate activation blockers.
     acknowledgement/provider-list/provider-delete/cloud/deployment authority.
   - [x] Complete the inactive activation-readiness review in
     `docs/adr/0022-activation-readiness.md`. Production remains explicitly
-    blocked on live advisory shadow integration, complete enabled-domain and
-    provider/KMS adapters, runtime ownership/Store policy/acknowledgement
-    wiring, signed capacity/security evidence, restart/delete/export/schema
-    drills, and an operator-authorized canary/cloud change.
+    blocked on the Phase-1 controller/resources/telemetry, strict tmpfs-size and
+    signed security/advisory-drill evidence, and an operator-authorized canary/
+    cloud change. Enabled-domain/provider adapters, authority ownership, Store/
+    acknowledgement wiring, and mutation-lifecycle drills remain separate
+    Phase-2 blockers.
+  - [x] Record the final production decision package in
+    `docs/adr/0022-production-activation-runbook.md`. It separates the one-
+    archive, empty-mutation, legacy-authoritative Phase-1 canary from the later
+    plan-allowlisted Phase-2 tmpfs-eligible authority and the Phase-3/4/5 work
+    required for an all-user rollout; fixes the exact evidence, execution order,
+    rollback/no-go rules, and authority handoff; and performs no activation or
+    external mutation.
+  - [ ] Supply and independently verify the real three-root trust configuration,
+    exact release image/profile, fresh window and zero-serving observation,
+    canary scope and tmpfs eligibility, security and Phase-1 advisory-drill
+    receipts, deployed monitoring/rollback policies, deployment compatibility,
+    and explicit
+    operator/cloud authorization before Phase 1.
+  - [ ] After successful Phase-1 evidence, separately review and authorize the
+    exact Phase-2 plan allowlist, provider adapters, durable runtime/Store/
+    acknowledgement integration, mutation-lifecycle drills, sticky eligible-
+    archive cohorts, thresholds, and rollback. Phase-1 approval cannot satisfy
+    this item; large-archive and production-wide all-user expansion additionally
+    require the Phase-3/4 extent and Phase-5 scale decisions.
   - [x] Add the first inactive Phase-1 live-owner boundary without reusing
     WalAuthoritative state. A separate encrypted-Control row binds the exact
     `ParityVerified` operation and released ShadowWal witness to one random

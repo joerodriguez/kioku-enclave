@@ -532,7 +532,7 @@ CREATE TABLE IF NOT EXISTS archive_v3_maintenance_import_artifacts (
 );
 -- One exact, operator-selected Phase-1 canary admission. The authorization is
 -- inert until its full tuple is atomically consumed by the first advisory
--- owner reservation. The private two-root verifier and exact issuer are
+-- owner reservation. The private three-root verifier and exact issuer are
 -- compiled but inactive; production roots and a live attestation caller are
 -- intentionally absent.
 CREATE TABLE IF NOT EXISTS archive_v3_advisory_canary_scopes (
