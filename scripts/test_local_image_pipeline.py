@@ -995,6 +995,27 @@ class LocalImagePipelineTests(unittest.TestCase):
             outputs["builder_post"] = before
             self.assertTrue(pipeline.validate_receipt_outputs(Path(temporary_directory), "build", payload))
 
+    def test_resumable_builder_binding_excludes_volatile_disk_telemetry(self) -> None:
+        pipeline = load_pipeline()
+        before = {
+            "id": "builder-id",
+            "name": "reviewed-builder",
+            "node_name": "worker0",
+            "endpoint": "ssh://builder.example",
+            "platform": "linux/amd64",
+            "transport": "ssh",
+            "transport_pin": "SHA256:host-key",
+            "disk_free_bytes": 80,
+            "disk_reserve_bytes": 50,
+            "disk_total_bytes": 100,
+        }
+        after = dict(before, disk_free_bytes=70)
+        self.assertEqual(
+            pipeline.builder_identity_binding(before),
+            pipeline.builder_identity_binding(after),
+        )
+        self.assertNotIn("disk_free_bytes", pipeline.builder_identity_binding(before))
+
     def test_config_snapshot_hash_is_stable_after_source_mutation(self) -> None:
         pipeline = load_pipeline()
         with tempfile.TemporaryDirectory() as temporary_directory:
