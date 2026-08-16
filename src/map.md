@@ -7,6 +7,11 @@ persistent disk; bounded audio, screenshot pixels, transcript/screen text, and m
 leave the TEE through the documented Vertex inference boundary, while explicitly
 configured webhook events use the separate webhook boundary.
 
+The inactive ADR-0022 Phase-1 advisory owner now also has a private
+`archive_v3_advisory_owner/canary.rs` child: its opaque exact scope is consumed
+atomically with the first owner reservation. Production issuance remains absent
+until operator-signature trust roots and independent image attestation are reviewed.
+
 | File | Role |
 |---|---|
 | `main.rs` | Entry point; wires public OAuth, auth-gated Cloud Capture/session/push/query routes and separate single-event/reference-batch request budgets, environment-separated Secret-Manager APNs credentials, legacy `/v1/*`, public health/attestation, and offline ADR-0016 commands; starts media, summarization, finalization, push, and deletion workers; production fails closed without APNs configuration and serves only through `serve_tls` |

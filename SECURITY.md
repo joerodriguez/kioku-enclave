@@ -188,7 +188,16 @@ surfaces.
 
   The first post-bootstrap Phase-1 owner is also type-separated. Its private
   launcher reauthenticates the exact immutable `ParityVerified` Control row and
-  released Active+ShadowWal witness, reserves one random advisory owner in a
+  released Active+ShadowWal witness. It also requires one opaque exact canary
+  scope whose encrypted-Control row binds one private user/archive/import,
+  maintenance/source/parity commitments, the released witness hash, a release-
+  image digest, and a verified-operator-statement commitment. The complete
+  `Authorized -> Consumed` scope CAS and first random advisory-owner insert
+  share one transaction; either both persist or neither does. Reopen accepts
+  only the consumed scope linked to the exact retained initial reservation.
+  Production scope issuance is deliberately unconstructible until a reviewed
+  operator-signature trust root and independently authenticated image digest
+  exist; tests alone may issue fixtures. The launcher then reserves the owner in a
   dedicated table, and durably advances `Reserved -> SendStarted` before the
   exact witness CAS. Response loss grants no retry under a new identity: only
   the exact expected owner and canonical next fence may be adopted, after

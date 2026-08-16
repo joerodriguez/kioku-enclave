@@ -2053,6 +2053,11 @@ impl X {
         maintenance_production = without_cfg_test_items(maintenance)
         witness = (ROOT / "src/archive_v3_witness.rs").read_text(encoding="utf-8")
         control = (ROOT / "src/cp/control_store.rs").read_text(encoding="utf-8")
+        control_production = without_cfg_test_items(control)
+        canary = (
+            ROOT / "src/archive_v3_advisory_owner/canary.rs"
+        ).read_text(encoding="utf-8")
+        canary_production = without_cfg_test_items(canary)
         sqlite_vfs = (ROOT / "src/archive_v3_sqlite_vfs.rs").read_text(
             encoding="utf-8"
         )
@@ -2065,15 +2070,90 @@ impl X {
         self.assertIn("mod archive_v3_advisory_owner;", main)
         self.assertNotIn("archive_v3_advisory_owner::", main)
         self.assertIn("mod comparison;", advisory_production)
+        self.assertIn("mod canary;", advisory_production)
+        self.assertNotIn("pub mod canary", advisory_production)
         self.assertNotIn("pub mod comparison", advisory_production)
         self.assertIn("struct SingleArchiveAdvisoryOwner", advisory_production)
         self.assertNotIn(
             "pub(crate) struct SingleArchiveAdvisoryOwner", advisory_production
         )
         self.assertIn(
-            "async fn start(handoff: CompletedAdvisoryShadowHandoff)",
+            "async fn start(\n        handoff: CompletedAdvisoryShadowHandoff,\n        canary: AdvisoryCanaryScope,",
             advisory_production,
         )
+        self.assertIn("pub(crate) struct AdvisoryCanaryScope", canary_production)
+        for forbidden in ("derive(Clone", "derive(Copy", "Serialize", "Deserialize"):
+            self.assertNotIn(forbidden, canary_production)
+        self.assertIn(
+            "_token: crate::cp::control_store::AdvisoryOwnerPersistenceContext",
+            canary_production,
+        )
+        self.assertIn(
+            "#[cfg(test)]\nfn authorize_advisory_canary_for_test_conn(", control
+        )
+        self.assertIn(
+            "#[cfg(test)]\n    pub(crate) async fn authorize_advisory_canary_for_test(",
+            control,
+        )
+        self.assertNotIn("authorize_advisory_canary_for_test", advisory_production)
+        self.assertNotIn("authorize_advisory_canary_for_test", main)
+        self.assertNotIn("authorize_advisory_canary_for_test", query)
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS archive_v3_advisory_canary_scopes",
+            control_production,
+        )
+        self.assertIn("fn reserve_advisory_owner_with_canary_conn(", control_production)
+        self.assertNotIn("fn reserve_advisory_owner_conn(", control_production)
+        self.assertIn(
+            "async fn reserve_advisory_owner_with_canary(", advisory_production
+        )
+        start_begin = advisory_production.index("async fn start(")
+        start_end = advisory_production.index("async fn maintain_lease", start_begin)
+        start_owner = advisory_production[start_begin:start_end]
+        self.assertEqual(start_owner.count("reserve_advisory_owner_with_canary("), 1)
+        reauthenticate = start_owner.index("reauthenticate_for_advisory_owner")
+        reserve = start_owner.index("reserve_advisory_owner_with_canary(")
+        runtime_conversion = start_owner.index("let runtime = runtime")
+        send_started = start_owner.index("mark_advisory_owner_send_started")
+        self.assertLess(reauthenticate, reserve)
+        self.assertLess(reserve, runtime_conversion)
+        self.assertLess(runtime_conversion, send_started)
+        reserve_begin = control_production.index(
+            "fn reserve_advisory_owner_with_canary_conn("
+        )
+        reserve_end = control_production.index(
+            "fn mark_advisory_owner_send_started_conn", reserve_begin
+        )
+        reserve_control = control_production[reserve_begin:reserve_end]
+        for required in (
+            "load_advisory_canary_scope_conn",
+            "state='consumed'",
+            "consumed_owner_id=?1",
+            "authorization_commitment=?14",
+            "commitment=?15",
+            "revision=1",
+            "INSERT INTO archive_v3_advisory_owners",
+            "load_advisory_owner_reservation_conn",
+            "advisory canary consumption readback changed",
+            "tx.commit()?",
+        ):
+            self.assertIn(required, reserve_control)
+        self.assertLess(
+            reserve_control.index("UPDATE archive_v3_advisory_canary_scopes"),
+            reserve_control.index("INSERT INTO archive_v3_advisory_owners"),
+        )
+        for forbidden in (
+            "std::env::",
+            "Store::new",
+            "create_if_absent",
+            ".put_object(",
+            ".enumerate(",
+            "delete_exact",
+            "delete_object",
+            "acknowledge_result",
+        ):
+            self.assertNotIn(forbidden, canary_production)
+            self.assertNotIn(forbidden, reserve_control)
         self.assertNotIn("start_advisory_owner_for_test", advisory_production)
         self.assertIn("AdvisoryOwnerRuntimeContext(())", advisory_production)
         self.assertIn("MigrationState::ShadowWal", advisory_production)

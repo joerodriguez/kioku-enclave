@@ -13,6 +13,11 @@ It includes TLS, OAuth, sync, MCP/REST queries, account operations, summarisatio
 encrypted persistence; client applications and deployment automation are downstream
 consumers.
 
+ADR-0022's inactive Phase-1 advisory path includes an exact one-shot encrypted-Control
+canary scope whose consumption is atomic with the first owner reservation. It has no
+production issuer or live caller pending trusted operator-signature and image-attestation
+inputs and the separate activation review.
+
 ## Where it sits
 
 ```
