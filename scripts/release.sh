@@ -17,6 +17,11 @@ LOCAL_ROLL_SCRIPT="${LOCAL_ROLL_SCRIPT:-scripts/local-operations.sh}"
 RELEASE_SIGNER_FINGERPRINT="${RELEASE_SIGNER_FINGERPRINT:-}"
 EVIDENCE_PUBLIC_KEY="${LOCAL_BUILD_EVIDENCE_PUBLIC_KEY:-}"
 EVIDENCE_PUBLIC_KEY_SHA256="${LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256:-}"
+FROZEN_COMMIT=""
+COORDINATOR_RECEIPT=""
+COORDINATOR_SIGNATURE=""
+COORDINATOR_PUBLIC_KEY="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY:-}"
+COORDINATOR_PUBLIC_KEY_SHA256="${COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256:-}"
 
 usage() {
   cat <<'EOF'
@@ -30,11 +35,18 @@ Options:
   --roll                      After publication, invoke the local deployment roll script.
   --deployment-repo PATH      Checked-out Kioku deployment repository (required by --roll).
   --roll-script PATH          Path relative to deployment repo (default scripts/local-operations.sh).
+  --frozen-commit SHA          Build a detached frozen commit approved by a signed coordinator receipt.
+  --coordinator-advancement-receipt PATH
+                              Signed receipt for --frozen-commit (not a skip/force flag).
+  --coordinator-advancement-signature PATH
+                              Detached Ed25519 signature (default: receipt path + .sig).
 
 Required environment:
   RELEASE_SIGNER_FINGERPRINT              trusted signed-tag key fingerprint
   LOCAL_BUILD_EVIDENCE_PUBLIC_KEY         external Ed25519 PEM public key path
   LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256  SHA-256 of that public key's DER form
+  COORDINATOR_ADVANCEMENT_PUBLIC_KEY      external Ed25519 coordinator-key path (frozen mode)
+  COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256 SHA-256 of that coordinator key's DER form
 EOF
 }
 
@@ -53,6 +65,9 @@ while [[ $# -gt 0 ]]; do
     --roll) ROLL=true; shift ;;
     --deployment-repo) DEPLOYMENT_REPO_PATH="${2:-}"; shift 2 ;;
     --roll-script) LOCAL_ROLL_SCRIPT="${2:-}"; shift 2 ;;
+    --frozen-commit) FROZEN_COMMIT="${2:-}"; shift 2 ;;
+    --coordinator-advancement-receipt) COORDINATOR_RECEIPT="${2:-}"; shift 2 ;;
+    --coordinator-advancement-signature) COORDINATOR_SIGNATURE="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "unknown option: $1" ;;
   esac
@@ -65,6 +80,7 @@ done
 [[ -n "$RELEASE_SIGNER_FINGERPRINT" ]] || die "RELEASE_SIGNER_FINGERPRINT is required"
 [[ -n "$EVIDENCE_PUBLIC_KEY" && -f "$EVIDENCE_PUBLIC_KEY" ]] || die "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY must name the external trust-anchor public key"
 [[ "$EVIDENCE_PUBLIC_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "LOCAL_BUILD_EVIDENCE_PUBLIC_KEY_SHA256 must be a lowercase SHA-256 fingerprint"
+[[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] || die "GOOGLE_APPLICATION_CREDENTIALS is not accepted; use reviewed gcloud identity configuration"
 if [[ "$ROLL" == true && "$APPLY" != true ]]; then
   die "--roll requires --apply; review the dry-run output before allowing a VM replacement"
 fi
@@ -74,19 +90,40 @@ fi
 
 for command_name in git gh python3 openssl; do need "$command_name"; done
 cd "$REPO_ROOT"
-[[ "$(git branch --show-current)" == main ]] || die "releases must be prepared from local main"
+if [[ -z "$FROZEN_COMMIT" ]]; then
+  [[ "$(git branch --show-current)" == main ]] || die "releases must be prepared from local main"
+else
+  [[ "$FROZEN_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "--frozen-commit must be a lowercase 40-character commit"
+  [[ -n "$COORDINATOR_RECEIPT" && -f "$COORDINATOR_RECEIPT" ]] || die "--frozen-commit requires a signed coordinator advancement receipt"
+  [[ -n "$COORDINATOR_PUBLIC_KEY" && -f "$COORDINATOR_PUBLIC_KEY" ]] || die "COORDINATOR_ADVANCEMENT_PUBLIC_KEY must name the coordinator trust anchor"
+  [[ "$COORDINATOR_PUBLIC_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "COORDINATOR_ADVANCEMENT_PUBLIC_KEY_SHA256 must be a lowercase SHA-256 fingerprint"
+  if [[ -z "$COORDINATOR_SIGNATURE" ]]; then
+    COORDINATOR_SIGNATURE="${COORDINATOR_RECEIPT}.sig"
+  fi
+  [[ -f "$COORDINATOR_SIGNATURE" ]] || die "coordinator advancement signature is missing"
+fi
 [[ -z "$(git status --porcelain)" ]] || die "working tree is not clean"
 
 # Read the exact local configuration through the same no-shell, ownership- and
 # schema-checked parser used for image builds.  Only non-secret release claims
 # cross this boundary.
-RELEASE_CONFIG_FIELDS="$(python3 - "$CONFIG_FILE" "$TAG" <<'PY'
+RELEASE_CONFIG_SNAPSHOT="$(mktemp)"
+chmod 600 "$RELEASE_CONFIG_SNAPSHOT"
+trap 'rm -f "$RELEASE_CONFIG_SNAPSHOT"' EXIT
+RELEASE_CONFIG_FIELDS="$(python3 - "$CONFIG_FILE" "$TAG" "$RELEASE_CONFIG_SNAPSHOT" <<'PY'
 import sys
+import os
 from pathlib import Path
 sys.path.insert(0, "scripts")
-from local_image_pipeline import configured_environment
+from local_image_pipeline import configured_environment_snapshot
 
-configuration, builder = configured_environment(Path(sys.argv[1]), "production", sys.argv[2])
+configuration, builder, snapshot = configured_environment_snapshot(Path(sys.argv[1]), "production", sys.argv[2])
+descriptor = os.open(sys.argv[3], os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+try:
+    os.write(descriptor, snapshot.data)
+finally:
+    os.close(descriptor)
+os.chmod(sys.argv[3], 0o600)
 keys = (
     "PROJECT_ID", "REGION", "AR_REPOSITORY", "IMAGE_NAME",
     "ENCLAVE_GCS_BUCKET", "ENCLAVE_GCS_MEDIA_BUCKET",
@@ -96,6 +133,7 @@ keys = (
 print("\x1f".join((*[configuration[key] for key in keys], builder)))
 PY
 )" || die "local release configuration is invalid"
+CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
 IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
 if [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
@@ -105,8 +143,24 @@ fi
 # Keep the active-image rollout quarantine entirely local. It runs before the
 # origin refresh so an ineligible roll performs no network or external action.
 git fetch origin main
-COMMIT="$(git rev-parse HEAD)"
-[[ "$COMMIT" == "$(git rev-parse origin/main)" ]] || die "local main must exactly match origin/main"
+ORIGIN_MAIN="$(git rev-parse origin/main)"
+if [[ -z "$FROZEN_COMMIT" ]]; then
+  COMMIT="$(git rev-parse HEAD)"
+  [[ "$COMMIT" == "$ORIGIN_MAIN" ]] || die "local main must exactly match origin/main"
+else
+  COMMIT="$FROZEN_COMMIT"
+  [[ "$(git rev-parse HEAD)" == "$COMMIT" ]] || die "detached frozen mode requires HEAD to equal --frozen-commit"
+  git cat-file -e "${COMMIT}^{commit}" || die "frozen commit is not present locally"
+  git merge-base --is-ancestor "$COMMIT" "$ORIGIN_MAIN" || die "frozen commit is not an ancestor of fetched origin/main"
+  python3 scripts/verify_coordinator_advancement_receipt.py \
+    --receipt "$COORDINATOR_RECEIPT" \
+    --signature "$COORDINATOR_SIGNATURE" \
+    --public-key "$COORDINATOR_PUBLIC_KEY" \
+    --expected-public-key-sha256 "$COORDINATOR_PUBLIC_KEY_SHA256" \
+    --repository "$REPOSITORY" --tag "$TAG" \
+    --frozen-commit "$COMMIT" --origin-main "$ORIGIN_MAIN" \
+    >/dev/null || die "coordinator advancement receipt is invalid"
+fi
 IMAGE_REPOSITORY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${IMAGE_NAME}"
 
 MANIFEST="$EVIDENCE_DIR/enclave-local-build-evidence.json"
@@ -114,6 +168,9 @@ SIGNATURE="$EVIDENCE_DIR/enclave-local-build-evidence.sig"
 METADATA="$EVIDENCE_DIR/enclave-release.json"
 SBOM="$EVIDENCE_DIR/enclave-sbom.spdx.json"
 SCAN="$EVIDENCE_DIR/enclave-scan.json"
+SOURCE_ARCHIVE="$(mktemp)"
+trap 'rm -f "$SOURCE_ARCHIVE" "$RELEASE_CONFIG_SNAPSHOT"' EXIT
+git archive --format=tar --output="$SOURCE_ARCHIVE" "$COMMIT" || die "could not materialize the immutable frozen source archive"
 [[ -s "$MANIFEST" && -s "$SIGNATURE" && -s "$METADATA" && -s "$SBOM" && -s "$SCAN" ]] || die "evidence directory must contain the signed manifest, release metadata, SBOM, and scan result"
 
 EVIDENCE_BUNDLE="$(python3 scripts/verify_local_evidence_bundle.py \
@@ -125,7 +182,8 @@ EVIDENCE_BUNDLE="$(python3 scripts/verify_local_evidence_bundle.py \
   --expected-gcs-bucket "$EXPECTED_GCS_BUCKET" \
   --expected-gcs-media-bucket "$EXPECTED_GCS_MEDIA_BUCKET" \
   --expected-gcs-legacy-media-bucket "$EXPECTED_GCS_LEGACY_MEDIA_BUCKET" \
-  --config "$CONFIG_FILE")"
+  --config "$CONFIG_FILE" \
+  --source-archive "$SOURCE_ARCHIVE")"
 EVIDENCE_FIELDS="$(EVIDENCE_BUNDLE="$EVIDENCE_BUNDLE" python3 - <<'PY'
 import json
 import os
@@ -178,7 +236,7 @@ if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   EXPECTED_PRERELEASE=false
 fi
 NOTES="$(mktemp)"
-trap 'rm -f "$NOTES"' EXIT
+trap 'rm -f "$NOTES" "$SOURCE_ARCHIVE" "$RELEASE_CONFIG_SNAPSHOT"' EXIT
 printf '%s\n' \
   "Open-source Kioku enclave release **${TAG}**." "" \
   "| Field | Value |" "|---|---|" \
@@ -188,6 +246,24 @@ printf '%s\n' \
   "| Build evidence | locally built and signed with the configured external Ed25519 trust anchor |" \
   "| SBOM | \`${SBOM_VERSION}\` |" "" \
   "The digest is the deployment and KMS attestation anchor." > "$NOTES"
+
+compare_existing_release_assets() {
+  local downloaded asset
+  downloaded="$(mktemp -d)"
+  chmod 700 "$downloaded"
+  for asset in "${EXPECTED_ASSETS[@]}"; do
+    gh release download "$TAG" --repo "$REPOSITORY" --pattern "$asset" --dir "$downloaded" >/dev/null
+    [[ -f "$downloaded/$asset" && ! -L "$downloaded/$asset" ]] || {
+      rm -rf "$downloaded"
+      die "published release asset is missing: $asset"
+    }
+    cmp -s "$EVIDENCE_DIR/$asset" "$downloaded/$asset" || {
+      rm -rf "$downloaded"
+      die "published release asset differs from local evidence: $asset"
+    }
+  done
+  rm -rf "$downloaded"
+}
 
 echo "Local evidence is valid for ${TAG}: ${DIGEST_URI}"
 if [[ "$APPLY" != true ]]; then
@@ -205,7 +281,20 @@ REGISTRY_DIGEST="$(gcloud --impersonate-service-account="$BUILDER_SERVICE_ACCOUN
 [[ "$REGISTRY_DIGEST" == "$DIGEST" ]] || die "Artifact Registry did not resolve the signed image digest"
 git push origin "$TAG"
 
-release_json="$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft,isImmutable,isPrerelease,assets 2>/dev/null || true)"
+RELEASE_STATE_ERROR="$(mktemp)"
+trap 'rm -f "$RELEASE_STATE_ERROR" "$NOTES" "$SOURCE_ARCHIVE" "$RELEASE_CONFIG_SNAPSHOT"' EXIT
+if ! release_json="$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft,isImmutable,isPrerelease,assets 2>"$RELEASE_STATE_ERROR")"; then
+  release_error="$(<"$RELEASE_STATE_ERROR")"
+  # gh has no machine-readable not-found exit code. Accept only its exact
+  # documented absence messages; permission, transport, and malformed-state
+  # failures must never be treated as an absent release.
+  if [[ "$release_error" != "release not found" && "$release_error" != "HTTP 404: Not Found" ]]; then
+    rm -f "$RELEASE_STATE_ERROR"
+    die "could not read existing GitHub release state"
+  fi
+  release_json=""
+fi
+rm -f "$RELEASE_STATE_ERROR"
 if [[ -n "$release_json" ]]; then
   RELEASE_JSON="$release_json" EXPECTED_PRERELEASE="$EXPECTED_PRERELEASE" python3 - "${EXPECTED_ASSETS[@]}" <<'PY'
 import json
@@ -218,6 +307,7 @@ expected_prerelease = os.environ["EXPECTED_PRERELEASE"] == "true"
 if release.get("isDraft") is not False or release.get("isImmutable") is not True or release.get("isPrerelease") is not expected_prerelease or actual != expected:
     raise SystemExit("existing release is not the expected immutable evidence release")
 PY
+  compare_existing_release_assets
   echo "Existing immutable release is already exact; it was not modified."
 else
   if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -240,7 +330,8 @@ expected_prerelease = os.environ["EXPECTED_PRERELEASE"] == "true"
 if release.get("isDraft") is not False or release.get("isImmutable") is not True or release.get("isPrerelease") is not expected_prerelease or actual != expected:
     raise SystemExit("GitHub did not publish the expected immutable evidence release")
 PY
-fi
+  compare_existing_release_assets
+  fi
 
 if [[ "$ROLL" == true ]]; then
   ROLL_PATH="${DEPLOYMENT_REPO_PATH}/${LOCAL_ROLL_SCRIPT}"

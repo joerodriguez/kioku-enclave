@@ -22,18 +22,22 @@ non-secret coordinates documented in ``ENVIRONMENT`` below.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from typing import Any, Mapping, Sequence
 
+import local_image_pipeline as _image_pipeline
 from local_image_pipeline import PipelineError, configured_environment_snapshot
 
 
@@ -55,6 +59,13 @@ IMAGE_REPOSITORY = re.compile(
     r"[a-z0-9-]+-docker\.pkg\.dev/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*\Z"
 )
 GITHUB_REPOSITORY = "joerodriguez/kioku-enclave"
+_RELEASE_ASSET_NAMES = (
+    "enclave-local-build-evidence.json",
+    "enclave-local-build-evidence.sig",
+    "enclave-release.json",
+    "enclave-sbom.spdx.json",
+    "enclave-scan.json",
+)
 
 # Names that must be added to the coordinator's explicit later-phase
 # environment allowlist.  No credential is accepted by prepare.
@@ -76,6 +87,7 @@ ENVIRONMENT = {
         "SSH_AUTH_SOCK",
         "KIOKU_RELEASE_NATIVE_DOCKER_CONFIG",
         "KIOKU_RELEASE_NATIVE_BUILDX_CONFIG",
+        "CLOUDSDK_CONFIG",
     ),
     "later_credentials": (
         "KIOKU_RELEASE_EVIDENCE_PRIVATE_KEY",
@@ -110,6 +122,21 @@ class AdapterError(RuntimeError):
 
 def fail(message: str) -> "NoReturn":
     raise AdapterError(message)
+
+
+def _canonical_path(path: Path, label: str) -> Path:
+    """Resolve one path while allowing macOS's canonical /var alias only."""
+    try:
+        canonical = path.resolve(strict=True)
+    except OSError:
+        fail(f"{label} has an unsafe path")
+    if canonical != path and not (
+        path.parts[:2] == ("/", "var")
+        and canonical.parts[:3] == ("/", "private", "var")
+        and canonical.parts[3:] == path.parts[2:]
+    ):
+        fail(f"{label} has symlinked ancestry")
+    return canonical
 
 
 def canonical(value: Any) -> bytes:
@@ -178,7 +205,10 @@ def _state_root() -> Path:
 
 def _run(argv: Sequence[str], *, cwd: Path = ROOT, env: Mapping[str, str] | None = None, timeout: int = 3600) -> str:
     """Run a reviewed child command, forwarding no child stdout."""
-    child_env = dict(env or os.environ)
+    # Never inherit the adapter's ambient process environment.  Callers that
+    # need a credential explicitly construct a separately reviewed env (gh or
+    # gcloud); ordinary git/tag/push children receive only this base.
+    child_env = dict(_base_child_env() if env is None else env)
     try:
         completed = subprocess.run(
             tuple(str(part) for part in argv),
@@ -213,7 +243,6 @@ def _redacted_diagnostic(value: str) -> str:
         "KIOKU_RELEASE_GITHUB_TOKEN",
         "KIOKU_RELEASE_GCP_READONLY_SERVICE_ACCOUNT",
         "GH_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
     ):
         secret = os.environ.get(name)
         if secret:
@@ -247,6 +276,8 @@ def _owned_private_directory(path_value: str, label: str) -> Path:
         or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
         fail(f"{label} must be a current-user-owned mode-0700 directory")
+    canonical = _canonical_path(path, label)
+    path = canonical
     # The directory is an explicit credential-free boundary.  Reject links,
     # unsafe modes, and JSON fields that Docker credential helpers use.  Empty
     # directories are valid; Buildx creates its own non-secret metadata there.
@@ -298,12 +329,92 @@ def _owned_private_directory(path_value: str, label: str) -> Path:
     return path
 
 
+def _owned_private_cloud_directory(path_value: str) -> Path:
+    """Validate the explicit gcloud config boundary without parsing credentials."""
+    path = Path(path_value)
+    if not path.is_absolute() or ".." in path.parts:
+        fail("CLOUDSDK_CONFIG must be an absolute non-repository path")
+    try:
+        metadata = path.lstat()
+    except OSError:
+        fail("CLOUDSDK_CONFIG is missing")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail("CLOUDSDK_CONFIG must be a current-user-owned mode-0700 directory")
+    canonical = _canonical_path(path, "CLOUDSDK_CONFIG")
+    path = canonical
+    try:
+        path.resolve(strict=True).relative_to(ROOT.resolve(strict=True))
+    except ValueError:
+        pass
+    else:
+        fail("CLOUDSDK_CONFIG must be outside the source repository")
+    for directory, directories, files in os.walk(path, topdown=True, followlinks=False):
+        parent = Path(directory)
+        for name in directories:
+            child = parent / name
+            child_metadata = child.lstat()
+            if (
+                stat.S_ISLNK(child_metadata.st_mode)
+                or not stat.S_ISDIR(child_metadata.st_mode)
+                or child_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(child_metadata.st_mode) != 0o700
+            ):
+                fail("CLOUDSDK_CONFIG contains an unsafe directory")
+        for name in files:
+            child = parent / name
+            child_metadata = child.lstat()
+            if (
+                stat.S_ISLNK(child_metadata.st_mode)
+                or not stat.S_ISREG(child_metadata.st_mode)
+                or child_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(child_metadata.st_mode) != 0o600
+            ):
+                fail("CLOUDSDK_CONFIG contains an unsafe file")
+    return path
+
+
 def _owned_private_file(path_value: str, label: str) -> Path:
     path = Path(path_value)
     if not path.is_absolute() or ".." in path.parts:
         fail(f"{label} must be an absolute non-symlink path")
     _regular(path, private=True)
-    return path
+    canonical = _canonical_path(path, label)
+    return canonical
+
+
+def _known_hosts_has_fingerprint(payload: bytes, endpoint: str, expected: str) -> bool:
+    """Require the endpoint's actual known-host key to match the pinned hash."""
+    parsed = urllib.parse.urlparse(endpoint)
+    if parsed.scheme != "ssh" or not parsed.hostname:
+        return False
+    hostnames = {parsed.hostname}
+    if parsed.port is not None:
+        hostnames.add(f"[{parsed.hostname}]:{parsed.port}")
+    normalized = expected.rstrip("=")
+    for raw_line in payload.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(b"#"):
+            continue
+        fields = line.split()
+        offset = 1 if fields and fields[0].startswith(b"@") else 0
+        if len(fields) < offset + 3:
+            continue
+        try:
+            names = fields[offset].decode("ascii").split(",")
+            if not hostnames.intersection(names):
+                continue
+            key = base64.b64decode(fields[offset + 2], validate=True)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        actual = "SHA256:" + base64.b64encode(hashlib.sha256(key).digest()).decode("ascii").rstrip("=")
+        if actual == normalized:
+            return True
+    return False
 
 
 def _native_child_env(*, include_cloud: bool) -> dict[str, str]:
@@ -340,7 +451,7 @@ def _native_child_env(*, include_cloud: bool) -> dict[str, str]:
         if not SSH_HOST_KEY.fullmatch(host_key):
             fail("Docker SSH host-key pin is malformed")
         try:
-            if host_key.encode("ascii") not in known_hosts.read_bytes():
+            if not _known_hosts_has_fingerprint(known_hosts.read_bytes(), endpoint, host_key):
                 fail("Docker SSH known-hosts file does not contain the pinned host key")
             tokens = shlex.split(_env("DOCKER_SSH_COMMAND"))
         except (OSError, UnicodeDecodeError, ValueError):
@@ -358,7 +469,18 @@ def _native_child_env(*, include_cloud: bool) -> dict[str, str]:
             options[key] = value
             index += 2
         if options != {"StrictHostKeyChecking": "yes", "UserKnownHostsFile": str(known_hosts)}:
-            fail("Docker SSH transport is not strict-host-key pinned")
+            option_path = options.get("UserKnownHostsFile", "")
+            if not option_path or not Path(option_path).is_absolute():
+                fail("Docker SSH transport is not strict-host-key pinned")
+            try:
+                option_path = str(_canonical_path(Path(option_path), "Docker SSH known-hosts file"))
+            except AdapterError:
+                fail("Docker SSH transport is not strict-host-key pinned")
+            if options.get("StrictHostKeyChecking") != "yes" or option_path != str(known_hosts):
+                fail("Docker SSH transport is not strict-host-key pinned")
+        environment["DOCKER_SSH_COMMAND"] = (
+            f"ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts}"
+        )
         if "SSH_AUTH_SOCK" in os.environ:
             try:
                 socket_metadata = Path(os.environ["SSH_AUTH_SOCK"]).lstat()
@@ -394,11 +516,19 @@ def _native_child_env(*, include_cloud: bool) -> dict[str, str]:
             fail("unix native Buildx transport cannot carry SSH/TLS coordinates")
     docker_config = _owned_private_directory(_env("KIOKU_RELEASE_NATIVE_DOCKER_CONFIG"), "native Docker config directory")
     buildx_config = _owned_private_directory(_env("KIOKU_RELEASE_NATIVE_BUILDX_CONFIG"), "native Buildx config directory")
-    environment.update({"DOCKER_CONFIG": str(docker_config), "BUILDX_CONFIG": str(buildx_config)})
+    environment.update({
+        "DOCKER_CONFIG": str(docker_config),
+        "BUILDX_CONFIG": str(buildx_config),
+        # The direct pipeline revalidates these same paths before every child
+        # subprocess; forwarding the reviewed source coordinates lets it keep
+        # one environment boundary instead of trusting ambient config paths.
+        "KIOKU_RELEASE_NATIVE_DOCKER_CONFIG": str(docker_config),
+        "KIOKU_RELEASE_NATIVE_BUILDX_CONFIG": str(buildx_config),
+    })
     if include_cloud:
-        for name_key in ("CLOUDSDK_CONFIG", "GOOGLE_APPLICATION_CREDENTIALS"):
-            if name_key in os.environ:
-                environment[name_key] = os.environ[name_key]
+        environment["CLOUDSDK_CONFIG"] = str(
+            _owned_private_cloud_directory(_env("CLOUDSDK_CONFIG"))
+        )
     return environment
 
 
@@ -482,14 +612,51 @@ def _state_relative(path: Path) -> str:
 def _artifact_files(output: Path, paths: Sequence[Path]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for path in paths:
-        _regular(path, private=True)
+        relative = _state_relative(path)
         try:
-            data = path.read_bytes()
-        except OSError as error:
+            data = _read_bound_file(path, label="adapter artifact")
+        except (OSError, PipelineError) as error:
             fail(f"cannot read adapter artifact: {error}")
-        result.append({"path": _state_relative(path), "digest": "sha256:" + hashlib.sha256(data).hexdigest()})
+        result.append({"path": relative, "digest": "sha256:" + hashlib.sha256(data).hexdigest()})
     # The output contract is content-addressed and deterministic.
     return sorted(result, key=lambda item: item["path"])
+
+
+def _read_bound_file(
+    path: Path,
+    *,
+    label: str,
+    expected_sha256: str | None = None,
+    expected_manifest_digest: str | None = None,
+) -> bytes:
+    """Read one private file through a held descriptor and bind its bytes."""
+    descriptor = _image_pipeline._open_owned(path, label, private=True)
+    try:
+        if expected_sha256 is not None and expected_manifest_digest is not None:
+            _image_pipeline.verify_oci_archive_fd(
+                descriptor,
+                expected_sha256,
+                expected_manifest_digest,
+                mode=0o600,
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            before = os.fstat(handle.fileno())
+            data = handle.read()
+            after = os.fstat(handle.fileno())
+            if (
+                before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or len(data) != after.st_size
+            ):
+                fail(f"{label} changed while it was read")
+        actual = hashlib.sha256(data).hexdigest()
+        if expected_sha256 is not None and actual != expected_sha256:
+            fail(f"{label} no longer matches its immutable receipt")
+        return data
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _pipeline(stage: str, config: Path, tag: str, output: Path) -> None:
@@ -527,16 +694,16 @@ def _read_json(path: Path, label: str) -> dict[str, Any]:
 
 
 def _receipt(output: Path, stage: str) -> dict[str, Any]:
-    receipts = sorted(output.glob(f"{stage}-receipt-*.json"))
-    valid: list[dict[str, Any]] = []
-    for path in receipts:
-        item = _read_json(path, f"{stage} receipt")
-        payload = item.get("outputs")
-        if isinstance(payload, dict):
-            valid.append(payload)
-    if not valid:
+    try:
+        valid = _image_pipeline.stage_receipt_candidates(output, stage)
+    except PipelineError as error:
+        fail(str(error))
+    if len(valid) != 1:
         fail(f"{stage} receipt is missing")
-    return valid[-1]
+    payload = valid[0].get("outputs")
+    if not isinstance(payload, dict):
+        fail(f"{stage} receipt outputs are invalid")
+    return payload
 
 
 def _artifact(output: Path, *, stage: str = "build") -> tuple[Path, str, str]:
@@ -547,9 +714,21 @@ def _artifact(output: Path, *, stage: str = "build") -> tuple[Path, str, str]:
     if not isinstance(path_value, str) or not isinstance(artifact_hash, str) or not isinstance(digest, str):
         fail("artifact receipt is incomplete")
     artifact = Path(path_value).absolute()
-    _regular(artifact, private=True)
-    if hashlib.sha256(artifact.read_bytes()).hexdigest() != artifact_hash or not DIGEST.fullmatch(digest):
-        fail("artifact no longer matches its immutable receipt")
+    if not DIGEST.fullmatch(digest) or not HEX_HASH.fullmatch(artifact_hash):
+        fail("artifact receipt contains malformed hashes")
+    try:
+        artifact.resolve(strict=True).relative_to(_artifact_root().resolve(strict=True))
+    except (OSError, ValueError):
+        fail("artifact receipt escaped the coordinator artifact root")
+    try:
+        _read_bound_file(
+            artifact,
+            label="OCI artifact",
+            expected_sha256=artifact_hash,
+            expected_manifest_digest=digest,
+        )
+    except PipelineError as error:
+        fail(str(error))
     return artifact, artifact_hash, digest
 
 
@@ -721,6 +900,12 @@ def _gh(*args: str, timeout: int = 120) -> str:
     return _run(("gh", *args), cwd=ROOT, env=_gh_env(), timeout=timeout)
 
 
+def _github_release_absence(stderr: str) -> bool:
+    """Recognize only gh's exact release-not-found responses."""
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return len(lines) == 1 and lines[0] in {"release not found", "HTTP 404: Not Found"}
+
+
 def _release_json(repository: str, tag: str) -> dict[str, Any] | None:
     try:
         completed = subprocess.run(
@@ -731,8 +916,7 @@ def _release_json(repository: str, tag: str) -> dict[str, Any] | None:
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         fail("GitHub release state command failed")
     if completed.returncode:
-        message = completed.stderr.lower()
-        if "not found" in message or "release not found" in message:
+        if _github_release_absence(completed.stderr):
             return None
         diagnostic = _redacted_diagnostic(completed.stderr)
         if diagnostic:
@@ -749,18 +933,89 @@ def _release_json(repository: str, tag: str) -> dict[str, Any] | None:
 
 
 def _gcloud_env() -> dict[str, str]:
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        fail(
+            "GOOGLE_APPLICATION_CREDENTIALS is not accepted by the enclave release adapter; use reviewed gcloud identity configuration"
+        )
     environment = _base_child_env()
-    for name in ("CLOUDSDK_CONFIG", "GOOGLE_APPLICATION_CREDENTIALS"):
-        if name in os.environ:
-            environment[name] = os.environ[name]
+    environment["CLOUDSDK_CONFIG"] = str(
+        _owned_private_cloud_directory(_env("CLOUDSDK_CONFIG"))
+    )
     return environment
+
+
+def _registry_digest_optional(repository: str, tag: str, account: str) -> str | None:
+    """Read a registry tag, distinguishing an exact absence from an error."""
+    image = f"{repository}:{tag}"
+    try:
+        completed = subprocess.run(
+            (
+                "gcloud",
+                *_gcloud_prefix(account),
+                "artifacts",
+                "docker",
+                "images",
+                "describe",
+                image,
+                "--format=value(image_summary.digest)",
+            ),
+            cwd=str(ROOT),
+            env=_gcloud_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        fail("Artifact Registry state command failed")
+    if completed.returncode:
+        lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
+        if len(lines) == 1 and re.fullmatch(
+            r"ERROR:\s+\(gcloud\.artifacts\.docker\.images\.describe\)\s+NOT_FOUND:.*",
+            lines[0],
+            re.IGNORECASE,
+        ):
+            return None
+        diagnostic = _redacted_diagnostic(completed.stderr)
+        if diagnostic:
+            sys.stderr.write(diagnostic)
+        fail("Artifact Registry state command failed")
+    value = completed.stdout.strip()
+    if not value:
+        fail("Artifact Registry returned an empty digest response")
+    if not DIGEST.fullmatch(value):
+        fail("Artifact Registry returned a non-immutable digest")
+    return value
 
 
 def _expected_assets(release: Mapping[str, Any], *, prerelease: bool) -> None:
     names = sorted(asset.get("name") for asset in release.get("assets", []) if isinstance(asset, Mapping))
-    expected = sorted(("enclave-local-build-evidence.json", "enclave-local-build-evidence.sig", "enclave-release.json", "enclave-sbom.spdx.json", "enclave-scan.json"))
+    expected = sorted(_RELEASE_ASSET_NAMES)
     if release.get("isDraft") is not False or release.get("isImmutable") is not True or release.get("isPrerelease") is not prerelease or names != expected:
         fail("GitHub release is not the exact immutable enclave evidence release")
+
+
+def _compare_published_assets(output: Path, repository: str, tag: str) -> None:
+    """Prove an existing immutable release contains the exact prepared bytes.
+
+    GitHub's asset metadata is not sufficient evidence for a retry: an asset
+    list can be complete while an individual payload is stale or replaced.
+    Download every expected asset through the reviewed CLI and compare its
+    bytes to the private prepared evidence before accepting the release.
+    """
+    downloaded = _download_release(output, repository, tag)
+    try:
+        for name in _RELEASE_ASSET_NAMES:
+            local = output / name
+            remote = downloaded / name
+            _regular(local, private=True)
+            _regular(remote, private=True)
+            if local.read_bytes() != remote.read_bytes():
+                fail(f"immutable GitHub asset differs from the prepared evidence: {name}")
+    finally:
+        shutil.rmtree(downloaded, ignore_errors=True)
 
 
 def _publish_release(output: Path, repository: str, tag: str, digest: str) -> None:
@@ -778,7 +1033,7 @@ def _publish_release(output: Path, repository: str, tag: str, digest: str) -> No
             handle.write(notes)
             notes_path = Path(handle.name)
         try:
-            command = ["release", "create", tag, *(str(output / name) for name in ("enclave-local-build-evidence.json", "enclave-local-build-evidence.sig", "enclave-release.json", "enclave-sbom.spdx.json", "enclave-scan.json")), "--repo", repository, "--verify-tag", "--title", f"Kioku enclave {tag}", "--notes-file", str(notes_path)]
+            command = ["release", "create", tag, *(str(output / name) for name in _RELEASE_ASSET_NAMES), "--repo", repository, "--verify-tag", "--title", f"Kioku enclave {tag}", "--notes-file", str(notes_path)]
             if prerelease:
                 command.append("--prerelease")
             _gh(*command, timeout=300)
@@ -791,6 +1046,7 @@ def _publish_release(output: Path, repository: str, tag: str, digest: str) -> No
     if current is None:
         fail("GitHub release disappeared after publication")
     _expected_assets(current, prerelease=prerelease)
+    _compare_published_assets(output, repository, tag)
 
 
 def publish() -> Mapping[str, Any]:
@@ -825,7 +1081,7 @@ def publish() -> Mapping[str, Any]:
         fail("Artifact Registry digest differs from the signed candidate")
     _confirmation(version, digest)
     _publish_release(output, repository, tag, digest)
-    files = [output / name for name in ("enclave-local-build-evidence.json", "enclave-local-build-evidence.sig", "enclave-release.json", "enclave-sbom.spdx.json", "enclave-scan.json") if (output / name).exists()]
+    files = [output / name for name in _RELEASE_ASSET_NAMES if (output / name).exists()]
     # The OCI archive's filename is executor-owned; include it from the build
     # receipt as well as the immutable release assets.
     artifact_path = _artifact_path
@@ -851,7 +1107,7 @@ def verify() -> Mapping[str, Any]:
         fail("publish receipt has no immutable image digest")
     image_repository, _registry_reader = _image_repository(config, tag)
     _verify_bundle(output, config, commit, tag, digest, image_repository=image_repository)
-    files = [output / name for name in ("enclave-local-build-evidence.json", "enclave-local-build-evidence.sig", "enclave-release.json", "enclave-sbom.spdx.json", "enclave-scan.json")]
+    files = [output / name for name in _RELEASE_ASSET_NAMES]
     return {"schema": SCHEMA, "status": "success", "artifact_digest": digest, "version": version, "artifact_files": _artifact_files(output, files)}
 
 
@@ -859,7 +1115,7 @@ def _download_release(output: Path, repository: str, tag: str) -> Path:
     directory = Path(tempfile.mkdtemp(prefix="state-evidence-", dir=str(output)))
     directory.chmod(0o700)
     _private_directory(directory)
-    for name in ("enclave-local-build-evidence.json", "enclave-local-build-evidence.sig", "enclave-release.json", "enclave-sbom.spdx.json", "enclave-scan.json"):
+    for name in _RELEASE_ASSET_NAMES:
         _gh("release", "download", tag, "--repo", repository, "--pattern", name, "--dir", str(directory), timeout=300)
         downloaded = directory / name
         _regular(downloaded, private=False)
@@ -882,6 +1138,9 @@ def state(destination: str) -> Mapping[str, Any]:
     # published” from a malformed or partially published release.
     release = _release_json(repository, tag)
     if release is None:
+        registry_digest = _registry_digest_optional(image_repository, tag, registry_reader)
+        if registry_digest is not None:
+            fail("Artifact Registry contains the candidate tag but no immutable evidence release exists")
         return {
             "schema": STATE_SCHEMA,
             "status": "success",

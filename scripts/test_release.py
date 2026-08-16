@@ -70,6 +70,26 @@ class LocalReleaseContracts(unittest.TestCase):
         self.assertIn("exact mode 0600", EVIDENCE)
         self.assertNotIn('"config":', EVIDENCE)
 
+    def test_frozen_detached_release_requires_signed_ancestor_receipt(self) -> None:
+        self.assertIn("--frozen-commit", RELEASE)
+        self.assertIn("verify_coordinator_advancement_receipt.py", RELEASE)
+        self.assertIn('git merge-base --is-ancestor "$COMMIT" "$ORIGIN_MAIN"', RELEASE)
+        self.assertIn('[[ "$(git rev-parse HEAD)" == "$COMMIT" ]]', RELEASE)
+        self.assertIn('local main must exactly match origin/main', RELEASE)
+
+    def test_release_retries_compare_every_existing_asset_byte_for_byte(self) -> None:
+        self.assertIn("compare_existing_release_assets()", RELEASE)
+        self.assertIn("gh release download", RELEASE)
+        self.assertIn("cmp -s", RELEASE)
+
+    def test_release_state_query_accepts_only_exact_absence(self) -> None:
+        self.assertIn('release_error" != "release not found"', RELEASE)
+        self.assertIn('release_error" != "HTTP 404: Not Found"', RELEASE)
+        self.assertNotIn('release view "$TAG" --repo "$REPOSITORY" --json isDraft,isImmutable,isPrerelease,assets 2>/dev/null || true', RELEASE)
+
+    def test_release_rejects_service_account_json_credentials(self) -> None:
+        self.assertIn("GOOGLE_APPLICATION_CREDENTIALS is not accepted", RELEASE)
+
 
 if __name__ == "__main__":
     unittest.main()

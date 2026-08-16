@@ -309,14 +309,14 @@ class SelectorTests(unittest.TestCase):
 
     def test_selected_profile_is_validated_and_baked_into_the_runtime_image(self) -> None:
         dockerfile = DOCKERFILE.read_text()
-        self.assertGreaterEqual(dockerfile.count("ARG KIOKU_BUILD_PROFILE"), 2)
+        self.assertIn("ARG CONFIG_SHA256", dockerfile)
         self.assertIn(
-            'case "${KIOKU_BUILD_PROFILE}" in production|evaluation)',
+            "--build-arg CONFIG_SHA256=<sha256-of-/secure/kioku-runtime.env>",
             dockerfile,
         )
-        self.assertIn("production)", dockerfile)
-        self.assertIn('[ -n "${APNS_TEAM_ID}" ]', dockerfile)
-        self.assertIn("ENV KIOKU_BUILD_PROFILE=${KIOKU_BUILD_PROFILE}", dockerfile)
+        self.assertIn("type=secret,id=kioku-config,required", dockerfile)
+        self.assertIn("/build/kioku-config", dockerfile)
+        self.assertNotIn("ENV KIOKU_BUILD_PROFILE=${KIOKU_BUILD_PROFILE}", dockerfile)
 
     def test_selector_docker_and_local_schema_v9_manifest_bind_the_same_three_buckets(self) -> None:
         completed, selected = self.run_selector("production", environment())
@@ -339,13 +339,12 @@ class SelectorTests(unittest.TestCase):
                 "gcs_legacy_media_bucket",
             ),
         ):
-            self.assertIn(f'("{build_arg}", configuration["{env_name}"])', pipeline)
-            self.assertIn(f"ARG {build_arg}", dockerfile)
-            self.assertIn(f"{build_arg}=${{{build_arg}}}", dockerfile)
+            self.assertIn(f'"{build_arg}": "{env_name}"', pipeline)
+            self.assertNotIn(f"ARG {build_arg}", dockerfile)
+            self.assertNotIn(f"{build_arg}=${{{build_arg}}}", dockerfile)
             self.assertIn(f'"{manifest_field}"', pipeline)
             self.assertIn(f'"{manifest_field}"', verifier)
-        self.assertIn('[ "${GCS_LEGACY_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
-        self.assertNotIn('[ "${GCS_MEDIA_BUCKET}" = "${GCS_BUCKET}" ]', dockerfile)
+        self.assertIn("GCS_LEGACY_MEDIA_BUCKET", dockerfile)
         self.assertIn('"schema_version": 9', pipeline)
         self.assertIn("schema_version must be 9", verifier)
 
@@ -515,19 +514,17 @@ class SelectorTests(unittest.TestCase):
             "ARCHIVE_V3_WITNESS_DATABASE_ID",
             "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
         ):
-            self.assertIn(f'("{name}", configuration["{name}"])', pipeline)
-            self.assertIn(f"ARG {name}", dockerfile)
-            self.assertIn(f"{name}=${{{name}}}", dockerfile)
+            self.assertIn(name, pipeline)
+            self.assertNotIn(f"ARG {name}", dockerfile)
+            self.assertIn(name, dockerfile)
             self.assertNotIn(f"PRODUCTION_{name}", pipeline)
             self.assertNotIn(f"EVALUATION_{name}", pipeline)
         validator = "scripts/validate_archive_v3_shadow_runtime_environment.sh"
-        self.assertIn(f"COPY --chmod=0555 {validator}", dockerfile)
+        self.assertIn("scripts/assemble_image_config.sh", dockerfile)
         dockerignore_lines = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
-        self.assertIn("!scripts/", dockerignore_lines)
+        self.assertIn("!scripts/assemble_image_config.sh", dockerignore_lines)
         self.assertIn(f"!{validator}", dockerignore_lines)
-        invocation = "&& /build/validate_archive_v3_shadow_runtime_environment.sh"
-        self.assertIn(invocation, dockerfile)
-        self.assertLess(dockerfile.index(f"COPY --chmod=0555 {validator}"), dockerfile.index(invocation))
+        self.assertIn("type=secret,id=kioku-config,required", dockerfile)
         for name in (
             "ARCHIVE_V3_SHADOW_RUNTIME_MODE",
             "ARCHIVE_V3_ARCHIVE_BUCKET",
@@ -538,7 +535,7 @@ class SelectorTests(unittest.TestCase):
             "ARCHIVE_V3_WITNESS_DATABASE_ID",
             "ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT",
         ):
-            self.assertIn(f'"${{{name}}}"', dockerfile)
+            self.assertIn(name, dockerfile)
         self.assertIn('"archive_v3_archive_binding_commitment"', pipeline)
         self.assertIn('"archive_v3_archive_binding_commitment"', verifier)
         main = MAIN.read_text(encoding="utf-8")

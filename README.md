@@ -527,19 +527,56 @@ production build arguments nor launch-policy overrides.
 ## Local verification and release evidence
 
 GitHub Actions is disabled. `scripts/local_image_pipeline.py` reuses the reviewed hosted
-job's formatting, locked tests, all-target Clippy, RustSec audit, Docker arguments, SBOM,
-and fixed-high vulnerability scan locally. It accepts only a non-repository, regular
-mode-0600 configuration file without shell evaluation, builds `linux/amd64`, and performs
-all untrusted compilation and scanning before it requests short-lived impersonated
-credentials for the push-only Artifact Registry identity. The audit retains the documented
+job's formatting, locked tests, all-target Clippy, RustSec audit, SBOM, and fixed-high
+vulnerability scan locally. It accepts only a non-repository, regular mode-0600 configuration
+file without shell evaluation, snapshots those bytes once, freezes and rechecks a Git
+archive, and requires a reviewed/pinned native Linux/amd64 BuildKit worker with bounded
+free-space/cache checks. Both native and explicitly acknowledged emulated paths emit an
+exact OCI archive without daemon loading, scan that archive before requesting short-lived
+impersonated credentials, quarantine and rehash the scanned bytes, and promote that exact
+manifest with Skopeo's exact auth file, digestfile, and preserve-digests checks.
+The quarantine is copied and fsynced through a private O_EXCL file, reopened read-only,
+validated, unlinked, and passed to Skopeo as an inherited `/dev/fd` descriptor; no
+quarantine pathname or writable descriptor remains. Its mode, inode, file hash, and
+manifest digest are checked before and after the copy.
+Evidence creation receives the SBOM and scan hashes from the scan receipt and reads each
+asset through a stable no-follow descriptor; the release bundle verifier reopens and
+rehashes those exact assets before publication.
+Allowlisted runtime configuration reaches only the final Docker layer through an ephemeral
+BuildKit secret; its non-secret content hash binds that late cache and it is never placed in
+argv or Docker history. If native hardware is unavailable, the fallback requires explicit
+opt-in and a second confirmation for release tags; it is labeled in evidence and never
+presented as a warm native run. Receipts use a mode-0600 run lock, content-addressed names,
+artifact/scan rehashes, and idempotent push/evidence reuse. A detached frozen release commit
+is accepted only with a separately signed coordinator advancement receipt proving it is an
+ancestor of freshly fetched `origin/main`; ordinary releases still require exact local-main
+tip parity.
+Native preflight reads `docker buildx ls --no-trunc --format '{{json .}}'`, pins
+`KIOKU_NATIVE_BUILDER_NAME` and `KIOKU_NATIVE_BUILDER_ID`, requires exactly one nested
+worker, and revalidates that worker's full endpoint/transport/identity binding after the
+build; the same reviewed Buildx name is passed to the build. SSH workers additionally require a
+current-user-owned `DOCKER_SSH_KNOWN_HOSTS` file containing the pinned
+`DOCKER_SSH_HOST_KEY_SHA256` and a `DOCKER_SSH_COMMAND` with
+`StrictHostKeyChecking=yes` and that exact `UserKnownHostsFile`, while TCP workers require `DOCKER_TLS_VERIFY=1`, a private
+`DOCKER_CERT_PATH`, and its `DOCKER_BUILDER_CA_SHA256`. It probes the selected worker's
+root filesystem with a no-network, no-cache BuildKit build bound to the exact named
+builder and the digest-pinned probe image; it never uses the client's default-daemon
+`docker run` filesystem as a proxy. It rejects the run below the bounded cache reserve.
+The emergency fallback is therefore explicit and fail-closed when the reviewed native
+worker or its disk probe is unavailable; it remains an OCI/digest-preserving path rather
+than a mutable local image-tag export.
+The audit retains the documented
 `RUSTSEC-2023-0071` exception because this service verifies RS256 signatures but performs
 no RSA private-key operation.
 
-The pushed digest, tagged source commit, configuration hash, Dockerfile/Cargo.lock/SBOM/
-scan hashes, tool versions, and timestamps form canonical local evidence. A separate
+The pushed digest, tagged source commit, immutable source-archive hash, configuration hash,
+Dockerfile/Cargo.lock/SBOM/scan hashes, tool versions, and timestamps form canonical local
+evidence. A separate
 mode-0600 Ed25519 private key signs those exact bytes; verification requires an externally
-pinned public-key fingerprint. `scripts/release.sh` is the sole publisher and fails before
-mutation unless both the signed source tag and local evidence verify. GitHub is used for
+pinned public-key fingerprint. Two reviewed publication interfaces are available: standalone
+`scripts/release.sh` and the frozen-source `scripts/release_train_enclave.py publish` adapter.
+Both fail before mutation unless the signed source tag and local evidence verify; the adapter
+also binds the coordinator plan, exact artifact, and frozen detached source. GitHub is used for
 immutable public release hosting, not execution or build identity.
 
 Production is the sole active owner evaluation environment. Signed releases either carry
@@ -605,8 +642,9 @@ published trusted fingerprint; a valid signature from an unknown key is not suff
 The release contains `enclave-local-build-evidence.json`, its detached `.sig`, the SPDX
 SBOM, and the vulnerability scan. Verify the canonical evidence with the separately pinned
 public key and fingerprint, then require the exact repository, tag, commit, production
-profile, digest-qualified image, file hashes, and successful scan. `scripts/release.sh`
-performs those checks before publication or rollout.
+profile, digest-qualified image, file hashes, and successful scan. Both reviewed publication
+interfaces perform those checks before publication or rollout; the coordinator adapter also
+requires the signed plan and exact handoff receipt.
 
 ### 3. Match all anchors
 

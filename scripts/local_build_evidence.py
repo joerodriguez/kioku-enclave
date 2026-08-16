@@ -47,6 +47,9 @@ FIELDS = {
     "created_at",
     "completed_at",
 }
+LEGACY_FIELDS = frozenset(FIELDS)
+SOURCE_ARCHIVE_FIELD = "source_archive_sha256"
+FULL_FIELDS = frozenset((*FIELDS, SOURCE_ARCHIVE_FIELD))
 
 
 def fail(message: str) -> "NoReturn":
@@ -58,12 +61,18 @@ def canonical(data: dict[str, Any]) -> bytes:
 
 
 def sha256(path: Path) -> str:
-    try:
-        with path.open("rb") as handle:
-            digest = hashlib.file_digest(handle, "sha256")
-    except OSError as error:
-        fail(f"cannot hash {path}: {error}")
-    return digest.hexdigest()
+    return hashlib.sha256(read_regular_bytes(path, f"hash input {path}")).hexdigest()
+
+
+def expected_asset_bytes(path: Path, label: str, expected: str) -> bytes:
+    """Read one stable asset once and require its scan-receipt hash."""
+    if not SHA256.fullmatch(expected):
+        fail(f"expected {label} hash must be a lowercase sha256")
+    value = read_regular_bytes(path, label)
+    actual = hashlib.sha256(value).hexdigest()
+    if actual != expected:
+        fail(f"{label} does not match the scan receipt hash")
+    return value
 
 
 def text(value: object, field: str) -> str:
@@ -90,7 +99,12 @@ def read_regular_bytes(path: Path, label: str) -> bytes:
             fail(f"{label} must be one stable regular file")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
-            return handle.read()
+            before = os.fstat(handle.fileno())
+            value = handle.read()
+            after = os.fstat(handle.fileno())
+            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns or len(value) != after.st_size:
+                fail(f"{label} changed while it was read")
+            return value
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -101,7 +115,7 @@ def read_manifest_bytes(raw: bytes) -> dict[str, Any]:
         data = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"cannot parse manifest: {error}")
-    if not isinstance(data, dict) or set(data) != FIELDS:
+    if not isinstance(data, dict) or set(data) not in (LEGACY_FIELDS, FULL_FIELDS):
         fail("manifest has missing or unexpected fields")
     if raw != canonical(data):
         fail("manifest is not canonical JSON")
@@ -133,6 +147,11 @@ def validate(data: dict[str, Any]) -> None:
     for field in ("config_sha256", "dockerfile_sha256", "cargo_lock_sha256", "release_metadata_sha256", "sbom_sha256", "scan_sha256"):
         if not isinstance(data[field], str) or not SHA256.fullmatch(data[field]):
             fail(f"{field} must be a lowercase sha256")
+    if SOURCE_ARCHIVE_FIELD in data and (
+        not isinstance(data[SOURCE_ARCHIVE_FIELD], str)
+        or not SHA256.fullmatch(data[SOURCE_ARCHIVE_FIELD])
+    ):
+        fail("source_archive_sha256 must be a lowercase sha256")
     versions = data["tool_versions"]
     if not isinstance(versions, dict) or not versions:
         fail("tool_versions must be a non-empty object")
@@ -253,6 +272,12 @@ def create(arguments: argparse.Namespace) -> None:
         if name in parsed_versions:
             fail("each --tool-version name must be unique")
         parsed_versions[name] = version
+    sbom_bytes = expected_asset_bytes(
+        arguments.sbom, "SBOM", arguments.expected_sbom_sha256
+    )
+    scan_bytes = expected_asset_bytes(
+        arguments.scan, "scan", arguments.expected_scan_sha256
+    )
     values: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "source_repository": arguments.repository,
@@ -265,16 +290,38 @@ def create(arguments: argparse.Namespace) -> None:
         "dockerfile_sha256": sha256(arguments.dockerfile),
         "cargo_lock_sha256": sha256(arguments.cargo_lock),
         "release_metadata_sha256": sha256(arguments.release_metadata),
-        "sbom_sha256": sha256(arguments.sbom),
-        "scan_sha256": sha256(arguments.scan),
+        "sbom_sha256": hashlib.sha256(sbom_bytes).hexdigest(),
+        "scan_sha256": hashlib.sha256(scan_bytes).hexdigest(),
         "tool_versions": parsed_versions,
         "created_at": arguments.created_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "completed_at": arguments.completed_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if arguments.config_sha256 is not None:
+        if not SHA256.fullmatch(arguments.config_sha256):
+            fail("configuration hash must be a lowercase sha256")
+        if values["config_sha256"] != arguments.config_sha256:
+            fail("provided configuration hash does not match the stable configuration bytes")
+
+    if arguments.source_archive_sha256 is not None:
+        if not SHA256.fullmatch(arguments.source_archive_sha256):
+            fail("source archive hash must be a lowercase sha256")
+        values[SOURCE_ARCHIVE_FIELD] = arguments.source_archive_sha256
     validate(values)
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(canonical(values))
+        encoded = canonical(values)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(output, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(encoded)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except FileExistsError:
+        fail(f"refusing to overwrite existing evidence: {output}")
     except OSError as error:
         fail(f"cannot write evidence: {error}")
 
@@ -357,11 +404,15 @@ def parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--image-digest-uri", required=True)
     create_parser.add_argument("--image-digest", required=True)
     create_parser.add_argument("--config", type=Path, required=True)
+    create_parser.add_argument("--config-sha256")
     create_parser.add_argument("--dockerfile", type=Path, required=True)
     create_parser.add_argument("--cargo-lock", type=Path, required=True)
     create_parser.add_argument("--release-metadata", type=Path, required=True)
     create_parser.add_argument("--sbom", type=Path, required=True)
     create_parser.add_argument("--scan", type=Path, required=True)
+    create_parser.add_argument("--expected-sbom-sha256", required=True)
+    create_parser.add_argument("--expected-scan-sha256", required=True)
+    create_parser.add_argument("--source-archive-sha256")
     create_parser.add_argument("--tool-version", action="append", default=[], required=True)
     create_parser.add_argument("--created-at")
     create_parser.add_argument("--completed-at")
