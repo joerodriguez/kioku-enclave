@@ -2104,15 +2104,26 @@ impl X {
             'b"kioku/archive-v3/advisory-canary/operator-statement/v1\\0"',
             'b"kioku/archive-v3/advisory-canary/operator-statement-commitment/v1\\0"',
             'b"kioku/archive-v3/advisory-canary/image-attestation/v1\\0"',
+            'b"kioku/archive-v3/advisory-canary/runtime-admission/v1\\0"',
+            'b"kioku/archive-v3/advisory-canary/runtime-admission-commitment/v1\\0"',
+            'b"kioku/archive-v3/advisory-canary/authoritative-mutation-set/empty/v1\\0"',
             'b"kioku/archive-v3/advisory-canary/authorization-evidence/v1\\0"',
             "const OPERATOR_STATEMENT_BYTES: usize = 242;",
             "const IMAGE_ATTESTATION_BYTES: usize = 82;",
+            "const RUNTIME_ADMISSION_BYTES: usize = 298;",
             "const PINNED_OPERATOR_PUBLIC_KEY: [u8; 32] = [0; 32];",
             "const PINNED_IMAGE_ATTESTATION_PUBLIC_KEY: [u8; 32] = [0; 32];",
+            "const PINNED_RUNTIME_ADMISSION_PUBLIC_KEY: [u8; 32] = [0; 32];",
             "operator == image_attestation",
+            "operator == runtime_admission",
+            "image_attestation == runtime_admission",
+            "u16::from_be_bytes([bytes[291], bytes[292]]) != 0",
+            "u32::from_be_bytes([bytes[294], bytes[295], bytes[296], bytes[297]]) != 0",
+            "hasher.update(0_u16.to_be_bytes())",
             "UnparsedPublicKey::new(&ED25519, public_key)",
             "verify_pinned_advisory_canary_authorization",
             "authenticate_image_attestation",
+            "authenticate_runtime_admission",
             "authenticate_for_control",
             "authorization_evidence_commitment",
             "hasher.update(scope_id)",
@@ -2128,10 +2139,8 @@ impl X {
             ),
             2,
         )
-        self.assertIn(
-            "fn validated(operator: [u8; 32], image_attestation: [u8; 32]) -> Result<Self>",
-            canary_trust_production,
-        )
+        self.assertIn("fn validated(", canary_trust_production)
+        self.assertIn("runtime_admission: [u8; 32]", canary_trust_production)
         self.assertNotIn("pub(crate) fn validated(", canary_trust_production)
         self.assertIn(
             "fn verify_advisory_canary_authorization_with_roots(",
@@ -2146,6 +2155,7 @@ impl X {
             "private_key",
             "PRIVATE KEY",
             "std::env::",
+            "std::time::SystemTime",
             "from_env",
             "fetch_attestation",
             "AttestationCredentials",
@@ -2178,6 +2188,10 @@ impl X {
             "CREATE TABLE IF NOT EXISTS archive_v3_advisory_canary_scopes",
             control_production,
         )
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS archive_v3_advisory_activation_preconditions",
+            control_production,
+        )
         issuer_begin = control_production.index("fn authorize_advisory_canary_conn(")
         issuer_end = control_production.index(
             "    Ok((capability, true))\n}", issuer_begin
@@ -2189,6 +2203,8 @@ impl X {
             "load_advisory_canary_capability_conn",
             "load_advisory_canary_scope_conn",
             "INSERT INTO archive_v3_advisory_canary_scopes",
+            "INSERT INTO archive_v3_advisory_activation_preconditions",
+            "load_advisory_activation_preconditions_conn",
             "advisory canary authorization readback changed",
             "tx.commit()?",
         ):
@@ -2196,6 +2212,12 @@ impl X {
         self.assertLess(
             issuer_control.index("authenticate_for_control"),
             issuer_control.index("INSERT INTO archive_v3_advisory_canary_scopes"),
+        )
+        self.assertLess(
+            issuer_control.index("INSERT INTO archive_v3_advisory_canary_scopes"),
+            issuer_control.index(
+                "INSERT INTO archive_v3_advisory_activation_preconditions"
+            ),
         )
         self.assertNotIn("OsRng", issuer_control)
         self.assertIn(
@@ -2229,6 +2251,7 @@ impl X {
         reserve_control = control_production[reserve_begin:reserve_end]
         for required in (
             "load_advisory_canary_scope_conn",
+            "load_advisory_activation_preconditions_conn",
             "state='consumed'",
             "consumed_owner_id=?1",
             "authorization_commitment=?14",
@@ -2242,7 +2265,24 @@ impl X {
             self.assertIn(required, reserve_control)
         self.assertLess(
             reserve_control.index("UPDATE archive_v3_advisory_canary_scopes"),
+            reserve_control.index(
+                "UPDATE archive_v3_advisory_activation_preconditions"
+            ),
+        )
+        self.assertLess(
+            reserve_control.index(
+                "UPDATE archive_v3_advisory_activation_preconditions"
+            ),
             reserve_control.index("INSERT INTO archive_v3_advisory_owners"),
+        )
+        mark_begin = control_production.index("fn mark_advisory_owner_send_started_conn(")
+        mark_end = control_production.index("fn bind_advisory_owner_conn(", mark_begin)
+        mark_control = control_production[mark_begin:mark_end]
+        self.assertIn("load_advisory_activation_preconditions_conn", mark_control)
+        self.assertIn("preconditions.consumed", mark_control)
+        self.assertLess(
+            mark_control.index("load_advisory_activation_preconditions_conn"),
+            mark_control.index("stage == AdvisoryOwnerStage::SendStarted"),
         )
         for forbidden in (
             "std::env::",

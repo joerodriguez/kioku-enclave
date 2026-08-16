@@ -191,17 +191,29 @@ surfaces.
   released Active+ShadowWal witness. It also requires one opaque exact canary
   scope whose encrypted-Control row binds one private user/archive/import,
   maintenance/source/parity commitments, the released witness hash, a release-
-  image digest, and a verified-operator-statement commitment. The complete
-  `Authorized -> Consumed` scope CAS and first random advisory-owner insert
-  share one transaction; either both persist or neither does. Reopen accepts
-  only the consumed scope linked to the exact retained initial reservation.
+  image digest, and a verified-operator-statement commitment. A separate
+  encrypted runtime-precondition row binds that scope and image to a constant
+  empty Phase-1 authoritative-mutation set, legacy-only acknowledgements, one
+  exact maintenance-window/deployment-revision/challenge tuple, zero serving
+  replicas, and content-free monitoring/rollback policy commitments. Both
+  complete `Authorized -> Consumed` CASes and the first random advisory-owner
+  insert share one transaction; either all three persist or none does. Reopen
+  and `SendStarted` accept only both consumed rows linked to the exact retained
+  initial reservation.
   A private verifier now requires a scope-unique canonical operator statement
-  signed by one Ed25519 root and a second-root image assertion binding that
-  exact statement proof to the same release digest. Encrypted Control alone
-  may turn the resulting non-cloneable value into the exact one-row scope, with
-  transactional exact replay. The two roots must be nonzero and distinct, but
-  the checked-in production roots are deliberately invalid and no live
-  attestation adapter or caller exists; tests alone may issue fixtures. The launcher then reserves the owner in a
+  signed by one Ed25519 root, a second-root image assertion binding that exact
+  statement proof to the same release digest, and a pairwise-distinct third-
+  root deployment-observer assertion binding the runtime preconditions. Encrypted
+  Control alone may turn the resulting non-cloneable value into the exact scope
+  and precondition rows, with transactional exact replay. The three roots must
+  be nonzero and pairwise distinct, but the checked-in production roots are
+  deliberately invalid and no live image-attestation/deployment-observer adapter
+  or caller exists; tests alone may issue fixtures. The signed commitments do
+  not prove that monitoring or rollback is deployed, and the post-import proof
+  does not retrospectively prove the importer ran inside its window. A future
+  launcher must hold a freshly authenticated window and zero-serving condition
+  across importer execution, handoff, and owner admission without trusting the
+  process clock. The launcher then reserves the owner in a
   dedicated table, and durably advances `Reserved -> SendStarted` before the
   exact witness CAS. Response loss grants no retry under a new identity: only
   the exact expected owner and canonical next fence may be adopted, after

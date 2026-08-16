@@ -584,6 +584,75 @@ CREATE TABLE IF NOT EXISTS archive_v3_advisory_canary_scopes (
             AND authorization_commitment!=commitment)
     )
 );
+-- Exact inactive Phase-1 runtime admission facts. The independent signed
+-- observation attests an empty authoritative mutation set, legacy-only
+-- acknowledgements, one maintenance window, and zero serving replicas. It is
+-- inserted with the canary authorization, then bound to the exact initial
+-- owner reservation in the same transaction that consumes the canary.
+CREATE TABLE IF NOT EXISTS archive_v3_advisory_activation_preconditions (
+    scope_id BLOB PRIMARY KEY REFERENCES archive_v3_advisory_canary_scopes(scope_id)
+        CHECK(length(scope_id)=16 AND scope_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    archive_id BLOB NOT NULL UNIQUE REFERENCES archive_bindings(archive_id)
+        CHECK(length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    maintenance_operation_id BLOB NOT NULL UNIQUE
+        CHECK(length(maintenance_operation_id)=16 AND maintenance_operation_id!=zeroblob(16)),
+    canary_authorization_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(canary_authorization_commitment)=32
+              AND canary_authorization_commitment!=zeroblob(32)),
+    terminal_witness_hash BLOB NOT NULL
+        CHECK(length(terminal_witness_hash)=32 AND terminal_witness_hash!=zeroblob(32)),
+    release_image_digest BLOB NOT NULL
+        CHECK(length(release_image_digest)=32 AND release_image_digest!=zeroblob(32)),
+    empty_mutation_set_commitment BLOB NOT NULL
+        CHECK(length(empty_mutation_set_commitment)=32
+              AND empty_mutation_set_commitment!=zeroblob(32)),
+    deployment_target_commitment BLOB NOT NULL
+        CHECK(length(deployment_target_commitment)=32
+              AND deployment_target_commitment!=zeroblob(32)),
+    maintenance_window_id BLOB NOT NULL
+        CHECK(length(maintenance_window_id)=16 AND maintenance_window_id!=zeroblob(16)),
+    deployment_revision_commitment BLOB NOT NULL
+        CHECK(length(deployment_revision_commitment)=32
+              AND deployment_revision_commitment!=zeroblob(32)),
+    challenge_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(challenge_commitment)=32 AND challenge_commitment!=zeroblob(32)),
+    monitoring_policy_commitment BLOB NOT NULL
+        CHECK(length(monitoring_policy_commitment)=32
+              AND monitoring_policy_commitment!=zeroblob(32)),
+    rollback_policy_commitment BLOB NOT NULL
+        CHECK(length(rollback_policy_commitment)=32
+              AND rollback_policy_commitment!=zeroblob(32)),
+    signed_evidence_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(signed_evidence_commitment)=32
+              AND signed_evidence_commitment!=zeroblob(32)),
+    state TEXT NOT NULL CHECK(state IN ('authorized','consumed')),
+    consumed_owner_id BLOB CHECK(
+        consumed_owner_id IS NULL
+        OR (length(consumed_owner_id)=16 AND consumed_owner_id!=zeroblob(16))
+    ),
+    consumed_owner_commitment BLOB CHECK(
+        consumed_owner_commitment IS NULL
+        OR (length(consumed_owner_commitment)=32
+            AND consumed_owner_commitment!=zeroblob(32))
+    ),
+    authorization_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(authorization_commitment)=32
+              AND authorization_commitment!=zeroblob(32)),
+    commitment BLOB NOT NULL CHECK(length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK(revision IN (1,2)),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (archive_id,maintenance_operation_id)
+        REFERENCES archive_v3_maintenance_imports(archive_id,operation_id),
+    CHECK(
+        (state='authorized' AND revision=1 AND consumed_owner_id IS NULL
+         AND consumed_owner_commitment IS NULL
+         AND authorization_commitment=commitment)
+        OR (state='consumed' AND revision=2 AND consumed_owner_id IS NOT NULL
+            AND consumed_owner_commitment IS NOT NULL
+            AND authorization_commitment!=commitment)
+    )
+);
 -- Phase-1-only advisory ShadowWal owner acquisition. This table is separate
 -- from WalAuthoritative ownership and retains only exact comparison facts.
 CREATE TABLE IF NOT EXISTS archive_v3_advisory_owners (
@@ -9157,6 +9226,8 @@ fn advisory_owner_stage_as_db(value: AdvisoryOwnerStage) -> &'static str {
 
 const ADVISORY_CANARY_SCOPE_COMMITMENT_DOMAIN: &[u8] =
     b"kioku/archive-v3/advisory-canary-scope/v1\0";
+const ADVISORY_ACTIVATION_PRECONDITIONS_COMMITMENT_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-activation-preconditions/v1\0";
 
 struct AdvisoryCanaryTerminalFacts {
     user_id: String,
@@ -9167,12 +9238,13 @@ struct AdvisoryCanaryTerminalFacts {
     terminal_witness_hash: [u8; 32],
 }
 
+type AdvisoryCanaryTrustCommitments<'a> = (&'a [u8; 32], &'a [u8; 32], &'a [u8; 32]);
+
 fn advisory_canary_scope_commitment(
     scope_id: &[u8; 16],
     operation_id: MaintenanceImportOperationId,
     terminal: &AdvisoryCanaryTerminalFacts,
-    release_image_digest: &[u8; 32],
-    operator_statement_commitment: &[u8; 32],
+    trust: AdvisoryCanaryTrustCommitments<'_>,
     revision: u64,
     consumed: Option<(AdvisoryOwnerId, [u8; 32])>,
 ) -> Result<[u8; 32]> {
@@ -9190,8 +9262,9 @@ fn advisory_canary_scope_commitment(
     hasher.update(terminal.source_commitment);
     hasher.update(terminal.parity_commitment);
     hasher.update(terminal.terminal_witness_hash);
-    hasher.update(release_image_digest);
-    hasher.update(operator_statement_commitment);
+    hasher.update(trust.0);
+    hasher.update(trust.1);
+    hasher.update(trust.2);
     hasher.update(revision.to_be_bytes());
     match consumed {
         None => hasher.update([0]),
@@ -9251,9 +9324,269 @@ struct LoadedAdvisoryCanaryScope {
     terminal: AdvisoryCanaryTerminalFacts,
     release_image_digest: [u8; 32],
     operator_statement_commitment: [u8; 32],
+    activation_preconditions_commitment: [u8; 32],
     authorization_commitment: [u8; 32],
     consumed: Option<(AdvisoryOwnerId, [u8; 32])>,
     commitment: [u8; 32],
+}
+
+struct LoadedAdvisoryActivationPreconditions {
+    scope_id: [u8; 16],
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    canary_authorization_commitment: [u8; 32],
+    terminal_witness_hash: [u8; 32],
+    release_image_digest: [u8; 32],
+    empty_mutation_set_commitment: [u8; 32],
+    deployment_target_commitment: [u8; 32],
+    maintenance_window_id: [u8; 16],
+    deployment_revision_commitment: [u8; 32],
+    challenge_commitment: [u8; 32],
+    monitoring_policy_commitment: [u8; 32],
+    rollback_policy_commitment: [u8; 32],
+    signed_evidence_commitment: [u8; 32],
+    consumed: Option<(AdvisoryOwnerId, [u8; 32])>,
+    authorization_commitment: [u8; 32],
+    commitment: [u8; 32],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advisory_activation_preconditions_commitment(
+    scope_id: &[u8; 16],
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    canary_authorization_commitment: &[u8; 32],
+    terminal_witness_hash: &[u8; 32],
+    release_image_digest: &[u8; 32],
+    empty_mutation_set_commitment: &[u8; 32],
+    deployment_target_commitment: &[u8; 32],
+    maintenance_window_id: &[u8; 16],
+    deployment_revision_commitment: &[u8; 32],
+    challenge_commitment: &[u8; 32],
+    monitoring_policy_commitment: &[u8; 32],
+    rollback_policy_commitment: &[u8; 32],
+    signed_evidence_commitment: &[u8; 32],
+    revision: u64,
+    consumed: Option<(AdvisoryOwnerId, [u8; 32])>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_ACTIVATION_PRECONDITIONS_COMMITMENT_DOMAIN);
+    hasher.update(1_u16.to_be_bytes());
+    hasher.update(scope_id);
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(canary_authorization_commitment);
+    hasher.update(terminal_witness_hash);
+    hasher.update(release_image_digest);
+    hasher.update(empty_mutation_set_commitment);
+    hasher.update(deployment_target_commitment);
+    hasher.update(maintenance_window_id);
+    hasher.update(deployment_revision_commitment);
+    hasher.update(challenge_commitment);
+    hasher.update(monitoring_policy_commitment);
+    hasher.update(rollback_policy_commitment);
+    hasher.update(signed_evidence_commitment);
+    hasher.update(revision.to_be_bytes());
+    match consumed {
+        None => hasher.update([0]),
+        Some((owner_id, owner_commitment)) => {
+            hasher.update([1]);
+            hasher.update(owner_id.as_bytes());
+            hasher.update(owner_commitment);
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn load_advisory_activation_preconditions_conn(
+    conn: &Connection,
+    scope: &LoadedAdvisoryCanaryScope,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<LoadedAdvisoryActivationPreconditions> {
+    type PreconditionsRow = (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    );
+    let row: PreconditionsRow = conn.query_row(
+        "SELECT format_version,archive_id,maintenance_operation_id,
+                canary_authorization_commitment,terminal_witness_hash,
+                release_image_digest,empty_mutation_set_commitment,
+                deployment_target_commitment,maintenance_window_id,
+                deployment_revision_commitment,challenge_commitment,
+                monitoring_policy_commitment,rollback_policy_commitment,
+                signed_evidence_commitment,state,consumed_owner_id,
+                consumed_owner_commitment,authorization_commitment,commitment,revision
+         FROM archive_v3_advisory_activation_preconditions WHERE scope_id=?1",
+        [scope.scope_id.as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+                row.get(14)?,
+                row.get(15)?,
+                row.get(16)?,
+                row.get(17)?,
+                row.get(18)?,
+                row.get(19)?,
+            ))
+        },
+    )?;
+    if row.0 != 1 {
+        return Err(EnclaveError::Store(
+            "unsupported advisory activation preconditions format".into(),
+        ));
+    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    let archive_id =
+        ArchiveId::from_bytes(fixed_blob::<16>(&row.1, "advisory activation archive")?);
+    let stored_operation = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&row.2, "advisory activation operation")?,
+    )
+    .map_err(|_| EnclaveError::Store("invalid advisory activation operation".into()))?;
+    let canary_authorization_commitment =
+        fixed_blob::<32>(&row.3, "advisory activation canary authorization")?;
+    let terminal_witness_hash = fixed_blob::<32>(&row.4, "advisory activation terminal witness")?;
+    let release_image_digest = fixed_blob::<32>(&row.5, "advisory activation image")?;
+    let empty_mutation_set_commitment =
+        fixed_blob::<32>(&row.6, "advisory activation empty mutation set")?;
+    let deployment_target_commitment =
+        fixed_blob::<32>(&row.7, "advisory activation deployment target")?;
+    let maintenance_window_id = fixed_blob::<16>(&row.8, "advisory activation window")?;
+    let deployment_revision_commitment =
+        fixed_blob::<32>(&row.9, "advisory activation deployment revision")?;
+    let challenge_commitment = fixed_blob::<32>(&row.10, "advisory activation challenge")?;
+    let monitoring_policy_commitment =
+        fixed_blob::<32>(&row.11, "advisory activation monitoring policy")?;
+    let rollback_policy_commitment =
+        fixed_blob::<32>(&row.12, "advisory activation rollback policy")?;
+    let signed_evidence_commitment =
+        fixed_blob::<32>(&row.13, "advisory activation signed evidence")?;
+    let consumed = match (row.14.as_str(), row.15, row.16, row.19) {
+        ("authorized", None, None, 1) => None,
+        ("consumed", Some(owner), Some(commitment), 2) => Some((
+            AdvisoryOwnerId::from_control_bytes(
+                token,
+                fixed_blob::<16>(&owner, "advisory activation consumed owner")?,
+            )
+            .map_err(map_advisory_owner_error)?,
+            fixed_blob::<32>(&commitment, "advisory activation owner commitment")?,
+        )),
+        _ => {
+            return Err(EnclaveError::Store(
+                "advisory activation preconditions state is corrupt".into(),
+            ))
+        }
+    };
+    let authorization_commitment = fixed_blob::<32>(&row.17, "advisory activation authorization")?;
+    let commitment = fixed_blob::<32>(&row.18, "advisory activation commitment")?;
+    if archive_id != scope.terminal.archive_id
+        || stored_operation != operation_id
+        || canary_authorization_commitment != scope.authorization_commitment
+        || terminal_witness_hash != scope.terminal.terminal_witness_hash
+        || release_image_digest != scope.release_image_digest
+        || signed_evidence_commitment != scope.activation_preconditions_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory activation preconditions changed".into(),
+        ));
+    }
+    let expected_authorization = advisory_activation_preconditions_commitment(
+        &scope.scope_id,
+        archive_id,
+        operation_id,
+        &canary_authorization_commitment,
+        &terminal_witness_hash,
+        &release_image_digest,
+        &empty_mutation_set_commitment,
+        &deployment_target_commitment,
+        &maintenance_window_id,
+        &deployment_revision_commitment,
+        &challenge_commitment,
+        &monitoring_policy_commitment,
+        &rollback_policy_commitment,
+        &signed_evidence_commitment,
+        1,
+        None,
+    );
+    if authorization_commitment != expected_authorization {
+        return Err(EnclaveError::Store(
+            "advisory activation authorization is corrupt".into(),
+        ));
+    }
+    let revision = if consumed.is_some() { 2 } else { 1 };
+    let expected_commitment = advisory_activation_preconditions_commitment(
+        &scope.scope_id,
+        archive_id,
+        operation_id,
+        &canary_authorization_commitment,
+        &terminal_witness_hash,
+        &release_image_digest,
+        &empty_mutation_set_commitment,
+        &deployment_target_commitment,
+        &maintenance_window_id,
+        &deployment_revision_commitment,
+        &challenge_commitment,
+        &monitoring_policy_commitment,
+        &rollback_policy_commitment,
+        &signed_evidence_commitment,
+        revision,
+        consumed,
+    );
+    if commitment != expected_commitment {
+        return Err(EnclaveError::Store(
+            "advisory activation preconditions commitment is corrupt".into(),
+        ));
+    }
+    Ok(LoadedAdvisoryActivationPreconditions {
+        scope_id: scope.scope_id,
+        archive_id,
+        operation_id,
+        canary_authorization_commitment,
+        terminal_witness_hash,
+        release_image_digest,
+        empty_mutation_set_commitment,
+        deployment_target_commitment,
+        maintenance_window_id,
+        deployment_revision_commitment,
+        challenge_commitment,
+        monitoring_policy_commitment,
+        rollback_policy_commitment,
+        signed_evidence_commitment,
+        consumed,
+        authorization_commitment,
+        commitment,
+    })
 }
 
 fn load_advisory_canary_scope_conn(
@@ -9262,7 +9595,7 @@ fn load_advisory_canary_scope_conn(
     expected: &crate::archive_v3_witness::WitnessRecord,
 ) -> Result<LoadedAdvisoryCanaryScope> {
     let token = AdvisoryOwnerPersistenceContext(());
-    let (scope_id, operation_id, image, statement, capability_commitment) =
+    let (scope_id, operation_id, image, statement, activation, capability_commitment) =
         canary.control_view(token);
     let terminal = advisory_canary_terminal_facts_conn(conn, operation_id, expected)?;
     type ScopeRow = (
@@ -9333,8 +9666,7 @@ fn load_advisory_canary_scope_conn(
         scope_id,
         operation_id,
         &terminal,
-        image,
-        statement,
+        (image, statement, activation),
         1,
         None,
     )?;
@@ -9368,8 +9700,7 @@ fn load_advisory_canary_scope_conn(
         scope_id,
         operation_id,
         &terminal,
-        image,
-        statement,
+        (image, statement, activation),
         revision,
         consumed,
     )?;
@@ -9383,6 +9714,7 @@ fn load_advisory_canary_scope_conn(
         terminal,
         release_image_digest: *image,
         operator_statement_commitment: *statement,
+        activation_preconditions_commitment: *activation,
         authorization_commitment,
         consumed,
         commitment,
@@ -9393,13 +9725,23 @@ fn load_advisory_canary_capability_conn(
     conn: &Connection,
     operation_id: MaintenanceImportOperationId,
 ) -> Result<AdvisoryCanaryScope> {
-    let row: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
-        "SELECT scope_id,release_image_digest,operator_statement_commitment,
-                authorization_commitment
-         FROM archive_v3_advisory_canary_scopes
-         WHERE maintenance_operation_id=?1",
+    type CanaryCapabilityRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    let row: CanaryCapabilityRow = conn.query_row(
+        "SELECT s.scope_id,s.release_image_digest,s.operator_statement_commitment,
+                p.signed_evidence_commitment,s.authorization_commitment
+         FROM archive_v3_advisory_canary_scopes s
+         JOIN archive_v3_advisory_activation_preconditions p ON p.scope_id=s.scope_id
+         WHERE s.maintenance_operation_id=?1",
         [operation_id.as_bytes().as_slice()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
     )?;
     AdvisoryCanaryScope::from_control(
         AdvisoryOwnerPersistenceContext(()),
@@ -9407,7 +9749,8 @@ fn load_advisory_canary_capability_conn(
         operation_id,
         fixed_blob::<32>(&row.1, "advisory canary release image")?,
         fixed_blob::<32>(&row.2, "advisory canary operator statement")?,
-        fixed_blob::<32>(&row.3, "advisory canary authorization")?,
+        fixed_blob::<32>(&row.3, "advisory activation preconditions")?,
+        fixed_blob::<32>(&row.4, "advisory canary authorization")?,
     )
     .map_err(map_advisory_owner_error)
 }
@@ -9446,9 +9789,21 @@ fn authorize_advisory_canary_conn(
     {
         let retained = load_advisory_canary_capability_conn(&tx, operation_id)?;
         let loaded = load_advisory_canary_scope_conn(&tx, &retained, expected)?;
+        let preconditions =
+            load_advisory_activation_preconditions_conn(&tx, &loaded, operation_id)?;
         if loaded.scope_id != verified.scope_id
             || loaded.release_image_digest != verified.release_image_digest
             || loaded.operator_statement_commitment != verified.operator_statement_commitment
+            || loaded.activation_preconditions_commitment
+                != verified.activation_preconditions_commitment
+            || preconditions.empty_mutation_set_commitment != verified.empty_mutation_set_commitment
+            || preconditions.deployment_target_commitment != verified.deployment_target_commitment
+            || preconditions.maintenance_window_id != verified.maintenance_window_id
+            || preconditions.deployment_revision_commitment
+                != verified.deployment_revision_commitment
+            || preconditions.challenge_commitment != verified.challenge_commitment
+            || preconditions.monitoring_policy_commitment != verified.monitoring_policy_commitment
+            || preconditions.rollback_policy_commitment != verified.rollback_policy_commitment
         {
             return Err(EnclaveError::Conflict(
                 "advisory canary authorization changed".into(),
@@ -9461,8 +9816,11 @@ fn authorize_advisory_canary_conn(
         &verified.scope_id,
         operation_id,
         &terminal,
-        &verified.release_image_digest,
-        &verified.operator_statement_commitment,
+        (
+            &verified.release_image_digest,
+            &verified.operator_statement_commitment,
+            &verified.activation_preconditions_commitment,
+        ),
         1,
         None,
     )?;
@@ -9494,13 +9852,76 @@ fn authorize_advisory_canary_conn(
             "advisory canary authorization raced".into(),
         ));
     }
+    let preconditions_authorization = advisory_activation_preconditions_commitment(
+        &verified.scope_id,
+        terminal.archive_id,
+        operation_id,
+        &authorization_commitment,
+        &terminal.terminal_witness_hash,
+        &verified.release_image_digest,
+        &verified.empty_mutation_set_commitment,
+        &verified.deployment_target_commitment,
+        &verified.maintenance_window_id,
+        &verified.deployment_revision_commitment,
+        &verified.challenge_commitment,
+        &verified.monitoring_policy_commitment,
+        &verified.rollback_policy_commitment,
+        &verified.activation_preconditions_commitment,
+        1,
+        None,
+    );
+    if tx.execute(
+        "INSERT INTO archive_v3_advisory_activation_preconditions
+         (scope_id,format_version,archive_id,maintenance_operation_id,
+          canary_authorization_commitment,terminal_witness_hash,release_image_digest,
+          empty_mutation_set_commitment,deployment_target_commitment,maintenance_window_id,
+          deployment_revision_commitment,challenge_commitment,monitoring_policy_commitment,
+          rollback_policy_commitment,signed_evidence_commitment,state,consumed_owner_id,
+          consumed_owner_commitment,authorization_commitment,commitment,revision)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+                 'authorized',NULL,NULL,?15,?15,1)",
+        rusqlite::params![
+            verified.scope_id.as_slice(),
+            terminal.archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            authorization_commitment.as_slice(),
+            terminal.terminal_witness_hash.as_slice(),
+            verified.release_image_digest.as_slice(),
+            verified.empty_mutation_set_commitment.as_slice(),
+            verified.deployment_target_commitment.as_slice(),
+            verified.maintenance_window_id.as_slice(),
+            verified.deployment_revision_commitment.as_slice(),
+            verified.challenge_commitment.as_slice(),
+            verified.monitoring_policy_commitment.as_slice(),
+            verified.rollback_policy_commitment.as_slice(),
+            verified.activation_preconditions_commitment.as_slice(),
+            preconditions_authorization.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory activation preconditions authorization raced".into(),
+        ));
+    }
     let capability = load_advisory_canary_capability_conn(&tx, operation_id)?;
     let loaded = load_advisory_canary_scope_conn(&tx, &capability, expected)?;
+    let preconditions = load_advisory_activation_preconditions_conn(&tx, &loaded, operation_id)?;
     if loaded.scope_id != verified.scope_id
         || loaded.release_image_digest != verified.release_image_digest
         || loaded.operator_statement_commitment != verified.operator_statement_commitment
+        || loaded.activation_preconditions_commitment
+            != verified.activation_preconditions_commitment
         || loaded.consumed.is_some()
         || loaded.commitment != authorization_commitment
+        || preconditions.empty_mutation_set_commitment != verified.empty_mutation_set_commitment
+        || preconditions.deployment_target_commitment != verified.deployment_target_commitment
+        || preconditions.maintenance_window_id != verified.maintenance_window_id
+        || preconditions.deployment_revision_commitment != verified.deployment_revision_commitment
+        || preconditions.challenge_commitment != verified.challenge_commitment
+        || preconditions.monitoring_policy_commitment != verified.monitoring_policy_commitment
+        || preconditions.rollback_policy_commitment != verified.rollback_policy_commitment
+        || preconditions.consumed.is_some()
+        || preconditions.commitment != preconditions_authorization
     {
         return Err(EnclaveError::Conflict(
             "advisory canary authorization readback changed".into(),
@@ -9571,6 +9992,7 @@ fn authorize_advisory_canary_for_test_conn(
         terminal.terminal_witness_hash,
         release_image_digest,
         operator_statement_commitment,
+        [0xa7; 32],
     )
     .map_err(map_advisory_owner_error)?;
     authorize_advisory_canary_conn(conn, &authorization, expected)
@@ -9801,7 +10223,9 @@ fn reserve_advisory_owner_with_canary_conn(
     let tx = conn.unchecked_transaction()?;
     authenticate_advisory_owner_terminal_conn(&tx, operation_id, expected)?;
     let scope = load_advisory_canary_scope_conn(&tx, canary, expected)?;
-    let (_, scope_operation_id, _, _, _) = canary.control_view(AdvisoryOwnerPersistenceContext(()));
+    let preconditions = load_advisory_activation_preconditions_conn(&tx, &scope, operation_id)?;
+    let (_, scope_operation_id, _, _, _, _) =
+        canary.control_view(AdvisoryOwnerPersistenceContext(()));
     if scope_operation_id != operation_id {
         return Err(EnclaveError::Conflict(
             "advisory canary operation changed".into(),
@@ -9835,12 +10259,17 @@ fn reserve_advisory_owner_with_canary_conn(
                 "advisory canary consumption changed".into(),
             ));
         }
+        if preconditions.consumed != Some((retained_owner, initial_commitment)) {
+            return Err(EnclaveError::Conflict(
+                "advisory activation preconditions consumption changed".into(),
+            ));
+        }
         tx.commit()?;
         return Ok((retained, false));
     }
-    if scope.consumed.is_some() {
+    if scope.consumed.is_some() || preconditions.consumed.is_some() {
         return Err(EnclaveError::Conflict(
-            "advisory canary is already consumed".into(),
+            "advisory canary admission is already consumed".into(),
         ));
     }
     let token = AdvisoryOwnerPersistenceContext(());
@@ -9853,8 +10282,11 @@ fn reserve_advisory_owner_with_canary_conn(
         &scope.scope_id,
         operation_id,
         &scope.terminal,
-        &scope.release_image_digest,
-        &scope.operator_statement_commitment,
+        (
+            &scope.release_image_digest,
+            &scope.operator_statement_commitment,
+            &scope.activation_preconditions_commitment,
+        ),
         2,
         Some((owner_id, commitment)),
     )?;
@@ -9893,6 +10325,66 @@ fn reserve_advisory_owner_with_canary_conn(
             "advisory canary consumption raced".into(),
         ));
     }
+    let consumed_preconditions_commitment = advisory_activation_preconditions_commitment(
+        &preconditions.scope_id,
+        preconditions.archive_id,
+        preconditions.operation_id,
+        &preconditions.canary_authorization_commitment,
+        &preconditions.terminal_witness_hash,
+        &preconditions.release_image_digest,
+        &preconditions.empty_mutation_set_commitment,
+        &preconditions.deployment_target_commitment,
+        &preconditions.maintenance_window_id,
+        &preconditions.deployment_revision_commitment,
+        &preconditions.challenge_commitment,
+        &preconditions.monitoring_policy_commitment,
+        &preconditions.rollback_policy_commitment,
+        &preconditions.signed_evidence_commitment,
+        2,
+        Some((owner_id, commitment)),
+    );
+    if tx.execute(
+        "UPDATE archive_v3_advisory_activation_preconditions
+         SET state='consumed',consumed_owner_id=?1,consumed_owner_commitment=?2,
+             commitment=?3,revision=2,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE scope_id=?4 AND format_version=1 AND archive_id=?5
+           AND maintenance_operation_id=?6 AND canary_authorization_commitment=?7
+           AND terminal_witness_hash=?8 AND release_image_digest=?9
+           AND empty_mutation_set_commitment=?10 AND deployment_target_commitment=?11
+           AND maintenance_window_id=?12 AND deployment_revision_commitment=?13
+           AND challenge_commitment=?14 AND monitoring_policy_commitment=?15
+           AND rollback_policy_commitment=?16 AND signed_evidence_commitment=?17
+           AND state='authorized' AND consumed_owner_id IS NULL
+           AND consumed_owner_commitment IS NULL AND authorization_commitment=?18
+           AND commitment=?19 AND revision=1",
+        rusqlite::params![
+            owner_id.as_bytes().as_slice(),
+            commitment.as_slice(),
+            consumed_preconditions_commitment.as_slice(),
+            preconditions.scope_id.as_slice(),
+            preconditions.archive_id.as_bytes().as_slice(),
+            preconditions.operation_id.as_bytes().as_slice(),
+            preconditions.canary_authorization_commitment.as_slice(),
+            preconditions.terminal_witness_hash.as_slice(),
+            preconditions.release_image_digest.as_slice(),
+            preconditions.empty_mutation_set_commitment.as_slice(),
+            preconditions.deployment_target_commitment.as_slice(),
+            preconditions.maintenance_window_id.as_slice(),
+            preconditions.deployment_revision_commitment.as_slice(),
+            preconditions.challenge_commitment.as_slice(),
+            preconditions.monitoring_policy_commitment.as_slice(),
+            preconditions.rollback_policy_commitment.as_slice(),
+            preconditions.signed_evidence_commitment.as_slice(),
+            preconditions.authorization_commitment.as_slice(),
+            preconditions.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory activation preconditions consumption raced".into(),
+        ));
+    }
     if tx.execute(
         "INSERT INTO archive_v3_advisory_owners
          (archive_id,format_version,maintenance_operation_id,owner_id,expected_witness,
@@ -9921,7 +10413,13 @@ fn reserve_advisory_owner_with_canary_conn(
         ));
     }
     let consumed_scope = load_advisory_canary_scope_conn(&tx, canary, expected)?;
-    if consumed_scope.consumed != Some((owner_id, commitment)) {
+    let consumed_preconditions =
+        load_advisory_activation_preconditions_conn(&tx, &consumed_scope, operation_id)?;
+    if consumed_scope.consumed != Some((owner_id, commitment))
+        || consumed_scope.commitment != consumed_scope_commitment
+        || consumed_preconditions.consumed != Some((owner_id, commitment))
+        || consumed_preconditions.commitment != consumed_preconditions_commitment
+    {
         return Err(EnclaveError::Conflict(
             "advisory canary consumption readback changed".into(),
         ));
@@ -9955,6 +10453,20 @@ fn mark_advisory_owner_send_started_conn(
         reserved.control_view(token);
     let tx = conn.unchecked_transaction()?;
     authenticate_advisory_owner_terminal_conn(&tx, operation_id, expected)?;
+    let canary = load_advisory_canary_capability_conn(&tx, operation_id)?;
+    let scope = load_advisory_canary_scope_conn(&tx, &canary, expected)?;
+    let preconditions = load_advisory_activation_preconditions_conn(&tx, &scope, operation_id)?;
+    let initial =
+        AdvisoryOwnerReservation::new_for_control(token, operation_id, owner_id, expected.clone())
+            .map_err(map_advisory_owner_error)?;
+    let (_, _, _, _, _, initial_commitment) = initial.control_view(token);
+    if scope.consumed != Some((owner_id, initial_commitment))
+        || preconditions.consumed != Some((owner_id, initial_commitment))
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory activation admission changed before send".into(),
+        ));
+    }
     let current = load_advisory_owner_reservation_conn(&tx, expected.archive_id())?;
     if current.control_view(token) != reserved.control_view(token) {
         return Err(EnclaveError::Conflict(
@@ -25259,6 +25771,7 @@ mod tests {
             terminal.terminal_witness_hash,
             [0x9a; 32],
             [0x9b; 32],
+            [0x9c; 32],
         )
         .unwrap();
         gcs.fail_next_put_after_commit(EnclaveError::Gcs(
@@ -29631,6 +30144,7 @@ mod tests {
             terminal.terminal_witness_hash,
             [0xd1; 32],
             [0xd2; 32],
+            [0xd3; 32],
         )
         .unwrap();
         conn.execute_batch(
@@ -29654,7 +30168,29 @@ mod tests {
             0,
             "late issuer readback corruption must roll back the scope row"
         );
-        conn.execute_batch("DROP TRIGGER corrupt_advisory_canary_authorization_after_insert;")
+        conn.execute_batch(
+            "DROP TRIGGER corrupt_advisory_canary_authorization_after_insert;
+             CREATE TRIGGER corrupt_advisory_activation_authorization_after_insert
+             AFTER INSERT ON archive_v3_advisory_activation_preconditions
+             BEGIN
+               UPDATE archive_v3_advisory_activation_preconditions
+               SET monitoring_policy_commitment=x'd4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4'
+               WHERE scope_id=NEW.scope_id;
+             END;",
+        )
+        .unwrap();
+        assert!(authorize_advisory_canary_conn(&conn, &authorization, &released).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_canary_scopes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "late precondition readback corruption must roll back both authorization rows"
+        );
+        conn.execute_batch("DROP TRIGGER corrupt_advisory_activation_authorization_after_insert;")
             .unwrap();
         let (issued, changed) =
             authorize_advisory_canary_conn(&conn, &authorization, &released).unwrap();
@@ -29677,6 +30213,7 @@ mod tests {
             terminal.terminal_witness_hash,
             [0xd1; 32],
             [0xd2; 32],
+            [0xd3; 32],
         )
         .unwrap();
         assert!(authorize_advisory_canary_conn(&conn, &conflicting, &released).is_err());
@@ -29704,6 +30241,7 @@ mod tests {
             [0x72; 32],
             [0x73; 32],
             [0x74; 32],
+            [0x75; 32],
         )
         .unwrap();
         assert!(reserve_advisory_owner_with_canary_conn(
@@ -29786,13 +30324,14 @@ mod tests {
         assert!(!changed);
         assert_eq!(replayed.control_view(token), reserved.control_view(token));
 
-        let (scope_id, _, _, statement, authorization) = reopened.control_view(token);
+        let (scope_id, _, _, statement, activation, authorization) = reopened.control_view(token);
         let substituted = AdvisoryCanaryScope::from_control(
             token,
             *scope_id,
             maintenance.operation_id,
             [0x77; 32],
             *statement,
+            *activation,
             *authorization,
         )
         .unwrap();
@@ -29820,6 +30359,21 @@ mod tests {
             "UPDATE archive_v3_advisory_canary_scopes SET operator_statement_commitment=x'8787878787878787878787878787878787878787878787878787878787878787'",
             "UPDATE archive_v3_advisory_canary_scopes SET authorization_commitment=x'8888888888888888888888888888888888888888888888888888888888888888',commitment=x'8888888888888888888888888888888888888888888888888888888888888888'",
             "UPDATE archive_v3_advisory_canary_scopes SET commitment=x'8989898989898989898989898989898989898989898989898989898989898989'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET archive_id=x'90909090909090909090909090909090'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET maintenance_operation_id=x'91919191919191919191919191919191'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET canary_authorization_commitment=x'9292929292929292929292929292929292929292929292929292929292929292'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET terminal_witness_hash=x'9393939393939393939393939393939393939393939393939393939393939393'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET release_image_digest=x'9494949494949494949494949494949494949494949494949494949494949494'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET empty_mutation_set_commitment=x'9595959595959595959595959595959595959595959595959595959595959595'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET deployment_target_commitment=x'9696969696969696969696969696969696969696969696969696969696969696'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET maintenance_window_id=x'97979797979797979797979797979797'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET deployment_revision_commitment=x'9898989898989898989898989898989898989898989898989898989898989898'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET challenge_commitment=x'9999999999999999999999999999999999999999999999999999999999999999'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET monitoring_policy_commitment=x'9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET rollback_policy_commitment=x'9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET signed_evidence_commitment=x'9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET authorization_commitment=x'9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d',commitment=x'9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d9d'",
+            "UPDATE archive_v3_advisory_activation_preconditions SET commitment=x'9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e'",
         ] {
             let conn = account_conn();
             let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
@@ -29924,7 +30478,7 @@ mod tests {
                 [0x8b; 32],
             )
             .unwrap();
-            reserve_advisory_owner_with_canary_conn(
+            let (reserved, _) = reserve_advisory_owner_with_canary_conn(
                 &conn,
                 &canary,
                 maintenance.operation_id,
@@ -29951,6 +30505,7 @@ mod tests {
                 &released,
             )
             .is_err());
+            assert!(mark_advisory_owner_send_started_conn(&conn, &reserved).is_err());
             assert_eq!(
                 conn.query_row(
                     "SELECT count(*) FROM archive_v3_advisory_owners",
@@ -29959,6 +30514,60 @@ mod tests {
                 )
                 .unwrap(),
                 i64::from(!remove_owner)
+            );
+        }
+
+        for mutation in [
+            "DELETE FROM archive_v3_advisory_activation_preconditions",
+            "UPDATE archive_v3_advisory_activation_preconditions
+             SET state='authorized',consumed_owner_id=NULL,
+                 consumed_owner_commitment=NULL,
+                 commitment=authorization_commitment,revision=1",
+        ] {
+            let conn = account_conn();
+            let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+            let release_provider = InMemoryWitness::from_provider_record_at_tick(
+                Some(maintenance.shadow.encode()),
+                maintenance.shadow.last_server_tick() + 1,
+            )
+            .unwrap();
+            let released = release_provider
+                .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+                .unwrap();
+            let (canary, _) = authorize_advisory_canary_for_test_conn(
+                &conn,
+                maintenance.operation_id,
+                &released,
+                [0x8c; 32],
+                [0x8d; 32],
+            )
+            .unwrap();
+            let (reserved, _) = reserve_advisory_owner_with_canary_conn(
+                &conn,
+                &canary,
+                maintenance.operation_id,
+                &released,
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute_batch(mutation).unwrap();
+            assert!(reserve_advisory_owner_with_canary_conn(
+                &conn,
+                &canary,
+                maintenance.operation_id,
+                &released,
+            )
+            .is_err());
+            assert!(mark_advisory_owner_send_started_conn(&conn, &reserved).is_err());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_advisory_owners",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "partial or rearmed activation proof must not replace the owner"
             );
         }
     }
@@ -30007,6 +30616,16 @@ mod tests {
             "authorized",
             "failed owner insertion must roll back canary consumption"
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM archive_v3_advisory_activation_preconditions",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "authorized",
+            "failed owner insertion must roll back activation consumption"
+        );
 
         conn.execute_batch(
             "DROP TRIGGER corrupt_advisory_owner_after_insert;
@@ -30041,6 +30660,44 @@ mod tests {
         assert_eq!(
             conn.query_row(
                 "SELECT state FROM archive_v3_advisory_canary_scopes",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "authorized"
+        );
+
+        conn.execute_batch(
+            "DROP TRIGGER corrupt_advisory_canary_after_owner_insert;
+             CREATE TRIGGER corrupt_advisory_activation_after_owner_insert
+             AFTER INSERT ON archive_v3_advisory_owners
+             BEGIN
+               UPDATE archive_v3_advisory_activation_preconditions
+               SET commitment=x'9494949494949494949494949494949494949494949494949494949494949494'
+               WHERE maintenance_operation_id=NEW.maintenance_operation_id;
+             END;",
+        )
+        .unwrap();
+        assert!(reserve_advisory_owner_with_canary_conn(
+            &conn,
+            &canary,
+            maintenance.operation_id,
+            &released,
+        )
+        .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_owners",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "late activation readback corruption must roll back owner insertion"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM archive_v3_advisory_activation_preconditions",
                 [],
                 |row| row.get::<_, String>(0),
             )

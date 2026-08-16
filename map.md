@@ -14,9 +14,11 @@ encrypted persistence; client applications and deployment automation are downstr
 consumers.
 
 ADR-0022's inactive Phase-1 advisory path includes an exact one-shot encrypted-Control
-canary scope whose consumption is atomic with the first owner reservation. Its private
-two-root verifier and exact Control issuer are compiled, but both checked-in public-key
-anchors remain deliberately invalid and there is no live attestation adapter or caller
+canary scope plus a separate runtime-precondition row whose consumption is atomic with
+the first owner reservation. Its private three-root operator/image/deployment-observer
+verifier fixes Phase 1 to no authoritative mutations, legacy-only acknowledgements, and
+zero serving replicas in one exact maintenance window. All checked-in public-key anchors
+remain deliberately invalid and there is no live attestation/deployment observer or caller
 pending the separate activation review.
 
 ## Where it sits
