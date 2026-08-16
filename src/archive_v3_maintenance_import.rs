@@ -807,6 +807,11 @@ pub(crate) trait MaintenanceImportPersistence: ShadowObjectInventory + Send + Sy
         operation_id: MaintenanceImportOperationId,
     ) -> Result<MaintenanceImportRecord, MaintenanceImportError>;
 
+    async fn ensure_advisory_release_absent(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<(), MaintenanceImportError>;
+
     async fn persist_fencing(
         &self,
         operation_id: MaintenanceImportOperationId,
@@ -1039,6 +1044,9 @@ impl SingleArchiveMaintenanceImporter {
         let session_id = ShadowSessionId::for_operation(*operation_id.as_bytes())
             .map_err(|_| MaintenanceImportError::Corrupt)?;
         let mut record = persistence.load_exact(operation_id).await?;
+        persistence
+            .ensure_advisory_release_absent(operation_id)
+            .await?;
         if record.stage == MaintenanceImportStage::ManualRequired {
             return Err(MaintenanceImportError::Conflict);
         }
@@ -1057,6 +1065,13 @@ impl SingleArchiveMaintenanceImporter {
             .begin_archive_maintenance(MaintenanceCoordinatorContext(()), plan)
             .await
             .map_err(|_| MaintenanceImportError::Unavailable)?;
+        // Pair this final Control check with Store's per-user lifecycle lock.
+        // The inactive release executor takes the same lock before preparing
+        // its durable row, so neither same-process path can recreate/delete
+        // the marker across the other's admission decision.
+        persistence
+            .ensure_advisory_release_absent(operation_id)
+            .await?;
         let pinned = if matches!(
             record.stage,
             MaintenanceImportStage::Prepared | MaintenanceImportStage::Fencing
@@ -1857,9 +1872,10 @@ async fn finish_advisory_import(
     // The target retains only a private exact Store/user/archive/import
     // binding. Minting it scrubs DB/WAL/SHM and drops the owned maintenance
     // guards; the Store/barrier blocked state and permanent provider fence
-    // remain fail-closed. The Control-only advisory-release ledger still has
-    // no Store/provider executor. Unlike the authoritative handoff, Phase 1
-    // transfers no long-lived guard or callable Store surface.
+    // remain fail-closed. The later inactive release executor can use this
+    // target only for its one exact provider marker; it still cannot unblock
+    // Store or install capture. Unlike the authoritative handoff, Phase 1
+    // transfers no long-lived guard or general Store surface.
     let store_capture_target = pinned
         .into_advisory_capture_target(MaintenanceCoordinatorContext(()), source)
         .map_err(|_| MaintenanceImportError::Conflict)?;
@@ -3162,6 +3178,13 @@ mod tests {
             Err(MaintenanceImportError::Unavailable)
         }
 
+        async fn ensure_advisory_release_absent(
+            &self,
+            _operation_id: MaintenanceImportOperationId,
+        ) -> Result<(), MaintenanceImportError> {
+            Ok(())
+        }
+
         async fn persist_fencing(
             &self,
             _operation_id: MaintenanceImportOperationId,
@@ -3777,7 +3800,8 @@ mod tests {
     async fn real_sqlite_import_stops_advisory_reopens_and_fences_authority() {
         use crate::{
             cp::control_store::ControlStore,
-            store::{tests::FakeGcs, tests::FakeKms, Store},
+            error::EnclaveError,
+            store::{tests::FakeGcs, tests::FakeKms, GcsClient, Store},
         };
 
         let control = Arc::new(ControlStore::new(
@@ -3797,7 +3821,7 @@ mod tests {
         let operation_id = plan.operation_id;
 
         let legacy_gcs = Arc::new(FakeGcs::new());
-        let store = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs));
+        let store = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs.clone()));
         store
             .with_user(&user.id, |connection| {
                 connection.execute(
@@ -3931,8 +3955,9 @@ mod tests {
         // fence. An advisory restart reacquires and revalidates the exact
         // legacy source, observes the already-released witness, and remints no
         // serving or release authority.
-        // Obtain both opaque handoffs before either is allowed to acquire the
-        // later live advisory owner; this models a restart/lost local result.
+        // Obtain two restart handoffs before any is allowed to acquire the
+        // later live advisory owner; this models restart/lost-local-result
+        // recovery without rerunning maintenance after the marker is absent.
         let restart_plan = control
             .prepare_archive_v3_maintenance_import(&user.id)
             .await
@@ -3946,6 +3971,29 @@ mod tests {
                 Arc::clone(&control),
                 Arc::clone(&store),
                 restart_plan,
+            )
+            .unwrap(),
+        )
+        .run()
+        .await
+        .unwrap();
+        let stale_authority_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let release_restart_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let release_restart = SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(
+            SingleArchiveMaintenanceImporter::from_test_components(
+                archive_id,
+                Arc::clone(&objects),
+                Arc::clone(&registry_provider),
+                witness.clone(),
+                Arc::clone(&control),
+                Arc::clone(&store),
+                release_restart_plan,
             )
             .unwrap(),
         )
@@ -3979,7 +4027,6 @@ mod tests {
         assert!(heartbeated.last_server_tick() > first_bound.last_server_tick());
         assert_eq!(heartbeated.root(), first_bound.root());
         assert_eq!(heartbeated.migration(), MigrationState::ShadowWal);
-        drop(first_owner);
 
         // Reopening from the second parity-certified handoff exact-loads the
         // durable bound row. It must not advance the witness fence or issue a
@@ -4006,29 +4053,129 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
-        drop(reopened_owner);
+        first_owner.maintain_lease().await.unwrap();
+        let second_heartbeat = witness.read_current_exact(archive_id).await.unwrap();
+        assert!(second_heartbeat.last_server_tick() > heartbeated.last_server_tick());
+        assert!(matches!(
+            reopened_owner.release_legacy_fence().await,
+            Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+        ));
+        let marker_name = store.identity_rebind_fence_object_name(&user.id).unwrap();
+        let marker_generation = legacy_gcs
+            .get_object(&marker_name)
+            .await
+            .unwrap()
+            .generation;
+        legacy_gcs.reset_operation_counts();
+        legacy_gcs.fail_next_get(EnclaveError::NotFound);
+        assert!(matches!(
+            first_owner.mark_advisory_fence_delete_started().await,
+            Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+        ));
+        assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+        first_owner
+            .mark_advisory_fence_delete_started()
+            .await
+            .unwrap();
+        let marker_metadata =
+            legacy_gcs.replace_live_wrapped_dek(&marker_name, "substituted-marker-metadata");
+        legacy_gcs.reset_operation_counts();
+        assert!(matches!(
+            first_owner
+                .reconcile_advisory_fence_absence_for_test()
+                .await,
+            Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+        ));
+        assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+        assert_eq!(
+            legacy_gcs.replace_live_wrapped_dek(&marker_name, &marker_metadata),
+            "substituted-marker-metadata"
+        );
+        let replacement_generation = marker_generation.checked_add(1).unwrap();
+        assert_eq!(
+            legacy_gcs.replace_live_generation(&marker_name, replacement_generation),
+            marker_generation
+        );
+        legacy_gcs.reset_operation_counts();
+        assert!(matches!(
+            first_owner
+                .reconcile_advisory_fence_absence_for_test()
+                .await,
+            Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+        ));
+        assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+        assert_eq!(
+            legacy_gcs.replace_live_generation(&marker_name, marker_generation),
+            replacement_generation
+        );
+
+        // With retained DeleteStarted, even when the exact provider deletion
+        // commits but its response is lost, a fresh exact-name read alone
+        // authorizes the terminal Control transition.
+        legacy_gcs.reset_operation_counts();
+        legacy_gcs.fail_next_generation_delete_after_commit(&marker_name, marker_generation);
+        let released_owner = first_owner.release_legacy_fence().await.unwrap();
+        assert!(released_owner.is_released());
+        assert!(released_owner.has_exact_capture_target(&user.id, archive_id, operation_id));
+        assert!(matches!(
+            legacy_gcs.get_object(&marker_name).await,
+            Err(EnclaveError::NotFound)
+        ));
+        assert_eq!(legacy_gcs.operation_counts(), (0, 1));
+        // Provider release alone is never local serving authority.
+        assert!(matches!(
+            store.with_user(&user.id, |_| Ok(())).await,
+            Err(EnclaveError::Auth(_))
+        ));
+        drop(released_owner);
+
+        // Reopen exact-loads the terminal Control row and performs no second
+        // marker read, delete, list, or owner-witness mutation.
+        legacy_gcs.reset_operation_counts();
+        let live_gets_before_reopen = legacy_gcs.live_get_count();
+        let release_reopened =
+            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(release_restart)
+                .await
+                .unwrap()
+                .release_legacy_fence()
+                .await
+                .unwrap();
+        assert!(release_reopened.is_released());
+        assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+        assert_eq!(legacy_gcs.live_get_count(), live_gets_before_reopen);
+        assert!(matches!(
+            store.with_user(&user.id, |_| Ok(())).await,
+            Err(EnclaveError::Auth(_))
+        ));
+        drop(release_reopened);
 
         // Selecting the later authority importer against a completed advisory
         // terminal fails closed. A separately reviewed Phase-2 transition
         // must define how it acquires new authority; the advisory type cannot
         // silently continue into R2.
-        let authority_plan = control
-            .prepare_archive_v3_maintenance_import(&user.id)
-            .await
-            .unwrap();
         let authority = SingleArchiveMaintenanceImporter::from_test_components(
             archive_id,
-            objects,
-            registry_provider,
-            witness,
-            control,
-            store,
-            authority_plan,
+            Arc::clone(&objects),
+            Arc::clone(&registry_provider),
+            witness.clone(),
+            Arc::clone(&control),
+            Arc::clone(&store),
+            stale_authority_plan,
         )
         .unwrap()
         .run()
         .await;
         assert!(matches!(authority, Err(MaintenanceImportError::Conflict)));
+        assert!(matches!(
+            control
+                .prepare_archive_v3_maintenance_import(&user.id)
+                .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        assert!(matches!(
+            legacy_gcs.get_object(&marker_name).await,
+            Err(EnclaveError::NotFound)
+        ));
     }
 
     #[tokio::test]

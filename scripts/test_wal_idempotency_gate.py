@@ -2041,6 +2041,7 @@ impl X {
         maintenance = (ROOT / "src/archive_v3_maintenance_import.rs").read_text(
             encoding="utf-8"
         )
+        maintenance_production = without_cfg_test_items(maintenance)
         witness = (ROOT / "src/archive_v3_witness.rs").read_text(encoding="utf-8")
         control = (ROOT / "src/cp/control_store.rs").read_text(encoding="utf-8")
 
@@ -2069,7 +2070,6 @@ impl X {
         self.assertIn("maintain_advisory_owner_lease_unresolved", runtime)
         self.assertIn("is_exact_unleased_advisory_terminal", witness)
         self.assertIn("maintain_exact_advisory_owner_lease", witness)
-        self.assertNotIn("archive_v3_advisory_owner::", store)
         self.assertNotIn("archive_v3_advisory_owner::", query)
         self.assertIn(
             "pub(crate) struct StoreShadowCaptureSelection", store_production
@@ -2091,7 +2091,7 @@ impl X {
         )
         self.assertIn("into_advisory_capture_target", maintenance)
         self.assertIn("struct StoreAdvisoryCaptureTarget", store_production)
-        self.assertNotIn("impl StoreAdvisoryCaptureTarget", store_production)
+        self.assertEqual(store_production.count("impl StoreAdvisoryCaptureTarget"), 1)
         self.assertNotIn("exact_identity_for_test", store_production)
         self.assertIn("struct AdvisoryRelease", advisory_production)
         self.assertIn("AdvisoryReleaseStage::Prepared", advisory_production)
@@ -2105,8 +2105,71 @@ impl X {
         self.assertIn(
             "advisory release permanently fenced lease advancement", control
         )
-        self.assertNotIn("AdvisoryFenceObservation::from_store", store_production)
-        self.assertNotIn("AdvisoryFenceAbsence::from_store", store_production)
+        self.assertIn(
+            "async fn release_legacy_fence(self)", advisory_production
+        )
+        self.assertNotIn(
+            "pub(crate) async fn release_legacy_fence", advisory_production
+        )
+        self.assertIn(
+            "struct ReleasedSingleArchiveAdvisoryOwner", advisory_production
+        )
+        self.assertIn(
+            ".acquire_advisory_release_lifecycle()", advisory_production
+        )
+        self.assertIn(
+            "_release_lifecycle_guard: tokio::sync::OwnedMutexGuard<()>",
+            advisory_production,
+        )
+        self.assertIn(".observe_advisory_fence(&release)", advisory_production)
+        self.assertIn(
+            ".reconcile_advisory_fence_absence(&release)", advisory_production
+        )
+        release_start = advisory_production.index("async fn release_legacy_fence(self)")
+        release_end = advisory_production.index(
+            "fn map_advisory_store_error", release_start
+        )
+        release_method = advisory_production[release_start:release_end]
+        self.assertIn("read_advisory_owner_current_exact", release_method)
+        self.assertIn("current != *self._bound.observed()", release_method)
+        executor_start = store_production.index("impl StoreAdvisoryCaptureTarget")
+        executor_end = store_production.index(
+            "impl Drop for PinnedLegacySnapshot", executor_start
+        )
+        executor = store_production[executor_start:executor_end]
+        self.assertIn("AdvisoryFenceObservation::from_store", executor)
+        self.assertIn("AdvisoryFenceAbsence::from_store", executor)
+        self.assertEqual(executor.count(".delete_object_generation("), 1)
+        self.assertEqual(executor.count(".get_object(&marker_name)"), 3)
+        self.assertIn("AdvisoryReleaseStoreStage::Prepared", executor)
+        self.assertIn("AdvisoryReleaseStoreStage::DeleteStarted", executor)
+        self.assertIn("identity_rebind_fence_object_name", executor)
+        self.assertIn("fn acquire_advisory_release_lifecycle", executor)
+        self.assertEqual(
+            maintenance_production.count(
+                ".ensure_advisory_release_absent(operation_id)"
+            ),
+            2,
+        )
+        self.assertIn(
+            "advisory release permanently fenced maintenance re-entry", control
+        )
+        for forbidden in (
+            "list_",
+            ".delete_object(",
+            ".put_object(",
+            ".with_user(",
+            "blocked_users.remove",
+            "content_write_barrier.changed.notify",
+            "release_open_registration",
+            "CaptureRegistration",
+            "CaptureRegistry",
+            "StoreShadowCapture",
+            "tokio::spawn",
+            "std::env::",
+            "acknowledge_result",
+        ):
+            self.assertNotIn(forbidden, executor)
         for forbidden in (
             "StoreShadowCapture",
             ".with_user(",

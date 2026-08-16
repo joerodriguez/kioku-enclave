@@ -581,9 +581,24 @@ separate activation blockers.
     commitment, positive generation, and exact-name absence proof. Preparing
     release permanently fences lease succession; every transition uses a full-
     tuple CAS and exact readback, and late failure rolls back. Store-token-gated
-    marker/absence proof constructors exist, but no Store method invokes them;
-    provider get/delete, local unblock, selector installation, capture, startup,
+    marker/absence proof constructors are consumed only by the following exact-
+    user executor; local unblock, selector installation, capture, startup,
     serving, route, task, and cloud authority remain absent.
+  - [x] Add the inactive Store-owned exact advisory-marker executor. The
+    consuming owner freezes lease work, acquires the same one-user lifecycle
+    lock as maintenance, and freshly matches its exact retained witness before
+    Control prepare; plan re-adoption plus a post-lock Control check reject
+    a release row before provider I/O, including stale plans. The retained one-
+    user target then derives only its HMAC marker name and exact-gets/authenticates the bound
+    authority, metadata, and positive generation. Control must durably record
+    `DeleteStarted` before Store can delete exactly that generation. Success or
+    a lost response settles only through a fresh exact-name `NotFound`; missing
+    pre-marker state, substituted metadata/authority, replacement generation,
+    or unavailable read fails closed. Reopen of `Released` performs no provider
+    operation. The target has no list/put/broad-delete surface and completion
+    intentionally leaves Store/barrier admission blocked; local unblock,
+    capture installation/comparison, startup, serving, route, task, cloud, and
+    deployment authority remain absent.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

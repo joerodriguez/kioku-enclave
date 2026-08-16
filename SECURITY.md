@@ -174,9 +174,10 @@ surfaces.
   rereads the exact no-owner ShadowWal record, revalidates the pinned legacy generation again,
   then scrubs DB/WAL/SHM and drops its owned Store guard values. The permanent
   legacy provider fence and process-local Store/barrier blocks deliberately
-  remain fail-closed. Encrypted Control now has an inactive release ledger, but
-  its provider-delete, exact-absence, and Store-unblock executor remains absent,
-  so legacy serving still cannot resume. Its opaque handoff carries no Store fence,
+  remain fail-closed. Encrypted Control and the retained exact-user Store target
+  now provide an inactive exact-marker release executor, but its provider-confirmed
+  completion deliberately does not unblock Store/barrier admission, so legacy
+  serving still cannot resume. Its opaque handoff carries no Store fence,
   acknowledgement, serving policy, route, capture, or WalAuthoritative conversion.
   A higher-fence, changed-root/registry, changed-migration, deletion, or ambiguous unreconciled
   record fails closed. The existing authority importer is a distinct type and
@@ -216,8 +217,9 @@ surfaces.
   keeping every field private; the conversion scrubs scratch and drops its
   owned maintenance guards before the advisory owner receives it. It does not
   clear the permanent provider fence or Store/barrier blocked state. The owner
-  can only retain this opaque target: there is still no selector conversion,
-  capture/drain operation, general Store access, comparison, or live caller.
+  can retain this opaque target and consume it only through the inactive exact-
+  marker release path: there is still no selector conversion, capture/drain
+  operation, general Store access, comparison, unblock, or live caller.
   A separate inactive Control row now binds `Prepared -> DeleteStarted -> Released`
   to the exact parity terminal, exact bound advisory-owner witness/revision/commitment,
   and maintenance-fence commitment. Preparing that row permanently fences further
@@ -225,8 +227,21 @@ surfaces.
   minted exact canonical marker-name, authority, metadata, and positive-generation observation;
   `Released` additionally requires a Store-token-minted exact-name absence proof bound
   to that deletion marker. Every transition full-tuple-CASes and exact-readbacks in one
-  transaction. No Store code mints either proof yet, and this slice adds no provider
-  get/delete, local unblock, capture, retry, startup, serving, or cloud authority.
+  transaction. The consuming owner cannot heartbeat concurrently: it takes
+  the same one-user Store lifecycle lock as maintenance and is moved into a
+  terminal type before release begins. It freshly requires the exact retained
+  advisory witness before Control can freeze release. Maintenance plan re-adoption and a
+  second post-lock check reject any existing release row, so stale same-process
+  plans fail before provider I/O and cannot recreate the marker. Store first exact-gets its HMAC-
+  derived marker, authenticates the expected authority/metadata/positive
+  generation, and only then returns the observation. After Control durably records
+  `DeleteStarted`, Store may delete exactly that generation and mints absence only
+  after a fresh exact-name `NotFound`; a lost delete response is settled by that
+  same read, while a missing pre-marker, substituted marker, replacement generation,
+  or unavailable read fails closed. Reopen exact-loads `Released` without another
+  provider operation. The executor cannot list, put, delete another object, unblock
+  local admission, install capture, retry an owner lease, launch, serve, or mutate
+  cloud/deployment configuration.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness

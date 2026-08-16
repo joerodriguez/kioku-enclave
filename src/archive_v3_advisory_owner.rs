@@ -11,9 +11,10 @@
 //! from the `WalAuthoritative` publisher. It retains one sealed exact-user
 //! Store target but cannot inspect or operate it, and exposes no capture, root,
 //! object, cipher, acknowledgement, route, task, configuration, or serving
-//! capability. A separate Control-only release ledger durably orders exact
-//! marker observation, deletion start, and exact-name absence, but no Store
-//! or provider executor invokes it yet.
+//! capability. A separate inactive release path lets only the retained exact-
+//! user Store target observe and delete its one permanent marker after Control
+//! durably freezes the owner. It confirms exact-name absence but deliberately
+//! leaves every process-local Store/barrier block closed.
 
 use std::{fmt, sync::Arc};
 
@@ -477,6 +478,16 @@ pub(crate) enum AdvisoryReleaseStage {
     Released = 3,
 }
 
+/// Minimal authenticated state exposed only to Store through its private
+/// maintenance token. Store learns no owner or witness fields; it receives
+/// only the stage and exact generation needed for its one named marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdvisoryReleaseStoreStage {
+    Prepared,
+    DeleteStarted { marker_generation: u64 },
+    Released,
+}
+
 type AdvisoryReleaseMarkerTuple = (
     Option<[u8; 32]>,
     Option<u64>,
@@ -847,6 +858,44 @@ impl AdvisoryRelease {
             marker_observation_commitment: self.marker_observation_commitment,
             absence_commitment: self.absence_commitment,
             commitment: self.commitment,
+        }
+    }
+
+    pub(crate) fn authenticate_store_target(
+        &self,
+        _token: crate::store::StoreMaintenanceContext,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        marker_name: &str,
+        fence_authority: &str,
+    ) -> Result<AdvisoryReleaseStoreStage> {
+        if self.archive_id != archive_id
+            || self.operation_id != operation_id
+            || !crate::store::is_canonical_identity_rebind_fence_object_name(marker_name)
+            || !valid_advisory_fence_authority(fence_authority)
+            || advisory_fence_authority_commitment(archive_id, operation_id, fence_authority)
+                != self.fence_authority_commitment
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let marker_name_commitment =
+            advisory_fence_name_commitment(archive_id, operation_id, marker_name);
+        match self.stage {
+            AdvisoryReleaseStage::Prepared => Ok(AdvisoryReleaseStoreStage::Prepared),
+            AdvisoryReleaseStage::DeleteStarted => {
+                if self.marker_name_commitment != Some(marker_name_commitment) {
+                    return Err(AdvisoryOwnerError::Conflict);
+                }
+                Ok(AdvisoryReleaseStoreStage::DeleteStarted {
+                    marker_generation: self.marker_generation.ok_or(AdvisoryOwnerError::Corrupt)?,
+                })
+            }
+            AdvisoryReleaseStage::Released => {
+                if self.marker_name_commitment != Some(marker_name_commitment) {
+                    return Err(AdvisoryOwnerError::Conflict);
+                }
+                Ok(AdvisoryReleaseStoreStage::Released)
+            }
         }
     }
 }
@@ -1333,6 +1382,16 @@ struct SingleArchiveAdvisoryOwner {
     may_heartbeat: bool,
 }
 
+/// Terminal inactive owner after the permanent Store marker is proven absent.
+/// The original owner remains nested and unreachable so no lease maintenance
+/// can race or resume after release. Its Store target still retains every
+/// process-local block for the separately reviewed unblock/capture phase.
+struct ReleasedSingleArchiveAdvisoryOwner {
+    _owner: SingleArchiveAdvisoryOwner,
+    _release: AdvisoryRelease,
+    _release_lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl SingleArchiveAdvisoryOwner {
     async fn start(handoff: CompletedAdvisoryShadowHandoff) -> Result<Self> {
         let CompletedAdvisoryShadowHandoffView {
@@ -1561,6 +1620,88 @@ impl SingleArchiveAdvisoryOwner {
         }
         Ok(())
     }
+
+    /// Consume the owner before beginning irreversible release. Control is
+    /// always advanced to `DeleteStarted` before Store receives exact-delete
+    /// authority; a restart exact-loads the retained stage and reconciles only
+    /// exact-name absence. No local Store admission gate is reopened here.
+    async fn release_legacy_fence(self) -> Result<ReleasedSingleArchiveAdvisoryOwner> {
+        let release_lifecycle_guard = self
+            ._capture_target
+            .acquire_advisory_release_lifecycle()
+            .await
+            .map_err(map_advisory_store_error)?;
+        let current = self
+            ._runtime
+            .read_advisory_owner_current_exact(
+                &AdvisoryOwnerRuntimeContext(()),
+                self._bound.observed().archive_id(),
+            )
+            .await
+            .map_err(|_| AdvisoryOwnerError::Publication)?;
+        if current != *self._bound.observed() {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let mut release = match self
+            ._control
+            .load_advisory_release(AdvisoryOwnerRuntimeContext(()), &self._bound)
+            .await?
+        {
+            Some(retained) => retained,
+            None => {
+                self._control
+                    .prepare_advisory_release(AdvisoryOwnerRuntimeContext(()), &self._bound)
+                    .await?
+            }
+        };
+        loop {
+            release = match release.stage {
+                AdvisoryReleaseStage::Prepared => {
+                    let observation = self
+                        ._capture_target
+                        .observe_advisory_fence(&release)
+                        .await
+                        .map_err(map_advisory_store_error)?;
+                    self._control
+                        .mark_advisory_fence_delete_started(
+                            AdvisoryOwnerRuntimeContext(()),
+                            &release,
+                            &observation,
+                        )
+                        .await?
+                }
+                AdvisoryReleaseStage::DeleteStarted => {
+                    let absence = self
+                        ._capture_target
+                        .reconcile_advisory_fence_absence(&release)
+                        .await
+                        .map_err(map_advisory_store_error)?;
+                    self._control
+                        .mark_advisory_fence_released(
+                            AdvisoryOwnerRuntimeContext(()),
+                            &release,
+                            &absence,
+                        )
+                        .await?
+                }
+                AdvisoryReleaseStage::Released => break,
+            };
+        }
+        Ok(ReleasedSingleArchiveAdvisoryOwner {
+            _owner: self,
+            _release: release,
+            _release_lifecycle_guard: release_lifecycle_guard,
+        })
+    }
+}
+
+fn map_advisory_store_error(error: crate::error::EnclaveError) -> AdvisoryOwnerError {
+    match error {
+        crate::error::EnclaveError::Auth(_)
+        | crate::error::EnclaveError::Conflict(_)
+        | crate::error::EnclaveError::InvalidRequest(_) => AdvisoryOwnerError::Conflict,
+        _ => AdvisoryOwnerError::Publication,
+    }
 }
 
 impl fmt::Debug for SingleArchiveAdvisoryOwner {
@@ -1569,8 +1710,17 @@ impl fmt::Debug for SingleArchiveAdvisoryOwner {
     }
 }
 
+impl fmt::Debug for ReleasedSingleArchiveAdvisoryOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReleasedSingleArchiveAdvisoryOwner(<inactive>)")
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct AdvisoryOwnerTestHandle(SingleArchiveAdvisoryOwner);
+
+#[cfg(test)]
+pub(crate) struct ReleasedAdvisoryOwnerTestHandle(ReleasedSingleArchiveAdvisoryOwner);
 
 #[cfg(test)]
 impl AdvisoryOwnerTestHandle {
@@ -1592,10 +1742,102 @@ impl AdvisoryOwnerTestHandle {
             ._capture_target
             .exact_identity_for_test(user_id, archive_id, operation_id)
     }
+
+    pub(crate) async fn release_legacy_fence(self) -> Result<ReleasedAdvisoryOwnerTestHandle> {
+        self.0
+            .release_legacy_fence()
+            .await
+            .map(ReleasedAdvisoryOwnerTestHandle)
+    }
+
+    pub(crate) async fn mark_advisory_fence_delete_started(&self) -> Result<()> {
+        let release = match self
+            .0
+            ._control
+            .load_advisory_release(AdvisoryOwnerRuntimeContext(()), &self.0._bound)
+            .await?
+        {
+            Some(retained) => retained,
+            None => {
+                self.0
+                    ._control
+                    .prepare_advisory_release(AdvisoryOwnerRuntimeContext(()), &self.0._bound)
+                    .await?
+            }
+        };
+        match release.stage {
+            AdvisoryReleaseStage::Prepared => {
+                let observation = self
+                    .0
+                    ._capture_target
+                    .observe_advisory_fence(&release)
+                    .await
+                    .map_err(map_advisory_store_error)?;
+                let next = self
+                    .0
+                    ._control
+                    .mark_advisory_fence_delete_started(
+                        AdvisoryOwnerRuntimeContext(()),
+                        &release,
+                        &observation,
+                    )
+                    .await?;
+                (next.stage == AdvisoryReleaseStage::DeleteStarted)
+                    .then_some(())
+                    .ok_or(AdvisoryOwnerError::Corrupt)
+            }
+            AdvisoryReleaseStage::DeleteStarted => Ok(()),
+            AdvisoryReleaseStage::Released => Err(AdvisoryOwnerError::Conflict),
+        }
+    }
+
+    pub(crate) async fn reconcile_advisory_fence_absence_for_test(&self) -> Result<()> {
+        let release = self
+            .0
+            ._control
+            .load_advisory_release(AdvisoryOwnerRuntimeContext(()), &self.0._bound)
+            .await?
+            .ok_or(AdvisoryOwnerError::Conflict)?;
+        if release.stage != AdvisoryReleaseStage::DeleteStarted {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        self.0
+            ._capture_target
+            .reconcile_advisory_fence_absence(&release)
+            .await
+            .map(|_| ())
+            .map_err(map_advisory_store_error)
+    }
+}
+
+#[cfg(test)]
+impl ReleasedAdvisoryOwnerTestHandle {
+    pub(crate) fn has_exact_capture_target(
+        &self,
+        user_id: &str,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> bool {
+        self.0
+            ._owner
+            ._capture_target
+            .exact_identity_for_test(user_id, archive_id, operation_id)
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        self.0._release.stage == AdvisoryReleaseStage::Released
+    }
 }
 
 #[cfg(test)]
 impl fmt::Debug for AdvisoryOwnerTestHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for ReleasedAdvisoryOwnerTestHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
