@@ -2409,7 +2409,15 @@ def main() -> None:
             "cargo_inputs_sha256": immutable_source_subset_digest(commit, "Cargo.toml", "Cargo.lock"),
             "source_inputs_sha256": immutable_source_subset_digest(commit, "src"),
             "builder_mode": "native-linux-amd64" if native else "emulated-fallback",
-            "builder": builder_snapshot or {"mode": "emulated-fallback"},
+            # A resumable receipt binds the immutable worker identity, not a
+            # point-in-time disk measurement. Free-space is rechecked on every
+            # run and retained in builder_post telemetry; including it here
+            # made every later --resume miss its own valid build receipt.
+            "builder": (
+                builder_identity_binding(builder_snapshot)
+                if builder_snapshot is not None
+                else {"mode": "emulated-fallback"}
+            ),
         }
         artifact = output_dir / OCI_ARTIFACT_NAME
         snapshot_directory = tempfile.TemporaryDirectory(prefix="kioku-config-snapshot-")
