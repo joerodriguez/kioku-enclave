@@ -659,7 +659,15 @@ separate activation blockers.
     consumed into a terminal type with no second comparison operation. This
     records only the comparison result: it does not settle the restored VFS
     drain, acknowledge a user operation, publish, or change authority.
-    Explicit canary scope, capture-retirement policy, acknowledgement,
+  - [x] Retire the one-shot advisory capture only after that Control terminal
+    is durable. A cancellation-owned Store task authenticates the exact
+    archive/import target, serializes with its open SQLite actor, clears only
+    the matching selector, takes and retires only the matching registration,
+    and returns an opaque proof. Registration retirement scrubs the restored
+    prefix and later queued bytes. Exact already-retired state reconciles after
+    a lost local result; partial/substituted states fail closed. The legacy
+    connection remains open and later writes remain authoritative without
+    capture. Explicit operator canary scope, acknowledgement,
     launcher/startup/route/config, cloud, deployment, and serving authority
     remain next.
 

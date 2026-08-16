@@ -198,8 +198,9 @@ struct UserHandle {
     /// The (validated) user id this handle belongs to. Stored directly so the
     /// GCS object name never has to be reconstructed from the temp-file path.
     user_id: UserId,
-    /// Rust drops fields in declaration order: the SQLite connection must
-    /// close before this registration retires its exact path/stream scope.
+    /// Rust drops fields in declaration order: ordinary teardown closes SQLite
+    /// before retiring this registration. The reviewed advisory terminal may
+    /// take and retire it in place while the legacy connection stays open.
     conn: Connection,
     _shadow_capture_registration: Option<CaptureRegistration>,
     blob_meta: BlobMeta,
@@ -653,8 +654,9 @@ pub(crate) struct StoreAdvisoryReleaseLifecycle {
 /// Inactive proof that the exact released advisory target installed its
 /// exact-user capture selection before reopening both local admission gates.
 /// It retains the capture registry for a separately reviewed owner-only drain,
-/// but carries no connection, provider, acknowledgement, task, or serving
-/// operation.
+/// and can consume a durable exact comparison into selector/registration
+/// retirement, but carries no connection, provider, acknowledgement, or
+/// serving operation.
 pub(crate) struct StoreAdvisoryResumedTarget {
     _store: Arc<Store>,
     _user_id: UserId,
@@ -678,6 +680,16 @@ pub(crate) struct StoreAdvisoryCapturedDrain {
 /// snapshot/drain pair into the private comparison worker.
 #[derive(Clone, Copy)]
 pub(crate) struct StoreAdvisoryComparisonContext(());
+
+/// Token constructed only by Store while consuming an exact settled
+/// comparison into local capture retirement.
+#[derive(Clone, Copy)]
+pub(crate) struct StoreAdvisoryRetirementContext(());
+
+/// Opaque proof that the exact advisory selector is absent and its matching
+/// live registration, when present, was retired and scrubbed. It contains no
+/// Store, SQLite, capture, provider, or acknowledgement capability.
+pub(crate) struct StoreAdvisoryCaptureRetired(());
 
 #[cfg(test)]
 impl StoreAdvisoryComparisonContext {
@@ -2128,6 +2140,125 @@ impl StoreAdvisoryResumedTarget {
             _drain: drain,
         })
     }
+
+    /// Consume the one-shot target after its successful comparison is durable.
+    /// The owned task clears only the exact selector and retires only the
+    /// matching live registration. Caller cancellation cannot strand a
+    /// half-retired selector/registration pair; a retained Control settlement
+    /// can invoke the exact already-retired reconciliation path.
+    pub(crate) async fn retire_advisory_capture(
+        &self,
+        settlement: &crate::archive_v3_advisory_owner::AdvisoryComparisonSettlement,
+    ) -> Result<StoreAdvisoryCaptureRetired> {
+        settlement
+            .authenticate_store_target(
+                StoreAdvisoryRetirementContext(()),
+                self._archive_id,
+                self._operation_id,
+            )
+            .map_err(|_| EnclaveError::Conflict("advisory retirement target changed".into()))?;
+        let store = Arc::clone(&self._store);
+        let user_id = self._user_id.clone();
+        let capture = Arc::clone(&self._capture);
+        retire_advisory_capture_owned(store, user_id, capture).await
+    }
+}
+
+async fn retire_advisory_capture_owned(
+    store: Arc<Store>,
+    user_id: UserId,
+    capture: Arc<StoreShadowCapture>,
+) -> Result<StoreAdvisoryCaptureRetired> {
+    tokio::spawn(async move {
+        retire_advisory_capture_state(store, user_id, capture).await?;
+        Ok(StoreAdvisoryCaptureRetired(()))
+    })
+    .await
+    .map_err(|_| EnclaveError::Store("advisory capture retirement task failed".into()))?
+}
+
+async fn retire_advisory_capture_state(
+    store: Arc<Store>,
+    user_id: UserId,
+    capture: Arc<StoreShadowCapture>,
+) -> Result<()> {
+    let registry = store.registry.lock().await;
+    let actor = match registry.open_users.get(&user_id) {
+        Some(open) if open.status == OpenStatus::Open => Arc::clone(&open.actor),
+        Some(_) => {
+            return Err(EnclaveError::Conflict(
+                "advisory capture handle is changing".into(),
+            ))
+        }
+        None => {
+            // Keep the registry guard while taking the selector write lock.
+            // Open-slot reservation takes the same registry -> selector order,
+            // so no new Loading handle can retain the selector between this
+            // exact absence observation and the clear.
+            let mut selection = store.shadow_capture.write().map_err(|_| {
+                EnclaveError::Store("advisory capture selection unavailable".into())
+            })?;
+            match selection.as_ref() {
+                Some(retained)
+                    if retained.user_id == user_id && Arc::ptr_eq(&retained.capture, &capture) =>
+                {
+                    *selection = None;
+                }
+                None => {}
+                Some(_) => {
+                    return Err(EnclaveError::Conflict(
+                        "advisory capture retirement selection changed".into(),
+                    ))
+                }
+            }
+            drop(selection);
+            drop(registry);
+            return Ok(());
+        }
+    };
+    drop(registry);
+
+    let mut state = actor.state.lock().await;
+    let handle = match state.handle.as_mut() {
+        Some(handle) if handle.user_id == user_id => handle,
+        Some(_) => {
+            return Err(EnclaveError::Conflict(
+                "advisory capture user changed".into(),
+            ))
+        }
+        None => {
+            return Err(EnclaveError::Conflict(
+                "advisory capture handle disappeared".into(),
+            ))
+        }
+    };
+    let mut selection = store
+        .shadow_capture
+        .write()
+        .map_err(|_| EnclaveError::Store("advisory capture selection unavailable".into()))?;
+    let selection_matches = selection.as_ref().is_some_and(|retained| {
+        retained.user_id == user_id && Arc::ptr_eq(&retained.capture, &capture)
+    });
+    match (
+        selection_matches,
+        handle._shadow_capture_registration.as_ref(),
+    ) {
+        (true, Some(retained)) if retained.belongs_to(&capture.registry) => {
+            let registration = handle._shadow_capture_registration.take().ok_or_else(|| {
+                EnclaveError::Conflict("advisory capture registration disappeared".into())
+            })?;
+            *selection = None;
+            drop(selection);
+            drop(registration);
+        }
+        (false, None) if selection.is_none() => {}
+        _ => {
+            return Err(EnclaveError::Conflict(
+                "advisory capture retirement state changed".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -12235,6 +12366,221 @@ pub(crate) mod tests {
         max_open: usize,
     ) -> Store {
         Store::new_internal_with_max_open(kms, gcs, Arc::clone(&media_gcs), media_gcs, max_open)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advisory_retirement_serializes_no_handle_with_concurrent_open() {
+        let capture = StoreShadowCapture::shared_for_test();
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new_internal_with_max_open_and_shadow_capture(
+            Arc::new(FakeKms),
+            gcs.clone(),
+            gcs.clone(),
+            gcs,
+            1,
+            Some(StoreShadowCaptureSelection::for_test(
+                "retirement-open-race",
+                Arc::clone(&capture),
+            )),
+        ));
+        let selection_guard = store.shadow_capture.write().unwrap();
+        let retirement = tokio::spawn(retire_advisory_capture_state(
+            Arc::clone(&store),
+            "retirement-open-race".to_string(),
+            Arc::clone(&capture),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store.registry.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retirement did not retain the registry lock before selector clear"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            store.registry.try_lock().is_err(),
+            "the no-handle observation must retain the registry lock until selector clear"
+        );
+
+        let concurrent_open = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .with_user("retirement-open-race", |connection| {
+                        connection.execute(
+                            "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
+                            ["2026-08-16T00:00:00Z", "opened after retirement"],
+                        )?;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        drop(selection_guard);
+        retirement.await.unwrap().unwrap();
+        concurrent_open.await.unwrap().unwrap();
+
+        assert!(store.shadow_capture.read().unwrap().is_none());
+        let actor = match store
+            .actor_for_existing("retirement-open-race")
+            .await
+            .unwrap()
+        {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("concurrent handle unexpectedly evicted"),
+        };
+        let state = actor.state.lock().await;
+        assert!(
+            state
+                .handle
+                .as_ref()
+                .unwrap()
+                ._shadow_capture_registration
+                .is_none(),
+            "a handle loading after exact retirement must not retain capture"
+        );
+        drop(state);
+        drop(actor);
+        store
+            .with_user("retirement-open-evictor", |_| Ok(()))
+            .await
+            .unwrap();
+        retire_advisory_capture_state(
+            Arc::clone(&store),
+            "retirement-open-race".to_string(),
+            Arc::clone(&capture),
+        )
+        .await
+        .expect("exact absence after eviction must reconcile");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advisory_retirement_cancellation_finishes_owned_selector_clear() {
+        let capture = StoreShadowCapture::shared_for_test();
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new_internal_with_max_open_and_shadow_capture(
+            Arc::new(FakeKms),
+            gcs.clone(),
+            gcs.clone(),
+            gcs,
+            1,
+            Some(StoreShadowCaptureSelection::for_test(
+                "retirement-cancel",
+                Arc::clone(&capture),
+            )),
+        ));
+        let selection_guard = store.shadow_capture.write().unwrap();
+        let caller = tokio::spawn(retire_advisory_capture_owned(
+            Arc::clone(&store),
+            "retirement-cancel".to_string(),
+            Arc::clone(&capture),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store.registry.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned retirement did not reach the selector boundary"
+            );
+            std::thread::yield_now();
+        }
+        caller.abort();
+        drop(selection_guard);
+        let _ = caller.await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if store.shadow_capture.read().unwrap().is_none()
+                    && store.registry.try_lock().is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation-owned retirement must finish exactly");
+    }
+
+    #[tokio::test]
+    async fn advisory_retirement_rejects_partial_and_substituted_live_state() {
+        let capture = StoreShadowCapture::shared_for_test();
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new_internal_with_max_open_and_shadow_capture(
+            Arc::new(FakeKms),
+            gcs.clone(),
+            gcs.clone(),
+            gcs,
+            1,
+            Some(StoreShadowCaptureSelection::for_test(
+                "retirement-partial",
+                Arc::clone(&capture),
+            )),
+        ));
+        store
+            .with_user("retirement-partial", |_| Ok(()))
+            .await
+            .unwrap();
+        let actor = match store
+            .actor_for_existing("retirement-partial")
+            .await
+            .unwrap()
+        {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("capture handle unexpectedly evicted"),
+        };
+
+        *store.shadow_capture.write().unwrap() = None;
+        assert!(matches!(
+            retire_advisory_capture_state(
+                Arc::clone(&store),
+                "retirement-partial".to_string(),
+                Arc::clone(&capture),
+            )
+            .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        {
+            let state = actor.state.lock().await;
+            assert!(
+                state
+                    .handle
+                    .as_ref()
+                    .unwrap()
+                    ._shadow_capture_registration
+                    .is_some(),
+                "a missing selector must not consume the retained registration"
+            );
+        }
+
+        *store.shadow_capture.write().unwrap() = Some(StoreShadowCaptureSelection::for_test(
+            "retirement-substituted",
+            Arc::clone(&capture),
+        ));
+        assert!(matches!(
+            retire_advisory_capture_state(
+                Arc::clone(&store),
+                "retirement-partial".to_string(),
+                Arc::clone(&capture),
+            )
+            .await,
+            Err(EnclaveError::Conflict(_))
+        ));
+        {
+            let selection = store.shadow_capture.read().unwrap();
+            assert!(selection.as_ref().is_some_and(|retained| {
+                retained.user_id == "retirement-substituted"
+                    && Arc::ptr_eq(&retained.capture, &capture)
+            }));
+        }
+        let state = actor.state.lock().await;
+        assert!(
+            state
+                .handle
+                .as_ref()
+                .unwrap()
+                ._shadow_capture_registration
+                .is_some(),
+            "a substituted selector must not consume the retained registration"
+        );
     }
 
     #[tokio::test]

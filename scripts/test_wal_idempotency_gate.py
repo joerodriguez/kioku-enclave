@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 26
-EXPECTED_WORKER_SPAWN_SHA256 = "02cb3f5946af5b08813cb1938b4a8aa5cefd0622e65c8eb3c0d20523fa8e3dbd"
+EXPECTED_WORKER_SPAWN_COUNT = 27
+EXPECTED_WORKER_SPAWN_SHA256 = "62c477284313aa32d6555414e1449eff1997c9762137892cf3de0de530763719"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2200,9 +2200,13 @@ impl X {
         drain_start = executor.index(
             "pub(crate) async fn begin_advisory_capture_drain"
         )
+        retirement_start = executor.index(
+            "pub(crate) async fn retire_advisory_capture"
+        )
         provider_executor = executor[:resume_start]
         local_executor = executor[resume_start:drain_start]
-        drain_executor = executor[drain_start:]
+        drain_executor = executor[drain_start:retirement_start]
+        retirement_executor = executor[retirement_start:]
         self.assertIn("AdvisoryFenceObservation::from_store", executor)
         self.assertIn("AdvisoryFenceAbsence::from_store", executor)
         self.assertEqual(provider_executor.count(".delete_object_generation("), 1)
@@ -2318,6 +2322,66 @@ impl X {
             "std::env::",
         ):
             self.assertNotIn(forbidden, drain_executor)
+        self.assertIn("StoreAdvisoryRetirementContext(())", retirement_executor)
+        self.assertEqual(
+            store_production.count("struct StoreAdvisoryRetirementContext"), 1
+        )
+        self.assertEqual(
+            store_production.count("struct StoreAdvisoryCaptureRetired"), 1
+        )
+        self.assertNotRegex(
+            store_production,
+            r"impl[^{}]{0,160}\bfor\s+StoreAdvisoryCaptureRetired\b",
+        )
+        self.assertIn("authenticate_store_target", retirement_executor)
+        self.assertIn("tokio::spawn(async move", retirement_executor)
+        self.assertLess(
+            retirement_executor.index("authenticate_store_target"),
+            retirement_executor.index("retire_advisory_capture_owned("),
+        )
+        self.assertEqual(
+            retirement_executor.count("async fn retire_advisory_capture_owned("), 1
+        )
+        self.assertLess(
+            retirement_executor.index("retire_advisory_capture_owned("),
+            retirement_executor.index("tokio::spawn(async move"),
+        )
+        self.assertEqual(
+            retirement_executor.count("async fn retire_advisory_capture_state("), 1
+        )
+        self.assertIn("open.status == OpenStatus::Open", retirement_executor)
+        self.assertIn("let registry = store.registry.lock().await", retirement_executor)
+        self.assertIn("drop(registry);\n            return Ok(())", retirement_executor)
+        self.assertLess(
+            retirement_executor.index("let registry = store.registry.lock().await"),
+            retirement_executor.index("let mut selection = store.shadow_capture.write()"),
+        )
+        self.assertIn("actor.state.lock().await", retirement_executor)
+        self.assertIn("_shadow_capture_registration.take()", retirement_executor)
+        self.assertIn("retained.belongs_to(&capture.registry)", retirement_executor)
+        self.assertIn("Arc::ptr_eq(&retained.capture, &capture)", retirement_executor)
+        self.assertIn("*selection = None", retirement_executor)
+        self.assertIn("StoreAdvisoryCaptureRetired(())", retirement_executor)
+        live_take = retirement_executor.index("_shadow_capture_registration.take()")
+        self.assertLess(
+            live_take,
+            retirement_executor.index("*selection = None", live_take),
+        )
+        for forbidden in (
+            ".get_object(",
+            ".delete_object",
+            ".put_object(",
+            "list_",
+            ".with_user(",
+            "open_db(",
+            ".register(",
+            ".commit()",
+            ".settle(",
+            "CapturedWalCommit",
+            "acknowledge_result",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, retirement_executor)
         self.assertIn("struct OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
         self.assertNotIn("pub struct OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
         self.assertEqual(
@@ -2571,12 +2635,28 @@ impl X {
             "reauthenticate_boundary(&self).await?",
             "load_advisory_comparison",
             "settle_advisory_comparison",
+            "retire_advisory_capture(&settlement)",
             "SettledSingleArchiveAdvisoryOwner",
         ):
             self.assertIn(required, settlement_owner)
         self.assertEqual(
-            settlement_owner.count("reauthenticate_boundary(&self).await?"), 2
+            settlement_owner.count("reauthenticate_boundary(&self).await?"), 3
         )
+        first_auth = settlement_owner.index("reauthenticate_boundary(&self).await?")
+        load = settlement_owner.index("load_advisory_comparison")
+        settle = settlement_owner.index("settle_advisory_comparison")
+        second_auth = settlement_owner.index(
+            "reauthenticate_boundary(&self).await?", first_auth + 1
+        )
+        retirement = settlement_owner.index("retire_advisory_capture(&settlement)")
+        third_auth = settlement_owner.index(
+            "reauthenticate_boundary(&self).await?", second_auth + 1
+        )
+        self.assertLess(first_auth, load)
+        self.assertLess(load, settle)
+        self.assertLess(settle, second_auth)
+        self.assertLess(second_auth, retirement)
+        self.assertLess(retirement, third_auth)
         for forbidden in (
             "acknowledge_result",
             "create_if_absent",
@@ -2613,6 +2693,8 @@ impl X {
         self.assertIn("fn from_evidence_for_control", comparison_production)
         self.assertIn("fn from_control", comparison_production)
         self.assertIn("fn control_view", comparison_production)
+        self.assertIn("fn authenticate_store_target", comparison_production)
+        self.assertIn("StoreAdvisoryRetirementContext", comparison_production)
         self.assertNotIn("pub(crate) fn new", comparison_production)
         self.assertNotIn("pub(crate) fn commitment", comparison_production)
         self.assertIn("reauthenticate_boundary(owner).await?", comparison_production)
@@ -2639,6 +2721,12 @@ impl X {
         for active_parent in (main, query, store_production, maintenance_production):
             self.assertNotIn("settle_comparison(", active_parent)
             self.assertNotIn("settle_advisory_comparison(", active_parent)
+        self.assertEqual(
+            advisory_production.count(".retire_advisory_capture(&settlement)"),
+            1,
+        )
+        for active_parent in (main, query, maintenance_production):
+            self.assertNotIn("retire_advisory_capture(", active_parent)
         self.assertEqual(
             maintenance_production.count(
                 ".ensure_advisory_release_absent(operation_id)"

@@ -38,9 +38,10 @@ use crate::archive_v3_shadow::{CapturedWalCommit, ShadowCaptureMetrics, WalCaptu
 use crate::archive_v3_shadow_session::{ShadowAttemptId, ShadowSessionId};
 use crate::archive_v3_wal_owner::{AuthenticatedWalSettlement, WalOwnerContext};
 
-/// The registry deliberately has a small fixed owner count.  A caller must
-/// retire a path registration after closing its SQLite connection rather than
-/// accumulating per-user capture state in the process.
+/// The registry deliberately has a small fixed owner count. Ordinary callers
+/// retire a path registration after closing SQLite. The reviewed inactive
+/// advisory terminal may retire its exact registration in place; callbacks
+/// retain their allocation but become capture-disabled.
 pub const MAX_CAPTURE_REGISTRATIONS: usize = 64;
 /// VFS allocations are retained until process exit so a live SQLite
 /// connection can never dereference freed callbacks after the name is
