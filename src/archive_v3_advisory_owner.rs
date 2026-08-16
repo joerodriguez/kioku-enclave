@@ -11,7 +11,9 @@
 //! from the `WalAuthoritative` publisher. It retains one sealed exact-user
 //! Store target but cannot inspect or operate it, and exposes no capture, root,
 //! object, cipher, acknowledgement, route, task, configuration, or serving
-//! capability.
+//! capability. A separate Control-only release ledger durably orders exact
+//! marker observation, deletion start, and exact-name absence, but no Store
+//! or provider executor invokes it yet.
 
 use std::{fmt, sync::Arc};
 
@@ -34,6 +36,16 @@ use crate::{
 const ADVISORY_OWNER_FORMAT_V1: u16 = 1;
 const ADVISORY_OWNER_LEASE_TICKS: u64 = 300;
 const ADVISORY_OWNER_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/advisory-shadow-owner/v1\0";
+const ADVISORY_RELEASE_FORMAT_V1: u16 = 1;
+const ADVISORY_RELEASE_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/advisory-release/v1\0";
+const ADVISORY_FENCE_AUTHORITY_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-release/fence-authority/v1\0";
+const ADVISORY_FENCE_NAME_DOMAIN: &[u8] = b"kioku/archive-v3/advisory-release/fence-name/v1\0";
+const ADVISORY_FENCE_OBSERVATION_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-release/fence-observation/v1\0";
+const ADVISORY_FENCE_ABSENCE_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-release/fence-absence/v1\0";
+const ADVISORY_FENCE_METADATA: &str = "kioku-identity-rebind-fence-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub(crate) enum AdvisoryOwnerError {
@@ -453,6 +465,717 @@ impl fmt::Debug for BoundAdvisoryOwner {
     }
 }
 
+/// Durable end-of-advisory protocol. `Prepared` freezes the exact advisory
+/// owner binding, `DeleteStarted` records the exact provider-marker generation
+/// before any future delete, and `Released` accepts only a Store-minted exact-
+/// name absence proof. None of these states can call Store or a provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum AdvisoryReleaseStage {
+    Prepared = 1,
+    DeleteStarted = 2,
+    Released = 3,
+}
+
+type AdvisoryReleaseMarkerTuple = (
+    Option<[u8; 32]>,
+    Option<u64>,
+    Option<[u8; 32]>,
+    Option<[u8; 32]>,
+);
+
+type AdvisoryFenceObservationControlView = (
+    ArchiveId,
+    MaintenanceImportOperationId,
+    [u8; 32],
+    [u8; 32],
+    [u8; 32],
+    u64,
+    [u8; 32],
+);
+
+/// Opaque exact release row. It is deliberately non-cloneable: future Store
+/// release work must retain the one authenticated value supplied by Control.
+pub(crate) struct AdvisoryRelease {
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    owner_id: AdvisoryOwnerId,
+    owner_witness: WitnessRecord,
+    owner_revision: u64,
+    owner_commitment: [u8; 32],
+    fence_authority_commitment: [u8; 32],
+    revision: u64,
+    stage: AdvisoryReleaseStage,
+    marker_name_commitment: Option<[u8; 32]>,
+    marker_generation: Option<u64>,
+    marker_observation_commitment: Option<[u8; 32]>,
+    absence_commitment: Option<[u8; 32]>,
+    commitment: [u8; 32],
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct AdvisoryReleaseControlView<'a> {
+    pub(crate) archive_id: ArchiveId,
+    pub(crate) operation_id: MaintenanceImportOperationId,
+    pub(crate) owner_id: AdvisoryOwnerId,
+    pub(crate) owner_witness: &'a WitnessRecord,
+    pub(crate) owner_revision: u64,
+    pub(crate) owner_commitment: [u8; 32],
+    pub(crate) fence_authority_commitment: [u8; 32],
+    pub(crate) revision: u64,
+    pub(crate) stage: AdvisoryReleaseStage,
+    pub(crate) marker_name_commitment: Option<[u8; 32]>,
+    pub(crate) marker_generation: Option<u64>,
+    pub(crate) marker_observation_commitment: Option<[u8; 32]>,
+    pub(crate) absence_commitment: Option<[u8; 32]>,
+    pub(crate) commitment: [u8; 32],
+}
+
+impl AdvisoryRelease {
+    pub(crate) fn prepared_for_control(
+        token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        owner: &BoundAdvisoryOwner,
+        fence_authority: &str,
+    ) -> Result<Self> {
+        if !valid_advisory_fence_authority(fence_authority) {
+            return Err(AdvisoryOwnerError::Corrupt);
+        }
+        let (operation_id, owner_id, _, _, observed, _, owner_revision, owner_commitment) =
+            owner.control_view(token);
+        let archive_id = observed.archive_id();
+        let fence_authority_commitment =
+            advisory_fence_authority_commitment(archive_id, operation_id, fence_authority);
+        let commitment = advisory_release_commitment(
+            archive_id,
+            operation_id,
+            owner_id,
+            observed,
+            owner_revision,
+            owner_commitment,
+            fence_authority_commitment,
+            1,
+            AdvisoryReleaseStage::Prepared,
+            None,
+            None,
+            None,
+            None,
+        );
+        Self::from_control(
+            token,
+            archive_id,
+            operation_id,
+            owner_id,
+            observed.clone(),
+            owner_revision,
+            owner_commitment,
+            fence_authority_commitment,
+            1,
+            AdvisoryReleaseStage::Prepared,
+            (None, None, None, None),
+            commitment,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_control(
+        _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        owner_id: AdvisoryOwnerId,
+        owner_witness: WitnessRecord,
+        owner_revision: u64,
+        owner_commitment: [u8; 32],
+        fence_authority_commitment: [u8; 32],
+        revision: u64,
+        stage: AdvisoryReleaseStage,
+        marker: AdvisoryReleaseMarkerTuple,
+        persisted_commitment: [u8; 32],
+    ) -> Result<Self> {
+        let (
+            marker_name_commitment,
+            marker_generation,
+            marker_observation_commitment,
+            absence_commitment,
+        ) = marker;
+        let valid_stage = match stage {
+            AdvisoryReleaseStage::Prepared => {
+                revision == 1
+                    && marker_name_commitment.is_none()
+                    && marker_generation.is_none()
+                    && marker_observation_commitment.is_none()
+                    && absence_commitment.is_none()
+            }
+            AdvisoryReleaseStage::DeleteStarted => {
+                revision == 2
+                    && marker_name_commitment.is_some()
+                    && marker_generation.is_some_and(|generation| generation > 0)
+                    && marker_observation_commitment.is_some()
+                    && absence_commitment.is_none()
+            }
+            AdvisoryReleaseStage::Released => {
+                revision == 3
+                    && marker_name_commitment.is_some()
+                    && marker_generation.is_some_and(|generation| generation > 0)
+                    && marker_observation_commitment.is_some()
+                    && absence_commitment.is_some()
+            }
+        };
+        if !valid_stage
+            || archive_id != owner_witness.archive_id()
+            || owner_witness.deletion() != DeletionState::Active
+            || owner_witness.migration() != MigrationState::ShadowWal
+            || owner_revision == 0
+            || owner_commitment == [0; 32]
+            || fence_authority_commitment == [0; 32]
+        {
+            return Err(AdvisoryOwnerError::Corrupt);
+        }
+        let prepared_commitment = advisory_release_commitment(
+            archive_id,
+            operation_id,
+            owner_id,
+            &owner_witness,
+            owner_revision,
+            owner_commitment,
+            fence_authority_commitment,
+            1,
+            AdvisoryReleaseStage::Prepared,
+            None,
+            None,
+            None,
+            None,
+        );
+        if let (Some(name), Some(generation), Some(observation)) = (
+            marker_name_commitment,
+            marker_generation,
+            marker_observation_commitment,
+        ) {
+            if observation
+                != advisory_fence_observation_commitment(
+                    archive_id,
+                    operation_id,
+                    prepared_commitment,
+                    fence_authority_commitment,
+                    name,
+                    generation,
+                )
+            {
+                return Err(AdvisoryOwnerError::Corrupt);
+            }
+            if let Some(absence) = absence_commitment {
+                let delete_started_commitment = advisory_release_commitment(
+                    archive_id,
+                    operation_id,
+                    owner_id,
+                    &owner_witness,
+                    owner_revision,
+                    owner_commitment,
+                    fence_authority_commitment,
+                    2,
+                    AdvisoryReleaseStage::DeleteStarted,
+                    Some(name),
+                    Some(generation),
+                    Some(observation),
+                    None,
+                );
+                if absence
+                    != advisory_fence_absence_commitment(
+                        archive_id,
+                        operation_id,
+                        delete_started_commitment,
+                        name,
+                        generation,
+                    )
+                {
+                    return Err(AdvisoryOwnerError::Corrupt);
+                }
+            }
+        }
+        let commitment = advisory_release_commitment(
+            archive_id,
+            operation_id,
+            owner_id,
+            &owner_witness,
+            owner_revision,
+            owner_commitment,
+            fence_authority_commitment,
+            revision,
+            stage,
+            marker_name_commitment,
+            marker_generation,
+            marker_observation_commitment,
+            absence_commitment,
+        );
+        if commitment == [0; 32] || commitment != persisted_commitment {
+            return Err(AdvisoryOwnerError::Corrupt);
+        }
+        Ok(Self {
+            archive_id,
+            operation_id,
+            owner_id,
+            owner_witness,
+            owner_revision,
+            owner_commitment,
+            fence_authority_commitment,
+            revision,
+            stage,
+            marker_name_commitment,
+            marker_generation,
+            marker_observation_commitment,
+            absence_commitment,
+            commitment,
+        })
+    }
+
+    pub(crate) fn delete_started_for_control(
+        &self,
+        token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        observation: &AdvisoryFenceObservation,
+    ) -> Result<Self> {
+        let observation_view = observation.control_view(token);
+        if self.stage != AdvisoryReleaseStage::Prepared
+            || observation_view.0 != self.archive_id
+            || observation_view.1 != self.operation_id
+            || observation_view.2 != self.commitment
+            || observation_view.3 != self.fence_authority_commitment
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let commitment = advisory_release_commitment(
+            self.archive_id,
+            self.operation_id,
+            self.owner_id,
+            &self.owner_witness,
+            self.owner_revision,
+            self.owner_commitment,
+            self.fence_authority_commitment,
+            2,
+            AdvisoryReleaseStage::DeleteStarted,
+            Some(observation_view.4),
+            Some(observation_view.5),
+            Some(observation_view.6),
+            None,
+        );
+        Self::from_control(
+            token,
+            self.archive_id,
+            self.operation_id,
+            self.owner_id,
+            self.owner_witness.clone(),
+            self.owner_revision,
+            self.owner_commitment,
+            self.fence_authority_commitment,
+            2,
+            AdvisoryReleaseStage::DeleteStarted,
+            (
+                Some(observation_view.4),
+                Some(observation_view.5),
+                Some(observation_view.6),
+                None,
+            ),
+            commitment,
+        )
+    }
+
+    pub(crate) fn released_for_control(
+        &self,
+        token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        absence: &AdvisoryFenceAbsence,
+    ) -> Result<Self> {
+        let absence_view = absence.control_view(token);
+        if self.stage != AdvisoryReleaseStage::DeleteStarted
+            || absence_view.0 != self.archive_id
+            || absence_view.1 != self.operation_id
+            || absence_view.2 != self.commitment
+            || Some(absence_view.3) != self.marker_name_commitment
+            || Some(absence_view.4) != self.marker_generation
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let commitment = advisory_release_commitment(
+            self.archive_id,
+            self.operation_id,
+            self.owner_id,
+            &self.owner_witness,
+            self.owner_revision,
+            self.owner_commitment,
+            self.fence_authority_commitment,
+            3,
+            AdvisoryReleaseStage::Released,
+            self.marker_name_commitment,
+            self.marker_generation,
+            self.marker_observation_commitment,
+            Some(absence_view.5),
+        );
+        Self::from_control(
+            token,
+            self.archive_id,
+            self.operation_id,
+            self.owner_id,
+            self.owner_witness.clone(),
+            self.owner_revision,
+            self.owner_commitment,
+            self.fence_authority_commitment,
+            3,
+            AdvisoryReleaseStage::Released,
+            (
+                self.marker_name_commitment,
+                self.marker_generation,
+                self.marker_observation_commitment,
+                Some(absence_view.5),
+            ),
+            commitment,
+        )
+    }
+
+    pub(crate) fn control_view(
+        &self,
+        _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+    ) -> AdvisoryReleaseControlView<'_> {
+        AdvisoryReleaseControlView {
+            archive_id: self.archive_id,
+            operation_id: self.operation_id,
+            owner_id: self.owner_id,
+            owner_witness: &self.owner_witness,
+            owner_revision: self.owner_revision,
+            owner_commitment: self.owner_commitment,
+            fence_authority_commitment: self.fence_authority_commitment,
+            revision: self.revision,
+            stage: self.stage,
+            marker_name_commitment: self.marker_name_commitment,
+            marker_generation: self.marker_generation,
+            marker_observation_commitment: self.marker_observation_commitment,
+            absence_commitment: self.absence_commitment,
+            commitment: self.commitment,
+        }
+    }
+}
+
+impl fmt::Debug for AdvisoryRelease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdvisoryRelease(<opaque>)")
+    }
+}
+
+/// Exact live marker facts. The only production constructor requires Store's
+/// private maintenance token; Control cannot infer or fabricate an observation.
+pub(crate) struct AdvisoryFenceObservation {
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    prepared_release_commitment: [u8; 32],
+    fence_authority_commitment: [u8; 32],
+    marker_name_commitment: [u8; 32],
+    marker_generation: u64,
+    commitment: [u8; 32],
+}
+
+impl AdvisoryFenceObservation {
+    pub(crate) fn from_store(
+        _token: crate::store::StoreMaintenanceContext,
+        prepared: &AdvisoryRelease,
+        marker_name: &str,
+        fence_authority: &str,
+        marker_metadata: &str,
+        marker_generation: i64,
+    ) -> Result<Self> {
+        Self::from_exact_facts(
+            prepared,
+            marker_name,
+            fence_authority,
+            marker_metadata,
+            marker_generation,
+        )
+    }
+
+    fn from_exact_facts(
+        prepared: &AdvisoryRelease,
+        marker_name: &str,
+        fence_authority: &str,
+        marker_metadata: &str,
+        marker_generation: i64,
+    ) -> Result<Self> {
+        if prepared.stage != AdvisoryReleaseStage::Prepared
+            || !crate::store::is_canonical_identity_rebind_fence_object_name(marker_name)
+            || !valid_advisory_fence_authority(fence_authority)
+            || marker_metadata != ADVISORY_FENCE_METADATA
+            || advisory_fence_authority_commitment(
+                prepared.archive_id,
+                prepared.operation_id,
+                fence_authority,
+            ) != prepared.fence_authority_commitment
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let marker_generation = u64::try_from(marker_generation)
+            .ok()
+            .filter(|generation| *generation > 0)
+            .ok_or(AdvisoryOwnerError::Corrupt)?;
+        let marker_name_commitment =
+            advisory_fence_name_commitment(prepared.archive_id, prepared.operation_id, marker_name);
+        let commitment = advisory_fence_observation_commitment(
+            prepared.archive_id,
+            prepared.operation_id,
+            prepared.commitment,
+            prepared.fence_authority_commitment,
+            marker_name_commitment,
+            marker_generation,
+        );
+        Ok(Self {
+            archive_id: prepared.archive_id,
+            operation_id: prepared.operation_id,
+            prepared_release_commitment: prepared.commitment,
+            fence_authority_commitment: prepared.fence_authority_commitment,
+            marker_name_commitment,
+            marker_generation,
+            commitment,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        prepared: &AdvisoryRelease,
+        marker_name: &str,
+        fence_authority: &str,
+        marker_metadata: &str,
+        marker_generation: i64,
+    ) -> Result<Self> {
+        Self::from_exact_facts(
+            prepared,
+            marker_name,
+            fence_authority,
+            marker_metadata,
+            marker_generation,
+        )
+    }
+
+    fn control_view(
+        &self,
+        _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+    ) -> AdvisoryFenceObservationControlView {
+        (
+            self.archive_id,
+            self.operation_id,
+            self.prepared_release_commitment,
+            self.fence_authority_commitment,
+            self.marker_name_commitment,
+            self.marker_generation,
+            self.commitment,
+        )
+    }
+}
+
+impl fmt::Debug for AdvisoryFenceObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdvisoryFenceObservation(<opaque>)")
+    }
+}
+
+/// Exact-name provider absence after the durable deletion marker. Like the
+/// observation, this can be minted in production only inside Store.
+pub(crate) struct AdvisoryFenceAbsence {
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    delete_started_commitment: [u8; 32],
+    marker_name_commitment: [u8; 32],
+    marker_generation: u64,
+    commitment: [u8; 32],
+}
+
+impl AdvisoryFenceAbsence {
+    pub(crate) fn from_store(
+        _token: crate::store::StoreMaintenanceContext,
+        delete_started: &AdvisoryRelease,
+        marker_name: &str,
+    ) -> Result<Self> {
+        Self::from_exact_facts(delete_started, marker_name)
+    }
+
+    fn from_exact_facts(delete_started: &AdvisoryRelease, marker_name: &str) -> Result<Self> {
+        let marker_name_commitment = advisory_fence_name_commitment(
+            delete_started.archive_id,
+            delete_started.operation_id,
+            marker_name,
+        );
+        if delete_started.stage != AdvisoryReleaseStage::DeleteStarted
+            || !crate::store::is_canonical_identity_rebind_fence_object_name(marker_name)
+            || Some(marker_name_commitment) != delete_started.marker_name_commitment
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let marker_generation = delete_started
+            .marker_generation
+            .ok_or(AdvisoryOwnerError::Corrupt)?;
+        let commitment = advisory_fence_absence_commitment(
+            delete_started.archive_id,
+            delete_started.operation_id,
+            delete_started.commitment,
+            marker_name_commitment,
+            marker_generation,
+        );
+        Ok(Self {
+            archive_id: delete_started.archive_id,
+            operation_id: delete_started.operation_id,
+            delete_started_commitment: delete_started.commitment,
+            marker_name_commitment,
+            marker_generation,
+            commitment,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(delete_started: &AdvisoryRelease, marker_name: &str) -> Result<Self> {
+        Self::from_exact_facts(delete_started, marker_name)
+    }
+
+    fn control_view(
+        &self,
+        _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+    ) -> (
+        ArchiveId,
+        MaintenanceImportOperationId,
+        [u8; 32],
+        [u8; 32],
+        u64,
+        [u8; 32],
+    ) {
+        (
+            self.archive_id,
+            self.operation_id,
+            self.delete_started_commitment,
+            self.marker_name_commitment,
+            self.marker_generation,
+            self.commitment,
+        )
+    }
+}
+
+impl fmt::Debug for AdvisoryFenceAbsence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdvisoryFenceAbsence(<opaque>)")
+    }
+}
+
+fn valid_advisory_fence_authority(authority: &str) -> bool {
+    authority.len() == 72
+        && authority.starts_with("archive_")
+        && authority[8..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn advisory_fence_authority_commitment(
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    authority: &str,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_FENCE_AUTHORITY_DOMAIN);
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update((authority.len() as u32).to_be_bytes());
+    hasher.update(authority.as_bytes());
+    hasher.finalize().into()
+}
+
+fn advisory_fence_name_commitment(
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    marker_name: &str,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_FENCE_NAME_DOMAIN);
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update((marker_name.len() as u32).to_be_bytes());
+    hasher.update(marker_name.as_bytes());
+    hasher.finalize().into()
+}
+
+fn advisory_fence_observation_commitment(
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    prepared_release_commitment: [u8; 32],
+    fence_authority_commitment: [u8; 32],
+    marker_name_commitment: [u8; 32],
+    marker_generation: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_FENCE_OBSERVATION_DOMAIN);
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(prepared_release_commitment);
+    hasher.update(fence_authority_commitment);
+    hasher.update(marker_name_commitment);
+    hasher.update(marker_generation.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn advisory_fence_absence_commitment(
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    delete_started_commitment: [u8; 32],
+    marker_name_commitment: [u8; 32],
+    marker_generation: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_FENCE_ABSENCE_DOMAIN);
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(delete_started_commitment);
+    hasher.update(marker_name_commitment);
+    hasher.update(marker_generation.to_be_bytes());
+    hasher.finalize().into()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advisory_release_commitment(
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    owner_id: AdvisoryOwnerId,
+    owner_witness: &WitnessRecord,
+    owner_revision: u64,
+    owner_commitment: [u8; 32],
+    fence_authority_commitment: [u8; 32],
+    revision: u64,
+    stage: AdvisoryReleaseStage,
+    marker_name_commitment: Option<[u8; 32]>,
+    marker_generation: Option<u64>,
+    marker_observation_commitment: Option<[u8; 32]>,
+    absence_commitment: Option<[u8; 32]>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_RELEASE_COMMITMENT_DOMAIN);
+    hasher.update(ADVISORY_RELEASE_FORMAT_V1.to_be_bytes());
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(owner_id.as_bytes());
+    hasher.update(owner_witness.encode());
+    hasher.update(owner_revision.to_be_bytes());
+    hasher.update(owner_commitment);
+    hasher.update(fence_authority_commitment);
+    hasher.update(revision.to_be_bytes());
+    hasher.update([stage as u8]);
+    for commitment in [
+        marker_name_commitment,
+        marker_observation_commitment,
+        absence_commitment,
+    ] {
+        if let Some(commitment) = commitment {
+            hasher.update([1]);
+            hasher.update(commitment);
+        } else {
+            hasher.update([0]);
+        }
+    }
+    if let Some(generation) = marker_generation {
+        hasher.update([1]);
+        hasher.update(generation.to_be_bytes());
+    } else {
+        hasher.update([0]);
+    }
+    hasher.finalize().into()
+}
+
 fn advisory_owner_commitment(
     operation_id: MaintenanceImportOperationId,
     owner_id: AdvisoryOwnerId,
@@ -528,6 +1251,32 @@ pub(crate) trait AdvisoryOwnerControl: Send + Sync {
         observed: &WitnessRecord,
         lease: WitnessLease,
     ) -> Result<BoundAdvisoryOwner>;
+
+    async fn prepare_advisory_release(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+    ) -> Result<AdvisoryRelease>;
+
+    async fn load_advisory_release(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+    ) -> Result<Option<AdvisoryRelease>>;
+
+    async fn mark_advisory_fence_delete_started(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        prepared: &AdvisoryRelease,
+        observation: &AdvisoryFenceObservation,
+    ) -> Result<AdvisoryRelease>;
+
+    async fn mark_advisory_fence_released(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        delete_started: &AdvisoryRelease,
+        absence: &AdvisoryFenceAbsence,
+    ) -> Result<AdvisoryRelease>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

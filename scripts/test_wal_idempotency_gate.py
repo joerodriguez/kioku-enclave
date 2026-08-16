@@ -15,10 +15,10 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 EXPECTED_STORE_CALL_COUNT = 151
 EXPECTED_STORE_CALL_SHA256 = "b558be76d3a94f57c0f96ba2658570c94d84f939283447100be370d433ac0d82"
 EXPECTED_STORE_SURFACE_COUNT = 15
-EXPECTED_STORE_SURFACE_SHA256 = "7366cedbcd4910c69eb899bf5660373207df14879ed02ec9eeb15ec004082df0"
+EXPECTED_STORE_SURFACE_SHA256 = "b6daaf17ce2e20d4d3c4364d9dd8021fbec9237063ffacab79b5697be7247c0f"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
-        "src/main.rs::main#0::Store::new_with_media_and_legacy#0",
+        "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
         "src/store.rs::new#2::Self::new_internal#0",
         "src/store.rs::new#2::factory_definition::new#0",
         "src/store.rs::new_internal#0::Self::new_internal_with_max_open#0",
@@ -54,7 +54,7 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     }
 )
 EXPECTED_WORKER_SPAWN_COUNT = 25
-EXPECTED_WORKER_SPAWN_SHA256 = "d2439295f115e106dccdc8f34d1d790a8066bece8942d8788e507c35259915c8"
+EXPECTED_WORKER_SPAWN_SHA256 = "f1006252cba4a4dbf27519bb3c0f16f8e96b53616d3d577d7679b99f6f9ad989"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2042,6 +2042,7 @@ impl X {
             encoding="utf-8"
         )
         witness = (ROOT / "src/archive_v3_witness.rs").read_text(encoding="utf-8")
+        control = (ROOT / "src/cp/control_store.rs").read_text(encoding="utf-8")
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
         self.assertNotIn("archive_v3_advisory_owner::", main)
@@ -2092,6 +2093,20 @@ impl X {
         self.assertIn("struct StoreAdvisoryCaptureTarget", store_production)
         self.assertNotIn("impl StoreAdvisoryCaptureTarget", store_production)
         self.assertNotIn("exact_identity_for_test", store_production)
+        self.assertIn("struct AdvisoryRelease", advisory_production)
+        self.assertIn("AdvisoryReleaseStage::Prepared", advisory_production)
+        self.assertIn("AdvisoryReleaseStage::DeleteStarted", advisory_production)
+        self.assertIn("AdvisoryReleaseStage::Released", advisory_production)
+        self.assertIn(
+            "_token: crate::store::StoreMaintenanceContext",
+            advisory_production,
+        )
+        self.assertIn("CREATE TABLE IF NOT EXISTS archive_v3_advisory_releases", control)
+        self.assertIn(
+            "advisory release permanently fenced lease advancement", control
+        )
+        self.assertNotIn("AdvisoryFenceObservation::from_store", store_production)
+        self.assertNotIn("AdvisoryFenceAbsence::from_store", store_production)
         for forbidden in (
             "StoreShadowCapture",
             ".with_user(",
@@ -2102,6 +2117,9 @@ impl X {
             "create_if_absent(",
             "list_objects",
             "delete_exact",
+            "delete_object(",
+            "delete_object_generation(",
+            "identity_write_fence_authority(",
             "tokio::spawn",
             "std::env::",
             "acknowledge_result(",

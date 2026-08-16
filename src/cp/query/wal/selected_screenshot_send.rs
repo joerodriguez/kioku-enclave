@@ -1410,7 +1410,11 @@ mod tests {
                  AFTER INSERT ON archive_v3_wal_selected_screenshot_send_started
                  BEGIN
                    UPDATE archive_v3_wal_selected_screenshot_send_started
-                   SET send_request_id=replace(send_request_id,'a','b')
+                   SET send_request_id=
+                       CASE substr(send_request_id,1,1)
+                         WHEN 'a' THEN 'b' || substr(send_request_id,2)
+                         ELSE 'a' || substr(send_request_id,2)
+                       END
                    WHERE operation_id=NEW.operation_id;
                  END;",
             )
