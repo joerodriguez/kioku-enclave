@@ -23,14 +23,19 @@
 //! result into a one-shot Control terminal, never a Store drain or user result.
 //! A separate resumed-only abort child records Control intent before exact
 //! capture retirement and finalizes only from the opaque retirement proof.
-//! Earlier abort loci and restart recovery of an unfinished abort remain
-//! intentionally absent, so this module is still not a production controller.
+//! Earlier abort loci remain intentionally absent. A separate private worker
+//! can reconcile an unfinished resumed abort only from exact Control state and
+//! read-only absence on the controller-owned Store; neither path is wired.
 
 mod abort;
+mod abort_reconcile;
 mod canary;
 mod canary_trust;
 mod comparison;
-pub(crate) use abort::{AdvisoryAbortReason, AdvisoryAbortStage, AdvisoryAbortTerminal};
+pub(crate) use abort::{
+    AdvisoryAbortReason, AdvisoryAbortRecoveryState, AdvisoryAbortStage, AdvisoryAbortTerminal,
+    PreparedAdvisoryAbortRecovery,
+};
 pub(crate) use canary::AdvisoryCanaryScope;
 #[allow(
     unused_imports,
@@ -1387,11 +1392,24 @@ pub(crate) trait AdvisoryOwnerControl: Send + Sync {
         release: &AdvisoryRelease,
     ) -> Result<Option<AdvisoryAbortTerminal>>;
 
+    async fn load_advisory_abort_recovery(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        operation_id: crate::archive_v3_maintenance_import::MaintenanceImportOperationId,
+    ) -> Result<Option<AdvisoryAbortRecoveryState>>;
+
     async fn finalize_advisory_abort(
         &self,
         token: AdvisoryOwnerRuntimeContext,
         prepared: &AdvisoryAbortTerminal,
         retired: &crate::store::StoreAdvisoryCaptureRetired,
+    ) -> Result<AdvisoryAbortTerminal>;
+
+    async fn finalize_advisory_abort_recovery(
+        &self,
+        token: AdvisoryOwnerRuntimeContext,
+        recovery: &PreparedAdvisoryAbortRecovery,
+        absence: &crate::store::StorePreparedAdvisoryAbortAbsent,
     ) -> Result<AdvisoryAbortTerminal>;
 }
 
@@ -2270,6 +2288,42 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
             .map(AbortedAdvisoryOwnerTestHandle)
     }
 
+    pub(crate) async fn prepare_abort_for_restart_test(
+        self,
+        reason: AdvisoryAbortReason,
+    ) -> Result<()> {
+        comparison::reauthenticate_boundary(&self.0).await?;
+        let retained = self
+            .0
+            ._owner
+            ._control
+            .load_advisory_abort(
+                AdvisoryOwnerRuntimeContext(()),
+                &self.0._owner._bound,
+                &self.0._release,
+            )
+            .await?;
+        let prepared = match retained {
+            Some(retained) => retained,
+            None => {
+                self.0
+                    ._owner
+                    ._control
+                    .prepare_advisory_abort(
+                        AdvisoryOwnerRuntimeContext(()),
+                        &self.0._owner._bound,
+                        &self.0._release,
+                        reason,
+                    )
+                    .await?
+            }
+        };
+        if prepared.stage() != AdvisoryAbortStage::Prepared || prepared.reason() != reason {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn abort_with_started_for_test(
         self,
         reason: AdvisoryAbortReason,
@@ -2281,6 +2335,74 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
             .map_err(|_| AdvisoryOwnerError::Publication)?
             .map(AbortedAdvisoryOwnerTestHandle)
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn reconcile_prepared_abort_for_test(
+    control: Arc<crate::cp::control_store::ControlStore>,
+    store: Arc<crate::store::Store>,
+    operation_id: crate::archive_v3_maintenance_import::MaintenanceImportOperationId,
+) -> Result<AdvisoryAbortStage> {
+    let control: Arc<dyn AdvisoryOwnerControl> = control;
+    abort_reconcile::reconcile_prepared_abort(control, store, operation_id)
+        .await
+        .map(|terminal| terminal.stage())
+}
+
+#[cfg(test)]
+pub(crate) async fn prove_prepared_abort_absence_for_test(
+    control: Arc<crate::cp::control_store::ControlStore>,
+    store: Arc<crate::store::Store>,
+    operation_id: crate::archive_v3_maintenance_import::MaintenanceImportOperationId,
+) -> Result<()> {
+    let recovery = control
+        .load_advisory_abort_recovery(AdvisoryOwnerRuntimeContext(()), operation_id)
+        .await?
+        .ok_or(AdvisoryOwnerError::Conflict)?;
+    let AdvisoryAbortRecoveryState::Prepared(recovery) = recovery else {
+        return Err(AdvisoryOwnerError::Conflict);
+    };
+    store
+        .prove_prepared_advisory_abort_local_absence(&recovery)
+        .await
+        .map(|_| ())
+        .map_err(map_advisory_store_error)
+}
+
+#[cfg(test)]
+pub(crate) async fn finalize_prepared_abort_recovery_once_for_test(
+    control: Arc<crate::cp::control_store::ControlStore>,
+    store: Arc<crate::store::Store>,
+    operation_id: crate::archive_v3_maintenance_import::MaintenanceImportOperationId,
+) -> Result<AdvisoryAbortStage> {
+    let recovery = control
+        .load_advisory_abort_recovery(AdvisoryOwnerRuntimeContext(()), operation_id)
+        .await?
+        .ok_or(AdvisoryOwnerError::Conflict)?;
+    let AdvisoryAbortRecoveryState::Prepared(recovery) = recovery else {
+        return Err(AdvisoryOwnerError::Conflict);
+    };
+    let absence = store
+        .prove_prepared_advisory_abort_local_absence(&recovery)
+        .await
+        .map_err(map_advisory_store_error)?;
+    control
+        .finalize_advisory_abort_recovery(AdvisoryOwnerRuntimeContext(()), &recovery, &absence)
+        .await
+        .map(|terminal| terminal.stage())
+}
+
+#[cfg(test)]
+pub(crate) async fn reconcile_prepared_abort_with_started_for_test(
+    control: Arc<crate::cp::control_store::ControlStore>,
+    store: Arc<crate::store::Store>,
+    operation_id: crate::archive_v3_maintenance_import::MaintenanceImportOperationId,
+    started: Arc<tokio::sync::Semaphore>,
+) -> Result<AdvisoryAbortStage> {
+    let control: Arc<dyn AdvisoryOwnerControl> = control;
+    abort_reconcile::reconcile_prepared_abort_with_started(control, store, operation_id, started)
+        .await
+        .map(|terminal| terminal.stage())
 }
 
 #[cfg(test)]

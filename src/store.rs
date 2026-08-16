@@ -694,6 +694,18 @@ pub(crate) struct StoreAdvisoryCaptureRetired {
     operation_id: MaintenanceImportOperationId,
 }
 
+/// Opaque proof that the controller-owned Store has no process-local capture
+/// state for one exact retained Prepared abort. The per-user lifecycle guard
+/// stays owned until Control either finalizes or rejects the proof.
+pub(crate) struct StorePreparedAdvisoryAbortAbsent {
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    prepared_commitment: [u8; 32],
+    user_commitment: [u8; 32],
+    commitment: [u8; 32],
+    _lifecycle_guard: OwnedMutexGuard<()>,
+}
+
 impl StoreAdvisoryCaptureRetired {
     pub(crate) fn commitment_for_advisory_abort(
         &self,
@@ -712,6 +724,57 @@ impl StoreAdvisoryCaptureRetired {
         hasher.update(operation_id.as_bytes());
         Ok(hasher.finalize().into())
     }
+}
+
+impl StorePreparedAdvisoryAbortAbsent {
+    pub(crate) fn commitment_for_advisory_abort_recovery(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryAbortContext,
+        recovery: &crate::archive_v3_advisory_owner::PreparedAdvisoryAbortRecovery,
+    ) -> Result<[u8; 32]> {
+        let view = recovery.store_view(StoreAdvisoryRetirementContext(()));
+        let user_commitment = advisory_abort_absent_user_commitment(view.user_id);
+        let expected = advisory_abort_absent_commitment(
+            view.archive_id,
+            view.operation_id,
+            recovery.prepared_commitment(),
+            user_commitment,
+        );
+        if self.archive_id != view.archive_id
+            || self.operation_id != view.operation_id
+            || self.prepared_commitment != recovery.prepared_commitment()
+            || self.user_commitment != user_commitment
+            || self.commitment != expected
+        {
+            return Err(EnclaveError::Conflict(
+                "advisory abort absence proof changed".into(),
+            ));
+        }
+        Ok(self.commitment)
+    }
+}
+
+fn advisory_abort_absent_user_commitment(user_id: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku/archive-v3/advisory-abort-absent-user/v1\0");
+    hasher.update((user_id.len() as u64).to_be_bytes());
+    hasher.update(user_id.as_bytes());
+    hasher.finalize().into()
+}
+
+fn advisory_abort_absent_commitment(
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    prepared_commitment: [u8; 32],
+    user_commitment: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku/archive-v3/advisory-abort-local-absence/v1\0");
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(prepared_commitment);
+    hasher.update(user_commitment);
+    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -2228,6 +2291,129 @@ impl StoreAdvisoryResumedTarget {
             self._operation_id,
         )
         .await
+    }
+}
+
+impl Store {
+    /// Prove only process-local absence for an exact retained Prepared abort.
+    /// This path never clears a selector, takes a registration, opens a user,
+    /// or changes either admission gate. A live capture must use the original
+    /// owner-held retirement path instead.
+    pub(crate) async fn prove_prepared_advisory_abort_local_absence(
+        self: &Arc<Self>,
+        recovery: &crate::archive_v3_advisory_owner::PreparedAdvisoryAbortRecovery,
+    ) -> Result<StorePreparedAdvisoryAbortAbsent> {
+        let view = recovery.store_view(StoreAdvisoryRetirementContext(()));
+        self.prove_prepared_advisory_abort_local_absence_target(
+            view.user_id.to_owned(),
+            view.archive_id,
+            view.operation_id,
+            recovery.prepared_commitment(),
+        )
+        .await
+    }
+
+    async fn prove_prepared_advisory_abort_local_absence_target(
+        self: &Arc<Self>,
+        user_id: UserId,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        prepared_commitment: [u8; 32],
+    ) -> Result<StorePreparedAdvisoryAbortAbsent> {
+        validate_user_id(&user_id)?;
+        if prepared_commitment == [0; 32] {
+            return Err(EnclaveError::Conflict(
+                "prepared advisory abort commitment is invalid".into(),
+            ));
+        }
+        let lifecycle_guard = self.lock_user_lifecycle(&user_id).await?;
+
+        let actor = {
+            let registry = self.registry.lock().await;
+            let barrier = self
+                .content_write_barrier
+                .state
+                .lock()
+                .expect("content barrier poisoned");
+            let selection = self.shadow_capture.read().map_err(|_| {
+                EnclaveError::Store("advisory capture selection unavailable".into())
+            })?;
+            if registry.blocked_users.contains(&user_id)
+                || barrier.blocked_users.contains(&user_id)
+                || barrier.active_writes.get(&user_id).copied().unwrap_or(0) != 0
+                || selection.is_some()
+            {
+                return Err(EnclaveError::Conflict(
+                    "prepared advisory abort local state is not absent".into(),
+                ));
+            }
+            match registry.open_users.get(&user_id) {
+                Some(open) if open.status == OpenStatus::Open => Some(Arc::clone(&open.actor)),
+                Some(_) => {
+                    return Err(EnclaveError::Conflict(
+                        "prepared advisory abort handle is changing".into(),
+                    ))
+                }
+                None => None,
+            }
+        };
+
+        if let Some(actor) = actor.as_ref() {
+            let state = actor.state.lock().await;
+            let handle = state.handle.as_ref().ok_or_else(|| {
+                EnclaveError::Conflict("prepared advisory abort handle disappeared".into())
+            })?;
+            if handle.user_id != user_id || handle._shadow_capture_registration.is_some() {
+                return Err(EnclaveError::Conflict(
+                    "prepared advisory abort registration is not absent".into(),
+                ));
+            }
+        }
+
+        let registry = self.registry.lock().await;
+        let barrier = self
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        let selection = self
+            .shadow_capture
+            .read()
+            .map_err(|_| EnclaveError::Store("advisory capture selection unavailable".into()))?;
+        if registry.blocked_users.contains(&user_id)
+            || barrier.blocked_users.contains(&user_id)
+            || barrier.active_writes.get(&user_id).copied().unwrap_or(0) != 0
+            || selection.is_some()
+            || match (actor.as_ref(), registry.open_users.get(&user_id)) {
+                (None, None) => false,
+                (Some(expected), Some(open)) => {
+                    open.status != OpenStatus::Open || !Arc::ptr_eq(expected, &open.actor)
+                }
+                _ => true,
+            }
+        {
+            return Err(EnclaveError::Conflict(
+                "prepared advisory abort local state changed".into(),
+            ));
+        }
+        let user_commitment = advisory_abort_absent_user_commitment(&user_id);
+        let commitment = advisory_abort_absent_commitment(
+            archive_id,
+            operation_id,
+            prepared_commitment,
+            user_commitment,
+        );
+        drop(selection);
+        drop(barrier);
+        drop(registry);
+        Ok(StorePreparedAdvisoryAbortAbsent {
+            archive_id,
+            operation_id,
+            prepared_commitment,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: lifecycle_guard,
+        })
     }
 }
 
@@ -12524,6 +12710,214 @@ pub(crate) mod tests {
         )
         .await
         .expect("exact absence after eviction must reconcile");
+    }
+
+    #[tokio::test]
+    async fn prepared_abort_absence_is_read_only_exact_and_lifecycle_held() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), gcs));
+        let user_id = "prepared-abort-absence".to_string();
+        let archive_id = crate::archive_v3::ArchiveId::from_bytes([0x73; 16]);
+        let operation_id = MaintenanceImportOperationId::from_control(
+            crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+            [0x74; 16],
+        )
+        .unwrap();
+
+        let proof = store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .unwrap();
+        let waiter = tokio::spawn({
+            let store = Arc::clone(&store);
+            let user_id = user_id.clone();
+            async move { store.lock_user_lifecycle(&user_id).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(proof);
+        waiter.await.unwrap().unwrap();
+
+        store.with_user(&user_id, |_| Ok(())).await.unwrap();
+        let proof = store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .unwrap();
+        drop(proof);
+
+        let active_write = store.acquire_content_write(&user_id).await.unwrap();
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .is_err());
+        drop(active_write);
+
+        store
+            .registry
+            .lock()
+            .await
+            .blocked_users
+            .insert(user_id.clone());
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .is_err());
+        store.registry.lock().await.blocked_users.remove(&user_id);
+
+        {
+            let mut barrier = store
+                .content_write_barrier
+                .state
+                .lock()
+                .expect("content barrier poisoned");
+            barrier.blocked_users.insert(user_id.clone());
+        }
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .is_err());
+        store
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned")
+            .blocked_users
+            .remove(&user_id);
+
+        {
+            let mut registry = store.registry.lock().await;
+            registry.open_users.get_mut(&user_id).unwrap().status = OpenStatus::Evicting;
+        }
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .is_err());
+        store
+            .registry
+            .lock()
+            .await
+            .open_users
+            .get_mut(&user_id)
+            .unwrap()
+            .status = OpenStatus::Open;
+
+        let capture = StoreShadowCapture::shared_for_test();
+        *store.shadow_capture.write().unwrap() = Some(StoreShadowCaptureSelection::for_test(
+            &user_id,
+            Arc::clone(&capture),
+        ));
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .is_err());
+        *store.shadow_capture.write().unwrap() = None;
+
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                user_id.clone(),
+                archive_id,
+                operation_id,
+                [0; 32],
+            )
+            .await
+            .is_err());
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                "../invalid".to_string(),
+                archive_id,
+                operation_id,
+                [0x75; 32],
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn prepared_abort_absence_rejects_registration_without_selector() {
+        let capture = StoreShadowCapture::shared_for_test();
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new_internal_with_max_open_and_shadow_capture(
+            Arc::new(FakeKms),
+            gcs.clone(),
+            gcs.clone(),
+            gcs,
+            1,
+            Some(StoreShadowCaptureSelection::for_test(
+                "prepared-abort-partial",
+                Arc::clone(&capture),
+            )),
+        ));
+        store
+            .with_user("prepared-abort-partial", |_| Ok(()))
+            .await
+            .unwrap();
+        *store.shadow_capture.write().unwrap() = None;
+        let operation_id = MaintenanceImportOperationId::from_control(
+            crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+            [0x76; 16],
+        )
+        .unwrap();
+        assert!(store
+            .prove_prepared_advisory_abort_local_absence_target(
+                "prepared-abort-partial".to_string(),
+                crate::archive_v3::ArchiveId::from_bytes([0x77; 16]),
+                operation_id,
+                [0x78; 32],
+            )
+            .await
+            .is_err());
+        let actor = match store
+            .actor_for_existing("prepared-abort-partial")
+            .await
+            .unwrap()
+        {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("capture handle unexpectedly evicted"),
+        };
+        assert!(actor
+            .state
+            .lock()
+            .await
+            .handle
+            .as_ref()
+            .unwrap()
+            ._shadow_capture_registration
+            .is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

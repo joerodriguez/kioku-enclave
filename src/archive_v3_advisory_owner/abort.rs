@@ -3,16 +3,18 @@
 //! This first abort slice deliberately covers only the state in which the
 //! exact legacy Store admission gates have already reopened with advisory WAL
 //! capture installed. Control records `Prepared` before Store retirement, and
-//! records `Aborted` only after an opaque exact-target retirement proof. The
-//! terminal is mutually exclusive with successful comparison settlement and
+//! records `Aborted` only after either an opaque exact-target retirement proof
+//! or the distinct restart-only proof that the exact local capture state is
+//! absent while its user lifecycle remains held. The terminal is mutually
+//! exclusive with successful comparison settlement and
 //! grants no provider, acknowledgement, database, launcher, list, or delete
 //! authority.
 
 use sha2::{Digest, Sha256};
 
 use super::{
-    AdvisoryAbortContext, AdvisoryOwnerError, AdvisoryRelease, AdvisoryReleaseStage,
-    BoundAdvisoryOwner, Result,
+    AdvisoryAbortContext, AdvisoryOwnerError, AdvisoryOwnerRuntimeContext, AdvisoryRelease,
+    AdvisoryReleaseStage, BoundAdvisoryOwner, Result,
 };
 
 const ADVISORY_ABORT_COMMITMENT_DOMAIN: &[u8] = b"kioku/archive-v3/advisory-resumed-abort/v1\0";
@@ -78,6 +80,25 @@ pub(crate) struct AdvisoryAbortTerminal {
     stage: AdvisoryAbortStage,
     retirement_commitment: Option<[u8; 32]>,
     commitment: [u8; 32],
+}
+
+/// Opaque restart capability reconstructed only by encrypted Control after it
+/// authenticates the complete retained abort/release/owner/import chain. The
+/// private user identity is visible only through Store's retirement token.
+pub(crate) struct PreparedAdvisoryAbortRecovery {
+    user_id: String,
+    terminal: AdvisoryAbortTerminal,
+}
+
+pub(crate) enum AdvisoryAbortRecoveryState {
+    Prepared(PreparedAdvisoryAbortRecovery),
+    Aborted(AdvisoryAbortTerminal),
+}
+
+pub(crate) struct AdvisoryAbortRecoveryStoreView<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) archive_id: crate::archive_v3::ArchiveId,
+    pub(crate) operation_id: crate::archive_v3_maintenance_import::MaintenanceImportOperationId,
 }
 
 pub(crate) struct AdvisoryAbortControlView<'a> {
@@ -195,6 +216,48 @@ impl AdvisoryAbortTerminal {
         )
     }
 
+    pub(crate) fn aborted_from_recovery_for_control(
+        token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        recovery: &PreparedAdvisoryAbortRecovery,
+        absence: &crate::store::StorePreparedAdvisoryAbortAbsent,
+    ) -> Result<Self> {
+        let prepared = recovery.terminal(AdvisoryOwnerRuntimeContext(()));
+        if prepared.stage != AdvisoryAbortStage::Prepared
+            || prepared.retirement_commitment.is_some()
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let retirement_commitment = absence
+            .commitment_for_advisory_abort_recovery(AdvisoryAbortContext(()), recovery)
+            .map_err(|_| AdvisoryOwnerError::Conflict)?;
+        let commitment = advisory_abort_commitment(
+            prepared.archive_id,
+            prepared.operation_id,
+            prepared.owner_id,
+            &prepared.owner_witness,
+            prepared.owner_revision,
+            prepared.owner_commitment,
+            prepared.release_commitment,
+            prepared.reason,
+            AdvisoryAbortStage::Aborted,
+            Some(retirement_commitment),
+        );
+        Self::from_control(
+            token,
+            prepared.archive_id,
+            prepared.operation_id,
+            prepared.owner_id,
+            prepared.owner_witness.clone(),
+            prepared.owner_revision,
+            prepared.owner_commitment,
+            prepared.release_commitment,
+            prepared.reason,
+            AdvisoryAbortStage::Aborted,
+            Some(retirement_commitment),
+            commitment,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_control(
         _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
@@ -281,6 +344,49 @@ impl AdvisoryAbortTerminal {
             return Err(AdvisoryOwnerError::Conflict);
         }
         Ok(())
+    }
+}
+
+impl PreparedAdvisoryAbortRecovery {
+    pub(crate) fn from_control(
+        _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        user_id: String,
+        terminal: AdvisoryAbortTerminal,
+    ) -> Result<Self> {
+        crate::store::validate_user_id(&user_id).map_err(|_| AdvisoryOwnerError::Corrupt)?;
+        if terminal.stage != AdvisoryAbortStage::Prepared {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        Ok(Self { user_id, terminal })
+    }
+
+    pub(crate) fn store_view(
+        &self,
+        _token: crate::store::StoreAdvisoryRetirementContext,
+    ) -> AdvisoryAbortRecoveryStoreView<'_> {
+        AdvisoryAbortRecoveryStoreView {
+            user_id: &self.user_id,
+            archive_id: self.terminal.archive_id,
+            operation_id: self.terminal.operation_id,
+        }
+    }
+
+    pub(crate) const fn prepared_commitment(&self) -> [u8; 32] {
+        self.terminal.commitment
+    }
+
+    pub(crate) const fn terminal(
+        &self,
+        _token: super::AdvisoryOwnerRuntimeContext,
+    ) -> &AdvisoryAbortTerminal {
+        &self.terminal
+    }
+
+    pub(crate) const fn terminal_for_control(
+        &self,
+        _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+    ) -> &AdvisoryAbortTerminal {
+        &self.terminal
     }
 }
 
