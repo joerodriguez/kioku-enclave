@@ -2115,10 +2115,13 @@ impl X {
             "struct ReleasedSingleArchiveAdvisoryOwner", advisory_production
         )
         self.assertIn(
+            "struct LocallyResumedSingleArchiveAdvisoryOwner", advisory_production
+        )
+        self.assertIn(
             ".acquire_advisory_release_lifecycle()", advisory_production
         )
         self.assertIn(
-            "_release_lifecycle_guard: tokio::sync::OwnedMutexGuard<()>",
+            "_release_lifecycle_guard: crate::store::StoreAdvisoryReleaseLifecycle",
             advisory_production,
         )
         self.assertIn(".observe_advisory_fence(&release)", advisory_production)
@@ -2132,19 +2135,64 @@ impl X {
         release_method = advisory_production[release_start:release_end]
         self.assertIn("read_advisory_owner_current_exact", release_method)
         self.assertIn("current != *self._bound.observed()", release_method)
+        self.assertIn(
+            "async fn resume_local_admission(self)", advisory_production
+        )
+        self.assertNotIn(
+            "pub(crate) async fn resume_local_admission", advisory_production
+        )
+        local_start = advisory_production.index(
+            "async fn resume_local_admission(self)"
+        )
+        local_end = advisory_production.index(
+            "fn map_advisory_store_error", local_start
+        )
+        local_owner = advisory_production[local_start:local_end]
+        self.assertIn("read_advisory_owner_current_exact", local_owner)
+        self.assertIn("current != *owner._bound.observed()", local_owner)
+        self.assertIn("load_advisory_release", local_owner)
+        self.assertIn("retained != release", local_owner)
+        self.assertIn(".resume_advisory_local_admission", local_owner)
         executor_start = store_production.index("impl StoreAdvisoryCaptureTarget")
         executor_end = store_production.index(
             "impl Drop for PinnedLegacySnapshot", executor_start
         )
         executor = store_production[executor_start:executor_end]
+        resume_start = executor.index(
+            "pub(crate) async fn resume_advisory_local_admission"
+        )
+        provider_executor = executor[:resume_start]
+        local_executor = executor[resume_start:]
         self.assertIn("AdvisoryFenceObservation::from_store", executor)
         self.assertIn("AdvisoryFenceAbsence::from_store", executor)
-        self.assertEqual(executor.count(".delete_object_generation("), 1)
-        self.assertEqual(executor.count(".get_object(&marker_name)"), 3)
+        self.assertEqual(provider_executor.count(".delete_object_generation("), 1)
+        self.assertEqual(provider_executor.count(".get_object(&marker_name)"), 3)
         self.assertIn("AdvisoryReleaseStoreStage::Prepared", executor)
         self.assertIn("AdvisoryReleaseStoreStage::DeleteStarted", executor)
         self.assertIn("identity_rebind_fence_object_name", executor)
         self.assertIn("fn acquire_advisory_release_lifecycle", executor)
+        self.assertIn("AdvisoryReleaseStoreStage::Released", local_executor)
+        self.assertIn("let mut registry = self._store.registry.lock().await", local_executor)
+        self.assertIn("let mut barrier = self", local_executor)
+        self.assertIn("registry_blocked != content_blocked", local_executor)
+        self.assertIn("registry.open_users.contains_key", local_executor)
+        self.assertIn(".active_writes", local_executor)
+        self.assertEqual(local_executor.count("blocked_users.remove"), 2)
+        self.assertIn("StoreAdvisoryResumedTarget", local_executor)
+        for forbidden in (
+            ".get_object(",
+            ".delete_object",
+            ".put_object(",
+            "list_",
+            ".with_user(",
+            "CaptureRegistration",
+            "CaptureRegistry",
+            "StoreShadowCapture",
+            "acknowledge_result",
+            "tokio::spawn",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, local_executor)
         self.assertEqual(
             maintenance_production.count(
                 ".ensure_advisory_release_absent(operation_id)"
@@ -2154,6 +2202,18 @@ impl X {
         self.assertIn(
             "advisory release permanently fenced maintenance re-entry", control
         )
+        run_start = maintenance_production.index("async fn run_owned(")
+        run_end = maintenance_production.index(
+            "fn from_terminal(", run_start
+        )
+        run_owned = maintenance_production[run_start:run_end]
+        admission = run_owned.index(".acquire_archive_maintenance_admission(")
+        final_release_check = run_owned.index(
+            ".ensure_advisory_release_absent(operation_id)", admission
+        )
+        close_admission = run_owned.index("admission.begin().await", admission)
+        self.assertLess(admission, final_release_check)
+        self.assertLess(final_release_check, close_admission)
         for forbidden in (
             "list_",
             ".delete_object(",
@@ -2169,7 +2229,7 @@ impl X {
             "std::env::",
             "acknowledge_result",
         ):
-            self.assertNotIn(forbidden, executor)
+            self.assertNotIn(forbidden, provider_executor)
         for forbidden in (
             "StoreShadowCapture",
             ".with_user(",
