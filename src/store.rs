@@ -2190,6 +2190,30 @@ impl StoreAdvisoryResumedTarget {
         )?;
         Ok(())
     }
+
+    pub(crate) async fn delete_uncaptured_metadata_for_test(&self, key: &str) -> Result<()> {
+        let actor = {
+            let registry = self._store.registry.lock().await;
+            Arc::clone(
+                &registry
+                    .open_users
+                    .get(&self._user_id)
+                    .ok_or_else(|| EnclaveError::Conflict("test handle is unavailable".into()))?
+                    .actor,
+            )
+        };
+        let state = actor.state.lock().await;
+        let handle = state
+            .handle
+            .as_ref()
+            .ok_or_else(|| EnclaveError::Conflict("test handle is unavailable".into()))?;
+        let connection = Connection::open_with_flags(
+            &handle.temp_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.execute("DELETE FROM app_metadata WHERE key=?1", [key])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
