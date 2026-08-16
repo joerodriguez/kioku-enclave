@@ -150,6 +150,20 @@ surfaces.
   direct continuation through it after this lease release is rejected; Phase 2
   still requires a separately reviewed exact authority-acquisition transition.
 
+  The first post-bootstrap Phase-1 owner is also type-separated. Its private
+  launcher reauthenticates the exact immutable `ParityVerified` Control row and
+  released Active+ShadowWal witness, reserves one random advisory owner in a
+  dedicated table, and durably advances `Reserved -> SendStarted` before the
+  exact witness CAS. Response loss grants no retry under a new identity: only
+  the exact expected owner and canonical next fence may be adopted, after
+  which Control full-tuple-CASes and exact-readbacks `Bound`. A second opaque
+  handoff exact-loads that same row and unchanged witness without another CAS.
+  The runtime view exposes only exact witness read/acquire and cannot reach
+  archive objects, registries, roots, ciphers, Store/VFS capture, routes,
+  acknowledgements, tasks, configuration, or serving. This slice deliberately
+  adds no heartbeat, expiry reacquire, root publication, or capture authority;
+  those remain required before a live advisory canary.
+
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness
   readback. The coordinator selects the distinct durable R2 attempt before reconciling any

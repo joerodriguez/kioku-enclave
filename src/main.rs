@@ -140,6 +140,10 @@ mod archive_v3_wal_idempotency;
 // It has no production publication authority, provider construction, runtime,
 // Store registry, startup, route, acknowledgement, or activation path.
 mod archive_v3_wal_owner;
+// Inactive Phase-1-only ShadowWal owner bootstrap. It is type-separated from
+// the WalAuthoritative publisher and exposes no Store, capture, object,
+// acknowledgement, startup, route, or serving capability.
+mod archive_v3_advisory_owner;
 // ADR-0022's bounded synchronous WAL-shadow capture state. It is not yet a
 // registered SQLite VFS and has no Store, provider, route, or authority wiring.
 mod archive_v3_shadow;

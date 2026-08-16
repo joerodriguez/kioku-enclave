@@ -754,6 +754,16 @@ impl WitnessRecord {
                 .is_some()
     }
 
+    /// Phase-1-only unleased terminal predicate. It intentionally exposes no
+    /// owner identity or lease capability and cannot accept WalAuthoritative.
+    pub(crate) fn is_exact_unleased_advisory_terminal(&self) -> bool {
+        self.valid()
+            && self.deletion == DeletionState::Active
+            && self.migration == MigrationState::ShadowWal
+            && self.owner_id.is_none()
+            && self.lease_expires_at_tick == 0
+    }
+
     pub(crate) fn exact_active_lease_for_wal_owner_bytes(
         &self,
         owner: &[u8; 16],
@@ -795,6 +805,46 @@ impl WitnessRecord {
             || self.last_server_tick < expected.last_server_tick
             || self.lease_expires_at_tick <= self.last_server_tick
             || self.migration != expected.migration
+            || self.deletion != expected.deletion
+            || self.deletion_fencing_epoch != expected.deletion_fencing_epoch
+            || self.deletion_worker_id != expected.deletion_worker_id
+            || self.deletion_operation_id != expected.deletion_operation_id
+            || self.deletion_evidence != expected.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
+    /// Validate the sole witness-owned transition from the released Phase-1
+    /// `ShadowWal` terminal to its first advisory owner. This predicate is
+    /// domain-separated by type and migration state from WalAuthoritative;
+    /// it grants neither root-advance nor acknowledgement authority.
+    pub(crate) fn exact_advisory_owner_acquire_from(
+        &self,
+        expected: &Self,
+        owner: &[u8; 16],
+    ) -> Result<WitnessLease> {
+        let owner = ObjectId::from_bytes(*owner);
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !expected.is_exact_unleased_advisory_terminal()
+            || !self.valid()
+            || self.archive_id != expected.archive_id
+            || self.database_epoch != expected.database_epoch
+            || self.database_epoch_generation != expected.database_epoch_generation
+            || self.predecessor != expected.predecessor
+            || self.root != expected.root
+            || self.registry != expected.registry
+            || self.owner_id != Some(owner)
+            || self.current_fencing_epoch != expected.next_fencing_epoch
+            || self.next_fencing_epoch
+                != self
+                    .current_fencing_epoch
+                    .checked_add(1)
+                    .ok_or(WitnessError::Fenced)?
+            || self.last_server_tick < expected.last_server_tick
+            || self.lease_expires_at_tick <= self.last_server_tick
+            || self.migration != MigrationState::ShadowWal
             || self.deletion != expected.deletion
             || self.deletion_fencing_epoch != expected.deletion_fencing_epoch
             || self.deletion_worker_id != expected.deletion_worker_id
@@ -2582,6 +2632,44 @@ impl InMemoryWitness {
             fencing_epoch,
             expires_at_tick,
         };
+        Ok((current.clone(), lease))
+    }
+
+    /// Phase-1-only exact advisory-owner acquisition. The provider mutation
+    /// accepts only the byte-exact unleased `ShadowWal` predecessor and then
+    /// validates the complete successor tuple before returning it.
+    pub(crate) fn acquire_exact_advisory_owner_lease(
+        &self,
+        expected: &WitnessRecord,
+        owner: ObjectId,
+        duration: u64,
+    ) -> Result<(WitnessRecord, WitnessLease)> {
+        if !nonzero_id(owner.as_bytes()) || !expected.is_exact_unleased_advisory_terminal() {
+            return Err(WitnessError::InvalidTransition);
+        }
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&expected.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        if current != expected {
+            return Err(WitnessError::CompareFailed);
+        }
+        let now = self.now(current)?;
+        let expires_at_tick = expiry(now, duration)?;
+        if current.owner_id.is_some() || now < current.lease_expires_at_tick {
+            return Err(WitnessError::Fenced);
+        }
+        let fencing_epoch = current.next_fencing_epoch;
+        current.next_fencing_epoch = fencing_epoch
+            .checked_add(1)
+            .ok_or(WitnessError::Malformed)?;
+        current.current_fencing_epoch = fencing_epoch;
+        current.owner_id = Some(owner);
+        current.lease_expires_at_tick = expires_at_tick;
+        let lease = current.exact_active_lease_for_owner(owner)?;
+        current.exact_advisory_owner_acquire_from(expected, owner.as_bytes())?;
         Ok((current.clone(), lease))
     }
 
@@ -5205,6 +5293,65 @@ mod tests {
             .with_migration_for_test(MigrationState::ShadowWal)
             .exact_wal_owner_reacquire_from(&renewed, owner.as_bytes())
             .is_err());
+    }
+
+    #[test]
+    fn advisory_owner_acquire_is_exact_and_shadow_wal_only() {
+        let (witness, _, bootstrap, _) = setup();
+        let importer = ObjectId::from_bytes(id(8));
+        let owner = ObjectId::from_bytes(id(65));
+        let current = witness.read_current(bootstrap.archive_id).unwrap().unwrap();
+        let retained = current.with_migration_for_test(MigrationState::ShadowWal);
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(retained.encode()),
+            retained.last_server_tick + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&retained, importer)
+            .unwrap();
+        assert!(released.is_exact_unleased_advisory_terminal());
+
+        let acquire_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(released.encode()),
+            released.last_server_tick + 1,
+        )
+        .unwrap();
+        let (acquired, lease) = acquire_provider
+            .acquire_exact_advisory_owner_lease(&released, owner, 20)
+            .unwrap();
+        assert_eq!(
+            acquired
+                .exact_advisory_owner_acquire_from(&released, owner.as_bytes())
+                .unwrap(),
+            lease
+        );
+        assert!(acquired
+            .with_next_fencing_epoch_for_test(acquired.next_fencing_epoch + 1)
+            .exact_advisory_owner_acquire_from(&released, owner.as_bytes())
+            .is_err());
+        assert!(acquired
+            .with_migration_for_test(MigrationState::WalAuthoritative)
+            .exact_advisory_owner_acquire_from(&released, owner.as_bytes())
+            .is_err());
+        assert!(acquire_provider
+            .acquire_exact_advisory_owner_lease(&released, owner, 20)
+            .is_err());
+        assert!(InMemoryWitness::from_provider_record_at_tick(
+            Some(
+                released
+                    .with_migration_for_test(MigrationState::WalAuthoritative)
+                    .encode()
+            ),
+            released.last_server_tick + 1,
+        )
+        .unwrap()
+        .acquire_exact_advisory_owner_lease(
+            &released.with_migration_for_test(MigrationState::WalAuthoritative),
+            owner,
+            20,
+        )
+        .is_err());
     }
 
     #[test]

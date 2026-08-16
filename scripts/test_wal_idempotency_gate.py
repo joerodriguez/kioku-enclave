@@ -2026,6 +2026,50 @@ impl X {
             self.assertNotIn(forbidden, launcher_production)
             self.assertNotIn(forbidden, publisher)
 
+    def test_phase1_advisory_owner_is_shadow_only_private_and_unwired(self) -> None:
+        advisory = (ROOT / "src/archive_v3_advisory_owner.rs").read_text(
+            encoding="utf-8"
+        )
+        advisory_production = without_cfg_test_items(advisory)
+        main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
+        store = (ROOT / "src/store.rs").read_text(encoding="utf-8")
+        query = (ROOT / "src/cp/query.rs").read_text(encoding="utf-8")
+        runtime = (ROOT / "src/archive_v3_shadow_runtime.rs").read_text(
+            encoding="utf-8"
+        )
+        witness = (ROOT / "src/archive_v3_witness.rs").read_text(encoding="utf-8")
+
+        self.assertIn("mod archive_v3_advisory_owner;", main)
+        self.assertNotIn("archive_v3_advisory_owner::", main)
+        self.assertIn("struct SingleArchiveAdvisoryOwner", advisory_production)
+        self.assertNotIn(
+            "pub(crate) struct SingleArchiveAdvisoryOwner", advisory_production
+        )
+        self.assertIn(
+            "async fn start(handoff: CompletedAdvisoryShadowHandoff)",
+            advisory_production,
+        )
+        self.assertNotIn("start_advisory_owner_for_test", advisory_production)
+        self.assertIn("AdvisoryOwnerRuntimeContext(())", advisory_production)
+        self.assertIn("MigrationState::ShadowWal", advisory_production)
+        self.assertNotIn("MigrationState::WalAuthoritative", advisory_production)
+        self.assertIn("exact_advisory_owner_acquire_from", advisory_production)
+        self.assertIn("into_advisory_owner", runtime)
+        self.assertIn("is_exact_unleased_advisory_terminal", witness)
+        self.assertNotIn("archive_v3_advisory_owner::", store)
+        self.assertNotIn("archive_v3_advisory_owner::", query)
+        for forbidden in (
+            "crate::store::",
+            "StoreShadowCapture",
+            "create_if_absent(",
+            "list_objects",
+            "delete_exact",
+            "tokio::spawn",
+            "std::env::",
+            "acknowledge_result(",
+        ):
+            self.assertNotIn(forbidden, advisory_production)
+
 
 def classify_worker_spawn(site: CallSite) -> str:
     # Exact sites remain pinned by the digest. This classification answers

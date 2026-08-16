@@ -616,6 +616,25 @@ impl MaintenanceImportRecord {
         self.owner_id
     }
 
+    /// Encrypted-Control-only authentication for the Phase-1 owner reserve
+    /// and bind transactions. The expected record must be the exact released
+    /// ShadowWal successor of this immutable parity terminal.
+    pub(crate) fn authenticate_advisory_owner_terminal(
+        &self,
+        _token: crate::cp::control_store::AdvisoryOwnerPersistenceContext,
+        operation_id: MaintenanceImportOperationId,
+        expected: &WitnessRecord,
+    ) -> Result<(), MaintenanceImportError> {
+        if self.operation_id != operation_id {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        validate_advisory_parity_evidence(
+            self,
+            self.source.ok_or(MaintenanceImportError::Corrupt)?,
+            expected,
+        )
+    }
+
     pub(crate) fn witnessed_record(&self) -> Result<Option<WitnessRecord>, MaintenanceImportError> {
         self.witness_bytes
             .as_deref()
@@ -938,15 +957,20 @@ impl SingleArchiveMaintenanceImporter {
     }
 
     #[cfg(test)]
-    fn from_test_components(
+    fn from_test_components<W>(
         archive_id: ArchiveId,
         objects: Arc<dyn ImmutableObjectBackend>,
         registries: Arc<dyn ExactKeyRegistryProvider>,
-        witness: Arc<dyn MaintenanceImportWitnessProvider>,
+        witness: Arc<W>,
         control: Arc<crate::cp::control_store::ControlStore>,
         store: Arc<crate::store::Store>,
         plan: AuthenticatedMaintenanceImportPlan,
-    ) -> Result<Self, MaintenanceImportError> {
+    ) -> Result<Self, MaintenanceImportError>
+    where
+        W: MaintenanceImportWitnessProvider
+            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
+            + 'static,
+    {
         if plan.archive_id != archive_id {
             return Err(MaintenanceImportError::Conflict);
         }
@@ -1514,6 +1538,17 @@ pub(crate) struct CompletedAdvisoryShadowHandoff {
     _control: Arc<crate::cp::control_store::ControlStore>,
 }
 
+/// Consuming Phase-1 view obtainable only with the advisory-owner module's
+/// private runtime token. It never contains a Store fence or authority
+/// conversion.
+pub(crate) struct CompletedAdvisoryShadowHandoffView {
+    pub(crate) runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+    pub(crate) terminal_witness: WitnessRecord,
+    pub(crate) archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+    pub(crate) parity: CompletedAdvisoryShadowParityEvidence,
+    pub(crate) control: Arc<crate::cp::control_store::ControlStore>,
+}
+
 /// Opaque proof retained only by the advisory handoff. The future live
 /// shadow owner must re-read this exact Control row and witness before it can
 /// obtain any capture or publication capability.
@@ -1529,6 +1564,46 @@ impl CompletedAdvisoryShadowParityEvidence {
     ) -> Result<Self, MaintenanceImportError> {
         validate_advisory_parity_evidence(&terminal_control, source, terminal_witness)?;
         Ok(Self { terminal_control })
+    }
+
+    pub(crate) const fn operation_id_for_advisory_owner(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+    ) -> MaintenanceImportOperationId {
+        self.terminal_control.operation_id
+    }
+
+    pub(crate) fn reauthenticate_for_advisory_owner(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        observed: &MaintenanceImportRecord,
+        terminal_witness: &WitnessRecord,
+    ) -> Result<(), MaintenanceImportError> {
+        if observed != &self.terminal_control {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        validate_advisory_parity_evidence(
+            &self.terminal_control,
+            self.terminal_control
+                .source()
+                .ok_or(MaintenanceImportError::Corrupt)?,
+            terminal_witness,
+        )
+    }
+}
+
+impl CompletedAdvisoryShadowHandoff {
+    pub(crate) fn into_advisory_owner(
+        self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+    ) -> CompletedAdvisoryShadowHandoffView {
+        CompletedAdvisoryShadowHandoffView {
+            runtime: self._runtime,
+            terminal_witness: self._terminal_witness,
+            archive_binding: self._archive_binding,
+            parity: self._parity,
+            control: self._control,
+        }
     }
 }
 
@@ -2509,7 +2584,29 @@ mod tests {
         }
     }
 
-    struct InMemoryMaintenanceWitness(InMemoryWitness);
+    struct InMemoryMaintenanceWitness {
+        inner: InMemoryWitness,
+        advisory_acquires: std::sync::atomic::AtomicUsize,
+        advisory_outcome_unknown_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl InMemoryMaintenanceWitness {
+        fn new(inner: InMemoryWitness) -> Self {
+            Self {
+                inner,
+                advisory_acquires: std::sync::atomic::AtomicUsize::new(0),
+                advisory_outcome_unknown_once: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn with_advisory_outcome_unknown(inner: InMemoryWitness) -> Self {
+            Self {
+                inner,
+                advisory_acquires: std::sync::atomic::AtomicUsize::new(0),
+                advisory_outcome_unknown_once: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
 
     #[async_trait]
     impl MaintenanceImportWitnessProvider for InMemoryMaintenanceWitness {
@@ -2517,7 +2614,7 @@ mod tests {
             &self,
             archive_id: ArchiveId,
         ) -> Result<WitnessRecord, WitnessError> {
-            self.0
+            self.inner
                 .read_current(archive_id)?
                 .ok_or(WitnessError::MissingArchive)
         }
@@ -2528,7 +2625,7 @@ mod tests {
             owner: ObjectId,
             duration_ticks: u64,
         ) -> Result<WitnessLease, WitnessError> {
-            self.0.acquire_lease(
+            self.inner.acquire_lease(
                 record.archive_id(),
                 record.database_epoch(),
                 record.registry().key_epoch(),
@@ -2543,7 +2640,7 @@ mod tests {
             owner: ObjectId,
         ) -> Result<WitnessLease, WitnessError> {
             let current = self
-                .0
+                .inner
                 .read_current(record.archive_id())?
                 .ok_or(WitnessError::MissingArchive)?;
             if current != *record {
@@ -2557,7 +2654,7 @@ mod tests {
             lease: WitnessLease,
             duration_ticks: u64,
         ) -> Result<WitnessLease, WitnessError> {
-            self.0.renew_lease(lease, duration_ticks)
+            self.inner.renew_lease(lease, duration_ticks)
         }
 
         async fn release_terminal_lease_unresolved(
@@ -2565,7 +2662,7 @@ mod tests {
             retained: WitnessRecord,
             owner: ObjectId,
         ) -> Result<(), MaintenanceWitnessCommitError> {
-            self.0
+            self.inner
                 .release_exact_maintenance_terminal(&retained, owner)
                 .map(|_| ())
                 .map_err(|_| MaintenanceWitnessCommitError::Rejected)
@@ -2576,7 +2673,7 @@ mod tests {
             retained: WitnessRecord,
             owner: ObjectId,
         ) -> Result<(), MaintenanceWitnessCommitError> {
-            self.0
+            self.inner
                 .release_exact_maintenance_advisory(&retained, owner)
                 .map(|_| ())
                 .map_err(|_| MaintenanceWitnessCommitError::Rejected)
@@ -2590,7 +2687,7 @@ mod tests {
             next: MigrationState,
         ) -> Result<(), MaintenanceWitnessCommitError> {
             let current = self
-                .0
+                .inner
                 .read_current(expected.archive_id())
                 .map_err(|_| MaintenanceWitnessCommitError::Rejected)?
                 .ok_or(MaintenanceWitnessCommitError::Rejected)?;
@@ -2602,13 +2699,56 @@ mod tests {
                 return Err(MaintenanceWitnessCommitError::Rejected);
             }
             let receipt = self
-                .0
+                .inner
                 .advance_exact_retained_migration_for_test(advance, next, &candidate)
                 .map_err(|_| MaintenanceWitnessCommitError::Rejected)?;
             if receipt.record() != &candidate {
                 return Err(MaintenanceWitnessCommitError::Rejected);
             }
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider for InMemoryMaintenanceWitness {
+        async fn read_current_exact(
+            &self,
+            archive_id: ArchiveId,
+        ) -> Result<WitnessRecord, WitnessError> {
+            self.inner
+                .read_current(archive_id)?
+                .ok_or(WitnessError::MissingArchive)
+        }
+
+        async fn acquire_owner_lease(
+            &self,
+            expected: &WitnessRecord,
+            owner: crate::archive_v3_advisory_owner::AdvisoryOwnerId,
+            duration_ticks: u64,
+        ) -> std::result::Result<
+            (WitnessRecord, WitnessLease),
+            crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError,
+        > {
+            let value = self
+                .inner
+                .acquire_exact_advisory_owner_lease(
+                    expected,
+                    ObjectId::from_bytes(*owner.as_bytes()),
+                    duration_ticks,
+                )
+                .map_err(|_| {
+                    crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError::Rejected
+                })?;
+            self.advisory_acquires
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .advisory_outcome_unknown_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerCommitError::OutcomeUnknown)
+            } else {
+                Ok(value)
+            }
         }
     }
 
@@ -3682,7 +3822,9 @@ mod tests {
                 ),
             ))
             .unwrap();
-        let witness = Arc::new(InMemoryMaintenanceWitness(witness));
+        let witness = Arc::new(InMemoryMaintenanceWitness::with_advisory_outcome_unknown(
+            witness,
+        ));
         let objects: Arc<dyn ImmutableObjectBackend> = backend;
         let registry_provider: Arc<dyn ExactKeyRegistryProvider> = registries;
         let importer = SingleArchiveMaintenanceImporter::from_test_components(
@@ -3716,11 +3858,11 @@ mod tests {
             advisory._parity.terminal_control.stage(),
             MaintenanceImportStage::ParityVerified
         );
-        drop(advisory);
-
         // The advisory handoff releases every process-local Store guard. An
         // advisory restart reacquires and revalidates the exact legacy source,
         // observes the already-released witness, and remints no authority.
+        // Obtain both opaque handoffs before either is allowed to acquire the
+        // later live advisory owner; this models a restart/lost local result.
         let restart_plan = control
             .prepare_archive_v3_maintenance_import(&user.id)
             .await
@@ -3749,7 +3891,36 @@ mod tests {
             ._terminal_witness
             .exact_active_lease_for_owner(owner_id)
             .is_err());
-        drop(restart);
+        let first_owner = crate::archive_v3_advisory_owner::start_advisory_owner_for_test(advisory)
+            .await
+            .unwrap();
+        assert_eq!(
+            format!("{first_owner:?}"),
+            "SingleArchiveAdvisoryOwner(<inactive>)"
+        );
+        let first_bound = witness.read_current_exact(archive_id).await.unwrap();
+        assert_eq!(first_bound.migration(), MigrationState::ShadowWal);
+        assert!(first_bound.exact_active_lease_for_owner(owner_id).is_err());
+        drop(first_owner);
+
+        // Reopening from the second parity-certified handoff exact-loads the
+        // durable bound row. It must not advance the witness fence or issue a
+        // second owner acquisition.
+        let reopened_owner =
+            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(restart)
+                .await
+                .unwrap();
+        assert_eq!(
+            witness.read_current_exact(archive_id).await.unwrap(),
+            first_bound
+        );
+        assert_eq!(
+            witness
+                .advisory_acquires
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        drop(reopened_owner);
 
         // Selecting the later authority importer against a completed advisory
         // terminal fails closed. A separately reviewed Phase-2 transition
@@ -3890,7 +4061,7 @@ mod tests {
                 ),
             ))
             .unwrap();
-        let witness = Arc::new(InMemoryMaintenanceWitness(witness));
+        let witness = Arc::new(InMemoryMaintenanceWitness::new(witness));
         let objects: Arc<dyn ImmutableObjectBackend> = backend;
         let registry_provider: Arc<dyn ExactKeyRegistryProvider> = registries;
         let handoff = SingleArchiveMaintenanceImporter::from_test_components(

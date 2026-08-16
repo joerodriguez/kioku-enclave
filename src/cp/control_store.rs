@@ -29,6 +29,10 @@ use crate::{
         ArchiveId, KeyKind, KeyRegistryContext, LogicalLocation, ObjectContext, ObjectId,
         ObjectRole,
     },
+    archive_v3_advisory_owner::{
+        AdvisoryOwnerControl, AdvisoryOwnerError, AdvisoryOwnerId, AdvisoryOwnerReservation,
+        AdvisoryOwnerStage, BoundAdvisoryOwner,
+    },
     archive_v3_inventory_coordinator::{
         pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
         AuthenticatedPreWitnessInventoryPlan, DeletionInventoryControl, PreWitnessInventoryControl,
@@ -523,6 +527,33 @@ CREATE TABLE IF NOT EXISTS archive_v3_maintenance_import_artifacts (
     UNIQUE (archive_id, operation_id, attempt, object_id),
     FOREIGN KEY (archive_id, operation_id, attempt)
         REFERENCES archive_v3_maintenance_import_attempts(archive_id, operation_id, attempt)
+);
+-- Phase-1-only advisory ShadowWal owner acquisition. This table is separate
+-- from WalAuthoritative ownership and retains only exact comparison facts.
+CREATE TABLE IF NOT EXISTS archive_v3_advisory_owners (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_bindings(archive_id)
+        CHECK(length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    maintenance_operation_id BLOB NOT NULL UNIQUE
+        CHECK(length(maintenance_operation_id)=16 AND maintenance_operation_id!=zeroblob(16)),
+    owner_id BLOB NOT NULL UNIQUE CHECK(length(owner_id)=16 AND owner_id!=zeroblob(16)),
+    expected_witness BLOB NOT NULL CHECK(length(expected_witness)=724),
+    lease_predecessor_witness BLOB CHECK(
+        lease_predecessor_witness IS NULL OR length(lease_predecessor_witness)=724
+    ),
+    observed_witness BLOB CHECK(observed_witness IS NULL OR length(observed_witness)=724),
+    stage TEXT NOT NULL CHECK(stage IN ('reserved','send_started','bound','manual_required')),
+    commitment BLOB NOT NULL CHECK(length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK(revision>0),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (archive_id,maintenance_operation_id)
+        REFERENCES archive_v3_maintenance_imports(archive_id,operation_id),
+    CHECK(
+        (stage IN ('reserved','send_started','manual_required')
+            AND lease_predecessor_witness IS NULL AND observed_witness IS NULL)
+        OR (stage='bound' AND lease_predecessor_witness IS NOT NULL
+            AND observed_witness IS NOT NULL)
+    )
 );
 -- Inactive single-owner WAL publication protocol. These rows contain only
 -- content-free authenticated bindings and immutable-object facts. They never
@@ -1230,6 +1261,11 @@ pub(crate) struct ArchiveBinding {
 #[derive(Clone, Copy)]
 pub(crate) struct MaintenancePersistenceContext(());
 
+/// Unforgeable producer token for Phase-1 advisory-owner durable facts. It is
+/// distinct from the WalAuthoritative owner token.
+#[derive(Clone, Copy)]
+pub(crate) struct AdvisoryOwnerPersistenceContext(());
+
 /// Unforgeable producer token for WAL-owner durable capabilities. Only this
 /// encrypted control module can construct it.
 #[derive(Clone, Copy)]
@@ -1237,6 +1273,13 @@ pub(crate) struct WalOwnerPersistenceContext(());
 
 #[cfg(test)]
 impl WalOwnerPersistenceContext {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl AdvisoryOwnerPersistenceContext {
     pub(crate) const fn for_test() -> Self {
         Self(())
     }
@@ -8937,6 +8980,419 @@ fn map_wal_owner_error(error: WalOwnerError) -> EnclaveError {
         | WalOwnerError::Publication
         | WalOwnerError::Poisoned => EnclaveError::Store("WAL owner is unavailable".into()),
     }
+}
+
+fn map_advisory_owner_error(error: AdvisoryOwnerError) -> EnclaveError {
+    match error {
+        AdvisoryOwnerError::Conflict => {
+            EnclaveError::Conflict("advisory owner state conflicts".into())
+        }
+        AdvisoryOwnerError::Corrupt => {
+            EnclaveError::Store("advisory owner state is corrupt".into())
+        }
+        AdvisoryOwnerError::Persistence | AdvisoryOwnerError::Publication => {
+            EnclaveError::Store("advisory owner is unavailable".into())
+        }
+    }
+}
+
+fn map_advisory_persistence_error(error: EnclaveError) -> AdvisoryOwnerError {
+    match error {
+        EnclaveError::Conflict(_) | EnclaveError::Auth(_) => AdvisoryOwnerError::Conflict,
+        EnclaveError::InvalidRequest(_) => AdvisoryOwnerError::Corrupt,
+        _ => AdvisoryOwnerError::Persistence,
+    }
+}
+
+fn advisory_owner_stage_from_db(value: &str) -> Result<AdvisoryOwnerStage> {
+    match value {
+        "reserved" => Ok(AdvisoryOwnerStage::Reserved),
+        "send_started" => Ok(AdvisoryOwnerStage::SendStarted),
+        "bound" => Ok(AdvisoryOwnerStage::Bound),
+        "manual_required" => Ok(AdvisoryOwnerStage::ManualRequired),
+        _ => Err(EnclaveError::Store(
+            "unsupported advisory owner stage".into(),
+        )),
+    }
+}
+
+fn advisory_owner_stage_as_db(value: AdvisoryOwnerStage) -> &'static str {
+    match value {
+        AdvisoryOwnerStage::Reserved => "reserved",
+        AdvisoryOwnerStage::SendStarted => "send_started",
+        AdvisoryOwnerStage::Bound => "bound",
+        AdvisoryOwnerStage::ManualRequired => "manual_required",
+    }
+}
+
+fn authenticate_advisory_owner_terminal_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<()> {
+    let terminal = maintenance_import_record_conn(conn, operation_id)?;
+    terminal
+        .authenticate_advisory_owner_terminal(
+            AdvisoryOwnerPersistenceContext(()),
+            operation_id,
+            expected,
+        )
+        .map_err(maintenance_store_error)
+}
+
+fn load_advisory_owner_reservation_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<AdvisoryOwnerReservation> {
+    type AdvisoryOwnerRow = (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        String,
+        Vec<u8>,
+        i64,
+    );
+    let row: AdvisoryOwnerRow = conn.query_row(
+        "SELECT format_version,maintenance_operation_id,owner_id,expected_witness,
+                lease_predecessor_witness,observed_witness,stage,commitment,revision
+         FROM archive_v3_advisory_owners WHERE archive_id=?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    if row.0 != 1 {
+        return Err(EnclaveError::Store(
+            "unsupported advisory owner format".into(),
+        ));
+    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&row.1, "advisory owner maintenance operation")?,
+    )
+    .map_err(maintenance_store_error)?;
+    let owner_id =
+        AdvisoryOwnerId::from_control_bytes(token, fixed_blob::<16>(&row.2, "advisory owner ID")?)
+            .map_err(map_advisory_owner_error)?;
+    let expected = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &row.3,
+        "advisory owner expected witness",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid advisory owner expected witness".into()))?;
+    let predecessor = row
+        .4
+        .map(|value| {
+            crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+                { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+            >(
+                &value,
+                "advisory owner lease predecessor",
+            )?)
+            .map_err(|_| EnclaveError::Store("invalid advisory owner predecessor".into()))
+        })
+        .transpose()?;
+    let observed = row
+        .5
+        .map(|value| {
+            crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+                { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+            >(
+                &value,
+                "advisory owner observed witness",
+            )?)
+            .map_err(|_| EnclaveError::Store("invalid advisory owner observed witness".into()))
+        })
+        .transpose()?;
+    AdvisoryOwnerReservation::from_control(
+        token,
+        operation_id,
+        owner_id,
+        expected,
+        u64::try_from(row.8)
+            .map_err(|_| EnclaveError::Store("invalid advisory owner revision".into()))?,
+        advisory_owner_stage_from_db(&row.6)?,
+        (predecessor.as_ref(), observed.as_ref()),
+        fixed_blob::<32>(&row.7, "advisory owner commitment")?,
+    )
+    .map_err(map_advisory_owner_error)
+}
+
+fn load_bound_advisory_owner_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    observed: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<BoundAdvisoryOwner> {
+    type BoundAdvisoryOwnerRow = (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        i64,
+    );
+    let row: BoundAdvisoryOwnerRow = conn.query_row(
+        "SELECT format_version,maintenance_operation_id,owner_id,expected_witness,
+                lease_predecessor_witness,observed_witness,stage,commitment,revision
+         FROM archive_v3_advisory_owners WHERE archive_id=?1",
+        [observed.archive_id().as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    if row.0 != 1
+        || row.1.as_slice() != operation_id.as_bytes()
+        || row.5.as_slice() != observed.encode().as_slice()
+        || row.6 != "bound"
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory owner binding changed".into(),
+        ));
+    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    let owner_id =
+        AdvisoryOwnerId::from_control_bytes(token, fixed_blob::<16>(&row.2, "advisory owner ID")?)
+            .map_err(map_advisory_owner_error)?;
+    let expected = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &row.3,
+        "advisory owner expected witness",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid advisory owner expected witness".into()))?;
+    authenticate_advisory_owner_terminal_conn(conn, operation_id, &expected)?;
+    let predecessor = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &row.4,
+        "advisory owner lease predecessor",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid advisory owner predecessor".into()))?;
+    BoundAdvisoryOwner::from_control_persisted(
+        token,
+        operation_id,
+        owner_id,
+        expected,
+        predecessor,
+        observed.clone(),
+        u64::try_from(row.8)
+            .map_err(|_| EnclaveError::Store("invalid advisory owner revision".into()))?,
+        fixed_blob::<32>(&row.7, "advisory owner commitment")?,
+    )
+    .map_err(map_advisory_owner_error)
+}
+
+fn reserve_advisory_owner_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+) -> Result<(AdvisoryOwnerReservation, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    authenticate_advisory_owner_terminal_conn(&tx, operation_id, expected)?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_owners WHERE archive_id=?1)",
+        [expected.archive_id().as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        let retained = load_advisory_owner_reservation_conn(&tx, expected.archive_id())?;
+        let (retained_operation, _, retained_expected, _, _, _) =
+            retained.control_view(AdvisoryOwnerPersistenceContext(()));
+        if retained_operation != operation_id || retained_expected != expected {
+            return Err(EnclaveError::Conflict(
+                "advisory owner terminal changed".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((retained, false));
+    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    let owner_id = AdvisoryOwnerId::random_for_control(token).map_err(map_advisory_owner_error)?;
+    let reserved =
+        AdvisoryOwnerReservation::new_for_control(token, operation_id, owner_id, expected.clone())
+            .map_err(map_advisory_owner_error)?;
+    let (_, _, expected, revision, stage, commitment) = reserved.control_view(token);
+    if tx.execute(
+        "INSERT INTO archive_v3_advisory_owners
+         (archive_id,format_version,maintenance_operation_id,owner_id,expected_witness,
+          lease_predecessor_witness,observed_witness,stage,commitment,revision)
+         VALUES (?1,1,?2,?3,?4,NULL,NULL,?5,?6,?7)",
+        rusqlite::params![
+            expected.archive_id().as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            owner_id.as_bytes().as_slice(),
+            expected.encode().as_slice(),
+            advisory_owner_stage_as_db(stage),
+            commitment.as_slice(),
+            i64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("advisory owner revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory owner reserve raced".into(),
+        ));
+    }
+    let loaded = load_advisory_owner_reservation_conn(&tx, expected.archive_id())?;
+    if loaded.control_view(token) != reserved.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory owner reserve readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn mark_advisory_owner_send_started_conn(
+    conn: &Connection,
+    reserved: &AdvisoryOwnerReservation,
+) -> Result<(AdvisoryOwnerReservation, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let (operation_id, owner_id, expected, revision, stage, commitment) =
+        reserved.control_view(token);
+    let tx = conn.unchecked_transaction()?;
+    authenticate_advisory_owner_terminal_conn(&tx, operation_id, expected)?;
+    let current = load_advisory_owner_reservation_conn(&tx, expected.archive_id())?;
+    if current.control_view(token) != reserved.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory owner reservation changed".into(),
+        ));
+    }
+    if stage == AdvisoryOwnerStage::SendStarted {
+        tx.commit()?;
+        return Ok((current, false));
+    }
+    let next = reserved
+        .send_started_for_control(token)
+        .map_err(map_advisory_owner_error)?;
+    let (_, _, _, next_revision, next_stage, next_commitment) = next.control_view(token);
+    if tx.execute(
+        "UPDATE archive_v3_advisory_owners
+         SET stage=?1,commitment=?2,revision=?3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?4 AND format_version=1
+           AND maintenance_operation_id=?5 AND owner_id=?6
+           AND expected_witness=?7 AND lease_predecessor_witness IS NULL
+           AND observed_witness IS NULL AND stage=?8 AND commitment=?9 AND revision=?10",
+        rusqlite::params![
+            advisory_owner_stage_as_db(next_stage),
+            next_commitment.as_slice(),
+            i64::try_from(next_revision)
+                .map_err(|_| EnclaveError::Store("advisory owner revision overflow".into()))?,
+            expected.archive_id().as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            owner_id.as_bytes().as_slice(),
+            expected.encode().as_slice(),
+            advisory_owner_stage_as_db(stage),
+            commitment.as_slice(),
+            i64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("advisory owner revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory owner send marker raced".into(),
+        ));
+    }
+    let loaded = load_advisory_owner_reservation_conn(&tx, expected.archive_id())?;
+    if loaded.control_view(token) != next.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory owner send marker readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn bind_advisory_owner_conn(
+    conn: &Connection,
+    reserved: &AdvisoryOwnerReservation,
+    observed: &crate::archive_v3_witness::WitnessRecord,
+    lease: crate::archive_v3_witness::WitnessLease,
+) -> Result<(BoundAdvisoryOwner, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let (operation_id, owner_id, expected, revision, stage, commitment) =
+        reserved.control_view(token);
+    let tx = conn.unchecked_transaction()?;
+    authenticate_advisory_owner_terminal_conn(&tx, operation_id, expected)?;
+    let current = load_advisory_owner_reservation_conn(&tx, expected.archive_id())?;
+    if current.control_view(token) != reserved.control_view(token) {
+        if current.control_view(token).4 == AdvisoryOwnerStage::Bound {
+            let bound = load_bound_advisory_owner_conn(&tx, operation_id, observed)?;
+            tx.commit()?;
+            return Ok((bound, false));
+        }
+        return Err(EnclaveError::Conflict(
+            "advisory owner reservation changed".into(),
+        ));
+    }
+    let bound = BoundAdvisoryOwner::bind_for_control(token, reserved, observed.clone(), lease)
+        .map_err(map_advisory_owner_error)?;
+    let (_, _, _, _, _, next_revision, next_commitment) = bound.control_view(token);
+    if tx.execute(
+        "UPDATE archive_v3_advisory_owners
+         SET lease_predecessor_witness=?1,observed_witness=?2,stage='bound',
+             commitment=?3,revision=?4,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?5 AND format_version=1
+           AND maintenance_operation_id=?6 AND owner_id=?7
+           AND expected_witness=?8 AND lease_predecessor_witness IS NULL
+           AND observed_witness IS NULL AND stage=?9 AND commitment=?10 AND revision=?11",
+        rusqlite::params![
+            expected.encode().as_slice(),
+            observed.encode().as_slice(),
+            next_commitment.as_slice(),
+            i64::try_from(next_revision)
+                .map_err(|_| EnclaveError::Store("advisory owner revision overflow".into()))?,
+            expected.archive_id().as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            owner_id.as_bytes().as_slice(),
+            expected.encode().as_slice(),
+            advisory_owner_stage_as_db(stage),
+            commitment.as_slice(),
+            i64::try_from(revision)
+                .map_err(|_| EnclaveError::Store("advisory owner revision overflow".into()))?,
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict("advisory owner bind raced".into()));
+    }
+    let loaded = load_bound_advisory_owner_conn(&tx, operation_id, observed)?;
+    if loaded.control_view(token) != bound.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory owner exact readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
 }
 
 fn map_wal_persistence_error(error: EnclaveError) -> WalOwnerError {
@@ -18874,6 +19330,57 @@ impl WalOwnerControl for ControlStore {
 }
 
 #[async_trait::async_trait]
+impl AdvisoryOwnerControl for ControlStore {
+    async fn reserve_advisory_owner(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        operation_id: MaintenanceImportOperationId,
+        expected: &crate::archive_v3_witness::WitnessRecord,
+    ) -> std::result::Result<AdvisoryOwnerReservation, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            reserve_advisory_owner_conn(conn, operation_id, expected)
+        })
+        .await
+        .map_err(map_advisory_persistence_error)
+    }
+
+    async fn mark_advisory_owner_send_started(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        reserved: &AdvisoryOwnerReservation,
+    ) -> std::result::Result<AdvisoryOwnerReservation, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| mark_advisory_owner_send_started_conn(conn, reserved))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
+
+    async fn bind_advisory_owner(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        reserved: &AdvisoryOwnerReservation,
+        observed: &crate::archive_v3_witness::WitnessRecord,
+        lease: crate::archive_v3_witness::WitnessLease,
+    ) -> std::result::Result<BoundAdvisoryOwner, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            bind_advisory_owner_conn(conn, reserved, observed, lease)
+        })
+        .await
+        .map_err(map_advisory_persistence_error)
+    }
+
+    async fn load_bound_advisory_owner(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        operation_id: MaintenanceImportOperationId,
+        observed: &crate::archive_v3_witness::WitnessRecord,
+    ) -> std::result::Result<BoundAdvisoryOwner, AdvisoryOwnerError> {
+        self.read(|conn| load_bound_advisory_owner_conn(conn, operation_id, observed))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
+}
+
+#[async_trait::async_trait]
 impl WalPublisherControl for ControlStore {
     async fn reserve_owner(
         &self,
@@ -25483,6 +25990,32 @@ mod tests {
         Ok(fixture)
     }
 
+    fn seed_maintenance_advisory_parity(
+        conn: &Connection,
+    ) -> Result<MaintenanceControlRecoveryFixture> {
+        maintenance_import_plan_conn(conn, USER_ID)?;
+        let fixture = seed_maintenance_shadow_send_unknown(conn)?;
+        reconcile_maintenance_witness_conn(
+            conn,
+            fixture.operation_id,
+            MaintenanceImportStage::ShadowSendUnknown,
+            &fixture.shadow,
+        )?;
+        let terminal = persist_maintenance_parity_conn(
+            conn,
+            fixture.operation_id,
+            fixture.source,
+            &fixture.shadow,
+            [0x91; 32],
+        )?;
+        if terminal.stage() != MaintenanceImportStage::ParityVerified {
+            return Err(EnclaveError::Store(
+                "test advisory parity terminal was not durable".into(),
+            ));
+        }
+        Ok(fixture)
+    }
+
     fn replace_current_maintenance_artifact(
         conn: &Connection,
         operation_id: MaintenanceImportOperationId,
@@ -26771,6 +27304,141 @@ mod tests {
         );
         let binding = WalOwnerStoreBinding::from_authenticated_witness(&observed).unwrap();
         (released, observed, lease, binding)
+    }
+
+    #[test]
+    fn advisory_owner_reserve_send_bind_and_reopen_are_exact() {
+        use crate::archive_v3_witness::InMemoryWitness;
+
+        let conn = account_conn();
+        let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(maintenance.shadow.encode()),
+            maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+            .unwrap();
+        assert!(released.is_exact_unleased_advisory_terminal());
+
+        let (reserved, changed) =
+            reserve_advisory_owner_conn(&conn, maintenance.operation_id, &released).unwrap();
+        assert!(changed);
+        let (replayed, changed) =
+            reserve_advisory_owner_conn(&conn, maintenance.operation_id, &released).unwrap();
+        assert!(!changed);
+        assert_eq!(
+            replayed.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            reserved.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+
+        let (send_started, changed) =
+            mark_advisory_owner_send_started_conn(&conn, &reserved).unwrap();
+        assert!(changed);
+        let (replayed_send, changed) =
+            mark_advisory_owner_send_started_conn(&conn, &send_started).unwrap();
+        assert!(!changed);
+        assert_eq!(
+            replayed_send.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            send_started.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+
+        let owner = ObjectId::from_bytes(
+            *send_started
+                .control_view(AdvisoryOwnerPersistenceContext::for_test())
+                .1
+                .as_bytes(),
+        );
+        let acquire_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(released.encode()),
+            released.last_server_tick() + 1,
+        )
+        .unwrap();
+        let (observed, lease) = acquire_provider
+            .acquire_exact_advisory_owner_lease(&released, owner, 300)
+            .unwrap();
+        let (bound, changed) =
+            bind_advisory_owner_conn(&conn, &send_started, &observed, lease).unwrap();
+        assert!(changed);
+        assert_eq!(
+            bound
+                .control_view(AdvisoryOwnerPersistenceContext::for_test())
+                .3,
+            &observed
+        );
+        let (replayed_bound, changed) =
+            bind_advisory_owner_conn(&conn, &send_started, &observed, lease).unwrap();
+        assert!(!changed);
+        assert_eq!(
+            replayed_bound.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            bound.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+        assert_eq!(
+            load_bound_advisory_owner_conn(&conn, maintenance.operation_id, &observed)
+                .unwrap()
+                .control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            bound.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+
+        let substituted = observed
+            .with_next_fencing_epoch_for_test(observed.root().root().sequence().saturating_add(10));
+        assert!(
+            load_bound_advisory_owner_conn(&conn, maintenance.operation_id, &substituted).is_err()
+        );
+        assert!(reserve_advisory_owner_conn(
+            &conn,
+            maintenance.operation_id,
+            &released.with_migration_for_test(
+                crate::archive_v3_witness::MigrationState::WalAuthoritative
+            )
+        )
+        .is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_owners WHERE stage='bound' AND revision=3",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn advisory_owner_late_reserve_readback_failure_rolls_back() {
+        use crate::archive_v3_witness::InMemoryWitness;
+
+        let conn = account_conn();
+        let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(maintenance.shadow.encode()),
+            maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER corrupt_advisory_owner_after_insert
+             AFTER INSERT ON archive_v3_advisory_owners
+             BEGIN
+               UPDATE archive_v3_advisory_owners
+               SET revision=revision+1
+               WHERE archive_id=NEW.archive_id;
+             END;",
+        )
+        .unwrap();
+        assert!(reserve_advisory_owner_conn(&conn, maintenance.operation_id, &released).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_owners",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     fn candidate_wal_checkpoint_fixture(
