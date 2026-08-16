@@ -28,6 +28,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import urllib.parse
 
 from select_build_configuration import (
@@ -943,6 +944,22 @@ def immutable_source_archive_digest(commit: str) -> str:
     return hashlib.sha256(completed.stdout).hexdigest()
 
 
+def immutable_source_subset_digest(commit: str, *paths: str) -> str:
+    """Hash one exact committed input subset for an explicit BuildKit cache key."""
+    if not paths or any(not re.fullmatch(r"[A-Za-z0-9._/-]+", path) for path in paths):
+        raise PipelineError("immutable source subset paths are invalid")
+    completed = subprocess.run(
+        ["git", "archive", "--format=tar", commit, "--", *paths],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode:
+        raise PipelineError("could not create the immutable source subset archive")
+    return hashlib.sha256(completed.stdout).hexdigest()
+
+
 def normalize_source_snapshot_timestamps(context: Path) -> None:
     """Remove commit-wide archive mtimes from BuildKit's reusable cache keys."""
     # `git archive` stamps every member with the commit timestamp. BuildKit can
@@ -1104,13 +1121,20 @@ def docker_build_arguments(
     profile: str,
     *,
     config_sha256: str,
+    cargo_inputs_sha256: str,
+    source_inputs_sha256: str,
 ) -> list[str]:
     # Deployment values are passed through one ephemeral BuildKit secret. Only
     # source/profile metadata is allowed in argv, so Docker history cannot
     # disclose the selected configuration.
-    if not re.fullmatch(r"[0-9a-f]{64}", config_sha256):
-        raise PipelineError("image configuration hash must be a lowercase sha256")
-    argument_names = (("CONFIG_SHA256", config_sha256),)
+    hashes = {
+        "CONFIG_SHA256": config_sha256,
+        "CARGO_INPUTS_SHA256": cargo_inputs_sha256,
+        "SOURCE_INPUTS_SHA256": source_inputs_sha256,
+    }
+    if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes.values()):
+        raise PipelineError("image build input hashes must be lowercase sha256 values")
+    argument_names = tuple(hashes.items())
     result: list[str] = []
     for name, value in argument_names:
         result.extend(["--build-arg", f"{name}={value}"])
@@ -1412,6 +1436,16 @@ def sbom_and_scan(image_uri: str, output_dir: Path, *, artifact_ref: str | None 
     missing = sorted(REQUIRED_SBOM_PACKAGES - package_names)
     if missing:
         raise PipelineError("SBOM is missing auditable Rust packages: " + ", ".join(missing))
+    try:
+        package_version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as error:
+        raise PipelineError("could not determine the expected enclave package version") from error
+    enclave_packages = [
+        package for package in sbom.get("packages", [])
+        if isinstance(package, dict) and str(package.get("name", "")).lower() == "kioku-enclave"
+    ]
+    if len(enclave_packages) != 1 or enclave_packages[0].get("versionInfo") != package_version:
+        raise PipelineError("SBOM enclave version does not match the signed source candidate")
     harden_private_output(sbom_path, "SBOM output")
     # Capture only scan output, never selected configuration or credentials.
     scan = run(
@@ -2350,6 +2384,8 @@ def main() -> None:
             "image_config_sha256": image_config_sha256,
             "dockerfile_sha256": sha256(ROOT / "Dockerfile"),
             "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
+            "cargo_inputs_sha256": immutable_source_subset_digest(commit, "Cargo.toml", "Cargo.lock"),
+            "source_inputs_sha256": immutable_source_subset_digest(commit, "src"),
             "builder_mode": "native-linux-amd64" if native else "emulated-fallback",
             "builder": builder_snapshot or {"mode": "emulated-fallback"},
         }
@@ -2378,6 +2414,8 @@ def main() -> None:
                             configuration,
                             arguments.profile,
                             config_sha256=image_config_sha256,
+                            cargo_inputs_sha256=build_inputs["cargo_inputs_sha256"],
+                            source_inputs_sha256=build_inputs["source_inputs_sha256"],
                         ),
                         "--secret", f"id=kioku-config,src={config_secret}",
                     ])
