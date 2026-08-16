@@ -13,10 +13,10 @@
 //! a missing registration, poisoned capture mutex, malformed WAL, or capture
 //! panic leaves the underlying return code untouched.
 //!
-//! The wrapper is opt-in and is not registered by application startup. A
-//! private Store constructor can retain one connection-scoped registration for
-//! later runtime composition, but every live constructor remains disabled. It
-//! has no provider, witness, route, recovery, handoff, or authority wiring.
+//! The wrapper is opt-in and is not registered by application startup. Store
+//! constructors remain disabled; only the inactive advisory terminal may
+//! install one exact-user selection before reopening local admission. It has
+//! no drain/comparison worker, provider, route, recovery, or serving wiring.
 
 use std::{
     collections::BTreeMap,
