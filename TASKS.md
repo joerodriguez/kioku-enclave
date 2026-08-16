@@ -623,6 +623,14 @@ repository, construct the runtime at startup, or enable any user-visible behavio
   and whole provider bundle without exposing raw getters. Each non-cloneable handoff value is
   consumed once; terminal restart may remint it, so durable globally unique owner acquisition is
   deferred to the inactive WAL worker slice.
+- [x] Split the Phase-1 terminal from the later authority transition. A distinct
+  advisory importer stops only after the exact `ParityVerified` ShadowWal row,
+  releases only that same-fence maintenance lease with lost-response exact reread,
+  freshly revalidates the pinned legacy generation, scrubs DB/WAL/SHM, and drops
+  every Store admission guard. Its non-cloneable handoff has no Store fence,
+  acknowledgement/serving/capture surface, or WalAuthoritative conversion; the
+  existing R2 importer remains a separate type path and is deliberately fenced
+  after advisory lease release pending a reviewed Phase-2 authority acquisition.
 - [x] Kept the result offline and non-serving. The importer is obtainable only by
   consuming the sealed image-bound runtime and a non-cloneable encrypted-control plan;
   there is no main/startup/Store constructor call, route, worker, environment/config

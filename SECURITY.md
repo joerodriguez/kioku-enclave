@@ -139,7 +139,18 @@ surfaces.
   decrypts the root and full checkpoint without listing, and compares independent SQLite copies
   with the full parity verifier on a blocking lane. Immediately before parity becomes durable,
   Store rereads the exact pinned legacy generation and the coordinator rereads the unchanged
-  witness. R2 is a new exact root over the same authenticated checkpoint, is likewise durable
+  witness. A type-separated Phase-1 importer may stop at this point: it reloads the exact
+  `ParityVerified` Control row, requires the fresh Active+ShadowWal witness to be the retained
+  same-fence record or its sole lease-release successor, releases only the importer owner/expiry,
+  rereads the exact no-owner ShadowWal record, revalidates the pinned legacy generation again,
+  then scrubs DB/WAL/SHM and drops every Store admission guard. Its opaque handoff carries no
+  Store fence, acknowledgement, serving policy, route, capture, or WalAuthoritative conversion.
+  A higher-fence, changed-root/registry, changed-migration, deletion, or ambiguous unreconciled
+  record fails closed. The existing authority importer is a distinct type and
+  direct continuation through it after this lease release is rejected; Phase 2
+  still requires a separately reviewed exact authority-acquisition transition.
+
+  R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness
   readback. The coordinator selects the distinct durable R2 attempt before reconciling any
   ShadowWal-bound artifact. A same-fence restart adopts that attempt's empty or partial exact

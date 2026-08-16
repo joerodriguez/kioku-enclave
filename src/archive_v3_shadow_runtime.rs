@@ -3,7 +3,7 @@
     reason = "construction-only ADR-0022 runtime bundle is intentionally not wired to startup or authority"
 )]
 
-//! Sealed, inactive ADR-0022 single-archive WAL runtime composition.
+//! Sealed, inactive ADR-0022 single-archive shadow/WAL runtime composition.
 //!
 //! This module accepts only typed deployment fragments and builds the fixed
 //! archive-GCS, registry-KMS, and named-Firestore provider graph. Construction
@@ -15,6 +15,9 @@
 //! route, health signal, admission input, or deletion driver. The GCS
 //! hard-delete gate is permanently false until a later independently audited
 //! slice supplies authenticated lifecycle evidence.
+//! The sealed owner has two type-separated consumers: an advisory importer
+//! that can stop only at verified ShadowWal, and the later authority importer.
+//! Neither has a startup caller.
 
 use std::{fmt, sync::Arc};
 
@@ -38,7 +41,8 @@ use crate::{
     },
     archive_v3_maintenance_import::{
         AuthenticatedMaintenanceImportPlan, MaintenanceImportError,
-        MaintenanceImportWitnessProvider, SingleArchiveMaintenanceImporter,
+        MaintenanceImportWitnessProvider, SingleArchiveAdvisoryShadowImporter,
+        SingleArchiveMaintenanceImporter,
     },
     archive_v3_registry_kms::GcpArchiveV3RegistryKms,
     archive_v3_shadow_coordinator::ShadowCheckpointWitnessProvider,
@@ -506,6 +510,27 @@ impl MaintenanceRuntimeContext {
 }
 
 impl SealedSingleArchiveWalRuntime {
+    /// One-shot Phase-1 composition. The returned type can stop only at the
+    /// verified advisory ShadowWal handoff and exposes no WalAuthoritative
+    /// transition method.
+    pub(crate) fn into_advisory_shadow_importer(
+        self,
+        plan: AuthenticatedMaintenanceImportPlan,
+        persistence: Arc<ControlStore>,
+        store: Arc<crate::store::Store>,
+    ) -> Result<SingleArchiveAdvisoryShadowImporter, MaintenanceImportError> {
+        let importer = SingleArchiveMaintenanceImporter::from_sealed_runtime(
+            MaintenanceRuntimeContext(()),
+            self.binding.binding.archive_id(),
+            self.binding,
+            self.bundle,
+            persistence,
+            store,
+            plan,
+        )?;
+        Ok(SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(importer))
+    }
+
     /// One-shot inactive composition. This has no startup caller and returns
     /// only the private maintenance state machine, never raw providers.
     pub(crate) fn into_maintenance_importer(
@@ -985,6 +1010,7 @@ mod tests {
             );
         }
         assert!(source.contains(concat!("impl SealedSingleArchiveWal", "Runtime {")));
+        assert!(source.contains("fn into_advisory_shadow_importer("));
         assert!(source.contains("fn into_maintenance_importer("));
         let factory = source
             .find("fn from_control_store(")
@@ -1006,6 +1032,7 @@ mod tests {
             "PendingSingleArchiveWalRuntime::new",
             "DurableSingleArchiveBinding::from_control_store",
             "SealedSingleArchiveWalRuntime",
+            "into_advisory_shadow_importer",
         ] {
             assert!(!main.contains(forbidden), "live wiring: {forbidden}");
         }

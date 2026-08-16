@@ -1040,15 +1040,41 @@ impl WitnessRecord {
         retained: &Self,
         owner: ObjectId,
     ) -> Result<bool> {
+        self.exact_maintenance_release_from(retained, owner, MigrationState::WalAuthoritative)
+    }
+
+    /// Authenticate either the byte-exact retained Phase-1 advisory record or
+    /// the sole witness-owned successor produced by releasing that record's
+    /// maintenance lease. This is deliberately distinct from the
+    /// WalAuthoritative terminal predicate: a ShadowWal release never grants
+    /// serving or acknowledgement authority.
+    pub(crate) fn exact_maintenance_advisory_or_release_from(
+        &self,
+        retained: &Self,
+        owner: ObjectId,
+    ) -> Result<bool> {
+        self.exact_maintenance_release_from(retained, owner, MigrationState::ShadowWal)
+    }
+
+    fn exact_maintenance_release_from(
+        &self,
+        retained: &Self,
+        owner: ObjectId,
+        expected_migration: MigrationState,
+    ) -> Result<bool> {
         retained.exact_active_lease_for_owner(owner)?;
         if !retained.valid()
-            || retained.migration != MigrationState::WalAuthoritative
+            || retained.migration != expected_migration
             || retained.deletion != DeletionState::Active
         {
             return Err(WitnessError::Fenced);
         }
         if self == retained
-            || self.exact_maintenance_terminal_active_at_provider_tick(retained, owner)
+            || self.exact_maintenance_release_active_at_provider_tick(
+                retained,
+                owner,
+                expected_migration,
+            )
         {
             return Ok(true);
         }
@@ -1065,7 +1091,7 @@ impl WitnessRecord {
             || self.next_fencing_epoch != retained.next_fencing_epoch
             || self.lease_expires_at_tick != 0
             || self.last_server_tick < retained.last_server_tick
-            || self.migration != MigrationState::WalAuthoritative
+            || self.migration != expected_migration
             || self.deletion != DeletionState::Active
             || self.deletion_fencing_epoch != retained.deletion_fencing_epoch
             || self.deletion_worker_id != retained.deletion_worker_id
@@ -1082,6 +1108,31 @@ impl WitnessRecord {
         retained: &Self,
         owner: ObjectId,
     ) -> bool {
+        self.exact_maintenance_release_active_at_provider_tick(
+            retained,
+            owner,
+            MigrationState::WalAuthoritative,
+        )
+    }
+
+    fn exact_maintenance_advisory_active_at_provider_tick(
+        &self,
+        retained: &Self,
+        owner: ObjectId,
+    ) -> bool {
+        self.exact_maintenance_release_active_at_provider_tick(
+            retained,
+            owner,
+            MigrationState::ShadowWal,
+        )
+    }
+
+    fn exact_maintenance_release_active_at_provider_tick(
+        &self,
+        retained: &Self,
+        owner: ObjectId,
+        expected_migration: MigrationState,
+    ) -> bool {
         let same_fence_owner = self.current_fencing_epoch == retained.current_fencing_epoch
             && self.next_fencing_epoch == retained.next_fencing_epoch
             && self.lease_expires_at_tick == retained.lease_expires_at_tick;
@@ -1097,8 +1148,8 @@ impl WitnessRecord {
             && retained.owner_id == Some(owner)
             && same_fence_owner
             && self.last_server_tick >= retained.last_server_tick
-            && self.migration == MigrationState::WalAuthoritative
-            && retained.migration == MigrationState::WalAuthoritative
+            && self.migration == expected_migration
+            && retained.migration == expected_migration
             && self.deletion == DeletionState::Active
             && retained.deletion == DeletionState::Active
             && self.deletion_fencing_epoch == retained.deletion_fencing_epoch
@@ -2656,6 +2707,40 @@ impl InMemoryWitness {
             return Ok(current.clone());
         }
         if !current.exact_maintenance_terminal_active_at_provider_tick(retained, owner) {
+            return Err(WitnessError::Fenced);
+        }
+        current.owner_id = None;
+        current.lease_expires_at_tick = 0;
+        if !current.valid() {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(current.clone())
+    }
+
+    /// Phase-1-only maintenance release. It clears only the exact importer
+    /// lease from an authenticated ShadowWal record and preserves every root,
+    /// registry, fence, migration, and deletion fact. It cannot create or
+    /// imply WalAuthoritative state.
+    pub(crate) fn release_exact_maintenance_advisory(
+        &self,
+        retained: &WitnessRecord,
+        owner: ObjectId,
+    ) -> Result<WitnessRecord> {
+        let mut state = self.lock()?;
+        available(&state)?;
+        let current = state
+            .records
+            .get_mut(&retained.archive_id)
+            .ok_or(WitnessError::MissingArchive)?;
+        let _now = self.now(current)?;
+        if current
+            .exact_maintenance_advisory_or_release_from(retained, owner)
+            .is_ok()
+            && current.owner_id.is_none()
+        {
+            return Ok(current.clone());
+        }
+        if !current.exact_maintenance_advisory_active_at_provider_tick(retained, owner) {
             return Err(WitnessError::Fenced);
         }
         current.owner_id = None;
