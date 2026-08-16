@@ -675,9 +675,21 @@ separate activation blockers.
     `authorized -> consumed` CAS is atomic with the first advisory-owner
     reservation; reopen accepts only that exact scope/owner pair, while absent,
     substituted, partial, corrupt, or reused scopes fail closed. Authorization
-    alone is inert. Production issuance remains intentionally absent until a
-    reviewed signature trust root and independently attested image identity
-    exist. Acknowledgement,
+    alone is inert.
+  - [x] Add the inactive canary trust/issuance seam. A fixed-size canonical
+    operator statement binds a scope-unique private-user commitment and the
+    exact archive/import/maintenance/source/parity/released-witness/image
+    tuple. One Ed25519 root authenticates it; an independently controlled
+    second root authenticates an image assertion bound to the exact signed
+    statement proof and digest. Only the resulting non-cloneable value can
+    enter Control's transactional exact-row issuer. Roots must be nonzero and
+    distinct; checked-in production anchors deliberately remain invalid and
+    no signing key, environment/config override, live attestation adapter, or
+    caller exists.
+  - [ ] Populate separately controlled operator and image-attestation public
+    roots, review the live Confidential Space claim/nonce verifier that may
+    sign the image assertion, and bind that exact adapter into a separately
+    authorized inactive launcher. Acknowledgement,
     launcher/startup/route/config, cloud, deployment, and serving authority
     remain next.
 

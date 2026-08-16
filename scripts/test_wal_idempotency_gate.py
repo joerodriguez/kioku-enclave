@@ -2058,6 +2058,10 @@ impl X {
             ROOT / "src/archive_v3_advisory_owner/canary.rs"
         ).read_text(encoding="utf-8")
         canary_production = without_cfg_test_items(canary)
+        canary_trust = (
+            ROOT / "src/archive_v3_advisory_owner/canary_trust.rs"
+        ).read_text(encoding="utf-8")
+        canary_trust_production = without_cfg_test_items(canary_trust)
         sqlite_vfs = (ROOT / "src/archive_v3_sqlite_vfs.rs").read_text(
             encoding="utf-8"
         )
@@ -2071,7 +2075,9 @@ impl X {
         self.assertNotIn("archive_v3_advisory_owner::", main)
         self.assertIn("mod comparison;", advisory_production)
         self.assertIn("mod canary;", advisory_production)
+        self.assertIn("mod canary_trust;", advisory_production)
         self.assertNotIn("pub mod canary", advisory_production)
+        self.assertNotIn("pub mod canary_trust", advisory_production)
         self.assertNotIn("pub mod comparison", advisory_production)
         self.assertIn("struct SingleArchiveAdvisoryOwner", advisory_production)
         self.assertNotIn(
@@ -2089,6 +2095,76 @@ impl X {
             canary_production,
         )
         self.assertIn(
+            "pub(crate) struct VerifiedAdvisoryCanaryAuthorization",
+            canary_trust_production,
+        )
+        for forbidden in ("derive(Clone", "derive(Copy", "Serialize", "Deserialize"):
+            self.assertNotIn(forbidden, canary_trust_production)
+        for required in (
+            'b"kioku/archive-v3/advisory-canary/operator-statement/v1\\0"',
+            'b"kioku/archive-v3/advisory-canary/operator-statement-commitment/v1\\0"',
+            'b"kioku/archive-v3/advisory-canary/image-attestation/v1\\0"',
+            'b"kioku/archive-v3/advisory-canary/authorization-evidence/v1\\0"',
+            "const OPERATOR_STATEMENT_BYTES: usize = 242;",
+            "const IMAGE_ATTESTATION_BYTES: usize = 82;",
+            "const PINNED_OPERATOR_PUBLIC_KEY: [u8; 32] = [0; 32];",
+            "const PINNED_IMAGE_ATTESTATION_PUBLIC_KEY: [u8; 32] = [0; 32];",
+            "operator == image_attestation",
+            "UnparsedPublicKey::new(&ED25519, public_key)",
+            "verify_pinned_advisory_canary_authorization",
+            "authenticate_image_attestation",
+            "authenticate_for_control",
+            "authorization_evidence_commitment",
+            "hasher.update(scope_id)",
+        ):
+            self.assertIn(required, canary_trust_production)
+        self.assertIn(
+            "verify_pinned_advisory_canary_authorization, VerifiedAdvisoryCanaryAuthorization",
+            advisory_production,
+        )
+        self.assertEqual(
+            canary_trust_production.count(
+                "-> Result<VerifiedAdvisoryCanaryAuthorization>"
+            ),
+            2,
+        )
+        self.assertIn(
+            "fn validated(operator: [u8; 32], image_attestation: [u8; 32]) -> Result<Self>",
+            canary_trust_production,
+        )
+        self.assertNotIn("pub(crate) fn validated(", canary_trust_production)
+        self.assertIn(
+            "fn verify_advisory_canary_authorization_with_roots(",
+            canary_trust_production,
+        )
+        self.assertNotIn(
+            "pub(crate) fn verify_advisory_canary_authorization_with_roots(",
+            canary_trust_production,
+        )
+        for forbidden in (
+            "Ed25519KeyPair",
+            "private_key",
+            "PRIVATE KEY",
+            "std::env::",
+            "from_env",
+            "fetch_attestation",
+            "AttestationCredentials",
+            "KIOKU_BUILD_PROFILE",
+            "ArchiveV3ShadowRuntimeDeployment",
+            "reqwest",
+            "crate::store",
+            "Gcs",
+            "create_if_absent",
+            ".put_object(",
+            ".enumerate(",
+            "delete_exact",
+            "delete_object",
+            "acknowledge_result",
+        ):
+            self.assertNotIn(forbidden, canary_trust_production)
+        self.assertNotIn("verify_pinned_advisory_canary_authorization", main)
+        self.assertNotIn("verify_pinned_advisory_canary_authorization", query)
+        self.assertIn(
             "#[cfg(test)]\nfn authorize_advisory_canary_for_test_conn(", control
         )
         self.assertIn(
@@ -2102,6 +2178,32 @@ impl X {
             "CREATE TABLE IF NOT EXISTS archive_v3_advisory_canary_scopes",
             control_production,
         )
+        issuer_begin = control_production.index("fn authorize_advisory_canary_conn(")
+        issuer_end = control_production.index(
+            "    Ok((capability, true))\n}", issuer_begin
+        ) + len("    Ok((capability, true))\n}")
+        issuer_control = control_production[issuer_begin:issuer_end]
+        for required in (
+            "advisory_canary_terminal_facts_conn",
+            "authenticate_for_control",
+            "load_advisory_canary_capability_conn",
+            "load_advisory_canary_scope_conn",
+            "INSERT INTO archive_v3_advisory_canary_scopes",
+            "advisory canary authorization readback changed",
+            "tx.commit()?",
+        ):
+            self.assertIn(required, issuer_control)
+        self.assertLess(
+            issuer_control.index("authenticate_for_control"),
+            issuer_control.index("INSERT INTO archive_v3_advisory_canary_scopes"),
+        )
+        self.assertNotIn("OsRng", issuer_control)
+        self.assertIn(
+            "pub(crate) async fn authorize_verified_advisory_canary(",
+            control_production,
+        )
+        self.assertNotIn("authorize_verified_advisory_canary", main)
+        self.assertNotIn("authorize_verified_advisory_canary", query)
         self.assertIn("fn reserve_advisory_owner_with_canary_conn(", control_production)
         self.assertNotIn("fn reserve_advisory_owner_conn(", control_production)
         self.assertIn(

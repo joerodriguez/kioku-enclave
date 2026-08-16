@@ -33,7 +33,7 @@ use crate::{
         AdvisoryCanaryScope, AdvisoryComparisonEvidence, AdvisoryComparisonSettlement,
         AdvisoryFenceAbsence, AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError,
         AdvisoryOwnerId, AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease,
-        AdvisoryReleaseStage, BoundAdvisoryOwner,
+        AdvisoryReleaseStage, BoundAdvisoryOwner, VerifiedAdvisoryCanaryAuthorization,
     },
     archive_v3_inventory_coordinator::{
         pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
@@ -532,8 +532,9 @@ CREATE TABLE IF NOT EXISTS archive_v3_maintenance_import_artifacts (
 );
 -- One exact, operator-selected Phase-1 canary admission. The authorization is
 -- inert until its full tuple is atomically consumed by the first advisory
--- owner reservation. Production issuance is intentionally absent until a
--- trusted operator-statement verifier and exact image attestation exist.
+-- owner reservation. The private two-root verifier and exact issuer are
+-- compiled but inactive; production roots and a live attestation caller are
+-- intentionally absent.
 CREATE TABLE IF NOT EXISTS archive_v3_advisory_canary_scopes (
     scope_id BLOB PRIMARY KEY CHECK(length(scope_id)=16 AND scope_id!=zeroblob(16)),
     format_version INTEGER NOT NULL CHECK(format_version=1),
@@ -9388,8 +9389,7 @@ fn load_advisory_canary_scope_conn(
     })
 }
 
-#[cfg(test)]
-fn load_advisory_canary_capability_for_test_conn(
+fn load_advisory_canary_capability_conn(
     conn: &Connection,
     operation_id: MaintenanceImportOperationId,
 ) -> Result<AdvisoryCanaryScope> {
@@ -9412,21 +9412,31 @@ fn load_advisory_canary_capability_for_test_conn(
     .map_err(map_advisory_owner_error)
 }
 
-#[cfg(test)]
-fn authorize_advisory_canary_for_test_conn(
+fn authorize_advisory_canary_conn(
     conn: &Connection,
-    operation_id: MaintenanceImportOperationId,
+    authorization: &VerifiedAdvisoryCanaryAuthorization,
     expected: &crate::archive_v3_witness::WitnessRecord,
-    release_image_digest: [u8; 32],
-    operator_statement_commitment: [u8; 32],
 ) -> Result<(AdvisoryCanaryScope, bool)> {
-    if release_image_digest == [0; 32] || operator_statement_commitment == [0; 32] {
-        return Err(EnclaveError::InvalidRequest(
-            "advisory canary test evidence must be nonzero".into(),
-        ));
-    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        authorization.operation_id_for_control(token),
+    )
+    .map_err(|_| EnclaveError::InvalidRequest("advisory canary operation is invalid".into()))?;
     let tx = conn.unchecked_transaction()?;
     let terminal = advisory_canary_terminal_facts_conn(&tx, operation_id, expected)?;
+    let verified = authorization
+        .authenticate_for_control(
+            token,
+            &terminal.user_id,
+            terminal.archive_id,
+            operation_id,
+            &terminal.operation_commitment,
+            &terminal.source_commitment,
+            &terminal.parity_commitment,
+            &terminal.terminal_witness_hash,
+        )
+        .map_err(map_advisory_owner_error)?;
     if tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_canary_scopes
                        WHERE maintenance_operation_id=?1)",
@@ -9434,10 +9444,11 @@ fn authorize_advisory_canary_for_test_conn(
         |row| row.get::<_, i64>(0),
     )? != 0
     {
-        let retained = load_advisory_canary_capability_for_test_conn(&tx, operation_id)?;
+        let retained = load_advisory_canary_capability_conn(&tx, operation_id)?;
         let loaded = load_advisory_canary_scope_conn(&tx, &retained, expected)?;
-        if loaded.release_image_digest != release_image_digest
-            || loaded.operator_statement_commitment != operator_statement_commitment
+        if loaded.scope_id != verified.scope_id
+            || loaded.release_image_digest != verified.release_image_digest
+            || loaded.operator_statement_commitment != verified.operator_statement_commitment
         {
             return Err(EnclaveError::Conflict(
                 "advisory canary authorization changed".into(),
@@ -9446,24 +9457,12 @@ fn authorize_advisory_canary_for_test_conn(
         tx.commit()?;
         return Ok((retained, false));
     }
-    let mut scope_id = [0; 16];
-    for _ in 0..16 {
-        OsRng.fill_bytes(&mut scope_id);
-        if scope_id != [0; 16] {
-            break;
-        }
-    }
-    if scope_id == [0; 16] {
-        return Err(EnclaveError::Store(
-            "advisory canary scope ID is unavailable".into(),
-        ));
-    }
     let authorization_commitment = advisory_canary_scope_commitment(
-        &scope_id,
+        &verified.scope_id,
         operation_id,
         &terminal,
-        &release_image_digest,
-        &operator_statement_commitment,
+        &verified.release_image_digest,
+        &verified.operator_statement_commitment,
         1,
         None,
     )?;
@@ -9477,7 +9476,7 @@ fn authorize_advisory_canary_for_test_conn(
          VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
                  'authorized',NULL,NULL,?11,?11,1)",
         rusqlite::params![
-            scope_id.as_slice(),
+            verified.scope_id.as_slice(),
             terminal.user_id,
             terminal.archive_id.as_bytes().as_slice(),
             operation_id.as_bytes().as_slice(),
@@ -9485,8 +9484,8 @@ fn authorize_advisory_canary_for_test_conn(
             terminal.source_commitment.as_slice(),
             terminal.parity_commitment.as_slice(),
             terminal.terminal_witness_hash.as_slice(),
-            release_image_digest.as_slice(),
-            operator_statement_commitment.as_slice(),
+            verified.release_image_digest.as_slice(),
+            verified.operator_statement_commitment.as_slice(),
             authorization_commitment.as_slice(),
         ],
     )? != 1
@@ -9495,15 +9494,86 @@ fn authorize_advisory_canary_for_test_conn(
             "advisory canary authorization raced".into(),
         ));
     }
-    let capability = load_advisory_canary_capability_for_test_conn(&tx, operation_id)?;
+    let capability = load_advisory_canary_capability_conn(&tx, operation_id)?;
     let loaded = load_advisory_canary_scope_conn(&tx, &capability, expected)?;
-    if loaded.consumed.is_some() || loaded.commitment != authorization_commitment {
+    if loaded.scope_id != verified.scope_id
+        || loaded.release_image_digest != verified.release_image_digest
+        || loaded.operator_statement_commitment != verified.operator_statement_commitment
+        || loaded.consumed.is_some()
+        || loaded.commitment != authorization_commitment
+    {
         return Err(EnclaveError::Conflict(
             "advisory canary authorization readback changed".into(),
         ));
     }
     tx.commit()?;
     Ok((capability, true))
+}
+
+#[cfg(test)]
+fn load_advisory_canary_capability_for_test_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<AdvisoryCanaryScope> {
+    load_advisory_canary_capability_conn(conn, operation_id)
+}
+
+#[cfg(test)]
+fn authorize_advisory_canary_for_test_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected: &crate::archive_v3_witness::WitnessRecord,
+    release_image_digest: [u8; 32],
+    operator_statement_commitment: [u8; 32],
+) -> Result<(AdvisoryCanaryScope, bool)> {
+    if release_image_digest == [0; 32] || operator_statement_commitment == [0; 32] {
+        return Err(EnclaveError::InvalidRequest(
+            "advisory canary test evidence must be nonzero".into(),
+        ));
+    }
+    let terminal = advisory_canary_terminal_facts_conn(conn, operation_id, expected)?;
+    let retained_scope_id = conn
+        .query_row(
+            "SELECT scope_id FROM archive_v3_advisory_canary_scopes
+             WHERE maintenance_operation_id=?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .map(|value| fixed_blob::<16>(&value, "advisory canary scope ID"))
+        .transpose()?;
+    let scope_id = match retained_scope_id {
+        Some(scope_id) => scope_id,
+        None => {
+            let mut scope_id = [0; 16];
+            for _ in 0..16 {
+                OsRng.fill_bytes(&mut scope_id);
+                if scope_id != [0; 16] {
+                    break;
+                }
+            }
+            if scope_id == [0; 16] {
+                return Err(EnclaveError::Store(
+                    "advisory canary scope ID is unavailable".into(),
+                ));
+            }
+            scope_id
+        }
+    };
+    let authorization = VerifiedAdvisoryCanaryAuthorization::for_control_test(
+        scope_id,
+        &terminal.user_id,
+        terminal.archive_id,
+        operation_id,
+        terminal.operation_commitment,
+        terminal.source_commitment,
+        terminal.parity_commitment,
+        terminal.terminal_witness_hash,
+        release_image_digest,
+        operator_statement_commitment,
+    )
+    .map_err(map_advisory_owner_error)?;
+    authorize_advisory_canary_conn(conn, &authorization, expected)
 }
 
 fn advisory_release_stage_from_db(value: &str) -> Result<AdvisoryReleaseStage> {
@@ -16407,6 +16477,21 @@ impl ControlStore {
             gcs,
             lifecycle_store: None,
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "inactive ADR-0022 canary trust boundary has no production caller"
+    )]
+    pub(crate) async fn authorize_verified_advisory_canary(
+        &self,
+        authorization: &VerifiedAdvisoryCanaryAuthorization,
+        expected: &crate::archive_v3_witness::WitnessRecord,
+    ) -> Result<AdvisoryCanaryScope> {
+        self.write_owned_if_changed(|conn| {
+            authorize_advisory_canary_conn(conn, authorization, expected)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -25157,15 +25242,42 @@ mod tests {
         let released = release_provider
             .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
             .unwrap();
-        let canary = control
-            .authorize_advisory_canary_for_test(
-                maintenance.operation_id,
-                &released,
-                [0x9a; 32],
-                [0x9b; 32],
-            )
+        let terminal = control
+            .read(|conn| {
+                advisory_canary_terminal_facts_conn(conn, maintenance.operation_id, &released)
+            })
             .await
             .unwrap();
+        let authorization = VerifiedAdvisoryCanaryAuthorization::for_control_test(
+            [0x99; 16],
+            &terminal.user_id,
+            terminal.archive_id,
+            maintenance.operation_id,
+            terminal.operation_commitment,
+            terminal.source_commitment,
+            terminal.parity_commitment,
+            terminal.terminal_witness_hash,
+            [0x9a; 32],
+            [0x9b; 32],
+        )
+        .unwrap();
+        gcs.fail_next_put_after_commit(EnclaveError::Gcs(
+            "simulated lost canary authorization response".into(),
+        ));
+        let canary = control
+            .authorize_verified_advisory_canary(&authorization, &released)
+            .await
+            .unwrap();
+        drop(control);
+        let control = ControlStore::new(kms.clone(), gcs.clone());
+        let replayed_canary = control
+            .authorize_verified_advisory_canary(&authorization, &released)
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed_canary.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            canary.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
         gcs.fail_next_put_after_commit(EnclaveError::Gcs(
             "simulated lost canary reserve response".into(),
         ));
@@ -29489,6 +29601,85 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn verified_advisory_canary_issuer_replays_exactly_and_rolls_back_late_corruption() {
+        use crate::archive_v3_witness::InMemoryWitness;
+
+        let conn = account_conn();
+        let maintenance = seed_maintenance_advisory_parity(&conn).unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(maintenance.shadow.encode()),
+            maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+            .unwrap();
+        let terminal =
+            advisory_canary_terminal_facts_conn(&conn, maintenance.operation_id, &released)
+                .unwrap();
+        let authorization = VerifiedAdvisoryCanaryAuthorization::for_control_test(
+            [0xd0; 16],
+            &terminal.user_id,
+            terminal.archive_id,
+            maintenance.operation_id,
+            terminal.operation_commitment,
+            terminal.source_commitment,
+            terminal.parity_commitment,
+            terminal.terminal_witness_hash,
+            [0xd1; 32],
+            [0xd2; 32],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER corrupt_advisory_canary_authorization_after_insert
+             AFTER INSERT ON archive_v3_advisory_canary_scopes
+             BEGIN
+               UPDATE archive_v3_advisory_canary_scopes
+               SET operator_statement_commitment=x'd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3'
+               WHERE scope_id=NEW.scope_id;
+             END;",
+        )
+        .unwrap();
+        assert!(authorize_advisory_canary_conn(&conn, &authorization, &released).is_err());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM archive_v3_advisory_canary_scopes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "late issuer readback corruption must roll back the scope row"
+        );
+        conn.execute_batch("DROP TRIGGER corrupt_advisory_canary_authorization_after_insert;")
+            .unwrap();
+        let (issued, changed) =
+            authorize_advisory_canary_conn(&conn, &authorization, &released).unwrap();
+        assert!(changed);
+        let (replayed, changed) =
+            authorize_advisory_canary_conn(&conn, &authorization, &released).unwrap();
+        assert!(!changed);
+        assert_eq!(
+            replayed.control_view(AdvisoryOwnerPersistenceContext::for_test()),
+            issued.control_view(AdvisoryOwnerPersistenceContext::for_test())
+        );
+        let conflicting = VerifiedAdvisoryCanaryAuthorization::for_control_test(
+            [0xd4; 16],
+            &terminal.user_id,
+            terminal.archive_id,
+            maintenance.operation_id,
+            terminal.operation_commitment,
+            terminal.source_commitment,
+            terminal.parity_commitment,
+            terminal.terminal_witness_hash,
+            [0xd1; 32],
+            [0xd2; 32],
+        )
+        .unwrap();
+        assert!(authorize_advisory_canary_conn(&conn, &conflicting, &released).is_err());
     }
 
     #[test]

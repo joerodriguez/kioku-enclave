@@ -40,6 +40,10 @@ hyper = { version = "1.10", default-features = false, features = ["server", "htt
 hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 sha2 = "0.10"
 hmac = "0.12"
+# Direct, locked Ed25519 verification for the inactive ADR-0022 Phase-1
+# canary admission statement. The operator and independent image-attestation
+# roots remain separately pinned and no signing key enters the enclave.
+ring = "0.17.14"
 
 # ACME (RFC 8555) client for in-enclave TLS certificate issuance/renewal
 # (ADR-0003): the enclave answers HTTP-01 itself and generates the key inside
