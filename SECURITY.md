@@ -288,6 +288,15 @@ surfaces.
   database, retry an owner lease, acknowledge, launch, serve, or mutate cloud/
   deployment configuration.
 
+  Pre-owner durable abort handles maintenance import failure or stop before reaching
+  `AdvisoryReleaseStoreStage::Released`. It lacks `Released` authority and reconciles
+  exact-generation GCS marker deletion to fresh `NotFound`. Store preflight verifies
+  the user lifecycle lock, confirms exact marker deletion, and asserts local gate cleanliness
+  (no active raw writes, no open DB connection, no capture selector, symmetric gates).
+  Control durably transitions the import stage to `manual_required` under the exclusive user
+  lifecycle lock, asserting the complete absence of any advisory owner or release row.
+  Store then safely unblocks both process-local gates without creating capture or opening DB handles.
+
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness
   readback. The coordinator selects the distinct durable R2 attempt before reconciling any

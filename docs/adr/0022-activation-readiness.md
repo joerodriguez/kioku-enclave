@@ -83,9 +83,12 @@ the second durably prepares before atomically reopening the paired legacy gates
 without capture. Both are mutually exclusive with successful comparison, and
 normal resume checks abort absence under the same exact-user lifecycle. A private restart worker can also finish a retained
 `Prepared` row only after the controller-owned Store proves process-local
-capture absence while holding the exact-user lifecycle guard. This is not yet
-a complete controller stop policy: pre-owner marker/gate cleanup remains absent
-and fails closed.
+capture absence while holding the exact-user lifecycle guard. Pre-owner durable
+abort and cleanup is now implemented: it reconciles exact-generation GCS marker
+deletion to fresh `NotFound`, durably transitions the maintenance import stage to
+`manual_required` under exclusive user lifecycle lock asserting absence of any
+advisory owner or release row, and safely unblocks local legacy Store gates without
+installing capture or opening DB handles.
 
 ## Required order
 
