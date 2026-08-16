@@ -72,6 +72,9 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::{
+    archive_v3_advisory_owner::{
+        AdvisoryFenceAbsence, AdvisoryFenceObservation, AdvisoryRelease, AdvisoryReleaseStoreStage,
+    },
     archive_v3_maintenance_import::{
         AuthenticatedMaintenanceImportPlan, MaintenanceImportOperationId, MaintenanceSourceBinding,
         MaintenanceStorePlanView,
@@ -596,19 +599,21 @@ pub(crate) struct StoreWalAuthorityFence {
 
 /// Non-cloneable exact-user Store target retained by the inactive Phase-1
 /// advisory owner. Its Store handle and identity tuple are private, and this
-/// slice exposes no capture, connection, mutation, acknowledgement, or
-/// serving operation. Only a freshly revalidated pinned maintenance source
-/// can mint it after its scratch family is scrubbed. The owned maintenance
-/// guards are dropped, but the fail-closed Store/barrier blocks and permanent
-/// provider fence deliberately remain. The reviewed Control-only release
-/// ledger grants no Store/provider executor; a later exact delete/absence and
-/// local-unblock operation must restore legacy authority atomically.
+/// slice exposes no capture, connection, acknowledgement, or serving
+/// operation. Only a freshly revalidated pinned maintenance source can mint
+/// it after its scratch family is scrubbed. The owned maintenance guards are
+/// dropped, but the fail-closed Store/barrier blocks and permanent provider
+/// fence deliberately remain. Its one mutation surface authenticates a
+/// Control-frozen advisory release, reconciles deletion of only the exact
+/// marker generation, and proves exact-name absence. It cannot list objects
+/// or reopen any local admission gate.
 pub(crate) struct StoreAdvisoryCaptureTarget {
     _store: Arc<Store>,
     _user_id: UserId,
     _archive_id: crate::archive_v3::ArchiveId,
     _operation_id: MaintenanceImportOperationId,
     _source: MaintenanceSourceBinding,
+    _fence_authority: String,
 }
 
 #[cfg(test)]
@@ -1560,6 +1565,7 @@ impl PinnedLegacySnapshot {
             _archive_id: self._archive_id,
             _operation_id: self._operation_id,
             _source: self.source,
+            _fence_authority: self._plan.fence_authority.clone(),
         };
         // Drop releases the owned lifecycle/actor guards before the advisory
         // owner can receive the target. Fail-closed Store/barrier blocked state
@@ -1632,6 +1638,137 @@ impl std::fmt::Debug for StoreWalAuthorityFence {
 impl std::fmt::Debug for StoreAdvisoryCaptureTarget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("StoreAdvisoryCaptureTarget(<opaque-inactive>)")
+    }
+}
+
+impl StoreAdvisoryCaptureTarget {
+    pub(crate) async fn acquire_advisory_release_lifecycle(&self) -> Result<OwnedMutexGuard<()>> {
+        self._store.lock_user_lifecycle(&self._user_id).await
+    }
+
+    fn exact_marker_name_and_stage(
+        &self,
+        release: &AdvisoryRelease,
+    ) -> Result<(String, AdvisoryReleaseStoreStage)> {
+        let marker_name = self
+            ._store
+            .identity_rebind_fence_object_name(&self._user_id)?;
+        let stage = release
+            .authenticate_store_target(
+                StoreMaintenanceContext(()),
+                self._archive_id,
+                self._operation_id,
+                &marker_name,
+                &self._fence_authority,
+            )
+            .map_err(|_| EnclaveError::Conflict("advisory release Store target changed".into()))?;
+        Ok((marker_name, stage))
+    }
+
+    fn authenticate_exact_marker(
+        &self,
+        marker: &GcsGetResponse,
+        expected_generation: Option<i64>,
+    ) -> Result<()> {
+        let authority = std::str::from_utf8(&marker.ciphertext)
+            .map_err(|_| EnclaveError::Conflict("advisory fence authority is invalid".into()))?;
+        if marker.generation <= 0
+            || expected_generation.is_some_and(|expected| marker.generation != expected)
+            || marker.wrapped_dek_b64 != IDENTITY_REBIND_FENCE_METADATA
+            || authority != self._fence_authority
+        {
+            return Err(EnclaveError::Conflict(
+                "advisory fence marker changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exact-read the one permanent legacy fence only after Control has
+    /// frozen the owner in `Prepared`. No provider mutation occurs here.
+    pub(crate) async fn observe_advisory_fence(
+        &self,
+        prepared: &AdvisoryRelease,
+    ) -> Result<AdvisoryFenceObservation> {
+        let (marker_name, stage) = self.exact_marker_name_and_stage(prepared)?;
+        if stage != AdvisoryReleaseStoreStage::Prepared {
+            return Err(EnclaveError::Conflict(
+                "advisory release is not prepared".into(),
+            ));
+        }
+        let marker = self
+            ._store
+            .gcs
+            .get_object(&marker_name)
+            .await
+            .map_err(|error| {
+                if matches!(error, EnclaveError::NotFound) {
+                    EnclaveError::Conflict(
+                        "advisory fence disappeared before deletion was durable".into(),
+                    )
+                } else {
+                    error
+                }
+            })?;
+        self.authenticate_exact_marker(&marker, None)?;
+        AdvisoryFenceObservation::from_store(
+            StoreMaintenanceContext(()),
+            prepared,
+            &marker_name,
+            &self._fence_authority,
+            &marker.wrapped_dek_b64,
+            marker.generation,
+        )
+        .map_err(|_| EnclaveError::Conflict("advisory fence observation changed".into()))
+    }
+
+    /// Reconcile deletion of only the generation already recorded in
+    /// `DeleteStarted`. Success and ambiguous delete outcomes both require a
+    /// fresh exact-name `NotFound`; any replacement marker remains fenced.
+    pub(crate) async fn reconcile_advisory_fence_absence(
+        &self,
+        delete_started: &AdvisoryRelease,
+    ) -> Result<AdvisoryFenceAbsence> {
+        let (marker_name, stage) = self.exact_marker_name_and_stage(delete_started)?;
+        let AdvisoryReleaseStoreStage::DeleteStarted { marker_generation } = stage else {
+            return Err(EnclaveError::Conflict(
+                "advisory release deletion has not started".into(),
+            ));
+        };
+        let marker_generation = i64::try_from(marker_generation)
+            .map_err(|_| EnclaveError::Conflict("advisory fence generation overflow".into()))?;
+        match self._store.gcs.get_object(&marker_name).await {
+            Ok(marker) => self.authenticate_exact_marker(&marker, Some(marker_generation))?,
+            Err(EnclaveError::NotFound) => {
+                return AdvisoryFenceAbsence::from_store(
+                    StoreMaintenanceContext(()),
+                    delete_started,
+                    &marker_name,
+                )
+                .map_err(|_| EnclaveError::Conflict("advisory fence absence changed".into()));
+            }
+            Err(error) => return Err(error),
+        }
+        let delete_result = self
+            ._store
+            .gcs
+            .delete_object_generation(&marker_name, marker_generation)
+            .await;
+        match self._store.gcs.get_object(&marker_name).await {
+            Err(EnclaveError::NotFound) => AdvisoryFenceAbsence::from_store(
+                StoreMaintenanceContext(()),
+                delete_started,
+                &marker_name,
+            )
+            .map_err(|_| EnclaveError::Conflict("advisory fence absence changed".into())),
+            Ok(marker) => {
+                self.authenticate_exact_marker(&marker, Some(marker_generation))?;
+                Err(delete_result.err().unwrap_or_else(|| {
+                    EnclaveError::Conflict("advisory fence remained after exact deletion".into())
+                }))
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -8617,6 +8754,7 @@ pub(crate) mod tests {
         fail_put_after_commit: StdMutex<Option<EnclaveError>>,
         corrupt_wrapped_dek_after_commit_failure: StdMutex<Option<String>>,
         fail_generation_delete: StdMutex<Option<(String, i64)>>,
+        fail_generation_delete_after_commit: StdMutex<Option<(String, i64)>>,
         vanish_generation_on_get: StdMutex<Option<(String, i64)>>,
         soft_delete_enabled: StdMutex<bool>,
         soft_delete_hard_delete_time: StdMutex<Option<String>>,
@@ -8642,6 +8780,7 @@ pub(crate) mod tests {
                 fail_put_after_commit: StdMutex::new(None),
                 corrupt_wrapped_dek_after_commit_failure: StdMutex::new(None),
                 fail_generation_delete: StdMutex::new(None),
+                fail_generation_delete_after_commit: StdMutex::new(None),
                 vanish_generation_on_get: StdMutex::new(None),
                 soft_delete_enabled: StdMutex::new(false),
                 soft_delete_hard_delete_time: StdMutex::new(Some(
@@ -8714,7 +8853,7 @@ pub(crate) mod tests {
             *self.exact_generation_gets.lock().unwrap()
         }
 
-        fn live_get_count(&self) -> usize {
+        pub(crate) fn live_get_count(&self) -> usize {
             self.live_gets.lock().unwrap().len()
         }
 
@@ -8787,12 +8926,43 @@ pub(crate) mod tests {
             *self.fail_put_after_commit.lock().unwrap() = Some(error);
         }
 
-        fn fail_next_get(&self, error: EnclaveError) {
+        pub(crate) fn fail_next_get(&self, error: EnclaveError) {
             *self.fail_get.lock().unwrap() = Some(error);
         }
 
         pub(crate) fn fail_next_generation_delete(&self, object_name: &str, generation: i64) {
             *self.fail_generation_delete.lock().unwrap() = Some((object_name.into(), generation));
+        }
+
+        pub(crate) fn fail_next_generation_delete_after_commit(
+            &self,
+            object_name: &str,
+            generation: i64,
+        ) {
+            *self.fail_generation_delete_after_commit.lock().unwrap() =
+                Some((object_name.into(), generation));
+        }
+
+        pub(crate) fn replace_live_wrapped_dek(
+            &self,
+            object_name: &str,
+            replacement: &str,
+        ) -> String {
+            let mut objects = self.objects.lock().unwrap();
+            let object = objects
+                .get_mut(object_name)
+                .and_then(|versions| versions.iter_mut().rev().find(|version| version.live))
+                .expect("test object must have one live generation");
+            std::mem::replace(&mut object.wrapped_dek_b64, replacement.into())
+        }
+
+        pub(crate) fn replace_live_generation(&self, object_name: &str, replacement: i64) -> i64 {
+            let mut objects = self.objects.lock().unwrap();
+            let object = objects
+                .get_mut(object_name)
+                .and_then(|versions| versions.iter_mut().rev().find(|version| version.live))
+                .expect("test object must have one live generation");
+            std::mem::replace(&mut object.generation, replacement)
         }
 
         fn generation(&self, object_name: &str) -> Option<i64> {
@@ -9164,6 +9334,19 @@ pub(crate) mod tests {
                 if versions.is_empty() {
                     store.remove(object_name);
                 }
+            }
+            drop(store);
+            if self
+                .fail_generation_delete_after_commit
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|failure| failure.0 == object_name && failure.1 == generation)
+            {
+                *self.fail_generation_delete_after_commit.lock().unwrap() = None;
+                return Err(EnclaveError::Gcs(
+                    "injected lost generation-delete response".into(),
+                ));
             }
             Ok(())
         }

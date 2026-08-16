@@ -6884,6 +6884,7 @@ fn maintenance_import_plan_conn(
             fixed_blob::<16>(&operation_id, "maintenance operation ID")?,
         )
         .map_err(maintenance_store_error)?;
+        ensure_advisory_release_absent_conn(conn, operation_id)?;
         let owner_id = ObjectId::from_bytes(fixed_blob::<16>(&owner_id, "maintenance owner ID")?);
         let attempt = u32::try_from(attempt)
             .map_err(|_| EnclaveError::Store("maintenance attempt is invalid".into()))?;
@@ -9614,6 +9615,26 @@ fn exact_advisory_fence_authority_conn(
         |row| row.get(0),
     )?;
     Ok(authority)
+}
+
+fn ensure_advisory_release_absent_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<()> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM archive_v3_advisory_releases
+             WHERE maintenance_operation_id=?1
+         )",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if exists {
+        return Err(EnclaveError::Conflict(
+            "advisory release permanently fenced maintenance re-entry".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn load_advisory_release_conn(conn: &Connection, archive_id: ArchiveId) -> Result<AdvisoryRelease> {
@@ -19553,6 +19574,15 @@ impl MaintenanceImportPersistence for ControlStore {
         operation_id: MaintenanceImportOperationId,
     ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
         self.read(move |conn| maintenance_import_record_conn(conn, operation_id))
+            .await
+            .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn ensure_advisory_release_absent(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> std::result::Result<(), MaintenanceImportError> {
+        self.read(move |conn| ensure_advisory_release_absent_conn(conn, operation_id))
             .await
             .map_err(map_maintenance_persistence_error)
     }
