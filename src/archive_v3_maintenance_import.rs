@@ -1857,8 +1857,9 @@ async fn finish_advisory_import(
     // The target retains only a private exact Store/user/archive/import
     // binding. Minting it scrubs DB/WAL/SHM and drops the owned maintenance
     // guards; the Store/barrier blocked state and permanent provider fence
-    // remain fail-closed. Unlike the authoritative handoff, Phase 1 transfers
-    // no long-lived guard or callable Store surface.
+    // remain fail-closed. The Control-only advisory-release ledger still has
+    // no Store/provider executor. Unlike the authoritative handoff, Phase 1
+    // transfers no long-lived guard or callable Store surface.
     let store_capture_target = pinned
         .into_advisory_capture_target(MaintenanceCoordinatorContext(()), source)
         .map_err(|_| MaintenanceImportError::Conflict)?;

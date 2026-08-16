@@ -600,8 +600,9 @@ pub(crate) struct StoreWalAuthorityFence {
 /// serving operation. Only a freshly revalidated pinned maintenance source
 /// can mint it after its scratch family is scrubbed. The owned maintenance
 /// guards are dropped, but the fail-closed Store/barrier blocks and permanent
-/// provider fence deliberately remain until a reviewed advisory-release
-/// protocol can restore legacy authority atomically.
+/// provider fence deliberately remain. The reviewed Control-only release
+/// ledger grants no Store/provider executor; a later exact delete/absence and
+/// local-unblock operation must restore legacy authority atomically.
 pub(crate) struct StoreAdvisoryCaptureTarget {
     _store: Arc<Store>,
     _user_id: UserId,

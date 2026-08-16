@@ -573,8 +573,17 @@ separate activation blockers.
     Minting it scrubs scratch and drops the owned maintenance guards, while the
     permanent provider fence and Store/barrier blocked state remain fail-closed.
     Its Store handle and identity fields stay private and it has no operation
-    or selector conversion. A durable advisory-release protocol, capture
-    installation, and comparison remain separate inactive reviews.
+    or selector conversion. Capture installation and comparison remain separate
+    inactive reviews.
+  - [x] Add the inactive durable advisory-release ledger. Encrypted Control
+    binds `Prepared -> DeleteStarted -> Released` to the exact parity terminal,
+    exact bound advisory owner, maintenance fence, canonical marker-name
+    commitment, positive generation, and exact-name absence proof. Preparing
+    release permanently fences lease succession; every transition uses a full-
+    tuple CAS and exact readback, and late failure rolls back. Store-token-gated
+    marker/absence proof constructors exist, but no Store method invokes them;
+    provider get/delete, local unblock, selector installation, capture, startup,
+    serving, route, task, and cloud authority remain absent.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

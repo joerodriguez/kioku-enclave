@@ -174,8 +174,9 @@ surfaces.
   rereads the exact no-owner ShadowWal record, revalidates the pinned legacy generation again,
   then scrubs DB/WAL/SHM and drops its owned Store guard values. The permanent
   legacy provider fence and process-local Store/barrier blocks deliberately
-  remain fail-closed; a separate durable advisory-release protocol is required
-  before legacy serving can resume. Its opaque handoff carries no Store fence,
+  remain fail-closed. Encrypted Control now has an inactive release ledger, but
+  its provider-delete, exact-absence, and Store-unblock executor remains absent,
+  so legacy serving still cannot resume. Its opaque handoff carries no Store fence,
   acknowledgement, serving policy, route, capture, or WalAuthoritative conversion.
   A higher-fence, changed-root/registry, changed-migration, deletion, or ambiguous unreconciled
   record fails closed. The existing authority importer is a distinct type and
@@ -215,9 +216,17 @@ surfaces.
   keeping every field private; the conversion scrubs scratch and drops its
   owned maintenance guards before the advisory owner receives it. It does not
   clear the permanent provider fence or Store/barrier blocked state. The owner
-  can only retain this opaque target: there is still no advisory-release,
-  selector conversion, capture/drain operation, general Store access,
-  comparison, or live caller.
+  can only retain this opaque target: there is still no selector conversion,
+  capture/drain operation, general Store access, comparison, or live caller.
+  A separate inactive Control row now binds `Prepared -> DeleteStarted -> Released`
+  to the exact parity terminal, exact bound advisory-owner witness/revision/commitment,
+  and maintenance-fence commitment. Preparing that row permanently fences further
+  advisory lease succession. `DeleteStarted` can be derived only from a Store-token-
+  minted exact canonical marker-name, authority, metadata, and positive-generation observation;
+  `Released` additionally requires a Store-token-minted exact-name absence proof bound
+  to that deletion marker. Every transition full-tuple-CASes and exact-readbacks in one
+  transaction. No Store code mints either proof yet, and this slice adds no provider
+  get/delete, local unblock, capture, retry, startup, serving, or cloud authority.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness

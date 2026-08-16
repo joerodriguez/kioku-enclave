@@ -16,8 +16,9 @@ claim production evidence.
   full logical contents, and selected queries before it can mint a terminal handoff.
 - A type-separated Phase-1 importer can now stop at that verified `ShadowWal` point, release only
   the exact maintenance lease, scrub its scratch family, and drop its owned Store guard values.
-  The permanent legacy provider fence and process-local Store/barrier blocks remain fail-closed;
-  a reviewed durable advisory-release transition is required before legacy serving can resume.
+  The permanent legacy provider fence and process-local Store/barrier blocks remain fail-closed.
+  A reviewed Control-only advisory-release ledger now exists, but its Store/provider executor and
+  local unblock transition are still required before legacy serving can resume.
   Its opaque handoff cannot request `WalAuthoritative` or change serving acknowledgements. Direct
   use of the existing authority importer after release is fenced; a separately reviewed Phase-2
   acquisition transition is still required.
@@ -41,6 +42,11 @@ claim production evidence.
 - The launcher, publisher, logical codecs, and test-only Store policy have no caller from main,
   startup, configuration, routes, health, workers, the production Store registry, or an
   acknowledgement surface.
+- The inactive advisory release ledger authenticates the exact parity terminal and bound owner,
+  then full-tuple-CASes `Prepared -> DeleteStarted -> Released`. Preparation permanently fences
+  owner-lease succession. Later stages accept only Store-token-minted exact marker-name/authority/
+  metadata/generation and exact-name absence evidence. No Store method mints those proofs and no provider
+  delete, Store unblock, capture selector, startup, route, or task invokes this ledger.
 
 ## Activation decision
 
@@ -49,7 +55,7 @@ reviewed activation change and production evidence**.
 
 | Boundary | Current state | Required before activation |
 |---|---|---|
-| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap plus inactive exact advisory-owner acquisition/heartbeat/expiry-reacquire exist. Store's inactive capture injection is exact-one-user and production-unconstructible; the parity terminal now hands the owner a sealed exact Store/user/archive/import target, but the permanent provider fence and Store/barrier blocks remain fail-closed and the target has no operation. There is still no live caller or post-bootstrap comparison owner. | Add an exact durable advisory-release transition that restores legacy authority without a write race, then owner-only capture installation/drain and independent comparison; require an explicit canary scope; shadow failure cannot alter latency, response, retry, or stored legacy result. |
+| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap plus inactive exact advisory-owner acquisition/heartbeat/expiry-reacquire exist. Store's inactive capture injection is exact-one-user and production-unconstructible; the parity terminal hands the owner a sealed exact Store/user/archive/import target. The Control-only release ledger durably orders marker observation/deletion-start/absence and freezes owner succession, but the permanent provider fence and Store/barrier blocks remain fail-closed because no executor or unblock operation exists. There is still no live caller or post-bootstrap comparison owner. | Add the exact Store-owned provider-delete/absence executor and race-free local unblock transition, then owner-only capture installation/drain and independent comparison; require an explicit canary scope; shadow failure cannot alter latency, response, retry, or stored legacy result. |
 | Enabled mutation set | Reviewed sealed subset only | Select an exact canary operation allowlist. Every enabled path must supply its stable identity and typed plan; unsupported audio/person/identity/voice, screen-person, generic/audio/finalization Vertex-begin, and other unreviewed semantics stay disabled or receive their own review first. |
 | External attempts | Provider-neutral seams only where reviewed | For any enabled provider-writing domain, construct only the reviewed KMS/provider adapter and preserve durable B send identity, one-shot execution, exact readback, C definitive-rejection, and manual handling of ambiguity. |
 | Runtime ownership | Private inactive Phase-1 lease-lifecycle owner and separate authoritative launcher; advisory release cannot enter the existing authority importer | Add owner-only capture, then prove one archive/one owner, maintenance-window and zero-serving-replica preconditions, restart ownership, a distinct exact Phase-2 authority acquisition, drain/handoff behavior, and no second Store/runtime authority. |

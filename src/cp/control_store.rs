@@ -30,8 +30,9 @@ use crate::{
         ObjectRole,
     },
     archive_v3_advisory_owner::{
-        AdvisoryOwnerControl, AdvisoryOwnerError, AdvisoryOwnerId, AdvisoryOwnerReservation,
-        AdvisoryOwnerStage, BoundAdvisoryOwner,
+        AdvisoryFenceAbsence, AdvisoryFenceObservation, AdvisoryOwnerControl, AdvisoryOwnerError,
+        AdvisoryOwnerId, AdvisoryOwnerReservation, AdvisoryOwnerStage, AdvisoryRelease,
+        AdvisoryReleaseStage, BoundAdvisoryOwner,
     },
     archive_v3_inventory_coordinator::{
         pre_witness_page_plan_for_snapshot, AuthenticatedInventoryPlan,
@@ -553,6 +554,56 @@ CREATE TABLE IF NOT EXISTS archive_v3_advisory_owners (
             AND lease_predecessor_witness IS NULL AND observed_witness IS NULL)
         OR (stage='bound' AND lease_predecessor_witness IS NOT NULL
             AND observed_witness IS NOT NULL)
+    )
+);
+-- Inactive end-of-advisory protocol. Control records the exact owner and
+-- maintenance fence before any future provider delete, durably marks that
+-- irreversible boundary, and accepts release only from exact-name absence.
+-- This table grants no provider or Store capability by itself.
+CREATE TABLE IF NOT EXISTS archive_v3_advisory_releases (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_v3_advisory_owners(archive_id)
+        CHECK(length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    maintenance_operation_id BLOB NOT NULL UNIQUE
+        CHECK(length(maintenance_operation_id)=16 AND maintenance_operation_id!=zeroblob(16)),
+    owner_id BLOB NOT NULL UNIQUE CHECK(length(owner_id)=16 AND owner_id!=zeroblob(16)),
+    owner_witness BLOB NOT NULL CHECK(length(owner_witness)=724),
+    owner_revision INTEGER NOT NULL CHECK(owner_revision>0),
+    owner_commitment BLOB NOT NULL
+        CHECK(length(owner_commitment)=32 AND owner_commitment!=zeroblob(32)),
+    fence_authority_commitment BLOB NOT NULL
+        CHECK(length(fence_authority_commitment)=32
+              AND fence_authority_commitment!=zeroblob(32)),
+    stage TEXT NOT NULL CHECK(stage IN ('prepared','delete_started','released')),
+    marker_name_commitment BLOB CHECK(
+        marker_name_commitment IS NULL
+        OR (length(marker_name_commitment)=32 AND marker_name_commitment!=zeroblob(32))
+    ),
+    marker_generation INTEGER CHECK(marker_generation IS NULL OR marker_generation>0),
+    marker_observation_commitment BLOB CHECK(
+        marker_observation_commitment IS NULL
+        OR (length(marker_observation_commitment)=32
+            AND marker_observation_commitment!=zeroblob(32))
+    ),
+    absence_commitment BLOB CHECK(
+        absence_commitment IS NULL
+        OR (length(absence_commitment)=32 AND absence_commitment!=zeroblob(32))
+    ),
+    commitment BLOB NOT NULL CHECK(length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK(revision BETWEEN 1 AND 3),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (archive_id,maintenance_operation_id)
+        REFERENCES archive_v3_maintenance_imports(archive_id,operation_id),
+    CHECK(
+        (stage='prepared' AND revision=1
+         AND marker_name_commitment IS NULL AND marker_generation IS NULL
+         AND marker_observation_commitment IS NULL AND absence_commitment IS NULL)
+        OR (stage='delete_started' AND revision=2
+            AND marker_name_commitment IS NOT NULL AND marker_generation IS NOT NULL
+            AND marker_observation_commitment IS NOT NULL AND absence_commitment IS NULL)
+        OR (stage='released' AND revision=3
+            AND marker_name_commitment IS NOT NULL AND marker_generation IS NOT NULL
+            AND marker_observation_commitment IS NOT NULL AND absence_commitment IS NOT NULL)
     )
 );
 -- Inactive single-owner WAL publication protocol. These rows contain only
@@ -9025,6 +9076,17 @@ fn advisory_owner_stage_as_db(value: AdvisoryOwnerStage) -> &'static str {
     }
 }
 
+fn advisory_release_stage_from_db(value: &str) -> Result<AdvisoryReleaseStage> {
+    match value {
+        "prepared" => Ok(AdvisoryReleaseStage::Prepared),
+        "delete_started" => Ok(AdvisoryReleaseStage::DeleteStarted),
+        "released" => Ok(AdvisoryReleaseStage::Released),
+        _ => Err(EnclaveError::Store(
+            "unsupported advisory release stage".into(),
+        )),
+    }
+}
+
 fn authenticate_advisory_owner_terminal_conn(
     conn: &Connection,
     operation_id: MaintenanceImportOperationId,
@@ -9423,6 +9485,17 @@ fn persist_advisory_owner_successor_conn(
 ) -> Result<(BoundAdvisoryOwner, bool)> {
     let token = AdvisoryOwnerPersistenceContext(());
     let tx = conn.unchecked_transaction()?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_releases WHERE archive_id=?1)",
+        [observed.archive_id().as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        let _ = load_advisory_release_conn(&tx, observed.archive_id())?;
+        return Err(EnclaveError::Conflict(
+            "advisory release permanently fenced lease advancement".into(),
+        ));
+    }
     let (stored_operation, stored_observed): (Vec<u8>, Vec<u8>) = tx.query_row(
         "SELECT maintenance_operation_id,observed_witness FROM archive_v3_advisory_owners
          WHERE archive_id=?1 AND format_version=1 AND stage='bound'",
@@ -9520,6 +9593,402 @@ fn persist_advisory_owner_successor_conn(
     if loaded.control_view(token) != next.control_view(token) {
         return Err(EnclaveError::Conflict(
             "advisory owner successor readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn exact_advisory_fence_authority_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<String> {
+    let authority: String = conn.query_row(
+        "SELECT fence_authority FROM archive_v3_maintenance_imports
+         WHERE archive_id=?1 AND operation_id=?2 AND format_version=1",
+        rusqlite::params![
+            archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(authority)
+}
+
+fn load_advisory_release_conn(conn: &Connection, archive_id: ArchiveId) -> Result<AdvisoryRelease> {
+    type AdvisoryReleaseRow = (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        i64,
+    );
+    let row: AdvisoryReleaseRow = conn.query_row(
+        "SELECT format_version,maintenance_operation_id,owner_id,owner_witness,
+                owner_revision,owner_commitment,fence_authority_commitment,stage,
+                marker_name_commitment,marker_generation,marker_observation_commitment,
+                absence_commitment,commitment,revision
+         FROM archive_v3_advisory_releases WHERE archive_id=?1",
+        [archive_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+            ))
+        },
+    )?;
+    if row.0 != 1 {
+        return Err(EnclaveError::Store(
+            "unsupported advisory release format".into(),
+        ));
+    }
+    let token = AdvisoryOwnerPersistenceContext(());
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&row.1, "advisory release operation ID")?,
+    )
+    .map_err(maintenance_store_error)?;
+    let owner_id = AdvisoryOwnerId::from_control_bytes(
+        token,
+        fixed_blob::<16>(&row.2, "advisory release owner ID")?,
+    )
+    .map_err(map_advisory_owner_error)?;
+    let owner_witness = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &row.3,
+        "advisory release owner witness",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid advisory release owner witness".into()))?;
+    let release = AdvisoryRelease::from_control(
+        token,
+        archive_id,
+        operation_id,
+        owner_id,
+        owner_witness,
+        u64::try_from(row.4)
+            .map_err(|_| EnclaveError::Store("invalid advisory release owner revision".into()))?,
+        fixed_blob::<32>(&row.5, "advisory release owner commitment")?,
+        fixed_blob::<32>(&row.6, "advisory release fence authority commitment")?,
+        u64::try_from(row.13)
+            .map_err(|_| EnclaveError::Store("invalid advisory release revision".into()))?,
+        advisory_release_stage_from_db(&row.7)?,
+        (
+            row.8
+                .map(|value| fixed_blob::<32>(&value, "advisory release marker name"))
+                .transpose()?,
+            row.9
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| {
+                        EnclaveError::Store("invalid advisory release marker generation".into())
+                    })
+                })
+                .transpose()?,
+            row.10
+                .map(|value| fixed_blob::<32>(&value, "advisory release marker observation"))
+                .transpose()?,
+            row.11
+                .map(|value| fixed_blob::<32>(&value, "advisory release absence"))
+                .transpose()?,
+        ),
+        fixed_blob::<32>(&row.12, "advisory release commitment")?,
+    )
+    .map_err(map_advisory_owner_error)?;
+    let view = release.control_view(token);
+    let current = load_bound_advisory_owner_conn(conn, operation_id, view.owner_witness)?;
+    let (_, current_owner, _, _, current_witness, _, current_revision, current_commitment) =
+        current.control_view(token);
+    if current_owner != view.owner_id
+        || current_witness != view.owner_witness
+        || current_revision != view.owner_revision
+        || current_commitment != view.owner_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory release owner binding changed".into(),
+        ));
+    }
+    let fence_authority = exact_advisory_fence_authority_conn(conn, archive_id, operation_id)?;
+    let expected = AdvisoryRelease::prepared_for_control(token, &current, &fence_authority)
+        .map_err(map_advisory_owner_error)?;
+    let expected_view = expected.control_view(token);
+    if view.archive_id != expected_view.archive_id
+        || view.operation_id != expected_view.operation_id
+        || view.owner_id != expected_view.owner_id
+        || view.owner_witness != expected_view.owner_witness
+        || view.owner_revision != expected_view.owner_revision
+        || view.owner_commitment != expected_view.owner_commitment
+        || view.fence_authority_commitment != expected_view.fence_authority_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory release predecessor changed".into(),
+        ));
+    }
+    Ok(release)
+}
+
+fn load_optional_advisory_release_conn(
+    conn: &Connection,
+    owner: &BoundAdvisoryOwner,
+) -> Result<Option<AdvisoryRelease>> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let (operation_id, _, _, _, observed, _, _, _) = owner.control_view(token);
+    let current = load_bound_advisory_owner_conn(conn, operation_id, observed)?;
+    if current.control_view(token) != owner.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory release owner changed".into(),
+        ));
+    }
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_releases WHERE archive_id=?1)",
+        [observed.archive_id().as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    exists
+        .then(|| load_advisory_release_conn(conn, observed.archive_id()))
+        .transpose()
+}
+
+fn prepare_advisory_release_conn(
+    conn: &Connection,
+    owner: &BoundAdvisoryOwner,
+) -> Result<(AdvisoryRelease, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let tx = conn.unchecked_transaction()?;
+    let (operation_id, _, _, _, observed, _, _, _) = owner.control_view(token);
+    let current = load_bound_advisory_owner_conn(&tx, operation_id, observed)?;
+    if current.control_view(token) != owner.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory release owner changed".into(),
+        ));
+    }
+    let fence_authority =
+        exact_advisory_fence_authority_conn(&tx, observed.archive_id(), operation_id)?;
+    let prepared = AdvisoryRelease::prepared_for_control(token, &current, &fence_authority)
+        .map_err(map_advisory_owner_error)?;
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archive_v3_advisory_releases WHERE archive_id=?1)",
+        [observed.archive_id().as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0
+    {
+        let retained = load_advisory_release_conn(&tx, observed.archive_id())?;
+        if retained.control_view(token) != prepared.control_view(token) {
+            return Err(EnclaveError::Conflict(
+                "advisory release already advanced".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((retained, false));
+    }
+    let view = prepared.control_view(token);
+    if tx.execute(
+        "INSERT INTO archive_v3_advisory_releases
+         (archive_id,format_version,maintenance_operation_id,owner_id,owner_witness,
+          owner_revision,owner_commitment,fence_authority_commitment,stage,
+          marker_name_commitment,marker_generation,marker_observation_commitment,
+          absence_commitment,commitment,revision)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,'prepared',NULL,NULL,NULL,NULL,?8,1)",
+        rusqlite::params![
+            view.archive_id.as_bytes().as_slice(),
+            view.operation_id.as_bytes().as_slice(),
+            view.owner_id.as_bytes().as_slice(),
+            view.owner_witness.encode().as_slice(),
+            i64::try_from(view.owner_revision).map_err(|_| EnclaveError::Store(
+                "advisory release owner revision overflow".into()
+            ))?,
+            view.owner_commitment.as_slice(),
+            view.fence_authority_commitment.as_slice(),
+            view.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory release prepare raced".into(),
+        ));
+    }
+    let loaded = load_advisory_release_conn(&tx, view.archive_id)?;
+    if loaded.control_view(token) != prepared.control_view(token) {
+        return Err(EnclaveError::Conflict(
+            "advisory release prepare readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn mark_advisory_fence_delete_started_conn(
+    conn: &Connection,
+    prepared: &AdvisoryRelease,
+    observation: &AdvisoryFenceObservation,
+) -> Result<(AdvisoryRelease, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let prepared_view = prepared.control_view(token);
+    let next = prepared
+        .delete_started_for_control(token, observation)
+        .map_err(map_advisory_owner_error)?;
+    let next_view = next.control_view(token);
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_release_conn(&tx, prepared_view.archive_id)?;
+    if current.control_view(token) == next_view {
+        tx.commit()?;
+        return Ok((current, false));
+    }
+    if current.control_view(token) != prepared_view {
+        return Err(EnclaveError::Conflict(
+            "advisory release delete predecessor changed".into(),
+        ));
+    }
+    if tx.execute(
+        "UPDATE archive_v3_advisory_releases
+         SET stage='delete_started',marker_name_commitment=?1,marker_generation=?2,
+             marker_observation_commitment=?3,commitment=?4,revision=2,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?5 AND format_version=1 AND maintenance_operation_id=?6
+           AND owner_id=?7 AND owner_witness=?8 AND owner_revision=?9
+           AND owner_commitment=?10 AND fence_authority_commitment=?11
+           AND stage='prepared' AND marker_name_commitment IS NULL
+           AND marker_generation IS NULL AND marker_observation_commitment IS NULL
+           AND absence_commitment IS NULL AND commitment=?12 AND revision=1",
+        rusqlite::params![
+            next_view
+                .marker_name_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            next_view
+                .marker_generation
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store(
+                    "advisory release marker generation overflow".into()
+                ))?,
+            next_view
+                .marker_observation_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            next_view.commitment.as_slice(),
+            prepared_view.archive_id.as_bytes().as_slice(),
+            prepared_view.operation_id.as_bytes().as_slice(),
+            prepared_view.owner_id.as_bytes().as_slice(),
+            prepared_view.owner_witness.encode().as_slice(),
+            i64::try_from(prepared_view.owner_revision).map_err(|_| EnclaveError::Store(
+                "advisory release owner revision overflow".into()
+            ))?,
+            prepared_view.owner_commitment.as_slice(),
+            prepared_view.fence_authority_commitment.as_slice(),
+            prepared_view.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory release delete marker raced".into(),
+        ));
+    }
+    let loaded = load_advisory_release_conn(&tx, prepared_view.archive_id)?;
+    if loaded.control_view(token) != next_view {
+        return Err(EnclaveError::Conflict(
+            "advisory release delete readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn mark_advisory_fence_released_conn(
+    conn: &Connection,
+    delete_started: &AdvisoryRelease,
+    absence: &AdvisoryFenceAbsence,
+) -> Result<(AdvisoryRelease, bool)> {
+    let token = AdvisoryOwnerPersistenceContext(());
+    let delete_view = delete_started.control_view(token);
+    let next = delete_started
+        .released_for_control(token, absence)
+        .map_err(map_advisory_owner_error)?;
+    let next_view = next.control_view(token);
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_release_conn(&tx, delete_view.archive_id)?;
+    if current.control_view(token) == next_view {
+        tx.commit()?;
+        return Ok((current, false));
+    }
+    if current.control_view(token) != delete_view {
+        return Err(EnclaveError::Conflict(
+            "advisory release absence predecessor changed".into(),
+        ));
+    }
+    if tx.execute(
+        "UPDATE archive_v3_advisory_releases
+         SET stage='released',absence_commitment=?1,commitment=?2,revision=3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE archive_id=?3 AND format_version=1 AND maintenance_operation_id=?4
+           AND owner_id=?5 AND owner_witness=?6 AND owner_revision=?7
+           AND owner_commitment=?8 AND fence_authority_commitment=?9
+           AND stage='delete_started' AND marker_name_commitment=?10
+           AND marker_generation=?11 AND marker_observation_commitment=?12
+           AND absence_commitment IS NULL AND commitment=?13 AND revision=2",
+        rusqlite::params![
+            next_view
+                .absence_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            next_view.commitment.as_slice(),
+            delete_view.archive_id.as_bytes().as_slice(),
+            delete_view.operation_id.as_bytes().as_slice(),
+            delete_view.owner_id.as_bytes().as_slice(),
+            delete_view.owner_witness.encode().as_slice(),
+            i64::try_from(delete_view.owner_revision).map_err(|_| EnclaveError::Store(
+                "advisory release owner revision overflow".into()
+            ))?,
+            delete_view.owner_commitment.as_slice(),
+            delete_view.fence_authority_commitment.as_slice(),
+            delete_view
+                .marker_name_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            delete_view
+                .marker_generation
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| EnclaveError::Store(
+                    "advisory release marker generation overflow".into()
+                ))?,
+            delete_view
+                .marker_observation_commitment
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+            delete_view.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory release absence marker raced".into(),
+        ));
+    }
+    let loaded = load_advisory_release_conn(&tx, delete_view.archive_id)?;
+    if loaded.control_view(token) != next_view {
+        return Err(EnclaveError::Conflict(
+            "advisory release absence readback changed".into(),
         ));
     }
     tx.commit()?;
@@ -19533,6 +20002,52 @@ impl AdvisoryOwnerControl for ControlStore {
         .await
         .map_err(map_advisory_persistence_error)
     }
+
+    async fn prepare_advisory_release(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+    ) -> std::result::Result<AdvisoryRelease, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| prepare_advisory_release_conn(conn, owner))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
+
+    async fn load_advisory_release(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        owner: &BoundAdvisoryOwner,
+    ) -> std::result::Result<Option<AdvisoryRelease>, AdvisoryOwnerError> {
+        self.read(|conn| load_optional_advisory_release_conn(conn, owner))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
+
+    async fn mark_advisory_fence_delete_started(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        prepared: &AdvisoryRelease,
+        observation: &AdvisoryFenceObservation,
+    ) -> std::result::Result<AdvisoryRelease, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            mark_advisory_fence_delete_started_conn(conn, prepared, observation)
+        })
+        .await
+        .map_err(map_advisory_persistence_error)
+    }
+
+    async fn mark_advisory_fence_released(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        delete_started: &AdvisoryRelease,
+        absence: &AdvisoryFenceAbsence,
+    ) -> std::result::Result<AdvisoryRelease, AdvisoryOwnerError> {
+        self.write_owned_if_changed(|conn| {
+            mark_advisory_fence_released_conn(conn, delete_started, absence)
+        })
+        .await
+        .map_err(map_advisory_persistence_error)
+    }
 }
 
 #[async_trait::async_trait]
@@ -27459,6 +27974,232 @@ mod tests {
         );
         let binding = WalOwnerStoreBinding::from_authenticated_witness(&observed).unwrap();
         (released, observed, lease, binding)
+    }
+
+    fn bound_advisory_owner_fixture(conn: &Connection) -> BoundAdvisoryOwner {
+        use crate::archive_v3_witness::InMemoryWitness;
+
+        let maintenance = seed_maintenance_advisory_parity(conn).unwrap();
+        let release_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(maintenance.shadow.encode()),
+            maintenance.shadow.last_server_tick() + 1,
+        )
+        .unwrap();
+        let released = release_provider
+            .release_exact_maintenance_advisory(&maintenance.shadow, maintenance.owner_id)
+            .unwrap();
+        let reserved = reserve_advisory_owner_conn(conn, maintenance.operation_id, &released)
+            .unwrap()
+            .0;
+        let send_started = mark_advisory_owner_send_started_conn(conn, &reserved)
+            .unwrap()
+            .0;
+        let owner = ObjectId::from_bytes(
+            *send_started
+                .control_view(AdvisoryOwnerPersistenceContext::for_test())
+                .1
+                .as_bytes(),
+        );
+        let acquire_provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(released.encode()),
+            released.last_server_tick() + 1,
+        )
+        .unwrap();
+        let (observed, lease) = acquire_provider
+            .acquire_exact_advisory_owner_lease(&released, owner, 300)
+            .unwrap();
+        bind_advisory_owner_conn(conn, &send_started, &observed, lease)
+            .unwrap()
+            .0
+    }
+
+    fn advisory_fence_authority(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT fence_authority FROM archive_v3_maintenance_imports",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn advisory_release_prepare_delete_absence_and_reopen_are_exact() {
+        let conn = account_conn();
+        let bound = bound_advisory_owner_fixture(&conn);
+        let token = AdvisoryOwnerPersistenceContext::for_test();
+        let owner_view = bound.control_view(token);
+        assert!(load_optional_advisory_release_conn(&conn, &bound)
+            .unwrap()
+            .is_none());
+
+        let (prepared, changed) = prepare_advisory_release_conn(&conn, &bound).unwrap();
+        assert!(changed);
+        assert_eq!(
+            prepared.control_view(token).stage,
+            AdvisoryReleaseStage::Prepared
+        );
+        let (replayed_prepared, changed) = prepare_advisory_release_conn(&conn, &bound).unwrap();
+        assert!(!changed);
+        assert!(replayed_prepared.control_view(token) == prepared.control_view(token));
+
+        let marker_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let authority = advisory_fence_authority(&conn);
+        let mut wrong_authority = authority.clone();
+        let replacement = if wrong_authority.as_bytes()[8] == b'0' {
+            "1"
+        } else {
+            "0"
+        };
+        wrong_authority.replace_range(8..9, replacement);
+        assert!(AdvisoryFenceObservation::for_test(
+            &prepared,
+            &marker_name,
+            &wrong_authority,
+            "kioku-identity-rebind-fence-v1",
+            7,
+        )
+        .is_err());
+        assert!(AdvisoryFenceObservation::for_test(
+            &prepared,
+            "control/identity-rebind-fences/not-canonical",
+            &authority,
+            "kioku-identity-rebind-fence-v1",
+            7,
+        )
+        .is_err());
+        assert!(AdvisoryFenceObservation::for_test(
+            &prepared,
+            &marker_name,
+            &authority,
+            "wrong-metadata",
+            7,
+        )
+        .is_err());
+        assert!(AdvisoryFenceObservation::for_test(
+            &prepared,
+            &marker_name,
+            &authority,
+            "kioku-identity-rebind-fence-v1",
+            0,
+        )
+        .is_err());
+        let observation = AdvisoryFenceObservation::for_test(
+            &prepared,
+            &marker_name,
+            &authority,
+            "kioku-identity-rebind-fence-v1",
+            7,
+        )
+        .unwrap();
+        let (delete_started, changed) =
+            mark_advisory_fence_delete_started_conn(&conn, &prepared, &observation).unwrap();
+        assert!(changed);
+        assert_eq!(
+            delete_started.control_view(token).stage,
+            AdvisoryReleaseStage::DeleteStarted
+        );
+        let (replayed_delete, changed) =
+            mark_advisory_fence_delete_started_conn(&conn, &prepared, &observation).unwrap();
+        assert!(!changed);
+        assert!(replayed_delete.control_view(token) == delete_started.control_view(token));
+
+        assert!(AdvisoryFenceAbsence::for_test(
+            &delete_started,
+            &crate::store::test_identity_rebind_fence_object_name("other-user")
+        )
+        .is_err());
+        let absence = AdvisoryFenceAbsence::for_test(&delete_started, &marker_name).unwrap();
+        let (released, changed) =
+            mark_advisory_fence_released_conn(&conn, &delete_started, &absence).unwrap();
+        assert!(changed);
+        assert_eq!(
+            released.control_view(token).stage,
+            AdvisoryReleaseStage::Released
+        );
+        let (replayed_release, changed) =
+            mark_advisory_fence_released_conn(&conn, &delete_started, &absence).unwrap();
+        assert!(!changed);
+        assert!(replayed_release.control_view(token) == released.control_view(token));
+        assert!(
+            load_advisory_release_conn(&conn, owner_view.4.archive_id())
+                .unwrap()
+                .control_view(token)
+                == released.control_view(token)
+        );
+    }
+
+    #[test]
+    fn advisory_release_freezes_owner_and_late_readback_failure_rolls_back() {
+        let conn = account_conn();
+        let bound = bound_advisory_owner_fixture(&conn);
+        let token = AdvisoryOwnerPersistenceContext::for_test();
+        let owner_view = bound.control_view(token);
+        let previous = owner_view.4.clone();
+        let owner_id = owner_view.1;
+        let (prepared, changed) = prepare_advisory_release_conn(&conn, &bound).unwrap();
+        assert!(changed);
+
+        let renewed = previous.renewed_maintenance_lease_for_test();
+        let renewed_lease = renewed
+            .exact_advisory_owner_heartbeat_from(&previous, owner_id.as_bytes())
+            .unwrap();
+        assert!(
+            persist_advisory_owner_successor_conn(&conn, &previous, &renewed, renewed_lease,)
+                .is_err()
+        );
+        assert_eq!(
+            load_bound_advisory_owner_conn(&conn, owner_view.0, &previous)
+                .unwrap()
+                .control_view(token),
+            bound.control_view(token)
+        );
+
+        let marker_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+        let authority = advisory_fence_authority(&conn);
+        let observation = AdvisoryFenceObservation::for_test(
+            &prepared,
+            &marker_name,
+            &authority,
+            "kioku-identity-rebind-fence-v1",
+            9,
+        )
+        .unwrap();
+        let (delete_started, changed) =
+            mark_advisory_fence_delete_started_conn(&conn, &prepared, &observation).unwrap();
+        assert!(changed);
+        let before = delete_started.control_view(token);
+        let absence = AdvisoryFenceAbsence::for_test(&delete_started, &marker_name).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER corrupt_advisory_release_after_release
+             AFTER UPDATE ON archive_v3_advisory_releases
+             WHEN NEW.stage='released'
+             BEGIN
+               UPDATE archive_v3_advisory_releases
+               SET commitment=x'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+               WHERE archive_id=NEW.archive_id;
+             END;",
+        )
+        .unwrap();
+        assert!(mark_advisory_fence_released_conn(&conn, &delete_started, &absence).is_err());
+        assert!(
+            load_advisory_release_conn(&conn, before.archive_id)
+                .unwrap()
+                .control_view(token)
+                == before
+        );
+
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        conn.execute(
+            "UPDATE archive_v3_advisory_releases
+             SET marker_observation_commitment=zeroblob(32)
+             WHERE archive_id=?1",
+            [before.archive_id.as_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        assert!(load_advisory_release_conn(&conn, before.archive_id).is_err());
     }
 
     #[test]
