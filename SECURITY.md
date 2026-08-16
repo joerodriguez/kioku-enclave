@@ -173,11 +173,13 @@ surfaces.
   same-fence record or its sole lease-release successor, releases only the importer owner/expiry,
   rereads the exact no-owner ShadowWal record, revalidates the pinned legacy generation again,
   then scrubs DB/WAL/SHM and drops its owned Store guard values. The permanent
-  legacy provider fence and process-local Store/barrier blocks deliberately
-  remain fail-closed. Encrypted Control and the retained exact-user Store target
-  now provide an inactive exact-marker release executor, but its provider-confirmed
-  completion deliberately does not unblock Store/barrier admission, so legacy
-  serving still cannot resume. Its opaque handoff carries no Store fence,
+  legacy provider fence and process-local Store/barrier blocks initially remain
+  fail-closed. Encrypted Control and the retained exact-user Store target provide
+  an inactive exact-marker release executor plus a separate consuming local-resume
+  transition. The latter freshly exact-reads the frozen witness and terminal
+  release while retaining the same user lifecycle lock, then reopens the registry
+  and raw-content gates together without provider or database I/O. Its opaque
+  result carries no Store connection,
   acknowledgement, serving policy, route, capture, or WalAuthoritative conversion.
   A higher-fence, changed-root/registry, changed-migration, deletion, or ambiguous unreconciled
   record fails closed. The existing authority importer is a distinct type and
@@ -218,8 +220,8 @@ surfaces.
   owned maintenance guards before the advisory owner receives it. It does not
   clear the permanent provider fence or Store/barrier blocked state. The owner
   can retain this opaque target and consume it only through the inactive exact-
-  marker release path: there is still no selector conversion, capture/drain
-  operation, general Store access, comparison, unblock, or live caller.
+  marker release and local-resume path: there is still no selector conversion,
+  capture/drain operation, general Store access, comparison, or live caller.
   A separate inactive Control row now binds `Prepared -> DeleteStarted -> Released`
   to the exact parity terminal, exact bound advisory-owner witness/revision/commitment,
   and maintenance-fence commitment. Preparing that row permanently fences further
@@ -239,9 +241,14 @@ surfaces.
   after a fresh exact-name `NotFound`; a lost delete response is settled by that
   same read, while a missing pre-marker, substituted marker, replacement generation,
   or unavailable read fails closed. Reopen exact-loads `Released` without another
-  provider operation. The executor cannot list, put, delete another object, unblock
-  local admission, install capture, retry an owner lease, launch, serve, or mutate
-  cloud/deployment configuration.
+  provider operation. Before maintenance closes either local gate it now first
+  acquires the same lifecycle lock and repeats the terminal-release absence check;
+  a stale waiter therefore cannot reblock Store after release. Only the consuming
+  terminal owner can reopen both local gates, while holding their registry/barrier
+  locks together and requiring no open handle or active raw writer. A partial gate
+  state fails closed. The resulting opaque target cannot list, get, put, delete,
+  open a database, install capture, retry an owner lease, acknowledge, launch,
+  serve, or mutate cloud/deployment configuration.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness

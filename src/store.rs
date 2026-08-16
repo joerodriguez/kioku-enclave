@@ -563,6 +563,15 @@ pub(crate) struct ArchiveMaintenanceTransition {
     state: OwnedMutexGuard<UserActorState>,
 }
 
+/// Store-owned pre-transition admission. It holds the exact user's lifecycle
+/// gate without changing either local admission fence, so Control can perform
+/// its final terminal-release check before maintenance blocks the process.
+pub(crate) struct ArchiveMaintenanceAdmission {
+    store: Arc<Store>,
+    plan: MaintenanceStorePlanView,
+    lifecycle_guard: OwnedMutexGuard<()>,
+}
+
 /// Content-free tentative source facts observed while all local admissions
 /// are already closed but before the permanent provider marker is created.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -603,10 +612,10 @@ pub(crate) struct StoreWalAuthorityFence {
 /// operation. Only a freshly revalidated pinned maintenance source can mint
 /// it after its scratch family is scrubbed. The owned maintenance guards are
 /// dropped, but the fail-closed Store/barrier blocks and permanent provider
-/// fence deliberately remain. Its one mutation surface authenticates a
-/// Control-frozen advisory release, reconciles deletion of only the exact
-/// marker generation, and proves exact-name absence. It cannot list objects
-/// or reopen any local admission gate.
+/// fence deliberately remain. Its mutation surfaces authenticate a Control-
+/// frozen advisory release, reconcile deletion of only the exact marker
+/// generation, prove exact-name absence, and finally reopen both local gates
+/// together from that terminal row. It cannot list objects or open a database.
 pub(crate) struct StoreAdvisoryCaptureTarget {
     _store: Arc<Store>,
     _user_id: UserId,
@@ -614,6 +623,27 @@ pub(crate) struct StoreAdvisoryCaptureTarget {
     _operation_id: MaintenanceImportOperationId,
     _source: MaintenanceSourceBinding,
     _fence_authority: String,
+}
+
+/// Exact-user lifecycle authority retained continuously from release through
+/// the local transition. Its identity fields prevent another Store target's
+/// otherwise opaque mutex guard from being substituted.
+pub(crate) struct StoreAdvisoryReleaseLifecycle {
+    _guard: OwnedMutexGuard<()>,
+    user_id: UserId,
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+}
+
+/// Inactive proof that the exact released advisory target reopened both local
+/// admission gates together. It carries no connection, capture selector,
+/// provider, acknowledgement, task, or serving operation.
+pub(crate) struct StoreAdvisoryResumedTarget {
+    _store: Arc<Store>,
+    _user_id: UserId,
+    _archive_id: crate::archive_v3::ArchiveId,
+    _operation_id: MaintenanceImportOperationId,
+    _source: MaintenanceSourceBinding,
 }
 
 #[cfg(test)]
@@ -1641,9 +1671,23 @@ impl std::fmt::Debug for StoreAdvisoryCaptureTarget {
     }
 }
 
+impl std::fmt::Debug for StoreAdvisoryResumedTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreAdvisoryResumedTarget(<opaque-inactive>)")
+    }
+}
+
 impl StoreAdvisoryCaptureTarget {
-    pub(crate) async fn acquire_advisory_release_lifecycle(&self) -> Result<OwnedMutexGuard<()>> {
-        self._store.lock_user_lifecycle(&self._user_id).await
+    pub(crate) async fn acquire_advisory_release_lifecycle(
+        &self,
+    ) -> Result<StoreAdvisoryReleaseLifecycle> {
+        let guard = self._store.lock_user_lifecycle(&self._user_id).await?;
+        Ok(StoreAdvisoryReleaseLifecycle {
+            _guard: guard,
+            user_id: self._user_id.clone(),
+            archive_id: self._archive_id,
+            operation_id: self._operation_id,
+        })
     }
 
     fn exact_marker_name_and_stage(
@@ -1770,10 +1814,82 @@ impl StoreAdvisoryCaptureTarget {
             Err(error) => Err(error),
         }
     }
+
+    /// Reopen both process-local legacy admission gates only for the exact
+    /// terminal release while continuously owning the user's lifecycle lock.
+    /// The two gate locks are held together, so no caller can observe a
+    /// half-resumed Store. There is no provider or local database I/O.
+    pub(crate) async fn resume_advisory_local_admission(
+        &self,
+        released: &AdvisoryRelease,
+        lifecycle: StoreAdvisoryReleaseLifecycle,
+    ) -> Result<StoreAdvisoryResumedTarget> {
+        let (_, stage) = self.exact_marker_name_and_stage(released)?;
+        if stage != AdvisoryReleaseStoreStage::Released
+            || lifecycle.user_id != self._user_id
+            || lifecycle.archive_id != self._archive_id
+            || lifecycle.operation_id != self._operation_id
+        {
+            return Err(EnclaveError::Conflict(
+                "advisory local release target changed".into(),
+            ));
+        }
+
+        let mut registry = self._store.registry.lock().await;
+        let mut barrier = self
+            ._store
+            .content_write_barrier
+            .state
+            .lock()
+            .expect("content barrier poisoned");
+        let registry_blocked = registry.blocked_users.contains(&self._user_id);
+        let content_blocked = barrier.blocked_users.contains(&self._user_id);
+        if registry_blocked != content_blocked
+            || registry.open_users.contains_key(&self._user_id)
+            || barrier
+                .active_writes
+                .get(&self._user_id)
+                .copied()
+                .unwrap_or(0)
+                != 0
+        {
+            return Err(EnclaveError::Conflict(
+                "advisory local release gates changed".into(),
+            ));
+        }
+        registry.blocked_users.remove(&self._user_id);
+        barrier.blocked_users.remove(&self._user_id);
+        drop(barrier);
+        drop(registry);
+        self._store.content_write_barrier.changed.notify_waiters();
+        self._store.registry_changed.notify_waiters();
+
+        Ok(StoreAdvisoryResumedTarget {
+            _store: Arc::clone(&self._store),
+            _user_id: self._user_id.clone(),
+            _archive_id: self._archive_id,
+            _operation_id: self._operation_id,
+            _source: self._source,
+        })
+    }
 }
 
 #[cfg(test)]
 impl StoreAdvisoryCaptureTarget {
+    pub(crate) fn exact_identity_for_test(
+        &self,
+        user_id: &str,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> bool {
+        self._user_id == user_id
+            && self._archive_id == archive_id
+            && self._operation_id == operation_id
+    }
+}
+
+#[cfg(test)]
+impl StoreAdvisoryResumedTarget {
     pub(crate) fn exact_identity_for_test(
         &self,
         user_id: &str,
@@ -3747,27 +3863,23 @@ impl Store {
         }
     }
 
-    /// Acquire every process-local single-user gate before the permanent
-    /// archive fence is allowed to reach the provider. The input is a
+    /// Acquire the exact user's lifecycle gate without changing local
+    /// admission. The caller must recheck terminal Control state while this
+    /// value is alive, then consume it through `begin`. The input is a
     /// non-cloneable encrypted-control capability, never a raw user/archive
     /// pair. This method is intentionally not wired to production startup.
-    pub(crate) async fn begin_archive_maintenance(
+    pub(crate) async fn acquire_archive_maintenance_admission(
         self: &Arc<Self>,
         _token: crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext,
         plan: AuthenticatedMaintenanceImportPlan,
-    ) -> Result<ArchiveMaintenanceTransition> {
+    ) -> Result<ArchiveMaintenanceAdmission> {
         let plan = plan.into_store_view(StoreMaintenanceContext(()));
         validate_user_id(&plan.user_id)?;
         let lifecycle_guard = self.lock_user_lifecycle(&plan.user_id).await?;
-        self.block_content_writes_for_deletion(&plan.user_id).await;
-        let actor = self.actor_for_deletion(&plan.user_id).await;
-        let state = Arc::clone(&actor.state).lock_owned().await;
-        Ok(ArchiveMaintenanceTransition {
+        Ok(ArchiveMaintenanceAdmission {
             store: Arc::clone(self),
             plan,
-            _lifecycle_guard: lifecycle_guard,
-            actor,
-            state,
+            lifecycle_guard,
         })
     }
 
@@ -5367,6 +5479,28 @@ impl IdentityRebindTransition {
             barrier.blocked_users.remove(&self.stable_user_id);
         }
         self.store.content_write_barrier.changed.notify_waiters();
+    }
+}
+
+impl ArchiveMaintenanceAdmission {
+    /// Close and drain both local admission paths only after the caller has
+    /// performed its final Control check under this same lifecycle guard.
+    pub(crate) async fn begin(self) -> ArchiveMaintenanceTransition {
+        let Self {
+            store,
+            plan,
+            lifecycle_guard,
+        } = self;
+        store.block_content_writes_for_deletion(&plan.user_id).await;
+        let actor = store.actor_for_deletion(&plan.user_id).await;
+        let state = Arc::clone(&actor.state).lock_owned().await;
+        ArchiveMaintenanceTransition {
+            store,
+            plan,
+            _lifecycle_guard: lifecycle_guard,
+            actor,
+            state,
+        }
     }
 }
 
@@ -14514,13 +14648,27 @@ pub(crate) mod tests {
         assert_eq!(gcs.exact_generation_count(&object_name), 1);
 
         let plan = maintenance_test_plan(user_id);
-        let mut transition = store
-            .begin_archive_maintenance(
+        let admission = store
+            .acquire_archive_maintenance_admission(
                 crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
                 plan,
             )
             .await
             .unwrap();
+        // Lifecycle acquisition alone must not close either local admission
+        // path. Control performs its final terminal-release check here.
+        store.with_user(user_id, |_| Ok(())).await.unwrap();
+        let content_lease = store.acquire_content_write(user_id).await.unwrap();
+        drop(content_lease);
+        let mut transition = admission.begin().await;
+        assert!(matches!(
+            store.with_user(user_id, |_| Ok(())).await,
+            Err(EnclaveError::Auth(_))
+        ));
+        assert!(matches!(
+            store.acquire_content_write(user_id).await,
+            Err(EnclaveError::Auth(_))
+        ));
         let tentative = transition.tentative_source().await.unwrap();
         assert!(tentative.base_generation > 0);
         assert_eq!(tentative.sqlite_schema_version, 0);
@@ -14586,12 +14734,14 @@ pub(crate) mod tests {
             .unwrap();
         store.save_user(user_id).await.unwrap();
         let mut transition = store
-            .begin_archive_maintenance(
+            .acquire_archive_maintenance_admission(
                 crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
                 maintenance_test_plan(user_id),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .begin()
+            .await;
         let tentative = transition.tentative_source().await.unwrap();
         let pinned = match transition.fence_and_pin(tentative).await.unwrap() {
             MaintenanceFenceAndPin::Pinned(pinned) => pinned,
@@ -14604,12 +14754,14 @@ pub(crate) mod tests {
 
         let restarted = Arc::new(Store::new(Arc::new(FakeKms), gcs.clone()));
         let transition = restarted
-            .begin_archive_maintenance(
+            .acquire_archive_maintenance_admission(
                 crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
                 maintenance_test_plan(user_id),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .begin()
+            .await;
         let recovered = transition.recover_pinned(source).await.unwrap();
         recovered
             .exact_generation_revalidation()
@@ -14622,12 +14774,14 @@ pub(crate) mod tests {
         gcs.vanish_next_exact_generation_get(&gcs_object_name(user_id), source_view.generation);
         let second_restart = Arc::new(Store::new(Arc::new(FakeKms), gcs));
         let transition = second_restart
-            .begin_archive_maintenance(
+            .acquire_archive_maintenance_admission(
                 crate::archive_v3_maintenance_import::MaintenanceCoordinatorContext::for_test(),
                 maintenance_test_plan(user_id),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .begin()
+            .await;
         assert!(transition.recover_pinned(source).await.is_err());
     }
 

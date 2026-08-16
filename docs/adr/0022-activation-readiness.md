@@ -18,9 +18,10 @@ claim production evidence.
   the exact maintenance lease, scrub its scratch family, and drop its owned Store guard values.
   The permanent legacy provider fence and process-local Store/barrier blocks remain fail-closed.
   A reviewed inactive Store-owned executor now consumes the Control advisory-release ledger and
-  reconciles deletion of only the exact permanent marker generation. Its terminal state leaves
-  every process-local block closed; a separate race-free local unblock transition is still
-  required before legacy serving can resume.
+  reconciles deletion of only the exact permanent marker generation. A separate consuming local-
+  resume transition freshly reauthenticates the frozen witness and exact terminal Control row
+  under the same user lifecycle lock, then reopens both process-local gates together without
+  provider or database I/O. It is still private and has no production caller.
   Its opaque handoff cannot request `WalAuthoritative` or change serving acknowledgements. Direct
   use of the existing authority importer after release is fenced; a separately reviewed Phase-2
   acquisition transition is still required.
@@ -52,8 +53,12 @@ claim production evidence.
   and reconciles a lost response only through fresh exact-name absence. Release and maintenance
   serialize on the same one-user lifecycle lock; maintenance plan adoption plus a post-lock
   Control check rejects started release before provider I/O, and release freshly matches the
-  retained advisory witness before Control prepare. It has no list/put/broad-
-  delete capability. No Store unblock, capture selector, startup, route, or task invokes this path.
+  retained advisory witness before Control prepare. Maintenance now performs that post-lock
+  check before closing either local gate, so a stale waiter cannot leave Store reblocked after
+  terminal resume. Local resume repeats the exact witness and release reads, rejects partial gate/
+  active-handle or writer state, and clears registry plus raw-content admission under both locks.
+  It has no list/get/put/delete capability. No capture selector, startup, route, or task invokes
+  this path.
 
 ## Activation decision
 
@@ -62,7 +67,7 @@ reviewed activation change and production evidence**.
 
 | Boundary | Current state | Required before activation |
 |---|---|---|
-| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap plus inactive exact advisory-owner acquisition/heartbeat/expiry-reacquire exist. Store's inactive capture injection is exact-one-user and production-unconstructible; the parity terminal hands the owner a sealed exact Store/user/archive/import target. The release ledger and Store-owned executor now durably freeze succession, authenticate/delete only the exact marker generation, and prove exact-name absence, including lost-response recovery. Store/barrier blocks remain fail-closed because local unblock is deliberately absent. There is still no live caller or post-bootstrap comparison owner. | Add the race-free local unblock transition, then owner-only capture installation/drain and independent comparison; require an explicit canary scope; shadow failure cannot alter latency, response, retry, or stored legacy result. |
+| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap plus inactive exact advisory-owner acquisition/heartbeat/expiry-reacquire exist. Store's inactive capture injection is exact-one-user and production-unconstructible; the parity terminal hands the owner a sealed exact Store/user/archive/import target. The release ledger and Store-owned executor durably freeze succession, authenticate/delete only the exact marker generation, and prove exact-name absence, including lost-response recovery. The separate local transition now reopens both process-local legacy gates atomically only after fresh exact witness/Control authentication, and stale maintenance cannot reblock them. There is still no live caller, owner-installed capture, or post-bootstrap comparison owner. | Add owner-only capture installation/drain and independent comparison; require an explicit canary scope; shadow failure cannot alter latency, response, retry, or stored legacy result. |
 | Enabled mutation set | Reviewed sealed subset only | Select an exact canary operation allowlist. Every enabled path must supply its stable identity and typed plan; unsupported audio/person/identity/voice, screen-person, generic/audio/finalization Vertex-begin, and other unreviewed semantics stay disabled or receive their own review first. |
 | External attempts | Provider-neutral seams only where reviewed | For any enabled provider-writing domain, construct only the reviewed KMS/provider adapter and preserve durable B send identity, one-shot execution, exact readback, C definitive-rejection, and manual handling of ambiguity. |
 | Runtime ownership | Private inactive Phase-1 lease-lifecycle owner and separate authoritative launcher; advisory release cannot enter the existing authority importer | Add owner-only capture, then prove one archive/one owner, maintenance-window and zero-serving-replica preconditions, restart ownership, a distinct exact Phase-2 authority acquisition, drain/handoff behavior, and no second Store/runtime authority. |

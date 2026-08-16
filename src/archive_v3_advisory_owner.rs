@@ -9,12 +9,13 @@
 //! initial witness transaction, and adopts only exact one-step acquisition,
 //! heartbeat, or post-expiry reacquire successors. It is deliberately separate
 //! from the `WalAuthoritative` publisher. It retains one sealed exact-user
-//! Store target but cannot inspect or operate it, and exposes no capture, root,
-//! object, cipher, acknowledgement, route, task, configuration, or serving
-//! capability. A separate inactive release path lets only the retained exact-
-//! user Store target observe and delete its one permanent marker after Control
-//! durably freezes the owner. It confirms exact-name absence but deliberately
-//! leaves every process-local Store/barrier block closed.
+//! Store target and exposes no capture, root, object, cipher, acknowledgement,
+//! route, task, configuration, or serving capability. A separate inactive
+//! release path lets only that target observe and delete its one permanent
+//! marker after Control durably freezes the owner. Provider confirmation leaves
+//! local gates closed; a second consuming terminal transition freshly
+//! reauthenticates witness and Control state before reopening both gates
+//! together and returning only an opaque inactive target.
 
 use std::{fmt, sync::Arc};
 
@@ -507,6 +508,7 @@ type AdvisoryFenceObservationControlView = (
 
 /// Opaque exact release row. It is deliberately non-cloneable: future Store
 /// release work must retain the one authenticated value supplied by Control.
+#[derive(PartialEq, Eq)]
 pub(crate) struct AdvisoryRelease {
     archive_id: ArchiveId,
     operation_id: MaintenanceImportOperationId,
@@ -1389,7 +1391,16 @@ struct SingleArchiveAdvisoryOwner {
 struct ReleasedSingleArchiveAdvisoryOwner {
     _owner: SingleArchiveAdvisoryOwner,
     _release: AdvisoryRelease,
-    _release_lifecycle_guard: tokio::sync::OwnedMutexGuard<()>,
+    _release_lifecycle_guard: crate::store::StoreAdvisoryReleaseLifecycle,
+}
+
+/// Terminal inactive owner after the exact provider and both process-local
+/// legacy fences are released. The nested owner remains unreachable, and the
+/// Store result has no capture, connection, acknowledgement, or serving API.
+struct LocallyResumedSingleArchiveAdvisoryOwner {
+    _owner: SingleArchiveAdvisoryOwner,
+    _release: AdvisoryRelease,
+    _resumed_target: crate::store::StoreAdvisoryResumedTarget,
 }
 
 impl SingleArchiveAdvisoryOwner {
@@ -1695,6 +1706,48 @@ impl SingleArchiveAdvisoryOwner {
     }
 }
 
+impl ReleasedSingleArchiveAdvisoryOwner {
+    /// Consume the provider-terminal owner into a process-local resumed
+    /// state. A fresh exact witness and Control release read are required
+    /// while the same Store lifecycle gate remains continuously owned.
+    async fn resume_local_admission(self) -> Result<LocallyResumedSingleArchiveAdvisoryOwner> {
+        let Self {
+            _owner: owner,
+            _release: release,
+            _release_lifecycle_guard: lifecycle,
+        } = self;
+        let current = owner
+            ._runtime
+            .read_advisory_owner_current_exact(
+                &AdvisoryOwnerRuntimeContext(()),
+                owner._bound.observed().archive_id(),
+            )
+            .await
+            .map_err(|_| AdvisoryOwnerError::Publication)?;
+        if current != *owner._bound.observed() {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let retained = owner
+            ._control
+            .load_advisory_release(AdvisoryOwnerRuntimeContext(()), &owner._bound)
+            .await?
+            .ok_or(AdvisoryOwnerError::Conflict)?;
+        if retained.stage != AdvisoryReleaseStage::Released || retained != release {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        let resumed_target = owner
+            ._capture_target
+            .resume_advisory_local_admission(&retained, lifecycle)
+            .await
+            .map_err(map_advisory_store_error)?;
+        Ok(LocallyResumedSingleArchiveAdvisoryOwner {
+            _owner: owner,
+            _release: retained,
+            _resumed_target: resumed_target,
+        })
+    }
+}
+
 fn map_advisory_store_error(error: crate::error::EnclaveError) -> AdvisoryOwnerError {
     match error {
         crate::error::EnclaveError::Auth(_)
@@ -1716,11 +1769,20 @@ impl fmt::Debug for ReleasedSingleArchiveAdvisoryOwner {
     }
 }
 
+impl fmt::Debug for LocallyResumedSingleArchiveAdvisoryOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LocallyResumedSingleArchiveAdvisoryOwner(<inactive>)")
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct AdvisoryOwnerTestHandle(SingleArchiveAdvisoryOwner);
 
 #[cfg(test)]
 pub(crate) struct ReleasedAdvisoryOwnerTestHandle(ReleasedSingleArchiveAdvisoryOwner);
+
+#[cfg(test)]
+pub(crate) struct LocallyResumedAdvisoryOwnerTestHandle(LocallyResumedSingleArchiveAdvisoryOwner);
 
 #[cfg(test)]
 impl AdvisoryOwnerTestHandle {
@@ -1827,6 +1889,29 @@ impl ReleasedAdvisoryOwnerTestHandle {
     pub(crate) fn is_released(&self) -> bool {
         self.0._release.stage == AdvisoryReleaseStage::Released
     }
+
+    pub(crate) async fn resume_local_admission(
+        self,
+    ) -> Result<LocallyResumedAdvisoryOwnerTestHandle> {
+        self.0
+            .resume_local_admission()
+            .await
+            .map(LocallyResumedAdvisoryOwnerTestHandle)
+    }
+}
+
+#[cfg(test)]
+impl LocallyResumedAdvisoryOwnerTestHandle {
+    pub(crate) fn has_exact_resumed_target(
+        &self,
+        user_id: &str,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> bool {
+        self.0
+            ._resumed_target
+            .exact_identity_for_test(user_id, archive_id, operation_id)
+    }
 }
 
 #[cfg(test)]
@@ -1838,6 +1923,13 @@ impl fmt::Debug for AdvisoryOwnerTestHandle {
 
 #[cfg(test)]
 impl fmt::Debug for ReleasedAdvisoryOwnerTestHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for LocallyResumedAdvisoryOwnerTestHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }

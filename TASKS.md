@@ -599,6 +599,18 @@ separate activation blockers.
     intentionally leaves Store/barrier admission blocked; local unblock,
     capture installation/comparison, startup, serving, route, task, cloud, and
     deployment authority remain absent.
+  - [x] Add the separate inactive race-free local-resume transition. Maintenance
+    now acquires only the exact-user lifecycle gate, repeats the terminal-release
+    absence check while holding it, and only then closes Store/barrier admission;
+    a stale waiter cannot reblock the user after release. The consuming terminal
+    advisory owner retains that same lifecycle authority, freshly exact-reads the
+    unchanged ShadowWal witness and full terminal Control row, and asks Store to
+    clear the registry and raw-content gates while holding both gate locks. A
+    partial gate state, open handle, active raw writer, changed witness, changed
+    release, or wrong target fails closed. Exact reopen is idempotent and performs
+    no provider/database I/O. The returned opaque target has no Store connection,
+    capture selector, provider, acknowledgement, task, route, startup, serving,
+    cloud, or deployment authority; owner-only capture/drain/comparison is next.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

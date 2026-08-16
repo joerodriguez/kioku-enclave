@@ -16,8 +16,8 @@
 //! ShadowWal, releases only that exact maintenance lease, drops its owned Store
 //! guards, and cannot request the later WalAuthoritative transition. The
 //! permanent legacy provider fence and fail-closed Store/barrier blocks remain
-//! until a separately reviewed advisory-release protocol restores legacy
-//! authority.
+//! until the separately reviewed inactive advisory release and exact local-
+//! resume transitions restore legacy admission; neither has a live caller.
 
 use std::{
     fmt,
@@ -1061,17 +1061,19 @@ impl SingleArchiveMaintenanceImporter {
             return Err(MaintenanceImportError::Conflict);
         }
 
-        let mut transition = store
-            .begin_archive_maintenance(MaintenanceCoordinatorContext(()), plan)
+        let admission = store
+            .acquire_archive_maintenance_admission(MaintenanceCoordinatorContext(()), plan)
             .await
             .map_err(|_| MaintenanceImportError::Unavailable)?;
-        // Pair this final Control check with Store's per-user lifecycle lock.
-        // The inactive release executor takes the same lock before preparing
-        // its durable row, so neither same-process path can recreate/delete
-        // the marker across the other's admission decision.
+        // Pair this final Control check with Store's per-user lifecycle lock,
+        // before either local admission gate is changed. The inactive release
+        // executor takes the same lock before preparing its durable row and
+        // keeps it through local resume, so a stale waiter cannot recreate the
+        // marker or leave Store reblocked after terminal release.
         persistence
             .ensure_advisory_release_absent(operation_id)
             .await?;
+        let mut transition = admission.begin().await;
         let pinned = if matches!(
             record.stage,
             MaintenanceImportStage::Prepared | MaintenanceImportStage::Fencing
@@ -3955,7 +3957,7 @@ mod tests {
         // fence. An advisory restart reacquires and revalidates the exact
         // legacy source, observes the already-released witness, and remints no
         // serving or release authority.
-        // Obtain two restart handoffs before any is allowed to acquire the
+        // Obtain three restart handoffs before any is allowed to acquire the
         // later live advisory owner; this models restart/lost-local-result
         // recovery without rerunning maintenance after the marker is absent.
         let restart_plan = control
@@ -3994,6 +3996,25 @@ mod tests {
                 Arc::clone(&control),
                 Arc::clone(&store),
                 release_restart_plan,
+            )
+            .unwrap(),
+        )
+        .run()
+        .await
+        .unwrap();
+        let resume_restart_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let resume_restart = SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(
+            SingleArchiveMaintenanceImporter::from_test_components(
+                archive_id,
+                Arc::clone(&objects),
+                Arc::clone(&registry_provider),
+                witness.clone(),
+                Arc::clone(&control),
+                Arc::clone(&store),
+                resume_restart_plan,
             )
             .unwrap(),
         )
@@ -4147,12 +4168,46 @@ mod tests {
             store.with_user(&user.id, |_| Ok(())).await,
             Err(EnclaveError::Auth(_))
         ));
-        drop(release_reopened);
+        witness
+            .inner
+            .replace_current_for_test(
+                second_heartbeat.with_deletion_for_test(DeletionState::Tombstoned),
+            )
+            .unwrap();
+        assert!(matches!(
+            release_reopened.resume_local_admission().await,
+            Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+        ));
+        assert!(matches!(
+            store.with_user(&user.id, |_| Ok(())).await,
+            Err(EnclaveError::Auth(_))
+        ));
+        witness
+            .inner
+            .replace_current_for_test(second_heartbeat)
+            .unwrap();
+        let resumed_owner =
+            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(resume_restart)
+                .await
+                .unwrap()
+                .release_legacy_fence()
+                .await
+                .unwrap()
+                .resume_local_admission()
+                .await
+                .unwrap();
+        assert!(resumed_owner.has_exact_resumed_target(&user.id, archive_id, operation_id));
+        assert_eq!(legacy_gcs.operation_counts(), (0, 0));
+        assert_eq!(legacy_gcs.live_get_count(), live_gets_before_reopen);
+        let content_lease = store.acquire_content_write(&user.id).await.unwrap();
+        drop(content_lease);
+        store.with_user(&user.id, |_| Ok(())).await.unwrap();
 
         // Selecting the later authority importer against a completed advisory
         // terminal fails closed. A separately reviewed Phase-2 transition
         // must define how it acquires new authority; the advisory type cannot
-        // silently continue into R2.
+        // silently continue into R2. Its rejection also cannot re-close either
+        // local gate after the exact terminal resume.
         let authority = SingleArchiveMaintenanceImporter::from_test_components(
             archive_id,
             Arc::clone(&objects),
@@ -4166,6 +4221,9 @@ mod tests {
         .run()
         .await;
         assert!(matches!(authority, Err(MaintenanceImportError::Conflict)));
+        store.with_user(&user.id, |_| Ok(())).await.unwrap();
+        let content_lease = store.acquire_content_write(&user.id).await.unwrap();
+        drop(content_lease);
         assert!(matches!(
             control
                 .prepare_archive_v3_maintenance_import(&user.id)
@@ -4321,8 +4379,10 @@ mod tests {
             .prepare_archive_v3_maintenance_import(&user.id)
             .await
             .unwrap();
-        let blocked = store
-            .begin_archive_maintenance(MaintenanceCoordinatorContext::for_test(), blocked_plan);
+        let blocked = store.acquire_archive_maintenance_admission(
+            MaintenanceCoordinatorContext::for_test(),
+            blocked_plan,
+        );
         assert!(tokio::time::timeout(Duration::from_millis(25), blocked)
             .await
             .is_err());
