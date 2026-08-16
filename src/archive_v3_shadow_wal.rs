@@ -22,7 +22,8 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -44,7 +45,10 @@ use crate::{
         recover_checkpoint_from_recovery_root, ExactImmutableObjectBackend, ShadowCheckpointError,
         ShadowObjectStaging, TmpfsCheckpointSink, UploadedCheckpoint,
     },
-    archive_v3_shadow_parity::OwnedPrivateStagedSqliteCopy,
+    archive_v3_shadow_parity::{
+        OwnedPrivateStagedSqliteCopy, PrivateStagedSqliteCopy, ShadowParityResult,
+        ShadowParityRunControl, ShadowParityVerifier,
+    },
     archive_v3_witness::{
         DeletionState, MigrationState, RecoveryRoot, RootCommitment, RootReference, WitnessLease,
         WitnessRecord,
@@ -82,6 +86,9 @@ pub enum ShadowWalError {
 }
 
 pub type Result<T> = std::result::Result<T, ShadowWalError>;
+
+const ADVISORY_CAPTURE_PARITY_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-captured-prefix-parity/v1\0";
 
 /// Opaque description of immutable objects that were sealed and then read
 /// back successfully. It has no authority until a separately authenticated
@@ -931,6 +938,178 @@ impl std::fmt::Debug for RecoveredMaintenanceStaging {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RecoveredMaintenanceStaging(<redacted>)")
     }
+}
+
+/// Replay one complete advisory capture prefix onto an independently
+/// recovered R1 staging copy. The prefix must begin at frame one of capture
+/// generation one and remain strictly contiguous; a missing earlier frame or
+/// generation therefore fails closed instead of being applied to the wrong
+/// base. Every generation is checkpointed and its sidecars are removed before
+/// the staging identity is rebound for parity.
+pub(crate) async fn replay_advisory_captured_prefix(
+    mut recovered: RecoveredMaintenanceStaging,
+    commits: &[CapturedWalCommit],
+    token: crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+) -> Result<RecoveredMaintenanceStaging> {
+    validate_advisory_captured_prefix(commits)?;
+    let path = recovered
+        .owned
+        .path_for_advisory_comparison(token)
+        .map_err(|_| ShadowWalError::CompositeRecovery)?
+        .to_path_buf();
+    let mut sink = CompositeWalRecoverySink::new(path);
+    let mut active_generation = None;
+    let mut after_logical_file_length = recovered.recovered.logical_file_length;
+    for (index, commit) in commits.iter().enumerate() {
+        let validation_sequence = recovered
+            .recovered
+            .root_seq
+            .checked_add(u64::try_from(index).map_err(|_| ShadowWalError::CompositeRecovery)?)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ShadowWalError::CompositeRecovery)?;
+        commit
+            .validate_segments(validation_sequence)
+            .map_err(|_| ShadowWalError::CompositeRecovery)?;
+        if active_generation != Some(commit.wal_generation()) {
+            if active_generation.is_some() {
+                sink.finish_generation(after_logical_file_length).await?;
+            }
+            sink.begin_generation(
+                commit.wal_generation(),
+                commit.replay_header(),
+                after_logical_file_length,
+            )
+            .await?;
+            active_generation = Some(commit.wal_generation());
+        }
+        sink.write_wal_frames(commit.first_frame_no(), commit.replay_frames())
+            .await?;
+        after_logical_file_length = commit
+            .effective_logical_file_length(validation_sequence)
+            .map_err(|_| ShadowWalError::CompositeRecovery)?;
+    }
+    sink.finish_generation(after_logical_file_length).await?;
+    recovered
+        .owned
+        .refresh_after_advisory_replay(token)
+        .map_err(|_| ShadowWalError::CompositeRecovery)?;
+    recovered.recovered.logical_file_length = after_logical_file_length;
+    Ok(recovered)
+}
+
+fn validate_advisory_captured_prefix(commits: &[CapturedWalCommit]) -> Result<()> {
+    let first = commits.first().ok_or(ShadowWalError::CompositeRecovery)?;
+    if first.wal_generation() != 1 || first.first_frame_no() != 1 {
+        return Err(ShadowWalError::CompositeRecovery);
+    }
+    for pair in commits.windows(2) {
+        let previous = &pair[0];
+        let commit = &pair[1];
+        let same_generation = commit.wal_generation() == previous.wal_generation()
+            && commit.first_frame_no()
+                == previous
+                    .first_frame_no()
+                    .checked_add(u64::from(previous.frame_count()))
+                    .ok_or(ShadowWalError::CompositeRecovery)?
+            && commit.replay_header() == previous.replay_header()
+            && commit.replay_checksum_before() == captured_terminal_checksum(previous)?;
+        let next_generation = previous
+            .wal_generation()
+            .checked_add(1)
+            .is_some_and(|generation| generation == commit.wal_generation())
+            && commit.first_frame_no() == 1;
+        if !same_generation && !next_generation {
+            return Err(ShadowWalError::CompositeRecovery);
+        }
+    }
+    Ok(())
+}
+
+/// Back up the already-pinned legacy transaction into a fresh cleanup-owned
+/// 0600 staging file and compare it with the replayed R1 copy. Raw paths,
+/// SQLite connections, commits, and individual parity dimensions never leave
+/// this worker boundary.
+pub(crate) fn compare_advisory_staged_snapshot(
+    snapshot: rusqlite::Connection,
+    recovered: RecoveredMaintenanceStaging,
+    commits: &[CapturedWalCommit],
+    token: crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+) -> Result<[u8; 32]> {
+    let primary = backup_advisory_snapshot(snapshot)?;
+    let primary_copy = PrivateStagedSqliteCopy::from_owned_maintenance_recovery(&primary)
+        .map_err(|_| ShadowWalError::CompositeRecovery)?;
+    let shadow_copy = PrivateStagedSqliteCopy::from_owned_maintenance_recovery(&recovered.owned)
+        .map_err(|_| ShadowWalError::CompositeRecovery)?;
+    let cancelled = AtomicBool::new(false);
+    let control =
+        ShadowParityRunControl::new(Instant::now() + Duration::from_secs(300), &cancelled);
+    let parity =
+        match ShadowParityVerifier::compare_staged_copies(&primary_copy, &shadow_copy, &control)
+            .map_err(|_| ShadowWalError::CompositeRecovery)?
+        {
+            ShadowParityResult::Match(digests) => digests.maintenance_commitment(),
+            ShadowParityResult::Mismatch(_) => return Err(ShadowWalError::CompositeRecovery),
+        };
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_CAPTURE_PARITY_DOMAIN);
+    hasher.update(
+        u32::try_from(commits.len())
+            .map_err(|_| ShadowWalError::CompositeRecovery)?
+            .to_be_bytes(),
+    );
+    for commit in commits {
+        hasher.update(commit.publication_commitment());
+    }
+    hasher.update(parity);
+    #[cfg(test)]
+    let cleanup_paths = [
+        primary.path_for_test().to_path_buf(),
+        recovered.owned.path_for_test().to_path_buf(),
+    ];
+    drop(recovered);
+    drop(primary);
+    #[cfg(test)]
+    for path in cleanup_paths {
+        assert!(!path.exists(), "comparison staging primary must be removed");
+        assert!(
+            !sqlite_sidecar_path(&path, "-wal").exists(),
+            "comparison staging WAL must be removed"
+        );
+        assert!(
+            !sqlite_sidecar_path(&path, "-shm").exists(),
+            "comparison staging SHM must be removed"
+        );
+    }
+    let _ = token;
+    Ok(hasher.finalize().into())
+}
+
+fn backup_advisory_snapshot(
+    snapshot: rusqlite::Connection,
+) -> Result<OwnedPrivateStagedSqliteCopy> {
+    let path = fresh_recovery_path()?;
+    let mut cleanup = CompositeRecoveryCleanup::new(path.clone());
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(
+        options
+            .open(&path)
+            .map_err(|_| ShadowWalError::CompositeRecovery)?,
+    );
+    snapshot
+        .backup("main", &path, None)
+        .map_err(|_| ShadowWalError::CompositeRecovery)?;
+    drop(snapshot);
+    let owned =
+        OwnedPrivateStagedSqliteCopy::from_recovery_proof(CompositeRecoveryProof::new(path))
+            .map_err(|_| ShadowWalError::CompositeRecovery)?;
+    cleanup.disarm();
+    Ok(owned)
 }
 
 pub(crate) async fn recover_owned_maintenance_staging(
@@ -3568,5 +3747,51 @@ mod tests {
         .unwrap();
         assert_eq!(shrink.candidate_root().checkpoint_logical_file_length, 4096);
         assert_eq!(shrink.candidate_root().logical_file_length, 4096);
+    }
+
+    #[test]
+    fn advisory_replay_prefix_requires_exact_generation_and_frame_continuity() {
+        assert!(matches!(
+            super::validate_advisory_captured_prefix(&[]),
+            Err(ShadowWalError::CompositeRecovery)
+        ));
+        assert!(super::validate_advisory_captured_prefix(&two_captured_commits()).is_ok());
+        assert!(super::validate_advisory_captured_prefix(&generation_rollover_commits()).is_ok());
+        let substituted = vec![captured_commit(1), captured_commit(1)];
+        assert!(matches!(
+            super::validate_advisory_captured_prefix(&substituted),
+            Err(ShadowWalError::CompositeRecovery)
+        ));
+
+        let exact = two_captured_commits();
+        let invalid_prefixes = [
+            vec![exact[0].clone().with_wal_generation_for_test(2)],
+            vec![exact[0].clone().with_first_frame_no_for_test(2)],
+            vec![exact[1].clone(), exact[0].clone()],
+            vec![
+                exact[0].clone(),
+                exact[1]
+                    .clone()
+                    .with_first_frame_no_for_test(exact[1].first_frame_no() + 1),
+            ],
+            vec![
+                exact[0].clone(),
+                exact[1].clone().with_replay_header_byte_for_test(0),
+            ],
+            vec![
+                exact[0].clone(),
+                exact[1].clone().with_checksum_before_for_test([0, 0]),
+            ],
+            vec![
+                exact[0].clone(),
+                exact[1].clone().with_wal_generation_for_test(3),
+            ],
+        ];
+        for invalid in invalid_prefixes {
+            assert!(matches!(
+                super::validate_advisory_captured_prefix(&invalid),
+                Err(ShadowWalError::CompositeRecovery)
+            ));
+        }
     }
 }

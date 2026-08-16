@@ -477,6 +477,28 @@ impl OwnedPrivateStagedSqliteCopy {
         &self.copy
     }
 
+    /// Advisory-comparison-only access to the cleanup-owned staging path.
+    /// The unforgeable owner token keeps the path inside the private replay
+    /// worker; no Store, route, or provider adapter can obtain it.
+    pub(crate) fn path_for_advisory_comparison(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+    ) -> Result<&Path, ShadowParityError> {
+        self.copy.validate_unchanged()?;
+        Ok(&self.copy.path)
+    }
+
+    /// Rebind the private identity after the owner worker has replayed one
+    /// authenticated captured prefix and removed every SQLite sidecar. The
+    /// cleanup owner and path are unchanged.
+    pub(crate) fn refresh_after_advisory_replay(
+        &mut self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+    ) -> Result<(), ShadowParityError> {
+        self.copy.identity = staged_identity(&self.copy.path)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn path_for_test(&self) -> &Path {
         &self.copy.path

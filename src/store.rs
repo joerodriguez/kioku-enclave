@@ -674,6 +674,131 @@ pub(crate) struct StoreAdvisoryCapturedDrain {
     _drain: OwnedAdvisoryCapturedDrain,
 }
 
+/// Token minted only inside Store when an advisory owner consumes an opaque
+/// snapshot/drain pair into the private comparison worker.
+#[derive(Clone, Copy)]
+pub(crate) struct StoreAdvisoryComparisonContext(());
+
+#[cfg(test)]
+impl StoreAdvisoryComparisonContext {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct AdvisoryComparisonStall {
+    entered: tokio::sync::Semaphore,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl AdvisoryComparisonStall {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: tokio::sync::Semaphore::new(0),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("comparison stall remains open")
+            .forget();
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().expect("comparison stall lock") = true;
+        self.release.notify_all();
+    }
+
+    fn block_after_parity(&self) {
+        self.entered.add_permits(1);
+        let mut released = self.released.lock().expect("comparison stall lock");
+        while !*released {
+            released = self.release.wait(released).expect("comparison stall wait");
+        }
+    }
+}
+
+/// Content-free result of the owner-private local replay and parity worker.
+/// It exposes no SQLite connection, path, captured bytes, row data, or
+/// individual parity dimension.
+pub(crate) struct StoreAdvisoryComparisonEvidence([u8; 32]);
+
+impl StoreAdvisoryComparisonEvidence {
+    fn from_restored(
+        commitment: [u8; 32],
+        _restored: crate::archive_v3_sqlite_vfs::AdvisoryComparisonRestored,
+    ) -> Self {
+        Self(commitment)
+    }
+
+    pub(crate) const fn commitment_for_advisory_owner(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+    ) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for StoreAdvisoryComparisonEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreAdvisoryComparisonEvidence(<opaque>)")
+    }
+}
+
+impl StoreAdvisoryCapturedDrain {
+    /// Consume the opaque pair into one owned task. Caller cancellation cannot
+    /// detach the plaintext staging files or captured clone: the task retains
+    /// their cleanup owners. A live registration restores the original prefix
+    /// before evidence; concurrent retirement instead scrubs and fails closed.
+    pub(crate) async fn compare_recovered_advisory(
+        self,
+        token: crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+        recovered: crate::archive_v3_shadow_wal::RecoveredMaintenanceStaging,
+    ) -> Result<StoreAdvisoryComparisonEvidence> {
+        let Self {
+            _snapshot: snapshot,
+            _drain: drain,
+        } = self;
+        tokio::spawn(async move {
+            let store_token = StoreAdvisoryComparisonContext(());
+            let commits = drain
+                .captured_prefix_for_comparison(store_token)
+                .map_err(|_| EnclaveError::Conflict("advisory comparison source changed".into()))?;
+            let commit_count = commits.len();
+            let recovered = crate::archive_v3_shadow_wal::replay_advisory_captured_prefix(
+                recovered, &commits, token,
+            )
+            .await
+            .map_err(|_| EnclaveError::Conflict("advisory replay failed".into()))?;
+            tokio::task::spawn_blocking(move || {
+                let commitment = crate::archive_v3_shadow_wal::compare_advisory_staged_snapshot(
+                    snapshot, recovered, &commits, token,
+                )
+                .map_err(|_| EnclaveError::Conflict("advisory parity failed".into()))?;
+                let restored = drain
+                    .restore_after_comparison(store_token, commit_count)
+                    .map_err(|_| {
+                        EnclaveError::Conflict("advisory comparison source retired".into())
+                    })?;
+                Ok(StoreAdvisoryComparisonEvidence::from_restored(
+                    commitment, restored,
+                ))
+            })
+            .await
+            .map_err(|_| EnclaveError::Store("advisory comparison task failed".into()))?
+        })
+        .await
+        .map_err(|_| EnclaveError::Store("advisory comparison owner failed".into()))?
+    }
+}
+
 #[cfg(test)]
 impl StoreWalAuthorityFence {
     pub(crate) fn scratch_family_absent_for_test(&self) -> bool {
@@ -2034,6 +2159,37 @@ impl StoreAdvisoryResumedTarget {
             .contains_stream_for_test(registration.stream_id())
             .then(|| registration.completed_len())
     }
+
+    pub(crate) async fn write_uncaptured_metadata_for_test(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let actor = {
+            let registry = self._store.registry.lock().await;
+            Arc::clone(
+                &registry
+                    .open_users
+                    .get(&self._user_id)
+                    .ok_or_else(|| EnclaveError::Conflict("test handle is unavailable".into()))?
+                    .actor,
+            )
+        };
+        let state = actor.state.lock().await;
+        let handle = state
+            .handle
+            .as_ref()
+            .ok_or_else(|| EnclaveError::Conflict("test handle is unavailable".into()))?;
+        let connection = Connection::open_with_flags(
+            &handle.temp_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.execute(
+            "INSERT OR REPLACE INTO app_metadata(key,value) VALUES(?1,?2)",
+            [key, value],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2052,6 +2208,49 @@ impl StoreAdvisoryCapturedDrain {
             .optional()
             .ok()
             .flatten()
+    }
+
+    pub(crate) async fn compare_recovered_advisory_stalled_for_test(
+        self,
+        token: crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+        recovered: crate::archive_v3_shadow_wal::RecoveredMaintenanceStaging,
+        stall: std::sync::Arc<AdvisoryComparisonStall>,
+    ) -> Result<StoreAdvisoryComparisonEvidence> {
+        let Self {
+            _snapshot: snapshot,
+            _drain: drain,
+        } = self;
+        tokio::spawn(async move {
+            let store_token = StoreAdvisoryComparisonContext(());
+            let commits = drain
+                .captured_prefix_for_comparison(store_token)
+                .map_err(|_| EnclaveError::Conflict("advisory comparison source changed".into()))?;
+            let commit_count = commits.len();
+            let recovered = crate::archive_v3_shadow_wal::replay_advisory_captured_prefix(
+                recovered, &commits, token,
+            )
+            .await
+            .map_err(|_| EnclaveError::Conflict("advisory replay failed".into()))?;
+            tokio::task::spawn_blocking(move || {
+                let commitment = crate::archive_v3_shadow_wal::compare_advisory_staged_snapshot(
+                    snapshot, recovered, &commits, token,
+                )
+                .map_err(|_| EnclaveError::Conflict("advisory parity failed".into()))?;
+                stall.block_after_parity();
+                let restored = drain
+                    .restore_after_comparison(store_token, commit_count)
+                    .map_err(|_| {
+                        EnclaveError::Conflict("advisory comparison source retired".into())
+                    })?;
+                Ok(StoreAdvisoryComparisonEvidence::from_restored(
+                    commitment, restored,
+                ))
+            })
+            .await
+            .map_err(|_| EnclaveError::Store("advisory comparison task failed".into()))?
+        })
+        .await
+        .map_err(|_| EnclaveError::Store("advisory comparison owner failed".into()))?
     }
 }
 

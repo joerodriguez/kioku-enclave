@@ -19,6 +19,8 @@
 //! result retains no database operation. The resumed owner can select only an
 //! opaque cancellation-safe capture prefix; it cannot inspect or settle it.
 
+mod comparison;
+
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
@@ -1373,6 +1375,12 @@ pub(crate) trait AdvisoryOwnerWitnessProvider: Send + Sync {
 #[derive(Clone, Copy)]
 pub(crate) struct AdvisoryOwnerRuntimeContext(());
 
+/// Token constructible only by this owner and its private comparison child.
+/// It gates exact recovery, local replay, and opaque evidence extraction
+/// without exposing any underlying provider or SQLite capability.
+#[derive(Clone, Copy)]
+pub(crate) struct AdvisoryComparisonContext(());
+
 /// Opaque owner capability. It intentionally has no operation method in this
 /// slice; owning it proves only that Control and the exact ShadowWal witness
 /// agree on one initial advisory lease.
@@ -1762,6 +1770,12 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
             .await
             .map_err(map_advisory_store_error)
     }
+
+    /// Run the owner-private, read-only advisory comparison. The returned
+    /// evidence is content-free and cannot settle the captured prefix.
+    async fn compare_captured_prefix(&self) -> Result<comparison::AdvisoryComparisonEvidence> {
+        comparison::compare_captured_prefix(self).await
+    }
 }
 
 fn map_advisory_store_error(error: crate::error::EnclaveError) -> AdvisoryOwnerError {
@@ -1940,6 +1954,33 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
         &self,
     ) -> Result<crate::store::StoreAdvisoryCapturedDrain> {
         self.0.begin_capture_drain().await
+    }
+
+    pub(crate) async fn compare_captured_prefix_for_test(&self) -> Result<String> {
+        self.0
+            .compare_captured_prefix()
+            .await
+            .map(|evidence| format!("{evidence:?}"))
+    }
+
+    pub(crate) async fn compare_captured_prefix_with_stall_for_test(
+        &self,
+        stall: Arc<crate::store::AdvisoryComparisonStall>,
+    ) -> Result<String> {
+        comparison::compare_captured_prefix_with_stall(&self.0, stall)
+            .await
+            .map(|evidence| format!("{evidence:?}"))
+    }
+
+    pub(crate) async fn write_uncaptured_metadata_for_test(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> crate::error::Result<()> {
+        self.0
+            ._resumed_target
+            .write_uncaptured_metadata_for_test(key, value)
+            .await
     }
 }
 

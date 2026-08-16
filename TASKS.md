@@ -634,6 +634,24 @@ separate activation blockers.
     replay, comparison result, settlement, acknowledgement, provider, task,
     route, startup, configuration, cloud, or deployment surface is exposed;
     independent replay/comparison remains next.
+  - [x] Add the inactive owner-private captured-prefix comparison worker. It
+    reauthenticates the exact maintenance source, released owner row, and
+    current ShadowWal witness before and after work; recovers only that
+    witness-nominated R1 graph; replays the complete generation/frame/checksum-
+    contiguous prefix onto cleanup-owned staging; backs up the already-pinned
+    legacy transaction into a separately created 0600 staging file; and runs
+    the existing full parity verifier. Caller cancellation leaves one owned
+    task responsible for staging cleanup, cloned capture bytes zeroize on task
+    exit, and an atomic exact-live restoration proof makes registration
+    retirement win cleanly before evidence can be minted. The only output is
+    a domain-separated non-cloneable opaque commitment. It cannot
+    settle the drain, so the exact prefix restores after every match, mismatch,
+    error, cancellation, or lost result while the registration remains live.
+    Fault regressions cover pre/post source, release, and witness changes,
+    capture-lineage substitution/gaps/reordering, parity mismatch, retirement,
+    caller cancellation, and primary/recovered staging cleanup. Durable comparison settlement,
+    restart reconciliation, acknowledgement, launcher/startup/route/config,
+    cloud, deployment, and serving authority remain next.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

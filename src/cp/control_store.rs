@@ -15694,6 +15694,62 @@ impl ControlStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn replace_advisory_release_commitment_for_test(
+        &self,
+        archive_id: ArchiveId,
+        replacement: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        self.write(move |conn| {
+            let stored: Vec<u8> = conn.query_row(
+                "SELECT commitment FROM archive_v3_advisory_releases WHERE archive_id=?1",
+                [archive_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            let stored = fixed_blob::<32>(&stored, "advisory release commitment")?;
+            if conn.execute(
+                "UPDATE archive_v3_advisory_releases SET commitment=?1 WHERE archive_id=?2",
+                rusqlite::params![replacement.as_slice(), archive_id.as_bytes().as_slice()],
+            )? != 1
+            {
+                return Err(EnclaveError::Conflict(
+                    "advisory release test mutation missed".into(),
+                ));
+            }
+            Ok(stored)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_maintenance_source_commitment_for_test(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        replacement: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        self.write(move |conn| {
+            let stored: Vec<u8> = conn.query_row(
+                "SELECT source_commitment FROM archive_v3_maintenance_imports
+                 WHERE operation_id=?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            let stored = fixed_blob::<32>(&stored, "maintenance source commitment")?;
+            if conn.execute(
+                "UPDATE archive_v3_maintenance_imports SET source_commitment=?1
+                 WHERE operation_id=?2",
+                rusqlite::params![replacement.as_slice(), operation_id.as_bytes().as_slice()],
+            )? != 1
+            {
+                return Err(EnclaveError::Conflict(
+                    "maintenance source test mutation missed".into(),
+                ));
+            }
+            Ok(stored)
+        })
+        .await
+    }
+
     pub fn new_with_store(
         kms: Arc<dyn KmsClient>,
         gcs: Arc<dyn GcsClient>,
