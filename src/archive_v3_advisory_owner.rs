@@ -1752,9 +1752,10 @@ impl ReleasedSingleArchiveAdvisoryOwner {
 }
 
 impl LocallyResumedSingleArchiveAdvisoryOwner {
-    /// Borrow the terminal owner to select the exact queued capture prefix.
-    /// The returned Store value is opaque and cancellation restores the
-    /// prefix; comparison and settlement are intentionally absent here.
+    /// Borrow the terminal owner to pin the exact legacy read snapshot and
+    /// select its queued capture prefix. The returned Store value is opaque
+    /// and cancellation restores the prefix; replay, comparison, and
+    /// settlement are intentionally absent here.
     async fn begin_capture_drain(&self) -> Result<crate::store::StoreAdvisoryCapturedDrain> {
         self._resumed_target
             .begin_advisory_capture_drain()

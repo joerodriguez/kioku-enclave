@@ -4237,6 +4237,12 @@ mod tests {
             exact_capture_count
         );
         assert_eq!(
+            capture_drain
+                .snapshot_metadata_value_for_test("advisory-capture")
+                .as_deref(),
+            Some("exact-user")
+        );
+        assert_eq!(
             resumed_owner.captured_commit_count_for_test().await,
             Some(0)
         );
@@ -4256,6 +4262,11 @@ mod tests {
             .await
             .expect("later exact-user commit remains in the live capture stream");
         assert!(later_capture_count > 0);
+        assert_eq!(
+            capture_drain.snapshot_metadata_value_for_test("advisory-capture-later"),
+            None,
+            "the read transaction must remain pinned before later exact-user commits"
+        );
         drop(capture_drain);
         assert_eq!(
             resumed_owner.captured_commit_count_for_test().await,

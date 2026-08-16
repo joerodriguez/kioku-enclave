@@ -665,10 +665,12 @@ pub(crate) struct StoreAdvisoryResumedTarget {
 }
 
 /// Opaque, cancellation-safe ownership of the exact captured prefix selected
-/// by the resumed advisory owner. This slice exposes no commit bytes or
-/// settlement operation; dropping it restores the prefix while the exact
-/// connection remains live.
+/// by the resumed advisory owner plus a read-only SQLite transaction pinned
+/// to the same exact-user state while the Store actor is serialized. This
+/// slice exposes neither input; dropping it releases the snapshot and restores
+/// the prefix while the exact connection remains live.
 pub(crate) struct StoreAdvisoryCapturedDrain {
+    _snapshot: Connection,
     _drain: OwnedAdvisoryCapturedDrain,
 }
 
@@ -1940,9 +1942,10 @@ impl StoreAdvisoryCaptureTarget {
 }
 
 impl StoreAdvisoryResumedTarget {
-    /// Select the complete prefix currently queued for the exact resumed user.
-    /// The Store never opens a connection for the owner: the user's existing
-    /// open handle must belong to the installed advisory capture registry.
+    /// Pin a read-only snapshot and select the complete prefix currently queued
+    /// for the exact resumed user while its actor is serialized. The Store
+    /// exposes neither connection to the owner: the user's existing writable
+    /// handle must belong to the installed advisory capture registry.
     pub(crate) async fn begin_advisory_capture_drain(&self) -> Result<StoreAdvisoryCapturedDrain> {
         let actor = {
             let registry = self._store.registry.lock().await;
@@ -1977,6 +1980,15 @@ impl StoreAdvisoryResumedTarget {
                 "advisory capture has no complete commit".into(),
             ));
         }
+        init_vec_extension();
+        let snapshot = Connection::open_with_flags(
+            &handle.temp_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        snapshot
+            .execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN DEFERRED;")?;
+        let _: i64 =
+            snapshot.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
         let session = crate::archive_v3_shadow_session::ShadowSessionId::for_operation(
             *self._operation_id.as_bytes(),
         )
@@ -1986,7 +1998,10 @@ impl StoreAdvisoryResumedTarget {
             .begin_drain(session, attempt)
             .and_then(|lease| lease.take_for_advisory())
             .map_err(|_| EnclaveError::Conflict("advisory capture drain unavailable".into()))?;
-        Ok(StoreAdvisoryCapturedDrain { _drain: drain })
+        Ok(StoreAdvisoryCapturedDrain {
+            _snapshot: snapshot,
+            _drain: drain,
+        })
     }
 }
 
@@ -2025,6 +2040,18 @@ impl StoreAdvisoryResumedTarget {
 impl StoreAdvisoryCapturedDrain {
     pub(crate) fn captured_commit_count_for_test(&self) -> usize {
         self._drain.captured_commit_count_for_test()
+    }
+
+    pub(crate) fn snapshot_metadata_value_for_test(&self, key: &str) -> Option<String> {
+        self._snapshot
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 }
 

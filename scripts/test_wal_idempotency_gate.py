@@ -2231,6 +2231,8 @@ impl X {
         ):
             self.assertNotIn(forbidden, local_executor)
         self.assertIn("struct StoreAdvisoryCapturedDrain", store_production)
+        self.assertIn("_snapshot: Connection", store_production)
+        self.assertIn("_drain: OwnedAdvisoryCapturedDrain", store_production)
         self.assertNotIn("impl StoreAdvisoryCapturedDrain", store_production)
         self.assertNotRegex(
             store_production,
@@ -2240,6 +2242,17 @@ impl X {
         self.assertIn("handle.user_id != self._user_id", drain_executor)
         self.assertIn("registration.belongs_to(&self._capture.registry)", drain_executor)
         self.assertIn("registration.completed_len() == 0", drain_executor)
+        self.assertIn("OpenFlags::SQLITE_OPEN_READ_ONLY", drain_executor)
+        self.assertIn("OpenFlags::SQLITE_OPEN_NO_MUTEX", drain_executor)
+        self.assertIn("&handle.temp_path", drain_executor)
+        self.assertIn("PRAGMA query_only=ON", drain_executor)
+        self.assertIn("PRAGMA trusted_schema=OFF", drain_executor)
+        self.assertIn("BEGIN DEFERRED", drain_executor)
+        self.assertIn("SELECT count(*) FROM sqlite_schema", drain_executor)
+        self.assertLess(
+            drain_executor.index("SELECT count(*) FROM sqlite_schema"),
+            drain_executor.index(".begin_drain(session, attempt)"),
+        )
         self.assertIn("ShadowSessionId::for_operation", drain_executor)
         self.assertIn("ShadowAttemptId::random()", drain_executor)
         self.assertIn(".begin_drain(session, attempt)", drain_executor)

@@ -612,7 +612,7 @@ separate activation blockers.
     holding both gate locks, so no legacy handle can open in an uncaptured gap;
     unrelated users remain on the ordinary VFS and capture-open failure still
     preserves legacy behavior. The returned opaque target retains only that
-    exact capture registry and has no Store connection, drain, provider,
+    exact capture registry and initially has no Store connection, drain, provider,
     acknowledgement, task, route, startup, serving, cloud, or deployment
     authority; owner-only drain/comparison is next.
   - [x] Add the inactive owner-only capture drain. The resumed advisory owner
@@ -622,9 +622,18 @@ separate activation blockers.
     and bytes retain their fixed queue reservation, so dropping it restores the
     full prefix ahead of captures observed later even if the later generation
     faults; stream retirement instead scrubs it. An empty/missing/changing/wrong-registry handle fails
-    closed, a second concurrent drain is rejected, and no Store connection is
-    opened. Independent replay/comparison, durable evidence, acknowledgement,
+    closed, a second concurrent drain is rejected, and no writable Store
+    connection is opened. Independent replay/comparison, durable evidence, acknowledgement,
     launcher/startup/route/config, cloud, and deployment authority remain next.
+  - [x] Bind the inactive advisory drain to an exact legacy comparison
+    snapshot. While the one-user Store actor is serialized, Store opens a
+    derived-path read-only/query-only SQLite connection, begins and establishes
+    its read transaction before selecting the complete capture prefix, and
+    returns both only inside the same opaque non-cloneable value. Later writes
+    are excluded from the pinned snapshot. No path, SQL, row, commit bytes,
+    replay, comparison result, settlement, acknowledgement, provider, task,
+    route, startup, configuration, cloud, or deployment surface is exposed;
+    independent replay/comparison remains next.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 
