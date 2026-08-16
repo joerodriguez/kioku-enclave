@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 27
-EXPECTED_WORKER_SPAWN_SHA256 = "62c477284313aa32d6555414e1449eff1997c9762137892cf3de0de530763719"
+EXPECTED_WORKER_SPAWN_COUNT = 28
+EXPECTED_WORKER_SPAWN_SHA256 = "ae7415dc6b84ad1d2a357c9a9b2f42077a732b5f866ffc2aa88b5dbe2f500f55"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2070,15 +2070,21 @@ impl X {
             ROOT / "src/archive_v3_advisory_owner/comparison.rs"
         ).read_text(encoding="utf-8")
         comparison_production = without_cfg_test_items(comparison)
+        abort = (
+            ROOT / "src/archive_v3_advisory_owner/abort.rs"
+        ).read_text(encoding="utf-8")
+        abort_production = without_cfg_test_items(abort)
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
         self.assertNotIn("archive_v3_advisory_owner::", main)
         self.assertIn("mod comparison;", advisory_production)
+        self.assertIn("mod abort;", advisory_production)
         self.assertIn("mod canary;", advisory_production)
         self.assertIn("mod canary_trust;", advisory_production)
         self.assertNotIn("pub mod canary", advisory_production)
         self.assertNotIn("pub mod canary_trust", advisory_production)
         self.assertNotIn("pub mod comparison", advisory_production)
+        self.assertNotIn("pub mod abort", advisory_production)
         self.assertIn("struct SingleArchiveAdvisoryOwner", advisory_production)
         self.assertNotIn(
             "pub(crate) struct SingleArchiveAdvisoryOwner", advisory_production
@@ -2583,7 +2589,9 @@ impl X {
         self.assertIn("retained.belongs_to(&capture.registry)", retirement_executor)
         self.assertIn("Arc::ptr_eq(&retained.capture, &capture)", retirement_executor)
         self.assertIn("*selection = None", retirement_executor)
-        self.assertIn("StoreAdvisoryCaptureRetired(())", retirement_executor)
+        self.assertIn("StoreAdvisoryCaptureRetired {", retirement_executor)
+        self.assertIn("retire_advisory_capture_for_abort", retirement_executor)
+        self.assertIn("advisory abort target changed", retirement_executor)
         live_take = retirement_executor.index("_shadow_capture_registration.take()")
         self.assertLess(
             live_take,
@@ -2850,7 +2858,7 @@ impl X {
             "async fn settle_comparison(self)"
         )
         settlement_end = advisory_production.index(
-            "fn map_advisory_store_error", settlement_start
+            "async fn abort_resumed(", settlement_start
         )
         settlement_owner = advisory_production[settlement_start:settlement_end]
         for required in (
@@ -2893,12 +2901,95 @@ impl X {
             "std::env::",
         ):
             self.assertNotIn(forbidden, settlement_owner)
+        abort_owner_start = advisory_production.index("async fn abort_resumed(")
+        abort_owned_start = advisory_production.index(
+            "async fn abort_resumed_owned(", abort_owner_start
+        )
+        abort_owner_end = advisory_production.index(
+            "fn map_advisory_store_error", abort_owned_start
+        )
+        abort_wrapper = advisory_production[abort_owner_start:abort_owned_start]
+        abort_owner = advisory_production[abort_owned_start:abort_owner_end]
+        self.assertIn("tokio::spawn(async move", abort_wrapper)
+        self.assertIn("self.abort_resumed_owned(reason).await", abort_wrapper)
+        self.assertEqual(abort_wrapper.count("tokio::spawn(async move"), 1)
+        for required in (
+            "reauthenticate_boundary(&self).await?",
+            "load_advisory_abort",
+            "prepare_advisory_abort",
+            "retire_advisory_capture_for_abort(&prepared)",
+            "finalize_advisory_abort",
+            "AbortedSingleArchiveAdvisoryOwner",
+            "Err(AdvisoryOwnerError::Publication)",
+            "Err(AdvisoryOwnerError::Persistence)",
+        ):
+            self.assertIn(required, abort_owner)
+        self.assertEqual(
+            abort_owner.count(
+                "tokio::time::sleep(std::time::Duration::from_millis(100)).await"
+            ),
+            2,
+        )
+        self.assertEqual(abort_owner.count("reauthenticate_boundary(&self).await?"), 2)
+        abort_first_auth = abort_owner.index("reauthenticate_boundary(&self).await?")
+        abort_load = abort_owner.index("load_advisory_abort")
+        abort_prepare = abort_owner.index("prepare_advisory_abort")
+        abort_retire = abort_owner.index("retire_advisory_capture_for_abort(&prepared)")
+        abort_finalize = abort_owner.index("finalize_advisory_abort")
+        abort_last_auth = abort_owner.index(
+            "reauthenticate_boundary(&self).await?", abort_first_auth + 1
+        )
+        self.assertLess(abort_first_auth, abort_load)
+        self.assertLess(abort_load, abort_prepare)
+        self.assertLess(abort_prepare, abort_retire)
+        self.assertLess(abort_retire, abort_finalize)
+        self.assertLess(abort_finalize, abort_last_auth)
+        for forbidden in (
+            "acknowledge_result",
+            "create_if_absent",
+            ".put_object(",
+            "list_objects",
+            ".enumerate(",
+            "delete_exact",
+            "delete_object",
+            "Store::new",
+            ".with_user(",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, abort_owner)
         self.assertIn(
             "CREATE TABLE IF NOT EXISTS archive_v3_advisory_comparisons",
             control,
         )
         self.assertIn("fn load_advisory_comparison_conn", control)
         self.assertIn("fn settle_advisory_comparison_conn", control)
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS archive_v3_advisory_aborts", control
+        )
+        self.assertIn("fn load_advisory_abort_conn", control)
+        self.assertIn("fn prepare_advisory_abort_conn", control)
+        self.assertIn("fn finalize_advisory_abort_conn", control)
+        abort_load_start = control_production.index(
+            "fn load_optional_advisory_abort_conn"
+        )
+        abort_load_end = control_production.index(
+            "fn prepare_advisory_abort_conn", abort_load_start
+        )
+        abort_load = control_production[abort_load_start:abort_load_end]
+        self.assertIn("archive_v3_advisory_comparisons", abort_load)
+        self.assertIn("load_advisory_comparison_conn(conn, archive_id)", abort_load)
+        self.assertIn(
+            "advisory comparison conflicts with retained abort", abort_load
+        )
+        abort_exists = abort_load.index("archive_v3_advisory_aborts")
+        abort_none = abort_load.index("return Ok(None)")
+        comparison_exists = abort_load.index("archive_v3_advisory_comparisons")
+        self.assertLess(abort_exists, abort_none)
+        self.assertLess(abort_none, comparison_exists)
+        self.assertIn(
+            "advisory abort permanently fenced comparison settlement", control
+        )
+        self.assertIn("advisory comparison permanently fenced abort", control)
         self.assertIn("load_optional_advisory_release_conn(&tx, owner)", control)
         self.assertIn("load_advisory_comparison_conn(&tx", control)
         self.assertIn("async fn compare_captured_prefix(", comparison_production)
@@ -2940,9 +3031,43 @@ impl X {
             "std::env::",
         ):
             self.assertNotIn(forbidden, comparison_production)
+        for required in (
+            'b"kioku/archive-v3/advisory-resumed-abort/v1\\0"',
+            "pub(crate) enum AdvisoryAbortReason",
+            "pub(crate) enum AdvisoryAbortStage",
+            "pub(crate) struct AdvisoryAbortTerminal",
+            "fn prepared_for_control",
+            "fn aborted_for_control",
+            "fn from_control",
+            "fn authenticate_store_target",
+        ):
+            self.assertIn(required, abort_production)
+        for forbidden in (
+            "Serialize",
+            "Deserialize",
+            "create_if_absent",
+            ".put_object(",
+            "list_objects",
+            ".enumerate(",
+            "delete_exact",
+            "delete_object",
+            "Store::new",
+            ".with_user(",
+            "acknowledge_result",
+            "tokio::spawn",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, abort_production)
+        self.assertIn(
+            "#[derive(PartialEq, Eq)]\npub(crate) struct AdvisoryAbortTerminal",
+            abort_production,
+        )
         for active_parent in (main, query, store_production, maintenance_production):
             self.assertNotIn("settle_comparison(", active_parent)
             self.assertNotIn("settle_advisory_comparison(", active_parent)
+        for active_parent in (main, query, maintenance_production):
+            self.assertNotIn("abort_resumed(", active_parent)
+            self.assertNotIn("prepare_advisory_abort(", active_parent)
         self.assertEqual(
             advisory_production.count(".retire_advisory_capture(&settlement)"),
             1,
@@ -2986,6 +3111,9 @@ impl X {
             "acknowledge_result",
         ):
             self.assertNotIn(forbidden, provider_executor)
+        advisory_without_owned_abort_spawn = advisory_production.replace(
+            "tokio::spawn(async move { self.abort_resumed_owned(reason).await })", ""
+        )
         for forbidden in (
             "StoreShadowCapture",
             ".with_user(",
@@ -3005,7 +3133,7 @@ impl X {
             "advance_root",
             "RootAdvance",
         ):
-            self.assertNotIn(forbidden, advisory_production)
+            self.assertNotIn(forbidden, advisory_without_owned_abort_spawn)
 
 
 def classify_worker_spawn(site: CallSite) -> str:

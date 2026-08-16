@@ -689,7 +689,43 @@ pub(crate) struct StoreAdvisoryRetirementContext(());
 /// Opaque proof that the exact advisory selector is absent and its matching
 /// live registration, when present, was retired and scrubbed. It contains no
 /// Store, SQLite, capture, provider, or acknowledgement capability.
-pub(crate) struct StoreAdvisoryCaptureRetired(());
+pub(crate) struct StoreAdvisoryCaptureRetired {
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+}
+
+impl StoreAdvisoryCaptureRetired {
+    pub(crate) fn commitment_for_advisory_abort(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryAbortContext,
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<[u8; 32]> {
+        if self.archive_id != archive_id || self.operation_id != operation_id {
+            return Err(EnclaveError::Conflict(
+                "advisory abort retirement proof changed".into(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"kioku/archive-v3/advisory-capture-retired/v1\0");
+        hasher.update(archive_id.as_bytes());
+        hasher.update(operation_id.as_bytes());
+        Ok(hasher.finalize().into())
+    }
+}
+
+#[cfg(test)]
+impl StoreAdvisoryCaptureRetired {
+    pub(crate) fn for_advisory_abort_test(
+        archive_id: crate::archive_v3::ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Self {
+        Self {
+            archive_id,
+            operation_id,
+        }
+    }
+}
 
 #[cfg(test)]
 impl StoreAdvisoryComparisonContext {
@@ -2160,7 +2196,38 @@ impl StoreAdvisoryResumedTarget {
         let store = Arc::clone(&self._store);
         let user_id = self._user_id.clone();
         let capture = Arc::clone(&self._capture);
-        retire_advisory_capture_owned(store, user_id, capture).await
+        retire_advisory_capture_owned(
+            store,
+            user_id,
+            capture,
+            self._archive_id,
+            self._operation_id,
+        )
+        .await
+    }
+
+    /// Retire the exact capture only after Control durably records a matching
+    /// resumed-phase abort predecessor. The returned proof contains no Store
+    /// or database authority and can only finalize that exact abort row.
+    pub(crate) async fn retire_advisory_capture_for_abort(
+        &self,
+        prepared: &crate::archive_v3_advisory_owner::AdvisoryAbortTerminal,
+    ) -> Result<StoreAdvisoryCaptureRetired> {
+        prepared
+            .authenticate_store_target(
+                StoreAdvisoryRetirementContext(()),
+                self._archive_id,
+                self._operation_id,
+            )
+            .map_err(|_| EnclaveError::Conflict("advisory abort target changed".into()))?;
+        retire_advisory_capture_owned(
+            Arc::clone(&self._store),
+            self._user_id.clone(),
+            Arc::clone(&self._capture),
+            self._archive_id,
+            self._operation_id,
+        )
+        .await
     }
 }
 
@@ -2168,10 +2235,15 @@ async fn retire_advisory_capture_owned(
     store: Arc<Store>,
     user_id: UserId,
     capture: Arc<StoreShadowCapture>,
+    archive_id: crate::archive_v3::ArchiveId,
+    operation_id: MaintenanceImportOperationId,
 ) -> Result<StoreAdvisoryCaptureRetired> {
     tokio::spawn(async move {
         retire_advisory_capture_state(store, user_id, capture).await?;
-        Ok(StoreAdvisoryCaptureRetired(()))
+        Ok(StoreAdvisoryCaptureRetired {
+            archive_id,
+            operation_id,
+        })
     })
     .await
     .map_err(|_| EnclaveError::Store("advisory capture retirement task failed".into()))?
@@ -12474,6 +12546,12 @@ pub(crate) mod tests {
             Arc::clone(&store),
             "retirement-cancel".to_string(),
             Arc::clone(&capture),
+            crate::archive_v3::ArchiveId::from_bytes([0x71; 16]),
+            MaintenanceImportOperationId::from_control(
+                crate::cp::control_store::MaintenancePersistenceContext::for_test(),
+                [0x72; 16],
+            )
+            .unwrap(),
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while store.registry.try_lock().is_ok() {
