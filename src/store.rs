@@ -229,9 +229,10 @@ pub struct Store {
     /// connection, while deletion can still atomically close admission and
     /// wait for every admitted writer to settle.
     content_write_barrier: Arc<ContentWriteBarrier>,
-    /// Inactive local-only injection. Every production constructor stores
-    /// `None`; no startup/config/provider path can install the capture VFS.
-    shadow_capture: Option<Arc<StoreShadowCapture>>,
+    /// Inactive exact-user local-only injection. Every production constructor
+    /// stores `None`; no startup/config/provider path can select a user or
+    /// install the capture VFS.
+    shadow_capture: Option<StoreShadowCaptureSelection>,
     persistence_policy: StorePersistencePolicy,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
@@ -258,6 +259,37 @@ pub struct Store {
 pub(crate) struct StoreShadowCapture {
     registry: CaptureRegistry,
     vfs_name: CString,
+}
+
+/// Exact one-user capture selection. Production cannot construct this first
+/// inactive seam: the only constructor is test-only, and the Store applies it
+/// only when the validated user identity matches byte-for-byte. A separately
+/// reviewed advisory-owner handoff must become its sole production producer
+/// before any Phase-1 canary can use it.
+pub(crate) struct StoreShadowCaptureSelection {
+    user_id: UserId,
+    capture: Arc<StoreShadowCapture>,
+}
+
+impl StoreShadowCaptureSelection {
+    fn capture_for_user(&self, user_id: &str) -> Option<&StoreShadowCapture> {
+        (self.user_id == user_id).then_some(self.capture.as_ref())
+    }
+
+    #[cfg(test)]
+    fn for_test(user_id: &str, capture: Arc<StoreShadowCapture>) -> Self {
+        validate_user_id(user_id).expect("test capture user identity");
+        Self {
+            user_id: user_id.to_owned(),
+            capture,
+        }
+    }
+}
+
+impl std::fmt::Debug for StoreShadowCaptureSelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreShadowCaptureSelection(<exact-user-inactive>)")
+    }
 }
 
 impl StoreShadowCapture {
@@ -2199,7 +2231,7 @@ impl Store {
         media_gcs: Arc<dyn GcsClient>,
         legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
-        shadow_capture: Option<Arc<StoreShadowCapture>>,
+        shadow_capture: Option<StoreShadowCaptureSelection>,
     ) -> Self {
         Self::new_internal_with_max_open_shadow_capture_and_policy(
             kms,
@@ -2218,7 +2250,7 @@ impl Store {
         media_gcs: Arc<dyn GcsClient>,
         legacy_media_gcs: Arc<dyn GcsClient>,
         max_open: usize,
-        shadow_capture: Option<Arc<StoreShadowCapture>>,
+        shadow_capture: Option<StoreShadowCaptureSelection>,
         persistence_policy: StorePersistencePolicy,
     ) -> Self {
         Store {
@@ -4717,7 +4749,9 @@ impl Store {
         let temp_path = write_private_temp_db(user_id, &plaintext_db).await?;
         let (conn, shadow_capture_registration, migration_dirty) = match open_db(
             &temp_path,
-            self.shadow_capture.as_deref(),
+            self.shadow_capture
+                .as_ref()
+                .and_then(|selection| selection.capture_for_user(user_id)),
             self.persistence_policy,
         ) {
             Ok(opened) => opened,
@@ -11435,7 +11469,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn optional_shadow_capture_survives_attempts_and_retires_on_eviction_and_deletion() {
+    async fn exact_user_shadow_capture_excludes_others_and_retires_on_eviction_and_deletion() {
         let ordinary = Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         assert!(ordinary.shadow_capture.is_none());
 
@@ -11447,7 +11481,10 @@ pub(crate) mod tests {
             gcs.clone(),
             gcs,
             1,
-            Some(Arc::clone(&capture)),
+            Some(StoreShadowCaptureSelection::for_test(
+                "capture-lifetime",
+                Arc::clone(&capture),
+            )),
         );
         store
             .with_user("capture-lifetime", |connection| {
@@ -11562,7 +11599,35 @@ pub(crate) mod tests {
         ));
         assert!(!capture.registry.contains_stream_for_test(first_stream));
 
-        let deletion_actor = match store.actor_for_existing("capture-evictor").await.unwrap() {
+        let unselected_actor = match store.actor_for_existing("capture-evictor").await.unwrap() {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("unselected handle unexpectedly evicted"),
+        };
+        {
+            let state = unselected_actor.state.lock().await;
+            assert!(
+                state
+                    .handle
+                    .as_ref()
+                    .unwrap()
+                    ._shadow_capture_registration
+                    .is_none(),
+                "an unrelated user must never enter the selected capture VFS"
+            );
+        }
+        drop(unselected_actor);
+
+        store
+            .with_user("capture-lifetime", |connection| {
+                connection.execute(
+                    "INSERT INTO screenshots (captured_at, ocr_text) VALUES (?1, ?2)",
+                    ["2026-08-13T12:04:00Z", "pending deletion"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let deletion_actor = match store.actor_for_existing("capture-lifetime").await.unwrap() {
             SaveTarget::Actor(actor) => actor,
             SaveTarget::AlreadyFlushed => panic!("deletion capture handle unexpectedly evicted"),
         };
@@ -11585,7 +11650,7 @@ pub(crate) mod tests {
             (lease, stream)
         };
         drop(deletion_actor);
-        store.delete_user("capture-evictor").await.unwrap();
+        store.delete_user("capture-lifetime").await.unwrap();
         assert!(matches!(
             deletion_lease.commit(),
             Err(crate::archive_v3_sqlite_vfs::CaptureRegistryError::Retired)
