@@ -326,9 +326,10 @@ impl ArchiveV3ShadowRuntimeBundle {
     }
 }
 
-/// Consuming Phase-1 runtime view. It exposes only exact witness read,
-/// acquire, and same-owner maintain; immutable objects, registries, roots,
-/// deletion, and provider coordinates remain unreachable.
+/// Consuming Phase-1 runtime view. It exposes exact witness read, acquire, and
+/// same-owner maintain plus one token-gated exact-witness recovery into an
+/// opaque cleanup-owned staging value. Raw objects, registries, roots,
+/// ciphers, deletion, and provider coordinates remain unreachable.
 pub(crate) struct AdvisoryOwnerRuntimeOwner {
     bundle: ArchiveV3ShadowRuntimeBundle,
 }
@@ -392,6 +393,50 @@ impl AdvisoryOwnerRuntimeOwner {
         self.witness()
             .reacquire_owner_lease(&previous, owner, duration_ticks)
             .await
+    }
+
+    /// Recover only the immutable graph nominated by the exact active
+    /// ShadowWal witness into a cleanup-owned staging value. Provider and key
+    /// capabilities are consumed inside this wrapper and never cross into the
+    /// advisory owner or Store.
+    pub(crate) async fn recover_advisory_comparison_staging(
+        &self,
+        _token: &crate::archive_v3_advisory_owner::AdvisoryComparisonContext,
+        expected: &crate::archive_v3_witness::WitnessRecord,
+    ) -> crate::archive_v3_shadow_wal::Result<
+        crate::archive_v3_shadow_wal::RecoveredMaintenanceStaging,
+    > {
+        if expected.migration() != crate::archive_v3_witness::MigrationState::ShadowWal
+            || expected.deletion() != crate::archive_v3_witness::DeletionState::Active
+        {
+            return Err(crate::archive_v3_shadow_wal::ShadowWalError::CompositeRecovery);
+        }
+        let archive_id = expected.archive_id();
+        let registry = expected.registry();
+        let context = KeyRegistryContext::with_rotation_generation(
+            archive_id,
+            KeyKind::Archive,
+            registry.key_epoch(),
+            registry.rotation_generation(),
+        );
+        let cipher = resolve_archive_cipher(
+            &context,
+            registry.object_id(),
+            registry.ciphertext_hash(),
+            self.bundle.registries.as_ref(),
+        )
+        .await
+        .map(Arc::new)
+        .map_err(|_| crate::archive_v3_shadow_wal::ShadowWalError::CompositeRecovery)?;
+        let recovery = crate::archive_v3_witness::RecoveryRoot::from_exact_active_record(expected)
+            .map_err(|_| crate::archive_v3_shadow_wal::ShadowWalError::CompositeRecovery)?;
+        crate::archive_v3_shadow_wal::recover_owned_maintenance_staging(
+            recovery,
+            Arc::clone(&self.bundle.objects),
+            cipher,
+            archive_id,
+        )
+        .await
     }
 }
 

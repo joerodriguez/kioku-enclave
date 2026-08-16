@@ -241,7 +241,13 @@ pub(crate) struct OwnedAdvisoryCapturedDrain {
     token: u64,
     session_id: ShadowSessionId,
     attempt_id: ShadowAttemptId,
+    restored: bool,
 }
+
+/// Opaque proof that the exact advisory prefix was restored atomically while
+/// its capture registration was still live. Only Store can request this
+/// transition, and the proof carries no captured bytes or settlement power.
+pub(crate) struct AdvisoryComparisonRestored(());
 
 impl CaptureRegistry {
     pub fn new() -> Self {
@@ -588,6 +594,7 @@ impl CaptureDrainLease {
             token: self.token,
             session_id: self.session_id,
             attempt_id: self.attempt_id,
+            restored: false,
         })
     }
 
@@ -779,6 +786,9 @@ impl std::fmt::Debug for OwnedCapturedDrain {
 
 impl Drop for OwnedAdvisoryCapturedDrain {
     fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -805,6 +815,82 @@ impl Drop for OwnedAdvisoryCapturedDrain {
 impl std::fmt::Debug for OwnedAdvisoryCapturedDrain {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("OwnedAdvisoryCapturedDrain(<opaque>)")
+    }
+}
+
+impl OwnedAdvisoryCapturedDrain {
+    /// Clone the bounded detached prefix only for the owner-private comparison
+    /// worker. The opaque Store token cannot be constructed by a VFS, route,
+    /// or sibling owner. Cloned plaintext zeroizes when the owned
+    /// worker completes or is cancelled.
+    pub(crate) fn captured_prefix_for_comparison(
+        &self,
+        _token: crate::store::StoreAdvisoryComparisonContext,
+    ) -> Result<Vec<CapturedWalCommit>, CaptureRegistryError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CaptureRegistryError::StateUnavailable)?;
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count: state
+                .active_drain
+                .ok_or(CaptureRegistryError::DrainMismatch)?
+                .commit_count,
+        };
+        if state.retired || state.active_drain != Some(expected) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        state
+            .advisory_detached
+            .as_ref()
+            .filter(|commits| commits.len() == expected.commit_count)
+            .cloned()
+            .ok_or(CaptureRegistryError::DrainMismatch)
+    }
+
+    /// Atomically authenticate and restore the exact detached prefix while
+    /// the registration is still live. A concurrent retirement takes the
+    /// same mutex, scrubs the source, and prevents this proof from being
+    /// minted. Once this succeeds, later retirement cannot invalidate the
+    /// already-completed comparison boundary.
+    pub(crate) fn restore_after_comparison(
+        mut self,
+        _token: crate::store::StoreAdvisoryComparisonContext,
+        commit_count: usize,
+    ) -> Result<AdvisoryComparisonRestored, CaptureRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CaptureRegistryError::StateUnavailable)?;
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count,
+        };
+        if state.retired || state.active_drain != Some(expected) {
+            return Err(CaptureRegistryError::Retired);
+        }
+        let commits = state
+            .advisory_detached
+            .take()
+            .filter(|commits| commits.len() == commit_count)
+            .ok_or(CaptureRegistryError::DrainMismatch)?;
+        match state.capture.restore_completed_prefix(commits) {
+            Ok(()) => {
+                state.active_drain = None;
+                drop(state);
+                self.restored = true;
+                Ok(AdvisoryComparisonRestored(()))
+            }
+            Err(commits) => {
+                state.advisory_detached = Some(commits);
+                Err(CaptureRegistryError::DrainMismatch)
+            }
+        }
     }
 }
 
@@ -1851,7 +1937,12 @@ mod tests {
             .unwrap();
         let later = registration.completed_len();
         assert!(later > 0);
-        drop(owned);
+        let _restored = owned
+            .restore_after_comparison(
+                crate::store::StoreAdvisoryComparisonContext::for_test(),
+                selected,
+            )
+            .unwrap();
         assert_eq!(registration.completed_len(), selected + later);
         assert_eq!(
             registration
@@ -1931,7 +2022,13 @@ mod tests {
         assert!(state.advisory_detached.is_none());
         assert!(state.capture.is_scrubbed_for_test());
         drop(state);
-        drop(owned);
+        assert!(matches!(
+            owned.restore_after_comparison(
+                crate::store::StoreAdvisoryComparisonContext::for_test(),
+                1,
+            ),
+            Err(CaptureRegistryError::Retired)
+        ));
         drop(connection);
     }
 

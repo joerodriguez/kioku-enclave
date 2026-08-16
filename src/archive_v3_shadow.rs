@@ -230,6 +230,30 @@ impl CapturedWalCommit {
     pub(crate) fn replay_frames(&self) -> &[u8] {
         &self.frames
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_wal_generation_for_test(mut self, wal_generation: u64) -> Self {
+        self.wal_generation = wal_generation;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_first_frame_no_for_test(mut self, first_frame_no: u64) -> Self {
+        self.first_frame_no = first_frame_no;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_replay_header_byte_for_test(mut self, value: u8) -> Self {
+        self.wal_header[0] = value;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_checksum_before_for_test(mut self, checksum: [u32; 2]) -> Self {
+        self.checksum_before = checksum;
+        self
+    }
 }
 
 /// Owner-local state populated synchronously by a future wrapper VFS.

@@ -4184,9 +4184,10 @@ mod tests {
         ));
         witness
             .inner
-            .replace_current_for_test(second_heartbeat)
+            .replace_current_for_test(second_heartbeat.clone())
             .unwrap();
-        let resumed_owner =
+
+        let resumed_owner = Arc::new(
             crate::archive_v3_advisory_owner::start_advisory_owner_for_test(resume_restart)
                 .await
                 .unwrap()
@@ -4195,7 +4196,8 @@ mod tests {
                 .unwrap()
                 .resume_local_admission()
                 .await
-                .unwrap();
+                .unwrap(),
+        );
         assert!(resumed_owner.has_exact_resumed_target(&user.id, archive_id, operation_id));
         assert_eq!(legacy_gcs.operation_counts(), (0, 0));
         assert_eq!(legacy_gcs.live_get_count(), live_gets_before_reopen);
@@ -4272,6 +4274,188 @@ mod tests {
             resumed_owner.captured_commit_count_for_test().await,
             Some(exact_capture_count + later_capture_count),
             "cancellation restores only the selected prefix ahead of later commits"
+        );
+
+        witness
+            .inner
+            .replace_current_for_test(
+                second_heartbeat.with_deletion_for_test(DeletionState::Tombstoned),
+            )
+            .unwrap();
+        assert!(resumed_owner
+            .compare_captured_prefix_for_test()
+            .await
+            .is_err());
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(exact_capture_count + later_capture_count),
+            "a pre-comparison witness change cannot detach the prefix"
+        );
+        witness
+            .inner
+            .replace_current_for_test(second_heartbeat.clone())
+            .unwrap();
+
+        let retained_release_commitment = control
+            .replace_advisory_release_commitment_for_test(archive_id, [0x91; 32])
+            .await
+            .unwrap();
+        assert!(resumed_owner
+            .compare_captured_prefix_for_test()
+            .await
+            .is_err());
+        control
+            .replace_advisory_release_commitment_for_test(archive_id, retained_release_commitment)
+            .await
+            .unwrap();
+        let retained_source_commitment = control
+            .replace_maintenance_source_commitment_for_test(operation_id, [0x92; 32])
+            .await
+            .unwrap();
+        assert!(resumed_owner
+            .compare_captured_prefix_for_test()
+            .await
+            .is_err());
+        control
+            .replace_maintenance_source_commitment_for_test(
+                operation_id,
+                retained_source_commitment,
+            )
+            .await
+            .unwrap();
+
+        let post_boundary_stall = Arc::new(crate::store::AdvisoryComparisonStall::new());
+        let post_boundary_task = tokio::spawn({
+            let resumed_owner = Arc::clone(&resumed_owner);
+            let stall = Arc::clone(&post_boundary_stall);
+            async move {
+                resumed_owner
+                    .compare_captured_prefix_with_stall_for_test(stall)
+                    .await
+            }
+        });
+        post_boundary_stall.wait_until_entered().await;
+        witness
+            .inner
+            .replace_current_for_test(
+                second_heartbeat.with_deletion_for_test(DeletionState::Tombstoned),
+            )
+            .unwrap();
+        post_boundary_stall.release();
+        assert!(post_boundary_task.await.unwrap().is_err());
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(exact_capture_count + later_capture_count),
+            "a post-comparison witness change must fail after atomic restoration"
+        );
+        witness
+            .inner
+            .replace_current_for_test(second_heartbeat.clone())
+            .unwrap();
+
+        let post_release_stall = Arc::new(crate::store::AdvisoryComparisonStall::new());
+        let post_release_task = tokio::spawn({
+            let resumed_owner = Arc::clone(&resumed_owner);
+            let stall = Arc::clone(&post_release_stall);
+            async move {
+                resumed_owner
+                    .compare_captured_prefix_with_stall_for_test(stall)
+                    .await
+            }
+        });
+        post_release_stall.wait_until_entered().await;
+        let retained_release_commitment = control
+            .replace_advisory_release_commitment_for_test(archive_id, [0x93; 32])
+            .await
+            .unwrap();
+        post_release_stall.release();
+        assert!(post_release_task.await.unwrap().is_err());
+        control
+            .replace_advisory_release_commitment_for_test(archive_id, retained_release_commitment)
+            .await
+            .unwrap();
+
+        let post_source_stall = Arc::new(crate::store::AdvisoryComparisonStall::new());
+        let post_source_task = tokio::spawn({
+            let resumed_owner = Arc::clone(&resumed_owner);
+            let stall = Arc::clone(&post_source_stall);
+            async move {
+                resumed_owner
+                    .compare_captured_prefix_with_stall_for_test(stall)
+                    .await
+            }
+        });
+        post_source_stall.wait_until_entered().await;
+        let retained_source_commitment = control
+            .replace_maintenance_source_commitment_for_test(operation_id, [0x94; 32])
+            .await
+            .unwrap();
+        post_source_stall.release();
+        assert!(post_source_task.await.unwrap().is_err());
+        control
+            .replace_maintenance_source_commitment_for_test(
+                operation_id,
+                retained_source_commitment,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(exact_capture_count + later_capture_count),
+            "post-boundary Control changes must fail only after atomic restoration"
+        );
+
+        let cancellation_stall = Arc::new(crate::store::AdvisoryComparisonStall::new());
+        let cancelled_task = tokio::spawn({
+            let resumed_owner = Arc::clone(&resumed_owner);
+            let stall = Arc::clone(&cancellation_stall);
+            async move {
+                resumed_owner
+                    .compare_captured_prefix_with_stall_for_test(stall)
+                    .await
+            }
+        });
+        cancellation_stall.wait_until_entered().await;
+        cancelled_task.abort();
+        cancellation_stall.release();
+        let _ = cancelled_task.await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if resumed_owner.captured_commit_count_for_test().await
+                    == Some(exact_capture_count + later_capture_count)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancellation-owned worker must eventually restore the prefix");
+
+        assert_eq!(
+            resumed_owner
+                .compare_captured_prefix_for_test()
+                .await
+                .unwrap(),
+            "AdvisoryComparisonEvidence(<opaque>)"
+        );
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(exact_capture_count + later_capture_count),
+            "comparison evidence cannot settle the selected prefix"
+        );
+        resumed_owner
+            .write_uncaptured_metadata_for_test("advisory-uncaptured", "outside-capture-vfs")
+            .await
+            .unwrap();
+        assert!(resumed_owner
+            .compare_captured_prefix_for_test()
+            .await
+            .is_err());
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(exact_capture_count + later_capture_count),
+            "a parity mismatch cannot settle or lose the selected prefix"
         );
 
         // Selecting the later authority importer against a completed advisory

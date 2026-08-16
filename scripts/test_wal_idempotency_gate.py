@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 25
-EXPECTED_WORKER_SPAWN_SHA256 = "f1006252cba4a4dbf27519bb3c0f16f8e96b53616d3d577d7679b99f6f9ad989"
+EXPECTED_WORKER_SPAWN_COUNT = 26
+EXPECTED_WORKER_SPAWN_SHA256 = "02cb3f5946af5b08813cb1938b4a8aa5cefd0622e65c8eb3c0d20523fa8e3dbd"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2038,6 +2038,15 @@ impl X {
         runtime = (ROOT / "src/archive_v3_shadow_runtime.rs").read_text(
             encoding="utf-8"
         )
+        runtime_production = without_cfg_test_items(runtime)
+        shadow_wal = (ROOT / "src/archive_v3_shadow_wal.rs").read_text(
+            encoding="utf-8"
+        )
+        shadow_wal_production = without_cfg_test_items(shadow_wal)
+        shadow_checkpoint = (
+            ROOT / "src/archive_v3_shadow_checkpoint.rs"
+        ).read_text(encoding="utf-8")
+        shadow_checkpoint_production = without_cfg_test_items(shadow_checkpoint)
         maintenance = (ROOT / "src/archive_v3_maintenance_import.rs").read_text(
             encoding="utf-8"
         )
@@ -2048,9 +2057,15 @@ impl X {
             encoding="utf-8"
         )
         sqlite_vfs_production = without_cfg_test_items(sqlite_vfs)
+        comparison = (
+            ROOT / "src/archive_v3_advisory_owner/comparison.rs"
+        ).read_text(encoding="utf-8")
+        comparison_production = without_cfg_test_items(comparison)
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
         self.assertNotIn("archive_v3_advisory_owner::", main)
+        self.assertIn("mod comparison;", advisory_production)
+        self.assertNotIn("pub mod comparison", advisory_production)
         self.assertIn("struct SingleArchiveAdvisoryOwner", advisory_production)
         self.assertNotIn(
             "pub(crate) struct SingleArchiveAdvisoryOwner", advisory_production
@@ -2233,7 +2248,37 @@ impl X {
         self.assertIn("struct StoreAdvisoryCapturedDrain", store_production)
         self.assertIn("_snapshot: Connection", store_production)
         self.assertIn("_drain: OwnedAdvisoryCapturedDrain", store_production)
-        self.assertNotIn("impl StoreAdvisoryCapturedDrain", store_production)
+        self.assertEqual(store_production.count("impl StoreAdvisoryCapturedDrain"), 1)
+        comparison_impl_start = store_production.index(
+            "impl StoreAdvisoryCapturedDrain"
+        )
+        comparison_impl_open = store_production.index("{", comparison_impl_start)
+        comparison_impl_end = match_delimiter(
+            store_production, comparison_impl_open, "{", "}"
+        )
+        store_comparison = store_production[
+            comparison_impl_start:comparison_impl_end
+        ]
+        self.assertEqual(store_comparison.count("pub(crate) async fn"), 1)
+        self.assertIn("compare_recovered_advisory", store_comparison)
+        self.assertIn("replay_advisory_captured_prefix", store_comparison)
+        self.assertIn("compare_advisory_staged_snapshot", store_comparison)
+        self.assertIn("restore_after_comparison", store_comparison)
+        self.assertIn("StoreAdvisoryComparisonEvidence::from_restored", store_comparison)
+        self.assertIn("tokio::spawn(async move", store_comparison)
+        self.assertIn("tokio::task::spawn_blocking", store_comparison)
+        for forbidden in (
+            ".with_user(",
+            ".save_user(",
+            ".get_object(",
+            ".put_object(",
+            "list_",
+            "delete_",
+            ".settle(",
+            "acknowledge_result",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, store_comparison)
         self.assertNotRegex(
             store_production,
             r"impl[^{}]{0,160}\bfor\s+StoreAdvisoryCapturedDrain\b",
@@ -2275,7 +2320,35 @@ impl X {
             self.assertNotIn(forbidden, drain_executor)
         self.assertIn("struct OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
         self.assertNotIn("pub struct OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
-        self.assertNotIn("impl OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
+        self.assertEqual(
+            sqlite_vfs_production.count("impl OwnedAdvisoryCapturedDrain"), 1
+        )
+        owned_comparison_start = sqlite_vfs_production.index(
+            "impl OwnedAdvisoryCapturedDrain"
+        )
+        owned_comparison_open = sqlite_vfs_production.index(
+            "{", owned_comparison_start
+        )
+        owned_comparison_end = match_delimiter(
+            sqlite_vfs_production, owned_comparison_open, "{", "}"
+        )
+        owned_comparison = sqlite_vfs_production[
+            owned_comparison_start:owned_comparison_end
+        ]
+        self.assertEqual(owned_comparison.count("pub(crate) fn"), 2)
+        self.assertIn("captured_prefix_for_comparison", owned_comparison)
+        self.assertIn("restore_after_comparison", owned_comparison)
+        self.assertIn("restore_completed_prefix(commits)", owned_comparison)
+        self.assertIn("AdvisoryComparisonRestored", owned_comparison)
+        for forbidden in (
+            "pub fn",
+            "settle",
+            "release_completed_reservation",
+            "provider",
+            "list_",
+            "delete_",
+        ):
+            self.assertNotIn(forbidden, owned_comparison)
         self.assertEqual(
             len(
                 re.findall(
@@ -2299,6 +2372,213 @@ impl X {
         )
         owned_drain = sqlite_vfs_production[owned_start:owned_end]
         self.assertIn("restore_completed_prefix(commits)", owned_drain)
+
+        runtime_recovery_start = runtime_production.index(
+            "pub(crate) async fn recover_advisory_comparison_staging"
+        )
+        runtime_recovery_end = runtime_production.index(
+            "impl fmt::Debug for AdvisoryOwnerRuntimeOwner", runtime_recovery_start
+        )
+        runtime_recovery = runtime_production[
+            runtime_recovery_start:runtime_recovery_end
+        ]
+        for required in (
+            "MigrationState::ShadowWal",
+            "DeletionState::Active",
+            "KeyRegistryContext::with_rotation_generation",
+            "resolve_archive_cipher",
+            "RecoveryRoot::from_exact_active_record",
+            "recover_owned_maintenance_staging",
+        ):
+            self.assertIn(required, runtime_recovery)
+        for forbidden in (
+            "create_if_absent",
+            "list_objects",
+            "ImmutableObjectBackend::enumerate",
+            "EnumerationPage",
+            "EnumerationCursor",
+            "delete_exact",
+            "delete_object",
+            ".put_object(",
+        ):
+            self.assertNotIn(forbidden, runtime_recovery)
+        self.assertNotIn(".enumerate(", runtime_recovery)
+
+        replay_start = shadow_wal_production.index(
+            "pub(crate) async fn replay_advisory_captured_prefix"
+        )
+        replay_end = shadow_wal_production.index(
+            "fn validate_advisory_captured_prefix", replay_start
+        )
+        replay = shadow_wal_production[replay_start:replay_end]
+        for required in (
+            "validate_advisory_captured_prefix(commits)?",
+            "CompositeWalRecoverySink::new",
+            "validate_segments(validation_sequence)",
+            "sink.begin_generation",
+            "sink.write_wal_frames",
+            "sink.finish_generation",
+            "refresh_after_advisory_replay",
+        ):
+            self.assertIn(required, replay)
+        continuity_start = replay_end
+        continuity_end = shadow_wal_production.index(
+            "pub(crate) fn compare_advisory_staged_snapshot", continuity_start
+        )
+        continuity = shadow_wal_production[continuity_start:continuity_end]
+        for required in (
+            "first.wal_generation() != 1",
+            "first.first_frame_no() != 1",
+            "checked_add(u64::from(previous.frame_count()))",
+            "commit.replay_header() == previous.replay_header()",
+            "commit.replay_checksum_before() == captured_terminal_checksum(previous)?",
+            "checked_add(1)",
+        ):
+            self.assertIn(required, continuity)
+        comparison_start = continuity_end
+        backup_start = shadow_wal_production.index(
+            "fn backup_advisory_snapshot", comparison_start
+        )
+        staged_comparison = shadow_wal_production[comparison_start:backup_start]
+        for required in (
+            "PrivateStagedSqliteCopy::from_owned_maintenance_recovery(&primary)",
+            "PrivateStagedSqliteCopy::from_owned_maintenance_recovery(&recovered.owned)",
+            "ShadowParityVerifier::compare_staged_copies",
+            "ShadowParityResult::Match",
+            "ShadowParityResult::Mismatch",
+            "ADVISORY_CAPTURE_PARITY_DOMAIN",
+        ):
+            self.assertIn(required, staged_comparison)
+        backup_end = shadow_wal_production.index(
+            "pub(crate) async fn recover_owned_maintenance_staging", backup_start
+        )
+        backup = shadow_wal_production[backup_start:backup_end]
+        for required in (
+            "fresh_recovery_path()?",
+            "CompositeRecoveryCleanup::new",
+            ".create_new(true)",
+            ".mode(0o600)",
+            '.backup("main", &path, None)',
+            "OwnedPrivateStagedSqliteCopy::from_recovery_proof",
+            "cleanup.disarm()",
+        ):
+            self.assertIn(required, backup)
+        recovery_end = shadow_wal_production.index(
+            "pub(crate) async fn recover_owned_wal_owner_staging", backup_end
+        )
+        maintenance_recovery = shadow_wal_production[backup_end:recovery_end]
+        self.assertIn("OwnedExactBackend::Legacy(backend)", maintenance_recovery)
+        private_recovery_start = shadow_wal_production.index(
+            "async fn recover_owned_private_staging_inner"
+        )
+        private_recovery_end = shadow_wal_production.index(
+            "fn observe_recovery", private_recovery_start
+        )
+        private_recovery = shadow_wal_production[
+            private_recovery_start:private_recovery_end
+        ]
+        for required in (
+            "recover_checkpoint_from_recovery_root",
+            "recover_maintenance_zero_wal",
+            "recover_witness_nominated_wal",
+            "ensure_sqlite_sidecars_absent",
+            "OwnedPrivateStagedSqliteCopy::from_recovery_proof",
+        ):
+            self.assertIn(required, private_recovery)
+        for guarded in (replay, continuity, staged_comparison, backup, private_recovery):
+            for forbidden in (
+                "create_if_absent",
+                "list_objects",
+                "ImmutableObjectBackend::enumerate",
+                "EnumerationPage",
+                "EnumerationCursor",
+                "delete_exact",
+                "delete_object",
+                ".put_object(",
+            ):
+                self.assertNotIn(forbidden, guarded)
+            non_iteration_calls = guarded.replace(".iter().enumerate(", "").replace(
+                ".into_iter().enumerate(", ""
+            )
+            self.assertNotIn(".enumerate(", non_iteration_calls)
+        wal_recovery_start = shadow_wal_production.index(
+            "pub(crate) async fn recover_witness_nominated_wal"
+        )
+        wal_recovery_end = shadow_wal_production.index(
+            "#[cfg(test)]", wal_recovery_start
+        ) if "#[cfg(test)]" in shadow_wal_production[wal_recovery_start:] else len(shadow_wal_production)
+        wal_recovery = shadow_wal_production[wal_recovery_start:wal_recovery_end]
+        for required in (
+            "recover_witness_nominated_wal_inner",
+            "recover_maintenance_zero_wal",
+            "recover_exact_root_wal_mode",
+            "load_exact_wal_segment",
+            "load_exact_wal_commit_descriptor",
+            "load_commit_segments",
+            "load_root",
+            ".get(&context.object_key())",
+        ):
+            self.assertIn(required, wal_recovery)
+        checkpoint_recovery_start = shadow_checkpoint_production.index(
+            "pub async fn recover_checkpoint_from_recovery_root"
+        )
+        checkpoint_recovery_end = shadow_checkpoint_production.index(
+            "pub struct TmpfsCheckpointSink", checkpoint_recovery_start
+        )
+        checkpoint_recovery = shadow_checkpoint_production[
+            checkpoint_recovery_start:checkpoint_recovery_end
+        ]
+        for required in (
+            "recover_checkpoint_from_recovery_root_inner",
+            "load_witness_root",
+            "load_manifest",
+            "load_exact_envelope",
+            ".get(&context.object_key())",
+        ):
+            self.assertIn(required, checkpoint_recovery)
+        for guarded in (wal_recovery, checkpoint_recovery):
+            for forbidden in (
+                "create_if_absent",
+                "list_objects",
+                "ImmutableObjectBackend::enumerate",
+                "EnumerationPage",
+                "EnumerationCursor",
+                "delete_exact",
+                "delete_object",
+                ".put_object(",
+            ):
+                self.assertNotIn(forbidden, guarded)
+            non_iteration_calls = guarded.replace(".iter().enumerate(", "").replace(
+                ".into_iter().enumerate(", ""
+            )
+            self.assertNotIn(".enumerate(", non_iteration_calls)
+        self.assertIn("async fn compare_captured_prefix(", advisory_production)
+        self.assertNotIn(
+            "pub(crate) async fn compare_captured_prefix", advisory_production
+        )
+        self.assertIn("async fn compare_captured_prefix(", comparison_production)
+        self.assertNotIn("pub(crate)", comparison_production)
+        self.assertIn("reauthenticate_boundary(owner).await?", comparison_production)
+        self.assertEqual(
+            comparison_production.count("reauthenticate_boundary(owner).await?"),
+            2,
+        )
+        self.assertIn("recover_advisory_comparison_staging", comparison_production)
+        self.assertIn("compare_recovered_advisory", comparison_production)
+        self.assertIn("AdvisoryComparisonEvidence", comparison_production)
+        for forbidden in (
+            "create_if_absent",
+            ".put_object(",
+            "list_objects",
+            "delete_exact",
+            "delete_object",
+            "Store::new",
+            ".with_user(",
+            "acknowledge_result",
+            "tokio::spawn",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, comparison_production)
         self.assertEqual(
             maintenance_production.count(
                 ".ensure_advisory_release_absent(operation_id)"
