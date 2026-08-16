@@ -13,8 +13,11 @@
 //! Every provider-visible candidate is durable before send and every ambiguous
 //! send is reconciled from the exact witness record before another candidate
 //! can exist. A type-separated advisory owner stops after full parity at
-//! ShadowWal, releases only that exact maintenance lease, drops every Store
-//! admission guard, and cannot request the later WalAuthoritative transition.
+//! ShadowWal, releases only that exact maintenance lease, drops its owned Store
+//! guards, and cannot request the later WalAuthoritative transition. The
+//! permanent legacy provider fence and fail-closed Store/barrier blocks remain
+//! until a separately reviewed advisory-release protocol restores legacy
+//! authority.
 
 use std::{
     fmt,
@@ -1536,6 +1539,7 @@ pub(crate) struct CompletedAdvisoryShadowHandoff {
     _archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
     _parity: CompletedAdvisoryShadowParityEvidence,
     _control: Arc<crate::cp::control_store::ControlStore>,
+    _store_capture_target: crate::store::StoreAdvisoryCaptureTarget,
 }
 
 /// Consuming Phase-1 view obtainable only with the advisory-owner module's
@@ -1547,6 +1551,7 @@ pub(crate) struct CompletedAdvisoryShadowHandoffView {
     pub(crate) archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
     pub(crate) parity: CompletedAdvisoryShadowParityEvidence,
     pub(crate) control: Arc<crate::cp::control_store::ControlStore>,
+    pub(crate) store_capture_target: crate::store::StoreAdvisoryCaptureTarget,
 }
 
 /// Opaque proof retained only by the advisory handoff. The future live
@@ -1603,6 +1608,7 @@ impl CompletedAdvisoryShadowHandoff {
             archive_binding: self._archive_binding,
             parity: self._parity,
             control: self._control,
+            store_capture_target: self._store_capture_target,
         }
     }
 }
@@ -1848,16 +1854,21 @@ async fn finish_advisory_import(
     validate_exact_advisory_control(&durable, &exact_durable, source)?;
     let parity =
         CompletedAdvisoryShadowParityEvidence::from_terminal(exact_durable, source, &released)?;
-    // Dropping the pinned source scrubs its DB/WAL/SHM family and releases all
-    // legacy Store admission guards. Unlike the authoritative handoff, Phase
-    // 1 deliberately transfers no long-lived Store fence.
-    drop(pinned);
+    // The target retains only a private exact Store/user/archive/import
+    // binding. Minting it scrubs DB/WAL/SHM and drops the owned maintenance
+    // guards; the Store/barrier blocked state and permanent provider fence
+    // remain fail-closed. Unlike the authoritative handoff, Phase 1 transfers
+    // no long-lived guard or callable Store surface.
+    let store_capture_target = pinned
+        .into_advisory_capture_target(MaintenanceCoordinatorContext(()), source)
+        .map_err(|_| MaintenanceImportError::Conflict)?;
     Ok(CompletedAdvisoryShadowHandoff {
         _runtime: runtime,
         _terminal_witness: released,
         _archive_binding: archive_binding,
         _parity: parity,
         _control: control,
+        _store_capture_target: store_capture_target,
     })
 }
 
@@ -3782,6 +3793,7 @@ mod tests {
             .unwrap();
         let archive_id = plan.archive_id;
         let owner_id = plan.owner_id;
+        let operation_id = plan.operation_id;
 
         let legacy_gcs = Arc::new(FakeGcs::new());
         let store = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs));
@@ -3913,9 +3925,11 @@ mod tests {
             advisory._parity.terminal_control.stage(),
             MaintenanceImportStage::ParityVerified
         );
-        // The advisory handoff releases every process-local Store guard. An
-        // advisory restart reacquires and revalidates the exact legacy source,
-        // observes the already-released witness, and remints no authority.
+        // The advisory handoff drops its owned Store guards but deliberately
+        // retains fail-closed Store/barrier state and the permanent provider
+        // fence. An advisory restart reacquires and revalidates the exact
+        // legacy source, observes the already-released witness, and remints no
+        // serving or release authority.
         // Obtain both opaque handoffs before either is allowed to acquire the
         // later live advisory owner; this models a restart/lost local result.
         let restart_plan = control
@@ -3954,6 +3968,7 @@ mod tests {
             format!("{first_owner:?}"),
             "SingleArchiveAdvisoryOwner(<inactive>)"
         );
+        assert!(first_owner.has_exact_capture_target(&user.id, archive_id, operation_id));
         assert!(first_owner.may_heartbeat());
         let first_bound = witness.read_current_exact(archive_id).await.unwrap();
         assert_eq!(first_bound.migration(), MigrationState::ShadowWal);
@@ -3973,6 +3988,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!reopened_owner.may_heartbeat());
+        assert!(reopened_owner.has_exact_capture_target(&user.id, archive_id, operation_id));
         assert_eq!(
             witness.read_current_exact(archive_id).await.unwrap(),
             heartbeated

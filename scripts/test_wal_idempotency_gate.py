@@ -2038,6 +2038,9 @@ impl X {
         runtime = (ROOT / "src/archive_v3_shadow_runtime.rs").read_text(
             encoding="utf-8"
         )
+        maintenance = (ROOT / "src/archive_v3_maintenance_import.rs").read_text(
+            encoding="utf-8"
+        )
         witness = (ROOT / "src/archive_v3_witness.rs").read_text(encoding="utf-8")
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
@@ -2078,9 +2081,24 @@ impl X {
         self.assertNotIn("StoreShadowCaptureSelection::for_test", store_production)
         self.assertNotIn("Option<Arc<StoreShadowCapture>>", store_production)
         self.assertNotIn("StoreShadowCaptureSelection", main)
+        self.assertEqual(
+            advisory_production.count("crate::store::StoreAdvisoryCaptureTarget"), 1
+        )
+        self.assertIn(
+            "_capture_target: crate::store::StoreAdvisoryCaptureTarget",
+            advisory_production,
+        )
+        self.assertIn("into_advisory_capture_target", maintenance)
+        self.assertIn("struct StoreAdvisoryCaptureTarget", store_production)
+        self.assertNotIn("impl StoreAdvisoryCaptureTarget", store_production)
+        self.assertNotIn("exact_identity_for_test", store_production)
         for forbidden in (
-            "crate::store::",
             "StoreShadowCapture",
+            ".with_user(",
+            ".with_user_mut(",
+            ".save_user(",
+            "CaptureRegistration",
+            "CaptureRegistry",
             "create_if_absent(",
             "list_objects",
             "delete_exact",

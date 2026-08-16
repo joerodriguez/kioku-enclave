@@ -15,9 +15,11 @@ claim production evidence.
   archive-v3 database across SQLite integrity, FTS/vector integrity, table counts, logical export,
   full logical contents, and selected queries before it can mint a terminal handoff.
 - A type-separated Phase-1 importer can now stop at that verified `ShadowWal` point, release only
-  the exact maintenance lease, scrub its scratch family, and drop all Store admission guards. Its
-  opaque handoff cannot request `WalAuthoritative` or change serving acknowledgements. Direct use
-  of the existing authority importer after release is fenced; a separately reviewed Phase-2
+  the exact maintenance lease, scrub its scratch family, and drop its owned Store guard values.
+  The permanent legacy provider fence and process-local Store/barrier blocks remain fail-closed;
+  a reviewed durable advisory-release transition is required before legacy serving can resume.
+  Its opaque handoff cannot request `WalAuthoritative` or change serving acknowledgements. Direct
+  use of the existing authority importer after release is fenced; a separately reviewed Phase-2
   acquisition transition is still required.
 - The terminal handoff carries a non-cloneable parity-certified Control record. The private WAL
   launcher re-reads that exact record and reauthenticates its terminal witness/root relation before
@@ -47,7 +49,7 @@ reviewed activation change and production evidence**.
 
 | Boundary | Current state | Required before activation |
 |---|---|---|
-| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap plus inactive exact advisory-owner acquisition/heartbeat/expiry-reacquire exist. Store's inactive capture injection is now exact-one-user and production-unconstructible; there is still no live caller, owner handoff, or post-bootstrap comparison owner. | Add the authenticated owner-only capture/comparison handoff, then require an explicit canary scope; legacy remains sole authority; shadow failure cannot alter latency, response, retry, or stored legacy result; independently recovered parity is measured and retained. |
+| Phase-1 advisory shadow canary | Verified ShadowWal bootstrap plus inactive exact advisory-owner acquisition/heartbeat/expiry-reacquire exist. Store's inactive capture injection is exact-one-user and production-unconstructible; the parity terminal now hands the owner a sealed exact Store/user/archive/import target, but the permanent provider fence and Store/barrier blocks remain fail-closed and the target has no operation. There is still no live caller or post-bootstrap comparison owner. | Add an exact durable advisory-release transition that restores legacy authority without a write race, then owner-only capture installation/drain and independent comparison; require an explicit canary scope; shadow failure cannot alter latency, response, retry, or stored legacy result. |
 | Enabled mutation set | Reviewed sealed subset only | Select an exact canary operation allowlist. Every enabled path must supply its stable identity and typed plan; unsupported audio/person/identity/voice, screen-person, generic/audio/finalization Vertex-begin, and other unreviewed semantics stay disabled or receive their own review first. |
 | External attempts | Provider-neutral seams only where reviewed | For any enabled provider-writing domain, construct only the reviewed KMS/provider adapter and preserve durable B send identity, one-shot execution, exact readback, C definitive-rejection, and manual handling of ambiguity. |
 | Runtime ownership | Private inactive Phase-1 lease-lifecycle owner and separate authoritative launcher; advisory release cannot enter the existing authority importer | Add owner-only capture, then prove one archive/one owner, maintenance-window and zero-serving-replica preconditions, restart ownership, a distinct exact Phase-2 authority acquisition, drain/handoff behavior, and no second Store/runtime authority. |
