@@ -118,6 +118,8 @@ ENV CFLAGS="-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int
 ENV CFLAGS_x86_64_unknown_linux_musl="-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t"
 
 # Cache dependency compilation separately from source
+ARG CARGO_INPUTS_SHA256
+RUN printf '%s\n' "${CARGO_INPUTS_SHA256}" > /build/.cargo-inputs-sha256
 COPY Cargo.toml Cargo.lock ./
 # Create a dummy main so cargo can compile deps
 RUN --mount=type=cache,id=kioku-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -127,6 +129,8 @@ RUN --mount=type=cache,id=kioku-cargo-registry,target=/usr/local/cargo/registry,
     && rm -rf src
 
 # Build the real binary
+ARG SOURCE_INPUTS_SHA256
+RUN printf '%s\n' "${SOURCE_INPUTS_SHA256}" > /build/.source-inputs-sha256
 COPY src ./src
 # Touch main.rs so cargo detects the change
 RUN --mount=type=cache,id=kioku-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

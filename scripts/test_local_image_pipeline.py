@@ -209,7 +209,17 @@ class LocalImagePipelineTests(unittest.TestCase):
                 output = next(value for value in command if value.startswith("spdx-json="))
                 Path(output.removeprefix("spdx-json=")).write_text(
                     json.dumps(
-                        {"packages": [{"name": name} for name in pipeline.REQUIRED_SBOM_PACKAGES]}
+                        {"packages": [
+                            {
+                                "name": name,
+                                **({
+                                    "versionInfo": pipeline.tomllib.loads(
+                                        (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+                                    )["package"]["version"]
+                                } if name == "kioku-enclave" else {}),
+                            }
+                            for name in pipeline.REQUIRED_SBOM_PACKAGES
+                        ]}
                     ),
                     encoding="utf-8",
                 )
@@ -246,12 +256,16 @@ class LocalImagePipelineTests(unittest.TestCase):
         original_login = pipeline.temporary_docker_login
         original_snapshot = pipeline.source_snapshot
         original_archive_digest = pipeline.immutable_source_archive_digest
+        original_subset_digest = pipeline.immutable_source_subset_digest
         original_create_evidence = pipeline.create_release_evidence
         original_argv = sys.argv
         pipeline.run = fake_run
         pipeline.verify = lambda: calls.append(["verify"])
         pipeline.source_snapshot = lambda commit, **kwargs: nullcontext(ROOT)
         pipeline.immutable_source_archive_digest = lambda commit: "d" * 64
+        pipeline.immutable_source_subset_digest = lambda commit, *paths: (
+            "e" * 64 if paths == ("Cargo.toml", "Cargo.lock") else "f" * 64
+        )
         pipeline.temporary_docker_login = (
             lambda registry, docker_config, access_token: (
                 calls.append(["temporary-docker-login", registry, str(docker_config), "token-redacted"]),
@@ -298,6 +312,7 @@ class LocalImagePipelineTests(unittest.TestCase):
             pipeline.temporary_docker_login = original_login
             pipeline.source_snapshot = original_snapshot
             pipeline.immutable_source_archive_digest = original_archive_digest
+            pipeline.immutable_source_subset_digest = original_subset_digest
             pipeline.create_release_evidence = original_create_evidence
             sys.argv = original_argv
 
@@ -309,6 +324,8 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertTrue(any(argument.startswith("type=oci,dest=") for argument in build))
         self.assertNotIn("--load", build)
         self.assertTrue(any(argument.startswith("CONFIG_SHA256=") for argument in build))
+        self.assertIn("CARGO_INPUTS_SHA256=" + "e" * 64, build)
+        self.assertIn("SOURCE_INPUTS_SHA256=" + "f" * 64, build)
         self.assertFalse(any(argument.startswith("SOURCE_DATE_EPOCH=") for argument in build))
         self.assertIn("--secret", build)
         self.assertIn("id=kioku-config,src=", " ".join(build))
@@ -331,6 +348,10 @@ class LocalImagePipelineTests(unittest.TestCase):
         self.assertFalse(any("\n" in argument for argument in evidence_command))
         self.assertNotIn("configure-docker", str(calls))
         self.assertNotIn("ya29.", str(calls))
+
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertLess(dockerfile.index("ARG CARGO_INPUTS_SHA256"), dockerfile.index("COPY Cargo.toml Cargo.lock"))
+        self.assertLess(dockerfile.index("ARG SOURCE_INPUTS_SHA256"), dockerfile.index("COPY src ./src"))
 
     def test_preflight_rejects_builder_without_linux_amd64(self) -> None:
         pipeline = load_pipeline()
