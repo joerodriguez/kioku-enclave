@@ -2044,6 +2044,10 @@ impl X {
         maintenance_production = without_cfg_test_items(maintenance)
         witness = (ROOT / "src/archive_v3_witness.rs").read_text(encoding="utf-8")
         control = (ROOT / "src/cp/control_store.rs").read_text(encoding="utf-8")
+        sqlite_vfs = (ROOT / "src/archive_v3_sqlite_vfs.rs").read_text(
+            encoding="utf-8"
+        )
+        sqlite_vfs_production = without_cfg_test_items(sqlite_vfs)
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
         self.assertNotIn("archive_v3_advisory_owner::", main)
@@ -2160,6 +2164,13 @@ impl X {
         self.assertIn("load_advisory_release", local_owner)
         self.assertIn("retained != release", local_owner)
         self.assertIn(".resume_advisory_local_admission", local_owner)
+        self.assertIn("async fn begin_capture_drain(", advisory_production)
+        self.assertNotIn(
+            "pub(crate) async fn begin_capture_drain", advisory_production
+        )
+        self.assertEqual(
+            advisory_production.count(".begin_advisory_capture_drain()"), 1
+        )
         executor_start = store_production.index("impl StoreAdvisoryCaptureTarget")
         executor_end = store_production.index(
             "impl Drop for PinnedLegacySnapshot", executor_start
@@ -2168,8 +2179,15 @@ impl X {
         resume_start = executor.index(
             "pub(crate) async fn resume_advisory_local_admission"
         )
+        self.assertEqual(
+            store_production.count("impl StoreAdvisoryResumedTarget"), 1
+        )
+        drain_start = executor.index(
+            "pub(crate) async fn begin_advisory_capture_drain"
+        )
         provider_executor = executor[:resume_start]
-        local_executor = executor[resume_start:]
+        local_executor = executor[resume_start:drain_start]
+        drain_executor = executor[drain_start:]
         self.assertIn("AdvisoryFenceObservation::from_store", executor)
         self.assertIn("AdvisoryFenceAbsence::from_store", executor)
         self.assertEqual(provider_executor.count(".delete_object_generation("), 1)
@@ -2212,6 +2230,62 @@ impl X {
             "std::env::",
         ):
             self.assertNotIn(forbidden, local_executor)
+        self.assertIn("struct StoreAdvisoryCapturedDrain", store_production)
+        self.assertNotIn("impl StoreAdvisoryCapturedDrain", store_production)
+        self.assertNotRegex(
+            store_production,
+            r"impl[^{}]{0,160}\bfor\s+StoreAdvisoryCapturedDrain\b",
+        )
+        self.assertIn("OpenStatus::Open", drain_executor)
+        self.assertIn("handle.user_id != self._user_id", drain_executor)
+        self.assertIn("registration.belongs_to(&self._capture.registry)", drain_executor)
+        self.assertIn("registration.completed_len() == 0", drain_executor)
+        self.assertIn("ShadowSessionId::for_operation", drain_executor)
+        self.assertIn("ShadowAttemptId::random()", drain_executor)
+        self.assertIn(".begin_drain(session, attempt)", drain_executor)
+        self.assertIn("lease.take_for_advisory()", drain_executor)
+        for forbidden in (
+            ".get_object(",
+            ".delete_object",
+            ".put_object(",
+            "list_",
+            ".with_user(",
+            "open_db(",
+            ".register(",
+            ".commit()",
+            ".settle(",
+            "CapturedWalCommit",
+            "acknowledge_result",
+            "tokio::spawn",
+            "std::env::",
+        ):
+            self.assertNotIn(forbidden, drain_executor)
+        self.assertIn("struct OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
+        self.assertNotIn("pub struct OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
+        self.assertNotIn("impl OwnedAdvisoryCapturedDrain", sqlite_vfs_production)
+        self.assertEqual(
+            len(
+                re.findall(
+                    r"impl[^{}]{0,160}\bfor\s+OwnedAdvisoryCapturedDrain\b",
+                    sqlite_vfs_production,
+                )
+            ),
+            2,
+        )
+        self.assertEqual(
+            sqlite_vfs_production.count(
+                ".drain_completed_prefix_with_reservation("
+            ),
+            2,
+        )
+        owned_start = sqlite_vfs_production.index(
+            "impl Drop for OwnedAdvisoryCapturedDrain"
+        )
+        owned_end = sqlite_vfs_production.index(
+            "impl std::fmt::Debug for OwnedAdvisoryCapturedDrain", owned_start
+        )
+        owned_drain = sqlite_vfs_production[owned_start:owned_end]
+        self.assertIn("restore_completed_prefix(commits)", owned_drain)
         self.assertEqual(
             maintenance_production.count(
                 ".ensure_advisory_release_absent(operation_id)"

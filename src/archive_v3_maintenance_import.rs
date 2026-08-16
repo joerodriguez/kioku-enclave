@@ -4231,6 +4231,37 @@ mod tests {
             Some(exact_capture_count),
             "an unrelated user must never enter the advisory capture stream"
         );
+        let capture_drain = resumed_owner.begin_capture_drain_for_test().await.unwrap();
+        assert_eq!(
+            capture_drain.captured_commit_count_for_test(),
+            exact_capture_count
+        );
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(0)
+        );
+        assert!(resumed_owner.begin_capture_drain_for_test().await.is_err());
+        store
+            .with_user(&user.id, |connection| {
+                connection.execute(
+                    "INSERT INTO app_metadata(key,value) VALUES(?1,?2)",
+                    ["advisory-capture-later", "exact-user"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let later_capture_count = resumed_owner
+            .captured_commit_count_for_test()
+            .await
+            .expect("later exact-user commit remains in the live capture stream");
+        assert!(later_capture_count > 0);
+        drop(capture_drain);
+        assert_eq!(
+            resumed_owner.captured_commit_count_for_test().await,
+            Some(exact_capture_count + later_capture_count),
+            "cancellation restores only the selected prefix ahead of later commits"
+        );
 
         // Selecting the later authority importer against a completed advisory
         // terminal fails closed. A separately reviewed Phase-2 transition

@@ -241,6 +241,8 @@ pub struct WalCaptureState {
     published_frames: usize,
     completed: VecDeque<CapturedWalCommit>,
     completed_bytes: usize,
+    reserved_completed_commits: usize,
+    reserved_completed_bytes: usize,
     disabled: Option<ShadowCaptureFault>,
     metrics: ShadowCaptureMetrics,
 }
@@ -273,6 +275,8 @@ impl WalCaptureState {
             published_frames: 0,
             completed: VecDeque::new(),
             completed_bytes: 0,
+            reserved_completed_commits: 0,
+            reserved_completed_bytes: 0,
             disabled: None,
             metrics: ShadowCaptureMetrics::default(),
         }
@@ -378,8 +382,17 @@ impl WalCaptureState {
                     .iter()
                     .map(|commit| commit.frames.len())
                     .sum::<usize>();
-                if self.completed.len() + commits.len() > MAX_COMPLETED_SHADOW_COMMITS
-                    || self.completed_bytes.saturating_add(new_bytes) > MAX_COMPLETED_SHADOW_BYTES
+                if self
+                    .completed
+                    .len()
+                    .saturating_add(self.reserved_completed_commits)
+                    .saturating_add(commits.len())
+                    > MAX_COMPLETED_SHADOW_COMMITS
+                    || self
+                        .completed_bytes
+                        .saturating_add(self.reserved_completed_bytes)
+                        .saturating_add(new_bytes)
+                        > MAX_COMPLETED_SHADOW_BYTES
                 {
                     self.metrics.queue_full = self.metrics.queue_full.saturating_add(1);
                     self.drop_generation(ShadowCaptureFault::QueueFull);
@@ -442,6 +455,51 @@ impl WalCaptureState {
         Some(commits)
     }
 
+    /// Detach one exact prefix while retaining its count and byte budget.
+    /// Only one VFS drain can be active, so restoration can later require an
+    /// exact match rather than accepting caller-selected reservation facts.
+    pub(crate) fn drain_completed_prefix_with_reservation(
+        &mut self,
+        count: usize,
+    ) -> Option<Vec<CapturedWalCommit>> {
+        let drained_bytes = self
+            .completed
+            .iter()
+            .take(count)
+            .try_fold(0usize, |total, commit| {
+                total.checked_add(commit.frames.len())
+            })?;
+        let reserved_completed_commits = self.reserved_completed_commits.checked_add(count)?;
+        let reserved_completed_bytes = self.reserved_completed_bytes.checked_add(drained_bytes)?;
+        if reserved_completed_commits > MAX_COMPLETED_SHADOW_COMMITS
+            || reserved_completed_bytes > MAX_COMPLETED_SHADOW_BYTES
+        {
+            return None;
+        }
+        let commits = self.drain_completed_prefix(count)?;
+        self.reserved_completed_commits = reserved_completed_commits;
+        self.reserved_completed_bytes = reserved_completed_bytes;
+        Some(commits)
+    }
+
+    /// Permanently consume the one exact detached reservation after its
+    /// authenticated owner settlement has succeeded.
+    pub(crate) fn release_completed_reservation(&mut self, commits: &[CapturedWalCommit]) -> bool {
+        let Some(committed_bytes) = commits.iter().try_fold(0usize, |total, commit| {
+            total.checked_add(commit.frames.len())
+        }) else {
+            return false;
+        };
+        if self.reserved_completed_commits != commits.len()
+            || self.reserved_completed_bytes != committed_bytes
+        {
+            return false;
+        }
+        self.reserved_completed_commits = 0;
+        self.reserved_completed_bytes = 0;
+        true
+    }
+
     /// Restore an exact previously drained prefix ahead of commits observed
     /// later. This is used only by the owner-scoped publication lease when a
     /// candidate has not durably settled. The original ordering and byte
@@ -457,7 +515,8 @@ impl WalCaptureState {
             Some(value) => value,
             None => return Err(commits),
         };
-        if self.disabled.is_some()
+        if self.reserved_completed_commits != commits.len()
+            || self.reserved_completed_bytes != restored_bytes
             || self.completed.len().saturating_add(commits.len()) > MAX_COMPLETED_SHADOW_COMMITS
             || self
                 .completed_bytes
@@ -470,6 +529,8 @@ impl WalCaptureState {
             self.completed.push_front(commit);
         }
         self.completed_bytes += restored_bytes;
+        self.reserved_completed_commits = 0;
+        self.reserved_completed_bytes = 0;
         Ok(())
     }
 
@@ -485,6 +546,8 @@ impl WalCaptureState {
             && self.published_frames == 0
             && self.completed.is_empty()
             && self.completed_bytes == 0
+            && self.reserved_completed_commits == 0
+            && self.reserved_completed_bytes == 0
     }
 
     pub fn metrics(&self) -> ShadowCaptureMetrics {

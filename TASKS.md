@@ -615,6 +615,16 @@ separate activation blockers.
     exact capture registry and has no Store connection, drain, provider,
     acknowledgement, task, route, startup, serving, cloud, or deployment
     authority; owner-only drain/comparison is next.
+  - [x] Add the inactive owner-only capture drain. The resumed advisory owner
+    can borrow its exact Store target to select only the complete prefix on the
+    already-open exact-user capture registration. The non-cloneable drain has
+    no production commit-byte getter or settlement operation. Detached count
+    and bytes retain their fixed queue reservation, so dropping it restores the
+    full prefix ahead of captures observed later even if the later generation
+    faults; stream retirement instead scrubs it. An empty/missing/changing/wrong-registry handle fails
+    closed, a second concurrent drain is rejected, and no Store connection is
+    opened. Independent replay/comparison, durable evidence, acknowledgement,
+    launcher/startup/route/config, cloud, and deployment authority remain next.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 

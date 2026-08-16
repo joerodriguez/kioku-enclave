@@ -15,8 +15,9 @@
 //!
 //! The wrapper is opt-in and is not registered by application startup. Store
 //! constructors remain disabled; only the inactive advisory terminal may
-//! install one exact-user selection before reopening local admission. It has
-//! no drain/comparison worker, provider, route, recovery, or serving wiring.
+//! install one exact-user selection before reopening local admission. That
+//! owner may hold an opaque cancellation-safe prefix, but no comparison or
+//! settlement worker, provider, route, recovery, or serving wiring exists.
 
 use std::{
     collections::BTreeMap,
@@ -90,6 +91,7 @@ struct ActiveDrain {
 
 struct RegisteredCaptureState {
     capture: WalCaptureState,
+    advisory_detached: Option<Vec<CapturedWalCommit>>,
     retired: bool,
     next_drain_token: u64,
     active_drain: Option<ActiveDrain>,
@@ -100,6 +102,7 @@ impl RegisteredCaptureState {
     fn new() -> Self {
         Self {
             capture: WalCaptureState::new(),
+            advisory_detached: None,
             retired: false,
             next_drain_token: 0,
             active_drain: None,
@@ -113,6 +116,7 @@ impl RegisteredCaptureState {
         // every queued commit before any outstanding lease or live VFS
         // callback can observe the retired state.
         self.capture = WalCaptureState::new();
+        self.advisory_detached.take();
         self.active_drain = None;
         self.settled_drains.clear();
         self.next_drain_token = 0;
@@ -225,6 +229,18 @@ pub(crate) struct OwnedCapturedDrain {
     attempt_id: ShadowAttemptId,
     commits: Option<Vec<CapturedWalCommit>>,
     settled: bool,
+}
+
+/// Non-cloneable advisory owner for one exact captured prefix. It deliberately
+/// has no production read or settlement surface in this slice. Drop restores
+/// the complete prefix ahead of commits observed after the drain began; stream
+/// retirement instead scrubs it.
+pub(crate) struct OwnedAdvisoryCapturedDrain {
+    state: Arc<Mutex<RegisteredCaptureState>>,
+    stream_id: CaptureStreamId,
+    token: u64,
+    session_id: ShadowSessionId,
+    attempt_id: ShadowAttemptId,
 }
 
 impl CaptureRegistry {
@@ -429,6 +445,10 @@ fn canonical_scope_path(bytes: &[u8]) -> Result<Vec<u8>, CaptureRegistryError> {
 }
 
 impl CaptureRegistration {
+    pub(crate) fn belongs_to(&self, registry: &CaptureRegistry) -> bool {
+        Arc::ptr_eq(&self.registry.inner, &registry.inner)
+    }
+
     pub(crate) fn begin_exact_one_drain(
         &self,
         session_id: ShadowSessionId,
@@ -536,6 +556,41 @@ impl Drop for CaptureRegistration {
 }
 
 impl CaptureDrainLease {
+    pub(crate) fn take_for_advisory(
+        mut self,
+    ) -> Result<OwnedAdvisoryCapturedDrain, CaptureRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CaptureRegistryError::StateUnavailable)?;
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count: self.commit_count,
+        };
+        if state.retired || self.commit_count == 0 || state.active_drain != Some(expected) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        if state.advisory_detached.is_some() {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
+        let commits = state
+            .capture
+            .drain_completed_prefix_with_reservation(self.commit_count)
+            .ok_or(CaptureRegistryError::DrainMismatch)?;
+        state.advisory_detached = Some(commits);
+        drop(state);
+        self.settled = true;
+        Ok(OwnedAdvisoryCapturedDrain {
+            state: Arc::clone(&self.state),
+            stream_id: self.stream_id,
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+        })
+    }
+
     pub(crate) fn take_for_publication(
         mut self,
     ) -> Result<OwnedCapturedDrain, CaptureRegistryError> {
@@ -557,7 +612,7 @@ impl CaptureDrainLease {
         }
         let commits = state
             .capture
-            .drain_completed_prefix(1)
+            .drain_completed_prefix_with_reservation(1)
             .ok_or(CaptureRegistryError::DrainMismatch)?;
         drop(state);
         self.settled = true;
@@ -670,6 +725,13 @@ impl OwnedCapturedDrain {
         if state.retired || state.active_drain != Some(expected) {
             return Err(CaptureRegistryError::DrainMismatch);
         }
+        if !state.capture.release_completed_reservation(
+            self.commits
+                .as_deref()
+                .ok_or(CaptureRegistryError::DrainMismatch)?,
+        ) {
+            return Err(CaptureRegistryError::DrainMismatch);
+        }
         state.active_drain = None;
         state
             .settled_drains
@@ -712,6 +774,48 @@ impl Drop for OwnedCapturedDrain {
 impl std::fmt::Debug for OwnedCapturedDrain {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("OwnedCapturedDrain(<opaque>)")
+    }
+}
+
+impl Drop for OwnedAdvisoryCapturedDrain {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(active) = state.active_drain else {
+            return;
+        };
+        let expected = ActiveDrain {
+            token: self.token,
+            session_id: self.session_id,
+            attempt_id: self.attempt_id,
+            commit_count: active.commit_count,
+        };
+        if state.retired || state.active_drain != Some(expected) {
+            return;
+        }
+        let Some(commits) = state.advisory_detached.take() else {
+            return;
+        };
+        state.active_drain = None;
+        let _ = state.capture.restore_completed_prefix(commits);
+    }
+}
+
+impl std::fmt::Debug for OwnedAdvisoryCapturedDrain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnedAdvisoryCapturedDrain(<opaque>)")
+    }
+}
+
+#[cfg(test)]
+impl OwnedAdvisoryCapturedDrain {
+    pub(crate) fn captured_commit_count_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.advisory_detached.as_ref().map(Vec::len))
+            .unwrap_or_default()
     }
 }
 
@@ -1710,6 +1814,124 @@ mod tests {
         assert!(state.capture.is_scrubbed_for_test());
         assert!(state.active_drain.is_none());
         drop(state);
+        drop(connection);
+    }
+
+    #[test]
+    fn advisory_owned_drain_restores_the_full_prefix_ahead_of_later_commits() {
+        let session_id = ShadowSessionId::from_bytes([84; 16]);
+        let first_attempt = ShadowAttemptId::from_bytes([85; 16]);
+        let final_attempt = ShadowAttemptId::from_bytes([86; 16]);
+        let (_directory, c_path, registration, vfs) = setup();
+        let connection = open(&c_path, vfs.vfs_name_for_test());
+        wal_setup(&connection);
+        let _ = settle(&registration, 84, 1);
+        connection
+            .execute("INSERT INTO events VALUES (84)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO events VALUES (85)", [])
+            .unwrap();
+        let selected = registration.completed_len();
+        assert!(selected > 0);
+
+        let owned = registration
+            .begin_drain(session_id, first_attempt)
+            .unwrap()
+            .take_for_advisory()
+            .unwrap();
+        assert_eq!(owned.captured_commit_count_for_test(), selected);
+        assert_eq!(registration.completed_len(), 0);
+        assert!(matches!(
+            registration.begin_drain(session_id, final_attempt),
+            Err(CaptureRegistryError::DrainActive)
+        ));
+        connection
+            .execute("INSERT INTO events VALUES (86)", [])
+            .unwrap();
+        let later = registration.completed_len();
+        assert!(later > 0);
+        drop(owned);
+        assert_eq!(registration.completed_len(), selected + later);
+        assert_eq!(
+            registration
+                .begin_drain(session_id, final_attempt)
+                .unwrap()
+                .commit()
+                .unwrap()
+                .commits()
+                .len(),
+            selected + later
+        );
+        drop(connection);
+    }
+
+    #[test]
+    fn advisory_owned_drain_reserves_capacity_and_restores_after_later_fault() {
+        let session_id = ShadowSessionId::from_bytes([87; 16]);
+        let attempt_id = ShadowAttemptId::from_bytes([88; 16]);
+        let (_directory, c_path, registration, vfs) = setup();
+        let connection = open(&c_path, vfs.vfs_name_for_test());
+        wal_setup(&connection);
+        let _ = settle(&registration, 87, 1);
+        for value in 0..crate::archive_v3_shadow::MAX_COMPLETED_SHADOW_COMMITS {
+            connection
+                .execute("INSERT INTO events VALUES (?1)", [value as i64])
+                .unwrap();
+        }
+        assert_eq!(
+            registration.completed_len(),
+            crate::archive_v3_shadow::MAX_COMPLETED_SHADOW_COMMITS
+        );
+
+        let owned = registration
+            .begin_drain(session_id, attempt_id)
+            .unwrap()
+            .take_for_advisory()
+            .unwrap();
+        assert_eq!(registration.completed_len(), 0);
+        connection
+            .execute("INSERT INTO events VALUES (88)", [])
+            .unwrap();
+        assert_eq!(registration.completed_len(), 0);
+        assert_eq!(registration.metrics().queue_full, 1);
+
+        drop(owned);
+        assert_eq!(
+            registration.completed_len(),
+            crate::archive_v3_shadow::MAX_COMPLETED_SHADOW_COMMITS,
+            "the detached prefix must restore even after a later generation faults at the cap"
+        );
+        drop(connection);
+    }
+
+    #[test]
+    fn retiring_an_advisory_owned_drain_scrubs_its_detached_prefix() {
+        let session_id = ShadowSessionId::from_bytes([89; 16]);
+        let attempt_id = ShadowAttemptId::from_bytes([90; 16]);
+        let (_directory, c_path, registration, vfs) = setup();
+        let connection = open(&c_path, vfs.vfs_name_for_test());
+        wal_setup(&connection);
+        let _ = settle(&registration, 89, 1);
+        connection
+            .execute("INSERT INTO events VALUES (89)", [])
+            .unwrap();
+        let owned = registration
+            .begin_drain(session_id, attempt_id)
+            .unwrap()
+            .take_for_advisory()
+            .unwrap();
+        assert!(owned.captured_commit_count_for_test() > 0);
+        let state = Arc::clone(&registration.state);
+
+        drop(registration);
+        assert_eq!(owned.captured_commit_count_for_test(), 0);
+        let state = state.lock().unwrap();
+        assert!(state.retired);
+        assert!(state.advisory_detached.is_none());
+        assert!(state.capture.is_scrubbed_for_test());
+        drop(state);
+        drop(owned);
         drop(connection);
     }
 

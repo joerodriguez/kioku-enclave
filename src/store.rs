@@ -81,7 +81,8 @@ use crate::{
     },
     archive_v3_shadow_parity::AuthenticatedWalOwnerStaging,
     archive_v3_sqlite_vfs::{
-        CaptureRegistration, CaptureRegistry, OwnedCapturedDrain, RegisteredCaptureVfs,
+        CaptureRegistration, CaptureRegistry, OwnedAdvisoryCapturedDrain, OwnedCapturedDrain,
+        RegisteredCaptureVfs,
     },
     archive_v3_wal_idempotency::{
         ErasedPreparedLogicalMutation, ErasedPreparedLookup, ErasedValidatedWalLogicalResult,
@@ -661,6 +662,14 @@ pub(crate) struct StoreAdvisoryResumedTarget {
     _operation_id: MaintenanceImportOperationId,
     _source: MaintenanceSourceBinding,
     _capture: Arc<StoreShadowCapture>,
+}
+
+/// Opaque, cancellation-safe ownership of the exact captured prefix selected
+/// by the resumed advisory owner. This slice exposes no commit bytes or
+/// settlement operation; dropping it restores the prefix while the exact
+/// connection remains live.
+pub(crate) struct StoreAdvisoryCapturedDrain {
+    _drain: OwnedAdvisoryCapturedDrain,
 }
 
 #[cfg(test)]
@@ -1930,6 +1939,57 @@ impl StoreAdvisoryCaptureTarget {
     }
 }
 
+impl StoreAdvisoryResumedTarget {
+    /// Select the complete prefix currently queued for the exact resumed user.
+    /// The Store never opens a connection for the owner: the user's existing
+    /// open handle must belong to the installed advisory capture registry.
+    pub(crate) async fn begin_advisory_capture_drain(&self) -> Result<StoreAdvisoryCapturedDrain> {
+        let actor = {
+            let registry = self._store.registry.lock().await;
+            let open = registry.open_users.get(&self._user_id).ok_or_else(|| {
+                EnclaveError::Conflict("advisory capture handle is not open".into())
+            })?;
+            if open.status != OpenStatus::Open {
+                return Err(EnclaveError::Conflict(
+                    "advisory capture handle is changing".into(),
+                ));
+            }
+            Arc::clone(&open.actor)
+        };
+        let state = actor.state.lock().await;
+        let handle = state.handle.as_ref().ok_or_else(|| {
+            EnclaveError::Conflict("advisory capture handle is unavailable".into())
+        })?;
+        if handle.user_id != self._user_id {
+            return Err(EnclaveError::Conflict(
+                "advisory capture user changed".into(),
+            ));
+        }
+        let registration = handle
+            ._shadow_capture_registration
+            .as_ref()
+            .filter(|registration| registration.belongs_to(&self._capture.registry))
+            .ok_or_else(|| {
+                EnclaveError::Conflict("advisory capture registration changed".into())
+            })?;
+        if registration.completed_len() == 0 {
+            return Err(EnclaveError::Conflict(
+                "advisory capture has no complete commit".into(),
+            ));
+        }
+        let session = crate::archive_v3_shadow_session::ShadowSessionId::for_operation(
+            *self._operation_id.as_bytes(),
+        )
+        .map_err(|_| EnclaveError::Conflict("advisory capture session changed".into()))?;
+        let attempt = crate::archive_v3_shadow_session::ShadowAttemptId::random();
+        let drain = registration
+            .begin_drain(session, attempt)
+            .and_then(|lease| lease.take_for_advisory())
+            .map_err(|_| EnclaveError::Conflict("advisory capture drain unavailable".into()))?;
+        Ok(StoreAdvisoryCapturedDrain { _drain: drain })
+    }
+}
+
 #[cfg(test)]
 impl StoreAdvisoryResumedTarget {
     pub(crate) fn exact_identity_for_test(
@@ -1958,6 +2018,13 @@ impl StoreAdvisoryResumedTarget {
             .registry
             .contains_stream_for_test(registration.stream_id())
             .then(|| registration.completed_len())
+    }
+}
+
+#[cfg(test)]
+impl StoreAdvisoryCapturedDrain {
+    pub(crate) fn captured_commit_count_for_test(&self) -> usize {
+        self._drain.captured_commit_count_for_test()
     }
 }
 
