@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tarfile
 from types import SimpleNamespace
@@ -1235,6 +1236,24 @@ class LocalImagePipelineTests(unittest.TestCase):
             cloud.mkdir(mode=0o700)
             with self.assertRaisesRegex(pipeline.PipelineError, "symlinked ancestry"):
                 pipeline.reviewed_cloud_config_directory(str(ancestor / "cloud"))
+
+    def test_buildx_config_tightens_only_owned_regular_metadata_files(self) -> None:
+        pipeline = load_pipeline()
+        with tempfile.TemporaryDirectory() as temporary:
+            buildx_config = Path(temporary) / "buildx"
+            buildx_config.mkdir(mode=0o700)
+            metadata = buildx_config / "activity"
+            metadata.write_text("build reference\n", encoding="utf-8")
+            metadata.chmod(0o644)
+
+            reviewed = pipeline.reviewed_private_config_directory(
+                str(buildx_config),
+                "native Buildx config directory",
+                tighten_owned_files=True,
+            )
+
+            self.assertEqual(reviewed, buildx_config.resolve())
+            self.assertEqual(stat.S_IMODE(metadata.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

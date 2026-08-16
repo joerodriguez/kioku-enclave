@@ -455,7 +455,12 @@ def builder_identity_binding(snapshot: dict[str, object]) -> dict[str, object]:
     return {field: snapshot[field] for field in BUILDER_IDENTITY_FIELDS}
 
 
-def reviewed_private_config_directory(path_value: str, label: str) -> Path:
+def reviewed_private_config_directory(
+    path_value: str,
+    label: str,
+    *,
+    tighten_owned_files: bool = False,
+) -> Path:
     """Validate a dedicated Docker/Buildx directory before passing it to children."""
     path = Path(path_value)
     if not path.is_absolute() or ".." in path.parts:
@@ -498,13 +503,36 @@ def reviewed_private_config_directory(path_value: str, label: str) -> Path:
                 stat.S_ISLNK(child_metadata.st_mode)
                 or not stat.S_ISREG(child_metadata.st_mode)
                 or child_metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(child_metadata.st_mode) != 0o600
             ):
                 raise PipelineError(f"{label} contains an unsafe file")
+            if stat.S_IMODE(child_metadata.st_mode) != 0o600:
+                if not tighten_owned_files:
+                    raise PipelineError(f"{label} contains an unsafe file")
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    descriptor = os.open(child, flags)
+                except OSError as error:
+                    raise PipelineError(f"{label} contains an unsafe file") from error
+                try:
+                    opened_metadata = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(opened_metadata.st_mode)
+                        or opened_metadata.st_uid != os.geteuid()
+                        or (opened_metadata.st_dev, opened_metadata.st_ino)
+                        != (child_metadata.st_dev, child_metadata.st_ino)
+                    ):
+                        raise PipelineError(f"{label} contains an unsafe file")
+                    os.fchmod(descriptor, 0o600)
+                except OSError as error:
+                    raise PipelineError(f"{label} contains an unsafe file") from error
+                finally:
+                    os.close(descriptor)
             if child.suffix.lower() != ".json" and child.name != "config.json":
                 continue
             try:
-                document = json.loads(child.read_bytes())
+                document = json.loads(
+                    read_owned_bytes(child, f"{label} JSON metadata", private=True)
+                )
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise PipelineError(f"{label} contains invalid JSON metadata") from error
 
@@ -596,7 +624,11 @@ def configure_direct_child_environment(stage: str) -> None:
                 "and KIOKU_RELEASE_NATIVE_BUILDX_CONFIG directories"
             )
         docker_config = reviewed_private_config_directory(docker_config_value, "native Docker config directory")
-        buildx_config = reviewed_private_config_directory(buildx_config_value, "native Buildx config directory")
+        buildx_config = reviewed_private_config_directory(
+            buildx_config_value,
+            "native Buildx config directory",
+            tighten_owned_files=True,
+        )
         child.update({"DOCKER_CONFIG": str(docker_config), "BUILDX_CONFIG": str(buildx_config)})
         for name in DIRECT_ENV_TRANSPORT:
             if name in os.environ:
