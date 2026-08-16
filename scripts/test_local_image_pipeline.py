@@ -27,6 +27,27 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from test_select_build_configuration import environment  # noqa: E402
 
+# The production verifier intentionally invokes this contract suite from a
+# live builder environment. Fixtures must never inherit those coordinates;
+# each test supplies every transport/config value it means to exercise.
+for inherited_name in (
+    "KIOKU_NATIVE_BUILDER_NAME",
+    "KIOKU_NATIVE_BUILDER_ID",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_SSH_KNOWN_HOSTS",
+    "DOCKER_SSH_HOST_KEY_SHA256",
+    "DOCKER_SSH_COMMAND",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "DOCKER_BUILDER_CA_SHA256",
+    "SSH_AUTH_SOCK",
+    "KIOKU_RELEASE_NATIVE_DOCKER_CONFIG",
+    "KIOKU_RELEASE_NATIVE_BUILDX_CONFIG",
+    "CLOUDSDK_CONFIG",
+):
+    os.environ.pop(inherited_name, None)
+
 
 def load_pipeline():
     specification = importlib.util.spec_from_file_location(
