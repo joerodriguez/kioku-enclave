@@ -961,14 +961,36 @@ def immutable_source_subset_digest(commit: str, *paths: str) -> str:
 
 
 def normalize_source_snapshot_timestamps(context: Path) -> None:
-    """Remove commit-wide archive mtimes from BuildKit's reusable cache keys."""
+    """Give files content-derived mtimes for safe reusable BuildKit transport."""
     # `git archive` stamps every member with the commit timestamp. BuildKit can
     # consequently miss otherwise byte-identical COPY/cache records after a
     # script-only commit. The attested archive digest remains the source-of-
     # truth; this extracted tree is only a private transport representation.
     for directory, directories, files in os.walk(context, topdown=False, followlinks=False):
         parent = Path(directory)
-        for name in (*files, *directories):
+        for name in files:
+            path = parent / name
+            metadata = path.lstat()
+            digest = hashlib.sha256()
+            if stat.S_ISLNK(metadata.st_mode):
+                digest.update(b"symlink\0")
+                digest.update(os.readlink(path).encode("utf-8"))
+            elif stat.S_ISREG(metadata.st_mode):
+                digest.update(b"file\0")
+                with path.open("rb") as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            else:
+                raise PipelineError("immutable source snapshot contains an unsupported file type")
+            # A changed same-size file must have a different transport mtime so
+            # BuildKit's incremental context sender cannot retain stale bytes.
+            # Keep the value in a portable 2000-2030 range and deterministic
+            # for unchanged content across commits.
+            timestamp_ns = 946_684_800_000_000_000 + (
+                int.from_bytes(digest.digest()[:8], "big") % 946_684_800_000_000_000
+            )
+            os.utime(path, ns=(timestamp_ns, timestamp_ns), follow_symlinks=False)
+        for name in directories:
             os.utime(parent / name, ns=(0, 0), follow_symlinks=False)
         os.utime(parent, ns=(0, 0), follow_symlinks=False)
 

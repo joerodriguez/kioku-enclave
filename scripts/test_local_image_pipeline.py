@@ -610,9 +610,19 @@ class LocalImagePipelineTests(unittest.TestCase):
 
             pipeline.normalize_source_snapshot_timestamps(context)
 
-            self.assertEqual(source.stat().st_mtime_ns, 0)
+            first_content_timestamp = source.stat().st_mtime_ns
+            self.assertGreater(first_content_timestamp, 0)
             self.assertEqual(nested.stat().st_mtime_ns, 0)
             self.assertEqual(context.stat().st_mtime_ns, 0)
+
+            os.utime(source, (9_000_000, 9_000_000))
+            pipeline.normalize_source_snapshot_timestamps(context)
+            self.assertEqual(source.stat().st_mtime_ns, first_content_timestamp)
+
+            source.write_text("fn noop() {}\n")
+            self.assertEqual(len("fn noop() {}\n"), len("fn main() {}\n"))
+            pipeline.normalize_source_snapshot_timestamps(context)
+            self.assertNotEqual(source.stat().st_mtime_ns, first_content_timestamp)
 
     def test_remote_builder_disk_probe_is_pinned_and_rejects_low_space(self) -> None:
         pipeline = load_pipeline()
