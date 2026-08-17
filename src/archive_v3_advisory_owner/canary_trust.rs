@@ -123,6 +123,39 @@ impl VerifiedAdvisoryCanaryAuthorization {
         self.statement.operation_id
     }
 
+    pub(crate) const fn scope_id(&self) -> [u8; 16] {
+        self.statement.scope_id
+    }
+
+    pub(crate) const fn release_image_digest(&self) -> [u8; 32] {
+        self.statement.release_image_digest
+    }
+
+    pub(crate) const fn operator_statement_commitment(&self) -> [u8; 32] {
+        self.operator_statement_commitment
+    }
+
+    pub(crate) fn verify_matches_window(
+        &self,
+        window_id: &[u8; 16],
+        target_commitment: &[u8; 32],
+        revision_commitment: &[u8; 32],
+        challenge_commitment: &[u8; 32],
+        monitoring_commitment: &[u8; 32],
+        rollback_commitment: &[u8; 32],
+    ) -> Result<()> {
+        if &self.runtime_admission.maintenance_window_id != window_id
+            || &self.runtime_admission.deployment_target_commitment != target_commitment
+            || &self.runtime_admission.deployment_revision_commitment != revision_commitment
+            || &self.runtime_admission.challenge_commitment != challenge_commitment
+            || &self.runtime_admission.monitoring_policy_commitment != monitoring_commitment
+            || &self.runtime_admission.rollback_policy_commitment != rollback_commitment
+        {
+            return Err(AdvisoryOwnerError::Conflict);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn authenticate_for_control(
         &self,

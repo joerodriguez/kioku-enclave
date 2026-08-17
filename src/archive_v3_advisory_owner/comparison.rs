@@ -192,6 +192,24 @@ impl AdvisoryComparisonSettlement {
         }
         Ok(())
     }
+
+    pub(crate) const fn archive_id(&self) -> crate::archive_v3::ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn operation_id(
+        &self,
+    ) -> crate::archive_v3_maintenance_import::MaintenanceImportOperationId {
+        self.operation_id
+    }
+
+    pub(crate) const fn evidence_commitment(&self) -> [u8; 32] {
+        self.evidence_commitment
+    }
+
+    pub(crate) const fn commitment(&self) -> [u8; 32] {
+        self.commitment
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

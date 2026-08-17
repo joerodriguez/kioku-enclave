@@ -481,6 +481,12 @@ impl AdvisoryAbortTerminal {
         Ok(())
     }
 
+    pub(crate) const fn operation_id(
+        &self,
+    ) -> crate::archive_v3_maintenance_import::MaintenanceImportOperationId {
+        self.operation_id
+    }
+
     pub(crate) const fn prepared_commitment_for_store(&self) -> [u8; 32] {
         self.commitment
     }

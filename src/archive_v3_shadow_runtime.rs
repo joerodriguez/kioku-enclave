@@ -660,6 +660,27 @@ impl MaintenanceRuntimeContext {
 }
 
 impl SealedSingleArchiveWalRuntime {
+    #[cfg(test)]
+    pub(crate) fn for_test<W>(
+        archive_id: ArchiveId,
+        objects: Arc<dyn ImmutableObjectBackend>,
+        registries: Arc<dyn ExactKeyRegistryProvider>,
+        witness: Arc<W>,
+    ) -> Self
+    where
+        W: MaintenanceImportWitnessProvider
+            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
+            + 'static,
+    {
+        let bundle = ArchiveV3ShadowRuntimeBundle::from_maintenance_test_components(
+            objects, registries, witness,
+        );
+        let binding = DurableSingleArchiveBinding::from_control_store(
+            crate::cp::control_store::ArchiveBinding::for_runtime_test(archive_id),
+        );
+        Self { binding, bundle }
+    }
+
     /// One-shot Phase-1 composition. The returned type can stop only at the
     /// verified advisory ShadowWal handoff and exposes no WalAuthoritative
     /// transition method.

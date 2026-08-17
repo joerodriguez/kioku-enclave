@@ -790,6 +790,56 @@ CREATE TABLE IF NOT EXISTS archive_v3_advisory_aborts (
         OR (stage='aborted' AND retirement_commitment IS NOT NULL AND revision=2)
     )
 );
+-- Phase-1 advisory canary controller execution run ledger. Tracks durable
+-- state progression (Prepared -> Eligible -> Imported -> Authorized -> OwnerAdmitted -> Retired/Aborted/ManualRequired)
+-- with exact memory measurements, live window commitments, and one-shot terminal bounds.
+CREATE TABLE IF NOT EXISTS archive_v3_advisory_controller_runs (
+    run_id BLOB PRIMARY KEY CHECK(length(run_id)=16 AND run_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    policy_commitment BLOB NOT NULL CHECK(length(policy_commitment)=32 AND policy_commitment!=zeroblob(32)),
+    user_id TEXT NOT NULL REFERENCES archive_bindings(user_id),
+    archive_id BLOB NOT NULL REFERENCES archive_bindings(archive_id)
+        CHECK(length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    maintenance_operation_id BLOB NOT NULL UNIQUE
+        CHECK(length(maintenance_operation_id)=16 AND maintenance_operation_id!=zeroblob(16)),
+    stage TEXT NOT NULL CHECK(stage IN (
+        'prepared','eligible','imported','authorized','owner_admitted','retired','aborted','manual_required'
+    )),
+    measured_database_bytes INTEGER CHECK(measured_database_bytes IS NULL OR measured_database_bytes>0),
+    measured_total_tmpfs_bytes INTEGER CHECK(measured_total_tmpfs_bytes IS NULL OR measured_total_tmpfs_bytes>0),
+    measured_vm_bytes INTEGER CHECK(measured_vm_bytes IS NULL OR measured_vm_bytes>0),
+    window_id BLOB NOT NULL CHECK(length(window_id)=16 AND window_id!=zeroblob(16)),
+    window_intent_commitment BLOB NOT NULL
+        CHECK(length(window_intent_commitment)=32 AND window_intent_commitment!=zeroblob(32)),
+    scope_id BLOB CHECK(
+        scope_id IS NULL OR (length(scope_id)=16 AND scope_id!=zeroblob(16))
+    ),
+    owner_id BLOB CHECK(
+        owner_id IS NULL OR (length(owner_id)=16 AND owner_id!=zeroblob(16))
+    ),
+    settlement_commitment BLOB CHECK(
+        settlement_commitment IS NULL
+        OR (length(settlement_commitment)=32 AND settlement_commitment!=zeroblob(32))
+    ),
+    abort_reason TEXT CHECK(
+        abort_reason IS NULL
+        OR (length(abort_reason)>0 AND length(abort_reason)<=128)
+    ),
+    commitment BLOB NOT NULL CHECK(length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK(revision>0),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (archive_id,maintenance_operation_id)
+        REFERENCES archive_v3_maintenance_imports(archive_id,operation_id),
+    CHECK(
+        (stage='prepared' AND measured_database_bytes IS NULL AND measured_total_tmpfs_bytes IS NULL AND measured_vm_bytes IS NULL AND scope_id IS NULL AND owner_id IS NULL AND settlement_commitment IS NULL AND abort_reason IS NULL)
+        OR (stage='eligible' AND measured_database_bytes IS NOT NULL AND measured_total_tmpfs_bytes IS NOT NULL AND measured_vm_bytes IS NOT NULL AND scope_id IS NULL AND owner_id IS NULL AND settlement_commitment IS NULL AND abort_reason IS NULL)
+        OR (stage='imported' AND measured_database_bytes IS NOT NULL AND measured_total_tmpfs_bytes IS NOT NULL AND measured_vm_bytes IS NOT NULL AND scope_id IS NULL AND owner_id IS NULL AND settlement_commitment IS NULL AND abort_reason IS NULL)
+        OR (stage='authorized' AND measured_database_bytes IS NOT NULL AND measured_total_tmpfs_bytes IS NOT NULL AND measured_vm_bytes IS NOT NULL AND scope_id IS NOT NULL AND owner_id IS NULL AND settlement_commitment IS NULL AND abort_reason IS NULL)
+        OR (stage='owner_admitted' AND measured_database_bytes IS NOT NULL AND measured_total_tmpfs_bytes IS NOT NULL AND measured_vm_bytes IS NOT NULL AND scope_id IS NOT NULL AND owner_id IS NOT NULL AND settlement_commitment IS NULL AND abort_reason IS NULL)
+        OR (stage='retired' AND measured_database_bytes IS NOT NULL AND measured_total_tmpfs_bytes IS NOT NULL AND measured_vm_bytes IS NOT NULL AND scope_id IS NOT NULL AND owner_id IS NOT NULL AND settlement_commitment IS NOT NULL AND abort_reason IS NULL)
+        OR (stage IN ('aborted','manual_required') AND abort_reason IS NOT NULL)
+    )
+);
 -- Inactive single-owner WAL publication protocol. These rows contain only
 -- content-free authenticated bindings and immutable-object facts. They never
 -- contain logical mutation results, SQL, captured frames, plaintext, provider
@@ -12134,6 +12184,1051 @@ fn finalize_advisory_abort_recovery_conn(
     Ok((loaded, true))
 }
 
+const ADVISORY_CONTROLLER_RUN_COMMITMENT_DOMAIN: &[u8] =
+    b"kioku/archive-v3/advisory-controller-run/v1\0";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdvisoryControllerRunStage {
+    Prepared,
+    Eligible,
+    Imported,
+    Authorized,
+    OwnerAdmitted,
+    Retired,
+    Aborted,
+    ManualRequired,
+}
+
+impl AdvisoryControllerRunStage {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Eligible => "eligible",
+            Self::Imported => "imported",
+            Self::Authorized => "authorized",
+            Self::OwnerAdmitted => "owner_admitted",
+            Self::Retired => "retired",
+            Self::Aborted => "aborted",
+            Self::ManualRequired => "manual_required",
+        }
+    }
+
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "prepared" => Some(Self::Prepared),
+            "eligible" => Some(Self::Eligible),
+            "imported" => Some(Self::Imported),
+            "authorized" => Some(Self::Authorized),
+            "owner_admitted" => Some(Self::OwnerAdmitted),
+            "retired" => Some(Self::Retired),
+            "aborted" => Some(Self::Aborted),
+            "manual_required" => Some(Self::ManualRequired),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AdvisoryControllerRunRecord {
+    pub(crate) run_id: [u8; 16],
+    pub(crate) user_id: String,
+    pub(crate) archive_id: ArchiveId,
+    pub(crate) maintenance_operation_id: MaintenanceImportOperationId,
+    pub(crate) stage: AdvisoryControllerRunStage,
+    pub(crate) measured_database_bytes: Option<u64>,
+    pub(crate) measured_total_tmpfs_bytes: Option<u64>,
+    pub(crate) measured_vm_bytes: Option<u64>,
+    pub(crate) window_id: [u8; 16],
+    pub(crate) window_intent_commitment: [u8; 32],
+    pub(crate) scope_id: Option<[u8; 16]>,
+    pub(crate) owner_id: Option<[u8; 16]>,
+    pub(crate) settlement_commitment: Option<[u8; 32]>,
+    pub(crate) abort_reason: Option<String>,
+    pub(crate) commitment: [u8; 32],
+    pub(crate) revision: u64,
+}
+
+fn compute_phase1_policy_commitment() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kioku/archive-v3/phase1-tmpfs-policy/v1\0");
+    hasher.update(1u32.to_be_bytes()); // POLICY_VERSION = 1
+    hasher.update(2u64.to_be_bytes()); // DB_COPY_MULTIPLIER = 2
+    hasher.update((4u64 * 1024 * 1024 * 1024).to_be_bytes()); // MAX_PHASE1_TMPFS_BYTES = 4 GiB
+    hasher.update((64u64 * 1024 * 1024).to_be_bytes()); // WORST_CASE_WAL_BYTES = 64 MiB
+    hasher.update((64u64 * 1024 * 1024).to_be_bytes()); // SQLITE_SCRATCH_BYTES = 64 MiB
+    hasher.update((256u64 * 1024 * 1024).to_be_bytes()); // MODEL_WORKING_SET_BYTES = 256 MiB
+    hasher.update(4u64.to_be_bytes()); // VM_FRACTION_DENOMINATOR = 4
+    hasher.finalize().into()
+}
+
+const ADVISORY_CONTROLLER_RUN_FORMAT_VERSION: u32 = 1;
+
+#[allow(clippy::too_many_arguments)]
+fn compute_advisory_controller_run_commitment(
+    run_id: &[u8; 16],
+    user_id: &str,
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    stage: AdvisoryControllerRunStage,
+    measured_database_bytes: Option<u64>,
+    measured_total_tmpfs_bytes: Option<u64>,
+    measured_vm_bytes: Option<u64>,
+    window_id: &[u8; 16],
+    window_intent_commitment: &[u8; 32],
+    scope_id: Option<&[u8; 16]>,
+    owner_id: Option<&[u8; 16]>,
+    settlement_commitment: Option<&[u8; 32]>,
+    abort_reason: Option<&str>,
+    revision: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ADVISORY_CONTROLLER_RUN_COMMITMENT_DOMAIN);
+    hasher.update(ADVISORY_CONTROLLER_RUN_FORMAT_VERSION.to_be_bytes());
+    hasher.update(compute_phase1_policy_commitment());
+    hasher.update((user_id.len() as u32).to_be_bytes());
+    hasher.update(user_id.as_bytes());
+    hasher.update(run_id);
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(stage.as_str().as_bytes());
+    hasher.update(measured_database_bytes.unwrap_or(0).to_be_bytes());
+    hasher.update(measured_total_tmpfs_bytes.unwrap_or(0).to_be_bytes());
+    hasher.update(measured_vm_bytes.unwrap_or(0).to_be_bytes());
+    hasher.update(window_id);
+    hasher.update(window_intent_commitment);
+    hasher.update(scope_id.unwrap_or(&[0; 16]));
+    hasher.update(owner_id.unwrap_or(&[0; 16]));
+    hasher.update(settlement_commitment.unwrap_or(&[0; 32]));
+    hasher.update(abort_reason.unwrap_or("").as_bytes());
+    hasher.update(revision.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn load_advisory_controller_run_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<Option<AdvisoryControllerRunRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT run_id, user_id, archive_id, maintenance_operation_id, stage,
+                measured_database_bytes, measured_total_tmpfs_bytes, measured_vm_bytes,
+                window_id, window_intent_commitment, scope_id, owner_id,
+                settlement_commitment, abort_reason, format_version, policy_commitment,
+                commitment, revision
+         FROM archive_v3_advisory_controller_runs
+         WHERE maintenance_operation_id = ?1",
+    )?;
+    let mut rows = stmt.query([operation_id.as_bytes().as_slice()])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+
+    let run_id_bytes: Vec<u8> = row.get(0)?;
+    let run_id: [u8; 16] = run_id_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("corrupt run_id".into()))?;
+    let user_id: String = row.get(1)?;
+    let archive_id_bytes: Vec<u8> = row.get(2)?;
+    let archive_id_arr: [u8; 16] = archive_id_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("corrupt archive_id".into()))?;
+    let archive_id = ArchiveId::from_bytes(archive_id_arr);
+    let op_id_bytes: Vec<u8> = row.get(3)?;
+    let op_id_arr: [u8; 16] = op_id_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("corrupt op_id".into()))?;
+    let op_id =
+        MaintenanceImportOperationId::from_control(MaintenancePersistenceContext(()), op_id_arr)
+            .map_err(|_| EnclaveError::Store("corrupt operation_id".into()))?;
+    let stage_str: String = row.get(4)?;
+    let stage = AdvisoryControllerRunStage::from_str(&stage_str)
+        .ok_or_else(|| EnclaveError::Store("corrupt stage".into()))?;
+    let measured_database_bytes: Option<i64> = row.get(5)?;
+    let measured_total_tmpfs_bytes: Option<i64> = row.get(6)?;
+    let measured_vm_bytes: Option<i64> = row.get(7)?;
+    let window_id_bytes: Vec<u8> = row.get(8)?;
+    let window_id: [u8; 16] = window_id_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("corrupt window_id".into()))?;
+    let window_intent_bytes: Vec<u8> = row.get(9)?;
+    let window_intent_commitment: [u8; 32] = window_intent_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("corrupt window_intent".into()))?;
+    let scope_id: Option<[u8; 16]> = row
+        .get::<_, Option<Vec<u8>>>(10)?
+        .map(|v| {
+            v.as_slice()
+                .try_into()
+                .map_err(|_| EnclaveError::Store("corrupt scope_id".into()))
+        })
+        .transpose()?;
+    let owner_id: Option<[u8; 16]> = row
+        .get::<_, Option<Vec<u8>>>(11)?
+        .map(|v| {
+            v.as_slice()
+                .try_into()
+                .map_err(|_| EnclaveError::Store("corrupt owner_id".into()))
+        })
+        .transpose()?;
+    let settlement_commitment: Option<[u8; 32]> = row
+        .get::<_, Option<Vec<u8>>>(12)?
+        .map(|v| {
+            v.as_slice()
+                .try_into()
+                .map_err(|_| EnclaveError::Store("corrupt settlement_commitment".into()))
+        })
+        .transpose()?;
+    let abort_reason: Option<String> = row.get(13)?;
+    let format_version: i64 = row.get(14)?;
+    if format_version != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run format_version mismatch".into(),
+        ));
+    }
+    let policy_commitment_bytes: Vec<u8> = row.get(15)?;
+    let policy_commitment: [u8; 32] = policy_commitment_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("corrupt policy_commitment".into()))?;
+    if policy_commitment != compute_phase1_policy_commitment() {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run policy_commitment mismatch".into(),
+        ));
+    }
+    let commitment_bytes: Vec<u8> = row.get(16)?;
+    let commitment: [u8; 32] = commitment_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EnclaveError::Store("corrupt commitment".into()))?;
+    let revision: i64 = row.get(17)?;
+    let revision =
+        u64::try_from(revision).map_err(|_| EnclaveError::Store("corrupt revision".into()))?;
+
+    let measured_database_bytes = measured_database_bytes
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("negative database bytes".into()))?;
+    let measured_total_tmpfs_bytes = measured_total_tmpfs_bytes
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("negative total tmpfs bytes".into()))?;
+    let measured_vm_bytes = measured_vm_bytes
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("negative vm bytes".into()))?;
+
+    let expected_commitment = compute_advisory_controller_run_commitment(
+        &run_id,
+        &user_id,
+        archive_id,
+        op_id,
+        stage,
+        measured_database_bytes,
+        measured_total_tmpfs_bytes,
+        measured_vm_bytes,
+        &window_id,
+        &window_intent_commitment,
+        scope_id.as_ref(),
+        owner_id.as_ref(),
+        settlement_commitment.as_ref(),
+        abort_reason.as_deref(),
+        revision,
+    );
+    if commitment != expected_commitment {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run commitment mismatch".into(),
+        ));
+    }
+
+    Ok(Some(AdvisoryControllerRunRecord {
+        run_id,
+        user_id,
+        archive_id,
+        maintenance_operation_id: op_id,
+        stage,
+        measured_database_bytes,
+        measured_total_tmpfs_bytes,
+        measured_vm_bytes,
+        window_id,
+        window_intent_commitment,
+        scope_id,
+        owner_id,
+        settlement_commitment,
+        abort_reason,
+        commitment,
+        revision,
+    }))
+}
+
+fn prepare_advisory_controller_run_conn(
+    conn: &Connection,
+    run_id: [u8; 16],
+    user_id: &str,
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    window_id: [u8; 16],
+    window_intent_commitment: [u8; 32],
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    if let Some(existing) = load_advisory_controller_run_conn(&tx, operation_id)? {
+        if existing.run_id == run_id
+            && existing.user_id == user_id
+            && existing.archive_id == archive_id
+            && existing.window_id == window_id
+            && existing.window_intent_commitment == window_intent_commitment
+        {
+            tx.commit()?;
+            return Ok((existing, false));
+        }
+        return Err(EnclaveError::Conflict(
+            "advisory controller run already prepared differently".into(),
+        ));
+    }
+
+    let commitment = compute_advisory_controller_run_commitment(
+        &run_id,
+        user_id,
+        archive_id,
+        operation_id,
+        AdvisoryControllerRunStage::Prepared,
+        None,
+        None,
+        None,
+        &window_id,
+        &window_intent_commitment,
+        None,
+        None,
+        None,
+        None,
+        1,
+    );
+
+    tx.execute(
+        "INSERT INTO archive_v3_advisory_controller_runs
+         (run_id, format_version, policy_commitment, user_id, archive_id, maintenance_operation_id, stage,
+          window_id, window_intent_commitment, commitment, revision)
+         VALUES (?1, 1, ?2, ?3, ?4, ?5, 'prepared', ?6, ?7, ?8, 1)",
+        rusqlite::params![
+            run_id.as_slice(),
+            compute_phase1_policy_commitment().as_slice(),
+            user_id,
+            archive_id.as_bytes().as_slice(),
+            operation_id.as_bytes().as_slice(),
+            window_id.as_slice(),
+            window_intent_commitment.as_slice(),
+            commitment.as_slice(),
+        ],
+    )?;
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::Store("failed to load prepared controller run".into()))?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
+fn advance_advisory_controller_eligible_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    db_bytes: u64,
+    total_tmpfs_bytes: u64,
+    vm_bytes: u64,
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::NotFound)?;
+
+    let import_rec = maintenance_import_record_conn(&tx, operation_id)?;
+    if import_rec.archive_id() != current.archive_id {
+        return Err(EnclaveError::Conflict(
+            "maintenance import binding mismatch".into(),
+        ));
+    }
+
+    if current.stage == AdvisoryControllerRunStage::Eligible
+        && current.measured_database_bytes == Some(db_bytes)
+        && current.measured_total_tmpfs_bytes == Some(total_tmpfs_bytes)
+        && current.measured_vm_bytes == Some(vm_bytes)
+    {
+        tx.commit()?;
+        return Ok((current, false));
+    }
+
+    if current.stage != AdvisoryControllerRunStage::Prepared {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run cannot advance to eligible from current stage".into(),
+        ));
+    }
+
+    if import_rec.stage() != MaintenanceImportStage::Prepared {
+        return Err(EnclaveError::Conflict(
+            "maintenance import row does not match prepared stage for eligible transition".into(),
+        ));
+    }
+
+    let next_rev = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("revision overflow".into()))?;
+    let next_commitment = compute_advisory_controller_run_commitment(
+        &current.run_id,
+        &current.user_id,
+        current.archive_id,
+        current.maintenance_operation_id,
+        AdvisoryControllerRunStage::Eligible,
+        Some(db_bytes),
+        Some(total_tmpfs_bytes),
+        Some(vm_bytes),
+        &current.window_id,
+        &current.window_intent_commitment,
+        None,
+        None,
+        None,
+        None,
+        next_rev,
+    );
+
+    let rows = tx.execute(
+        "UPDATE archive_v3_advisory_controller_runs
+         SET stage='eligible', measured_database_bytes=?1, measured_total_tmpfs_bytes=?2,
+             measured_vm_bytes=?3, commitment=?4, revision=?5,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE maintenance_operation_id=?6 AND stage='prepared' AND revision=?7 AND commitment=?8",
+        rusqlite::params![
+            i64::try_from(db_bytes).map_err(|_| EnclaveError::Store("db_bytes overflow".into()))?,
+            i64::try_from(total_tmpfs_bytes)
+                .map_err(|_| EnclaveError::Store("tmpfs_bytes overflow".into()))?,
+            i64::try_from(vm_bytes).map_err(|_| EnclaveError::Store("vm_bytes overflow".into()))?,
+            next_commitment.as_slice(),
+            i64::try_from(next_rev).map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            operation_id.as_bytes().as_slice(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            current.commitment.as_slice(),
+        ],
+    )?;
+    if rows != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run advance to eligible raced".into(),
+        ));
+    }
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::Store("failed to load advanced controller run".into()))?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
+fn advance_advisory_controller_imported_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::NotFound)?;
+
+    let import_rec = maintenance_import_record_conn(&tx, operation_id)?;
+    if import_rec.archive_id() != current.archive_id {
+        return Err(EnclaveError::Conflict(
+            "maintenance import binding mismatch".into(),
+        ));
+    }
+
+    if current.stage == AdvisoryControllerRunStage::Imported {
+        if !matches!(
+            import_rec.stage(),
+            MaintenanceImportStage::ShadowWal | MaintenanceImportStage::ParityVerified
+        ) {
+            return Err(EnclaveError::Conflict(
+                "maintenance import row does not match imported stage".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((current, false));
+    }
+
+    if current.stage != AdvisoryControllerRunStage::Eligible {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run cannot advance to imported from current stage".into(),
+        ));
+    }
+
+    if !matches!(
+        import_rec.stage(),
+        MaintenanceImportStage::ShadowWal | MaintenanceImportStage::ParityVerified
+    ) {
+        return Err(EnclaveError::Conflict(
+            "maintenance import row does not match shadow_wal or parity_verified stage for imported transition".into(),
+        ));
+    }
+
+    let next_rev = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("revision overflow".into()))?;
+    let next_commitment = compute_advisory_controller_run_commitment(
+        &current.run_id,
+        &current.user_id,
+        current.archive_id,
+        current.maintenance_operation_id,
+        AdvisoryControllerRunStage::Imported,
+        current.measured_database_bytes,
+        current.measured_total_tmpfs_bytes,
+        current.measured_vm_bytes,
+        &current.window_id,
+        &current.window_intent_commitment,
+        None,
+        None,
+        None,
+        None,
+        next_rev,
+    );
+
+    let rows = tx.execute(
+        "UPDATE archive_v3_advisory_controller_runs
+         SET stage='imported', commitment=?1, revision=?2,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE maintenance_operation_id=?3 AND stage='eligible' AND revision=?4 AND commitment=?5",
+        rusqlite::params![
+            next_commitment.as_slice(),
+            i64::try_from(next_rev).map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            operation_id.as_bytes().as_slice(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            current.commitment.as_slice(),
+        ],
+    )?;
+    if rows != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run advance to imported raced".into(),
+        ));
+    }
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::Store("failed to load advanced controller run".into()))?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
+fn authenticate_canary_scope_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    scope_id: [u8; 16],
+    archive_id: ArchiveId,
+) -> Result<()> {
+    type ScopeRow = (
+        i64,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+    );
+    let row: ScopeRow = conn.query_row(
+        "SELECT format_version,user_id,archive_id,maintenance_operation_id,
+                maintenance_operation_commitment,source_commitment,parity_commitment,
+                terminal_witness_hash,release_image_digest,operator_statement_commitment,
+                state,consumed_owner_id,consumed_owner_commitment,
+                authorization_commitment,commitment,revision
+         FROM archive_v3_advisory_canary_scopes
+         WHERE maintenance_operation_id=?1 AND scope_id=?2",
+        rusqlite::params![operation_id.as_bytes().as_slice(), scope_id.as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+                row.get(14)?,
+                row.get(15)?,
+            ))
+        },
+    )?;
+    if row.0 != 1
+        || row.2.as_slice() != archive_id.as_bytes()
+        || row.3.as_slice() != operation_id.as_bytes()
+        || row.10 == "revoked"
+        || row.15 <= 0
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory canary scope row mismatch or revoked".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn authenticate_advisory_owner_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    owner_id: [u8; 16],
+    archive_id: ArchiveId,
+) -> Result<()> {
+    let owner_res = load_advisory_owner_reservation_conn(conn, archive_id)?;
+    if owner_res.operation_id() != operation_id
+        || owner_res.owner_id().as_bytes() != &owner_id
+        || owner_res.stage() != AdvisoryOwnerStage::Bound
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory owner row mismatch or not bound".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn advance_advisory_controller_authorized_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    scope_id: [u8; 16],
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::NotFound)?;
+
+    authenticate_canary_scope_conn(&tx, operation_id, scope_id, current.archive_id)?;
+
+    if current.stage == AdvisoryControllerRunStage::Authorized && current.scope_id == Some(scope_id)
+    {
+        tx.commit()?;
+        return Ok((current, false));
+    }
+
+    if current.stage != AdvisoryControllerRunStage::Imported {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run cannot advance to authorized from current stage".into(),
+        ));
+    }
+
+    let next_rev = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("revision overflow".into()))?;
+    let next_commitment = compute_advisory_controller_run_commitment(
+        &current.run_id,
+        &current.user_id,
+        current.archive_id,
+        current.maintenance_operation_id,
+        AdvisoryControllerRunStage::Authorized,
+        current.measured_database_bytes,
+        current.measured_total_tmpfs_bytes,
+        current.measured_vm_bytes,
+        &current.window_id,
+        &current.window_intent_commitment,
+        Some(&scope_id),
+        None,
+        None,
+        None,
+        next_rev,
+    );
+
+    let rows = tx.execute(
+        "UPDATE archive_v3_advisory_controller_runs
+         SET stage='authorized', scope_id=?1, commitment=?2, revision=?3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE maintenance_operation_id=?4 AND stage='imported' AND revision=?5 AND commitment=?6",
+        rusqlite::params![
+            scope_id.as_slice(),
+            next_commitment.as_slice(),
+            i64::try_from(next_rev).map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            operation_id.as_bytes().as_slice(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            current.commitment.as_slice(),
+        ],
+    )?;
+    if rows != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run advance to authorized raced".into(),
+        ));
+    }
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::Store("failed to load advanced controller run".into()))?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
+fn advance_advisory_controller_owner_admitted_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    owner_id: [u8; 16],
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::NotFound)?;
+
+    authenticate_advisory_owner_conn(&tx, operation_id, owner_id, current.archive_id)?;
+    let release_rec = load_advisory_release_conn(&tx, current.archive_id)?;
+    if release_rec.operation_id() != operation_id
+        || release_rec.stage() != AdvisoryReleaseStage::Released
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory release row does not match released stage for owner_admitted transition"
+                .into(),
+        ));
+    }
+
+    if current.stage == AdvisoryControllerRunStage::OwnerAdmitted
+        && current.owner_id == Some(owner_id)
+    {
+        tx.commit()?;
+        return Ok((current, false));
+    }
+
+    if current.stage != AdvisoryControllerRunStage::Authorized {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run cannot advance to owner_admitted from current stage".into(),
+        ));
+    }
+
+    let next_rev = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("revision overflow".into()))?;
+    let next_commitment = compute_advisory_controller_run_commitment(
+        &current.run_id,
+        &current.user_id,
+        current.archive_id,
+        current.maintenance_operation_id,
+        AdvisoryControllerRunStage::OwnerAdmitted,
+        current.measured_database_bytes,
+        current.measured_total_tmpfs_bytes,
+        current.measured_vm_bytes,
+        &current.window_id,
+        &current.window_intent_commitment,
+        current.scope_id.as_ref(),
+        Some(&owner_id),
+        None,
+        None,
+        next_rev,
+    );
+
+    let rows = tx.execute(
+        "UPDATE archive_v3_advisory_controller_runs
+         SET stage='owner_admitted', owner_id=?1, commitment=?2, revision=?3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE maintenance_operation_id=?4 AND stage='authorized' AND revision=?5 AND commitment=?6",
+        rusqlite::params![
+            owner_id.as_slice(),
+            next_commitment.as_slice(),
+            i64::try_from(next_rev).map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            operation_id.as_bytes().as_slice(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            current.commitment.as_slice(),
+        ],
+    )?;
+    if rows != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run advance to owner_admitted raced".into(),
+        ));
+    }
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::Store("failed to load advanced controller run".into()))?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
+fn advance_advisory_controller_retired_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    settlement_commitment: [u8; 32],
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::NotFound)?;
+
+    let comparison_rec = load_advisory_comparison_conn(&tx, current.archive_id)?;
+    if comparison_rec.operation_id() != operation_id
+        || comparison_rec.evidence_commitment() != settlement_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "advisory comparison row does not match settlement_commitment for retired transition"
+                .into(),
+        ));
+    }
+
+    if current.stage == AdvisoryControllerRunStage::Retired
+        && current.settlement_commitment == Some(settlement_commitment)
+    {
+        tx.commit()?;
+        return Ok((current, false));
+    }
+
+    if current.stage != AdvisoryControllerRunStage::OwnerAdmitted {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run cannot advance to retired from current stage".into(),
+        ));
+    }
+
+    let next_rev = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("revision overflow".into()))?;
+    let next_commitment = compute_advisory_controller_run_commitment(
+        &current.run_id,
+        &current.user_id,
+        current.archive_id,
+        current.maintenance_operation_id,
+        AdvisoryControllerRunStage::Retired,
+        current.measured_database_bytes,
+        current.measured_total_tmpfs_bytes,
+        current.measured_vm_bytes,
+        &current.window_id,
+        &current.window_intent_commitment,
+        current.scope_id.as_ref(),
+        current.owner_id.as_ref(),
+        Some(&settlement_commitment),
+        None,
+        next_rev,
+    );
+
+    let rows = tx.execute(
+        "UPDATE archive_v3_advisory_controller_runs
+         SET stage='retired', settlement_commitment=?1, commitment=?2, revision=?3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE maintenance_operation_id=?4 AND stage='owner_admitted' AND revision=?5 AND commitment=?6",
+        rusqlite::params![
+            settlement_commitment.as_slice(),
+            next_commitment.as_slice(),
+            i64::try_from(next_rev).map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            operation_id.as_bytes().as_slice(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            current.commitment.as_slice(),
+        ],
+    )?;
+    if rows != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run advance to retired raced".into(),
+        ));
+    }
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::Store("failed to load advanced controller run".into()))?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
+fn advance_advisory_controller_aborted_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    abort_reason: &str,
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::NotFound)?;
+
+    if current.stage == AdvisoryControllerRunStage::Aborted {
+        if current.abort_reason.as_deref() == Some(abort_reason) {
+            tx.commit()?;
+            return Ok((current, false));
+        } else {
+            return Err(EnclaveError::Conflict(
+                "cannot rewrite abort reason of already aborted controller run".into(),
+            ));
+        }
+    }
+
+    if matches!(
+        current.stage,
+        AdvisoryControllerRunStage::Retired | AdvisoryControllerRunStage::ManualRequired
+    ) {
+        return Err(EnclaveError::Conflict(
+            "cannot abort terminal advisory controller run".into(),
+        ));
+    }
+
+    // Authenticate inner abort state before advancing to Aborted
+    match current.stage {
+        AdvisoryControllerRunStage::Prepared | AdvisoryControllerRunStage::Eligible => {
+            let import_rec = maintenance_import_record_conn(&tx, operation_id)?;
+            if import_rec.stage() != MaintenanceImportStage::Prepared
+                && import_rec.stage() != MaintenanceImportStage::ManualRequired
+            {
+                return Err(EnclaveError::Conflict(
+                    "cannot abort controller run: maintenance import stage invalid".into(),
+                ));
+            }
+        }
+        AdvisoryControllerRunStage::Imported | AdvisoryControllerRunStage::Authorized => {
+            let import_rec = maintenance_import_record_conn(&tx, operation_id)?;
+            if import_rec.stage() != MaintenanceImportStage::ManualRequired {
+                return Err(EnclaveError::Conflict(
+                    "cannot abort controller run: maintenance import not pre_owner_aborted".into(),
+                ));
+            }
+        }
+        AdvisoryControllerRunStage::OwnerAdmitted => {
+            let abort_rec = load_advisory_abort_conn(&tx, current.archive_id)?;
+            if abort_rec.operation_id() != operation_id {
+                return Err(EnclaveError::Conflict(
+                    "cannot abort controller run: inner abort operation_id mismatch".into(),
+                ));
+            }
+        }
+        AdvisoryControllerRunStage::Aborted => {}
+        AdvisoryControllerRunStage::Retired | AdvisoryControllerRunStage::ManualRequired => {
+            return Err(EnclaveError::Conflict(
+                "cannot abort terminal advisory controller run".into(),
+            ));
+        }
+    }
+
+    let next_rev = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("revision overflow".into()))?;
+    let next_commitment = compute_advisory_controller_run_commitment(
+        &current.run_id,
+        &current.user_id,
+        current.archive_id,
+        current.maintenance_operation_id,
+        AdvisoryControllerRunStage::Aborted,
+        current.measured_database_bytes,
+        current.measured_total_tmpfs_bytes,
+        current.measured_vm_bytes,
+        &current.window_id,
+        &current.window_intent_commitment,
+        current.scope_id.as_ref(),
+        current.owner_id.as_ref(),
+        None,
+        Some(abort_reason),
+        next_rev,
+    );
+
+    let rows = tx.execute(
+        "UPDATE archive_v3_advisory_controller_runs
+         SET stage='aborted', abort_reason=?1, commitment=?2, revision=?3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE maintenance_operation_id=?4 AND stage=?5 AND revision=?6 AND commitment=?7",
+        rusqlite::params![
+            abort_reason,
+            next_commitment.as_slice(),
+            i64::try_from(next_rev).map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            operation_id.as_bytes().as_slice(),
+            current.stage.as_str(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            current.commitment.as_slice(),
+        ],
+    )?;
+    if rows != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run advance to aborted raced".into(),
+        ));
+    }
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::Store("failed to load advanced controller run".into()))?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
+#[allow(dead_code)]
+fn advance_advisory_controller_manual_required_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    reason: &str,
+) -> Result<(AdvisoryControllerRunRecord, bool)> {
+    let tx = conn.unchecked_transaction()?;
+    let current = load_advisory_controller_run_conn(&tx, operation_id)?
+        .ok_or_else(|| EnclaveError::NotFound)?;
+
+    if current.stage == AdvisoryControllerRunStage::ManualRequired {
+        if current.abort_reason.as_deref() == Some(reason) {
+            tx.commit()?;
+            return Ok((current, false));
+        } else {
+            return Err(EnclaveError::Conflict(
+                "cannot rewrite reason of already manual_required controller run".into(),
+            ));
+        }
+    }
+
+    if matches!(
+        current.stage,
+        AdvisoryControllerRunStage::Retired | AdvisoryControllerRunStage::Aborted
+    ) {
+        return Err(EnclaveError::Conflict(
+            "cannot transition terminal advisory controller run to manual_required".into(),
+        ));
+    }
+
+    let next_rev = current
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| EnclaveError::Store("revision overflow".into()))?;
+    let next_commitment = compute_advisory_controller_run_commitment(
+        &current.run_id,
+        &current.user_id,
+        current.archive_id,
+        current.maintenance_operation_id,
+        AdvisoryControllerRunStage::ManualRequired,
+        current.measured_database_bytes,
+        current.measured_total_tmpfs_bytes,
+        current.measured_vm_bytes,
+        &current.window_id,
+        &current.window_intent_commitment,
+        current.scope_id.as_ref(),
+        current.owner_id.as_ref(),
+        None,
+        Some(reason),
+        next_rev,
+    );
+
+    let rows = tx.execute(
+        "UPDATE archive_v3_advisory_controller_runs
+         SET stage='manual_required', abort_reason=?1, commitment=?2, revision=?3,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE maintenance_operation_id=?4 AND stage=?5 AND revision=?6 AND commitment=?7",
+        rusqlite::params![
+            reason,
+            next_commitment.as_slice(),
+            i64::try_from(next_rev).map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            operation_id.as_bytes().as_slice(),
+            current.stage.as_str(),
+            i64::try_from(current.revision)
+                .map_err(|_| EnclaveError::Store("revision overflow".into()))?,
+            current.commitment.as_slice(),
+        ],
+    )?;
+    if rows != 1 {
+        return Err(EnclaveError::Conflict(
+            "advisory controller run advance to manual_required raced".into(),
+        ));
+    }
+
+    let record = load_advisory_controller_run_conn(&tx, operation_id)?.ok_or_else(|| {
+        EnclaveError::Store("failed to load manual_required controller run".into())
+    })?;
+    tx.commit()?;
+    Ok((record, true))
+}
+
 fn map_wal_persistence_error(error: EnclaveError) -> WalOwnerError {
     match error {
         EnclaveError::Conflict(_) | EnclaveError::Auth(_) => WalOwnerError::Conflict,
@@ -18038,6 +19133,165 @@ impl ControlStore {
             }
             Ok(stored)
         })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn load_maintenance_import_record(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<MaintenanceImportRecord> {
+        self.read(move |conn| maintenance_import_record_conn(conn, operation_id))
+            .await
+    }
+
+    pub(crate) async fn prepare_advisory_controller_run(
+        &self,
+        run_id: [u8; 16],
+        user_id: &str,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        window_id: [u8; 16],
+        window_intent_commitment: [u8; 32],
+    ) -> Result<AdvisoryControllerRunRecord> {
+        let user_id = user_id.to_string();
+        self.write_owned_if_changed(move |conn| {
+            prepare_advisory_controller_run_conn(
+                conn,
+                run_id,
+                &user_id,
+                archive_id,
+                operation_id,
+                window_id,
+                window_intent_commitment,
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn advance_advisory_controller_eligible(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        db_bytes: u64,
+        total_tmpfs_bytes: u64,
+        vm_bytes: u64,
+    ) -> Result<AdvisoryControllerRunRecord> {
+        self.write_owned_if_changed(move |conn| {
+            advance_advisory_controller_eligible_conn(
+                conn,
+                operation_id,
+                db_bytes,
+                total_tmpfs_bytes,
+                vm_bytes,
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn advance_advisory_controller_imported(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<AdvisoryControllerRunRecord> {
+        self.write_owned_if_changed(move |conn| {
+            advance_advisory_controller_imported_conn(conn, operation_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn advance_advisory_controller_authorized(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        scope_id: [u8; 16],
+    ) -> Result<AdvisoryControllerRunRecord> {
+        self.write_owned_if_changed(move |conn| {
+            advance_advisory_controller_authorized_conn(conn, operation_id, scope_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn advance_advisory_controller_owner_admitted(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        owner_id: [u8; 16],
+    ) -> Result<AdvisoryControllerRunRecord> {
+        self.write_owned_if_changed(move |conn| {
+            advance_advisory_controller_owner_admitted_conn(conn, operation_id, owner_id)
+        })
+        .await
+    }
+
+    pub(crate) async fn advance_advisory_controller_retired(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        settlement_commitment: [u8; 32],
+    ) -> Result<AdvisoryControllerRunRecord> {
+        self.write_owned_if_changed(move |conn| {
+            advance_advisory_controller_retired_conn(conn, operation_id, settlement_commitment)
+        })
+        .await
+    }
+
+    pub(crate) async fn advance_advisory_controller_aborted(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        abort_reason: &str,
+    ) -> Result<AdvisoryControllerRunRecord> {
+        let reason = abort_reason.to_string();
+        self.write_owned_if_changed(move |conn| {
+            advance_advisory_controller_aborted_conn(conn, operation_id, &reason)
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn advance_advisory_controller_manual_required(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        reason: &str,
+    ) -> Result<AdvisoryControllerRunRecord> {
+        let reason = reason.to_string();
+        self.write_owned_if_changed(move |conn| {
+            advance_advisory_controller_manual_required_conn(conn, operation_id, &reason)
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn load_advisory_controller_run(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<Option<AdvisoryControllerRunRecord>> {
+        self.read(move |conn| load_advisory_controller_run_conn(conn, operation_id))
+            .await
+    }
+
+    pub(crate) async fn load_retained_advisory_comparison_exact(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<Option<AdvisoryComparisonSettlement>> {
+        self.read(
+            move |conn| match load_advisory_comparison_conn(conn, archive_id) {
+                Ok(comp) => Ok(Some(comp)),
+                Err(EnclaveError::Db(rusqlite::Error::QueryReturnedNoRows))
+                | Err(EnclaveError::NotFound) => Ok(None),
+                Err(e) => Err(e),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn load_retained_advisory_abort_exact(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<Option<AdvisoryAbortTerminal>> {
+        self.read(
+            move |conn| match load_advisory_abort_conn(conn, archive_id) {
+                Ok(ab) => Ok(Some(ab)),
+                Err(EnclaveError::Db(rusqlite::Error::QueryReturnedNoRows))
+                | Err(EnclaveError::NotFound) => Ok(None),
+                Err(e) => Err(e),
+            },
+        )
         .await
     }
 

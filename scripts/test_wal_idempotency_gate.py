@@ -53,8 +53,8 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 30
-EXPECTED_WORKER_SPAWN_SHA256 = "203920718f21b3b659c2519980039fcdf45729d1a748197bb56e56835b2022da"
+EXPECTED_WORKER_SPAWN_COUNT = 32
+EXPECTED_WORKER_SPAWN_SHA256 = "e43ce60d7da3c27ac18943d1ac81c6acad2d187d42f678311d9f5aa01332f44d"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2978,6 +2978,8 @@ impl X {
 
         released_abort_start = advisory_production.index(
             "async fn abort_before_local_resume("
+        ) if "async fn abort_before_local_resume(" in advisory_production else advisory_production.index(
+            "pub(super) async fn abort_before_local_resume("
         )
         released_abort_end = advisory_production.index(
             "impl LocallyResumedSingleArchiveAdvisoryOwner", released_abort_start
@@ -3514,6 +3516,96 @@ impl X {
             "RootAdvance",
         ):
             self.assertNotIn(forbidden, advisory_without_owned_abort_spawn)
+
+        controller_src = (
+            ROOT / "src/archive_v3_advisory_owner/controller.rs"
+        ).read_text(encoding="utf-8")
+        controller_production = without_cfg_test_items(controller_src)
+        window_src = (
+            ROOT / "src/archive_v3_advisory_owner/window.rs"
+        ).read_text(encoding="utf-8")
+        window_production = without_cfg_test_items(window_src)
+        telemetry_src = (
+            ROOT / "src/archive_v3_advisory_owner/telemetry.rs"
+        ).read_text(encoding="utf-8")
+        telemetry_production = without_cfg_test_items(telemetry_src)
+        maintenance_src = (
+            ROOT / "src/archive_v3_maintenance_import.rs"
+        ).read_text(encoding="utf-8")
+        maintenance_production = without_cfg_test_items(maintenance_src)
+        store_src = (
+            ROOT / "src/store.rs"
+        ).read_text(encoding="utf-8")
+        store_production = without_cfg_test_items(store_src)
+        control_store_src = (
+            ROOT / "src/cp/control_store.rs"
+        ).read_text(encoding="utf-8")
+        control_store_production = without_cfg_test_items(control_store_src)
+
+        # Controller encapsulation and ordering
+        self.assertIn("struct SingleArchivePhase1AdvisoryController", controller_production)
+        self.assertNotIn("pub(crate) struct SingleArchivePhase1AdvisoryController", controller_production)
+        self.assertNotIn("pub struct SingleArchivePhase1AdvisoryController", controller_production)
+        self.assertNotIn("SingleArchivePhase1AdvisoryController", main)
+        self.assertNotIn("SingleArchivePhase1AdvisoryController", query)
+
+        # P1: Preflight consuming token, bounded geometry observation without full-file read
+        self.assertIn("observe_source_database_bytes", store_production)
+        self.assertIn("PRAGMA page_count", store_production)
+        self.assertIn("PRAGMA page_size", store_production)
+        self.assertNotIn("tokio::fs::read", store_production.split("fn observe_source_database_bytes")[1].split("fn ")[0])
+
+        preflight_idx = controller_production.index("importer.preflight().await")
+        eval_policy_idx = controller_production.index("Phase1TmpfsPolicyV1::evaluate(database_bytes, vm_bytes)")
+        advance_eligible_idx = controller_production.index("advance_advisory_controller_eligible")
+        import_run_idx = controller_production.index("preflighted.run().await")
+        self.assertLess(preflight_idx, eval_policy_idx)
+        self.assertLess(eval_policy_idx, advance_eligible_idx)
+        self.assertLess(advance_eligible_idx, import_run_idx)
+
+        # P1: Exact fence authority required on pre-owner abort; no reason strings passed
+        self.assertIn("&plan_fence_authority", controller_production)
+        self.assertNotIn('abort_pre_owner(user_id, archive_id, operation_id, "window_lost")', controller_production)
+        self.assertNotIn('abort_pre_owner(user_id, archive_id, operation_id, "auth_failed")', controller_production)
+        self.assertNotIn('abort_pre_owner(user_id, archive_id, operation_id, "auth_mismatch")', controller_production)
+        self.assertNotIn('abort_pre_owner(user_id, archive_id, operation_id, "missing_auth")', controller_production)
+        self.assertNotIn('abort_pre_owner(user_id, archive_id, operation_id, "owner_start_failed")', controller_production)
+
+        # P1: Restart reconciliation checks inner comparison / abort state
+        self.assertIn("load_retained_advisory_comparison_exact", controller_production)
+        self.assertIn("load_retained_advisory_abort_exact", controller_production)
+        self.assertIn("record.user_id != user_id", controller_production)
+
+        # P1: Strict loaders in control store CAS and replay branches
+        self.assertIn("maintenance_import_record_conn", control_store_production)
+        self.assertIn("authenticate_canary_scope_conn", control_store_production)
+        self.assertIn("authenticate_advisory_owner_conn", control_store_production)
+        self.assertIn("load_advisory_release_conn", control_store_production)
+        self.assertIn("load_advisory_comparison_conn", control_store_production)
+
+        # P1: Typed comparison settlement
+        self.assertIn("enum AdvisorySettlementOutcome", ROOT.joinpath("src/archive_v3_advisory_owner.rs").read_text(encoding="utf-8"))
+        self.assertIn("super::AdvisorySettlementOutcome::Settled(settlement)", controller_production)
+        self.assertIn("super::AdvisorySettlementOutcome::Aborted(aborted)", controller_production)
+
+        # P2: Unforgeable window proof
+        self.assertIn("verify_revalidation_proof", controller_production)
+        self.assertIn("struct VerifiedWindowRevalidation", window_production)
+        self.assertNotIn("pub(crate) fn new(", window_production.split("struct VerifiedWindowRevalidation")[1].split("impl")[0] if "impl" in window_production.split("struct VerifiedWindowRevalidation")[1] else "")
+        self.assertIn("struct HeldPhase1Window", window_production)
+        for forbidden in ("derive(Clone", "derive(Copy", "Serialize", "Deserialize"):
+            self.assertNotIn(forbidden, window_production)
+
+        # P2: Policy commitment bound to DB_COPY_MULTIPLIER and VM_FRACTION_DENOMINATOR
+        self.assertIn("DB_COPY_MULTIPLIER", controller_production)
+        self.assertIn("VM_FRACTION_DENOMINATOR", controller_production)
+        self.assertIn("compute_phase1_policy_commitment", control_store_production)
+        self.assertIn("policy_commitment", control_store_production)
+
+        # Telemetry panic isolation and bounding
+        self.assertIn("catch_unwind", telemetry_production)
+        self.assertIn("try_send", telemetry_production)
+        self.assertIn("MAX_TELEMETRY_QUEUE_CAPACITY: usize = 256", telemetry_production)
 
 
 def classify_worker_spawn(site: CallSite) -> str:

@@ -68,6 +68,23 @@ impl AdvisoryCanaryScope {
             &self.authorization_commitment,
         )
     }
+
+    pub(crate) const fn scope_id(&self) -> [u8; 16] {
+        self.scope_id
+    }
+
+    pub(crate) const fn release_image_digest(&self) -> [u8; 32] {
+        self.release_image_digest
+    }
+
+    pub(crate) const fn operator_statement_commitment(&self) -> [u8; 32] {
+        self.operator_statement_commitment
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn scope_id_for_test(&self) -> [u8; 16] {
+        self.scope_id
+    }
 }
 
 impl fmt::Debug for AdvisoryCanaryScope {
