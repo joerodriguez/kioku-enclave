@@ -157,6 +157,11 @@ impl MaintenanceImportOperationId {
         Ok(Self(bytes))
     }
 
+    #[cfg(test)]
+    pub(crate) const fn from_bytes_for_test(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
     pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
@@ -274,6 +279,7 @@ impl fmt::Debug for MaintenanceSourceBinding {
 /// One-shot control capability. The user and archive identities have no
 /// getters; Store and sealed-runtime consumption use producer tokens rather
 /// than caller-supplied identifiers.
+#[derive(Clone)]
 pub(crate) struct AuthenticatedMaintenanceImportPlan {
     user_id: String,
     archive_id: ArchiveId,
@@ -326,6 +332,26 @@ impl AuthenticatedMaintenanceImportPlan {
             fence_authority,
             operation_commitment,
         })
+    }
+
+    pub(crate) fn plan_user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub(crate) fn fence_authority(&self) -> &str {
+        &self.fence_authority
+    }
+
+    pub(crate) const fn plan_operation_commitment(&self) -> [u8; 32] {
+        self.operation_commitment
+    }
+
+    pub(crate) const fn plan_archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn plan_operation_id(&self) -> MaintenanceImportOperationId {
+        self.operation_id
     }
 
     #[cfg(test)]
@@ -614,6 +640,14 @@ impl MaintenanceImportRecord {
 
     pub(crate) const fn stage(&self) -> MaintenanceImportStage {
         self.stage
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self.operation_id
     }
 
     pub(crate) const fn source(&self) -> Option<MaintenanceSourceBinding> {
@@ -986,7 +1020,7 @@ impl SingleArchiveMaintenanceImporter {
     }
 
     #[cfg(test)]
-    fn from_test_components<W>(
+    pub(crate) fn from_test_components<W>(
         archive_id: ArchiveId,
         objects: Arc<dyn ImmutableObjectBackend>,
         registries: Arc<dyn ExactKeyRegistryProvider>,
@@ -1064,9 +1098,10 @@ impl SingleArchiveMaintenanceImporter {
     pub(crate) async fn run(
         self,
     ) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
-        let completed = tokio::spawn(self.run_owned(MaintenanceImportTarget::WalAuthoritative))
-            .await
-            .map_err(|_| MaintenanceImportError::Unavailable)??;
+        let completed =
+            tokio::spawn(self.run_owned(MaintenanceImportTarget::WalAuthoritative, None))
+                .await
+                .map_err(|_| MaintenanceImportError::Unavailable)??;
         match completed {
             CompletedMaintenanceImport::WalAuthoritative(handoff) => Ok(*handoff),
             CompletedMaintenanceImport::Advisory(_) => Err(MaintenanceImportError::Corrupt),
@@ -1076,6 +1111,7 @@ impl SingleArchiveMaintenanceImporter {
     async fn run_owned(
         self,
         target: MaintenanceImportTarget,
+        existing_admission: Option<crate::store::ArchiveMaintenanceAdmission>,
     ) -> Result<CompletedMaintenanceImport, MaintenanceImportError> {
         let Self {
             archive_id,
@@ -1117,10 +1153,13 @@ impl SingleArchiveMaintenanceImporter {
             return Err(MaintenanceImportError::Conflict);
         }
 
-        let admission = store
-            .acquire_archive_maintenance_admission(MaintenanceCoordinatorContext(()), plan)
-            .await
-            .map_err(|_| MaintenanceImportError::Unavailable)?;
+        let admission = match existing_admission {
+            Some(admission) => admission,
+            None => store
+                .acquire_archive_maintenance_admission(MaintenanceCoordinatorContext(()), plan)
+                .await
+                .map_err(|_| MaintenanceImportError::Unavailable)?,
+        };
         // Pair this final Control check with Store's per-user lifecycle lock,
         // before either local admission gate is changed. The inactive release
         // executor takes the same lock before preparing its durable row and
@@ -1583,22 +1622,118 @@ impl SingleArchiveAdvisoryShadowImporter {
         Self { inner }
     }
 
-    /// Run only through the Phase-1 advisory terminal. Dropping the caller
-    /// cannot detach a witness mutation or scratch owner because the complete
-    /// state machine remains in one owned task.
+    pub(crate) fn plan(&self) -> &AuthenticatedMaintenanceImportPlan {
+        &self.inner.plan
+    }
+
+    pub(crate) fn fence_authority(&self) -> &str {
+        &self.inner.plan.fence_authority
+    }
+
+    /// Observe the tentative source database size under the user lifecycle lock
+    /// and return a consuming preflight token retaining the exact admission lock.
+    pub(crate) async fn preflight(
+        self,
+    ) -> Result<(u64, SingleArchivePreflightedShadowImporter), MaintenanceImportError> {
+        let admission = self
+            .inner
+            .store
+            .acquire_archive_maintenance_admission(
+                MaintenanceCoordinatorContext(()),
+                self.inner.plan.clone(),
+            )
+            .await
+            .map_err(|_| MaintenanceImportError::Unavailable)?;
+        let database_bytes = admission
+            .observe_source_database_bytes()
+            .await
+            .map_err(|_| MaintenanceImportError::Unavailable)?;
+        Ok((
+            database_bytes,
+            SingleArchivePreflightedShadowImporter {
+                inner: self.inner,
+                admission,
+                database_bytes,
+            },
+        ))
+    }
+
+    /// Run through the complete Phase-1 advisory shadow importer flow.
     pub(crate) async fn run(
         self,
     ) -> Result<CompletedAdvisoryShadowHandoff, MaintenanceImportError> {
-        let completed = tokio::spawn(
-            self.inner
-                .run_owned(MaintenanceImportTarget::AdvisoryShadow),
-        )
-        .await
-        .map_err(|_| MaintenanceImportError::Unavailable)??;
+        let (_bytes, preflighted) = self.preflight().await?;
+        preflighted.run().await
+    }
+}
+
+/// Non-cloneable consuming preflight token retaining the exact lifecycle/actor lock
+/// and measured database geometry. It transfers the held admission directly into the
+/// importer task without dropping or reacquiring the guard.
+pub(crate) struct SingleArchivePreflightedShadowImporter {
+    inner: SingleArchiveMaintenanceImporter,
+    admission: crate::store::ArchiveMaintenanceAdmission,
+    database_bytes: u64,
+}
+
+impl SingleArchivePreflightedShadowImporter {
+    pub(crate) fn database_bytes(&self) -> u64 {
+        self.database_bytes
+    }
+
+    pub(crate) fn plan(&self) -> &AuthenticatedMaintenanceImportPlan {
+        &self.inner.plan
+    }
+
+    pub(crate) fn fence_authority(&self) -> &str {
+        &self.inner.plan.fence_authority
+    }
+
+    /// Run only through the Phase-1 advisory terminal using the continuously retained
+    /// preflight admission.
+    pub(crate) async fn run(
+        self,
+    ) -> Result<CompletedAdvisoryShadowHandoff, MaintenanceImportError> {
+        let Self {
+            inner,
+            admission,
+            database_bytes: _,
+        } = self;
+        let completed =
+            tokio::spawn(inner.run_owned(MaintenanceImportTarget::AdvisoryShadow, Some(admission)))
+                .await
+                .map_err(|_| MaintenanceImportError::Unavailable)??;
         match completed {
             CompletedMaintenanceImport::Advisory(handoff) => Ok(*handoff),
             CompletedMaintenanceImport::WalAuthoritative(_) => Err(MaintenanceImportError::Corrupt),
         }
+    }
+
+    /// Abort the pre-owner import: drops the retained admission guard and executes
+    /// the authenticated store and control pre-owner abort with the authentic fence authority.
+    pub(crate) async fn abort_pre_owner(self) -> Result<(), MaintenanceImportError> {
+        let fence_auth = self.inner.plan.fence_authority.clone();
+        let archive_id = self.inner.plan.archive_id;
+        let operation_id = self.inner.plan.operation_id;
+        let admission = self
+            .admission
+            .into_pre_owner_abort_admission(&fence_auth)
+            .await
+            .map_err(|_| MaintenanceImportError::Conflict)?;
+        self.inner.control.abort_pre_owner(operation_id).await?;
+        let restored = self
+            .inner
+            .store
+            .restore_pre_owner_advisory_local_admission(
+                MaintenanceCoordinatorContext(()),
+                admission,
+            )
+            .await
+            .map_err(|_| MaintenanceImportError::Conflict)?;
+        let _ = restored
+            .authenticate(MaintenanceCoordinatorContext(()), archive_id, operation_id)
+            .map_err(|_| MaintenanceImportError::Conflict)?;
+        Ok(())
     }
 }
 
@@ -1613,6 +1748,23 @@ pub(crate) struct CompletedAdvisoryShadowHandoff {
     _parity: CompletedAdvisoryShadowParityEvidence,
     _control: Arc<crate::cp::control_store::ControlStore>,
     _store_capture_target: crate::store::StoreAdvisoryCaptureTarget,
+}
+
+impl CompletedAdvisoryShadowHandoff {
+    #[allow(dead_code)]
+    pub(crate) fn test_terminal_witness(&self) -> &WitnessRecord {
+        &self._terminal_witness
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn measured_database_bytes(&self) -> u64 {
+        self._parity
+            .terminal_control
+            .source
+            .as_ref()
+            .map(|s| s.plaintext_len)
+            .unwrap_or(0)
+    }
 }
 
 /// Consuming Phase-1 view obtainable only with the advisory-owner module's
@@ -2613,28 +2765,29 @@ const fn zero<const N: usize>(bytes: &[u8; N]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{atomic::AtomicUsize, Mutex};
 
     use crate::{
         archive_v3::{
-            ArchiveDek, ArchiveV3Error, DatabaseEpoch, InMemoryImmutableBackend, KeyEpoch,
-            KeyRegistryPlaintext,
+            resolve_archive_cipher, ArchiveDek, ArchiveV3Error, DatabaseEpoch,
+            InMemoryImmutableBackend, KeyEpoch, KeyRegistryPlaintext,
         },
         archive_v3_operation::{RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage},
         archive_v3_shadow_checkpoint::ShadowObjectInventoryError,
         archive_v3_shadow_session::ShadowAttemptId,
         archive_v3_witness::{
-            InMemoryWitness, KeyRegistryReference, RootCommitment, RootReference, Witness,
-            WitnessBootstrap,
+            InMemoryWitness, KeyRegistryReference, MigrationState, RootCommitment, RootReference,
+            Witness, WitnessBootstrap, WitnessError, WitnessLease,
         },
     };
+    use sha2::{Digest, Sha256};
 
-    struct TestRegistry {
-        object_id: ObjectId,
-        wrapped: Vec<u8>,
-        plaintext: Vec<u8>,
+    pub(crate) struct TestRegistry {
+        pub(crate) object_id: ObjectId,
+        pub(crate) wrapped: Vec<u8>,
+        pub(crate) plaintext: Vec<u8>,
     }
 
     #[async_trait]
@@ -2670,16 +2823,16 @@ mod tests {
         }
     }
 
-    struct InMemoryMaintenanceWitness {
-        inner: InMemoryWitness,
-        advisory_acquires: std::sync::atomic::AtomicUsize,
-        advisory_maintains: std::sync::atomic::AtomicUsize,
-        advisory_outcome_unknown_once: std::sync::atomic::AtomicBool,
-        advisory_maintain_outcome_unknown_once: std::sync::atomic::AtomicBool,
+    pub(crate) struct InMemoryMaintenanceWitness {
+        pub(crate) inner: InMemoryWitness,
+        pub(crate) advisory_acquires: std::sync::atomic::AtomicUsize,
+        pub(crate) advisory_maintains: std::sync::atomic::AtomicUsize,
+        pub(crate) advisory_outcome_unknown_once: std::sync::atomic::AtomicBool,
+        pub(crate) advisory_maintain_outcome_unknown_once: std::sync::atomic::AtomicBool,
     }
 
     impl InMemoryMaintenanceWitness {
-        fn new(inner: InMemoryWitness) -> Self {
+        pub(crate) fn new(inner: InMemoryWitness) -> Self {
             Self {
                 inner,
                 advisory_acquires: std::sync::atomic::AtomicUsize::new(0),
@@ -2689,7 +2842,7 @@ mod tests {
             }
         }
 
-        fn with_advisory_outcome_unknown(inner: InMemoryWitness) -> Self {
+        pub(crate) fn with_advisory_outcome_unknown(inner: InMemoryWitness) -> Self {
             Self {
                 inner,
                 advisory_acquires: std::sync::atomic::AtomicUsize::new(0),

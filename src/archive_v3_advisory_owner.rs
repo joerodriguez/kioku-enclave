@@ -31,6 +31,9 @@ mod abort_reconcile;
 mod canary;
 mod canary_trust;
 mod comparison;
+mod controller;
+mod telemetry;
+mod window;
 pub(crate) use abort::{
     AdvisoryAbortLocus, AdvisoryAbortReason, AdvisoryAbortRecoveryState, AdvisoryAbortStage,
     AdvisoryAbortTerminal, PreparedAdvisoryAbortRecovery,
@@ -295,11 +298,15 @@ impl AdvisoryOwnerReservation {
         )
     }
 
-    const fn owner_id(&self) -> AdvisoryOwnerId {
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self.operation_id
+    }
+
+    pub(crate) const fn owner_id(&self) -> AdvisoryOwnerId {
         self.owner_id
     }
 
-    const fn stage(&self) -> AdvisoryOwnerStage {
+    pub(crate) const fn stage(&self) -> AdvisoryOwnerStage {
         self.stage
     }
 }
@@ -892,6 +899,14 @@ impl AdvisoryRelease {
             absence_commitment: self.absence_commitment,
             commitment: self.commitment,
         }
+    }
+
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self.operation_id
+    }
+
+    pub(crate) const fn stage(&self) -> AdvisoryReleaseStage {
+        self.stage
     }
 
     pub(crate) fn authenticate_store_target(
@@ -1508,7 +1523,7 @@ struct ReleasedSingleArchiveAdvisoryOwner {
 /// legacy fences are released. The nested owner remains unreachable, and the
 /// Store result retains only the installed exact-user capture registry and has
 /// no connection, comparison, settlement, acknowledgement, or serving API.
-struct LocallyResumedSingleArchiveAdvisoryOwner {
+pub(crate) struct LocallyResumedSingleArchiveAdvisoryOwner {
     _owner: SingleArchiveAdvisoryOwner,
     _release: AdvisoryRelease,
     _resumed_target: crate::store::StoreAdvisoryResumedTarget,
@@ -1519,7 +1534,7 @@ struct LocallyResumedSingleArchiveAdvisoryOwner {
 /// capture is retired before construction, while the nested owner and target
 /// are unreachable. It has no acknowledgement, publication, provider, route,
 /// or authority-conversion operation.
-struct SettledSingleArchiveAdvisoryOwner {
+pub(crate) struct SettledSingleArchiveAdvisoryOwner {
     _owner: LocallyResumedSingleArchiveAdvisoryOwner,
     _settlement: AdvisoryComparisonSettlement,
     _retired: crate::store::StoreAdvisoryCaptureRetired,
@@ -1528,7 +1543,7 @@ struct SettledSingleArchiveAdvisoryOwner {
 /// Terminal inactive owner after a resumed-canary stop or comparison mismatch
 /// is durable and the exact Store capture has been retired. It carries no
 /// restart, acknowledgement, provider, route, or authority-conversion API.
-struct AbortedSingleArchiveAdvisoryOwner {
+pub(crate) struct AbortedSingleArchiveAdvisoryOwner {
     _owner: LocallyResumedSingleArchiveAdvisoryOwner,
     _abort: AdvisoryAbortTerminal,
     _retired: crate::store::StoreAdvisoryCaptureRetired,
@@ -1538,7 +1553,7 @@ struct AbortedSingleArchiveAdvisoryOwner {
 /// boundary. The paired legacy gates are open without advisory capture, and
 /// the exact abort is durable. It exposes no provider, acknowledgement,
 /// restart, route, or authority-conversion operation.
-struct AbortedReleasedSingleArchiveAdvisoryOwner {
+pub(crate) struct AbortedReleasedSingleArchiveAdvisoryOwner {
     _owner: SingleArchiveAdvisoryOwner,
     _release: AdvisoryRelease,
     _abort: AdvisoryAbortTerminal,
@@ -1546,6 +1561,14 @@ struct AbortedReleasedSingleArchiveAdvisoryOwner {
 }
 
 impl SingleArchiveAdvisoryOwner {
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self._bound.operation_id
+    }
+
+    pub(crate) const fn owner_id(&self) -> AdvisoryOwnerId {
+        self._bound.owner_id
+    }
+
     async fn start(
         handoff: CompletedAdvisoryShadowHandoff,
         canary: AdvisoryCanaryScope,
@@ -1853,6 +1876,17 @@ impl SingleArchiveAdvisoryOwner {
 }
 
 impl ReleasedSingleArchiveAdvisoryOwner {
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self._release.operation_id
+    }
+
+    pub(crate) const fn marker_generation(&self) -> i64 {
+        match self._release.marker_generation {
+            Some(generation) => generation as i64,
+            None => 0,
+        }
+    }
+
     async fn reauthenticate_boundary(&self) -> Result<()> {
         let current = self
             ._owner
@@ -1917,7 +1951,7 @@ impl ReleasedSingleArchiveAdvisoryOwner {
     /// ever installing capture. Control records `Prepared` before the paired
     /// local legacy gates reopen. Caller cancellation cannot cancel the owned
     /// transition, and only persistence errors are retried after local work.
-    async fn abort_before_local_resume(
+    pub(super) async fn abort_before_local_resume(
         self,
         reason: AdvisoryAbortReason,
     ) -> Result<AbortedReleasedSingleArchiveAdvisoryOwner> {
@@ -2048,6 +2082,14 @@ impl ReleasedSingleArchiveAdvisoryOwner {
 }
 
 impl LocallyResumedSingleArchiveAdvisoryOwner {
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self._release.operation_id
+    }
+
+    pub(crate) const fn owner_id(&self) -> AdvisoryOwnerId {
+        self._owner.owner_id()
+    }
+
     /// Borrow the terminal owner to pin the exact legacy read snapshot and
     /// select its queued capture prefix. The returned Store value is opaque
     /// and cancellation restores the prefix; replay, comparison, and
@@ -2068,9 +2110,9 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
     /// Consume the one-shot advisory owner into an exact durable comparison
     /// terminal. A retained row is exact-loaded before any new local work, so
     /// lost Control responses and owner restarts never run a second comparison.
-    async fn settle_comparison(self) -> Result<SettledSingleArchiveAdvisoryOwner> {
+    pub(super) async fn settle_comparison(self) -> Result<AdvisorySettlementOutcome> {
         comparison::reauthenticate_boundary(&self).await?;
-        if self
+        if let Some(retained_abort) = self
             ._owner
             ._control
             .load_advisory_abort(
@@ -2079,8 +2121,11 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
                 &self._release,
             )
             .await?
-            .is_some()
         {
+            if retained_abort.stage() == AdvisoryAbortStage::Aborted {
+                let aborted = self.abort_resumed_owned(retained_abort.reason()).await?;
+                return Ok(AdvisorySettlementOutcome::Aborted(aborted));
+            }
             return Err(AdvisoryOwnerError::Conflict);
         }
         let settlement = match self
@@ -2095,7 +2140,21 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
         {
             Some(retained) => retained,
             None => {
-                let evidence = self.compare_captured_prefix().await?;
+                let evidence = match self.compare_captured_prefix().await {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        let abort_reason = if matches!(
+                            error,
+                            AdvisoryOwnerError::Conflict | AdvisoryOwnerError::Corrupt
+                        ) {
+                            AdvisoryAbortReason::ComparisonMismatch
+                        } else {
+                            AdvisoryAbortReason::StopRequested
+                        };
+                        let aborted = self.abort_resumed_owned(abort_reason).await?;
+                        return Ok(AdvisorySettlementOutcome::Aborted(aborted));
+                    }
+                };
                 self._owner
                     ._control
                     .settle_advisory_comparison(
@@ -2114,17 +2173,19 @@ impl LocallyResumedSingleArchiveAdvisoryOwner {
             .await
             .map_err(map_advisory_store_error)?;
         comparison::reauthenticate_boundary(&self).await?;
-        Ok(SettledSingleArchiveAdvisoryOwner {
-            _owner: self,
-            _settlement: settlement,
-            _retired: retired,
-        })
+        Ok(AdvisorySettlementOutcome::Settled(
+            SettledSingleArchiveAdvisoryOwner {
+                _owner: self,
+                _settlement: settlement,
+                _retired: retired,
+            },
+        ))
     }
 
     /// Consume a locally resumed canary into a durable stop terminal. Control
     /// records the exact predecessor before the owned Store retirement task;
     /// only the opaque exact-target proof can advance it to `Aborted`.
-    async fn abort_resumed(
+    pub(super) async fn abort_resumed(
         self,
         reason: AdvisoryAbortReason,
     ) -> Result<AbortedSingleArchiveAdvisoryOwner> {
@@ -2232,6 +2293,36 @@ impl fmt::Debug for ReleasedSingleArchiveAdvisoryOwner {
 impl fmt::Debug for LocallyResumedSingleArchiveAdvisoryOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("LocallyResumedSingleArchiveAdvisoryOwner(<inactive>)")
+    }
+}
+
+/// Typed terminal capability returned by comparison settlement.
+pub(crate) enum AdvisorySettlementOutcome {
+    Settled(SettledSingleArchiveAdvisoryOwner),
+    Aborted(AbortedSingleArchiveAdvisoryOwner),
+}
+
+impl SettledSingleArchiveAdvisoryOwner {
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self._settlement.operation_id()
+    }
+
+    pub(crate) const fn evidence_commitment(&self) -> [u8; 32] {
+        self._settlement.evidence_commitment()
+    }
+
+    pub(crate) const fn settlement_commitment(&self) -> [u8; 32] {
+        self._settlement.commitment()
+    }
+}
+
+impl AbortedSingleArchiveAdvisoryOwner {
+    pub(crate) const fn operation_id(&self) -> MaintenanceImportOperationId {
+        self._abort.operation_id()
+    }
+
+    pub(crate) const fn reason(&self) -> AdvisoryAbortReason {
+        self._abort.reason()
     }
 }
 
@@ -2490,10 +2581,18 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
     }
 
     pub(crate) async fn settle_comparison_for_test(self) -> Result<SettledAdvisoryOwnerTestHandle> {
-        self.0
-            .settle_comparison()
-            .await
-            .map(SettledAdvisoryOwnerTestHandle)
+        match self.0.settle_comparison().await? {
+            AdvisorySettlementOutcome::Settled(settled) => {
+                Ok(SettledAdvisoryOwnerTestHandle(settled))
+            }
+            AdvisorySettlementOutcome::Aborted(_) => Err(AdvisoryOwnerError::Conflict),
+        }
+    }
+
+    pub(crate) async fn settle_comparison_outcome_for_test(
+        self,
+    ) -> Result<AdvisorySettlementOutcome> {
+        self.0.settle_comparison().await
     }
 
     pub(crate) async fn persist_comparison_without_retirement_for_test(&self) -> Result<()> {
@@ -2519,6 +2618,10 @@ impl LocallyResumedAdvisoryOwnerTestHandle {
             .abort_resumed(reason)
             .await
             .map(AbortedAdvisoryOwnerTestHandle)
+    }
+
+    pub(crate) fn into_inner(self) -> LocallyResumedSingleArchiveAdvisoryOwner {
+        self.0
     }
 
     pub(crate) async fn prepare_abort_for_restart_test(

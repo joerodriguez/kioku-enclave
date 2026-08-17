@@ -2725,6 +2725,48 @@ impl StoreAdvisoryResumedTarget {
 }
 
 impl Store {
+    /// Reconcile and prove that the Store capture for a settled comparison is retired.
+    /// Safely clears any active shadow capture selection for the user and unregisters
+    /// the actor's shadow capture state if open.
+    pub(crate) async fn reconcile_advisory_capture_retired(
+        &self,
+        user_id: &str,
+        settlement: &crate::archive_v3_advisory_owner::AdvisoryComparisonSettlement,
+    ) -> Result<StoreAdvisoryCaptureRetired> {
+        settlement
+            .authenticate_store_target(
+                StoreAdvisoryRetirementContext(()),
+                settlement.archive_id(),
+                settlement.operation_id(),
+            )
+            .map_err(|_| EnclaveError::Conflict("advisory retirement target changed".into()))?;
+        validate_user_id(user_id)?;
+        {
+            let mut selection = self.shadow_capture.write().map_err(|_| {
+                EnclaveError::Store("advisory capture selection unavailable".into())
+            })?;
+            if let Some(retained) = selection.as_ref() {
+                if retained.user_id == user_id {
+                    *selection = None;
+                }
+            }
+        }
+
+        let registry = self.registry.lock().await;
+        if let Some(open) = registry.open_users.get(user_id) {
+            if open.status == OpenStatus::Open {
+                let mut state = open.actor.state.lock().await;
+                if let Some(handle) = state.handle.as_mut() {
+                    handle._shadow_capture_registration = None;
+                }
+            }
+        }
+        Ok(StoreAdvisoryCaptureRetired {
+            archive_id: settlement.archive_id(),
+            operation_id: settlement.operation_id(),
+        })
+    }
+
     /// Prove only process-local absence for an exact retained Prepared abort.
     /// This path never clears a selector, takes a registration, opens a user,
     /// or changes either admission gate. A live capture must use the original
@@ -6844,6 +6886,113 @@ impl IdentityRebindTransition {
 }
 
 impl ArchiveMaintenanceAdmission {
+    /// Observe the tentative source database size under the user lifecycle lock
+    /// via metadata/page geometry inspection without allocating the full database into memory.
+    /// Content writes on the user ID are frozen at the barrier across measurement through handoff.
+    pub(crate) async fn observe_source_database_bytes(&self) -> Result<u64> {
+        self.store
+            .block_content_writes_for_deletion(&self.plan.user_id)
+            .await;
+        let actor = self.store.actor_for_deletion(&self.plan.user_id).await;
+        let mut state = Arc::clone(&actor.state).lock_owned().await;
+        self.store
+            .ensure_loaded(&self.plan.user_id, &actor, &mut state)
+            .await?;
+        let handle = state
+            .handle
+            .as_mut()
+            .ok_or_else(|| EnclaveError::Store("maintenance source actor disappeared".into()))?;
+        if handle.blob_meta.generation <= 0 {
+            return Err(EnclaveError::NotFound);
+        }
+        let page_count: i64 = handle
+            .conn
+            .query_row("PRAGMA page_count;", [], |row| row.get(0))?;
+        let page_size: i64 = handle
+            .conn
+            .query_row("PRAGMA page_size;", [], |row| row.get(0))?;
+        let page_count = u64::try_from(page_count)
+            .map_err(|_| EnclaveError::Store("negative page count".into()))?;
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| EnclaveError::Store("negative page size".into()))?;
+        let plaintext_len = page_count
+            .checked_mul(page_size)
+            .ok_or_else(|| EnclaveError::Store("database size overflow".into()))?;
+        if plaintext_len == 0
+            || !plaintext_len.is_multiple_of(u64::from(crate::archive_v3::SQLITE_PAGE_SIZE))
+            || plaintext_len > crate::archive_v3::MAX_DATABASE_BYTES
+        {
+            return Err(EnclaveError::Store(
+                "maintenance source geometry is invalid".into(),
+            ));
+        }
+        Ok(plaintext_len)
+    }
+
+    /// Convert this held admission directly into a pre-owner abort admission under the
+    /// same continuously held lifecycle lock, reconciling the fence marker.
+    pub(crate) async fn into_pre_owner_abort_admission(
+        self,
+        fence_authority: &str,
+    ) -> Result<StorePreOwnerAbortAdmission> {
+        let Self {
+            store,
+            plan,
+            lifecycle_guard,
+        } = self;
+        if !valid_legacy_fence_authority(fence_authority) {
+            return Err(EnclaveError::Conflict(
+                "invalid pre-owner fence authority".into(),
+            ));
+        }
+        let marker_name = store.identity_rebind_fence_object_name(&plan.user_id)?;
+        match store.gcs.get_object(&marker_name).await {
+            Ok(marker) => {
+                if marker.ciphertext != fence_authority.as_bytes() {
+                    return Err(EnclaveError::Conflict(
+                        "pre-owner fence marker authority changed".into(),
+                    ));
+                }
+                let delete_result = store
+                    .gcs
+                    .delete_object_generation(&marker_name, marker.generation)
+                    .await;
+                match store.gcs.get_object(&marker_name).await {
+                    Err(EnclaveError::NotFound) => {}
+                    Ok(_) => {
+                        return Err(delete_result.err().unwrap_or_else(|| {
+                            EnclaveError::Conflict(
+                                "pre-owner fence marker remained after deletion".into(),
+                            )
+                        }));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(EnclaveError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        validate_user_id(&plan.user_id)?;
+        let user_id = plan.user_id.clone();
+        let user_commitment = sha2::Sha256::digest(user_id.as_bytes()).into();
+        let fence_authority_commitment = sha2::Sha256::digest(fence_authority.as_bytes()).into();
+        let commitment = pre_owner_abort_admission_commitment(
+            plan.archive_id,
+            plan.operation_id,
+            fence_authority_commitment,
+            user_commitment,
+        );
+        Ok(StorePreOwnerAbortAdmission {
+            archive_id: plan.archive_id,
+            operation_id: plan.operation_id,
+            user_id,
+            fence_authority_commitment,
+            user_commitment,
+            commitment,
+            _lifecycle_guard: lifecycle_guard,
+        })
+    }
+
     /// Close and drain both local admission paths only after the caller has
     /// performed its final Control check under this same lifecycle guard.
     pub(crate) async fn begin(self) -> ArchiveMaintenanceTransition {
