@@ -1633,7 +1633,9 @@ async fn capture_status(
 /// the terminal zero-result — never invent it.
 async fn summarized_until_ms(state: &CpState, user_id: &str) -> Option<i64> {
     match state.control.summarized_until(user_id).await {
-        Ok(cursor) => cursor.as_deref().and_then(super::isotime::parse_epoch_millis),
+        Ok(cursor) => cursor
+            .as_deref()
+            .and_then(super::isotime::parse_epoch_millis),
         Err(_) => None,
     }
 }
@@ -4870,7 +4872,12 @@ mod tests {
             conn.execute(
                 "INSERT INTO speaker_observations(event_id,turn_id,speaker_local_id,\
                  started_at,ended_at,transcript_text) VALUES (?1,?2,'S0',?3,?4,'hello')",
-                params![manifest.event_id, turn, manifest.started_at, manifest.ended_at],
+                params![
+                    manifest.event_id,
+                    turn,
+                    manifest.started_at,
+                    manifest.ended_at
+                ],
             )
             .unwrap();
             conn.execute(
@@ -4890,7 +4897,11 @@ mod tests {
         let after = load_capture_session_status(&conn, &manifest.capture_session_id, None)
             .unwrap()
             .unwrap();
-        assert_eq!(after.evidence.voice_count, Some(2), "distinct labels, not turns");
+        assert_eq!(
+            after.evidence.voice_count,
+            Some(2),
+            "distinct labels, not turns"
+        );
         assert_eq!(after.evidence.top_contexts, vec!["Zoom", "Xcode"]);
     }
 
