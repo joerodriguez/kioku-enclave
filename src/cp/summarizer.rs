@@ -50,6 +50,11 @@ const MAX_WINDOW_HOURS: i64 = 6;
 /// this small can't form an episode (the prompt forbids <10-min episodes), so
 /// calling earlier only burns Vertex quota and risks consuming the content.
 const MIN_WINDOW_MINUTES: i64 = 20;
+/// Session-settled runs (ADR-0034) accept any window at least this long: the
+/// session is closed evidence, so the 20-minute live-tail floor above does
+/// not apply, but a sub-minute window cannot survive the significance floor
+/// and would only burn a call.
+const SETTLED_MIN_WINDOW_MS: i64 = 60 * 1000;
 const UTT_CAP: usize = 4000;
 const SCR_CAP: usize = 2000;
 const SIG_MIN_SUBSTANTIVE_UTT: i64 = 3;
@@ -66,18 +71,33 @@ const VISUAL_EVIDENCE_BACKFILL_BATCH: usize = 50;
 /// Compute the summarization window ending bound for a run starting at
 /// `new_from` with the live tail at `tail_cutoff` (both epoch ms).
 ///
-/// Returns `None` when the window is shorter than [`MIN_WINDOW_MINUTES`]
+/// Returns `None` when the window is shorter than `min_window_ms`
 /// (don't call the LLM, don't advance). Otherwise `Some((new_to,
 /// tail_bounded))` where `tail_bounded` means the window was cut short by the
 /// live tail rather than the [`MAX_WINDOW_HOURS`] cap — only tail-bounded
 /// windows may hold the cursor on empty output (the ratchet fix; module docs).
-fn window_bounds(new_from: i64, tail_cutoff: i64) -> Option<(i64, bool)> {
-    if new_from >= tail_cutoff - MIN_WINDOW_MINUTES * 60 * 1000 {
+fn window_bounds(new_from: i64, tail_cutoff: i64, min_window_ms: i64) -> Option<(i64, bool)> {
+    if new_from >= tail_cutoff - min_window_ms {
         return None;
     }
     let cap = MAX_WINDOW_HOURS * 60 * 60 * 1000;
     let new_to = tail_cutoff.min(new_from + cap);
     Some((new_to, new_to == tail_cutoff && new_to - new_from < cap))
+}
+
+/// How a summarizer run was initiated (ADR-0034).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SummarizeMode {
+    /// The recurring sweep: a [`TAIL_MINUTES`] settle buffer and a
+    /// [`MIN_WINDOW_MINUTES`] floor keep live-tail fragments away from the
+    /// LLM (module docs).
+    Scheduled,
+    /// A capture session just finished and every accepted media item is
+    /// processed, so the tail is complete evidence rather than a growing
+    /// fragment. The window may be short and runs to now; empty output still
+    /// holds the cursor (tail-bounded semantics), so an early call can never
+    /// consume content — at worst it spends one bounded LLM call.
+    SessionSettled,
 }
 
 fn now_ms() -> i64 {
@@ -901,8 +921,16 @@ fn derive_membership(
 
 /// Summarize one user's recent capture into episodes. Returns a short status.
 pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
-    // Serialize runs: the scheduler's catch-up loop and the list_episodes
-    // freshness trigger can fire concurrently for the same user, and two
+    summarize_user_window(state, user_id, SummarizeMode::Scheduled).await
+}
+
+async fn summarize_user_window(
+    state: &CpState,
+    user_id: &str,
+    mode: SummarizeMode,
+) -> Result<Value> {
+    // Serialize runs: the scheduler's catch-up loop and the session-settled
+    // kick (ADR-0034) can fire concurrently for the same user, and two
     // racing runs would summarize the same window and double-create episodes
     // (the cursor is only re-read here, under the lock). Global rather than
     // per-user is fine at current scale — runs are deliberately sequential
@@ -916,14 +944,23 @@ pub async fn summarize_user(state: &CpState, user_id: &str) -> Result<Value> {
 
     let summarized_until = state.control.summarized_until(user_id).await?;
     let now = now_ms();
-    let tail_cutoff = now - TAIL_MINUTES * 60 * 1000;
+    let (tail_cutoff, min_window_ms) = match mode {
+        SummarizeMode::Scheduled => (
+            now - TAIL_MINUTES * 60 * 1000,
+            MIN_WINDOW_MINUTES * 60 * 1000,
+        ),
+        // Settled evidence: nothing more arrives for this tail, so run to now
+        // and accept short windows (a bounded 5-minute recording is a
+        // legitimate episode when it survives the significance floor).
+        SummarizeMode::SessionSettled => (now, SETTLED_MIN_WINDOW_MS),
+    };
     let max_lookback = now - LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
 
     let new_from = match &summarized_until {
         Some(c) => ms(c).max(max_lookback),
         None => max_lookback,
     };
-    let Some(win) = window_bounds(new_from, tail_cutoff) else {
+    let Some(win) = window_bounds(new_from, tail_cutoff, min_window_ms) else {
         // Live tail too short to possibly hold an episode — wait for it to
         // grow (see module docs). Cursor is NOT advanced.
         return Ok(serde_json::json!({ "skipped": true }));
@@ -1571,35 +1608,123 @@ pub async fn summarize_all(state: &CpState) {
             }
         }
 
-        if let Err(e) = super::finalizer::finalize_user_episodes(state, &id).await {
-            warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
+        finalize_and_deliver_user(state, &id).await;
+    }
+}
+
+/// The per-user post-summarization tail: finalization plus webhook, email,
+/// and push delivery. Every step is idempotent and no-ops when nothing new
+/// finalized, so both the sweep and the session-settled kick run it.
+async fn finalize_and_deliver_user(state: &CpState, id: &str) {
+    if let Err(e) = super::finalizer::finalize_user_episodes(state, id).await {
+        warn!(user_id = %id, error = %e, "finalize_user_episodes failed");
+    }
+    if let Err(e) = super::webhook_worker::deliver_user_webhooks(state, id).await {
+        warn!(user_id = %id, error = %e, "deliver_user_webhooks failed");
+    }
+    if let Some(ref transport) = state.email_transport {
+        if let Err(e) = super::email_worker::deliver_user_emails(state, transport.as_ref(), id).await
+        {
+            warn!(user_id = %id, error = %e, "deliver_user_emails failed");
         }
-        if let Err(e) = super::webhook_worker::deliver_user_webhooks(state, &id).await {
-            warn!(user_id = %id, error = %e, "deliver_user_webhooks failed");
-        }
-        if let Some(ref transport) = state.email_transport {
-            if let Err(e) =
-                super::email_worker::deliver_user_emails(state, transport.as_ref(), &id).await
-            {
-                warn!(user_id = %id, error = %e, "deliver_user_emails failed");
-            }
-        }
-        if let Some(ref transport) = state.push_transport {
-            if let Err(e) = super::push::deliver_user_pushes(state, transport.as_ref(), &id).await {
-                warn!(user_id = %id, error = %e, "deliver_user_pushes failed");
-            }
+    }
+    if let Some(ref transport) = state.push_transport {
+        if let Err(e) = super::push::deliver_user_pushes(state, transport.as_ref(), id).await {
+            warn!(user_id = %id, error = %e, "deliver_user_pushes failed");
         }
     }
 }
 
+/// Session-settled kick queue (ADR-0034). Ingest and the media worker hint
+/// that a user's finished capture session may be fully processed; the
+/// scheduler task drains the queue between sweeps. A missing receiver (tests,
+/// or startup before [`spawn_scheduler`]) makes the kick a silent no-op — the
+/// 10-minute sweep remains the correctness backstop.
+static SESSION_SETTLED_KICKS: OnceLock<tokio::sync::mpsc::UnboundedSender<String>> =
+    OnceLock::new();
+
+/// Suppress repeat kicks for the same user within this window (rapid
+/// stop/start, one kick per completed media work unit).
+const KICK_DEBOUNCE_SECS: u64 = 30;
+
+/// Hint that `user_id`'s live tail may have just settled (a session finished
+/// or its last media work completed). Cheap, non-blocking, and safe to call
+/// speculatively: the scheduler re-checks the settled gate before any LLM
+/// call.
+pub fn kick_session_settled(user_id: &str) {
+    if let Some(sender) = SESSION_SETTLED_KICKS.get() {
+        let _ = sender.send(user_id.to_string());
+    }
+}
+
+/// The settled gate: the user's tail is complete evidence only when no
+/// capture session is open and recently active, and no accepted media is
+/// still queued, in flight, or awaiting retry. Anything pending means a later
+/// kick (or the sweep) will retry; running early would summarize a window
+/// whose transcript is still forming and could consume it.
+async fn session_tail_is_settled(state: &CpState, user_id: &str) -> bool {
+    let result = state
+        .store
+        .with_user(user_id, |conn| {
+            let (open_recent, media_pending) = conn.query_row(
+                "SELECT \
+                  (SELECT COUNT(*) FROM capture_sessions WHERE ended_at IS NULL \
+                    AND last_event_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 minutes')), \
+                  (SELECT COUNT(*) FROM media_objects \
+                    WHERE processing_state IN ('queued','processing','retry_wait') \
+                    AND deleted_at IS NULL)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            Ok(open_recent == 0 && media_pending == 0)
+        })
+        .await;
+    match result {
+        Ok(settled) => settled,
+        Err(e) => {
+            warn!(user_id, error = %e, "session-settled gate check failed");
+            false
+        }
+    }
+}
+
+async fn summarize_session_settled(state: &CpState, user_id: &str) {
+    if !session_tail_is_settled(state, user_id).await {
+        return;
+    }
+    match summarize_user_window(state, user_id, SummarizeMode::SessionSettled).await {
+        Ok(_) => {}
+        Err(e) => {
+            warn!(user_id, error = %e, "session-settled summarize failed");
+            return;
+        }
+    }
+    finalize_and_deliver_user(state, user_id).await;
+}
+
 /// Spawn the internal summarizer cron (replaces Cloud Scheduler). Sweeps every
-/// [`SCHEDULER_INTERVAL_SECS`].
+/// [`SCHEDULER_INTERVAL_SECS`] and drains session-settled kicks between
+/// sweeps.
 pub fn spawn_scheduler(state: Arc<CpState>) {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let _ = SESSION_SETTLED_KICKS.set(sender);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(SCHEDULER_INTERVAL_SECS));
+        let mut last_kick: HashMap<String, std::time::Instant> = HashMap::new();
         loop {
-            tick.tick().await;
-            summarize_all(&state).await;
+            tokio::select! {
+                _ = tick.tick() => summarize_all(&state).await,
+                Some(user_id) = receiver.recv() => {
+                    let debounced = last_kick.get(&user_id).is_some_and(|at| {
+                        at.elapsed() < Duration::from_secs(KICK_DEBOUNCE_SECS)
+                    });
+                    if debounced {
+                        continue;
+                    }
+                    last_kick.insert(user_id.clone(), std::time::Instant::now());
+                    summarize_session_settled(&state, &user_id).await;
+                }
+            }
         }
     });
 }
@@ -1649,6 +1774,8 @@ mod tests {
     const MIN: i64 = 60 * 1000;
     const HOUR: i64 = 60 * MIN;
 
+    const SCHEDULED_MIN_WINDOW: i64 = MIN_WINDOW_MINUTES * MIN;
+
     /// The live-tail ratchet fix (module docs): short tails wait, medium tails
     /// are tail-bounded (may hold the cursor), capped windows always advance.
     #[test]
@@ -1656,25 +1783,53 @@ mod tests {
         let tail = 1_000_000 * MIN; // arbitrary "now - 5min" reference
 
         // Tail shorter than MIN_WINDOW: don't run at all.
-        assert_eq!(window_bounds(tail - 10 * MIN, tail), None);
-        assert_eq!(window_bounds(tail, tail), None, "caught up exactly");
-        assert_eq!(window_bounds(tail + MIN, tail), None, "cursor past tail");
+        assert_eq!(window_bounds(tail - 10 * MIN, tail, SCHEDULED_MIN_WINDOW), None);
+        assert_eq!(
+            window_bounds(tail, tail, SCHEDULED_MIN_WINDOW),
+            None,
+            "caught up exactly"
+        );
+        assert_eq!(
+            window_bounds(tail + MIN, tail, SCHEDULED_MIN_WINDOW),
+            None,
+            "cursor past tail"
+        );
 
         // Tail-bounded window: ends at the tail, below the 6-h cap.
-        let (to, tail_bounded) = window_bounds(tail - 30 * MIN, tail).unwrap();
+        let (to, tail_bounded) =
+            window_bounds(tail - 30 * MIN, tail, SCHEDULED_MIN_WINDOW).unwrap();
         assert_eq!(to, tail);
         assert!(tail_bounded, "30-min live window may hold the cursor");
 
         // Window at the cap: advances unconditionally (backfill marches).
-        let (to, tail_bounded) = window_bounds(tail - 26 * HOUR, tail).unwrap();
+        let (to, tail_bounded) =
+            window_bounds(tail - 26 * HOUR, tail, SCHEDULED_MIN_WINDOW).unwrap();
         assert_eq!(to, tail - 26 * HOUR + MAX_WINDOW_HOURS * HOUR);
         assert!(!tail_bounded, "capped window must not hold the cursor");
 
         // Window exactly 6 h to the tail: treated as capped (advance) so a
         // pathological always-insignificant span can't hold forever.
-        let (to, tail_bounded) = window_bounds(tail - MAX_WINDOW_HOURS * HOUR, tail).unwrap();
+        let (to, tail_bounded) =
+            window_bounds(tail - MAX_WINDOW_HOURS * HOUR, tail, SCHEDULED_MIN_WINDOW).unwrap();
         assert_eq!(to, tail);
         assert!(!tail_bounded);
+    }
+
+    /// ADR-0034 session-settled runs: a short window is allowed (the session
+    /// is closed evidence), but it stays tail-bounded so empty output still
+    /// holds the cursor — an early call can never consume content.
+    #[test]
+    fn session_settled_window_accepts_short_tail_and_stays_tail_bounded() {
+        let tail = 1_000_000 * MIN;
+
+        let (to, tail_bounded) = window_bounds(tail - 5 * MIN, tail, SETTLED_MIN_WINDOW_MS)
+            .expect("a settled 5-minute recording is summarizable immediately");
+        assert_eq!(to, tail);
+        assert!(tail_bounded, "short settled window must hold cursor on empty output");
+
+        // Still refuses degenerate/caught-up windows.
+        assert_eq!(window_bounds(tail, tail, SETTLED_MIN_WINDOW_MS), None);
+        assert_eq!(window_bounds(tail + MIN, tail, SETTLED_MIN_WINDOW_MS), None);
     }
 
     #[test]
