@@ -1647,7 +1647,10 @@ async fn finish_capture_session(
             Ok(()) => Json(status).into_response(),
             Err(error) => error.into_response(),
         },
-        Ok(None) => EnclaveError::NotFound.into_response(),
+        // Finishing is idempotent: an unknown session is already in the goal
+        // state ("not active"), and clients queue finish markers durably, so a
+        // 404 here wedges their outbox forever after server-side session loss.
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -4799,5 +4802,98 @@ mod tests {
         ] {
             assert!(capture_requires_recording_lease(stream));
         }
+    }
+
+    fn finish_test_state() -> Arc<CpState> {
+        use crate::store::tests::{FakeGcs, FakeKms};
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        Arc::new(CpState {
+            store: Arc::new(crate::store::Store::new(kms.clone(), gcs.clone())),
+            control: Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs)),
+            billing: Arc::new(crate::cp::billing::FakeBillingGateway),
+            recording_lease_gate: Arc::new(crate::cp::billing::RecordingLeaseGates::default()),
+            config: Arc::new(crate::cp::CpConfig {
+                base_url: "http://localhost:8080".into(),
+                jwt_secrets: vec!["test".into()],
+                google_desktop_client_id: "desktop".into(),
+                google_ios_client_id: "ios".into(),
+                google_web_client_id: "web".into(),
+                google_web_client_secret: "secret".into(),
+                allowed_emails: None,
+                admin_user_ids: Vec::new(),
+                scheduler_sa_email: None,
+                vertex_project: "project".into(),
+                vertex_location: "global".into(),
+                vertex_model: "model".into(),
+                quota_utterances_per_day: 1,
+                quota_screenshots_per_day: 1,
+                quota_mcp_calls_per_day: 1,
+                quota_vertex_output_tokens_per_day: 1,
+                web_origin: "http://localhost:3000".into(),
+                reviewer_auth: None,
+                apple_sign_in: None,
+                billing_enforcement_mode: crate::cp::BillingEnforcementMode::Enforce,
+            }),
+            user_verifier: Arc::new(crate::cp::auth::UserIdTokenVerifier::new(vec![])),
+            reviewer_verifier: None,
+            apple_provider: None,
+            sync_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            reference_batch_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            reference_batch_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
+            mcp_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            oauth_limiter: crate::cp::limits::RateLimiter::new(10.0, 1.0),
+            test_email_limiter: crate::cp::limits::RateLimiter::new(3.0, 0.05),
+            email_transport: None,
+            push_transport: None,
+            embedding: None,
+            voice: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn finishing_an_unknown_capture_session_is_an_idempotent_no_op() {
+        let state = finish_test_state();
+        let response = finish_capture_session(
+            State(state),
+            axum::Extension(crate::cp::auth::AuthUser(
+                "11111111-1111-4111-8111-111111111111".into(),
+            )),
+            axum::extract::Path("session-lost-before-finish".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn finishing_a_known_capture_session_still_reports_its_status() {
+        let state = finish_test_state();
+        let user = crate::cp::auth::AuthUser("11111111-1111-4111-8111-111111111111".into());
+        state
+            .store
+            .with_user(&user.0, |conn| {
+                conn.execute(
+                    "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
+                     last_event_at,schema_version) \
+                     VALUES('session-1','device-1','install-1',\
+                     '2026-08-14T18:00:00.000Z','2026-08-14T18:00:05.000Z',2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let response = finish_capture_session(
+            State(state),
+            axum::Extension(user),
+            axum::extract::Path("session-1".into()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_slice(&body).unwrap();
+        assert!(status["ended_at"].is_string());
     }
 }
