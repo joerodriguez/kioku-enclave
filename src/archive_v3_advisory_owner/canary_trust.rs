@@ -456,6 +456,23 @@ fn authenticate_runtime_admission(
     })
 }
 
+/// Narrow accessor for the pinned deployment-observer (runtime-admission) root,
+/// used by the live window observer's production constructor. Fails closed while
+/// the pinned roots remain deliberately invalid zero roots.
+pub(super) fn pinned_deployment_observer_root() -> Result<[u8; 32]> {
+    Ok(CanaryTrustRoots::pinned()?.runtime_admission)
+}
+
+/// Domain-separated Ed25519 verification for sibling advisory-owner modules.
+pub(super) fn verify_observer_signature(
+    public_key: &[u8; 32],
+    domain: &[u8],
+    value: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    verify_ed25519(public_key, domain, value, signature)
+}
+
 fn verify_ed25519(
     public_key: &[u8; 32],
     domain: &[u8],
