@@ -1691,6 +1691,7 @@ async fn process_user(state: &CpState, user_id: &str) {
             return;
         }
     };
+    let mut completed_work = false;
     for class in
         media_planner::schedule_classes(audio_pending, screen_pending, MAX_JOBS_PER_USER_PER_SWEEP)
     {
@@ -1766,6 +1767,13 @@ async fn process_user(state: &CpState, user_id: &str) {
                 return;
             }
         }
+        completed_work = true;
+    }
+    if completed_work {
+        // ADR-0034: this pass may have drained the user's last pending media
+        // for a finished capture session. Only a hint; the summarizer's
+        // settled gate re-checks open sessions and remaining media work.
+        super::summarizer::kick_session_settled(user_id);
     }
     match state
         .store

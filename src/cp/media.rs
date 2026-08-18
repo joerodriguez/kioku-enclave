@@ -736,6 +736,22 @@ enum CaptureSessionStage {
     PreparingRecap,
     Ready,
     NeedsAttention,
+    /// Terminal honest zero-result (ADR-0034): all linked media processed and
+    /// a segmentation pass covering past the session's end linked nothing.
+    NoMemory,
+}
+
+/// Evidence echo (ADR-0034): facts derived mechanically from accepted
+/// evidence, never model output. Absent fields mean unknown — clients render
+/// nothing rather than a placeholder.
+#[derive(Debug, Serialize)]
+struct CaptureSessionEvidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_minutes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice_count: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    top_contexts: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -767,7 +783,19 @@ struct CaptureSessionStatus {
     event_count: i64,
     stage: CaptureSessionStage,
     processing: CaptureSessionProcessing,
+    evidence: CaptureSessionEvidence,
     memories: Vec<CaptureSessionMemory>,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureSessionList {
+    sessions: Vec<CaptureSessionStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptureSessionListQuery {
+    window_hours: Option<i64>,
+    max_sessions: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -898,6 +926,7 @@ pub fn router() -> Router<Arc<CpState>> {
                 .layer(DefaultBodyLimit::max(MAX_REFERENCE_BATCH_BYTES)),
         )
         .route("/api/v2/capture/events/{event_id}", get(capture_status))
+        .route("/api/v2/capture/sessions", get(list_capture_sessions))
         .route(
             "/api/v2/capture/sessions/{capture_session_id}",
             get(capture_session_status).post(finish_capture_session),
@@ -1599,6 +1628,16 @@ async fn capture_status(
     }
 }
 
+/// The summarizer cursor, for the no_memory derivation (ADR-0034). Best
+/// effort: an unreadable cursor degrades to "unknown", which can only delay
+/// the terminal zero-result — never invent it.
+async fn summarized_until_ms(state: &CpState, user_id: &str) -> Option<i64> {
+    match state.control.summarized_until(user_id).await {
+        Ok(cursor) => cursor.as_deref().and_then(super::isotime::parse_epoch_millis),
+        Err(_) => None,
+    }
+}
+
 async fn capture_session_status(
     State(state): State<Arc<CpState>>,
     Extension(user): Extension<AuthUser>,
@@ -1607,10 +1646,11 @@ async fn capture_session_status(
     if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
         return error.into_response();
     }
+    let cursor_ms = summarized_until_ms(&state, &user.0).await;
     match state
         .store
-        .with_user(&user.0, |conn| {
-            load_capture_session_status(conn, &capture_session_id)
+        .with_user(&user.0, move |conn| {
+            load_capture_session_status(conn, &capture_session_id, cursor_ms)
         })
         .await
     {
@@ -1618,6 +1658,61 @@ async fn capture_session_status(
         Ok(None) => EnclaveError::NotFound.into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+/// Bounded account-scoped session discovery (ADR-0034 §3): the web dashboard
+/// holds no capture-session ID, so it lists recent sessions instead. Reads
+/// the same per-user facts as the single-session endpoint; nothing global.
+async fn list_capture_sessions(
+    State(state): State<Arc<CpState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<CaptureSessionListQuery>,
+) -> Response {
+    let window_hours = query.window_hours.unwrap_or(8).clamp(1, 24);
+    let max_sessions = query.max_sessions.unwrap_or(5).clamp(1, 10);
+    let cursor_ms = summarized_until_ms(&state, &user.0).await;
+    match state
+        .store
+        .with_user(&user.0, move |conn| {
+            let ids = load_recent_capture_session_ids(conn, window_hours, max_sessions)?;
+            let mut sessions = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(status) = load_capture_session_status(conn, &id, cursor_ms)? {
+                    sessions.push(status);
+                }
+            }
+            Ok(CaptureSessionList { sessions })
+        })
+        .await
+    {
+        Ok(list) => Json(list).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Sessions that started within the window, plus still-open sessions with
+/// recent events (so an in-flight recording is discoverable even when it
+/// started before the window). Stale open sessions age out with their last
+/// event rather than pinning the list forever.
+fn load_recent_capture_session_ids(
+    conn: &Connection,
+    window_hours: i64,
+    max_sessions: i64,
+) -> Result<Vec<String>> {
+    let window_modifier = format!("-{window_hours} hours");
+    let mut statement = conn.prepare(
+        "SELECT id FROM capture_sessions \
+         WHERE started_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) \
+            OR (ended_at IS NULL \
+                AND last_event_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now',?1)) \
+         ORDER BY started_at DESC LIMIT ?2",
+    )?;
+    let ids = statement
+        .query_map(params![window_modifier, max_sessions], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
 }
 
 async fn finish_capture_session(
@@ -1639,12 +1734,19 @@ async fn finish_capture_session(
             if updated == 0 {
                 return Ok(None);
             }
-            load_capture_session_status(conn, &capture_session_id)
+            load_capture_session_status(conn, &capture_session_id, None)
         })
         .await
     {
         Ok(Some(status)) => match state.store.save_user(&user.0).await {
-            Ok(()) => Json(status).into_response(),
+            Ok(()) => {
+                // ADR-0034: the finished session may already be fully
+                // processed — let the summarizer form the memory now instead
+                // of waiting for the next 10-minute sweep. Only a hint; the
+                // settled gate re-checks before any LLM call.
+                super::summarizer::kick_session_settled(&user.0);
+                Json(status).into_response()
+            }
             Err(error) => error.into_response(),
         },
         // Finishing is idempotent: an unknown session is already in the goal
@@ -1678,6 +1780,7 @@ fn load_capture_status(conn: &Connection, event_id: &str) -> Result<Option<Captu
 fn load_capture_session_status(
     conn: &Connection,
     capture_session_id: &str,
+    summarized_until_ms: Option<i64>,
 ) -> Result<Option<CaptureSessionStatus>> {
     let session = conn
         .query_row(
@@ -1720,6 +1823,11 @@ fn load_capture_session_status(
         },
     )?;
 
+    // substance='none' episodes are excluded: the finalizer never finalizes
+    // them (they are hidden from browse/search under ADR-0009), so surfacing
+    // one here would wedge the stage at preparing_recap forever. A recording
+    // whose only product is a substance-none episode resolves to no_memory —
+    // the honest outcome (ADR-0034).
     let mut statement = conn.prepare(
         "SELECT DISTINCT e.id,e.title,e.started_at,e.ended_at,e.finalization_status,e.finalized_at \
          FROM episodes e JOIN episode_members m ON m.episode_id=e.id \
@@ -1729,7 +1837,8 @@ fn load_capture_session_status(
          LEFT JOIN screenshots s ON m.record_type='screenshot' AND m.record_id=s.id \
          LEFT JOIN capture_events ce ON ce.capture_session_id=?1 AND ( \
            ce.event_id=so.event_id OR s.source_key=('cloud-v2:'||ce.event_id)) \
-         WHERE ce.event_id IS NOT NULL ORDER BY e.started_at DESC,e.id DESC",
+         WHERE ce.event_id IS NOT NULL AND e.substance!='none' \
+         ORDER BY e.started_at DESC,e.id DESC",
     )?;
     let memories = statement
         .query_map([&capture_session_id], |row| {
@@ -1744,9 +1853,50 @@ fn load_capture_session_status(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // Evidence echo (ADR-0034): mechanical aggregates over accepted evidence.
+    // Mic and system audio cover the same wall-clock span, so take the
+    // largest single-kind sum rather than double-counting overlapped tracks.
+    let audio_minutes: Option<i64> = conn.query_row(
+        "SELECT CAST(MAX(kind_seconds)/60.0 + 0.5 AS INTEGER) FROM ( \
+           SELECT SUM((julianday(ended_at)-julianday(started_at))*86400.0) AS kind_seconds \
+           FROM capture_events WHERE capture_session_id=?1 \
+           AND stream_kind IN ('mic','system_audio','ios_mic') GROUP BY stream_kind)",
+        [&capture_session_id],
+        |row| row.get(0),
+    )?;
+    let voice_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT u.speaker_label) FROM capture_events ce \
+         JOIN speaker_observations so ON so.event_id=ce.event_id \
+         JOIN utterances u ON u.source_key=('cloud-v2:'||so.event_id||':'||so.turn_id) \
+         WHERE ce.capture_session_id=?1 AND u.speaker_label!=''",
+        [&capture_session_id],
+        |row| row.get(0),
+    )?;
+    // Application names only — never window-title text (ADR-0034 §8).
+    let mut contexts_statement = conn.prepare(
+        "SELECT s.active_app FROM capture_events ce \
+         JOIN screenshots s ON s.source_key=('cloud-v2:'||ce.event_id) \
+         WHERE ce.capture_session_id=?1 AND s.active_app IS NOT NULL AND s.active_app!='' \
+         GROUP BY s.active_app ORDER BY COUNT(*) DESC, s.active_app LIMIT 3",
+    )?;
+    let top_contexts = contexts_statement
+        .query_map([&capture_session_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
     let has_ready_memory = memories
         .iter()
         .any(|memory| memory.finalization_status == "complete" && memory.finalized_at.is_some());
+    // no_memory is declared only from facts: the session is over, every
+    // accepted media item reached a terminal success state, and the
+    // summarizer's cursor moved past the session's end without linking a
+    // memory. A held cursor (ratchet) keeps the stage at organizing — unknown
+    // stays visibly unknown rather than becoming a premature zero result.
+    let summarized_past_end = match (&ended_at, summarized_until_ms) {
+        (Some(ended), Some(cursor)) => {
+            super::isotime::parse_epoch_millis(ended).is_some_and(|end_ms| cursor > end_ms)
+        }
+        _ => false,
+    };
     let stage = if failed > 0 {
         CaptureSessionStage::NeedsAttention
     } else if queued + processing + retry_wait > 0 {
@@ -1756,7 +1906,11 @@ fn load_capture_session_status(
     } else if !memories.is_empty() {
         CaptureSessionStage::PreparingRecap
     } else if ended_at.is_some() {
-        CaptureSessionStage::Organizing
+        if summarized_past_end {
+            CaptureSessionStage::NoMemory
+        } else {
+            CaptureSessionStage::Organizing
+        }
     } else {
         CaptureSessionStage::Received
     };
@@ -1775,6 +1929,11 @@ fn load_capture_session_status(
             retry_wait,
             ready,
             failed,
+        },
+        evidence: CaptureSessionEvidence {
+            audio_minutes,
+            voice_count: (voice_count > 0).then_some(voice_count),
+            top_contexts,
         },
         memories,
     }))
@@ -2452,6 +2611,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_capture_events_time
             ON capture_events(started_at, event_id);
+        CREATE INDEX IF NOT EXISTS idx_capture_events_session
+            ON capture_events(capture_session_id);
         CREATE TABLE IF NOT EXISTS media_objects (
             asset_id TEXT PRIMARY KEY,
             event_id TEXT NOT NULL UNIQUE REFERENCES capture_events(event_id) ON DELETE CASCADE,
@@ -4508,10 +4669,9 @@ mod tests {
         assert!(status.error_code.is_none());
     }
 
-    #[test]
-    fn capture_session_status_tracks_processing_recap_and_ready_without_guessing() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
+    /// Stand-ins for the user-store tables the session status joins against
+    /// (the real ones live in `store.rs`; production has both in one DB).
+    fn session_status_content_tables(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE episodes (
                 id INTEGER PRIMARY KEY,
@@ -4519,10 +4679,13 @@ mod tests {
                 started_at TEXT NOT NULL,
                 ended_at TEXT NOT NULL,
                 finalization_status TEXT NOT NULL,
-                finalized_at TEXT
+                finalized_at TEXT,
+                substance TEXT NOT NULL DEFAULT 'normal'
              );
-             CREATE TABLE utterances (id INTEGER PRIMARY KEY, source_key TEXT);
-             CREATE TABLE screenshots (id INTEGER PRIMARY KEY, source_key TEXT);
+             CREATE TABLE utterances (id INTEGER PRIMARY KEY, source_key TEXT, \
+                speaker_label TEXT NOT NULL DEFAULT '');
+             CREATE TABLE screenshots (id INTEGER PRIMARY KEY, source_key TEXT, \
+                active_app TEXT);
              CREATE TABLE episode_members (
                 episode_id INTEGER NOT NULL,
                 record_type TEXT NOT NULL,
@@ -4530,10 +4693,17 @@ mod tests {
              );",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn capture_session_status_tracks_processing_recap_and_ready_without_guessing() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        session_status_content_tables(&conn);
 
         let manifest = valid_manifest();
         record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
-        let session = load_capture_session_status(&conn, &manifest.capture_session_id)
+        let session = load_capture_session_status(&conn, &manifest.capture_session_id, None)
             .unwrap()
             .expect("session exists after its first accepted event");
         assert_eq!(session.stage, CaptureSessionStage::Processing);
@@ -4551,7 +4721,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id)
+            load_capture_session_status(&conn, &manifest.capture_session_id, None)
                 .unwrap()
                 .unwrap()
                 .stage,
@@ -4576,7 +4746,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            load_capture_session_status(&conn, &manifest.capture_session_id)
+            load_capture_session_status(&conn, &manifest.capture_session_id, None)
                 .unwrap()
                 .unwrap()
                 .stage,
@@ -4589,12 +4759,171 @@ mod tests {
             [],
         )
         .unwrap();
-        let ready = load_capture_session_status(&conn, &manifest.capture_session_id)
+        let ready = load_capture_session_status(&conn, &manifest.capture_session_id, None)
             .unwrap()
             .unwrap();
         assert_eq!(ready.stage, CaptureSessionStage::Ready);
         assert_eq!(ready.memories.len(), 1);
         assert_eq!(ready.memories[0].id, 7);
+    }
+
+    /// ADR-0034: the terminal zero-result requires the summarizer cursor past
+    /// the session's end; a held cursor keeps `organizing`, and a
+    /// substance-none episode (never finalized, hidden from browse) does not
+    /// count as a memory.
+    #[test]
+    fn capture_session_no_memory_requires_summarized_past_end_and_ignores_substance_none() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        session_status_content_tables(&conn);
+
+        let manifest = valid_manifest();
+        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
+        conn.execute(
+            "UPDATE media_objects SET processing_state='ready' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE capture_sessions SET ended_at='2026-07-31T18:05:00.000Z' WHERE id=?1",
+            [&manifest.capture_session_id],
+        )
+        .unwrap();
+
+        let ended_ms = parse_epoch_millis("2026-07-31T18:05:00.000Z").unwrap();
+        // Cursor before the session end: still organizing, never a guess.
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms - 1))
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::Organizing
+        );
+        // Cursor past the end with nothing linked: honest terminal no_memory.
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms + 1))
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::NoMemory
+        );
+
+        // A linked substance-none episode is not a memory: the finalizer
+        // skips it, so counting it would wedge the stage at preparing_recap.
+        conn.execute(
+            "INSERT INTO screenshots(id,source_key) VALUES (1,?1)",
+            [format!("cloud-v2:{}", manifest.event_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episodes(id,title,started_at,ended_at,finalization_status,substance) \
+             VALUES (7,'Fragment',?1,?2,'pending_horizon','none')",
+            [&manifest.started_at, &manifest.ended_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episode_members(episode_id,record_type,record_id) \
+             VALUES (7,'screenshot',1)",
+            [],
+        )
+        .unwrap();
+        let status =
+            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms + 1))
+                .unwrap()
+                .unwrap();
+        assert_eq!(status.stage, CaptureSessionStage::NoMemory);
+        assert!(status.memories.is_empty());
+
+        // Reclassified upward (e.g. extension added substance): it counts.
+        conn.execute("UPDATE episodes SET substance='normal' WHERE id=7", [])
+            .unwrap();
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id, Some(ended_ms + 1))
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::PreparingRecap
+        );
+    }
+
+    /// ADR-0034 evidence echo: mechanical aggregates only, absent when
+    /// unknown, app names rather than window titles.
+    #[test]
+    fn capture_session_evidence_echo_reports_audio_voices_and_contexts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        session_status_content_tables(&conn);
+
+        let manifest = valid_manifest();
+        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
+
+        let before = load_capture_session_status(&conn, &manifest.capture_session_id, None)
+            .unwrap()
+            .unwrap();
+        // A 5-second accepted event rounds to zero whole minutes; no voices
+        // or screen evidence exists yet, so those fields stay absent.
+        assert_eq!(before.evidence.audio_minutes, Some(0));
+        assert_eq!(before.evidence.voice_count, None);
+        assert!(before.evidence.top_contexts.is_empty());
+
+        for (turn, label) in [("t1", "Me"), ("t2", "Speaker 1"), ("t3", "Me")] {
+            conn.execute(
+                "INSERT INTO speaker_observations(event_id,turn_id,speaker_local_id,\
+                 started_at,ended_at,transcript_text) VALUES (?1,?2,'S0',?3,?4,'hello')",
+                params![manifest.event_id, turn, manifest.started_at, manifest.ended_at],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO utterances(source_key,speaker_label) VALUES (?1,?2)",
+                params![format!("cloud-v2:{}:{}", manifest.event_id, turn), label],
+            )
+            .unwrap();
+        }
+        for app in ["Zoom", "Zoom", "Xcode"] {
+            conn.execute(
+                "INSERT INTO screenshots(source_key,active_app) VALUES (?1,?2)",
+                params![format!("cloud-v2:{}", manifest.event_id), app],
+            )
+            .unwrap();
+        }
+
+        let after = load_capture_session_status(&conn, &manifest.capture_session_id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.evidence.voice_count, Some(2), "distinct labels, not turns");
+        assert_eq!(after.evidence.top_contexts, vec!["Zoom", "Xcode"]);
+    }
+
+    /// ADR-0034 §3: discovery lists sessions started in the window plus
+    /// still-open recently-active sessions; stale open sessions age out.
+    #[test]
+    fn recent_capture_session_listing_is_bounded_and_recency_aware() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let insert = |id: &str, started_offset: &str, last_offset: &str, ended: bool| {
+            conn.execute(
+                "INSERT INTO capture_sessions(id,device_id,install_id,started_at,\
+                 last_event_at,ended_at,schema_version) VALUES (?1,'d','i',\
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now',?2),\
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now',?3),\
+                 CASE WHEN ?4 THEN strftime('%Y-%m-%dT%H:%M:%fZ','now',?3) END,2)",
+                params![id, started_offset, last_offset, ended],
+            )
+            .unwrap();
+        };
+        insert("fresh-ended", "-1 hours", "-1 hours", true);
+        insert("fresh-open", "-2 hours", "-2 hours", false);
+        insert("old-open-active", "-30 hours", "-1 hours", false);
+        insert("old-open-stale", "-30 hours", "-29 hours", false);
+        insert("old-ended", "-30 hours", "-29 hours", true);
+
+        let ids = load_recent_capture_session_ids(&conn, 8, 5).unwrap();
+        assert_eq!(ids, vec!["fresh-ended", "fresh-open", "old-open-active"]);
+
+        // The clamp bounds the response, newest first.
+        let ids = load_recent_capture_session_ids(&conn, 8, 1).unwrap();
+        assert_eq!(ids, vec!["fresh-ended"]);
     }
 
     #[test]
