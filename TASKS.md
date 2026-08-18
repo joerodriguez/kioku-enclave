@@ -872,3 +872,61 @@ serving-ready state and production WAL domain owners remain an activation blocke
 The checked items do not authorize archive-v3 persistence or deployment. See
 [`eval/capacity/README.md`](eval/capacity/README.md) for the reproducible operator command
 and the local gate's explicit limitations.
+
+## ADR-0022 Phase 3 extent VFS, WAL-to-extent, vector accelerator, and shadow verification
+
+- [x] **Milestone 3A**: Authenticated durable attempt ledger `ExtentAttemptLedger` in
+  `src/archive_v3_extent_commit.rs`: full-tuple CAS with same-transaction exact readback,
+  strict schema and `sqlite_master` authentication, single-active-attempt enforcement,
+  monotonic attempt sequences, domain-separated row and candidate-root commitments, and
+  permanent terminal retention. The witness-bound stage chain
+  (`Prepared -> ObjectsStaged -> CandidateReady -> WitnessSendStarted -> WitnessAdvanced -> Published`)
+  is enterable only through sealed evidence tokens with no production constructor in this
+  slice; Phase 3 shadow commits record no witness expectation and terminate at the
+  distinct `ShadowSettled` terminal, and interrupted pre-witness attempts terminate
+  durably at `AbortedPreWitness` so a crash can never wedge the attempt slot. Restart
+  reconciliation settles shadow candidates, aborts pre-witness work, and fails closed
+  (`ManualRequired`-style) on witness-stage attempts.
+- [x] **Milestone 3B**: Durable staged-object inventory bound to the exact attempt row in
+  the same authenticated ledger database: every immutable extent/node/root object is
+  reserved (sealed-context canonical AAD + ciphertext hash) before provider upload and
+  marked materialized only after exact readback, via the ledger-backed
+  `DurableExtentStaging` in `src/archive_v3_extent.rs`. No witness advancement exists in
+  this slice: `RootAdvance` construction remains test-only in `src/archive_v3_witness.rs`
+  and the Phase 4 authority transition owns any future production witness path.
+- [x] **Milestone 3C**: Shadow-only Extent VFS in `src/archive_v3_extent_vfs.rs`: one main
+  database per instance, journal/WAL/temp/mmap/shm file classes fail closed (memory
+  journal and temp modes required) so plaintext never reaches the host filesystem and
+  host-planted journals cannot enter the authenticated tree; `ATTACH` aliasing refused;
+  single-handle lifetime accounting; zeroizing page buffers; bounded runtime-flavor-safe
+  execution lanes.
+- [x] **Milestone 3D**: `xSync` durable shadow commit flow: heal-or-begin ledger attempt,
+  bounded whole-file extent staging with durable reservation/exact readback, candidate
+  root recording, `ShadowSettled` terminalization, exact snapshot-mask page cleaning, and
+  fail-safe revert (dirty discard + settled-root restore + durable abort) on any failure.
+  Commit size is bounded (256 MiB) pending Phase 4 incremental extent-object reuse.
+- [x] **Milestone 3E**: Cleanup-owned two-pass streaming WAL converter with SQLite
+  checksum-chain consistency validation (explicitly not cryptographic authentication),
+  SQLite-conformant torn-tail recovery semantics, bounded staging in fixed private
+  `/tmp` (unlinked-while-open, mode 0600), page-number and stream-size bounds, sparse
+  base-source merge, and zeroizing buffers in `src/archive_v3_wal_to_extent.rs`.
+- [x] **Milestone 3F**: Read-only shadow comparison in `src/archive_v3_extent_shadow.rs`:
+  coordinator-owned read-only connections (`query_only=ON`), statement-level read-only
+  enforcement on both engines, RAII transactions with concurrent snapshot pinning and
+  `data_version` receipt markers, order-independent duplicate-sensitive multiset row
+  digests, and content-free operation-scoped receipts.
+- [x] **Milestone 3G**: Encrypted vector accelerator in
+  `src/archive_v3_vector_accelerator.rs`: authenticated snapshot loading (fail-closed on
+  tamper), connectivity-validated flat-graph bounded beam search, build-time recall@20
+  certification enforced at construction and load, live-table re-validation of snapshot candidates
+  (deletion/update coherent), and memory-bounded row-capped exact fallback that reports
+  which path served the query.
+- [x] **Milestone 3H**: Static Phase 3 architecture gates
+  (`scripts/test_phase3_architecture_gate.py`, `src/archive_v3_phase3_gates.rs`),
+  consolidated documentation, and map updates.
+
+This compiled engine remains inactive and shadow-only: no Store, route, startup,
+provider-credential, acknowledgement, or witness-authority wiring exists, and the
+`Published` ledger terminal is unreachable without sealed witness evidence that this
+slice cannot mint. It does not activate production extent VFS serving or any authority
+cutover.

@@ -114,6 +114,19 @@ mod archive_v3_deletion;
 // Inactive ADR-0022 immutable sparse-extent tree. It is fake-tested only and
 // has no Store/VFS/provider/witness/route/flag/authority wiring.
 mod archive_v3_extent;
+// Inactive ADR-0022 SQLite Extent VFS and page cache paging layer.
+mod archive_v3_extent_vfs;
+// Inactive ADR-0022 WAL-to-extent streaming converter.
+mod archive_v3_wal_to_extent;
+// Inactive ADR-0022 Extent shadow coordinator and parity verifier.
+mod archive_v3_extent_shadow;
+// Inactive ADR-0022 durable shadow extent commit protocol.
+mod archive_v3_extent_commit;
+// Inactive ADR-0022 encrypted vector accelerator sidecar.
+mod archive_v3_vector_accelerator;
+// ADR-0022 Phase 3 comprehensive structural gate suite.
+#[cfg(test)]
+mod archive_v3_phase3_gates;
 // Inactive ADR-0022 Firestore witness transaction adapter and bounded concrete
 // REST transport. They have no runtime construction, Store, VFS, route, or
 // authority wiring.
