@@ -76,6 +76,8 @@ pub enum ExtentTreeError {
     LegacySession(#[from] LegacyExtentSessionError),
     #[error("the exact immutable extent-tree object is absent")]
     MissingObject,
+    #[error("durable extent attempt ledger refused the staged-object operation")]
+    AttemptLedger,
     #[error("extent range is outside the authenticated logical file")]
     Range,
 }
@@ -108,6 +110,25 @@ impl ExtentCipher for crate::archive_v3::VerifiedArchiveCipher {
         envelope: &CiphertextEnvelope,
     ) -> ArchiveResult<Vec<u8>> {
         crate::archive_v3::VerifiedArchiveCipher::open(self, context, envelope)
+    }
+}
+
+impl<T: ?Sized + ExtentCipher> ExtentCipher for Arc<T> {
+    fn archive_id(&self) -> ArchiveId {
+        (**self).archive_id()
+    }
+    fn key_epoch(&self) -> KeyEpoch {
+        (**self).key_epoch()
+    }
+    fn seal(&self, context: &ObjectContext, plaintext: &[u8]) -> ArchiveResult<CiphertextEnvelope> {
+        (**self).seal(context, plaintext)
+    }
+    fn open(
+        &self,
+        context: &ObjectContext,
+        envelope: &CiphertextEnvelope,
+    ) -> ArchiveResult<Vec<u8>> {
+        (**self).open(context, envelope)
     }
 }
 
@@ -484,10 +505,134 @@ impl std::fmt::Debug for UploadedExtentTree {
     }
 }
 
+/// Non-authoritative candidate extent root facts durably recorded in the Phase 3 shadow ledger.
+/// Phase 3 shadow candidates do not advance or claim witness authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShadowExtentRootCandidate {
+    archive_id: ArchiveId,
+    database_epoch: DatabaseEpoch,
+    key_epoch: KeyEpoch,
+    root: ImmutableReference,
+    logical_file_length: u64,
+    extent_slots: u64,
+    tree_height: u8,
+}
+
+impl ShadowExtentRootCandidate {
+    pub fn from_uploaded_tree(
+        archive_id: ArchiveId,
+        database_epoch: DatabaseEpoch,
+        key_epoch: KeyEpoch,
+        tree: &UploadedExtentTree,
+    ) -> Self {
+        Self {
+            archive_id,
+            database_epoch,
+            key_epoch,
+            root: tree.root().clone(),
+            logical_file_length: tree.logical_file_length(),
+            extent_slots: tree.extent_slots(),
+            tree_height: tree.tree_height(),
+        }
+    }
+
+    pub fn root(&self) -> &ImmutableReference {
+        &self.root
+    }
+
+    pub const fn logical_file_length(&self) -> u64 {
+        self.logical_file_length
+    }
+
+    pub const fn extent_slots(&self) -> u64 {
+        self.extent_slots
+    }
+
+    pub const fn tree_height(&self) -> u8 {
+        self.tree_height
+    }
+
+    pub const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub const fn database_epoch(&self) -> DatabaseEpoch {
+        self.database_epoch
+    }
+
+    pub const fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16 + 16 + 16 + 16 + 32 + 8 + 8 + 1);
+        buf.extend_from_slice(self.archive_id.as_bytes());
+        buf.extend_from_slice(self.database_epoch.as_bytes());
+        buf.extend_from_slice(self.key_epoch.as_bytes());
+        buf.extend_from_slice(self.root.object_id.as_bytes());
+        buf.extend_from_slice(&self.root.envelope_hash);
+        buf.extend_from_slice(&self.logical_file_length.to_be_bytes());
+        buf.extend_from_slice(&self.extent_slots.to_be_bytes());
+        buf.push(self.tree_height);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 16 + 16 + 16 + 16 + 32 + 8 + 8 + 1 {
+            return Err(ArchiveV3Error::Malformed("corrupt candidate root").into());
+        }
+        let archive_id = ArchiveId::from_bytes(bytes[0..16].try_into().unwrap());
+        let database_epoch = DatabaseEpoch::from_bytes(bytes[16..32].try_into().unwrap());
+        let key_epoch = KeyEpoch::from_bytes(bytes[32..48].try_into().unwrap());
+        let object_id = ObjectId::from_bytes(bytes[48..64].try_into().unwrap());
+        let envelope_hash: [u8; 32] = bytes[64..96].try_into().unwrap();
+        let logical_file_length = u64::from_be_bytes(bytes[96..104].try_into().unwrap());
+        let extent_slots = u64::from_be_bytes(bytes[104..112].try_into().unwrap());
+        let tree_height = bytes[112];
+        Ok(Self {
+            archive_id,
+            database_epoch,
+            key_epoch,
+            root: ImmutableReference {
+                object_id,
+                envelope_hash,
+            },
+            logical_file_length,
+            extent_slots,
+            tree_height,
+        })
+    }
+}
+
+/// Sealed witness publication result (Phase 4 witness-CAS outcome).
+/// Cannot be constructed in Phase 3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedExtentArchiveRoot {
+    _private: (),
+}
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for super::ShadowExtentRootCandidate {}
+    impl Sealed for super::AuthenticatedExtentRoot {}
+}
+
+/// Sealed descriptor interface for both recovery-authenticated and shadow candidate roots.
+/// Cannot be implemented by external types.
+pub trait ExtentTreeDescriptor: private::Sealed + Send + Sync {
+    fn archive_id(&self) -> ArchiveId;
+    fn database_epoch(&self) -> DatabaseEpoch;
+    fn key_epoch(&self) -> KeyEpoch;
+    fn root(&self) -> &ImmutableReference;
+    fn logical_file_length(&self) -> u64;
+    fn extent_slots(&self) -> u64;
+    fn tree_height(&self) -> u8;
+}
+
 /// Exact root facts minted only from an independently witness-selected and
 /// readback-authenticated root object. No generic production constructor
 /// exists.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticatedExtentRoot {
     archive_id: ArchiveId,
     database_epoch: DatabaseEpoch,
@@ -497,11 +642,63 @@ pub struct AuthenticatedExtentRoot {
     extent_slots: u64,
     tree_height: u8,
 }
+
+impl ExtentTreeDescriptor for AuthenticatedExtentRoot {
+    fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+    fn database_epoch(&self) -> DatabaseEpoch {
+        self.database_epoch
+    }
+    fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+    fn root(&self) -> &ImmutableReference {
+        &self.root
+    }
+    fn logical_file_length(&self) -> u64 {
+        self.logical_file_length
+    }
+    fn extent_slots(&self) -> u64 {
+        self.extent_slots
+    }
+    fn tree_height(&self) -> u8 {
+        self.tree_height
+    }
+}
+
+impl ExtentTreeDescriptor for ShadowExtentRootCandidate {
+    fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+    fn database_epoch(&self) -> DatabaseEpoch {
+        self.database_epoch
+    }
+    fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
+    }
+    fn root(&self) -> &ImmutableReference {
+        &self.root
+    }
+    fn logical_file_length(&self) -> u64 {
+        self.logical_file_length
+    }
+    fn extent_slots(&self) -> u64 {
+        self.extent_slots
+    }
+    fn tree_height(&self) -> u8 {
+        self.tree_height
+    }
+}
+
 impl AuthenticatedExtentRoot {
     /// Test-only fixture constructor. Production code cannot turn a raw root
     /// into recovery authority.
     #[cfg(test)]
-    fn from_test_verified_archive_root(archive_id: ArchiveId, root: &ArchiveRoot) -> Result<Self> {
+    pub(crate) fn from_test_verified_archive_root(
+        archive_id: ArchiveId,
+        root: &ArchiveRoot,
+    ) -> Result<Self> {
         root.validate()?;
         let extent_slots = extent_slots(root.logical_file_length)?;
         Ok(Self {
@@ -518,11 +715,45 @@ impl AuthenticatedExtentRoot {
             tree_height: extent_tree_height(extent_slots)?,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_mint_for_test(
+        archive_id: ArchiveId,
+        database_epoch: DatabaseEpoch,
+        key_epoch: KeyEpoch,
+        tree: &UploadedExtentTree,
+    ) -> Self {
+        Self {
+            archive_id,
+            database_epoch,
+            key_epoch,
+            root: tree.root().clone(),
+            logical_file_length: tree.logical_file_length(),
+            extent_slots: tree.extent_slots(),
+            tree_height: tree.tree_height(),
+        }
+    }
+
     pub fn root(&self) -> &ImmutableReference {
         &self.root
     }
     pub const fn logical_file_length(&self) -> u64 {
         self.logical_file_length
+    }
+    pub const fn extent_slots(&self) -> u64 {
+        self.extent_slots
+    }
+    pub const fn tree_height(&self) -> u8 {
+        self.tree_height
+    }
+    pub const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+    pub const fn database_epoch(&self) -> DatabaseEpoch {
+        self.database_epoch
+    }
+    pub const fn key_epoch(&self) -> KeyEpoch {
+        self.key_epoch
     }
 }
 
@@ -780,18 +1011,22 @@ pub(crate) async fn upload_extent_tree<C: ExtentCipher, S: ExtentObjectStaging>(
 /// caller-bounded scratch buffer and copied to `destination` only after every
 /// selected object has authenticated, so failure or cancellation cannot expose
 /// a trusted-looking partial reconstruction.
-pub async fn reconstruct_extent_range<C: ExtentCipher>(
+pub async fn reconstruct_extent_range<C: ExtentCipher + ?Sized, D: ExtentTreeDescriptor>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
-    root: &AuthenticatedExtentRoot,
+    root: &D,
     logical_offset: u64,
     destination: &mut [u8],
 ) -> Result<()> {
-    if cipher.archive_id() != root.archive_id || cipher.key_epoch() != root.key_epoch {
+    if cipher.archive_id() != root.archive_id() || cipher.key_epoch() != root.key_epoch() {
         return Err(ArchiveV3Error::InvalidContext.into());
     }
-    validate_database_length(root.logical_file_length)?;
-    validate_range(root.logical_file_length, logical_offset, destination.len())?;
+    validate_database_length(root.logical_file_length())?;
+    validate_range(
+        root.logical_file_length(),
+        logical_offset,
+        destination.len(),
+    )?;
     if destination.is_empty() {
         return Ok(());
     }
@@ -802,10 +1037,10 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
     let first = logical_offset / u64::from(EXTENT_BYTES);
     let last = end.saturating_sub(1) / u64::from(EXTENT_BYTES);
     let mut stack = vec![NodeTask {
-        level: root.tree_height,
+        level: root.tree_height(),
         range_start: 0,
-        range_end: root.extent_slots,
-        reference: root.root.clone(),
+        range_end: root.extent_slots(),
+        reference: root.root().clone(),
     }];
     let mut budget = RecoveryGetBudget::default();
     while let Some(task) = stack.pop() {
@@ -814,9 +1049,9 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
         }
         budget.consume()?;
         let context = node_context(
-            root.archive_id,
-            root.database_epoch,
-            root.key_epoch,
+            root.archive_id(),
+            root.database_epoch(),
+            root.key_epoch(),
             task.level,
             task.range_start,
             task.range_end,
@@ -830,8 +1065,8 @@ pub async fn reconstruct_extent_range<C: ExtentCipher>(
                     if entry.extent_no >= first && entry.extent_no <= last {
                         validate_recovery_extent_reference(
                             &entry,
-                            root.extent_slots,
-                            root.logical_file_length,
+                            root.extent_slots(),
+                            root.logical_file_length(),
                         )?;
                         copy_intersection(
                             backend,
@@ -1217,7 +1452,7 @@ async fn load_exact(
     }
     Ok(envelope)
 }
-async fn load_node<C: ExtentCipher>(
+async fn load_node<C: ExtentCipher + ?Sized>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
     context: &ObjectContext,
@@ -1270,10 +1505,10 @@ fn validate_node_shape(node: &MerkleNode, level: u8, start: u64, end: u64) -> Re
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
-async fn copy_intersection<C: ExtentCipher>(
+async fn copy_intersection<C: ExtentCipher + ?Sized, D: ExtentTreeDescriptor>(
     backend: &dyn ImmutableObjectBackend,
     cipher: &C,
-    root: &AuthenticatedExtentRoot,
+    root: &D,
     entry: &ExtentReference,
     requested_start: u64,
     requested_end: u64,
@@ -1287,13 +1522,13 @@ async fn copy_intersection<C: ExtentCipher>(
     let extent_end = extent_start
         .checked_add(u64::from(entry.logical_byte_len))
         .ok_or(ArchiveV3Error::Malformed("extent offset"))?;
-    if extent_end > root.logical_file_length {
+    if extent_end > root.logical_file_length() {
         return Err(ArchiveV3Error::Authentication.into());
     }
     let context = extent_context(
-        root.archive_id,
-        root.database_epoch,
-        root.key_epoch,
+        root.archive_id(),
+        root.database_epoch(),
+        root.key_epoch(),
         entry.extent_no,
         entry.logical_byte_len,
         entry.reference.object_id,
@@ -1320,8 +1555,94 @@ async fn copy_intersection<C: ExtentCipher>(
     Ok(())
 }
 
+/// Durable extent staging adapter recording exact object reservations and
+/// materializations in the authenticated extent attempt ledger. Every recorded fact is
+/// real: rows bind the durable attempt row's `attempt_id` to the sealed context's
+/// canonical AAD and the exact ciphertext hash. Reservation is durable before the
+/// provider create; materialization is recorded only after exact readback and caller
+/// verification.
+#[derive(Clone)]
+pub(crate) struct DurableExtentStaging {
+    ledger: Arc<dyn crate::archive_v3_extent_commit::ExtentAttemptLedger>,
+    attempt_id: [u8; 16],
+    next_ordinal: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DurableExtentStaging {
+    pub(crate) fn new(
+        ledger: Arc<dyn crate::archive_v3_extent_commit::ExtentAttemptLedger>,
+        attempt_id: [u8; 16],
+    ) -> Self {
+        Self {
+            ledger,
+            attempt_id,
+            next_ordinal: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl extent_staging_sealed::Sealed for DurableExtentStaging {}
+
+#[async_trait::async_trait]
+impl ExtentObjectStaging for DurableExtentStaging {
+    async fn create_and_readback_verified<F>(
+        &self,
+        backend: &dyn ImmutableObjectBackend,
+        context: &ObjectContext,
+        envelope: CiphertextEnvelope,
+        verify: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&CiphertextEnvelope) -> ArchiveResult<()> + Send,
+    {
+        let ordinal = self
+            .next_ordinal
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |ordinal| {
+                    (ordinal < crate::archive_v3_extent_commit::MAX_STAGED_OBJECTS_PER_ATTEMPT)
+                        .then_some(ordinal + 1)
+                },
+            )
+            .map_err(|_| ExtentTreeError::AttemptLedger)?;
+        let ordinal = u32::try_from(ordinal).map_err(|_| ExtentTreeError::AttemptLedger)?;
+
+        let record =
+            crate::archive_v3_extent_commit::ExtentStagedObjectRecord::from_sealed_context(
+                self.attempt_id,
+                ordinal,
+                context,
+                &envelope,
+            )
+            .map_err(|_| ExtentTreeError::AttemptLedger)?;
+
+        self.ledger
+            .reserve_staged_object(&record)
+            .map_err(|_| ExtentTreeError::AttemptLedger)?;
+
+        backend
+            .create_if_absent(context.object_key(), envelope.clone())
+            .await?;
+        let readback = backend
+            .get(&context.object_key())
+            .await?
+            .ok_or(ExtentTreeError::MissingObject)?;
+        if readback != envelope {
+            return Err(ArchiveV3Error::Authentication.into());
+        }
+        verify(&readback)?;
+
+        self.ledger
+            .mark_staged_object_materialized(&record)
+            .map_err(|_| ExtentTreeError::AttemptLedger)?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::archive_v3::{
         resolve_archive_cipher, ArchiveCipher, ArchiveDek, CreateIfAbsent,
@@ -1347,7 +1668,21 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
-    struct TestCipher {
+    pub(crate) fn make_test_uploaded_tree() -> UploadedExtentTree {
+        UploadedExtentTree {
+            root: ImmutableReference {
+                object_id: ObjectId::random(),
+                envelope_hash: [0xaa; 32],
+            },
+            logical_file_length: 4096,
+            extent_slots: 1,
+            tree_height: 0,
+            extent_count: 1,
+            sparse_content_commitment: [0xbb; 32],
+        }
+    }
+
+    pub(crate) struct TestCipher {
         archive: ArchiveId,
         epoch: KeyEpoch,
         cipher: ArchiveCipher,
@@ -1361,7 +1696,7 @@ mod tests {
         WrongContext,
     }
     impl TestCipher {
-        fn new(archive: ArchiveId, epoch: KeyEpoch) -> Self {
+        pub(crate) fn new(archive: ArchiveId, epoch: KeyEpoch) -> Self {
             Self {
                 archive,
                 epoch,
@@ -1593,8 +1928,8 @@ mod tests {
     /// Deliberately has no shadow-session or WAL binding. This exercises the
     /// generic extent staging contract a legacy conversion attempt will use,
     /// while retaining the same ordered publication invariants.
-    #[derive(Clone)]
-    struct NonWalTestStaging {
+    #[derive(Clone, Default)]
+    pub(crate) struct NonWalTestStaging {
         events: Arc<Mutex<Vec<&'static str>>>,
         next_ordinal: Arc<AtomicUsize>,
         materialized: Arc<AtomicUsize>,
@@ -1603,7 +1938,7 @@ mod tests {
     }
 
     impl NonWalTestStaging {
-        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        pub(crate) fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
             Self {
                 events,
                 next_ordinal: Arc::new(AtomicUsize::new(0)),
@@ -1611,6 +1946,10 @@ mod tests {
                 records: Arc::new(Mutex::new(Vec::new())),
                 fail_materialize: Arc::new(AtomicBool::new(false)),
             }
+        }
+
+        pub(crate) fn in_memory() -> Self {
+            Self::new(Arc::new(Mutex::new(Vec::new())))
         }
 
         fn record_counts(&self) -> (usize, usize) {
@@ -3776,5 +4115,162 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    struct Sparse32GiBExtentSource {
+        logical_length: u64,
+        extents_to_yield: Vec<u64>,
+        index: usize,
+    }
+
+    impl Sparse32GiBExtentSource {
+        fn new() -> Self {
+            let slots = 32_768u64; // 32 GiB
+            let logical_length = slots * u64::from(EXTENT_BYTES);
+            Self {
+                logical_length,
+                // Sparse extents across tree: slot 0, slot 16384 (middle), slot 32767 (final)
+                extents_to_yield: vec![0, 16_384, 32_767],
+                index: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExtentSource for Sparse32GiBExtentSource {
+        fn logical_file_length(&self) -> Result<u64> {
+            Ok(self.logical_length)
+        }
+
+        async fn next_extent(&mut self, destination: &mut [u8]) -> Result<Option<SourceExtent>> {
+            if self.index >= self.extents_to_yield.len() {
+                return Ok(None);
+            }
+            let extent_no = self.extents_to_yield[self.index];
+            self.index += 1;
+            destination.fill(0);
+            destination[0..8].copy_from_slice(&extent_no.to_be_bytes());
+            destination[8..16].copy_from_slice(b"SPARSE32");
+
+            Ok(Some(SourceExtent {
+                extent_no,
+                logical_byte_len: EXTENT_BYTES,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_large_archive_multi_gigabyte_sparse_merkle_tree() {
+        let backend = InMemoryImmutableBackend::default();
+        let archive_id = ArchiveId::random();
+        let database_epoch = DatabaseEpoch::random();
+        let key_epoch = KeyEpoch::random();
+        let cipher = TestCipher::new(archive_id, key_epoch);
+        let staging = NonWalTestStaging::in_memory();
+
+        let mut source = Sparse32GiBExtentSource::new();
+
+        let uploaded_tree = upload_extent_tree(
+            &backend,
+            &cipher,
+            archive_id,
+            database_epoch,
+            &mut source,
+            staging,
+        )
+        .await
+        .expect("uploads sparse 32 GiB extent tree");
+
+        assert_eq!(uploaded_tree.extent_count(), 3);
+        assert_eq!(uploaded_tree.extent_slots(), 32_768);
+        assert_eq!(
+            uploaded_tree.logical_file_length(),
+            32_768 * u64::from(EXTENT_BYTES)
+        );
+
+        let candidate_root = ShadowExtentRootCandidate::from_uploaded_tree(
+            archive_id,
+            database_epoch,
+            key_epoch,
+            &uploaded_tree,
+        );
+
+        // 1. Reconstruct non-empty sparse extents (slot 0, slot 16384, slot 32767)
+        for target_extent in [0u64, 16_384, 32_767] {
+            let mut buf = vec![0u8; 64];
+            reconstruct_extent_range(
+                &backend,
+                &cipher,
+                &candidate_root,
+                target_extent * u64::from(EXTENT_BYTES),
+                &mut buf,
+            )
+            .await
+            .expect("reconstructs sparse extent pattern");
+
+            assert_eq!(&buf[0..8], &target_extent.to_be_bytes());
+            assert_eq!(&buf[8..16], b"SPARSE32");
+        }
+
+        // 2. Reconstruct sparse hole (unpopulated extent 100) -> returns zeros
+        let mut hole_buf = vec![0xffu8; 64];
+        reconstruct_extent_range(
+            &backend,
+            &cipher,
+            &candidate_root,
+            100 * u64::from(EXTENT_BYTES),
+            &mut hole_buf,
+        )
+        .await
+        .expect("reconstructs hole");
+        assert_eq!(&hole_buf[..], &[0u8; 64]);
+    }
+
+    #[tokio::test]
+    async fn test_durable_extent_staging_reserves_before_upload_and_materializes_exactly() {
+        let backend = InMemoryImmutableBackend::default();
+        let archive_id = ArchiveId::random();
+        let database_epoch = DatabaseEpoch::random();
+        let key_epoch = KeyEpoch::random();
+        let cipher = TestCipher::new(archive_id, key_epoch);
+
+        let conn = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        let ledger: Arc<dyn crate::archive_v3_extent_commit::ExtentAttemptLedger> = Arc::new(
+            crate::archive_v3_extent_commit::SqliteExtentAttemptLedger::new(conn).unwrap(),
+        );
+        let attempt_id = [0x42; 16];
+        let staging = DurableExtentStaging::new(Arc::clone(&ledger), attempt_id);
+
+        let mut source = VecSource {
+            length: EXTENT_BYTES as u64,
+            entries: vec![(0, vec![0x42; EXTENT_BYTES as usize])],
+            next: 0,
+        };
+        let uploaded = upload_extent_tree(
+            &backend,
+            &cipher,
+            archive_id,
+            database_epoch,
+            &mut source,
+            staging,
+        )
+        .await
+        .expect("uploads extent tree with durable ledger staging");
+
+        assert_eq!(uploaded.extent_count(), 1);
+
+        // Every staged object was durably reserved with its real sealed-context facts
+        // and marked materialized only after exact readback.
+        let rows = ledger.load_staged_objects(attempt_id).unwrap();
+        assert!(!rows.is_empty());
+        for (idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.ordinal() as usize, idx);
+            assert_eq!(row.attempt_id(), attempt_id);
+            assert!(row.materialized(), "ordinal {idx} must be materialized");
+        }
+        // The uploaded root object is among the recorded rows by exact object id.
+        assert!(rows
+            .iter()
+            .any(|row| row.object_id() == *uploaded.root().object_id.as_bytes()));
     }
 }
