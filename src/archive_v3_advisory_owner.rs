@@ -32,6 +32,7 @@ mod canary;
 mod canary_trust;
 mod comparison;
 mod controller;
+mod live_window_observer;
 mod telemetry;
 mod window;
 pub(crate) use abort::{
