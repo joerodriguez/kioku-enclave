@@ -1943,6 +1943,10 @@ impl SingleArchiveWalStoreOwner {
             .map_err(|_| WalOwnerError::Corrupt)?;
         let setup = Connection::open(&path).map_err(|_| WalOwnerError::Corrupt)?;
         setup
+            .execute_batch(SCHEMA_SQL)
+            .map_err(|_| WalOwnerError::Corrupt)?;
+        run_migrations(&setup).map_err(|_| WalOwnerError::Corrupt)?;
+        setup
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS wal_owner_test_values(value BLOB NOT NULL);
                  CREATE TABLE IF NOT EXISTS wal_owner_test_operations(
@@ -7382,6 +7386,7 @@ CREATE TABLE IF NOT EXISTS utterances (
     confidence              REAL,
     speaker_label           TEXT NOT NULL,
     source_key              TEXT,
+    speaker_observation_id  INTEGER,
     created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -7543,7 +7548,11 @@ CREATE TABLE IF NOT EXISTS episodes (
     finalization_error TEXT,
     finalization_attempted_at TEXT,
     finalization_attempt_count INTEGER NOT NULL DEFAULT 0,
-    finalization_next_attempt_at TEXT
+    finalization_next_attempt_at TEXT,
+    identity_revision INTEGER NOT NULL DEFAULT 0,
+    finalized_identity_revision INTEGER NOT NULL DEFAULT 0,
+    identity_refresh_status TEXT DEFAULT NULL CHECK (identity_refresh_status IN ('queued', 'processing', 'ready', 'failed')),
+    speaker_processing_status TEXT NOT NULL DEFAULT 'ready' CHECK (speaker_processing_status IN ('ready', 'pending', 'degraded'))
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_started_at ON episodes(started_at);
 
@@ -8270,6 +8279,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         "ALTER TABLE episodes ADD COLUMN finalization_attempted_at TEXT;",
         "ALTER TABLE episodes ADD COLUMN finalization_attempt_count INTEGER NOT NULL DEFAULT 0;",
         "ALTER TABLE episodes ADD COLUMN finalization_next_attempt_at TEXT;",
+        "ALTER TABLE episodes ADD COLUMN identity_revision INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE episodes ADD COLUMN finalized_identity_revision INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE episodes ADD COLUMN identity_refresh_status TEXT DEFAULT NULL CHECK (identity_refresh_status IN ('queued', 'processing', 'ready', 'failed'));",
+        "ALTER TABLE episodes ADD COLUMN speaker_processing_status TEXT NOT NULL DEFAULT 'ready' CHECK (speaker_processing_status IN ('ready', 'pending', 'degraded'));",
+        "ALTER TABLE utterances ADD COLUMN speaker_observation_id INTEGER;",
     ] {
         if let Err(e) = conn.execute_batch(col_def) {
             let msg = e.to_string();
@@ -8281,31 +8295,56 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // Historical briefs remain readable but are never automatically sent back
     // to a paid model merely because the analysis schema changed. A scoped
     // user/operator action can still request regeneration explicitly.
-    conn.execute(
-        "UPDATE episodes
-         SET finalization_status = 'complete',
-             finalization_error = NULL,
-             finalization_attempt_count = 0,
-             finalization_next_attempt_at = NULL
-         WHERE finalized_at IS NOT NULL
-           AND (finalization_status IS NOT 'complete'
-                OR finalization_error IS NOT NULL
-                OR finalization_attempt_count <> 0
-                OR finalization_next_attempt_at IS NOT NULL)",
-        [],
-    )?;
+    let needs_complete_backfill: bool = conn
+        .query_row(
+            "SELECT 1 FROM episodes WHERE finalized_at IS NOT NULL \
+             AND (finalization_status IS NOT 'complete' \
+                  OR finalization_error IS NOT NULL \
+                  OR finalization_attempt_count <> 0 \
+                  OR finalization_next_attempt_at IS NOT NULL) LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if needs_complete_backfill {
+        conn.execute(
+            "UPDATE episodes
+             SET finalization_status = 'complete',
+                 finalization_error = NULL,
+                 finalization_attempt_count = 0,
+                 finalization_next_attempt_at = NULL
+             WHERE finalized_at IS NOT NULL
+               AND (finalization_status IS NOT 'complete'
+                    OR finalization_error IS NOT NULL
+                    OR finalization_attempt_count <> 0
+                    OR finalization_next_attempt_at IS NOT NULL)",
+            [],
+        )?;
+    }
     // Quarantine the pre-guard retry loop. Its attempt count was not persisted,
     // so treating it as fresh would immediately repeat the production incident.
-    conn.execute(
-        "UPDATE episodes
-         SET finalization_status = 'failed_terminal',
-             finalization_error = 'legacy unbounded retry quarantined; retry explicitly',
-             finalization_attempt_count = 3,
-             finalization_next_attempt_at = NULL
-         WHERE finalized_at IS NULL
-           AND finalization_status IN ('retry_model', 'processing')",
-        [],
-    )?;
+    let needs_quarantine: bool = conn
+        .query_row(
+            "SELECT 1 FROM episodes WHERE finalized_at IS NULL \
+             AND finalization_status IN ('retry_model', 'processing') LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if needs_quarantine {
+        conn.execute(
+            "UPDATE episodes
+             SET finalization_status = 'failed_terminal',
+                 finalization_error = 'legacy unbounded retry quarantined; retry explicitly',
+                 finalization_attempt_count = 3,
+                 finalization_next_attempt_at = NULL
+             WHERE finalized_at IS NULL
+               AND finalization_status IN ('retry_model', 'processing')",
+            [],
+        )?;
+    }
 
     // ADR-0011/0012: canonical briefs, generic webhook outbox, and watermarks.
     // The Gmail-specific table is deliberately dropped so old message ids and
@@ -14342,6 +14381,7 @@ pub(crate) mod tests {
         });
         blocked.wait_until_blocked().await;
         newcomer.abort();
+        blocked.release();
         assert!(newcomer
             .await
             .expect_err("eviction task was not cancelled")

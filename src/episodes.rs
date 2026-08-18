@@ -406,6 +406,9 @@ pub(crate) fn upsert_episodes(
             }
         }
 
+        crate::cp::identity::reconcile_episode_speaker_slots(conn, episode_id)?;
+        crate::cp::voice_memory::recalculate_all_episode_speaker_processing_status(conn)?;
+
         ids.push(episode_id);
     }
     Ok(ids)
@@ -573,8 +576,10 @@ pub(crate) fn purge_episode(
         return Ok(None);
     }
 
+    let tx = conn.unchecked_transaction()?;
+
     let collect = |sql: &str| -> Result<Vec<(i64, Option<String>)>> {
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = tx.prepare(sql)?;
         let rows = stmt
             .query_map([episode_id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -607,7 +612,7 @@ pub(crate) fn purge_episode(
         let ids = id_list(&utts);
         // Segments touched by these utterances, checked for emptiness after.
         let seg_ids: Vec<i64> = {
-            let mut stmt = conn.prepare(&format!(
+            let mut stmt = tx.prepare(&format!(
                 "SELECT DISTINCT audio_segment_id FROM utterances WHERE id IN ({ids})"
             ))?;
             let rows = stmt
@@ -615,7 +620,101 @@ pub(crate) fn purge_episode(
                 .collect::<std::result::Result<Vec<i64>, _>>()?;
             rows
         };
-        conn.execute_batch(&format!(
+
+        // Find all speaker_observation_ids linked to these utterances
+        let obs_ids: Vec<i64> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT DISTINCT speaker_observation_id FROM utterances \
+                 WHERE id IN ({ids}) AND speaker_observation_id IS NOT NULL"
+            ))?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<i64>, _>>()?;
+            rows
+        };
+
+        if !obs_ids.is_empty() {
+            let obs_id_str = obs_ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            // Find affected voice profiles
+            let affected_profiles: Vec<i64> = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT DISTINCT a.profile_id FROM voice_sample_profile_assignments a \
+                     JOIN voice_samples s ON s.id = a.sample_id \
+                     WHERE s.speaker_observation_id IN ({obs_id_str})"
+                ))?;
+                let rows = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                rows
+            };
+
+            // Query other episodes sharing affected profiles BEFORE deleting observation derivations
+            let other_affected_episodes: Vec<i64> = if !affected_profiles.is_empty() {
+                let prof_str = affected_profiles
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT DISTINCT m.episode_id FROM episode_members m \
+                     JOIN utterances u ON u.id = m.record_id \
+                     JOIN speaker_observations o ON o.id = u.speaker_observation_id \
+                     JOIN voice_samples s ON s.speaker_observation_id = o.id \
+                     JOIN voice_sample_profile_assignments a ON a.sample_id = s.id \
+                     WHERE a.profile_id IN ({prof_str}) AND m.episode_id <> ?1"
+                ))?;
+                let rows = stmt
+                    .query_map([episode_id], |r| r.get(0))?
+                    .filter_map(|x| x.ok())
+                    .collect();
+                rows
+            } else {
+                Vec::new()
+            };
+
+            // Delete observation derivations, evidence, claims, jobs, samples, and assignments
+            tx.execute_batch(&format!(
+                "DELETE FROM voice_sample_profile_assignments WHERE sample_id IN ( \
+                     SELECT id FROM voice_samples WHERE speaker_observation_id IN ({obs_id_str}) \
+                 ); \
+                 DELETE FROM voice_samples WHERE speaker_observation_id IN ({obs_id_str}); \
+                 DELETE FROM voice_embedding_jobs WHERE speaker_observation_id IN ({obs_id_str}); \
+                 DELETE FROM speaker_observation_sources WHERE speaker_observation_id IN ({obs_id_str}); \
+                 DELETE FROM identity_evidence WHERE speaker_observation_id IN ({obs_id_str}); \
+                 DELETE FROM person_name_claims WHERE speaker_observation_id IN ({obs_id_str}); \
+                 DELETE FROM person_facts WHERE speaker_observation_id IN ({obs_id_str}); \
+                 DELETE FROM speaker_observations WHERE id IN ({obs_id_str});"
+            ))?;
+
+            // Synchronously recompute representatives for each affected profile
+            for pid in &affected_profiles {
+                crate::cp::voice_memory::sync_recompute_profile_representatives(&tx, *pid)?;
+            }
+
+            // Invalidate other episodes sharing affected profiles
+            if !other_affected_episodes.is_empty() {
+                let ep_str = other_affected_episodes
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                tx.execute(
+                    &format!(
+                        "UPDATE episodes SET identity_revision = identity_revision + 1, identity_refresh_status = 'queued', \
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                         WHERE id IN ({ep_str})"
+                    ),
+                    [],
+                )?;
+            }
+        }
+
+        tx.execute_batch(&format!(
             "DELETE FROM vec_utterances WHERE utterance_id IN ({ids});
              DELETE FROM episode_members WHERE record_type='utterance' AND record_id IN ({ids});
              DELETE FROM utterances WHERE id IN ({ids});"
@@ -627,43 +726,69 @@ pub(crate) fn purge_episode(
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            conn.execute(
+            tx.execute(
                 &format!(
                     "DELETE FROM audio_segments WHERE id IN ({segs}) \
                      AND NOT EXISTS (SELECT 1 FROM utterances u WHERE u.audio_segment_id = audio_segments.id)"
                 ),
                 [],
             )?;
-            purge.deleted_segments = conn.changes() as usize;
+            purge.deleted_segments = tx.changes() as usize;
         }
     }
 
     if !scrs.is_empty() {
         let ids = id_list(&scrs);
-        let image_table_exists: i64 = conn.query_row(
+        let image_table_exists: i64 = tx.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='screenshot_images'",
             [],
             |row| row.get(0),
         )?;
         if image_table_exists != 0 {
-            conn.execute(
+            tx.execute(
                 &format!("DELETE FROM screenshot_images WHERE screenshot_id IN ({ids})"),
                 [],
             )?;
         }
-        conn.execute_batch(&format!(
-            "DELETE FROM vec_screenshots WHERE screenshot_id IN ({ids});
+        tx.execute_batch(&format!(
+            "DELETE FROM identity_evidence WHERE source_event_id IN (
+                 SELECT e.event_id FROM capture_events e
+                 JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence)
+                 WHERE s.id IN ({ids})
+             );
+             DELETE FROM person_facts WHERE source_event_id IN (
+                 SELECT e.event_id FROM capture_events e
+                 JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence)
+                 WHERE s.id IN ({ids})
+             );
+             DELETE FROM person_name_claims WHERE source_event_id IN (
+                 SELECT e.event_id FROM capture_events e
+                 JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence)
+                 WHERE s.id IN ({ids})
+             );
+             DELETE FROM vec_screenshots WHERE screenshot_id IN ({ids});
              DELETE FROM episode_members WHERE record_type='screenshot' AND record_id IN ({ids});
              DELETE FROM screenshots WHERE id IN ({ids});"
         ))?;
         purge.deleted_screenshots = scrs.len();
     }
 
-    conn.execute("DELETE FROM episodes WHERE id = ?1", [episode_id])?;
-    conn.execute(
+    tx.execute(
+        "UPDATE episode_speaker_slots SET status = 'superseded', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE episode_id = ?1",
+        [episode_id],
+    )?;
+    tx.execute(
+        "DELETE FROM episode_participants WHERE episode_id = ?1",
+        [episode_id],
+    )?;
+    tx.execute("DELETE FROM episodes WHERE id = ?1", [episode_id])?;
+    tx.execute(
         "DELETE FROM vec_episodes WHERE episode_id = ?1",
         [episode_id],
     )?;
+
+    tx.commit()?;
 
     Ok(Some(purge))
 }

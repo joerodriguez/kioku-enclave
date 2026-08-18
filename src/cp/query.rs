@@ -287,7 +287,22 @@ async fn query_episodes_value(
                         e.minute_summaries, e.substance, e.visual_evidence, \
                         e.finalized_at, e.finalization_version, \
                         e.finalization_status, e.finalization_attempted_at, \
-                        fb.overview, fb.decisions, fb.action_items, fb.important_links, fb.open_questions \
+                        fb.overview, fb.decisions, fb.action_items, fb.important_links, fb.open_questions, \
+                        CASE \
+                            WHEN EXISTS ( \
+                                SELECT 1 FROM episode_members m \
+                                JOIN utterances u ON u.id = m.record_id AND m.record_type = 'utterance' \
+                                JOIN voice_embedding_jobs j ON j.speaker_observation_id = u.speaker_observation_id \
+                                WHERE m.episode_id = e.id AND j.state IN ('pending', 'processing', 'retry_wait') \
+                            ) THEN 'pending' \
+                            WHEN EXISTS ( \
+                                SELECT 1 FROM episode_members m \
+                                JOIN utterances u ON u.id = m.record_id AND m.record_type = 'utterance' \
+                                JOIN voice_embedding_jobs j ON j.speaker_observation_id = u.speaker_observation_id \
+                                WHERE m.episode_id = e.id AND j.state = 'failed' \
+                            ) THEN 'degraded' \
+                            ELSE 'ready' \
+                        END \
                  FROM episodes e \
                  LEFT JOIN episode_final_briefs fb ON fb.episode_id = e.id \
                  WHERE \
@@ -321,6 +336,8 @@ async fn query_episodes_value(
                         None
                     };
 
+                    let speaker_processing_status: String = r.get(23)?;
+
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?,
                         "started_at": r.get::<_, String>(1)?,
@@ -350,6 +367,7 @@ async fn query_episodes_value(
                             "retry_wait" | "budget_wait" | "failed_terminal"
                         ),
                         "final_brief": final_brief,
+                        "speaker_processing_status": speaker_processing_status,
                     }))
                     },
                 )?
@@ -1130,7 +1148,7 @@ async fn rest_episode_members(
             // member to screenshot_images. Cloud Capture v2 source keys bind
             // canonical screenshots to their retained encrypted media object.
             let mut us = conn.prepare(
-                "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text, u.source_key \
+                "SELECT u.id, s.started_at, u.speaker_label, u.language, u.text, u.source_key, u.speaker_observation_id \
                  FROM episode_members m \
                  JOIN utterances u ON u.id = m.record_id \
                  JOIN audio_segments s ON s.id = u.audio_segment_id \
@@ -1139,13 +1157,26 @@ async fn rest_episode_members(
             let mut members: Vec<(String, Value)> = us
                 .query_map([id], |r| {
                     let ts: String = r.get(1)?;
+                    let obs_id: Option<i64> = r.get(6)?;
+                    let raw_label: String = r.get(2)?;
+                    let (resolved_label, attribution_kind) = if let Some(oid) = obs_id {
+                        if let Ok(attr) = crate::cp::identity::resolve_speaker_attribution(conn, oid, Some(id)) {
+                            (attr.display_label, Some(serde_json::to_value(attr.attribution_kind).unwrap_or(Value::Null)))
+                        } else {
+                            (raw_label, None)
+                        }
+                    } else {
+                        (raw_label, None)
+                    };
+
                     Ok((
                         ts.clone(),
                         json!({
                             "record_type": "utterance",
                             "record_id": r.get::<_, i64>(0)?,
                             "started_at": ts,
-                            "speaker_label": r.get::<_, String>(2)?,
+                            "speaker_label": resolved_label,
+                            "attribution_kind": attribution_kind,
                             "language": r.get::<_, Option<String>>(3)?,
                             "text": r.get::<_, String>(4)?,
                             "source_key": r.get::<_, Option<String>>(5)?,
@@ -1243,7 +1274,59 @@ async fn rest_episode_members(
 
             members.sort_by(|a, b| a.0.cmp(&b.0));
             let members: Vec<Value> = members.into_iter().map(|(_, v)| v).collect();
-            Ok(json!({ "episode_id": id, "member_count": members.len(), "members": members }))
+
+            let mut part_stmt = conn.prepare(
+                "SELECT p.participant_key, p.person_id, p.attribution_kind, p.state, \
+                        pe.display_name, p.source_claimed_name, s.slot_ordinal \
+                 FROM episode_participants p \
+                 LEFT JOIN people pe ON pe.id = p.person_id \
+                 LEFT JOIN episode_speaker_slots s ON s.id = p.speaker_slot_id \
+                 WHERE p.episode_id = ?1 AND p.state = 'active' \
+                 ORDER BY p.id ASC",
+            )?;
+            let participant_details: Vec<Value> = part_stmt
+                .query_map([id], |r| {
+                    let participant_key: String = r.get(0)?;
+                    let person_id: Option<i64> = r.get(1)?;
+                    let attribution_kind: String = r.get(2)?;
+                    let state: String = r.get(3)?;
+                    let pe_display_name: Option<String> = r.get(4)?;
+                    let source_claimed_name: Option<String> = r.get(5)?;
+                    let slot_ordinal: Option<i32> = r.get(6)?;
+
+                    let display_name = if participant_key == "owner"
+                        || attribution_kind == "owner_presentation"
+                        || attribution_kind == "owner_source_role"
+                    {
+                        "Me".to_string()
+                    } else if let Some(dn) = pe_display_name {
+                        dn
+                    } else if let Some(claimed) = source_claimed_name {
+                        claimed
+                    } else if let Some(ord) = slot_ordinal {
+                        let letter = crate::cp::identity::format_slot_ordinal(ord);
+                        format!("Unknown speaker {letter}")
+                    } else {
+                        "Unknown speaker".to_string()
+                    };
+
+                    Ok(json!({
+                        "participant_key": participant_key,
+                        "display_name": display_name,
+                        "person_id": person_id,
+                        "attribution_kind": attribution_kind,
+                        "state": state,
+                    }))
+                })?
+                .filter_map(|x| x.ok())
+                .collect();
+
+            Ok(json!({
+                "episode_id": id,
+                "member_count": members.len(),
+                "participant_details": participant_details,
+                "members": members,
+            }))
         })
         .await;
     match result {

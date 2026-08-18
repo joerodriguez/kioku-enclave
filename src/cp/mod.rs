@@ -21,6 +21,7 @@ pub mod dlp;
 pub mod email_renderer;
 pub mod email_worker;
 pub mod finalizer;
+pub mod identity;
 pub mod isotime;
 pub mod limits;
 pub mod mcp_projection;

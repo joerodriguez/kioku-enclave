@@ -141,7 +141,7 @@ async fn dump_user_export(store: &Store, user_id: &str) -> EnclaveResult<serde_j
 /// separate from the HTTP route: inactive ADR-0022 shadow verification uses
 /// the same pure value and hashes a version tag before comparing it.  Bump this
 /// when a reviewed export-schema change is intentionally incompatible.
-pub(crate) const CANONICAL_LOGICAL_EXPORT_VERSION: u16 = 1;
+pub(crate) const CANONICAL_LOGICAL_EXPORT_VERSION: u16 = 2;
 
 #[derive(Clone, Copy)]
 struct CanonicalExportTable {
@@ -232,6 +232,84 @@ const CANONICAL_EXPORT_TABLES: &[CanonicalExportTable] = &[
         table: "voice_samples",
         response_order: "speaker_observation_id, id",
         digest_order: "speaker_observation_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "speaker_clusters",
+        table: "speaker_clusters",
+        response_order: "work_unit_id, speaker_local_id, id",
+        digest_order: "work_unit_id, speaker_local_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "episode_speaker_slots",
+        table: "episode_speaker_slots",
+        response_order: "episode_id, slot_ordinal, id",
+        digest_order: "episode_id, slot_ordinal, id",
+    },
+    CanonicalExportTable {
+        response_field: "voice_profile_representatives",
+        table: "voice_profile_representatives",
+        response_order: "profile_id, channel_domain, id",
+        digest_order: "profile_id, channel_domain, id",
+    },
+    CanonicalExportTable {
+        response_field: "voice_embedding_jobs",
+        table: "voice_embedding_jobs",
+        response_order: "speaker_observation_id, embedding_space, processor_version, id",
+        digest_order: "speaker_observation_id, embedding_space, processor_version, id",
+    },
+    CanonicalExportTable {
+        response_field: "episode_participants",
+        table: "episode_participants",
+        response_order: "episode_id, participant_key, id",
+        digest_order: "episode_id, participant_key, id",
+    },
+    CanonicalExportTable {
+        response_field: "visual_speaker_observations",
+        table: "visual_speaker_observations",
+        response_order: "observed_at, event_id, id",
+        digest_order: "observed_at, event_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "profile_identity_bindings",
+        table: "profile_identity_bindings",
+        response_order: "voice_profile_id, id",
+        digest_order: "voice_profile_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "person_name_claims",
+        table: "person_name_claims",
+        response_order: "observed_at, id",
+        digest_order: "observed_at, id",
+    },
+    CanonicalExportTable {
+        response_field: "identity_evidence",
+        table: "identity_evidence",
+        response_order: "observed_at, id",
+        digest_order: "observed_at, id",
+    },
+    CanonicalExportTable {
+        response_field: "voice_profile_revisions",
+        table: "voice_profile_revisions",
+        response_order: "profile_id, id",
+        digest_order: "profile_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "voice_sample_profile_assignments",
+        table: "voice_sample_profile_assignments",
+        response_order: "sample_id, profile_id, id",
+        digest_order: "sample_id, profile_id, id",
+    },
+    CanonicalExportTable {
+        response_field: "speaker_observation_sources",
+        table: "speaker_observation_sources",
+        response_order: "speaker_observation_id, event_id, window_start_ms",
+        digest_order: "speaker_observation_id, event_id, window_start_ms",
+    },
+    CanonicalExportTable {
+        response_field: "person_facts",
+        table: "person_facts",
+        response_order: "person_id, id",
+        digest_order: "person_id, id",
     },
 ];
 
@@ -997,6 +1075,19 @@ mod tests {
             "people": [],
             "voice_profiles": [],
             "voice_samples": [],
+            "speaker_clusters": [],
+            "episode_speaker_slots": [],
+            "voice_profile_representatives": [],
+            "voice_embedding_jobs": [],
+            "episode_participants": [],
+            "visual_speaker_observations": [],
+            "profile_identity_bindings": [],
+            "person_name_claims": [],
+            "identity_evidence": [],
+            "voice_profile_revisions": [],
+            "voice_sample_profile_assignments": [],
+            "speaker_observation_sources": [],
+            "person_facts": [],
         });
         let expected_bytes = serde_json::to_vec(&expected).unwrap();
         assert_eq!(value, expected);

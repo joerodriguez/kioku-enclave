@@ -1275,7 +1275,7 @@ async fn summarize_user_window(
 /// gists) so extensions embed the full §G.1-merged timeline, not just the new
 /// window. Best-effort: an absent engine or a failed embed leaves the episode
 /// FTS-only — it never fails the summarizer run.
-async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) {
+pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) {
     let Some(engine) = state.embedding.as_ref().cloned() else {
         return;
     };
@@ -1623,7 +1623,8 @@ async fn finalize_and_deliver_user(state: &CpState, id: &str) {
         warn!(user_id = %id, error = %e, "deliver_user_webhooks failed");
     }
     if let Some(ref transport) = state.email_transport {
-        if let Err(e) = super::email_worker::deliver_user_emails(state, transport.as_ref(), id).await
+        if let Err(e) =
+            super::email_worker::deliver_user_emails(state, transport.as_ref(), id).await
         {
             warn!(user_id = %id, error = %e, "deliver_user_emails failed");
         }
@@ -1783,7 +1784,10 @@ mod tests {
         let tail = 1_000_000 * MIN; // arbitrary "now - 5min" reference
 
         // Tail shorter than MIN_WINDOW: don't run at all.
-        assert_eq!(window_bounds(tail - 10 * MIN, tail, SCHEDULED_MIN_WINDOW), None);
+        assert_eq!(
+            window_bounds(tail - 10 * MIN, tail, SCHEDULED_MIN_WINDOW),
+            None
+        );
         assert_eq!(
             window_bounds(tail, tail, SCHEDULED_MIN_WINDOW),
             None,
@@ -1825,7 +1829,10 @@ mod tests {
         let (to, tail_bounded) = window_bounds(tail - 5 * MIN, tail, SETTLED_MIN_WINDOW_MS)
             .expect("a settled 5-minute recording is summarizable immediately");
         assert_eq!(to, tail);
-        assert!(tail_bounded, "short settled window must hold cursor on empty output");
+        assert!(
+            tail_bounded,
+            "short settled window must hold cursor on empty output"
+        );
 
         // Still refuses degenerate/caught-up windows.
         assert_eq!(window_bounds(tail, tail, SETTLED_MIN_WINDOW_MS), None);
