@@ -28,6 +28,7 @@
 
 mod abort;
 mod abort_reconcile;
+mod attestation_challenge;
 mod canary;
 mod canary_trust;
 mod comparison;
