@@ -29473,8 +29473,8 @@ mod tests {
                     )?;
                     let binding = create_active_archive_binding_conn(conn, &old_id)?;
                     let source = IdentityRebindSource {
-                        base_generation: 1,
-                        source_generation: 1,
+                        base_generation: 0,
+                        source_generation: 0,
                         commitment,
                         plaintext: Vec::new(),
                         wrapped_dek_b64: String::new(),

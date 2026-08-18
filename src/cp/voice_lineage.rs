@@ -34,23 +34,43 @@ struct ResultProfileSpec<'a> {
 /// Existing history is never reactivated: a sample is backfilled only when it
 /// has no assignment row at all.
 pub fn backfill_profile_lineage(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "INSERT INTO voice_profile_revisions \
-         (profile_id,status,derivation_version,scorer_version,representative_kind,centroid,\
-          sample_count,medoid_sample_id,person_id,reason_code,active) \
-         SELECT v.id,v.status,?1,v.scorer_version,v.representative_kind,v.centroid,\
-                v.sample_count,v.medoid_sample_id,v.person_id,'schema_backfill',1 \
-         FROM voice_profiles v \
-         WHERE NOT EXISTS (SELECT 1 FROM voice_profile_revisions r WHERE r.profile_id=v.id)",
-        [LINEAGE_DERIVATION_VERSION],
-    )?;
-    conn.execute(
-        "INSERT INTO voice_sample_profile_assignments(sample_id,profile_id,active) \
-         SELECT s.id,s.voice_profile_id,1 FROM voice_samples s \
-         WHERE s.voice_profile_id IS NOT NULL \
-           AND NOT EXISTS (SELECT 1 FROM voice_sample_profile_assignments a WHERE a.sample_id=s.id)",
-        [],
-    )?;
+    let has_unversioned_profiles: bool = conn
+        .query_row(
+            "SELECT 1 FROM voice_profiles v WHERE NOT EXISTS (SELECT 1 FROM voice_profile_revisions r WHERE r.profile_id=v.id) LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if has_unversioned_profiles {
+        conn.execute(
+            "INSERT INTO voice_profile_revisions \
+             (profile_id,status,derivation_version,scorer_version,representative_kind,centroid,\
+              sample_count,medoid_sample_id,person_id,reason_code,active) \
+             SELECT v.id,v.status,?1,v.scorer_version,v.representative_kind,v.centroid,\
+                    v.sample_count,v.medoid_sample_id,v.person_id,'schema_backfill',1 \
+             FROM voice_profiles v \
+             WHERE NOT EXISTS (SELECT 1 FROM voice_profile_revisions r WHERE r.profile_id=v.id)",
+            [LINEAGE_DERIVATION_VERSION],
+        )?;
+    }
+    let has_unassigned_samples: bool = conn
+        .query_row(
+            "SELECT 1 FROM voice_samples s WHERE s.voice_profile_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM voice_sample_profile_assignments a WHERE a.sample_id=s.id) LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if has_unassigned_samples {
+        conn.execute(
+            "INSERT INTO voice_sample_profile_assignments(sample_id,profile_id,active) \
+             SELECT s.id,s.voice_profile_id,1 FROM voice_samples s \
+             WHERE s.voice_profile_id IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM voice_sample_profile_assignments a WHERE a.sample_id=s.id)",
+            [],
+        )?;
+    }
     Ok(())
 }
 

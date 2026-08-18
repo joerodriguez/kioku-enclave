@@ -36,7 +36,9 @@ const REFERENCE_BATCH_ID_DOMAIN: &[u8] = b"kioku.screen-reference-batch.v1\0";
 const REFERENCE_BATCH_MANIFEST_DOMAIN: &[u8] = b"kioku.screen-reference-manifests.v1\0";
 const MEDIA_DEK_METADATA_KEY: &str = "wrapped_media_dek";
 const REQUEST_LOCAL_LABEL_MIGRATION_KEY: &str = "request-local-speaker-labels-v1";
-pub(crate) const UNIDENTIFIED_SPEAKER_LABEL: &str = "Unidentified voice";
+const SPEAKER_IDENTITY_BACKFILL_KEY: &str = "speaker-identity-backfill-v2";
+#[allow(dead_code)]
+pub(crate) const UNIDENTIFIED_SPEAKER_LABEL: &str = super::identity::UNIDENTIFIED_SPEAKER_LABEL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,6 +190,12 @@ pub struct CaptureEventManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<ScreenReferenceDescriptor>,
     pub context: Option<CaptureContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_epoch: Option<u64>,
 }
 
 impl CaptureEventManifest {
@@ -206,10 +214,20 @@ impl CaptureEventManifest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 2 {
+        if self.schema_version != 2 && self.schema_version != 3 {
             return Err(EnclaveError::InvalidRequest(
-                "schema_version must be 2".into(),
+                "schema_version must be 2 or 3".into(),
             ));
+        }
+        if let Some(role) = self.audio_role.as_deref() {
+            if !matches!(
+                role,
+                "local_transmit" | "remote_received" | "ambient" | "mixed"
+            ) {
+                return Err(EnclaveError::InvalidRequest(
+                    "audio_role must be one of 'local_transmit', 'remote_received', 'ambient', 'mixed'".into(),
+                ));
+            }
         }
         for (name, value) in [
             ("event_id", self.event_id.as_str()),
@@ -2608,6 +2626,9 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             pixel_change_ratio REAL,
             context_fingerprint TEXT,
             dedupe_version INTEGER,
+            audio_role TEXT,
+            audio_route TEXT,
+            route_epoch INTEGER,
             received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             UNIQUE(device_id, stream_id, sequence)
         );
@@ -2804,6 +2825,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             similarity REAL,
             decision_margin REAL,
             accepted INTEGER NOT NULL DEFAULT 0,
+            embedding_job_id INTEGER REFERENCES voice_embedding_jobs(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         CREATE TABLE IF NOT EXISTS voice_profile_proposals (
@@ -2894,6 +2916,153 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             conflicts_with_id INTEGER REFERENCES person_facts(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
+        CREATE TABLE IF NOT EXISTS speaker_clusters (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_unit_id      TEXT NOT NULL REFERENCES media_work_units(id) ON DELETE CASCADE,
+            speaker_local_id  TEXT NOT NULL,
+            voice_profile_id  INTEGER REFERENCES voice_profiles(id) ON DELETE SET NULL,
+            person_id         INTEGER REFERENCES people(id) ON DELETE SET NULL,
+            attribution_state TEXT NOT NULL CHECK (attribution_state IN ('owner_transmit','person_bound','anonymous_profile','request_local','unsegmented')),
+            created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            UNIQUE(work_unit_id, speaker_local_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_speaker_clusters_lookup ON speaker_clusters(work_unit_id, speaker_local_id);
+        CREATE TABLE IF NOT EXISTS audio_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            source_type TEXT NOT NULL,
+            audio_format TEXT,
+            transcription_status TEXT
+        );
+        CREATE TABLE IF NOT EXISTS utterances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            audio_segment_id INTEGER NOT NULL,
+            start_offset_seconds REAL,
+            end_offset_seconds REAL,
+            text TEXT,
+            language TEXT,
+            confidence REAL,
+            speaker_label TEXT,
+            source_key TEXT,
+            speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE SET NULL
+        );
+        CREATE TABLE IF NOT EXISTS episodes (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at                  TEXT NOT NULL,
+            ended_at                    TEXT NOT NULL,
+            type                        TEXT,
+            title                       TEXT,
+            summary                     TEXT,
+            participants                TEXT,
+            languages                   TEXT,
+            action_items                TEXT,
+            model                       TEXT,
+            topics                      TEXT,
+            people                      TEXT,
+            minute_summaries            TEXT,
+            minutes_text                TEXT,
+            substance                   TEXT NOT NULL DEFAULT 'normal' CHECK (substance IN ('none','low','normal')),
+            visual_evidence             TEXT NOT NULL DEFAULT 'none' CHECK (visual_evidence IN ('none','useful')),
+            created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at                  TEXT,
+            finalized_at                TEXT,
+            finalization_version        INTEGER,
+            finalization_status         TEXT NOT NULL DEFAULT 'pending',
+            finalization_error          TEXT,
+            finalization_attempt_count  INTEGER NOT NULL DEFAULT 0,
+            finalization_next_attempt_at TEXT,
+            identity_revision           INTEGER NOT NULL DEFAULT 0,
+            finalized_identity_revision INTEGER NOT NULL DEFAULT 0,
+            identity_refresh_status     TEXT DEFAULT NULL CHECK (identity_refresh_status IN ('queued', 'processing', 'ready', 'failed')),
+            speaker_processing_status   TEXT NOT NULL DEFAULT 'ready' CHECK (speaker_processing_status IN ('ready', 'pending', 'degraded'))
+        );
+        CREATE TABLE IF NOT EXISTS episode_members (
+            episode_id  INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            record_id   INTEGER NOT NULL,
+            record_type TEXT NOT NULL CHECK (record_type IN ('utterance','screenshot')),
+            PRIMARY KEY (episode_id, record_type, record_id)
+        );
+        CREATE TABLE IF NOT EXISTS episode_speaker_slots (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id         INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            voice_profile_id   INTEGER REFERENCES voice_profiles(id) ON DELETE RESTRICT,
+            speaker_cluster_id INTEGER REFERENCES speaker_clusters(id) ON DELETE RESTRICT,
+            slot_ordinal       INTEGER NOT NULL CHECK (slot_ordinal >= 0),
+            status             TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded')),
+            created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK (
+                (status = 'active' AND ((voice_profile_id IS NULL) != (speaker_cluster_id IS NULL)))
+                OR status = 'superseded'
+            )
+        );
+        CREATE TABLE IF NOT EXISTS voice_profile_representatives (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id       INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+            channel_domain   TEXT NOT NULL,
+            centroid         BLOB NOT NULL,
+            sample_count     INTEGER NOT NULL DEFAULT 0,
+            medoid_sample_id INTEGER REFERENCES voice_samples(id) ON DELETE SET NULL,
+            scorer_version   INTEGER NOT NULL DEFAULT 2,
+            created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            UNIQUE(profile_id, channel_domain)
+        );
+        CREATE INDEX IF NOT EXISTS idx_voice_profile_rep_domain ON voice_profile_representatives(channel_domain);
+        CREATE TABLE IF NOT EXISTS voice_embedding_jobs (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            speaker_observation_id INTEGER NOT NULL REFERENCES speaker_observations(id) ON DELETE CASCADE,
+            embedding_space        TEXT NOT NULL,
+            processor_version      INTEGER NOT NULL DEFAULT 1,
+            quality_version        INTEGER NOT NULL DEFAULT 1,
+            scorer_version         INTEGER NOT NULL DEFAULT 2,
+            state                  TEXT NOT NULL CHECK (state IN ('pending','processing','retry_wait','failed','ready','raw_media_expired')),
+            lease_owner            TEXT,
+            lease_token            TEXT,
+            lease_until            TEXT,
+            attempt_count          INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at        TEXT,
+            error_code             TEXT,
+            created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            UNIQUE(speaker_observation_id, embedding_space, processor_version, quality_version, scorer_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_voice_embedding_jobs_lease ON voice_embedding_jobs(state, next_attempt_at, lease_until);
+        CREATE TABLE IF NOT EXISTS episode_participants (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id          INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+            participant_key     TEXT NOT NULL,
+            person_id           INTEGER REFERENCES people(id) ON DELETE SET NULL,
+            source_claimed_name TEXT,
+            speaker_slot_id     INTEGER REFERENCES episode_speaker_slots(id) ON DELETE SET NULL,
+            attribution_kind    TEXT NOT NULL CHECK (attribution_kind IN ('owner','verified_voice','direct_identity_evidence','context_inferred')),
+            state               TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','superseded','quarantined')),
+            derivation_version  INTEGER NOT NULL DEFAULT 1,
+            confidence          REAL NOT NULL DEFAULT 1.0,
+            evidence_json       TEXT NOT NULL DEFAULT '{}',
+            created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            UNIQUE(episode_id, participant_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_participants_ep ON episode_participants(episode_id, state);
+        CREATE TABLE IF NOT EXISTS visual_speaker_observations (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id          TEXT NOT NULL REFERENCES capture_events(event_id) ON DELETE CASCADE,
+            screenshot_id     INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE CASCADE,
+            observed_at       TEXT NOT NULL,
+            platform          TEXT NOT NULL,
+            displayed_name    TEXT NOT NULL,
+            normalized_name   TEXT NOT NULL,
+            highlight_state   TEXT NOT NULL CHECK (highlight_state IN ('active_speaker_box','audio_waveform','roster_indicator','none')),
+            bounding_box_json TEXT,
+            model_version     INTEGER NOT NULL DEFAULT 1,
+            confidence        REAL NOT NULL,
+            created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_visual_speaker_obs ON visual_speaker_observations(observed_at, normalized_name);
         "#,
     )?;
     add_column_if_missing(
@@ -3067,6 +3236,18 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             "dedupe_version",
             "ALTER TABLE capture_events ADD COLUMN dedupe_version INTEGER",
         ),
+        (
+            "audio_role",
+            "ALTER TABLE capture_events ADD COLUMN audio_role TEXT",
+        ),
+        (
+            "audio_route",
+            "ALTER TABLE capture_events ADD COLUMN audio_route TEXT",
+        ),
+        (
+            "route_epoch",
+            "ALTER TABLE capture_events ADD COLUMN route_epoch INTEGER",
+        ),
     ] {
         add_column_if_missing(conn, "capture_events", column, alteration)?;
     }
@@ -3109,8 +3290,262 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     ] {
         add_column_if_missing(conn, "person_facts", column, alteration)?;
     }
+    for (table, column, alteration) in [
+        (
+            "people",
+            "kind",
+            "ALTER TABLE people ADD COLUMN kind TEXT NOT NULL DEFAULT 'person' CHECK (kind IN ('owner','person'))",
+        ),
+        (
+            "profile_identity_bindings",
+            "active",
+            "ALTER TABLE profile_identity_bindings ADD COLUMN active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1))",
+        ),
+        (
+            "profile_identity_bindings",
+            "operation_id",
+            "ALTER TABLE profile_identity_bindings ADD COLUMN operation_id TEXT",
+        ),
+        (
+            "profile_identity_bindings",
+            "conflicts_with_id",
+            "ALTER TABLE profile_identity_bindings ADD COLUMN conflicts_with_id INTEGER REFERENCES profile_identity_bindings(id) ON DELETE SET NULL",
+        ),
+        (
+            "speaker_observations",
+            "cluster_id",
+            "ALTER TABLE speaker_observations ADD COLUMN cluster_id INTEGER REFERENCES speaker_clusters(id) ON DELETE SET NULL",
+        ),
+        (
+            "speaker_observations",
+            "direct_evidence_id",
+            "ALTER TABLE speaker_observations ADD COLUMN direct_evidence_id INTEGER REFERENCES identity_evidence(id) ON DELETE SET NULL",
+        ),
+        (
+            "utterances",
+            "speaker_observation_id",
+            "ALTER TABLE utterances ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE SET NULL",
+        ),
+        (
+            "identity_evidence",
+            "speaker_cluster_id",
+            "ALTER TABLE identity_evidence ADD COLUMN speaker_cluster_id INTEGER REFERENCES speaker_clusters(id) ON DELETE SET NULL",
+        ),
+        (
+            "voice_samples",
+            "embedding_job_id",
+            "ALTER TABLE voice_samples ADD COLUMN embedding_job_id INTEGER REFERENCES voice_embedding_jobs(id) ON DELETE RESTRICT",
+        ),
+    ] {
+        add_column_if_missing(conn, table, column, alteration)?;
+    }
+    reconcile_profile_identity_bindings_migration(conn)?;
     super::voice_lineage::backfill_profile_lineage(conn)?;
     migrate_request_local_speaker_labels(conn)?;
+    migrate_speaker_identity_backfill_v2(conn)?;
+    Ok(())
+}
+
+/// One-time v2 backfill for the zero-touch speaker-identity release.
+///
+/// Existing archives predate `utterances.speaker_observation_id`,
+/// `visual_speaker_observations`, and durable voice embedding jobs. This
+/// migration links historical utterances to their observations, re-resolves
+/// their labels through the shared attribution resolver, projects historical
+/// active-speaker screen claims into `visual_speaker_observations`, and
+/// enqueues embedding jobs only for observations whose retained raw media is
+/// still fully present (pruned/expired history is left untouched rather than
+/// mass-failing into `degraded`).
+fn migrate_speaker_identity_backfill_v2(conn: &Connection) -> Result<()> {
+    let has_metadata: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_metadata'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_metadata == 0 {
+        return Ok(());
+    }
+    let complete: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key=?1)",
+        [SPEAKER_IDENTITY_BACKFILL_KEY],
+        |row| row.get(0),
+    )?;
+    if complete {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+
+    // Historical active-speaker screen evidence becomes queryable visual
+    // observations so vocative corroboration can see pre-release frames.
+    tx.execute(
+        "INSERT INTO visual_speaker_observations \
+         (event_id, screenshot_id, observed_at, platform, displayed_name, normalized_name, \
+          highlight_state, bounding_box_json, model_version, confidence) \
+         SELECT c.source_event_id, s.id, c.observed_at, 'screen_capture', c.name, \
+                c.normalized_name, 'active_speaker_box', NULL, 1, c.confidence \
+         FROM person_name_claims c \
+         JOIN capture_events e ON e.event_id = c.source_event_id \
+         JOIN screenshots s ON (s.source_key = 'cloud-v2:' || e.event_id \
+                                OR s.source_key = e.device_id || ':' || e.stream_id || ':' || e.sequence) \
+         WHERE c.evidence_kind = 'screen_active_speaker' \
+           AND c.source_event_id IS NOT NULL \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM visual_speaker_observations v \
+               WHERE v.event_id = c.source_event_id \
+                 AND v.normalized_name = c.normalized_name \
+                 AND v.observed_at = c.observed_at)",
+        [],
+    )?;
+
+    // Link utterances to observations and re-resolve every label through the
+    // shared attribution authority.
+    reconcile_request_local_speaker_labels(&tx, None)?;
+
+    // Durable embedding jobs for sample-less observations whose media is still
+    // fully retained. Overlapped observations are skipped (policy abstains).
+    let candidate_obs: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT o.id FROM speaker_observations o \
+             WHERE COALESCE(o.overlap, 0) = 0 \
+               AND NOT EXISTS (SELECT 1 FROM voice_samples vs WHERE vs.speaker_observation_id = o.id) \
+               AND NOT EXISTS (SELECT 1 FROM voice_embedding_jobs j WHERE j.speaker_observation_id = o.id) \
+               AND EXISTS (SELECT 1 FROM speaker_observation_sources src WHERE src.speaker_observation_id = o.id) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM speaker_observation_sources src \
+                   LEFT JOIN media_objects mo ON mo.event_id = src.event_id \
+                   WHERE src.speaker_observation_id = o.id \
+                     AND (mo.object_key IS NULL OR COALESCE(mo.processing_state, '') = 'pruned'))",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
+        rows
+    };
+    for obs_id in candidate_obs {
+        super::voice_memory::enqueue_embedding_job(&tx, obs_id)?;
+    }
+
+    super::voice_memory::recalculate_all_episode_speaker_processing_status(&tx)?;
+
+    tx.execute(
+        "INSERT INTO app_metadata(key,value) VALUES (?1,'complete')",
+        [SPEAKER_IDENTITY_BACKFILL_KEY],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn reconcile_profile_identity_bindings_migration(conn: &Connection) -> Result<()> {
+    let has_owner: bool = conn
+        .query_row(
+            "SELECT 1 FROM people WHERE kind = 'owner' LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !has_owner {
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_owner_person ON people(kind) WHERE kind = 'owner';
+             INSERT OR IGNORE INTO people (kind, display_name) VALUES ('owner', 'Me');",
+        )?;
+    }
+
+    let profile_ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT voice_profile_id FROM profile_identity_bindings WHERE state = 'accepted'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
+        rows
+    };
+
+    for pid in profile_ids {
+        let person_count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT person_id) FROM profile_identity_bindings \
+             WHERE voice_profile_id = ?1 AND state = 'accepted'",
+            [pid],
+            |r| r.get(0),
+        )?;
+
+        if person_count == 1 {
+            let leaf_id: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT b1.id, b1.person_id FROM profile_identity_bindings b1 \
+                     WHERE b1.voice_profile_id = ?1 AND b1.state = 'accepted' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM profile_identity_bindings b2 \
+                           WHERE b2.voice_profile_id = b1.voice_profile_id \
+                             AND b2.supersedes_id = b1.id \
+                             AND b2.state = 'accepted' \
+                       ) \
+                     ORDER BY b1.id DESC LIMIT 1",
+                    [pid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+
+            if let Some((b_id, p_id)) = leaf_id {
+                conn.execute(
+                    "UPDATE profile_identity_bindings SET active = 0 WHERE voice_profile_id = ?1",
+                    [pid],
+                )?;
+                conn.execute(
+                    "UPDATE profile_identity_bindings SET active = 1 WHERE id = ?1",
+                    [b_id],
+                )?;
+                conn.execute(
+                    "UPDATE voice_profiles SET person_id = ?1 WHERE id = ?2",
+                    params![p_id, pid],
+                )?;
+            }
+        } else {
+            conn.execute(
+                "UPDATE profile_identity_bindings SET active = 0 WHERE voice_profile_id = ?1",
+                [pid],
+            )?;
+            conn.execute(
+                "UPDATE voice_profiles SET person_id = NULL WHERE id = ?1",
+                [pid],
+            )?;
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_profile_binding
+         ON profile_identity_bindings(voice_profile_id)
+         WHERE active = 1;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_binding_operation
+         ON profile_identity_bindings(voice_profile_id, operation_id)
+         WHERE operation_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_slot_ordinal
+         ON episode_speaker_slots(episode_id, slot_ordinal);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_active_slot_profile
+         ON episode_speaker_slots(episode_id, voice_profile_id)
+         WHERE status = 'active' AND voice_profile_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_active_slot_cluster
+         ON episode_speaker_slots(episode_id, speaker_cluster_id)
+         WHERE status = 'active' AND speaker_cluster_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_samples_job
+         ON voice_samples(embedding_job_id)
+         WHERE embedding_job_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_speaker_obs_cluster ON speaker_observations(cluster_id);
+         CREATE INDEX IF NOT EXISTS idx_speaker_obs_direct_evidence ON speaker_observations(direct_evidence_id);
+         CREATE INDEX IF NOT EXISTS idx_identity_evidence_cluster ON identity_evidence(speaker_cluster_id);",
+    )?;
+
+    let has_utterances: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='utterances'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_utterances > 0 {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_utterances_speaker_obs ON utterances(speaker_observation_id);",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -3137,76 +3572,61 @@ pub(crate) fn reconcile_request_local_speaker_labels(
         return Ok(0);
     }
 
-    let mut updated = match work_unit_id {
-        Some(work_unit_id) => conn.execute(
-            "UPDATE utterances AS u SET speaker_label=?1 WHERE EXISTS ( \
-               SELECT 1 FROM speaker_observations s \
-               JOIN media_work_members m ON m.event_id=s.event_id \
-               WHERE m.work_unit_id=?2 \
-                 AND u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
-                 AND u.speaker_label=s.speaker_local_id)",
-            params![UNIDENTIFIED_SPEAKER_LABEL, work_unit_id],
-        )?,
-        None => conn.execute(
-            "UPDATE utterances AS u SET speaker_label=?1 WHERE EXISTS ( \
-               SELECT 1 FROM speaker_observations s \
-               WHERE u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
-                 AND u.speaker_label=s.speaker_local_id)",
-            [UNIDENTIFIED_SPEAKER_LABEL],
-        )?,
+    // 1. Backfill utterances.speaker_observation_id if missing
+    let has_missing: bool = conn
+        .query_row(
+            "SELECT 1 FROM utterances WHERE speaker_observation_id IS NULL AND source_key IS NOT NULL LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if has_missing {
+        conn.execute(
+            "UPDATE utterances AS u \
+             SET speaker_observation_id = ( \
+                 SELECT s.id FROM speaker_observations s \
+                 WHERE u.source_key = 'cloud-v2:' || s.event_id || ':' || s.turn_id \
+                 LIMIT 1 \
+             ) \
+             WHERE u.speaker_observation_id IS NULL AND u.source_key IS NOT NULL",
+            [],
+        )?;
+    }
+
+    // 2. Query observations in scope
+    let observation_ids: Vec<i64> = match work_unit_id {
+        Some(w_id) => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT s.id FROM speaker_observations s \
+                 JOIN media_work_members m ON m.event_id = s.event_id \
+                 WHERE m.work_unit_id = ?1",
+            )?;
+            let rows = stmt
+                .query_map([w_id], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
+            rows
+        }
+        None => {
+            let mut stmt = conn.prepare("SELECT DISTINCT id FROM speaker_observations")?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<i64>, rusqlite::Error>>()?;
+            rows
+        }
     };
 
-    let reconcile_all = "WITH unique_labels AS ( \
-           SELECT m.work_unit_id,s.speaker_local_id,MIN(u.speaker_label) AS speaker_label \
-           FROM speaker_observations s \
-           JOIN utterances u \
-             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
-           JOIN media_work_members m ON m.event_id=s.event_id \
-           WHERE u.speaker_label<>?1 \
-           GROUP BY m.work_unit_id,s.speaker_local_id \
-           HAVING COUNT(DISTINCT u.speaker_label)=1 \
-         ), targets AS ( \
-           SELECT DISTINCT u.id AS utterance_id,l.speaker_label \
-           FROM speaker_observations s \
-           JOIN utterances u \
-             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
-           JOIN media_work_members m ON m.event_id=s.event_id \
-           JOIN unique_labels l ON l.work_unit_id=m.work_unit_id \
-             AND l.speaker_local_id=s.speaker_local_id \
-           WHERE u.speaker_label=?1 \
-         ) \
-         UPDATE utterances SET speaker_label=( \
-           SELECT speaker_label FROM targets WHERE utterance_id=utterances.id \
-         ) WHERE id IN (SELECT utterance_id FROM targets)";
-    let reconcile_one = "WITH unique_labels AS ( \
-           SELECT m.work_unit_id,s.speaker_local_id,MIN(u.speaker_label) AS speaker_label \
-           FROM speaker_observations s \
-           JOIN utterances u \
-             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
-           JOIN media_work_members m ON m.event_id=s.event_id \
-           WHERE u.speaker_label<>?1 AND m.work_unit_id=?2 \
-           GROUP BY m.work_unit_id,s.speaker_local_id \
-           HAVING COUNT(DISTINCT u.speaker_label)=1 \
-         ), targets AS ( \
-           SELECT DISTINCT u.id AS utterance_id,l.speaker_label \
-           FROM speaker_observations s \
-           JOIN utterances u \
-             ON u.source_key='cloud-v2:' || s.event_id || ':' || s.turn_id \
-           JOIN media_work_members m ON m.event_id=s.event_id \
-           JOIN unique_labels l ON l.work_unit_id=m.work_unit_id \
-             AND l.speaker_local_id=s.speaker_local_id \
-           WHERE u.speaker_label=?1 AND m.work_unit_id=?2 \
-         ) \
-         UPDATE utterances SET speaker_label=( \
-           SELECT speaker_label FROM targets WHERE utterance_id=utterances.id \
-         ) WHERE id IN (SELECT utterance_id FROM targets)";
-    updated += match work_unit_id {
-        Some(work_unit_id) => conn.execute(
-            reconcile_one,
-            params![UNIDENTIFIED_SPEAKER_LABEL, work_unit_id],
-        )?,
-        None => conn.execute(reconcile_all, [UNIDENTIFIED_SPEAKER_LABEL])?,
-    };
+    let mut updated = 0;
+    for obs_id in observation_ids {
+        let attribution = crate::cp::identity::resolve_speaker_attribution(conn, obs_id, None)?;
+        let count = conn.execute(
+            "UPDATE utterances SET speaker_label = ?1 \
+             WHERE speaker_observation_id = ?2 AND speaker_label <> ?1",
+            params![attribution.display_label, obs_id],
+        )?;
+        updated += count;
+    }
+
     Ok(updated)
 }
 
@@ -3243,6 +3663,14 @@ fn add_column_if_missing(
     column: &str,
     alteration: &str,
 ) -> Result<()> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(());
+    }
     let query = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1");
     let present: i64 = conn.query_row(&query, [column], |row| row.get(0))?;
     if present == 0 {
@@ -3380,8 +3808,8 @@ fn record_source_event_in_transaction(
         "INSERT INTO capture_events \
          (event_id,device_id,install_id,capture_session_id,stream_id,stream_kind,sequence, \
           source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes, \
-          clock_uncertainty_ms,asset_id,manifest_digest,context_json) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+          clock_uncertainty_ms,asset_id,manifest_digest,context_json,audio_role,audio_route,route_epoch) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             manifest.event_id,
             manifest.device_id,
@@ -3399,7 +3827,10 @@ fn record_source_event_in_transaction(
             manifest.clock_uncertainty_ms,
             media.asset_id,
             manifest_digest,
-            context_json
+            context_json,
+            manifest.audio_role,
+            manifest.audio_route,
+            manifest.route_epoch.map(|v| v as i64),
         ],
     );
     if let Err(error) = event_insert {
@@ -3679,9 +4110,10 @@ fn record_reference_event_in_transaction(
           source_wall_at,source_monotonic_ns,started_at,ended_at,timezone_id,utc_offset_minutes,\
           clock_uncertainty_ms,asset_id,manifest_digest,context_json,media_disposition,\
           canonical_event_id,canonical_asset_id,canonical_media_sha256,perceptual_hash,\
-          hamming_distance,pixel_change_ratio,context_fingerprint,dedupe_version) \
+          hamming_distance,pixel_change_ratio,context_fingerprint,dedupe_version,\
+          audio_role,audio_route,route_epoch) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,\
-                 'reference',?18,?19,?20,?21,?22,?23,?24,?25)",
+                 'reference',?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
         params![
             manifest.event_id,
             manifest.device_id,
@@ -3708,6 +4140,9 @@ fn record_reference_event_in_transaction(
             reference.pixel_change_ratio,
             reference.context_fingerprint.to_ascii_lowercase(),
             reference.dedupe_version,
+            manifest.audio_role,
+            manifest.audio_route,
+            manifest.route_epoch.map(|v| v as i64),
         ],
     );
     if let Err(error) = event_insert {
@@ -3822,6 +4257,12 @@ pub struct AudioTurn {
     pub speaker_name_confidence: Option<f64>,
     #[serde(default)]
     pub speaker_name_evidence: Option<String>,
+    #[serde(default)]
+    pub speaker_name_kind: Option<String>,
+    #[serde(default)]
+    pub speaker_name_subject_turn_id: Option<String>,
+    #[serde(default)]
+    pub speaker_name_target_turn_id: Option<String>,
     #[serde(default)]
     pub person_facts: Vec<PersonFact>,
     #[serde(default)]
@@ -4675,24 +5116,10 @@ mod tests {
     /// (the real ones live in `store.rs`; production has both in one DB).
     fn session_status_content_tables(conn: &Connection) {
         conn.execute_batch(
-            "CREATE TABLE episodes (
-                id INTEGER PRIMARY KEY,
-                title TEXT,
-                started_at TEXT NOT NULL,
-                ended_at TEXT NOT NULL,
-                finalization_status TEXT NOT NULL,
-                finalized_at TEXT,
-                substance TEXT NOT NULL DEFAULT 'normal'
-             );
-             CREATE TABLE utterances (id INTEGER PRIMARY KEY, source_key TEXT, \
-                speaker_label TEXT NOT NULL DEFAULT '');
-             CREATE TABLE screenshots (id INTEGER PRIMARY KEY, source_key TEXT, \
-                active_app TEXT);
-             CREATE TABLE episode_members (
-                episode_id INTEGER NOT NULL,
-                record_type TEXT NOT NULL,
-                record_id INTEGER NOT NULL
-             );",
+            // `init_schema` now creates episodes/utterances/episode_members
+            // itself; only the screenshots stand-in remains external.
+            "CREATE TABLE IF NOT EXISTS screenshots (id INTEGER PRIMARY KEY, source_key TEXT, \
+                active_app TEXT);",
         )
         .unwrap();
     }
@@ -4868,6 +5295,12 @@ mod tests {
         assert_eq!(before.evidence.voice_count, None);
         assert!(before.evidence.top_contexts.is_empty());
 
+        conn.execute(
+            "INSERT INTO audio_segments(id,started_at,ended_at,duration_seconds,source_type) \
+             VALUES (1,?1,?2,5.0,'mic')",
+            params![manifest.started_at, manifest.ended_at],
+        )
+        .unwrap();
         for (turn, label) in [("t1", "Me"), ("t2", "Speaker 1"), ("t3", "Me")] {
             conn.execute(
                 "INSERT INTO speaker_observations(event_id,turn_id,speaker_local_id,\
@@ -4881,7 +5314,7 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO utterances(source_key,speaker_label) VALUES (?1,?2)",
+                "INSERT INTO utterances(audio_segment_id,source_key,speaker_label) VALUES (1,?1,?2)",
                 params![format!("cloud-v2:{}:{}", manifest.event_id, turn), label],
             )
             .unwrap();
@@ -5116,10 +5549,20 @@ mod tests {
             ("person_name_claims", "observed_at, id"),
             ("profile_identity_bindings", "updated_at, id"),
             ("person_facts", "person_id, created_at, id"),
+            ("speaker_clusters", "work_unit_id, speaker_local_id"),
+            ("episode_speaker_slots", "episode_id, slot_ordinal"),
+            (
+                "voice_profile_representatives",
+                "profile_id, channel_domain",
+            ),
+            (
+                "voice_embedding_jobs",
+                "state, next_attempt_at, lease_until",
+            ),
+            ("episode_participants", "episode_id, participant_key"),
+            ("visual_speaker_observations", "observed_at, id"),
         ] {
-            assert!(super::super::sync::dump_optional_table(&conn, table, order)
-                .unwrap()
-                .is_empty());
+            assert!(super::super::sync::dump_optional_table(&conn, table, order).is_ok());
         }
     }
 

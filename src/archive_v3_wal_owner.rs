@@ -3961,19 +3961,15 @@ mod tests {
         control.captured.notified().await;
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        let witnessed = control.witnessed.notified();
         control.release_capture.add_permits(1);
-        tokio::time::timeout(std::time::Duration::from_secs(5), witnessed)
-            .await
-            .unwrap();
+        let mut attempts = 0;
+        while control.snapshot().0 != WalPublicationStage::Witnessed && attempts < 100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+        }
         assert_eq!(control.snapshot().0, WalPublicationStage::Witnessed);
-        assert_eq!(
-            handle
-                .submit(plan(41, b"cancel-after-commit"))
-                .await
-                .unwrap(),
-            b"cancel-after-commit"
-        );
+        let replay = handle.submit(plan(41, b"cancel-after-commit")).await;
+        assert_eq!(replay.unwrap(), b"cancel-after-commit");
     }
 
     #[tokio::test]

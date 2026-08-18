@@ -1275,7 +1275,7 @@ async fn summarize_user_window(
 /// gists) so extensions embed the full §G.1-merged timeline, not just the new
 /// window. Best-effort: an absent engine or a failed embed leaves the episode
 /// FTS-only — it never fails the summarizer run.
-async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) {
+pub(crate) async fn embed_episodes(state: &CpState, user_id: &str, ids: &[i64]) {
     let Some(engine) = state.embedding.as_ref().cloned() else {
         return;
     };
