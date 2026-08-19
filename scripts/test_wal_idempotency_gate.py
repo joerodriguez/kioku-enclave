@@ -82,7 +82,10 @@ EXPECTED_WORKER_SPAWN_COUNT = 33
 # Slice J-a: the sole delta is async_main's owner-body hash (pre-admission
 # selection installation); the spawn count and every spawn expression are
 # unchanged.
-EXPECTED_WORKER_SPAWN_SHA256 = "39ec6ea831bbbe1252726f716c89fe93392f3b01992f9c08b2264f2277d56080"
+# Slice J-b1: the actor and spawn_failed loop closures gained the Read arm
+# (reads serialize behind the full settle ladder); spawn count stays 33 and
+# no new spawn site exists.
+EXPECTED_WORKER_SPAWN_SHA256 = "adff185815272403fc518f184ba9d183d8384730e0f2ff83e0017620b4ef5c8d"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

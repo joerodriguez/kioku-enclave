@@ -1690,6 +1690,12 @@ struct WalOwnerCommand {
 
 enum WalOwnerMessage {
     Apply(WalOwnerCommand),
+    Read {
+        read: Box<dyn crate::store::ErasedWalStoreRead>,
+        response: oneshot::Sender<
+            Result<std::result::Result<Box<dyn Any + Send>, crate::error::EnclaveError>>,
+        >,
+    },
     #[cfg(test)]
     CheckpointedPlaintext {
         response: oneshot::Sender<Result<Vec<u8>>>,
@@ -1700,6 +1706,12 @@ enum WalStoreLaneCommand {
     Lookup {
         prepared: Box<dyn ErasedPreparedLogicalMutation>,
         response: oneshot::Sender<Result<crate::store::WalStoreReplay>>,
+    },
+    Read {
+        read: Box<dyn crate::store::ErasedWalStoreRead>,
+        response: oneshot::Sender<
+            Result<std::result::Result<Box<dyn Any + Send>, crate::error::EnclaveError>>,
+        >,
     },
     Apply {
         prepared: Box<dyn ErasedPreparedLogicalMutation>,
@@ -1842,6 +1854,17 @@ impl WalStoreLane {
         result.await.map_err(|_| WalOwnerError::Poisoned)?
     }
 
+    async fn read(
+        &self,
+        read: Box<dyn crate::store::ErasedWalStoreRead>,
+    ) -> Result<std::result::Result<Box<dyn Any + Send>, crate::error::EnclaveError>> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(WalStoreLaneCommand::Read { read, response })
+            .map_err(|_| WalOwnerError::Poisoned)?;
+        result.await.map_err(|_| WalOwnerError::Poisoned)?
+    }
+
     async fn apply(
         &self,
         prepared: Box<dyn ErasedPreparedLogicalMutation>,
@@ -1918,6 +1941,13 @@ fn run_wal_store_lane(
         match command {
             WalStoreLaneCommand::Lookup { prepared, response } => {
                 let result = store.lookup_settled_replay(prepared);
+                if store.is_poisoned() {
+                    thread_poisoned.store(true, Ordering::Release);
+                }
+                let _ = response.send(result);
+            }
+            WalStoreLaneCommand::Read { read, response } => {
+                let result = store.read_query_only(read);
                 if store.is_poisoned() {
                     thread_poisoned.store(true, Ordering::Release);
                 }
@@ -2002,6 +2032,36 @@ impl WalOwnerHandle {
             .downcast::<P::Output>()
             .map(|output| *output)
             .map_err(|_| WalOwnerError::Corrupt)
+    }
+
+    /// Query-only read serialized behind every in-flight apply's full
+    /// settle-advance ladder. The outer error is owner/lane integrity; the
+    /// inner result is the closure's own outcome on the settled state.
+    pub(crate) async fn read<F, T>(
+        &self,
+        read: F,
+    ) -> Result<std::result::Result<T, crate::error::EnclaveError>>
+    where
+        F: FnOnce(&rusqlite::Connection) -> std::result::Result<T, crate::error::EnclaveError>
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(WalOwnerMessage::Read {
+                read: Box::new(crate::store::WalStoreReadClosure::from_closure(read)),
+                response,
+            })
+            .await
+            .map_err(|_| WalOwnerError::Poisoned)?;
+        match result.await.map_err(|_| WalOwnerError::Poisoned)?? {
+            Ok(output) => output
+                .downcast::<T>()
+                .map(|output| Ok(*output))
+                .map_err(|_| WalOwnerError::Corrupt),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     #[cfg(test)]
@@ -2107,6 +2167,16 @@ where
                         let result = owner.apply_one(command.prepared).await;
                         let _ = command.response.send(result);
                     }
+                    // Reads serialize through this actor queue on purpose:
+                    // between a lane apply and its witness settlement the
+                    // lane's SQLite holds unsettled state, and this loop
+                    // finishes the full apply-settle-advance ladder before
+                    // taking the next message, so a reader can never observe
+                    // an unacknowledged write.
+                    WalOwnerMessage::Read { read, response } => {
+                        let result = owner.store.read(read).await;
+                        let _ = response.send(result);
+                    }
                     #[cfg(test)]
                     WalOwnerMessage::CheckpointedPlaintext { response } => {
                         let result = owner.store.checkpointed_plaintext().await;
@@ -2131,6 +2201,9 @@ where
                 match command {
                     WalOwnerMessage::Apply(command) => {
                         let _ = command.response.send(Err(WalOwnerError::Persistence));
+                    }
+                    WalOwnerMessage::Read { response, .. } => {
+                        let _ = response.send(Err(WalOwnerError::Persistence));
                     }
                     #[cfg(test)]
                     WalOwnerMessage::CheckpointedPlaintext { response } => {
@@ -4024,6 +4097,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_observe_only_settled_state_and_mutating_reads_poison_the_lane() {
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let control = Arc::new(FakeControl::new());
+        let publication = Arc::new(FakePublication::new(next));
+        let handle = SingleArchiveWalOwner::spawn(store, control, publication);
+
+        // A read after an acknowledged submit observes exactly the settled
+        // row: the actor queue finishes the full apply-settle-advance ladder
+        // before dispatching the read to the lane.
+        handle.submit(plan(42, b"settled-read")).await.unwrap();
+        let values = handle
+            .read(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT value FROM wal_owner_test_values ORDER BY rowid")?;
+                let rows: Vec<Vec<u8>> = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(values.iter().any(|value| value == b"settled-read"));
+
+        // An ordinary mutation attempt inside a read fails under SQLite
+        // query_only as the closure's own error, without harming the lane.
+        let refused = handle
+            .read(|connection| {
+                connection.execute(
+                    "INSERT INTO wal_owner_test_values(value) VALUES (x'99')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(refused.is_err());
+        // The refused mutation left the guard intact: the lane still serves
+        // settled reads (publication-independent proof it was not poisoned).
+        assert!(handle.read(|_| Ok(())).await.unwrap().is_ok());
+
+        // A read that defeats the pragma guard and actually mutates trips the
+        // fingerprint and poisons the lane: a write bypassing the WAL ladder
+        // can never be settled, so nothing may be served after it.
+        assert!(matches!(
+            handle
+                .read(|connection| {
+                    connection.pragma_update(None, "query_only", false)?;
+                    connection.execute(
+                        "INSERT INTO wal_owner_test_values(value) VALUES (x'aa')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .await,
+            Err(WalOwnerError::Corrupt)
+        ));
+        assert!(matches!(
+            handle.read(|_| Ok(())).await,
+            Err(WalOwnerError::Poisoned)
+        ));
+        assert!(matches!(
+            handle.submit(plan(44, b"post-poison")).await,
+            Err(WalOwnerError::Poisoned)
+        ));
+    }
+
+    #[tokio::test]
     async fn control_settlement_failure_never_acknowledges_and_poisons_the_lane() {
         let (current, next) = authoritative_records();
         let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
@@ -4529,5 +4672,12 @@ mod tests {
         }
         assert!(source.contains(concat!("spawn_", "authenticated")));
         assert!(source.contains(concat!("settlement.into_", "lane().await")));
+        assert_eq!(
+            source
+                .matches(concat!("send(WalStoreLaneCommand::", "Read"))
+                .count(),
+            1,
+            "lane reads must dispatch only through the actor-called wrapper"
+        );
     }
 }

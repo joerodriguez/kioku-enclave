@@ -1224,6 +1224,41 @@ impl WalCheckpointStall {
 /// SQLite copy. It is disjoint from the ordinary Store registry and legacy
 /// persistence policy: the only mutation input is a sealed logical-domain
 /// plan, and the only output is an opaque captured publication lease.
+/// Erased query-only read for the WAL store lane. Implemented only by the
+/// closure adapter below; the executor (`read_query_only`) owns every guard.
+pub(crate) trait ErasedWalStoreRead: Send {
+    fn run(
+        self: Box<Self>,
+        connection: &Connection,
+    ) -> std::result::Result<Box<dyn std::any::Any + Send>, EnclaveError>;
+}
+
+/// Closure adapter carrying a typed query-only read across the lane thread.
+pub(crate) struct WalStoreReadClosure<F>(F);
+
+impl<F> WalStoreReadClosure<F> {
+    pub(crate) fn from_closure<T>(read: F) -> Self
+    where
+        F: FnOnce(&Connection) -> std::result::Result<T, EnclaveError> + Send,
+        T: Send + 'static,
+    {
+        Self(read)
+    }
+}
+
+impl<F, T> ErasedWalStoreRead for WalStoreReadClosure<F>
+where
+    F: FnOnce(&Connection) -> std::result::Result<T, EnclaveError> + Send,
+    T: Send + 'static,
+{
+    fn run(
+        self: Box<Self>,
+        connection: &Connection,
+    ) -> std::result::Result<Box<dyn std::any::Any + Send>, EnclaveError> {
+        (self.0)(connection).map(|value| Box::new(value) as Box<dyn std::any::Any + Send>)
+    }
+}
+
 pub(crate) struct SingleArchiveWalStoreOwner {
     staged: Option<AuthenticatedWalOwnerStaging>,
     #[allow(
@@ -1612,6 +1647,56 @@ impl SingleArchiveWalStoreOwner {
 
     pub(crate) const fn instance_id(&self) -> WalOwnerInstanceId {
         self.instance_id
+    }
+
+    /// Query-only read over the lane's authoritative connection, dispatched
+    /// exclusively by the WAL owner actor AFTER any in-flight apply has fully
+    /// witness-settled and advanced — a reader can never observe locally
+    /// committed but unsettled state. The connection is guarded exactly like
+    /// `lookup_settled_replay`: SQLite `query_only` around the closure plus a
+    /// before/after mutation fingerprint, and any observed mutation, restore
+    /// failure, or capture activity poisons this owner, because a write that
+    /// bypassed the WAL ladder can never be settled. The outer result is the
+    /// guard/lane integrity; the inner result is the closure's own outcome.
+    pub(crate) fn read_query_only(
+        &mut self,
+        read: Box<dyn ErasedWalStoreRead>,
+    ) -> std::result::Result<
+        std::result::Result<Box<dyn std::any::Any + Send>, EnclaveError>,
+        WalOwnerError,
+    > {
+        if self.poisoned {
+            return Err(WalOwnerError::Poisoned);
+        }
+        let registration = self.registration.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        if registration.completed_len() != 0 {
+            self.poison();
+            return Err(WalOwnerError::Corrupt);
+        }
+        let connection = self.connection.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        let before = match database_mutation_fingerprint(connection) {
+            Ok(before) => before,
+            Err(_) => {
+                self.poison();
+                return Err(WalOwnerError::Corrupt);
+            }
+        };
+        if connection.pragma_update(None, "query_only", true).is_err() {
+            self.poison();
+            return Err(WalOwnerError::Corrupt);
+        }
+        let result = read.run(connection);
+        let after = database_mutation_fingerprint(connection);
+        let restore = connection.pragma_update(None, "query_only", false);
+        let registration = self.registration.as_ref().ok_or(WalOwnerError::Poisoned)?;
+        let capture_empty = registration.completed_len() == 0;
+        match (after, restore, capture_empty) {
+            (Ok(after), Ok(()), true) if after == before => Ok(result),
+            _ => {
+                self.poison();
+                Err(WalOwnerError::Corrupt)
+            }
+        }
     }
 
     /// Exact local lookup performed only after the actor has reconciled

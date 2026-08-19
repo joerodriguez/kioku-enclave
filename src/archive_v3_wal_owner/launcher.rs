@@ -34,6 +34,21 @@ impl SingleArchiveWalLauncherOwner {
     ) -> Result<P::Output> {
         self.owner.submit(prepared).await
     }
+
+    /// Query-only read on the settled authoritative state, serialized behind
+    /// every in-flight apply's full settle-advance ladder.
+    pub(super) async fn read<F, T>(
+        &self,
+        read: F,
+    ) -> Result<std::result::Result<T, crate::error::EnclaveError>>
+    where
+        F: FnOnce(&rusqlite::Connection) -> std::result::Result<T, crate::error::EnclaveError>
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        self.owner.read(read).await
+    }
 }
 
 impl std::fmt::Debug for SingleArchiveWalLauncherOwner {
