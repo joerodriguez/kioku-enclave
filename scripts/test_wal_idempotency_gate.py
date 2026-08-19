@@ -2225,9 +2225,15 @@ impl X {
             "const OPERATOR_STATEMENT_BYTES: usize = 242;",
             "const IMAGE_ATTESTATION_BYTES: usize = 82;",
             "const RUNTIME_ADMISSION_BYTES: usize = 298;",
-            "const PINNED_OPERATOR_PUBLIC_KEY: [u8; 32] = [0; 32];",
-            "const PINNED_IMAGE_ATTESTATION_PUBLIC_KEY: [u8; 32] = [0; 32];",
-            "const PINNED_RUNTIME_ADMISSION_PUBLIC_KEY: [u8; 32] = [0; 32];",
+            # Real solo-operator roots pinned per docs/adr/0022-solo-operator-activation.md;
+            # the exact full values are pinned by the Rust-side
+            # pinned_roots_are_the_exact_solo_operator_keys test in canary_trust.rs.
+            "const PINNED_OPERATOR_PUBLIC_KEY: [u8; 32] = [",
+            "0x5f, 0xd7, 0xb3, 0xa4, 0x21, 0xe0, 0xdb, 0x60, 0x64, 0x0b, 0x95, 0x87, 0x53, 0x4f, 0xa3, 0x61,",
+            "const PINNED_IMAGE_ATTESTATION_PUBLIC_KEY: [u8; 32] = [",
+            "0x43, 0x17, 0x20, 0xe1, 0x98, 0x3a, 0x92, 0x0e, 0x18, 0x3b, 0x08, 0xc9, 0x84, 0x2d, 0x4e, 0x72,",
+            "const PINNED_RUNTIME_ADMISSION_PUBLIC_KEY: [u8; 32] = [",
+            "0x56, 0x09, 0x2a, 0x35, 0x29, 0x1f, 0x7b, 0xc0, 0xcb, 0xfe, 0xfc, 0xe7, 0x8a, 0x69, 0xa2, 0x38,",
             "operator == image_attestation",
             "operator == runtime_admission",
             "image_attestation == runtime_admission",

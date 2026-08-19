@@ -1011,4 +1011,23 @@ mod tests {
         )
         .is_err());
     }
+    #[test]
+    fn pinned_roots_are_the_exact_solo_operator_keys() {
+        let hex = |bytes: [u8; 32]| -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        assert_eq!(
+            hex(PINNED_OPERATOR_PUBLIC_KEY),
+            "5fd7b3a421e0db60640b9587534fa3617bb0f11817c99d2762867538e1bbd2a5"
+        );
+        assert_eq!(
+            hex(PINNED_IMAGE_ATTESTATION_PUBLIC_KEY),
+            "431720e1983a920e183b08c9842d4e720354b17b0b91ad9ccd954c3362975900"
+        );
+        assert_eq!(
+            hex(PINNED_RUNTIME_ADMISSION_PUBLIC_KEY),
+            "56092a35291f7bc0cbfefce78a69a238337bfdb90e654a68d9d2e085e6da85f5"
+        );
+        assert!(CanaryTrustRoots::pinned().is_ok());
+    }
 }
