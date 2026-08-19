@@ -370,13 +370,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_constructor_fails_closed_on_invalid_pinned_roots() {
-        let source = QueueSource::of(vec![]);
-        // The pinned deployment-observer root is a deliberately invalid zero root
-        // until the separately reviewed activation change: the live observer cannot
-        // be constructed in production today.
+    async fn production_constructor_verifies_against_the_real_pinned_root() {
+        // Real solo-operator roots are pinned (docs/adr/0022-solo-operator-activation.md),
+        // so the production constructor now succeeds — and must verify observations
+        // against exactly that pinned root: a well-formed observation signed by any
+        // other key is rejected. (The real private key never enters this repository,
+        // so a positive-path signature check is impossible here by design.)
+        let window = make_window();
+        let wrong_key = observer_key(0x5A);
+        let observer =
+            LiveDeploymentWindowObserver::from_pinned_root(QueueSource::of(vec![observation(
+                &wrong_key, &window, 1, 1_500,
+            )]))
+            .expect("pinned deployment-observer root is real and nonzero");
         assert!(matches!(
-            LiveDeploymentWindowObserver::from_pinned_root(source),
+            observer.revalidate_window(&window).await,
             Err(AdvisoryOwnerError::Conflict)
         ));
     }
