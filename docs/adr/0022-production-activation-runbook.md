@@ -1,7 +1,10 @@
 # ADR-0022 production activation runbook
 
-Status: **NO-GO**. The reviewed inactive protocol boundaries are locally complete, but activation
-integration, operational evidence, and authority are absent. This runbook records the exact
+Status: **NO-GO** pending the reviewed prerequisites and wiring; the operational ceremony in this
+document is rescoped for the current single-operator/single-user deployment by the accepted
+amendment [`0022-solo-operator-activation.md`](0022-solo-operator-activation.md), which retains
+every data-safety property and no-go signal. The reviewed inactive protocol boundaries are locally
+complete, but activation integration and the amendment's prerequisites are not yet landed. This runbook records the exact
 decisions and evidence required; it does not grant permission to publish, deploy, mutate cloud
 resources, change Store policy, or affect production users.
 
