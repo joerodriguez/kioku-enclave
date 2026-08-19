@@ -977,6 +977,20 @@ pub(crate) trait MaintenanceImportPersistence: ShadowObjectInventory + Send + Sy
         lease: WitnessLease,
     ) -> Result<MaintenanceImportRecord, MaintenanceImportError>;
 
+    /// Persist the Phase-2 witness-lease succession from the settled advisory
+    /// terminal. Control revalidates the exact succession (or its restart
+    /// lineage) and binds the fresh-basis hash to the durable Phase-2
+    /// acquisition row before any retained witness fact changes.
+    async fn persist_phase2_succeeded_lease(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        expected_stage: MaintenanceImportStage,
+        previous: &WitnessRecord,
+        basis: Option<&WitnessRecord>,
+        succeeded: &WitnessRecord,
+        lease: WitnessLease,
+    ) -> Result<MaintenanceImportRecord, MaintenanceImportError>;
+
     async fn persist_manual_required(
         &self,
         operation_id: MaintenanceImportOperationId,
@@ -1619,16 +1633,36 @@ impl SingleArchiveMaintenanceImporter {
         let durable_witness = record
             .witnessed_record()?
             .ok_or(MaintenanceImportError::Corrupt)?;
-        let (renewed, renewed_record) = renew_exact_maintenance_lease(
-            witness.as_ref(),
-            persistence.as_ref(),
-            operation_id,
-            record.stage,
-            owner_id,
-            durable_witness,
-            current,
-        )
-        .await?;
+        // Under a Phase-2 acquisition the durable maintenance lease lineage
+        // resumes only through the succession from the settled advisory
+        // terminal; the plain renewal/reacquire ladder cannot apply across
+        // the advisory owner's era and is never consulted here.
+        let (renewed, renewed_record) = match &phase2_acquisition {
+            Some(_) => {
+                succeed_phase2_maintenance_lease(
+                    witness.as_ref(),
+                    persistence.as_ref(),
+                    operation_id,
+                    record.stage,
+                    owner_id,
+                    durable_witness,
+                    current,
+                )
+                .await?
+            }
+            None => {
+                renew_exact_maintenance_lease(
+                    witness.as_ref(),
+                    persistence.as_ref(),
+                    operation_id,
+                    record.stage,
+                    owner_id,
+                    durable_witness,
+                    current,
+                )
+                .await?
+            }
+        };
         current = renewed;
         record = renewed_record;
         let cipher = resolve_witness_cipher(&current, archive_id, registries).await?;
@@ -2663,6 +2697,63 @@ async fn renew_exact_maintenance_lease(
     Ok((observed, record))
 }
 
+/// Phase-2-only witness-lease succession from the settled advisory owner.
+/// Under the acquisition-gated door, the maintenance owner acquires the exact
+/// unleased advisory terminal its durable Phase-2 acquisition was minted
+/// over; encrypted Control refuses the persist unless the fresh basis hashes
+/// to that acquisition's terminal witness hash. A restart between the
+/// provider acquire and the durable persist re-adopts only the exact leased
+/// successor of the identical archive graph. Every refusal is fail-closed:
+/// the plain renewal/reacquire ladder is never consulted under Phase 2.
+#[allow(clippy::too_many_arguments)]
+async fn succeed_phase2_maintenance_lease(
+    witness: &dyn MaintenanceImportWitnessProvider,
+    persistence: &dyn MaintenanceImportPersistence,
+    operation_id: MaintenanceImportOperationId,
+    stage: MaintenanceImportStage,
+    owner_id: ObjectId,
+    durable: WitnessRecord,
+    observed: WitnessRecord,
+) -> Result<(WitnessRecord, MaintenanceImportRecord), MaintenanceImportError> {
+    if observed.exact_active_lease_for_owner(owner_id).is_ok() {
+        let lease = observed
+            .exact_phase2_succession_lineage_from(&durable, owner_id)
+            .map_err(|_| MaintenanceImportError::Conflict)?;
+        let record = persistence
+            .persist_phase2_succeeded_lease(operation_id, stage, &durable, None, &observed, lease)
+            .await?;
+        return Ok((observed, record));
+    }
+    if !observed.is_exact_phase2_succession_basis_of(&durable, owner_id) {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    let lease = witness
+        .acquire_lease_exact(&observed, owner_id, MAINTENANCE_LEASE_TICKS)
+        .await
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    let succeeded = witness
+        .read_current_exact(observed.archive_id())
+        .await
+        .map_err(|_| MaintenanceImportError::Unavailable)?;
+    let exact = succeeded
+        .exact_phase2_succession_from(&observed, owner_id)
+        .map_err(|_| MaintenanceImportError::Conflict)?;
+    if exact != lease {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    let record = persistence
+        .persist_phase2_succeeded_lease(
+            operation_id,
+            stage,
+            &durable,
+            Some(&observed),
+            &succeeded,
+            lease,
+        )
+        .await?;
+    Ok((succeeded, record))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reacquire_exact_maintenance_lease(
     witness: &dyn MaintenanceImportWitnessProvider,
@@ -3676,6 +3767,20 @@ pub(crate) mod tests {
             self.reacquires
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(record(&self.fixture, _expected_stage, reacquired))
+        }
+
+        async fn persist_phase2_succeeded_lease(
+            &self,
+            _operation_id: MaintenanceImportOperationId,
+            expected_stage: MaintenanceImportStage,
+            _previous: &WitnessRecord,
+            _basis: Option<&WitnessRecord>,
+            succeeded: &WitnessRecord,
+            _lease: WitnessLease,
+        ) -> Result<MaintenanceImportRecord, MaintenanceImportError> {
+            self.reacquires
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(record(&self.fixture, expected_stage, succeeded))
         }
 
         async fn persist_manual_required(
@@ -5641,6 +5746,7 @@ pub(crate) mod tests {
         authority_plan: AuthenticatedMaintenanceImportPlan,
         maintenance_fence: String,
         scope_id: [u8; 16],
+        clock_ticks: Arc<std::sync::atomic::AtomicU64>,
     }
 
     /// Real-sqlite advisory fixture for the Phase-2 acquisition transition.
@@ -5762,7 +5868,7 @@ pub(crate) mod tests {
             .create_if_absent(initial_context.object_key(), initial_envelope.clone())
             .await
             .unwrap();
-        let witness = InMemoryWitness::with_incrementing_clock_for_test(1);
+        let (witness, clock_ticks) = InMemoryWitness::with_shared_incrementing_clock_for_test(1);
         witness
             .bootstrap(WitnessBootstrap::new(
                 archive_id,
@@ -5873,6 +5979,7 @@ pub(crate) mod tests {
             authority_plan,
             maintenance_fence,
             scope_id,
+            clock_ticks,
         }
     }
 
@@ -6234,10 +6341,10 @@ pub(crate) mod tests {
         // (pre-lock and in-lock), takes the Store maintenance admission —
         // which fail-closed re-blocks the exact-user legacy gates — and
         // revalidates the pinned legacy source. It then stops at the
-        // maintenance witness-lease succession from the settled advisory
-        // owner (`renew_exact_maintenance_lease`), which is the separately
-        // reviewed resumed-R2 transition deliberately outside this
-        // acquisition slice; see the ignored full-terminal test below.
+        // witness-lease succession because the settled advisory owner's
+        // lease has not expired at the provider's trusted clock; the
+        // full-terminal test below jumps trusted time past the TTL and
+        // completes the continuation.
         let (_plan, reacquired) = crate::archive_v3_advisory_owner::acquire_phase2_authority(
             fixture.control.as_ref(),
             fixture.store.as_ref(),
@@ -6282,15 +6389,96 @@ pub(crate) mod tests {
             .is_err());
     }
 
-    /// Full Phase-2 continuation to the `WalAuthoritative` terminal. The
-    /// acquisition gates, Store admission, and pinned-source revalidation all
-    /// pass today (pinned by
-    /// `phase2_gated_importer_replaces_absence_predicate_exactly`), but the
-    /// run then requires the maintenance owner to succeed the settled
-    /// advisory owner's witness lease inside `renew_exact_maintenance_lease`.
-    /// That succession is a separately reviewed transition outside the
-    /// acquisition slice, so this full-terminal expectation stays ignored
-    /// until it lands.
+    /// The control-side basis binding: if the live witness moved after the
+    /// acquisition was minted (here: an intruding owner leased and expired
+    /// across the settled terminal), the succession's fresh basis no longer
+    /// hashes to the acquisition's terminal witness hash and the continuation
+    /// refuses — the moved archive can never be imported under an authority
+    /// minted over a different terminal.
+    async fn run_phase2_succession_refuses_a_moved_witness() {
+        let fixture = phase2_acquisition_fixture(Phase2FixtureMode::Settled).await;
+        let witness_hash = phase2_terminal_witness_hash(&fixture).await;
+        let statement = phase2_statement_from_durable(&fixture, witness_hash).await;
+        let authorization = phase2_authorization(statement, [0xe1; 32]);
+        let (_plan, acquisition) = crate::archive_v3_advisory_owner::acquire_phase2_authority(
+            fixture.control.as_ref(),
+            fixture.store.as_ref(),
+            fixture.witness.as_ref(),
+            &fixture.user_id,
+            &authorization,
+        )
+        .await
+        .unwrap();
+        let sealed = Phase2AcquiredAuthorityPlan::from_acquisition(
+            acquisition.persistence_context(),
+            &fixture.user_id,
+            &acquisition,
+        )
+        .unwrap();
+        // Move the witness after the mint: an intruder leases the settled
+        // terminal once its advisory TTL expires, then that lease expires
+        // too, so the driver-side acquire succeeds over a basis whose bytes
+        // differ from the acquisition's frozen terminal.
+        fixture
+            .clock_ticks
+            .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let current = fixture
+            .witness
+            .read_current_exact(fixture.archive_id)
+            .await
+            .unwrap();
+        fixture
+            .witness
+            .inner
+            .acquire_lease(
+                fixture.archive_id,
+                current.database_epoch(),
+                current.registry().key_epoch(),
+                ObjectId::from_bytes([0x99; 16]),
+                10,
+            )
+            .unwrap();
+        fixture
+            .clock_ticks
+            .store(2_000_000, std::sync::atomic::Ordering::SeqCst);
+        let importer = SingleArchiveMaintenanceImporter::from_test_components_with_phase2(
+            fixture.archive_id,
+            Arc::clone(&fixture.objects),
+            Arc::clone(&fixture.registries),
+            fixture.witness.clone(),
+            Arc::clone(&fixture.control),
+            Arc::clone(&fixture.store),
+            fixture.authority_plan.clone(),
+            sealed,
+        )
+        .unwrap();
+        assert!(matches!(
+            importer.run_phase2().await,
+            Err(MaintenanceImportError::Conflict)
+        ));
+        // The refusal left the durable authority untouched: the acquisition
+        // row is intact and the import row never left its settled stage.
+        let retained = fixture
+            .control
+            .load_phase2_authority_acquisition(fixture.archive_id)
+            .await
+            .unwrap();
+        assert!(retained.is_some());
+        let terminal = fixture
+            .witness
+            .read_current_exact(fixture.archive_id)
+            .await
+            .unwrap();
+        assert_eq!(terminal.migration(), MigrationState::ShadowWal);
+    }
+
+    /// Full Phase-2 continuation to the `WalAuthoritative` terminal: the
+    /// acquisition gates, Store admission, and pinned-source revalidation
+    /// pass, the maintenance owner succeeds the settled advisory owner's
+    /// expired witness lease through `succeed_phase2_maintenance_lease`
+    /// (trusted time jumped past the settled owner's TTL, exactly like the
+    /// operator's real cutover waits it out), and the R2 continuation then
+    /// drives the witness to its durable `WalAuthoritative` terminal.
     async fn run_phase2_full_terminal_after_lease_succession() {
         let fixture = phase2_acquisition_fixture(Phase2FixtureMode::Settled).await;
         let witness_hash = phase2_terminal_witness_hash(&fixture).await;
@@ -6311,6 +6499,13 @@ pub(crate) mod tests {
             &acquisition,
         )
         .unwrap();
+        // The settled advisory owner's witness lease must expire at the
+        // provider's trusted clock before the succession can acquire; jump
+        // trusted time past it, exactly like the operator's real cutover
+        // waits out the settled owner's TTL.
+        fixture
+            .clock_ticks
+            .store(1_000_000, std::sync::atomic::Ordering::SeqCst);
         let handoff = SingleArchiveMaintenanceImporter::from_test_components_with_phase2(
             fixture.archive_id,
             Arc::clone(&fixture.objects),
@@ -6338,7 +6533,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires the separately reviewed advisory-to-maintenance witness-lease succession"]
+    fn phase2_succession_refuses_a_moved_witness() {
+        std::thread::Builder::new()
+            .name("phase2-moved-witness-e2e".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run_phase2_succession_refuses_a_moved_witness());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn phase2_run_reaches_wal_authoritative_after_lease_succession() {
         std::thread::Builder::new()
             .name("phase2-terminal-e2e".into())

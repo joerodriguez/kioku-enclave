@@ -1361,6 +1361,128 @@ impl WitnessRecord {
         Ok(reacquired_lease)
     }
 
+    /// Phase-2-only succession basis: `self` is the exact settled advisory
+    /// terminal over the same archive graph the durable maintenance record
+    /// (`previous`, still carrying that era's maintenance lease facts)
+    /// pinned. The terminal retains the settled advisory owner's expired
+    /// lease facts (or none, if a release landed); it is never leased by the
+    /// maintenance owner itself. Every graph, epoch, root, registry,
+    /// predecessor, and deletion fact must be identical, trusted time is
+    /// monotone, and fencing sits at or beyond the durable record's
+    /// advertised next fence, so the durable maintenance lease can never
+    /// resurrect beside its successor. Which exact advisory owner held the
+    /// terminal is pinned by encrypted Control, which refuses any basis whose
+    /// full encoding does not hash to the durable Phase-2 acquisition's
+    /// terminal witness hash.
+    pub(crate) fn is_exact_phase2_succession_basis_of(
+        &self,
+        previous: &Self,
+        owner: ObjectId,
+    ) -> bool {
+        self.valid()
+            && self.deletion == DeletionState::Active
+            && self.migration == MigrationState::ShadowWal
+            && self.owner_id != Some(owner)
+            && previous.valid()
+            && previous.owner_id == Some(owner)
+            && previous.migration == MigrationState::ShadowWal
+            && previous.deletion == DeletionState::Active
+            && self.archive_id == previous.archive_id
+            && self.database_epoch == previous.database_epoch
+            && self.database_epoch_generation == previous.database_epoch_generation
+            && self.predecessor == previous.predecessor
+            && self.root == previous.root
+            && self.registry == previous.registry
+            && self.deletion_fencing_epoch == previous.deletion_fencing_epoch
+            && self.deletion_worker_id == previous.deletion_worker_id
+            && self.deletion_operation_id == previous.deletion_operation_id
+            && self.deletion_evidence == previous.deletion_evidence
+            && self.last_server_tick >= previous.last_server_tick
+            && self.current_fencing_epoch >= previous.next_fencing_epoch
+    }
+
+    /// Accept only the witness-owned transition produced by the Phase-2
+    /// maintenance owner acquiring the settled unleased advisory terminal
+    /// (`basis`). No graph, epoch, registry, migration, deletion,
+    /// predecessor, or evidence field may change; only trusted time and the
+    /// canonical next owner/fence/expiry tuple may advance. Mirrors
+    /// `exact_wal_owner_acquire_from` with the ShadowWal advisory-terminal
+    /// basis instead of the WalAuthoritative handoff.
+    pub(crate) fn exact_phase2_succession_from(
+        &self,
+        basis: &Self,
+        owner: ObjectId,
+    ) -> Result<WitnessLease> {
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !basis.valid()
+            || basis.deletion != DeletionState::Active
+            || basis.migration != MigrationState::ShadowWal
+            || basis.owner_id == Some(owner)
+            || !self.valid()
+            || self.archive_id != basis.archive_id
+            || self.database_epoch != basis.database_epoch
+            || self.database_epoch_generation != basis.database_epoch_generation
+            || self.predecessor != basis.predecessor
+            || self.root != basis.root
+            || self.registry != basis.registry
+            || self.owner_id != Some(owner)
+            || self.current_fencing_epoch != basis.next_fencing_epoch
+            || self.next_fencing_epoch
+                != self
+                    .current_fencing_epoch
+                    .checked_add(1)
+                    .ok_or(WitnessError::Fenced)?
+            || self.last_server_tick < basis.last_server_tick
+            || self.lease_expires_at_tick <= self.last_server_tick
+            || self.migration != basis.migration
+            || self.deletion != basis.deletion
+            || self.deletion_fencing_epoch != basis.deletion_fencing_epoch
+            || self.deletion_worker_id != basis.deletion_worker_id
+            || self.deletion_operation_id != basis.deletion_operation_id
+            || self.deletion_evidence != basis.deletion_evidence
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
+    /// Restart adoption for a Phase-2 succession that acquired its lease
+    /// before the durable record advanced: the observed record is leased by
+    /// the exact maintenance owner over the identical archive graph, strictly
+    /// beyond the durable era's fences. Weaker than
+    /// `exact_phase2_succession_from` only in not pinning the consumed basis
+    /// fence, which the adopted record's own acquire already burned.
+    pub(crate) fn exact_phase2_succession_lineage_from(
+        &self,
+        previous: &Self,
+        owner: ObjectId,
+    ) -> Result<WitnessLease> {
+        let lease = self.exact_active_lease_for_owner(owner)?;
+        if !previous.valid()
+            || previous.owner_id != Some(owner)
+            || previous.migration != MigrationState::ShadowWal
+            || previous.deletion != DeletionState::Active
+            || !self.valid()
+            || self.migration != MigrationState::ShadowWal
+            || self.deletion != DeletionState::Active
+            || self.archive_id != previous.archive_id
+            || self.database_epoch != previous.database_epoch
+            || self.database_epoch_generation != previous.database_epoch_generation
+            || self.predecessor != previous.predecessor
+            || self.root != previous.root
+            || self.registry != previous.registry
+            || self.deletion_fencing_epoch != previous.deletion_fencing_epoch
+            || self.deletion_worker_id != previous.deletion_worker_id
+            || self.deletion_operation_id != previous.deletion_operation_id
+            || self.deletion_evidence != previous.deletion_evidence
+            || self.last_server_tick < previous.last_server_tick
+            || self.current_fencing_epoch < previous.next_fencing_epoch
+        {
+            return Err(WitnessError::Fenced);
+        }
+        Ok(lease)
+    }
+
     /// Deterministically apply one already-authenticated migration advance to
     /// a private in-memory copy. Maintenance control persists these exact
     /// bytes before the provider request, so restart compares full witness
@@ -2647,6 +2769,33 @@ impl InMemoryWitness {
             std::sync::atomic::AtomicU64::new(start_tick),
         )))
     }
+    /// Like `with_incrementing_clock_for_test`, but hands back the shared
+    /// tick cell so a test can jump trusted time forward (e.g. past a settled
+    /// owner's lease expiry). Ticks still advance by one on every read, so
+    /// monotonicity is preserved.
+    #[cfg(test)]
+    pub(crate) fn with_shared_incrementing_clock_for_test(
+        start_tick: u64,
+    ) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
+        struct SharedIncrementingClock(Arc<std::sync::atomic::AtomicU64>);
+        impl TrustedClock for SharedIncrementingClock {
+            fn now_tick(&self) -> Result<u64> {
+                self.0
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |tick| tick.checked_add(1),
+                    )
+                    .map_err(|_| WitnessError::Clock)
+            }
+        }
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(start_tick));
+        (
+            Self::with_clock(Arc::new(SharedIncrementingClock(Arc::clone(&ticks)))),
+            ticks,
+        )
+    }
+
     fn with_clock(clock: Arc<dyn TrustedClock>) -> Self {
         Self::with_clock_and_authenticator(clock, Arc::new(DenyDeletionWorkers))
     }
@@ -5404,6 +5553,115 @@ mod tests {
         assert!(altered.iter().all(|record| record
             .exact_maintenance_terminal_or_release_from(&retained, owner)
             .is_err()));
+    }
+
+    #[test]
+    fn phase2_succession_transitions_bind_full_tuple_and_refuse_wrong_basis() {
+        let (witness, _, bootstrap, _) = setup();
+        let maintenance_owner = ObjectId::from_bytes(id(8));
+        let advisory_owner = ObjectId::from_bytes(id(77));
+        let mut durable = witness.read_current(bootstrap.archive_id).unwrap().unwrap();
+        durable.migration = MigrationState::ShadowWal;
+
+        // The settled advisory terminal: identical graph, the advisory
+        // owner's now-expired lease facts, fencing advanced through the
+        // advisory era, trusted time monotone.
+        let mut basis = durable.clone();
+        basis.owner_id = Some(advisory_owner);
+        basis.current_fencing_epoch = durable.next_fencing_epoch;
+        basis.next_fencing_epoch = durable.next_fencing_epoch + 1;
+        basis.last_server_tick = durable.last_server_tick + 5;
+        basis.lease_expires_at_tick = basis.last_server_tick + 1;
+        assert!(basis.is_exact_phase2_succession_basis_of(&durable, maintenance_owner));
+
+        // Single-fact refusals: a basis leased by the maintenance owner
+        // itself, a non-ShadowWal migration, a fence below the durable
+        // record's advertised next, regressed trusted time, and a changed
+        // graph fact must each refuse.
+        let mut wrong = basis.clone();
+        wrong.owner_id = Some(maintenance_owner);
+        assert!(!wrong.is_exact_phase2_succession_basis_of(&durable, maintenance_owner));
+        let mut wrong = basis.clone();
+        wrong.migration = MigrationState::Legacy;
+        assert!(!wrong.is_exact_phase2_succession_basis_of(&durable, maintenance_owner));
+        let mut wrong = basis.clone();
+        wrong.current_fencing_epoch = durable.current_fencing_epoch;
+        assert!(!wrong.is_exact_phase2_succession_basis_of(&durable, maintenance_owner));
+        let mut wrong = basis.clone();
+        wrong.last_server_tick = durable.last_server_tick - 1;
+        assert!(!wrong.is_exact_phase2_succession_basis_of(&durable, maintenance_owner));
+        let mut wrong = basis.clone();
+        wrong.database_epoch_generation += 1;
+        assert!(!wrong.is_exact_phase2_succession_basis_of(&durable, maintenance_owner));
+
+        // The provider-owned succession acquire consumes exactly the basis's
+        // advertised next fence after the advisory lease expired.
+        let provider = InMemoryWitness::from_provider_record_at_tick(
+            Some(basis.encode()),
+            basis.lease_expires_at_tick + 1,
+        )
+        .unwrap();
+        let lease = provider
+            .acquire_lease(
+                basis.archive_id,
+                basis.database_epoch,
+                basis.registry.key_epoch,
+                maintenance_owner,
+                20,
+            )
+            .unwrap();
+        let succeeded = provider.read_current(basis.archive_id).unwrap().unwrap();
+        assert_eq!(
+            succeeded
+                .exact_phase2_succession_from(&basis, maintenance_owner)
+                .unwrap(),
+            lease
+        );
+
+        // Readback refusals: a tampered next fence, a different owner, a
+        // fence that skipped the basis's advertised next, and a basis leased
+        // by the maintenance owner itself.
+        assert!(succeeded
+            .with_next_fencing_epoch_for_test(succeeded.next_fencing_epoch + 1)
+            .exact_phase2_succession_from(&basis, maintenance_owner)
+            .is_err());
+        assert!(succeeded
+            .exact_phase2_succession_from(&basis, ObjectId::from_bytes(id(9)))
+            .is_err());
+        let mut skipped = succeeded.clone();
+        skipped.current_fencing_epoch += 1;
+        assert!(skipped
+            .exact_phase2_succession_from(&basis, maintenance_owner)
+            .is_err());
+        let mut self_leased_basis = basis.clone();
+        self_leased_basis.owner_id = Some(maintenance_owner);
+        assert!(succeeded
+            .exact_phase2_succession_from(&self_leased_basis, maintenance_owner)
+            .is_err());
+
+        // Restart lineage adoption: the leased successor validates against
+        // the durable maintenance record without the consumed basis, and
+        // refuses a regressed fence, a different owner, or a durable record
+        // that never held the ShadowWal maintenance lease.
+        assert_eq!(
+            succeeded
+                .exact_phase2_succession_lineage_from(&durable, maintenance_owner)
+                .unwrap(),
+            lease
+        );
+        let mut regressed = succeeded.clone();
+        regressed.current_fencing_epoch = durable.current_fencing_epoch;
+        assert!(regressed
+            .exact_phase2_succession_lineage_from(&durable, maintenance_owner)
+            .is_err());
+        assert!(succeeded
+            .exact_phase2_succession_lineage_from(&durable, ObjectId::from_bytes(id(9)))
+            .is_err());
+        let mut legacy_durable = durable.clone();
+        legacy_durable.migration = MigrationState::Legacy;
+        assert!(succeeded
+            .exact_phase2_succession_lineage_from(&legacy_durable, maintenance_owner)
+            .is_err());
     }
 
     #[test]
