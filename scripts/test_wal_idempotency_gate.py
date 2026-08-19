@@ -106,7 +106,12 @@ EXPECTED_WORKER_SPAWN_COUNT = 33
 # no new spawn site exists.
 # Slice J-b3b: async_main's owner-body hash only; spawn count stays 33 and
 # every spawn expression is unchanged.
-EXPECTED_WORKER_SPAWN_SHA256 = "87c3c3c52fd35421833d73f2b2d6ccbc70a355e2bf21436d46f8a5afb812e39a"
+# Re-pinned after upstream #273/#274 (daily signup budget + content-free
+# signup events) changed upsert_user's owner body without co-updating this
+# gate — the gate fails on a clean origin/main checkout. Reviewed against the
+# dumped inventory: the sole delta is that owner-body hash; the spawn count
+# stays 33 and every spawn expression is unchanged.
+EXPECTED_WORKER_SPAWN_SHA256 = "27395dad540523467572f7286c3dba38b760b24d0e492819f9a8b42a2e30637e"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
