@@ -780,11 +780,21 @@ impl SealedSingleArchiveWalRuntime {
             .wal_authoritative_operation_for_archive(self.binding.binding.archive_id())
             .await
             .map_err(|_| crate::archive_v3_maintenance_import::MaintenanceImportError::Conflict)?;
+        // Clone the witness handle before the bundle moves into the handoff:
+        // reconstruction authenticates the live released terminal through it.
+        let witness = {
+            let provider = self
+                .bundle
+                .maintenance_witness(&MaintenanceRuntimeContext(()))
+                .ok_or(crate::archive_v3_maintenance_import::MaintenanceImportError::Unavailable)?;
+            Arc::clone(provider)
+        };
         crate::archive_v3_maintenance_import::CompletedMaintenanceWalHandoff::reconstruct_from_durable(
             self.bundle,
             self.binding,
             control,
             operation,
+            witness.as_ref(),
         )
         .await
     }

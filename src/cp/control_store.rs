@@ -20629,6 +20629,31 @@ impl ControlStore {
             .await
     }
 
+    /// The byte-exact terminal witness Control retained when the WAL owner was
+    /// first reserved for this archive, or `None` if no owner has ever been
+    /// reserved. Every later reservation compares against these exact bytes, so
+    /// the durable restart reconstruction must reuse them rather than deriving
+    /// or re-reading a record whose trusted time has since advanced.
+    pub(crate) async fn retained_wal_owner_terminal_witness(
+        &self,
+        archive_id: crate::archive_v3::ArchiveId,
+    ) -> Result<Option<crate::archive_v3_witness::WitnessRecord>> {
+        self.read(move |conn| {
+            let reserved: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM archive_v3_wal_owner_leases WHERE archive_id=?1)",
+                [archive_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            if reserved != 1 {
+                return Ok(None);
+            }
+            let retained = load_reserved_wal_owner_conn(conn, archive_id)?;
+            let view = retained.control_view(WalOwnerPersistenceContext(()));
+            Ok(Some(view.1.clone()))
+        })
+        .await
+    }
+
     /// The maintenance operation whose durable row rests at the
     /// `wal_authoritative` terminal for one archive — the identity the
     /// startup relaunch reconstructs the WAL-owner handoff from. Any other

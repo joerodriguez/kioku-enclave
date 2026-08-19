@@ -2178,6 +2178,7 @@ impl CompletedMaintenanceWalHandoff {
         archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
         control: Arc<crate::cp::control_store::ControlStore>,
         operation_id: MaintenanceImportOperationId,
+        witness: &dyn MaintenanceImportWitnessProvider,
     ) -> Result<Self, MaintenanceImportError> {
         let persistence: &dyn MaintenanceImportPersistence = control.as_ref();
         let terminal_control = persistence.load_exact(operation_id).await?;
@@ -2187,15 +2188,47 @@ impl CompletedMaintenanceWalHandoff {
         let source = terminal_control
             .source()
             .ok_or(MaintenanceImportError::Corrupt)?;
+        let archive_id = terminal_control.archive_id;
         let retained_terminal = terminal_control
             .witnessed_record()?
             .ok_or(MaintenanceImportError::Corrupt)?;
-        // The durable row retains the still-leased terminal; every evidence
-        // consumer requires its canonical release successor, exactly as the
-        // in-run path passed the provider's released record.
-        let terminal_witness = retained_terminal
-            .derived_maintenance_terminal_release(terminal_control.owner_id)
-            .map_err(|_| MaintenanceImportError::Corrupt)?;
+        // The durable row retains the still-LEASED terminal, while every
+        // evidence consumer — and Control's byte-exact owner-reservation
+        // comparison — requires the record the provider actually produced when
+        // it released that lease. That released record can never be derived
+        // locally: the provider stamps a fresh trusted tick as it releases, so
+        // a synthesized copy is byte-unequal to the live record and the first
+        // owner acquire would refuse forever. Prefer the byte-stable terminal
+        // Control retained at the first owner reservation; only a
+        // never-reserved archive falls back to the live provider read, which is
+        // then authenticated as the canonical release successor of the exact
+        // durable retained terminal.
+        let terminal_witness = match control
+            .retained_wal_owner_terminal_witness(archive_id)
+            .await
+            .map_err(|_| MaintenanceImportError::Unavailable)?
+        {
+            Some(retained) => retained,
+            None => {
+                let current = witness
+                    .read_current_exact(archive_id)
+                    .await
+                    .map_err(|_| MaintenanceImportError::Unavailable)?;
+                let still_leased = current
+                    .exact_maintenance_terminal_or_release_from(
+                        &retained_terminal,
+                        terminal_control.owner_id,
+                    )
+                    .map_err(|_| MaintenanceImportError::Conflict)?;
+                if still_leased {
+                    // The maintenance lease was never released, so the cutover
+                    // did not finish. Fail closed rather than serving from an
+                    // unreleased terminal.
+                    return Err(MaintenanceImportError::Conflict);
+                }
+                current
+            }
+        };
         let parity = CompletedMaintenanceParityEvidence::from_terminal(
             terminal_control,
             source,
@@ -6619,6 +6652,7 @@ pub(crate) mod tests {
             restart_binding,
             Arc::clone(&fixture.control),
             fixture.operation_id,
+            fixture.witness.as_ref(),
         )
         .await
         .unwrap();
@@ -6628,12 +6662,13 @@ pub(crate) mod tests {
         // and the same maintenance operation identity, revalidated through
         // the identical terminal-parity checks the run used.
         assert!(reconstructed.store_fence.is_none());
-        // Identical released terminal modulo trusted time: the derivation
-        // preserves the retained row's tick while the in-run release read the
-        // provider clock at release time.
+        // The reconstruction must reproduce the provider's released terminal
+        // BYTE-EXACTLY, because Control compares these bytes on every owner
+        // reservation and the publisher's first acquire demands equality.
         assert_eq!(
-            reconstructed.terminal_witness.root(),
-            run_terminal_witness.root()
+            reconstructed.terminal_witness.encode(),
+            run_terminal_witness.encode(),
+            "reconstruction must reproduce the provider's released terminal byte-exactly"
         );
         assert_eq!(
             reconstructed.terminal_witness.migration(),
@@ -6643,9 +6678,23 @@ pub(crate) mod tests {
             .terminal_witness
             .exact_active_lease_for_owner(ObjectId::from_bytes([0x5d; 16]))
             .is_err());
+        // Regression for the derived-release defect: the provider stamps a
+        // FRESH trusted tick as it releases, so the durable row's retained
+        // (still-leased) terminal has a strictly earlier tick. Any locally
+        // derived release would therefore be byte-unequal to the live record
+        // and the first owner acquire would refuse forever.
+        let retained_leased = MaintenanceImportPersistence::load_exact(
+            fixture.control.as_ref(),
+            fixture.operation_id,
+        )
+        .await
+        .unwrap()
+        .witnessed_record()
+        .unwrap()
+        .unwrap();
         assert!(
-            reconstructed.terminal_witness.last_server_tick()
-                <= run_terminal_witness.last_server_tick()
+            reconstructed.terminal_witness.last_server_tick() > retained_leased.last_server_tick(),
+            "the release advances trusted time; a derived release cannot match the provider"
         );
         assert_eq!(
             reconstructed.parity.operation_id_for_wal_owner(
@@ -6664,21 +6713,17 @@ pub(crate) mod tests {
         // database, and the settled-only read then serves the exact row the
         // pinned legacy generation carried into the archive (the later
         // capture-window write stayed a dirty local fact by design).
-        let terminal_row = MaintenanceImportPersistence::load_exact(
-            fixture.control.as_ref(),
-            fixture.operation_id,
-        )
-        .await
-        .unwrap();
-        let seed = terminal_row
-            .witnessed_record()
-            .unwrap()
-            .unwrap()
-            .derived_maintenance_terminal_release(terminal_row.owner_id)
+        // Seed the publisher's provider fake with the record the witness
+        // ACTUALLY released — never with a value derived from the code under
+        // test, which would make this end-to-end proof circular.
+        let live_released = fixture
+            .witness
+            .read_current_exact(fixture.archive_id)
+            .await
             .unwrap();
         let transport = Arc::new(
             crate::archive_v3_firestore_witness::test_transport::FakeTransport::new(
-                Some(seed.encode()),
+                Some(live_released.encode()),
                 [],
             ),
         );
@@ -6707,6 +6752,7 @@ pub(crate) mod tests {
             launch_binding,
             Arc::clone(&fixture.control),
             fixture.operation_id,
+            fixture.witness.as_ref(),
         )
         .await
         .unwrap();
