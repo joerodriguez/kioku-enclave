@@ -12720,6 +12720,19 @@ fn load_wal_authoritative_persistence_selection_conn(
             "wal-authority persistence selection requires an active account".into(),
         ));
     }
+    wal_authoritative_selection_for_bound_user_conn(conn, user_id)
+}
+
+/// Shared selection core: active archive binding plus the durable
+/// `wal_authoritative` terminal for exactly that archive. Deliberately does
+/// not check account status — the startup scan installs selections for
+/// suspended accounts too, because suspension already blocks serving while a
+/// later reactivation must never resurrect legacy snapshot persistence for a
+/// WAL-authoritative archive.
+fn wal_authoritative_selection_for_bound_user_conn(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<WalAuthoritativePersistenceSelection> {
     let binding = validate_active_archive_binding_conn(conn, user_id)?;
     let archive_id = binding.archive_id;
     let stage: Option<String> = conn
@@ -12739,6 +12752,35 @@ fn load_wal_authoritative_persistence_selection_conn(
         user_id: user_id.to_owned(),
         archive_id,
     })
+}
+
+/// Enumerate every user whose actively bound archive rests at the durable
+/// `wal_authoritative` terminal and mint their selections. The scan is only a
+/// candidate filter; each candidate is revalidated through the shared
+/// selection core in the same read transaction, and any candidate that fails
+/// revalidation fails the whole scan closed — startup must never admit
+/// requests while a WAL-authoritative user is missing their selection.
+fn load_wal_authoritative_persistence_selections_conn(
+    conn: &Connection,
+) -> Result<Vec<WalAuthoritativePersistenceSelection>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT b.user_id
+         FROM archive_bindings b
+         JOIN archive_v3_maintenance_imports i
+           ON i.archive_id = b.archive_id AND i.format_version = 1
+         WHERE i.stage = 'wal_authoritative'
+         ORDER BY b.user_id",
+    )?;
+    let user_ids: Vec<String> = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    user_ids
+        .iter()
+        .map(|user_id| {
+            validate_user_id(user_id)?;
+            wal_authoritative_selection_for_bound_user_conn(conn, user_id)
+        })
+        .collect()
 }
 
 fn load_phase2_authority_acquisition_conn(
@@ -20479,11 +20521,10 @@ impl ControlStore {
 
     /// Mint the sealed per-user WAL-authority persistence selection from the
     /// durable `wal_authoritative` terminal of the user's actively bound
-    /// archive. Read-only; intentionally uncalled by startup, routes, or any
-    /// provider path until the reviewed activation change.
+    /// archive. Read-only.
     #[allow(
         dead_code,
-        reason = "reserved for the reviewed Phase-2 activation; startup and serving remain intentionally unwired"
+        reason = "reserved for the per-user activation transition; startup uses the scan variant"
     )]
     pub(crate) async fn load_wal_authoritative_persistence_selection(
         &self,
@@ -20491,6 +20532,17 @@ impl ControlStore {
     ) -> Result<WalAuthoritativePersistenceSelection> {
         let user_id = user_id.to_owned();
         self.read(move |conn| load_wal_authoritative_persistence_selection_conn(conn, &user_id))
+            .await
+    }
+
+    /// Startup scan: mint the selection for every user whose actively bound
+    /// archive rests at the durable `wal_authoritative` terminal, regardless
+    /// of account status. Serving startup installs these into the Store
+    /// before request admission; any failure fails startup closed.
+    pub(crate) async fn load_wal_authoritative_persistence_selections(
+        &self,
+    ) -> Result<Vec<WalAuthoritativePersistenceSelection>> {
+        self.read(load_wal_authoritative_persistence_selections_conn)
             .await
     }
 
@@ -32435,6 +32487,45 @@ mod tests {
         // A non-active account refuses even over the durable terminal.
         conn.execute("UPDATE users SET status='suspended' WHERE id=?1", [USER_ID])
             .unwrap();
+        assert!(matches!(
+            load_wal_authoritative_persistence_selection_conn(&conn, USER_ID),
+            Err(EnclaveError::Auth(_))
+        ));
+    }
+
+    #[test]
+    fn wal_authoritative_persistence_selections_scan_is_status_independent_and_exact() {
+        // Nothing bound: the scan is empty, never an error.
+        let conn = account_conn();
+        assert!(load_wal_authoritative_persistence_selections_conn(&conn)
+            .unwrap()
+            .is_empty());
+
+        // A bound archive resting before the terminal is not selected.
+        let conn = account_conn();
+        maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        let _fixture = seed_maintenance_shadow_send_unknown(&conn).unwrap();
+        assert!(load_wal_authoritative_persistence_selections_conn(&conn)
+            .unwrap()
+            .is_empty());
+
+        // The durable terminal selects exactly the bound user/archive.
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        let selections = load_wal_authoritative_persistence_selections_conn(&conn).unwrap();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].user_id(), USER_ID);
+        assert_eq!(selections[0].archive_id(), fixture.archive_id);
+
+        // Account status never drops a terminal selection: suspension already
+        // blocks serving, and reactivation must never resurrect snapshot
+        // persistence. The per-user loader still refuses the suspended
+        // account for its own activation-transition callers.
+        conn.execute("UPDATE users SET status='suspended' WHERE id=?1", [USER_ID])
+            .unwrap();
+        let selections = load_wal_authoritative_persistence_selections_conn(&conn).unwrap();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].user_id(), USER_ID);
         assert!(matches!(
             load_wal_authoritative_persistence_selection_conn(&conn, USER_ID),
             Err(EnclaveError::Auth(_))

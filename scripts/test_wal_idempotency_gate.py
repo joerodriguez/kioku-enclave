@@ -25,7 +25,9 @@ EXPECTED_STORE_SURFACE_COUNT = 16
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
 # surface was added or removed.
-EXPECTED_STORE_SURFACE_SHA256 = "ffda0f5c40ff7ac36a19046805a7665d3c21b2393156983f46786cfefb23b47b"
+# Slice J-a: async_main's owner body gained the pre-admission WAL-authority
+# selection installation; both constructor call expressions are unchanged.
+EXPECTED_STORE_SURFACE_SHA256 = "0b859a9841be0cd1ca2c87e18f24a41757336943404f9807a3eea3fba3033f9c"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -77,7 +79,10 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
 # Deliberate ADR-0022 Phase-2 re-pin (upstream: run_phase2's owned spawn) plus
 # this change's media_worker sweep-closure delta (resurrection step).
 EXPECTED_WORKER_SPAWN_COUNT = 33
-EXPECTED_WORKER_SPAWN_SHA256 = "b7ea10ea59421b71e060989629ea4f81219c08df1a3660b6754a074013362b0d"
+# Slice J-a: the sole delta is async_main's owner-body hash (pre-admission
+# selection installation); the spawn count and every spawn expression are
+# unchanged.
+EXPECTED_WORKER_SPAWN_SHA256 = "39ec6ea831bbbe1252726f716c89fe93392f3b01992f9c08b2264f2277d56080"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2098,6 +2103,22 @@ impl X {
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         self.assertIn("mod archive_v3_wal_owner;", main)
         self.assertNotIn("archive_v3_wal_owner::", main)
+        # Deliberate ADR-0022 serving-activation pin (slice J-a): serving
+        # startup must install every durable-terminal WAL-authority
+        # persistence selection BEFORE the listener binds, and the scan/install
+        # pair appears exactly once (the pre-serving canary argv path returns
+        # earlier and never installs selections).
+        self.assertEqual(
+            main.count("load_wal_authoritative_persistence_selections()"), 1
+        )
+        self.assertEqual(main.count(".install_wal_authority_persistence("), 1)
+        install_at = main.index(".install_wal_authority_persistence(")
+        first_bind_at = main.index("tokio::net::TcpListener::bind")
+        self.assertLess(
+            install_at,
+            first_bind_at,
+            "WAL-authority selections must install before any listener binds",
+        )
         self.assertIn("mod launcher;", owner)
         self.assertIn("struct SingleArchiveWalOwner", owner)
         self.assertNotIn("pub(crate) struct SingleArchiveWalOwner", owner)

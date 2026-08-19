@@ -970,6 +970,31 @@ async fn async_main() {
         );
     }
 
+    // ADR-0022: a user whose archive durably reached the wal_authoritative
+    // terminal must never see legacy snapshot persistence again, across every
+    // restart. Install the Control-derived selections before any request is
+    // admitted; any refusal fails startup closed. Content-free: count only.
+    let wal_authority_selections = control_store
+        .load_wal_authoritative_persistence_selections()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("Failed to load WAL-authority persistence selections: {error}")
+        });
+    let installed_wal_authority_selections = wal_authority_selections.len();
+    for selection in wal_authority_selections {
+        store
+            .install_wal_authority_persistence(selection)
+            .unwrap_or_else(|error| {
+                panic!("Failed to install a WAL-authority persistence selection: {error}")
+            });
+    }
+    if installed_wal_authority_selections > 0 {
+        info!(
+            installed = installed_wal_authority_selections,
+            "installed WAL-authority persistence selections before request admission"
+        );
+    }
+
     let (jwt_secrets, google_web_client_secret) = if test_mode_enabled() {
         let jwt_secret =
             std::env::var("JWT_SECRET").unwrap_or_else(|_| "test-jwt-secret".to_string());
