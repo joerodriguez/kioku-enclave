@@ -13,7 +13,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CLASSIFICATIONS = frozenset({"A", "B", "C"})
 EXPECTED_STORE_CALL_COUNT = 160
-EXPECTED_STORE_CALL_SHA256 = "6910a19a12368a794d1e639d937fa03a7149d2bbd1fc92d2895f072ef0ae09a7"
+# Re-pinned after reviewing upstream 7db0162 (finalizer representative-screen
+# selection) and 901f3f0 (media dedupe_version 2): no call site was added or
+# removed and no classification changed; owner bodies moved, and the sole
+# closure delta is `elided: false` field initialization in the finalizer's
+# evidence-row constructor — no SQL or mutation-semantics change.
+EXPECTED_STORE_CALL_SHA256 = "1813372ba05ee4c382bc3b1567ef81c4f73e74fa6e202de5fa939d4657b040d2"
 EXPECTED_STORE_SURFACE_COUNT = 16
 EXPECTED_STORE_SURFACE_SHA256 = "f2a9028f214f26ffac34f9453a177902da78dbc71817f2db7776ef24e36ccd1d"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
