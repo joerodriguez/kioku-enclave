@@ -35,6 +35,7 @@ mod comparison;
 mod controller;
 mod live_window_observer;
 mod monitoring_policy;
+mod phase2_authority;
 pub(crate) mod solo_entry;
 mod telemetry;
 mod window;
