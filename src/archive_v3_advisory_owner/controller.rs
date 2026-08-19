@@ -110,6 +110,36 @@ pub(super) trait TrustedVmMemoryProvider: Send + Sync {
     async fn authenticated_vm_bytes(&self) -> Result<u64>;
 }
 
+/// Production VM memory provider reading MemTotal from /proc/meminfo inside the
+/// SEV-protected guest. The measurement is bound to the signed runtime admission's
+/// expectations by the caller; a missing or malformed /proc/meminfo (any
+/// non-Linux host) fails closed rather than guessing.
+pub(crate) struct ProcMeminfoVmMemoryProvider;
+
+#[async_trait::async_trait]
+impl TrustedVmMemoryProvider for ProcMeminfoVmMemoryProvider {
+    async fn authenticated_vm_bytes(&self) -> Result<u64> {
+        let raw = tokio::fs::read_to_string("/proc/meminfo")
+            .await
+            .map_err(|_| AdvisoryOwnerError::Persistence)?;
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kib: u64 = rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse()
+                    .map_err(|_| AdvisoryOwnerError::Corrupt)?;
+                if kib == 0 {
+                    return Err(AdvisoryOwnerError::Corrupt);
+                }
+                return kib.checked_mul(1024).ok_or(AdvisoryOwnerError::Corrupt);
+            }
+        }
+        Err(AdvisoryOwnerError::Corrupt)
+    }
+}
+
 /// Test VM memory provider returning a configured byte capacity.
 #[cfg(test)]
 pub(super) struct TestVmMemoryProvider {

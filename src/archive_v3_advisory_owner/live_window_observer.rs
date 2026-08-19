@@ -175,6 +175,70 @@ impl Phase1WindowObserver for LiveDeploymentWindowObserver {
     }
 }
 
+/// Operator-supplied observation feed for the solo-operator window: a local file of
+/// `payload_hex:signature_hex` lines, appended during the downtime window with
+/// `scripts/phase1_sign_window_observation.py`. Each fetch consumes the next
+/// unconsumed line exactly once; signature and window binding are verified by the
+/// observer, never here. Content-free errors; the file carries only public
+/// commitments and a signature, never key material.
+pub(crate) struct FileSignedWindowObservationSource {
+    path: std::path::PathBuf,
+    consumed: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Debug for FileSignedWindowObservationSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FileSignedWindowObservationSource(<opaque>)")
+    }
+}
+
+impl FileSignedWindowObservationSource {
+    pub(crate) fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            consumed: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SignedWindowObservationSource for FileSignedWindowObservationSource {
+    async fn fetch_latest(&self) -> Result<SignedWindowObservation> {
+        let raw = tokio::fs::read_to_string(&self.path)
+            .await
+            .map_err(|_| AdvisoryOwnerError::Persistence)?;
+        let index = self.consumed.load(std::sync::atomic::Ordering::SeqCst);
+        let line = raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .nth(index)
+            .ok_or(AdvisoryOwnerError::Persistence)?;
+        let (payload_hex, signature_hex) = line
+            .trim()
+            .split_once(':')
+            .ok_or(AdvisoryOwnerError::Corrupt)?;
+        let decode = |value: &str| -> Result<Vec<u8>> {
+            if value.is_empty() || !value.len().is_multiple_of(2) {
+                return Err(AdvisoryOwnerError::Corrupt);
+            }
+            (0..value.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&value[i..i + 2], 16)
+                        .map_err(|_| AdvisoryOwnerError::Corrupt)
+                })
+                .collect()
+        };
+        let observation = SignedWindowObservation {
+            payload: decode(payload_hex)?,
+            signature: decode(signature_hex)?,
+        };
+        self.consumed
+            .store(index + 1, std::sync::atomic::Ordering::SeqCst);
+        Ok(observation)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +450,76 @@ mod tests {
         assert!(matches!(
             observer.revalidate_window(&window).await,
             Err(AdvisoryOwnerError::Conflict)
+        ));
+    }
+    #[tokio::test]
+    async fn file_source_consumes_lines_exactly_once_through_the_real_observer() {
+        let key = observer_key(0x0E);
+        let window = make_window();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("observations.log");
+
+        let encode_line = |sequence: u64, ticks: u64| {
+            let obs = observation(&key, &window, sequence, ticks);
+            let hex = |bytes: &[u8]| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            };
+            format!("{}:{}\n", hex(&obs.payload), hex(&obs.signature))
+        };
+        std::fs::write(&path, encode_line(1, 1_400) + &encode_line(2, 1_600)).unwrap();
+
+        let source = Arc::new(FileSignedWindowObservationSource::new(path.clone()));
+        let observer = LiveDeploymentWindowObserver::with_root_for_test(public_root(&key), source);
+
+        let first = observer.revalidate_window(&window).await.unwrap();
+        assert_eq!(first.sequence(), 1);
+        window.verify_revalidation_proof(&first).unwrap();
+        let second = observer.revalidate_window(&window).await.unwrap();
+        assert_eq!(second.sequence(), 2);
+        window.verify_revalidation_proof(&second).unwrap();
+
+        // The feed is exhausted: a third fetch fails closed until the operator
+        // appends a fresh signed observation.
+        assert!(matches!(
+            observer.revalidate_window(&window).await,
+            Err(AdvisoryOwnerError::Persistence)
+        ));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(encode_line(3, 1_800).as_bytes())
+            })
+            .unwrap();
+        let third = observer.revalidate_window(&window).await.unwrap();
+        assert_eq!(third.sequence(), 3);
+
+        // Malformed lines fail closed with content-free errors.
+        let bad = dir.path().join("bad.log");
+        std::fs::write(&bad, "nothex:zz\n").unwrap();
+        let observer = LiveDeploymentWindowObserver::with_root_for_test(
+            public_root(&key),
+            Arc::new(FileSignedWindowObservationSource::new(bad)),
+        );
+        assert!(matches!(
+            observer.revalidate_window(&window).await,
+            Err(AdvisoryOwnerError::Corrupt)
+        ));
+
+        // A missing file is unavailable, not corrupt.
+        let observer = LiveDeploymentWindowObserver::with_root_for_test(
+            public_root(&key),
+            Arc::new(FileSignedWindowObservationSource::new(
+                dir.path().join("absent.log"),
+            )),
+        );
+        assert!(matches!(
+            observer.revalidate_window(&window).await,
+            Err(AdvisoryOwnerError::Persistence)
         ));
     }
 }
