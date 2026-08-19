@@ -45,50 +45,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_wal_idempotency_gate import (  # noqa: E402
     match_delimiter,
     sanitize_rust,
+    without_cfg_test_items,
 )
-
-
-def _phase3_cfg_test_spans(code: str) -> list[tuple[int, int]]:
-    """cfg(test) item spans with bracket-aware semicolon handling: a `;` inside
-    `()`/`[]` nesting (e.g. `[u8; 32]` in a signature) does not end the item."""
-    spans: list[tuple[int, int]] = []
-    for match in re.finditer(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]", code):
-        cursor = match.end()
-        while True:
-            cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
-            if code.startswith("#[", cursor):
-                cursor = match_delimiter(code, cursor + 1, "[", "]")
-                continue
-            break
-        depth = 0
-        end = None
-        for index in range(cursor, len(code)):
-            ch = code[index]
-            if ch in "([":
-                depth += 1
-            elif ch in ")]":
-                depth -= 1
-            elif ch == ";" and depth == 0:
-                end = index + 1
-                break
-            elif ch == "{" and depth == 0:
-                end = match_delimiter(code, index, "{", "}")
-                break
-        if end is None:
-            raise AssertionError("cfg(test) attribute has no item")
-        spans.append((match.start(), end))
-    return spans
-
-
-def without_cfg_test_items(source: str) -> str:
-    """Blank complete cfg(test) items while retaining production source text."""
-    code = sanitize_rust(source)
-    chars = list(source)
-    for start, end in _phase3_cfg_test_spans(code):
-        for index in range(start, end):
-            if chars[index] not in ("\n",):
-                chars[index] = " "
-    return "".join(chars)
 
 PHASE3_FILES = [
     "src/archive_v3_extent.rs",
