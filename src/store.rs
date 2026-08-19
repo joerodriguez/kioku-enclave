@@ -246,6 +246,14 @@ pub struct Store {
     /// `wal_authoritative` maintenance-import terminal, and there is no
     /// removal: a selected user can never fall back to snapshot persistence.
     wal_authority_persistence: StdRwLock<HashMap<UserId, [u8; 16]>>,
+    /// Inactive per-user WAL serving authorities. Registered only by the
+    /// config-gated startup relaunch after reconstruction; empty in every
+    /// production constructor today. A selected user with no registered
+    /// authority refuses reads rather than ever serving the stale legacy
+    /// snapshot.
+    wal_serving_authorities: StdRwLock<
+        HashMap<UserId, Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>>,
+    >,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     /// Current media write/read bucket. New capture objects are written here.
@@ -3925,6 +3933,7 @@ impl Store {
             shadow_capture: StdRwLock::new(shadow_capture),
             persistence_policy,
             wal_authority_persistence: StdRwLock::new(HashMap::new()),
+            wal_serving_authorities: StdRwLock::new(HashMap::new()),
             kms,
             gcs,
             media_gcs,
@@ -4012,6 +4021,95 @@ impl Store {
                 selections.insert(user_id, archive_id);
                 Ok(())
             }
+        }
+    }
+
+    /// Register the launched WAL serving authority for one selected user.
+    /// Requires the durable-terminal selection to already be installed (the
+    /// authority's basis), and is install-once: a second registration for the
+    /// same user is a Conflict. No removal exists; a poisoned authority
+    /// refuses every call and the process restarts to relaunch. Nothing in
+    /// startup, config, routes, or providers calls this yet; the sole
+    /// intended caller is the config-gated startup relaunch.
+    #[allow(
+        dead_code,
+        reason = "reserved for the config-gated startup relaunch; serving remains intentionally unwired"
+    )]
+    pub(crate) fn install_wal_serving_authority(
+        &self,
+        user_id: &str,
+        authority: Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>,
+    ) -> Result<()> {
+        validate_user_id(user_id)?;
+        let selections = self.wal_authority_persistence.read().map_err(|_| {
+            EnclaveError::Store("wal-authority persistence selections poisoned".into())
+        })?;
+        if !selections.contains_key(user_id) {
+            return Err(EnclaveError::Conflict(
+                "wal serving authority requires the durable-terminal selection".into(),
+            ));
+        }
+        drop(selections);
+        let mut authorities = self
+            .wal_serving_authorities
+            .write()
+            .map_err(|_| EnclaveError::Store("wal serving authorities poisoned".into()))?;
+        if authorities.contains_key(user_id) {
+            return Err(EnclaveError::Conflict(
+                "wal serving authority already registered".into(),
+            ));
+        }
+        authorities.insert(user_id.to_owned(), authority);
+        Ok(())
+    }
+
+    /// True exactly when the user has a durable-terminal WAL-authority
+    /// selection installed (never the whole-Store test seam): the users whose
+    /// legacy blob must never load again.
+    fn wal_selected(&self, user_id: &str) -> bool {
+        match self.wal_authority_persistence.read() {
+            Ok(selections) => selections.contains_key(user_id),
+            // Poisoned lock fails closed to "selected": refusal, not legacy.
+            Err(_) => true,
+        }
+    }
+
+    fn wal_serving_authority(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority>> {
+        self.wal_serving_authorities
+            .read()
+            .ok()
+            .and_then(|authorities| authorities.get(user_id).cloned())
+    }
+
+    /// Dual-path read: the single API domain code migrates onto. An
+    /// unselected user reads through the ordinary guarded legacy path; a
+    /// selected user's read routes to the registered serving authority's
+    /// settled-only lane, and refuses as unavailable when no authority is
+    /// registered — a WAL-authoritative user is never served the stale
+    /// legacy snapshot, and closure errors surface unchanged.
+    #[allow(
+        dead_code,
+        reason = "reserved for the per-domain routing migrations; serving remains intentionally unwired"
+    )]
+    pub(crate) async fn wal_authoritative_read<F, T>(&self, user_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if !self.wal_selected(user_id) {
+            return self.with_user_read(user_id, f).await;
+        }
+        let authority = self.wal_serving_authority(user_id).ok_or_else(|| {
+            EnclaveError::Store("wal-authoritative user has no serving authority".into())
+        })?;
+        match authority.read(f).await {
+            Ok(inner) => inner,
+            Err(_) => Err(EnclaveError::Store(
+                "wal serving authority is unavailable".into(),
+            )),
         }
     }
 
@@ -5489,6 +5587,18 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
+        // A WAL-authoritative user's legacy blob must never load again: after
+        // the cutover it is a stale snapshot, so every legacy-path read for a
+        // selected user refuses outright and availability arrives only
+        // through the routed settled-only lane (`wal_authoritative_read`).
+        // `with_user_read` and `read_user` delegate here, making this the
+        // single legacy-load choke point; the mutation family already
+        // refuses through the per-user policy.
+        if self.wal_selected(user_id) {
+            return Err(EnclaveError::Store(
+                "wal-authoritative user reads are routed".into(),
+            ));
+        }
         let actor = self.actor_for_access(user_id).await?;
         let mut state = actor.state.lock().await;
 
@@ -5616,6 +5726,12 @@ impl Store {
 
     /// Persist a user's index back to GCS.
     pub async fn save_user(&self, user_id: &str) -> Result<()> {
+        // A selected user has no legacy state to persist — their handle can
+        // never load — so saving is a provider-silent no-op success, keeping
+        // migration-era callers that save after mutations working unchanged.
+        if self.wal_selected(user_id) {
+            return Ok(());
+        }
         let actor = match self.actor_for_existing(user_id).await? {
             SaveTarget::Actor(actor) => actor,
             SaveTarget::AlreadyFlushed => return Ok(()),
@@ -13337,17 +13453,24 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        // The selected user gets the full fail-closed WAL-logical surface:
-        // reads are query-only, mutation closures never run, and nothing PUTs.
+        // The selected user's legacy blob never loads again: every
+        // legacy-path read refuses outright (never the stale snapshot),
+        // mutation closures never run, saves are provider-silent no-ops, and
+        // the routed read reports the authority as missing rather than
+        // falling back.
         let puts_before = gcs.put_attempts();
+        let read_ran = Arc::new(AtomicBool::new(false));
+        let read_ran_in_closure = Arc::clone(&read_ran);
         assert!(store
-            .with_user("wal-selected", |conn| {
-                conn.execute(
-                    "INSERT INTO screenshots (captured_at) VALUES (?1)",
-                    ["2026-08-19T12:00:00Z"],
-                )?;
+            .with_user("wal-selected", move |_| {
+                read_ran_in_closure.store(true, Ordering::SeqCst);
                 Ok(())
             })
+            .await
+            .is_err());
+        assert!(!read_ran.load(Ordering::SeqCst));
+        assert!(store
+            .with_user_read("wal-selected", |_| Ok(()))
             .await
             .is_err());
         let mut_ran = Arc::new(AtomicBool::new(false));
@@ -13364,7 +13487,10 @@ pub(crate) mod tests {
             .with_user_if_changed("wal-selected", |_| Ok(((), true)))
             .await
             .is_err());
-        // A clean selected handle saves as a no-op without provider writes.
+        assert!(store
+            .wal_authoritative_read("wal-selected", |_| Ok(()))
+            .await
+            .is_err());
         store.save_user("wal-selected").await.unwrap();
         assert_eq!(gcs.put_attempts(), puts_before);
 
@@ -13380,20 +13506,28 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
+        // The dual-path routed read serves unselected users through the
+        // ordinary guarded legacy path.
+        let counted: i64 = store
+            .wal_authoritative_read("legacy-neighbor", |conn| {
+                Ok(conn.query_row("SELECT count(*) FROM screenshots", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(counted, 1);
         store.save_user("legacy-neighbor").await.unwrap();
         assert_eq!(gcs.put_attempts(), puts_before + 1);
     }
 
     #[tokio::test]
-    async fn wal_authority_selection_refuses_genesis_dirty_save_and_eviction_put_for_selected_user()
-    {
+    async fn wal_authority_selection_refuses_every_legacy_load_before_provider_access() {
         let gcs = Arc::new(FakeGcs::new());
-        seed_current_user_object(&gcs, "wal-dirty-selected");
+        seed_current_user_object(&gcs, "wal-seeded-selected");
         let store = Store::new(Arc::new(FakeKms), gcs.clone());
         store
             .install_wal_authority_persistence(
                 crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
-                    "wal-dirty-selected",
+                    "wal-seeded-selected",
                     crate::archive_v3::ArchiveId::from_bytes([0x5f; 16]),
                 ),
             )
@@ -13407,37 +13541,27 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        // A selected user with no durable object has no reviewed WAL genesis:
-        // creation must refuse before any KMS wrap or provider write.
+        // Selected users refuse before any KMS wrap, temp file, or provider
+        // access — whether their legacy object exists (stale snapshot) or
+        // not (no reviewed WAL genesis): the legacy path never opens.
         let puts_before = gcs.put_attempts();
+        assert!(store
+            .with_user_read("wal-seeded-selected", |_| Ok(()))
+            .await
+            .is_err());
         assert!(store
             .with_user_read("wal-missing-selected", |_| Ok(()))
             .await
             .is_err());
-        assert_eq!(gcs.put_attempts(), puts_before);
-
-        // A dirtied selected handle can neither save nor be flushed away.
-        store
-            .with_user_read("wal-dirty-selected", |_| Ok(()))
+        assert!(store
+            .wal_authoritative_read("wal-missing-selected", |_| Ok(()))
             .await
-            .unwrap();
-        let actor = match store
-            .actor_for_existing("wal-dirty-selected")
-            .await
-            .unwrap()
-        {
-            SaveTarget::Actor(actor) => actor,
-            SaveTarget::AlreadyFlushed => panic!("fresh selected actor was unexpectedly evicted"),
-        };
-        {
-            let mut state = actor.state.lock().await;
-            state.handle.as_mut().unwrap().mark_dirty();
-        }
-        assert!(store.save_user("wal-dirty-selected").await.is_err());
+            .is_err());
         assert_eq!(gcs.put_attempts(), puts_before);
-        let state = actor.state.lock().await;
-        assert!(state.handle.is_some());
-        assert!(state.handle.as_ref().unwrap().dirty);
+        // Saving a selected user is a provider-silent no-op: nothing legacy
+        // ever loaded, and nothing may ever persist.
+        store.save_user("wal-seeded-selected").await.unwrap();
+        assert_eq!(gcs.put_attempts(), puts_before);
     }
 
     #[tokio::test]

@@ -6695,10 +6695,11 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let serving =
+        let serving = Arc::new(
             crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(launch_handoff)
                 .await
-                .unwrap();
+                .unwrap(),
+        );
         let captured = serving
             .read(|connection| {
                 let value: String = connection.query_row(
@@ -6712,6 +6713,41 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(captured, "exact");
+
+        // The Store's own routed read serves the lane for the selected user
+        // — the production read API end-to-end over WAL-authoritative data —
+        // while every legacy-path read refuses rather than serving the stale
+        // snapshot.
+        fixture
+            .store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    &fixture.user_id,
+                    fixture.archive_id,
+                ),
+            )
+            .unwrap();
+        fixture
+            .store
+            .install_wal_serving_authority(&fixture.user_id, Arc::clone(&serving))
+            .unwrap();
+        let routed: String = fixture
+            .store
+            .wal_authoritative_read(&fixture.user_id, |connection| {
+                Ok(connection.query_row(
+                    "SELECT value FROM app_metadata WHERE key='phase2-e2e'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(routed, "exact");
+        assert!(fixture
+            .store
+            .with_user(&fixture.user_id, |_| Ok(()))
+            .await
+            .is_err());
     }
 
     #[test]
