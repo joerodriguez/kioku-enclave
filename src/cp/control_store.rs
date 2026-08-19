@@ -12419,6 +12419,84 @@ fn acquire_phase2_authority_conn(
     Ok((loaded, true))
 }
 
+/// Sealed per-user WAL-authority persistence facts. Minted only by encrypted
+/// Control from the durable `wal_authoritative` maintenance-import terminal of
+/// the user's actively bound archive; sibling modules can consume but never
+/// construct it, so the Store's per-user WAL-logical persistence selection can
+/// only ever follow the durable terminal. There is no reverse transition.
+pub(crate) struct WalAuthoritativePersistenceSelection {
+    user_id: String,
+    archive_id: ArchiveId,
+}
+
+impl WalAuthoritativePersistenceSelection {
+    pub(crate) fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub(crate) fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    /// Test-only mint for Store-side selection tests; the production path is
+    /// exclusively `load_wal_authoritative_persistence_selection_conn`.
+    #[cfg(test)]
+    pub(crate) fn for_test(user_id: &str, archive_id: ArchiveId) -> Self {
+        validate_user_id(user_id).expect("test selection user identity");
+        Self {
+            user_id: user_id.to_owned(),
+            archive_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for WalAuthoritativePersistenceSelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WalAuthoritativePersistenceSelection(<opaque>)")
+    }
+}
+
+/// Mint the per-user WAL-authority persistence selection exactly when the
+/// user's actively bound archive has reached the durable `wal_authoritative`
+/// maintenance-import terminal. Every other stage — and any missing binding or
+/// import row — refuses with a content-free Conflict, so a selection can never
+/// precede the terminal it asserts.
+fn load_wal_authoritative_persistence_selection_conn(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<WalAuthoritativePersistenceSelection> {
+    validate_user_id(user_id)?;
+    let status: Option<String> = conn
+        .query_row("SELECT status FROM users WHERE id = ?1", [user_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if status.as_deref() != Some("active") {
+        return Err(EnclaveError::Auth(
+            "wal-authority persistence selection requires an active account".into(),
+        ));
+    }
+    let binding = validate_active_archive_binding_conn(conn, user_id)?;
+    let archive_id = binding.archive_id;
+    let stage: Option<String> = conn
+        .query_row(
+            "SELECT stage FROM archive_v3_maintenance_imports
+             WHERE archive_id=?1 AND format_version=1",
+            [archive_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stage.as_deref() != Some("wal_authoritative") {
+        return Err(EnclaveError::Conflict(
+            "wal-authority persistence requires the durable wal_authoritative terminal".into(),
+        ));
+    }
+    Ok(WalAuthoritativePersistenceSelection {
+        user_id: user_id.to_owned(),
+        archive_id,
+    })
+}
+
 fn load_phase2_authority_acquisition_conn(
     conn: &Connection,
     archive_id: ArchiveId,
@@ -20153,6 +20231,23 @@ impl ControlStore {
             Ok(((row, created), created))
         })
         .await
+    }
+
+    /// Mint the sealed per-user WAL-authority persistence selection from the
+    /// durable `wal_authoritative` terminal of the user's actively bound
+    /// archive. Read-only; intentionally uncalled by startup, routes, or any
+    /// provider path until the reviewed activation change.
+    #[allow(
+        dead_code,
+        reason = "reserved for the reviewed Phase-2 activation; startup and serving remain intentionally unwired"
+    )]
+    pub(crate) async fn load_wal_authoritative_persistence_selection(
+        &self,
+        user_id: &str,
+    ) -> Result<WalAuthoritativePersistenceSelection> {
+        let user_id = user_id.to_owned();
+        self.read(move |conn| load_wal_authoritative_persistence_selection_conn(conn, &user_id))
+            .await
     }
 
     /// Exact-load the durable Phase-2 acquisition for one archive with full
@@ -32037,6 +32132,41 @@ mod tests {
                 .unwrap()
                 .fencing_epoch()
         );
+    }
+
+    #[test]
+    fn wal_authoritative_persistence_selection_mints_only_from_the_durable_terminal() {
+        // No archive binding at all refuses before any import inspection.
+        let conn = account_conn();
+        assert!(load_wal_authoritative_persistence_selection_conn(&conn, USER_ID).is_err());
+
+        // Every pre-terminal import stage refuses with a content-free Conflict.
+        let conn = account_conn();
+        maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+        let _fixture = seed_maintenance_shadow_send_unknown(&conn).unwrap();
+        assert!(matches!(
+            load_wal_authoritative_persistence_selection_conn(&conn, USER_ID),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // The durable wal_authoritative terminal mints the exact selection.
+        let conn = account_conn();
+        let fixture = seed_maintenance_wal_authoritative(&conn).unwrap();
+        let selection = load_wal_authoritative_persistence_selection_conn(&conn, USER_ID).unwrap();
+        assert_eq!(selection.user_id(), USER_ID);
+        assert_eq!(selection.archive_id(), fixture.archive_id);
+        assert_eq!(
+            format!("{selection:?}"),
+            "WalAuthoritativePersistenceSelection(<opaque>)"
+        );
+
+        // A non-active account refuses even over the durable terminal.
+        conn.execute("UPDATE users SET status='suspended' WHERE id=?1", [USER_ID])
+            .unwrap();
+        assert!(matches!(
+            load_wal_authoritative_persistence_selection_conn(&conn, USER_ID),
+            Err(EnclaveError::Auth(_))
+        ));
     }
 
     #[test]

@@ -240,6 +240,12 @@ pub struct Store {
     /// closed. No startup/config/provider path can select a user.
     shadow_capture: StdRwLock<Option<StoreShadowCaptureSelection>>,
     persistence_policy: StorePersistencePolicy,
+    /// Inactive per-user WAL-authority persistence selections. Every
+    /// production constructor starts empty; the only installer consumes the
+    /// sealed Control-minted selection selected off the durable
+    /// `wal_authoritative` maintenance-import terminal, and there is no
+    /// removal: a selected user can never fall back to snapshot persistence.
+    wal_authority_persistence: StdRwLock<HashMap<UserId, [u8; 16]>>,
     pub kms: Arc<dyn KmsClient>,
     pub gcs: Arc<dyn GcsClient>,
     /// Current media write/read bucket. New capture objects are written here.
@@ -3833,6 +3839,7 @@ impl Store {
             content_write_barrier: Arc::new(ContentWriteBarrier::default()),
             shadow_capture: StdRwLock::new(shadow_capture),
             persistence_policy,
+            wal_authority_persistence: StdRwLock::new(HashMap::new()),
             kms,
             gcs,
             media_gcs,
@@ -3892,6 +3899,56 @@ impl Store {
                     Ok(())
                 }
             }
+        }
+    }
+
+    /// Install the per-user WAL-authority persistence selection by consuming
+    /// the sealed Control-minted facts. Install-once per user: an identical
+    /// re-install is idempotent, a different archive is a Conflict, and no
+    /// removal exists. Nothing in startup, config, routes, or providers calls
+    /// this; the sole intended caller is the reviewed Phase-2 activation
+    /// transition.
+    #[allow(
+        dead_code,
+        reason = "reserved for the reviewed Phase-2 activation; startup and serving remain intentionally unwired"
+    )]
+    pub(crate) fn install_wal_authority_persistence(
+        &self,
+        selection: crate::cp::control_store::WalAuthoritativePersistenceSelection,
+    ) -> Result<()> {
+        let user_id = selection.user_id().to_owned();
+        validate_user_id(&user_id)?;
+        let archive_id = *selection.archive_id().as_bytes();
+        let mut selections = self.wal_authority_persistence.write().map_err(|_| {
+            EnclaveError::Store("wal-authority persistence selections poisoned".into())
+        })?;
+        match selections.get(&user_id) {
+            Some(existing) if *existing == archive_id => Ok(()),
+            Some(_) => Err(EnclaveError::Conflict(
+                "wal-authority persistence already selected for a different archive".into(),
+            )),
+            None => {
+                selections.insert(user_id, archive_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve the persistence policy for one user: the WAL-logical policy
+    /// applies when the whole Store was constructed with it (test seam) or
+    /// when the user has a durable-terminal-backed WAL-authority selection.
+    /// A poisoned selection lock fails closed to the non-persisting policy
+    /// rather than ever letting a selected user reach snapshot persistence.
+    fn persistence_policy_for(&self, user_id: &str) -> StorePersistencePolicy {
+        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+            return StorePersistencePolicy::WalLogicalOnly;
+        }
+        match self.wal_authority_persistence.read() {
+            Ok(selections) if selections.contains_key(user_id) => {
+                StorePersistencePolicy::WalLogicalOnly
+            }
+            Ok(_) => StorePersistencePolicy::LegacySnapshot,
+            Err(_) => StorePersistencePolicy::WalLogicalOnly,
         }
     }
 
@@ -5366,7 +5423,8 @@ impl Store {
         let handle = state.handle.as_mut().ok_or_else(|| {
             EnclaveError::Store("open-user registry lost its SQLite handle".into())
         })?;
-        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly
+        let policy = self.persistence_policy_for(user_id);
+        if policy == StorePersistencePolicy::WalLogicalOnly
             && (handle.dirty || handle.blob_meta.retry_save_before_access)
         {
             return Err(wal_logical_only_error());
@@ -5374,7 +5432,7 @@ impl Store {
         if handle.blob_meta.retry_save_before_access {
             self.flush_handle(handle).await?;
         }
-        let wal_query_only = self.persistence_policy == StorePersistencePolicy::WalLogicalOnly;
+        let wal_query_only = policy == StorePersistencePolicy::WalLogicalOnly;
         if wal_query_only {
             handle.conn.pragma_update(None, "query_only", true)?;
         }
@@ -5431,7 +5489,7 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
-        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+        if self.persistence_policy_for(user_id) == StorePersistencePolicy::WalLogicalOnly {
             return Err(wal_logical_only_error());
         }
         let actor = self.actor_for_access(user_id).await?;
@@ -5468,7 +5526,7 @@ impl Store {
     where
         F: FnOnce(&Connection) -> Result<(T, bool)>,
     {
-        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+        if self.persistence_policy_for(user_id) == StorePersistencePolicy::WalLogicalOnly {
             return Err(wal_logical_only_error());
         }
         self.with_user(user_id, move |conn| f(conn).map(|(value, _changed)| value))
@@ -5484,7 +5542,7 @@ impl Store {
         let mut state = actor.state.lock().await;
         self.reject_if_blocked(user_id).await?;
         if let Some(handle) = state.handle.as_mut() {
-            if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+            if self.persistence_policy_for(user_id) == StorePersistencePolicy::WalLogicalOnly {
                 return if handle.dirty || handle.blob_meta.retry_save_before_access {
                     Err(wal_logical_only_error())
                 } else {
@@ -6349,7 +6407,8 @@ impl Store {
         let had_handle = state.handle.is_some();
 
         if let Some(handle) = state.handle.as_mut() {
-            if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly
+            if self.persistence_policy_for(&candidate.user_id)
+                == StorePersistencePolicy::WalLogicalOnly
                 && (handle.dirty || handle.blob_meta.retry_save_before_access)
             {
                 let mut registry = self.registry.lock().await;
@@ -6438,7 +6497,7 @@ impl Store {
                 // WAL-only has no reviewed bootstrap/genesis mutation. A
                 // missing user must fail before KMS wrap, empty-database
                 // creation, temp-file creation, or any provider write.
-                if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly {
+                if self.persistence_policy_for(user_id) == StorePersistencePolicy::WalLogicalOnly {
                     return Err(wal_logical_only_error());
                 }
                 // New user — generate a fresh DEK and an empty database
@@ -6465,7 +6524,7 @@ impl Store {
         // its SQLite schema is otherwise current. WAL-only mode has no owner
         // for that mutation, so reject before creating or opening a local
         // database file.
-        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly
+        if self.persistence_policy_for(user_id) == StorePersistencePolicy::WalLogicalOnly
             && envelope_rewrite_dirty
         {
             return Err(wal_logical_only_error());
@@ -6481,7 +6540,7 @@ impl Store {
         let (conn, shadow_capture_registration, migration_dirty) = match open_db(
             &temp_path,
             selected_capture.as_deref(),
-            self.persistence_policy,
+            self.persistence_policy_for(user_id),
         ) {
             Ok(opened) => opened,
             Err(e) => {
@@ -6503,7 +6562,9 @@ impl Store {
     }
 
     async fn flush_handle(&self, handle: &mut UserHandle) -> Result<()> {
-        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly && handle.dirty {
+        if self.persistence_policy_for(&handle.user_id) == StorePersistencePolicy::WalLogicalOnly
+            && handle.dirty
+        {
             return Err(wal_logical_only_error());
         }
         self.flush_handle_with_admission(handle, false, None, true)
@@ -6551,7 +6612,9 @@ impl Store {
         allowed_marker_authority: Option<&str>,
         preserve_recovery_checkpoint: bool,
     ) -> Result<()> {
-        if self.persistence_policy == StorePersistencePolicy::WalLogicalOnly && handle.dirty {
+        if self.persistence_policy_for(&handle.user_id) == StorePersistencePolicy::WalLogicalOnly
+            && handle.dirty
+        {
             return Err(wal_logical_only_error());
         }
         let started = Instant::now();
@@ -13176,6 +13239,166 @@ pub(crate) mod tests {
         assert!(stale_path.exists());
         assert!(!sqlite_sidecar_path(&stale_path, "-wal").exists());
         assert!(!sqlite_sidecar_path(&stale_path, "-shm").exists());
+    }
+
+    #[tokio::test]
+    async fn wal_authority_selection_applies_per_user_and_leaves_legacy_users_untouched() {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_current_user_object(&gcs, "wal-selected");
+        seed_current_user_object(&gcs, "legacy-neighbor");
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "wal-selected",
+                    crate::archive_v3::ArchiveId::from_bytes([0x5e; 16]),
+                ),
+            )
+            .unwrap();
+
+        // The selected user gets the full fail-closed WAL-logical surface:
+        // reads are query-only, mutation closures never run, and nothing PUTs.
+        let puts_before = gcs.put_attempts();
+        assert!(store
+            .with_user("wal-selected", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES (?1)",
+                    ["2026-08-19T12:00:00Z"],
+                )?;
+                Ok(())
+            })
+            .await
+            .is_err());
+        let mut_ran = Arc::new(AtomicBool::new(false));
+        let mut_ran_in_closure = Arc::clone(&mut_ran);
+        assert!(store
+            .with_user_mut("wal-selected", move |_| {
+                mut_ran_in_closure.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .is_err());
+        assert!(!mut_ran.load(Ordering::SeqCst));
+        assert!(store
+            .with_user_if_changed("wal-selected", |_| Ok(((), true)))
+            .await
+            .is_err());
+        // A clean selected handle saves as a no-op without provider writes.
+        store.save_user("wal-selected").await.unwrap();
+        assert_eq!(gcs.put_attempts(), puts_before);
+
+        // The unselected neighbor keeps every legacy snapshot capability
+        // through the very same Store instance.
+        store
+            .with_user("legacy-neighbor", |conn| {
+                conn.execute(
+                    "INSERT INTO screenshots (captured_at) VALUES (?1)",
+                    ["2026-08-19T12:00:01Z"],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user("legacy-neighbor").await.unwrap();
+        assert_eq!(gcs.put_attempts(), puts_before + 1);
+    }
+
+    #[tokio::test]
+    async fn wal_authority_selection_refuses_genesis_dirty_save_and_eviction_put_for_selected_user()
+    {
+        let gcs = Arc::new(FakeGcs::new());
+        seed_current_user_object(&gcs, "wal-dirty-selected");
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "wal-dirty-selected",
+                    crate::archive_v3::ArchiveId::from_bytes([0x5f; 16]),
+                ),
+            )
+            .unwrap();
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "wal-missing-selected",
+                    crate::archive_v3::ArchiveId::from_bytes([0x60; 16]),
+                ),
+            )
+            .unwrap();
+
+        // A selected user with no durable object has no reviewed WAL genesis:
+        // creation must refuse before any KMS wrap or provider write.
+        let puts_before = gcs.put_attempts();
+        assert!(store
+            .with_user_read("wal-missing-selected", |_| Ok(()))
+            .await
+            .is_err());
+        assert_eq!(gcs.put_attempts(), puts_before);
+
+        // A dirtied selected handle can neither save nor be flushed away.
+        store
+            .with_user_read("wal-dirty-selected", |_| Ok(()))
+            .await
+            .unwrap();
+        let actor = match store
+            .actor_for_existing("wal-dirty-selected")
+            .await
+            .unwrap()
+        {
+            SaveTarget::Actor(actor) => actor,
+            SaveTarget::AlreadyFlushed => panic!("fresh selected actor was unexpectedly evicted"),
+        };
+        {
+            let mut state = actor.state.lock().await;
+            state.handle.as_mut().unwrap().mark_dirty();
+        }
+        assert!(store.save_user("wal-dirty-selected").await.is_err());
+        assert_eq!(gcs.put_attempts(), puts_before);
+        let state = actor.state.lock().await;
+        assert!(state.handle.is_some());
+        assert!(state.handle.as_ref().unwrap().dirty);
+    }
+
+    #[tokio::test]
+    async fn wal_authority_selection_installs_once_per_user_and_refuses_archive_changes() {
+        let gcs = Arc::new(FakeGcs::new());
+        let store = Store::new(Arc::new(FakeKms), gcs.clone());
+        let first = crate::archive_v3::ArchiveId::from_bytes([0x61; 16]);
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "selected-once",
+                    first,
+                ),
+            )
+            .unwrap();
+        // Identical re-install is idempotent; a different archive conflicts.
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "selected-once",
+                    first,
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "selected-once",
+                    crate::archive_v3::ArchiveId::from_bytes([0x62; 16]),
+                ),
+            ),
+            Err(EnclaveError::Conflict(_))
+        ));
+        // A second user selects independently of the first.
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    "selected-second",
+                    crate::archive_v3::ArchiveId::from_bytes([0x63; 16]),
+                ),
+            )
+            .unwrap();
     }
 
     #[tokio::test]
