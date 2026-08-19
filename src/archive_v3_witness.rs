@@ -1361,6 +1361,31 @@ impl WitnessRecord {
         Ok(reacquired_lease)
     }
 
+    /// Derive the canonical lease-release successor of this exact retained
+    /// WalAuthoritative maintenance terminal, for durable restart
+    /// reconstruction of the WAL-owner handoff: byte-identical to what the
+    /// provider's release returned at the terminal (owner cleared, expiry
+    /// zero, trusted time preserved), and consumers re-check it through the
+    /// same terminal-or-release relation as the in-run path. Fails closed
+    /// unless `self` is the still-leased retained terminal, so nothing but
+    /// the durable row's exact bytes can shape it.
+    pub(crate) fn derived_maintenance_terminal_release(&self, owner: ObjectId) -> Result<Self> {
+        self.exact_active_lease_for_owner(owner)?;
+        if !self.valid()
+            || self.migration != MigrationState::WalAuthoritative
+            || self.deletion != DeletionState::Active
+        {
+            return Err(WitnessError::Fenced);
+        }
+        let mut released = self.clone();
+        released.owner_id = None;
+        released.lease_expires_at_tick = 0;
+        if !released.valid() {
+            return Err(WitnessError::InvalidTransition);
+        }
+        Ok(released)
+    }
+
     /// Phase-2-only succession basis: `self` is the exact settled advisory
     /// terminal over the same archive graph the durable maintenance record
     /// (`previous`, still carrying that era's maintenance lease facts)

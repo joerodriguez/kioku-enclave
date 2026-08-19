@@ -2103,7 +2103,7 @@ pub(crate) struct CompletedMaintenanceWalHandoff {
     archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
     parity: CompletedMaintenanceParityEvidence,
     control: Arc<crate::cp::control_store::ControlStore>,
-    store_fence: crate::store::StoreWalAuthorityFence,
+    store_fence: Option<crate::store::StoreWalAuthorityFence>,
 }
 
 pub(crate) struct CompletedMaintenanceWalHandoffView {
@@ -2112,7 +2112,7 @@ pub(crate) struct CompletedMaintenanceWalHandoffView {
     pub(crate) archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
     pub(crate) parity: CompletedMaintenanceParityEvidence,
     pub(crate) control: Arc<crate::cp::control_store::ControlStore>,
-    pub(crate) store_fence: crate::store::StoreWalAuthorityFence,
+    pub(crate) store_fence: Option<crate::store::StoreWalAuthorityFence>,
 }
 
 /// Non-cloneable proof that the offline maintenance transition reached its
@@ -2164,6 +2164,53 @@ impl fmt::Debug for CompletedMaintenanceParityEvidence {
 }
 
 impl CompletedMaintenanceWalHandoff {
+    /// Reconstruct the WAL-owner handoff from durable state alone, for a
+    /// serving process that restarts after the cutover. The exact durable
+    /// WalAuthoritative terminal row supplies the retained terminal witness
+    /// and re-mints the parity evidence through the same validation the
+    /// terminal path used; the publisher then performs its own live-witness
+    /// owner reserve/renew/reacquire with lost-response adoption. No Store
+    /// fence transfers on restart: the startup-installed per-user selection
+    /// carries the fence's guarantees durably, and the legacy generation
+    /// stays pinned by the durable row and the permanent provider marker.
+    pub(crate) async fn reconstruct_from_durable(
+        runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+        archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+        control: Arc<crate::cp::control_store::ControlStore>,
+        operation_id: MaintenanceImportOperationId,
+    ) -> Result<Self, MaintenanceImportError> {
+        let persistence: &dyn MaintenanceImportPersistence = control.as_ref();
+        let terminal_control = persistence.load_exact(operation_id).await?;
+        if terminal_control.stage() != MaintenanceImportStage::WalAuthoritative {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        let source = terminal_control
+            .source()
+            .ok_or(MaintenanceImportError::Corrupt)?;
+        let retained_terminal = terminal_control
+            .witnessed_record()?
+            .ok_or(MaintenanceImportError::Corrupt)?;
+        // The durable row retains the still-leased terminal; every evidence
+        // consumer requires its canonical release successor, exactly as the
+        // in-run path passed the provider's released record.
+        let terminal_witness = retained_terminal
+            .derived_maintenance_terminal_release(terminal_control.owner_id)
+            .map_err(|_| MaintenanceImportError::Corrupt)?;
+        let parity = CompletedMaintenanceParityEvidence::from_terminal(
+            terminal_control,
+            source,
+            &terminal_witness,
+        )?;
+        Ok(Self {
+            runtime,
+            terminal_witness,
+            archive_binding,
+            parity,
+            control,
+            store_fence: None,
+        })
+    }
+
     pub(crate) fn into_wal_owner(
         self,
         _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
@@ -2382,7 +2429,7 @@ async fn finish_offline_import(
         archive_binding,
         parity,
         control,
-        store_fence,
+        store_fence: Some(store_fence),
     })
 }
 
@@ -6524,12 +6571,73 @@ pub(crate) mod tests {
             format!("{handoff:?}"),
             "CompletedMaintenanceWalHandoff(<offline>)"
         );
+        let run_terminal_witness = handoff.terminal_witness.clone();
+        let run_operation_id = handoff.parity.operation_id_for_wal_owner(
+            crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test(),
+        );
+        drop(handoff);
         let terminal = fixture
             .witness
             .read_current_exact(fixture.archive_id)
             .await
             .unwrap();
         assert_eq!(terminal.migration(), MigrationState::WalAuthoritative);
+
+        // Restart: the in-run handoff is gone. Reconstruct it from durable
+        // state alone with a fresh runtime, launch the serving authority
+        // through the real publisher owner-acquisition against the live
+        // Control and witness, and prove the recovered authoritative
+        // database serves settled reads — including the exact pre-import
+        // capture row — through the settled-only read surface.
+        let restart_runtime =
+            crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle::from_maintenance_test_components(
+                Arc::clone(&fixture.objects),
+                Arc::clone(&fixture.registries),
+                fixture.witness.clone(),
+            );
+        let restart_binding =
+            crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding::from_control_store(
+                crate::cp::control_store::ArchiveBinding::for_runtime_test(fixture.archive_id),
+            );
+        let reconstructed = CompletedMaintenanceWalHandoff::reconstruct_from_durable(
+            restart_runtime,
+            restart_binding,
+            Arc::clone(&fixture.control),
+            fixture.operation_id,
+        )
+        .await
+        .unwrap();
+        // The durable reconstruction carries no Store fence (startup-installed
+        // selections replace it across restarts) and reproduces the in-run
+        // handoff's evidence byte-exactly: the same released terminal witness
+        // and the same maintenance operation identity, revalidated through
+        // the identical terminal-parity checks the run used.
+        assert!(reconstructed.store_fence.is_none());
+        // Identical released terminal modulo trusted time: the derivation
+        // preserves the retained row's tick while the in-run release read the
+        // provider clock at release time.
+        assert_eq!(
+            reconstructed.terminal_witness.root(),
+            run_terminal_witness.root()
+        );
+        assert_eq!(
+            reconstructed.terminal_witness.migration(),
+            MigrationState::WalAuthoritative
+        );
+        assert!(reconstructed
+            .terminal_witness
+            .exact_active_lease_for_owner(ObjectId::from_bytes([0x5d; 16]))
+            .is_err());
+        assert!(
+            reconstructed.terminal_witness.last_server_tick()
+                <= run_terminal_witness.last_server_tick()
+        );
+        assert_eq!(
+            reconstructed.parity.operation_id_for_wal_owner(
+                crate::archive_v3_wal_owner::WalOwnerStoreContext::for_test()
+            ),
+            run_operation_id
+        );
     }
 
     #[test]
@@ -6840,7 +6948,11 @@ pub(crate) mod tests {
         .run()
         .await
         .unwrap();
-        assert!(handoff.store_fence.scratch_family_absent_for_test());
+        assert!(handoff
+            .store_fence
+            .as_ref()
+            .unwrap()
+            .scratch_family_absent_for_test());
         let terminal = witness.read_current_exact(archive_id).await.unwrap();
         assert_eq!(terminal.migration(), MigrationState::WalAuthoritative);
         assert_eq!(terminal.root().root().sequence(), 2);
@@ -6877,7 +6989,11 @@ pub(crate) mod tests {
         .run()
         .await
         .unwrap();
-        assert!(restart.store_fence.scratch_family_absent_for_test());
+        assert!(restart
+            .store_fence
+            .as_ref()
+            .unwrap()
+            .scratch_family_absent_for_test());
         assert!(witness
             .read_current_exact(archive_id)
             .await
@@ -6906,7 +7022,11 @@ pub(crate) mod tests {
             owner_view.terminal_witness.migration(),
             MigrationState::WalAuthoritative
         );
-        assert!(owner_view.store_fence.scratch_family_absent_for_test());
+        assert!(owner_view
+            .store_fence
+            .as_ref()
+            .unwrap()
+            .scratch_family_absent_for_test());
     }
 
     #[test]
