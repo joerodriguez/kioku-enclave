@@ -22013,6 +22013,19 @@ impl ControlStore {
             .await
     }
 
+    /// Load the exact active legacy archive binding for one user, refusing
+    /// inactive, deleting, or fenced archives. This is the durable source the
+    /// sealed shadow runtime binds against; it performs no provider I/O.
+    #[allow(
+        dead_code,
+        reason = "reserved for the reviewed offline maintenance launcher; startup and serving remain intentionally unwired"
+    )]
+    pub(crate) async fn active_archive_binding(&self, user_id: &str) -> Result<ArchiveBinding> {
+        let user_id = user_id.to_string();
+        self.read(move |conn| validate_active_archive_binding_conn(conn, &user_id))
+            .await
+    }
+
     /// Prepare or exactly adopt the inactive one-user maintenance operation.
     /// This is the only producer of its non-cloneable plan and it performs no
     /// archive, witness, or legacy provider I/O.
@@ -28624,6 +28637,34 @@ mod tests {
                 .await,
             Err(EnclaveError::Auth(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn active_archive_binding_returns_exact_ledger_binding_and_fails_closed() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let user = control
+            .upsert_user("active-binding-subject", "binding@example.com")
+            .await
+            .unwrap();
+        let ledger = control
+            .archive_deletion_ledger(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let binding = control.active_archive_binding(&user.id).await.unwrap();
+        assert_eq!(
+            *binding.archive_id().as_bytes(),
+            *ledger.binding.archive_id().as_bytes()
+        );
+        assert_eq!(format!("{binding:?}"), "ArchiveBinding(<opaque>)");
+
+        // Unknown users fail closed rather than minting a binding.
+        assert!(control
+            .active_archive_binding("22222222-2222-4222-8222-222222222222")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
