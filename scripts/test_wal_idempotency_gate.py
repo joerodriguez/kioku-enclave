@@ -19,13 +19,18 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Slice F-c: the only call-site delta is with_user_if_changed's owner body,
 # whose refusal now reads the per-user resolver; its call expression and C
 # classification are unchanged.
-EXPECTED_STORE_CALL_COUNT = 166
+EXPECTED_STORE_CALL_COUNT = 168
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
 # submit, status read) inheriting the owner's pre-reviewed classification,
 # plus that owner's body hash across its unchanged legacy branch.
-EXPECTED_STORE_CALL_SHA256 = "4f86b48f35ac3ebea0d1108377e8d3a8bcda11c85396b43f3539c11a15f46525"
+# Slice J-c2 (media screen-reference batch): upload_screen_reference_batch
+# gains its routed preflight-read and settle-submit sites; its legacy
+# write+save pair stays inside the unselected branch (owner hash and the
+# indentation-shifted with_user expression move; save_user expression
+# unchanged).
+EXPECTED_STORE_CALL_SHA256 = "a058e16da47f0a2abccb03d12b2dbaf3af37819b8d8e0f2428b2717f9d7c626a"
 EXPECTED_STORE_SURFACE_COUNT = 16
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction

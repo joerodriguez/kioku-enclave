@@ -1085,17 +1085,39 @@ async fn upload_screen_reference_batch(
             )
         }
     };
-    let preflight = state
-        .store
-        .with_user_read(&user_id, |conn| {
-            request
-                .events
-                .iter()
-                .zip(&validated.manifest_digests)
-                .map(|(event, digest)| preflight_source_event(conn, event, digest, None))
-                .collect::<Result<Vec<_>>>()
-        })
-        .await;
+    // ADR-0022 per-domain routing: a WAL-authoritative user's preflight and
+    // batch write route through the settled lane — the sealed plan covers the
+    // complete manifest vector and every reference write, and the settle-
+    // submit replaces the legacy write+save pair with acknowledgement only
+    // after witness settlement. Billing reserve/complete, limits, leases, and
+    // telemetry are identical on both branches.
+    let wal_authoritative = state.store.is_wal_authoritative(&user_id);
+    let preflight = if wal_authoritative {
+        let events = request.events.clone();
+        let digests = validated.manifest_digests.clone();
+        state
+            .store
+            .wal_authoritative_read(&user_id, move |conn| {
+                events
+                    .iter()
+                    .zip(&digests)
+                    .map(|(event, digest)| preflight_source_event(conn, event, digest, None))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await
+    } else {
+        state
+            .store
+            .with_user_read(&user_id, |conn| {
+                request
+                    .events
+                    .iter()
+                    .zip(&validated.manifest_digests)
+                    .map(|(event, digest)| preflight_source_event(conn, event, digest, None))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await
+    };
     let preflight = match preflight {
         Ok(value) => value,
         Err(error) => {
@@ -1136,37 +1158,91 @@ async fn upload_screen_reference_batch(
         );
     }
 
-    let recorded = state
-        .store
-        .with_user(&user_id, |conn| {
-            record_reference_batch(conn, &user_id, &request.events, &validated.manifest_digests)
-        })
-        .await;
-    let recorded = match recorded {
-        Ok(value) => value,
-        Err(error) => {
-            return capture_error_response_for_route(
+    let recorded = if wal_authoritative {
+        let plan = match wal::MediaReferenceBatchPlan::new(
+            user_id.clone(),
+            request.batch_id.clone(),
+            request.events.clone(),
+        ) {
+            Ok(plan) => plan,
+            Err(_) => {
+                return capture_error_response_for_route(
+                    "screen_reference_batch",
+                    started_at,
+                    manifest,
+                    crate::error::EnclaveError::Store(
+                        "reference batch plan construction failed".into(),
+                    ),
+                )
+            }
+        };
+        let prepared =
+            match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    return capture_error_response_for_route(
+                        "screen_reference_batch",
+                        started_at,
+                        manifest,
+                        crate::error::EnclaveError::Store(
+                            "reference batch plan construction failed".into(),
+                        ),
+                    )
+                }
+            };
+        match state
+            .store
+            .wal_authoritative_submit(&user_id, prepared)
+            .await
+        {
+            Ok(outcome) => RecordedReferenceBatch {
+                new_count: usize::from(outcome.new_count()),
+                duplicate_count: usize::from(outcome.duplicate_count()),
+                committed_through_sequence: outcome.committed_through_sequence(),
+            },
+            Err(error) => {
+                return capture_error_response_for_route(
+                    "screen_reference_batch",
+                    started_at,
+                    manifest,
+                    error,
+                )
+            }
+        }
+    } else {
+        let recorded = state
+            .store
+            .with_user(&user_id, |conn| {
+                record_reference_batch(conn, &user_id, &request.events, &validated.manifest_digests)
+            })
+            .await;
+        let recorded = match recorded {
+            Ok(value) => value,
+            Err(error) => {
+                return capture_error_response_for_route(
+                    "screen_reference_batch",
+                    started_at,
+                    manifest,
+                    error,
+                )
+            }
+        };
+        if let Err(error) = state.store.save_user(&user_id).await {
+            tracing::error!(error = %error, "capture reference batch persistence failed");
+            return capture_failure_response_for_route(
                 "screen_reference_batch",
                 started_at,
                 manifest,
-                error,
-            )
+                CaptureIngestFailureReason::PersistenceUnavailable,
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "capture persistence failed",
+                )
+                    .into_response(),
+            );
         }
+        recorded
     };
-    if let Err(error) = state.store.save_user(&user_id).await {
-        tracing::error!(error = %error, "capture reference batch persistence failed");
-        return capture_failure_response_for_route(
-            "screen_reference_batch",
-            started_at,
-            manifest,
-            CaptureIngestFailureReason::PersistenceUnavailable,
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "capture persistence failed",
-            )
-                .into_response(),
-        );
-    }
     super::billing::complete_recording_delivery_batch(
         &state,
         &user_id,
@@ -4749,6 +4825,48 @@ mod tests {
             record_reference_event(&conn, "account-1", &v2, &"c".repeat(64)),
             Ok(RecordOutcome::Created)
         ));
+    }
+
+    #[test]
+    fn reference_batch_route_is_exactly_dual_path() {
+        // ADR-0022: the WAL-authoritative branch settles through the routed
+        // surfaces only, and the legacy branch keeps its exact write+save
+        // pair; the plan's apply shares record_reference_event_in_transaction
+        // with the legacy path, so the branches cannot drift semantically.
+        let source = include_str!("media.rs");
+        let start = source
+            .find(concat!("async fn upload_screen_", "reference_batch"))
+            .unwrap();
+        let end = source
+            .find(concat!("async fn upload_capture_", "event"))
+            .unwrap();
+        let route = &source[start..end];
+        assert_eq!(
+            route.matches(concat!("is_wal_", "authoritative(")).count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            1
+        );
+        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 1);
+        assert_eq!(route.matches(concat!(".save_", "user(")).count(), 1);
+        let submit_at = route
+            .find(concat!("wal_authoritative_", "submit("))
+            .unwrap();
+        let legacy_write_at = route.find(concat!(".with_", "user(")).unwrap();
+        assert!(
+            submit_at < legacy_write_at,
+            "the settled branch must precede the legacy write"
+        );
     }
 
     #[test]
