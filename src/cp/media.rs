@@ -3326,6 +3326,15 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             "speaker_observation_id",
             "ALTER TABLE utterances ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE SET NULL",
         ),
+        // Must exist before migrate_speaker_identity_backfill_v2 below: the
+        // backfill recalculates this column on databases created before the
+        // zero-touch speaker-identity release, and store.rs run_migrations
+        // adds it only AFTER init_schema returns (v0.8.26 production 500s).
+        (
+            "episodes",
+            "speaker_processing_status",
+            "ALTER TABLE episodes ADD COLUMN speaker_processing_status TEXT NOT NULL DEFAULT 'ready' CHECK (speaker_processing_status IN ('ready', 'pending', 'degraded'))",
+        ),
         (
             "identity_evidence",
             "speaker_cluster_id",

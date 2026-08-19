@@ -10132,6 +10132,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn speaker_identity_backfill_runs_on_databases_missing_the_status_column() {
+        // Production incident 2026-08-18 (v0.8.26): databases created before
+        // the zero-touch speaker-identity release have app_metadata (so the
+        // v2 backfill runs inside media::init_schema) but get the
+        // episodes.speaker_processing_status column only from the ALTER loop
+        // that runs AFTER init_schema returns — every existing user database
+        // failed to open with "no such column". Reproduce that exact shape:
+        // current schema, minus the column, minus the backfill marker.
+        init_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE episodes DROP COLUMN speaker_processing_status;")
+            .unwrap();
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key='speaker-identity-backfill-v2'",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let restored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('episodes') \
+                 WHERE name='speaker_processing_status'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restored, 1,
+            "migration must restore the column before the backfill"
+        );
+        let complete: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key='speaker-identity-backfill-v2')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            complete,
+            "backfill must complete instead of failing the open"
+        );
+    }
+
+    #[test]
     fn finalization_migration_never_auto_queues_historical_briefs() {
         init_vec_extension();
         let conn = Connection::open_in_memory().unwrap();
