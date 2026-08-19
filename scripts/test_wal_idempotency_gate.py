@@ -54,8 +54,11 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-EXPECTED_WORKER_SPAWN_COUNT = 32
-EXPECTED_WORKER_SPAWN_SHA256 = "21e3fa9b3d0286e5b7300af1b105e1d454fe0dcfa6a07d4f5864add5152f4a13"
+# Deliberate ADR-0022 Phase-2 re-pin: exactly one new owned spawn,
+# SingleArchiveMaintenanceImporter::run_phase2's tokio::spawn(run_owned(..)),
+# mirroring run()'s cancellation-ownership for the acquisition-gated door.
+EXPECTED_WORKER_SPAWN_COUNT = 33
+EXPECTED_WORKER_SPAWN_SHA256 = "44043f87de6fa0aa07250bc370f5f46c19b88128539990d35a4b8b7e27e5e337"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2265,8 +2268,15 @@ impl X {
             "hasher.update(scope_id)",
         ):
             self.assertIn(required, canary_trust_production)
+        # Deliberate ADR-0022 Phase-2 extension: the module additionally
+        # re-exports `scope_user_commitment` so the Phase-2 acquisition can
+        # bind the statement's user commitment to the durable canary scope.
         self.assertIn(
-            "verify_pinned_advisory_canary_authorization, VerifiedAdvisoryCanaryAuthorization",
+            "scope_user_commitment, verify_pinned_advisory_canary_authorization,",
+            advisory_production,
+        )
+        self.assertIn(
+            "VerifiedAdvisoryCanaryAuthorization,",
             advisory_production,
         )
         self.assertEqual(

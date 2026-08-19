@@ -561,6 +561,12 @@ fn empty_phase1_mutation_set_commitment() -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Canonical scope-bound user commitment shared by the Phase-1 admission check and
+/// the Phase-2 acquisition's durable binding. A pure derivation; grants nothing.
+pub(crate) fn scope_user_commitment(scope_id: &[u8; 16], user_id: &str) -> Result<[u8; 32]> {
+    user_id_commitment(scope_id, user_id)
+}
+
 fn user_id_commitment(scope_id: &[u8; 16], user_id: &str) -> Result<[u8; 32]> {
     let length = u64::try_from(user_id.len()).map_err(|_| AdvisoryOwnerError::Corrupt)?;
     if user_id.is_empty() {

@@ -35,6 +35,7 @@ mod comparison;
 mod controller;
 mod live_window_observer;
 mod monitoring_policy;
+mod phase2_acquisition;
 mod phase2_authority;
 pub(crate) mod solo_entry;
 mod telemetry;
@@ -49,9 +50,25 @@ pub(crate) use canary::AdvisoryCanaryScope;
     reason = "inactive canary verifier remains unwired until activation review"
 )]
 pub(crate) use canary_trust::{
-    verify_pinned_advisory_canary_authorization, VerifiedAdvisoryCanaryAuthorization,
+    scope_user_commitment, verify_pinned_advisory_canary_authorization,
+    VerifiedAdvisoryCanaryAuthorization,
 };
 pub(crate) use comparison::{AdvisoryComparisonEvidence, AdvisoryComparisonSettlement};
+#[allow(
+    unused_imports,
+    reason = "inactive phase2 acquisition driver remains unwired until activation review"
+)]
+pub(crate) use phase2_acquisition::acquire_phase2_authority;
+#[allow(
+    unused_imports,
+    reason = "inactive phase2 authority admission remains unwired until activation review"
+)]
+pub(crate) use phase2_authority::{
+    verify_pinned_phase2_authority, Phase2AuthorityAcquisitionEvidence,
+    VerifiedPhase2AuthorityAuthorization,
+};
+#[cfg(test)]
+pub(crate) use phase2_authority::{ParsedPhase2Admission, ParsedPhase2Statement};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdvisoryAbortContext(());
@@ -2371,6 +2388,10 @@ pub(crate) struct AbortedReleasedAdvisoryOwnerTestHandle(AbortedReleasedSingleAr
 impl AdvisoryOwnerTestHandle {
     pub(crate) async fn maintain_lease(&mut self) -> Result<()> {
         self.0.maintain_lease().await
+    }
+
+    pub(crate) fn owner_id_for_test(&self) -> [u8; 16] {
+        *self.0.owner_id().as_bytes()
     }
 
     pub(crate) const fn may_heartbeat(&self) -> bool {
