@@ -13,13 +13,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Re-pinned after reviewing upstream 7db0162/901f3f0 (owner bodies moved, no
-# semantics change) and for this change's three additions: media_worker
+# semantics change) and 29be594's three additions: media_worker
 # resurrect_user_failed_jobs (with_user + save_user, B) and summarizer
 # span_holds_recoverable_media (read-only, A).
+# Slice F-c: the only call-site delta is with_user_if_changed's owner body,
+# whose refusal now reads the per-user resolver; its call expression and C
+# classification are unchanged.
 EXPECTED_STORE_CALL_COUNT = 163
-EXPECTED_STORE_CALL_SHA256 = "9b2689f6c61e5dc430a636f528c11f876ceea53798a66fa937c64b8f519d8346"
+EXPECTED_STORE_CALL_SHA256 = "5f7de75a0eaed96f0d398e3ac5e8bb13c02749f82cefb6a9d3674d6b6019d3ab"
 EXPECTED_STORE_SURFACE_COUNT = 16
-EXPECTED_STORE_SURFACE_SHA256 = "f2a9028f214f26ffac34f9453a177902da78dbc71817f2db7776ef24e36ccd1d"
+# Slice F-c: the internal constructor's Store literal additionally initializes
+# the always-empty per-user WAL-authority selection map; no construction
+# surface was added or removed.
+EXPECTED_STORE_SURFACE_SHA256 = "ffda0f5c40ff7ac36a19046805a7665d3c21b2393156983f46786cfefb23b47b"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -40,8 +46,14 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
         "src/store.rs::new_with_media_and_legacy#0::factory_definition::new_with_media_and_legacy#0",
     }
 )
-EXPECTED_POLICY_SITE_COUNT = 41
-EXPECTED_POLICY_SITE_SHA256 = "8188d67b5cf5eeecf02cf9ac2a2991a12718edb3120179a4efd32f0713c01125"
+# Deliberate ADR-0022 slice F-c re-pin: policy consultation is now the single
+# private per-user resolver `persistence_policy_for` (whole-Store test seam OR
+# the user's durable-terminal-backed WAL-authority selection; poisoned lock
+# fails closed to WAL-logical). Every consult site keeps its exact refusal
+# comparison but reads the resolver instead of the field; only the resolver
+# and the construction chain touch `persistence_policy` directly.
+EXPECTED_POLICY_SITE_COUNT = 40
+EXPECTED_POLICY_SITE_SHA256 = "091e45a46d6c0e75a8c360fd4116c0a68878c383d4d75e1ec17ed0fd4e598b0c"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
@@ -51,6 +63,10 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::load_user#0::WalLogicalOnly#0",
         "src/store.rs::load_user#0::WalLogicalOnly#1",
         "src/store.rs::open_db#0::WalLogicalOnly#0",
+        "src/store.rs::persistence_policy_for#0::WalLogicalOnly#0",
+        "src/store.rs::persistence_policy_for#0::WalLogicalOnly#1",
+        "src/store.rs::persistence_policy_for#0::WalLogicalOnly#2",
+        "src/store.rs::persistence_policy_for#0::WalLogicalOnly#3",
         "src/store.rs::save_user#0::WalLogicalOnly#0",
         "src/store.rs::with_user#0::WalLogicalOnly#0",
         "src/store.rs::with_user#0::WalLogicalOnly#1",
