@@ -4109,6 +4109,48 @@ impl Store {
         }
     }
 
+    /// Route branch for the per-domain migrations: true exactly when the
+    /// user has a durable-terminal WAL-authority selection, so the route
+    /// takes the plan-and-submit path instead of the legacy mutation path.
+    pub(crate) fn is_wal_authoritative(&self, user_id: &str) -> bool {
+        self.wal_selected(user_id)
+    }
+
+    /// Submit one sealed, already-prepared logical plan through the selected
+    /// user's serving authority. Acknowledgement is the typed decoded output,
+    /// released only after immutable WAL publication and witness settlement.
+    /// Routes must branch on `is_wal_authoritative` first: an unselected user
+    /// refuses (their mutations stay on the legacy path), and a selected user
+    /// with no registered authority refuses as unavailable. Owner-side
+    /// refusals surface content-free: conflicts as Conflict (the client
+    /// retries its durable outbox marker), everything else as unavailable.
+    pub(crate) async fn wal_authoritative_submit<P>(
+        &self,
+        user_id: &str,
+        prepared: crate::archive_v3_wal_idempotency::PreparedLogicalMutation<P>,
+    ) -> Result<P::Output>
+    where
+        P: crate::archive_v3_wal_idempotency::WalLogicalDomainPlan,
+    {
+        if !self.wal_selected(user_id) {
+            return Err(EnclaveError::Conflict(
+                "wal-authoritative submit requires a selected user".into(),
+            ));
+        }
+        let authority = self.wal_serving_authority(user_id).ok_or_else(|| {
+            EnclaveError::Store("wal-authoritative user has no serving authority".into())
+        })?;
+        authority
+            .submit(prepared)
+            .await
+            .map_err(|error| match error {
+                crate::archive_v3_wal_owner::WalOwnerError::Conflict => {
+                    EnclaveError::Conflict("wal submit conflicted; retry".into())
+                }
+                _ => EnclaveError::Store("wal serving authority is unavailable".into()),
+            })
+    }
+
     /// Resolve the persistence policy for one user: the WAL-logical policy
     /// applies when the whole Store was constructed with it (test seam) or
     /// when the user has a durable-terminal-backed WAL-authority selection.

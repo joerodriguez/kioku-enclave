@@ -58,6 +58,13 @@ impl CaptureSessionFinishOutcome {
     pub(super) fn ended_at(&self) -> &str {
         &self.ended_at
     }
+
+    /// Test-only crate-visible accessor for the cross-module WAL launch
+    /// end-to-end tests.
+    #[cfg(test)]
+    pub(crate) fn ended_at_for_wal_e2e(&self) -> &str {
+        &self.ended_at
+    }
 }
 
 /// Caller-stable capture-session finish plan. Its operation ID is derived
@@ -79,6 +86,14 @@ impl CaptureSessionFinishPlan {
             operation_id,
             capture_session_id,
         })
+    }
+
+    /// Test-only crate-visible constructor for the cross-module WAL launch
+    /// end-to-end tests; production construction stays sealed to this
+    /// domain's routes.
+    #[cfg(test)]
+    pub(crate) fn new_for_wal_e2e(capture_session_id: String) -> Result<Self> {
+        Self::new(capture_session_id)
     }
 
     #[cfg(test)]

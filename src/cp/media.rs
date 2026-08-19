@@ -1765,6 +1765,75 @@ async fn finish_capture_session(
     if let Err(error) = validate_id("capture_session_id", &capture_session_id) {
         return error.into_response();
     }
+    // ADR-0022 per-domain routing: a WAL-authoritative user's finish flows
+    // through the sealed capture-session-finish plan — probe, settle-submit,
+    // then read the settled status — and is acknowledged only after witness
+    // settlement. The probe mirrors the legacy updated==0 branch (an unknown
+    // session is already in the goal state), and a submit-time conflict
+    // surfaces as an error so the client's durably queued finish marker
+    // retries instead of being silently dropped.
+    if state.store.is_wal_authoritative(&user.0) {
+        let probe_session_id = capture_session_id.clone();
+        match state
+            .store
+            .wal_authoritative_read(&user.0, move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT 1 FROM capture_sessions WHERE id=?1",
+                        [&probe_session_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some())
+            })
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return StatusCode::NO_CONTENT.into_response(),
+            Err(error) => return error.into_response(),
+        }
+        let plan = match wal::CaptureSessionFinishPlan::new(capture_session_id.clone()) {
+            Ok(plan) => plan,
+            Err(_) => {
+                return crate::error::EnclaveError::Store(
+                    "capture-session finish plan construction failed".into(),
+                )
+                .into_response()
+            }
+        };
+        let prepared =
+            match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    return crate::error::EnclaveError::Store(
+                        "capture-session finish plan construction failed".into(),
+                    )
+                    .into_response()
+                }
+            };
+        if let Err(error) = state
+            .store
+            .wal_authoritative_submit(&user.0, prepared)
+            .await
+        {
+            return error.into_response();
+        }
+        let status_session_id = capture_session_id.clone();
+        return match state
+            .store
+            .wal_authoritative_read(&user.0, move |conn| {
+                load_capture_session_status(conn, &status_session_id, None)
+            })
+            .await
+        {
+            Ok(Some(status)) => {
+                super::summarizer::kick_session_settled(&user.0);
+                Json(status).into_response()
+            }
+            Ok(None) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => error.into_response(),
+        };
+    }
     match state
         .store
         .with_user(&user.0, |conn| {

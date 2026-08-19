@@ -5847,6 +5847,13 @@ pub(crate) mod tests {
                     "INSERT INTO app_metadata(key,value) VALUES('phase2-e2e','exact')",
                     [],
                 )?;
+                connection.execute(
+                    "INSERT INTO capture_sessions
+                     (id,device_id,install_id,started_at,last_event_at,schema_version)
+                     VALUES('phase2-session','phase2-device','phase2-install',
+                            '2026-08-19T10:00:00Z','2026-08-19T10:05:00Z',1)",
+                    [],
+                )?;
                 Ok(())
             })
             .await
@@ -6748,6 +6755,66 @@ pub(crate) mod tests {
             .with_user(&fixture.user_id, |_| Ok(()))
             .await
             .is_err());
+
+        // Domain routing (media capture-session-finish): the sealed plan
+        // settles through the launched authority via the Store's submit
+        // surface — acknowledged only after witness settlement — an
+        // identical second submit replays the exact retained outcome, the
+        // routed read observes the settled end, and a plan for an absent
+        // session refuses as a retryable Conflict.
+        let finish = crate::cp::media::wal::CaptureSessionFinishPlan::new_for_wal_e2e(
+            "phase2-session".to_owned(),
+        )
+        .unwrap();
+        let prepared =
+            crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(finish).unwrap();
+        let outcome = fixture
+            .store
+            .wal_authoritative_submit(&fixture.user_id, prepared)
+            .await
+            .unwrap();
+        let ended_at = outcome.ended_at_for_wal_e2e().to_owned();
+        assert!(!ended_at.is_empty());
+        let replay = crate::cp::media::wal::CaptureSessionFinishPlan::new_for_wal_e2e(
+            "phase2-session".to_owned(),
+        )
+        .unwrap();
+        let prepared =
+            crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(replay).unwrap();
+        let replayed = fixture
+            .store
+            .wal_authoritative_submit(&fixture.user_id, prepared)
+            .await
+            .unwrap();
+        assert_eq!(replayed.ended_at_for_wal_e2e(), ended_at);
+        let observed: Option<String> = fixture
+            .store
+            .wal_authoritative_read(&fixture.user_id, |conn| {
+                use rusqlite::OptionalExtension as _;
+                Ok(conn
+                    .query_row(
+                        "SELECT ended_at FROM capture_sessions WHERE id='phase2-session'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(observed.as_deref(), Some(ended_at.as_str()));
+        let absent = crate::cp::media::wal::CaptureSessionFinishPlan::new_for_wal_e2e(
+            "phase2-missing".to_owned(),
+        )
+        .unwrap();
+        let prepared =
+            crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(absent).unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .wal_authoritative_submit(&fixture.user_id, prepared)
+                .await,
+            Err(crate::error::EnclaveError::Conflict(_))
+        ));
     }
 
     #[test]
