@@ -29973,6 +29973,62 @@ mod tests {
         assert_eq!(accounts, 2);
     }
 
+    /// The deployment repository builds log-based metrics by grepping the
+    /// serialized event for these exact substrings, and an alert hangs off the
+    /// refusal metric. Renaming a field or changing a literal here silently
+    /// stops that alert firing, which is worse than it failing loudly, so the
+    /// wire format is pinned.
+    #[test]
+    fn signup_events_serialize_the_substrings_the_log_metrics_match_on() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            observe_signup_created("google", 7, 25);
+            observe_signup_refused("apple", 25);
+        });
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+
+        assert!(
+            output.contains(r#""metric_schema":"signup_v1""#),
+            "{output}"
+        );
+        assert!(output.contains(r#""outcome":"created""#), "{output}");
+        assert!(output.contains(r#""outcome":"refused""#), "{output}");
+        assert!(output.contains(r#""provider":"google""#), "{output}");
+        assert!(output.contains(r#""provider":"apple""#), "{output}");
+        assert!(output.contains(r#""accounts_today":7"#), "{output}");
+
+        // Content-free: the event must never carry identity.
+        assert!(!output.contains('@'), "{output}");
+        for forbidden in ["email", "subject", "user_id", "google_sub", "token"] {
+            assert!(!output.contains(forbidden), "{forbidden} leaked: {output}");
+        }
+    }
+
     #[test]
     fn signup_reservation_reports_the_running_daily_count_for_observation() {
         // The returned value is what the content-free signup event publishes,
