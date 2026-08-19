@@ -1150,13 +1150,19 @@ pub(crate) async fn recover_owned_wal_owner_staging(
         return Err(ShadowWalError::CompositeRecovery);
     }
     let retained = recovery.clone();
+    // The first WAL-owner launch after the cutover recovers the maintenance
+    // R2 terminal itself, whose root is the producer-gated canonical
+    // checkpoint-only `0/0/0` geometry; every later owner root carries a
+    // nonzero WAL tuple. The zero-WAL arm's own strict shape checks (all-zero
+    // tuple, no extent tree, checkpoint length equal to the logical length)
+    // still gate it, so this accepts exactly the two witnessed shapes.
     recover_owned_private_staging_inner(
         recovery,
         Arc::new(OwnedExactBackend::Narrow(backend)),
         cipher,
         archive_id,
         None,
-        false,
+        true,
     )
     .await?
     .authenticate_wal_owner(&retained, binding)

@@ -59,6 +59,13 @@ impl FirestoreShadowWitness {
         Ok(Self { witness })
     }
 
+    /// Test-only wrap over a witness built on the shared protocol-faithful
+    /// fake transport, for cross-module WAL-owner launch end-to-end tests.
+    #[cfg(test)]
+    pub(crate) fn from_witness_for_test(witness: Arc<FirestoreWitness>) -> Self {
+        Self { witness }
+    }
+
     pub(crate) async fn wal_owner_read_current_exact(
         &self,
         _token: &crate::archive_v3_wal_owner::WalPublisherRuntimeContext,

@@ -352,6 +352,27 @@ impl ArchiveV3ShadowRuntimeBundle {
         Ok(WalPublisherRuntimeOwner { bundle: self })
     }
 
+    /// Test-only publisher-capable bundle over the shared fake Firestore
+    /// witness, for the WAL-owner launch end-to-end tests. Identical to the
+    /// maintenance test bundle plus the publisher witness the production
+    /// constructor bakes.
+    #[cfg(test)]
+    pub(crate) fn from_publisher_test_components<W>(
+        objects: Arc<dyn ImmutableObjectBackend>,
+        registries: Arc<dyn ExactKeyRegistryProvider>,
+        witness: Arc<W>,
+        wal_owner_witness: Arc<crate::archive_v3_firestore_shadow::FirestoreShadowWitness>,
+    ) -> Self
+    where
+        W: crate::archive_v3_maintenance_import::MaintenanceImportWitnessProvider
+            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
+            + 'static,
+    {
+        let mut bundle = Self::from_maintenance_test_components(objects, registries, witness);
+        bundle.wal_owner_witness = Some(wal_owner_witness);
+        bundle
+    }
+
     #[cfg(test)]
     pub(crate) fn from_maintenance_test_components<W>(
         objects: Arc<dyn ImmutableObjectBackend>,
