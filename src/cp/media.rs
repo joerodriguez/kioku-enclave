@@ -31,6 +31,9 @@ const MAX_TURNS: usize = 10_000;
 const MAX_MANIFEST_BYTES: usize = 128 * 1024;
 const MAX_MULTIPART_BYTES: usize = MAX_AUDIO_BYTES as usize + MAX_MANIFEST_BYTES + 64 * 1024;
 const MAX_REFERENCE_BATCH_BYTES: usize = 1024 * 1024;
+// Highest screen reference dedupe_version this enclave accepts; advertised in
+// batch receipts so clients upgrade only after proof of support.
+const MAX_SCREEN_DEDUPE_VERSION: u32 = 2;
 const MAX_REFERENCE_BATCH_EVENTS: usize = 64;
 const REFERENCE_BATCH_ID_DOMAIN: &[u8] = b"kioku.screen-reference-batch.v1\0";
 const REFERENCE_BATCH_MANIFEST_DOMAIN: &[u8] = b"kioku.screen-reference-manifests.v1\0";
@@ -338,15 +341,29 @@ fn validate_screen_reference(reference: &ScreenReferenceDescriptor) -> Result<()
             "reference.perceptual_hash must be 16 hexadecimal characters".into(),
         ));
     }
-    if reference.hamming_distance > 3
-        || !reference.pixel_change_ratio.is_finite()
-        || !(0.0..=0.01).contains(&reference.pixel_change_ratio)
+    // Version 1 kept references so conservative (exact fingerprint including
+    // per-window geometry, Hamming ≤ 3, ratio ≤ 0.01) that idle-screen jitter
+    // produced canonical uploads. Version 2 drops the volatile window
+    // inventory from the fingerprint and widens the pixel bounds enough to
+    // absorb clocks, badges, and cursor blinks while a scroll or content
+    // change still forces a canonical upload.
+    let bounds = match reference.dedupe_version {
+        1 => {
+            reference.hamming_distance <= 3 && (0.0..=0.01).contains(&reference.pixel_change_ratio)
+        }
+        2 => {
+            reference.hamming_distance <= 8 && (0.0..=0.03).contains(&reference.pixel_change_ratio)
+        }
+        _ => false,
+    };
+    if !reference.pixel_change_ratio.is_finite()
+        || !bounds
         || !validate_sha256(&reference.context_fingerprint)
-        || reference.dedupe_version != 1
     {
-        return Err(EnclaveError::InvalidRequest(
-            "reference deduplication evidence is outside version 1 bounds".into(),
-        ));
+        return Err(EnclaveError::InvalidRequest(format!(
+            "reference deduplication evidence is outside version {} bounds",
+            reference.dedupe_version
+        )));
     }
     Ok(())
 }
@@ -639,6 +656,10 @@ struct ScreenReferenceBatchAccepted {
     new_count: usize,
     duplicate_count: usize,
     committed_through_sequence: i64,
+    // Additive capability advertisement: clients keep sending dedupe_version 1
+    // until a batch receipt proves the enclave accepts a newer version, so a
+    // new client never wedges its outbox against an older enclave.
+    max_screen_dedupe_version: u32,
 }
 
 struct ValidatedReferenceBatch {
@@ -1169,6 +1190,7 @@ async fn upload_screen_reference_batch(
             new_count: recorded.new_count,
             duplicate_count: recorded.duplicate_count,
             committed_through_sequence: recorded.committed_through_sequence,
+            max_screen_dedupe_version: MAX_SCREEN_DEDUPE_VERSION,
         }),
     )
         .into_response()
@@ -3890,8 +3912,8 @@ fn record_source_event_in_transaction(
     Ok(RecordOutcome::Created)
 }
 
-fn semantic_context_value(context: &CaptureContext) -> Value {
-    json!({
+fn semantic_context_value(context: &CaptureContext, dedupe_version: u32) -> Value {
+    let mut value = json!({
         "active_app": context.active_app,
         "active_url": context.active_url,
         "active_url_title": context.active_url_title,
@@ -3900,15 +3922,29 @@ fn semantic_context_value(context: &CaptureContext) -> Value {
         "display_id": context.display_id,
         "primary_bundle_id": context.primary_bundle_id,
         "primary_window_id": context.primary_window_id,
-        "visible_windows": context.visible_windows,
-        "visible_windows_truncated": context.visible_windows_truncated,
         "window_title": context.window_title,
-    })
+    });
+    // Version 1 bound the fingerprint to the full visible-window inventory,
+    // whose fractional intersection ratios and z-order churn on every
+    // background repaint — so semantically identical screens rarely matched.
+    // Version 2 fingerprints only the literal foreground context above.
+    if dedupe_version <= 1 {
+        let map = value
+            .as_object_mut()
+            .expect("semantic context is an object");
+        map.insert("visible_windows".into(), json!(context.visible_windows));
+        map.insert(
+            "visible_windows_truncated".into(),
+            json!(context.visible_windows_truncated),
+        );
+    }
+    value
 }
 
-fn semantic_context_fingerprint(context: &CaptureContext) -> Result<String> {
+fn semantic_context_fingerprint(context: &CaptureContext, dedupe_version: u32) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(&semantic_context_value(
         context,
+        dedupe_version,
     ))?))
 }
 
@@ -4015,7 +4051,10 @@ fn record_reference_event_in_transaction(
     })?;
     if !reference
         .context_fingerprint
-        .eq_ignore_ascii_case(&semantic_context_fingerprint(current_context)?)
+        .eq_ignore_ascii_case(&semantic_context_fingerprint(
+            current_context,
+            reference.dedupe_version,
+        )?)
     {
         return Err(EnclaveError::CaptureReference(
             CaptureReferenceFailureReason::ContextFingerprintMismatch,
@@ -4077,7 +4116,13 @@ fn record_reference_event_in_transaction(
                 )
             })
         })?;
-    if semantic_context_value(&canonical_context) != semantic_context_value(current_context) {
+    // The transition check compares at the reference's dedupe version: a v2
+    // reference matches its canonical when the literal foreground context is
+    // unchanged, even if background window geometry drifted since the
+    // canonical was recorded.
+    if semantic_context_value(&canonical_context, reference.dedupe_version)
+        != semantic_context_value(current_context, reference.dedupe_version)
+    {
         return Err(EnclaveError::CaptureReference(
             CaptureReferenceFailureReason::ContextTransition,
         ));
@@ -4514,7 +4559,7 @@ mod tests {
             perceptual_hash: "0123456789abcdef".into(),
             hamming_distance: 2,
             pixel_change_ratio: 0.004,
-            context_fingerprint: semantic_context_fingerprint(context).unwrap(),
+            context_fingerprint: semantic_context_fingerprint(context, 1).unwrap(),
             dedupe_version: 1,
         });
         reference
@@ -4546,9 +4591,102 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            semantic_context_fingerprint(&context).unwrap(),
+            semantic_context_fingerprint(&context, 1).unwrap(),
             "fba21879bdcd32f61bed713119be4eda7a9736e3fff52ea1576f284fba83dabc"
         );
+        // Version 2 fingerprints the same context without the volatile
+        // visible-window inventory. This vector is pinned cross-language with
+        // the macOS client (ScreenTransportTests).
+        assert_eq!(
+            semantic_context_fingerprint(&context, 2).unwrap(),
+            "00e628e17b45c3462a25e7396c88503efbda2a9dc4f3f5234ac45d34728480ea"
+        );
+    }
+
+    #[test]
+    fn screen_reference_bounds_are_versioned() {
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        let make = |dedupe_version: u32, hamming_distance: u32, pixel_change_ratio: f64| {
+            let mut manifest = reference_to(&canonical, 1, "screen-event-1");
+            let context = canonical.context.as_ref().unwrap();
+            let descriptor = manifest.reference.as_mut().unwrap();
+            descriptor.dedupe_version = dedupe_version;
+            descriptor.hamming_distance = hamming_distance;
+            descriptor.pixel_change_ratio = pixel_change_ratio;
+            descriptor.context_fingerprint =
+                semantic_context_fingerprint(context, dedupe_version).unwrap();
+            manifest
+        };
+        // Version 1 keeps its historical bounds.
+        assert!(make(1, 3, 0.01).validate().is_ok());
+        assert!(make(1, 4, 0.004).validate().is_err());
+        assert!(make(1, 2, 0.011).validate().is_err());
+        // Version 2 absorbs idle jitter but still rejects real change.
+        assert!(make(2, 8, 0.03).validate().is_ok());
+        assert!(make(2, 9, 0.004).validate().is_err());
+        assert!(make(2, 2, 0.031).validate().is_err());
+        // Unknown future versions stay rejected.
+        assert!(make(3, 1, 0.001).validate().is_err());
+    }
+
+    #[test]
+    fn v2_reference_survives_background_window_drift_that_v1_rejects() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let canonical = valid_screen_manifest(0, "screen-event-0", "screen-asset-0");
+        record_source_event(
+            &conn,
+            "account-1",
+            &canonical,
+            &manifest_digest(&canonical).unwrap(),
+            "object-1",
+        )
+        .unwrap();
+
+        // Pixel-identical screen, but a background window appeared between
+        // captures, so the visible-window inventory drifted.
+        let drift = json!([
+            {"bundle_id":"com.google.Chrome","window_id":9},
+            {"bundle_id":"com.apple.dock","window_id":11}
+        ]);
+
+        let mut v1 = reference_to(&canonical, 1, "screen-event-1");
+        v1.context.as_mut().unwrap().visible_windows = Some(drift.clone());
+        v1.reference.as_mut().unwrap().context_fingerprint =
+            semantic_context_fingerprint(v1.context.as_ref().unwrap(), 1).unwrap();
+        assert!(matches!(
+            record_reference_event(&conn, "account-1", &v1, &"b".repeat(64)),
+            Err(EnclaveError::CaptureReference(
+                CaptureReferenceFailureReason::ContextTransition
+            ))
+        ));
+
+        let mut v2 = reference_to(&canonical, 1, "screen-event-2");
+        v2.context.as_mut().unwrap().visible_windows = Some(drift);
+        let descriptor = v2.reference.as_mut().unwrap();
+        descriptor.dedupe_version = 2;
+        descriptor.context_fingerprint =
+            semantic_context_fingerprint(v2.context.as_ref().unwrap(), 2).unwrap();
+        assert!(matches!(
+            record_reference_event(&conn, "account-1", &v2, &"c".repeat(64)),
+            Ok(RecordOutcome::Created)
+        ));
+    }
+
+    #[test]
+    fn batch_receipt_advertises_max_dedupe_version() {
+        let receipt = ScreenReferenceBatchAccepted {
+            batch_id: "b".repeat(64),
+            stream_id: "stream-1".into(),
+            first_sequence: 1,
+            last_sequence: 2,
+            new_count: 1,
+            duplicate_count: 1,
+            committed_through_sequence: 2,
+            max_screen_dedupe_version: MAX_SCREEN_DEDUPE_VERSION,
+        };
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["max_screen_dedupe_version"], json!(2));
     }
 
     #[test]
@@ -4926,7 +5064,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .context_fingerprint =
-            semantic_context_fingerprint(changed_context[1].context.as_ref().unwrap()).unwrap();
+            semantic_context_fingerprint(changed_context[1].context.as_ref().unwrap(), 1).unwrap();
         assert_eq!(reference_batch_id(&changed_context).unwrap(), batch_id);
         let changed_digests = changed_context
             .iter()
@@ -4947,7 +5085,7 @@ mod tests {
         oversized[0].context.as_mut().unwrap().visible_windows =
             Some(json!("x".repeat(MAX_MANIFEST_BYTES)));
         oversized[0].reference.as_mut().unwrap().context_fingerprint =
-            semantic_context_fingerprint(oversized[0].context.as_ref().unwrap()).unwrap();
+            semantic_context_fingerprint(oversized[0].context.as_ref().unwrap(), 1).unwrap();
         let oversized = ScreenReferenceBatchRequest {
             schema_version: 1,
             batch_id: reference_batch_id(&oversized).unwrap(),
@@ -5079,7 +5217,8 @@ mod tests {
                     reference.context.as_mut().unwrap().active_url =
                         Some("https://meet.google.com/different".into());
                     reference.reference.as_mut().unwrap().context_fingerprint =
-                        semantic_context_fingerprint(reference.context.as_ref().unwrap()).unwrap();
+                        semantic_context_fingerprint(reference.context.as_ref().unwrap(), 1)
+                            .unwrap();
                 }
                 "chain" => {
                     let first_reference = reference.clone();

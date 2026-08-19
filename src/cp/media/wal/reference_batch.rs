@@ -687,7 +687,7 @@ mod tests {
             perceptual_hash: "0123456789abcdef".to_owned(),
             hamming_distance: 2,
             pixel_change_ratio: 0.004,
-            context_fingerprint: super::super::super::semantic_context_fingerprint(context)
+            context_fingerprint: super::super::super::semantic_context_fingerprint(context, 1)
                 .unwrap(),
             dedupe_version: 1,
         });
@@ -756,8 +756,11 @@ mod tests {
         let mut changed = events;
         changed[1].context.as_mut().unwrap().window_title = Some("Changed".to_owned());
         changed[1].reference.as_mut().unwrap().context_fingerprint =
-            super::super::super::semantic_context_fingerprint(changed[1].context.as_ref().unwrap())
-                .unwrap();
+            super::super::super::semantic_context_fingerprint(
+                changed[1].context.as_ref().unwrap(),
+                1,
+            )
+            .unwrap();
         let changed = plan(changed);
         assert_eq!(one.operation_id(), changed.operation_id());
         assert_ne!(
@@ -774,8 +777,11 @@ mod tests {
             let mut event = reference_to(&canonical, sequence, &format!("screen-event-{sequence}"));
             event.context.as_mut().unwrap().visible_windows = Some(json!("x".repeat(120_000)));
             event.reference.as_mut().unwrap().context_fingerprint =
-                super::super::super::semantic_context_fingerprint(event.context.as_ref().unwrap())
-                    .unwrap();
+                super::super::super::semantic_context_fingerprint(
+                    event.context.as_ref().unwrap(),
+                    1,
+                )
+                .unwrap();
             events.push(event);
         }
         let error = PreparedLogicalMutation::prepare(plan(events))
@@ -864,8 +870,11 @@ mod tests {
         let mut changed = first.clone();
         changed[0].context.as_mut().unwrap().window_title = Some("Changed".to_owned());
         changed[0].reference.as_mut().unwrap().context_fingerprint =
-            super::super::super::semantic_context_fingerprint(changed[0].context.as_ref().unwrap())
-                .unwrap();
+            super::super::super::semantic_context_fingerprint(
+                changed[0].context.as_ref().unwrap(),
+                1,
+            )
+            .unwrap();
         assert_eq!(
             super::super::super::reference_batch_id(&first).unwrap(),
             super::super::super::reference_batch_id(&changed).unwrap()
