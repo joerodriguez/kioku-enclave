@@ -765,6 +765,30 @@ impl SealedSingleArchiveWalRuntime {
         Self { binding, bundle }
     }
 
+    /// Startup-relaunch composition: reconstruct the WAL-owner handoff from
+    /// durable state for this sealed runtime's exact bound archive. Consumes
+    /// the seal — the bundle and binding leave only inside the handoff, whose
+    /// sole consumer is the serving-authority launch.
+    pub(crate) async fn reconstruct_wal_serving_handoff(
+        self,
+        control: Arc<ControlStore>,
+    ) -> Result<
+        crate::archive_v3_maintenance_import::CompletedMaintenanceWalHandoff,
+        crate::archive_v3_maintenance_import::MaintenanceImportError,
+    > {
+        let operation = control
+            .wal_authoritative_operation_for_archive(self.binding.binding.archive_id())
+            .await
+            .map_err(|_| crate::archive_v3_maintenance_import::MaintenanceImportError::Conflict)?;
+        crate::archive_v3_maintenance_import::CompletedMaintenanceWalHandoff::reconstruct_from_durable(
+            self.bundle,
+            self.binding,
+            control,
+            operation,
+        )
+        .await
+    }
+
     /// One-shot Phase-1 composition. The returned type can stop only at the
     /// verified advisory ShadowWal handoff and exposes no WalAuthoritative
     /// transition method.

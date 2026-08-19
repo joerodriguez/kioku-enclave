@@ -176,6 +176,7 @@ mod archive_v3_shadow_parity;
 // has no Store/VFS/lifecycle, route, health, admission, deletion, task, flag,
 // callback, operation, or authority wiring.
 mod archive_v3_maintenance_import;
+mod archive_v3_serving_relaunch;
 mod archive_v3_shadow_runtime;
 // ADR-0022 checkpoint upload/recovery is compiled and fake-tested, but has no
 // Store/VFS runtime connection, provider construction, flag, route, or authority.
@@ -913,10 +914,11 @@ async fn async_main() {
 
     // ── KMS + GCS ─────────────────────────────────────────────────────────────
 
-    let kms: Arc<dyn crate::crypto::KmsClient> = Arc::new(
+    let concrete_kms = Arc::new(
         crypto::GcpKmsClient::from_env()
             .expect("KMS env vars (KMS_PROJECT, KMS_LOCATION, KMS_KEY_RING, KMS_KEY) must be set"),
     );
+    let kms: Arc<dyn crate::crypto::KmsClient> = Arc::clone(&concrete_kms) as _;
     let gcs: Arc<dyn crate::store::GcsClient> =
         Arc::new(GcpGcsClient::from_env().expect("GCS_BUCKET must be set"));
 
@@ -991,6 +993,25 @@ async fn async_main() {
         info!(
             installed = installed_wal_authority_selections,
             "installed WAL-authority persistence selections before request admission"
+        );
+    }
+
+    // ADR-0022: relaunch every selected user's WAL serving authority from
+    // durable state through the image-baked runtime coordinates, so the
+    // routed read serves the settled lane from the first admitted request.
+    // Off-config images with selected users fail startup closed here.
+    let relaunched_wal_serving_authorities =
+        archive_v3_serving_relaunch::relaunch_wal_serving_authorities(
+            || Ok(Arc::clone(&concrete_kms)),
+            Arc::clone(&control_store),
+            Arc::clone(&store),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("Failed to relaunch WAL serving authorities: {error}"));
+    if relaunched_wal_serving_authorities > 0 {
+        info!(
+            relaunched = relaunched_wal_serving_authorities,
+            "relaunched WAL serving authorities before request admission"
         );
     }
 

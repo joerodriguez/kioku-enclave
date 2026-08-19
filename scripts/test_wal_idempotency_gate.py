@@ -29,7 +29,10 @@ EXPECTED_STORE_SURFACE_COUNT = 16
 # selection installation; both constructor call expressions are unchanged.
 # Slice J-b3: the internal constructor's Store literal additionally
 # initializes the always-empty serving-authority registry.
-EXPECTED_STORE_SURFACE_SHA256 = "f363cabb293509180d642f617eb3c45b0755b4a5a4d93b7bc1d7ca9b2f6ad540"
+# Slice J-b3b: async_main's owner body gained the pre-admission serving
+# relaunch call and the concrete-KMS split; constructor expressions
+# unchanged.
+EXPECTED_STORE_SURFACE_SHA256 = "16e23e3acd5de1a65060ff02e729caadecbaecf6e1375b3b9e77bbeba897cf87"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -91,7 +94,9 @@ EXPECTED_WORKER_SPAWN_COUNT = 33
 # Slice J-b1: the actor and spawn_failed loop closures gained the Read arm
 # (reads serialize behind the full settle ladder); spawn count stays 33 and
 # no new spawn site exists.
-EXPECTED_WORKER_SPAWN_SHA256 = "adff185815272403fc518f184ba9d183d8384730e0f2ff83e0017620b4ef5c8d"
+# Slice J-b3b: async_main's owner-body hash only; spawn count stays 33 and
+# every spawn expression is unchanged.
+EXPECTED_WORKER_SPAWN_SHA256 = "87c3c3c52fd35421833d73f2b2d6ccbc70a355e2bf21436d46f8a5afb812e39a"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 

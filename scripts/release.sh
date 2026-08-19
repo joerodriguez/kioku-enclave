@@ -139,12 +139,14 @@ IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCK
 if [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
   # Deployment compatibility for active archive-v3 images (docs/adr/
   # 0022-solo-operator-activation.md): the baked runtime coordinates are consumed
-  # only by the pre-serving --run-archive-v3-phase1-canary subcommand — the serving
-  # path never reads them (enforced by scripts/test_wal_idempotency_gate.py's
-  # main-surface invariant), so an active-config image serves identically to an
-  # off-config image. Rolling one is still an explicit solo-operator decision: the
-  # tag must be an exact archive-v3 WAL release tag and the operator must
-  # acknowledge that exact tag out of band.
+  # by the pre-serving --run-archive-v3-phase1-canary subcommand and, since the
+  # J-b3b serving-activation slice, by serving startup's WAL serving-authority
+  # relaunch — an active-config image relaunches WAL authorities for every
+  # durable-terminal user before any listener binds, and an off-config image
+  # with such users refuses startup. Rolling an active-config image is therefore
+  # a real behavioral decision and stays two-factor: the tag must be an exact
+  # archive-v3 WAL release tag and the operator must acknowledge that exact tag
+  # out of band.
   [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-archive-v3-wal\.[0-9]+$ ]] \
     || die "active archive-v3 WAL images cannot roll: tag is not an exact archive-v3-wal release tag"
   [[ "${KIOKU_CONFIRM_ARCHIVE_V3_ROLL:-}" == "$TAG" ]] \

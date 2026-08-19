@@ -20535,6 +20535,37 @@ impl ControlStore {
             .await
     }
 
+    /// The maintenance operation whose durable row rests at the
+    /// `wal_authoritative` terminal for one archive — the identity the
+    /// startup relaunch reconstructs the WAL-owner handoff from. Any other
+    /// stage, or a missing row, refuses content-free.
+    pub(crate) async fn wal_authoritative_operation_for_archive(
+        &self,
+        archive_id: crate::archive_v3::ArchiveId,
+    ) -> Result<MaintenanceImportOperationId> {
+        self.read(move |conn| {
+            let operation: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT operation_id FROM archive_v3_maintenance_imports
+                     WHERE archive_id=?1 AND format_version=1 AND stage='wal_authoritative'",
+                    [archive_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let operation = operation.ok_or_else(|| {
+                EnclaveError::Conflict(
+                    "startup relaunch requires the durable wal_authoritative terminal".into(),
+                )
+            })?;
+            MaintenanceImportOperationId::from_control(
+                MaintenancePersistenceContext(()),
+                fixed_blob::<16>(&operation, "maintenance operation ID")?,
+            )
+            .map_err(maintenance_store_error)
+        })
+        .await
+    }
+
     /// Startup scan: mint the selection for every user whose actively bound
     /// archive rests at the durable `wal_authoritative` terminal, regardless
     /// of account status. Serving startup installs these into the Store
