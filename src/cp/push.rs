@@ -593,7 +593,11 @@ mod tests {
             Arc::new(crate::store::tests::FakeGcs::new()),
         );
         let user = control
-            .upsert_user("push-rotation-owner", "push@example.com")
+            .upsert_user(
+                "push-rotation-owner",
+                "push@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let id = "22222222-2222-4222-8222-222222222222";
@@ -627,11 +631,19 @@ mod tests {
             Arc::new(crate::store::tests::FakeGcs::new()),
         );
         let first_user = control
-            .upsert_user("push-first-owner", "first@example.com")
+            .upsert_user(
+                "push-first-owner",
+                "first@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let second_user = control
-            .upsert_user("push-second-owner", "second@example.com")
+            .upsert_user(
+                "push-second-owner",
+                "second@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         control

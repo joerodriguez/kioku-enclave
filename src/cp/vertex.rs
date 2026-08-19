@@ -620,7 +620,11 @@ mod tests {
         let store = Arc::new(crate::store::Store::new(kms.clone(), gcs.clone()));
         let control = Arc::new(super::super::control_store::ControlStore::new(kms, gcs));
         let user = control
-            .upsert_user("vertex-delete-fence", "vertex@example.com")
+            .upsert_user(
+                "vertex-delete-fence",
+                "vertex@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
 

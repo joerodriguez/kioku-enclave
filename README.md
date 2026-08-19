@@ -158,7 +158,9 @@ The public OAuth flow validates Google tokens against the baked desktop/iOS/web 
 and Sign in with Apple tokens against distinct iPhone App ID, Mac App ID, and web Services
 ID audiences. Native Apple requests require SHA-256 nonces; browser requests use Apple's
 server-returned raw nonce. Sign-up is open: every identity the provider verifies gets an
-account, and all paths issue Kioku tokens for sync, query, MCP, and account routes. OAuth authorization uses PKCE,
+account, bounded only by an image-baked service-wide daily new-account budget
+(`SIGNUP_LIMIT_PER_DAY`) that all sign-in paths share. All paths issue Kioku tokens for
+sync, query, MCP, and account routes. OAuth authorization uses PKCE,
 explicit consent, persisted single-use authorization codes, and client-bound refresh-token
 rotation. Provider subjects are namespaced and accounts are never linked by email.
 
@@ -459,6 +461,7 @@ docker build --platform linux/amd64 \
   --build-arg GOOGLE_DESKTOP_CLIENT_ID=desktop-id.apps.googleusercontent.com \
   --build-arg GOOGLE_IOS_CLIENT_ID=ios-id.apps.googleusercontent.com \
   --build-arg GOOGLE_WEB_CLIENT_ID=web-id.apps.googleusercontent.com \
+  --build-arg SIGNUP_LIMIT_PER_DAY=25 \
   --build-arg BASE_URL=https://api.example.com \
   --build-arg WEB_ORIGIN=https://app.example.com \
   --build-arg REVIEWER_AUTH_API_KEY=public-identity-platform-api-key \
@@ -499,6 +502,7 @@ binding.
 | `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` | Exact Apple audiences `com.kioku.ios`, `com.kiokuu.app`, and `com.kiokuu.web`; all five Apple values are set together or Apple auth stays off |
 | `APNS_TEAM_ID`, `APNS_PRODUCTION_KEY_ID`, `APNS_SANDBOX_KEY_ID` | Required production ready-alert provider identifiers; production and sandbox keys remain separated and are fetched from Secret Manager |
 | `ADMIN_USER_IDS` | Nonempty comma-separated stable owner UUIDs for margin reporting; owner-only reporting, not a sign-up gate |
+| `SIGNUP_LIMIT_PER_DAY` | Required positive integer. Service-wide ceiling on new accounts per UTC day, shared by every sign-in path. Signup is open, so this is the only bound on account creation; there is no default and a missing or non-positive value fails the build |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
 | `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE` | Exact matching HTTPS billing-service origin and Google OIDC audience |

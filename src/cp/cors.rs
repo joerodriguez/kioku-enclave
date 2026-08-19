@@ -82,6 +82,7 @@ mod tests {
             google_web_client_secret: "".to_string(),
             apple_sign_in: None,
             admin_user_ids: Vec::new(),
+            signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
             scheduler_sa_email: None,
             vertex_project: "".to_string(),
             vertex_location: "".to_string(),

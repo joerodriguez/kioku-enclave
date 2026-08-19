@@ -1420,6 +1420,7 @@ fn map_domain_error(error: EnclaveError) -> WalIdempotencyError {
         | EnclaveError::Auth(_)
         | EnclaveError::Embedding(_)
         | EnclaveError::Config(_)
+        | EnclaveError::SignupLimited
         | EnclaveError::Json(_)
         | EnclaveError::DeletionPending(_) => WalIdempotencyError::Unavailable,
     }

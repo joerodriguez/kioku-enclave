@@ -291,7 +291,11 @@ mod tests {
     async fn vertex_output_reservations_are_persistent_and_atomic() {
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("vertex-budget-user", "budget@example.com")
+            .upsert_user(
+                "vertex-budget-user",
+                "budget@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
 
@@ -328,7 +332,11 @@ mod tests {
     async fn vertex_work_classes_have_persistent_protected_budgets() {
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("class-budget-user", "classes@example.com")
+            .upsert_user(
+                "class-budget-user",
+                "classes@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let daily_limit = 16_384;
@@ -406,7 +414,11 @@ mod tests {
     async fn every_billable_media_retry_consumes_a_distinct_output_ceiling() {
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("media-retry-budget-user", "retries@example.com")
+            .upsert_user(
+                "media-retry-budget-user",
+                "retries@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
 

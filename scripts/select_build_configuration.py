@@ -43,6 +43,7 @@ PROFILE_KEYS = (
     "GOOGLE_IOS_CLIENT_ID",
     "GOOGLE_WEB_CLIENT_ID",
     "ADMIN_USER_IDS",
+    "SIGNUP_LIMIT_PER_DAY",
     "BASE_URL",
     "WEB_ORIGIN",
     "BILLING_SERVICE_URL",
@@ -210,6 +211,9 @@ def validate(configuration: dict[str, str], profile: str) -> None:
         raise SystemExit("ENCLAVE_ACME must be 1 for an enclave image")
     if not re.fullmatch(rf"mailto:{EMAIL_PATTERN}", configuration["ENCLAVE_ACME_CONTACT"]):
         raise SystemExit("invalid format for build configuration: ENCLAVE_ACME_CONTACT")
+
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", configuration["SIGNUP_LIMIT_PER_DAY"]):
+        raise SystemExit("invalid format for build configuration: SIGNUP_LIMIT_PER_DAY")
 
     admin_ids = [value.strip() for value in configuration["ADMIN_USER_IDS"].split(",")]
     if not admin_ids or any(

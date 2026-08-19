@@ -91,6 +91,10 @@ pub struct CpConfig {
     pub vertex_project: String,
     pub vertex_location: String,
     pub vertex_model: String,
+    /// Service-wide ceiling on new accounts per UTC day. Image-baked and
+    /// required: signup is open to any verified identity, so this is the only
+    /// bound on account creation and it must not have a permissive default.
+    pub signup_limit_per_day: i64,
     pub quota_utterances_per_day: i64,
     pub quota_screenshots_per_day: i64,
     pub quota_mcp_calls_per_day: i64,
@@ -156,6 +160,23 @@ impl CpConfig {
         jwt_secrets: Vec<String>,
         google_web_client_secret: String,
     ) -> crate::error::Result<Self> {
+        // Required, with no production default: an operator who forgets it gets
+        // a boot failure rather than an accidentally uncapped service. The test
+        // value is deliberately unrelated to any deployed budget.
+        let signup_limit_per_day = {
+            let raw = config_value("SIGNUP_LIMIT_PER_DAY", "3")?;
+            let parsed: i64 = raw.trim().parse().map_err(|_| {
+                crate::error::EnclaveError::Config(
+                    "SIGNUP_LIMIT_PER_DAY must be a whole number of accounts".into(),
+                )
+            })?;
+            if parsed < 1 {
+                return Err(crate::error::EnclaveError::Config(
+                    "SIGNUP_LIMIT_PER_DAY must be at least 1".into(),
+                ));
+            }
+            parsed
+        };
         let admin_user_ids = std::env::var("ADMIN_USER_IDS")
             .ok()
             .map(|raw| {
@@ -364,6 +385,7 @@ impl CpConfig {
             vertex_project: config_value("VERTEX_PROJECT", "test-project")?,
             vertex_location: config_value("VERTEX_LOCATION", "us-central1")?,
             vertex_model,
+            signup_limit_per_day,
             quota_utterances_per_day: parse_i64("QUOTA_UTTERANCES_PER_DAY", 50_000)?,
             quota_screenshots_per_day: parse_i64("QUOTA_SCREENSHOTS_PER_DAY", 20_000)?,
             quota_mcp_calls_per_day: parse_i64("QUOTA_MCP_CALLS_PER_DAY", 10_000)?,

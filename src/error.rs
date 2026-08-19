@@ -132,6 +132,11 @@ pub enum EnclaveError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// The service-wide daily new-account budget is exhausted. Existing
+    /// accounts are unaffected; only creation is refused.
+    #[error("signup limit reached")]
+    SignupLimited,
+
     #[error("{0}")]
     DeletionPending(DeletionPending),
 }
@@ -162,6 +167,13 @@ impl IntoResponse for EnclaveError {
                     "index": index,
                     "sequence": sequence,
                 })),
+            )
+                .into_response();
+        }
+        if matches!(self, EnclaveError::SignupLimited) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "signup_limit_reached"})),
             )
                 .into_response();
         }
