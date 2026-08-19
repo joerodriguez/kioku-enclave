@@ -45,31 +45,31 @@ pub(crate) struct MediaReferenceBatchOutcome {
 }
 
 impl MediaReferenceBatchOutcome {
-    pub(super) fn batch_id(&self) -> &str {
+    pub(in crate::cp::media) fn batch_id(&self) -> &str {
         &self.batch_id
     }
 
-    pub(super) fn stream_id(&self) -> &str {
+    pub(in crate::cp::media) fn stream_id(&self) -> &str {
         &self.stream_id
     }
 
-    pub(super) const fn first_sequence(&self) -> i64 {
+    pub(in crate::cp::media) const fn first_sequence(&self) -> i64 {
         self.first_sequence
     }
 
-    pub(super) const fn last_sequence(&self) -> i64 {
+    pub(in crate::cp::media) const fn last_sequence(&self) -> i64 {
         self.last_sequence
     }
 
-    pub(super) const fn new_count(&self) -> u16 {
+    pub(in crate::cp::media) const fn new_count(&self) -> u16 {
         self.new_count
     }
 
-    pub(super) const fn duplicate_count(&self) -> u16 {
+    pub(in crate::cp::media) const fn duplicate_count(&self) -> u16 {
         self.duplicate_count
     }
 
-    pub(super) const fn committed_through_sequence(&self) -> i64 {
+    pub(in crate::cp::media) const fn committed_through_sequence(&self) -> i64 {
         self.committed_through_sequence
     }
 }
@@ -86,7 +86,7 @@ pub(crate) struct MediaReferenceBatchPlan {
 }
 
 impl MediaReferenceBatchPlan {
-    pub(super) fn new(
+    pub(in crate::cp::media) fn new(
         account_id: String,
         batch_id: String,
         events: Vec<CaptureEventManifest>,
