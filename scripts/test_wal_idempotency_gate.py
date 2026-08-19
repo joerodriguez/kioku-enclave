@@ -27,7 +27,9 @@ EXPECTED_STORE_SURFACE_COUNT = 16
 # surface was added or removed.
 # Slice J-a: async_main's owner body gained the pre-admission WAL-authority
 # selection installation; both constructor call expressions are unchanged.
-EXPECTED_STORE_SURFACE_SHA256 = "0b859a9841be0cd1ca2c87e18f24a41757336943404f9807a3eea3fba3033f9c"
+# Slice J-b3: the internal constructor's Store literal additionally
+# initializes the always-empty serving-authority registry.
+EXPECTED_STORE_SURFACE_SHA256 = "f363cabb293509180d642f617eb3c45b0755b4a5a4d93b7bc1d7ca9b2f6ad540"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
@@ -55,7 +57,11 @@ EXPECTED_STORE_SURFACE_KEYS = frozenset(
 # comparison but reads the resolver instead of the field; only the resolver
 # and the construction chain touch `persistence_policy` directly.
 EXPECTED_POLICY_SITE_COUNT = 40
-EXPECTED_POLICY_SITE_SHA256 = "091e45a46d6c0e75a8c360fd4116c0a68878c383d4d75e1ec17ed0fd4e598b0c"
+# Slice J-b3: owner-body hashes moved for the constructor (serving-authority
+# registry init), with_user (selected-user legacy-load refusal), and
+# save_user (selected-user provider-silent no-op); every policy expression
+# and count is unchanged.
+EXPECTED_POLICY_SITE_SHA256 = "45041a416a62fc398a3cbea6b65f7e07376e7fa0b48c426f6f333e4bc1a0f611"
 EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     {
         "src/store.rs::<module>#0::WalLogicalOnly#0",
