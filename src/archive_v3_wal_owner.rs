@@ -2936,6 +2936,7 @@ mod tests {
         captured: tokio::sync::Notify,
         release_capture: tokio::sync::Semaphore,
         witnessed: tokio::sync::Notify,
+        fail_witnessed: AtomicBool,
     }
 
     impl FakeControl {
@@ -2962,7 +2963,13 @@ mod tests {
                 captured: tokio::sync::Notify::new(),
                 release_capture: tokio::sync::Semaphore::new(0),
                 witnessed: tokio::sync::Notify::new(),
+                fail_witnessed: AtomicBool::new(false),
             }
+        }
+
+        fn with_witnessed_failure(self) -> Self {
+            self.fail_witnessed.store(true, Ordering::SeqCst);
+            self
         }
 
         fn snapshot(&self) -> (WalPublicationStage, Vec<&'static str>) {
@@ -3166,6 +3173,11 @@ mod tests {
             capture: [u8; 32],
             witnessed: WitnessedWalCandidate,
         ) -> Result<AuthenticatedWalSettlement> {
+            if self.fail_witnessed.load(Ordering::SeqCst) {
+                let mut state = self.state.lock().unwrap();
+                state.trace.push("witnessed-refused");
+                return Err(WalOwnerError::Persistence);
+            }
             let settlement = AuthenticatedWalSettlement::from_control_cas(
                 crate::cp::control_store::WalOwnerPersistenceContext::for_test(),
                 context,
@@ -3230,6 +3242,7 @@ mod tests {
 
     struct FakePublication {
         next: WitnessRecord,
+        fail_send_terminal: AtomicBool,
         reject_fresh: AtomicBool,
         generic_refreshes: AtomicUsize,
         checkpoint_refreshes: AtomicUsize,
@@ -3241,6 +3254,7 @@ mod tests {
         fn new(next: WitnessRecord) -> Self {
             Self {
                 next,
+                fail_send_terminal: AtomicBool::new(false),
                 reject_fresh: AtomicBool::new(false),
                 generic_refreshes: AtomicUsize::new(0),
                 checkpoint_refreshes: AtomicUsize::new(0),
@@ -3260,6 +3274,10 @@ mod tests {
 
         fn reject_fresh(&self) {
             self.reject_fresh.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_send_terminal(&self) {
+            self.fail_send_terminal.store(true, Ordering::SeqCst);
         }
     }
 
@@ -3404,6 +3422,9 @@ mod tests {
             candidate: &WalPublicationCandidate,
         ) -> Result<WitnessedWalCandidate> {
             self.candidate_sends.fetch_add(1, Ordering::SeqCst);
+            if self.fail_send_terminal.load(Ordering::SeqCst) {
+                return Err(WalOwnerError::Corrupt);
+            }
             WitnessedWalCandidate::from_authority(candidate.clone(), self.next.clone())
         }
 
@@ -4000,6 +4021,109 @@ mod tests {
             let trace = control.snapshot().1;
             assert_eq!(trace.last(), Some(&"witnessed"));
         }
+    }
+
+    #[tokio::test]
+    async fn control_settlement_failure_never_acknowledges_and_poisons_the_lane() {
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let control = Arc::new(FakeControl::new().with_witnessed_failure());
+        let publication = Arc::new(FakePublication::new(next));
+        let handle = SingleArchiveWalOwner::spawn(store, control.clone(), publication);
+
+        // The witness CAS succeeded but the durable control settlement did
+        // not: the submitter must observe the failure, never its decoded
+        // output, exactly as the Phase-2 admission's
+        // acknowledge-after-witness-settlement fact requires.
+        assert!(matches!(
+            handle.submit(plan(42, b"settlement-loss")).await,
+            Err(WalOwnerError::Persistence)
+        ));
+        let (_, trace) = control.snapshot();
+        assert!(trace.contains(&"witnessed-refused"));
+        assert!(!trace.contains(&"witnessed"));
+
+        // The lane is poisoned: no later mutation can be acknowledged
+        // through this owner, forcing a fresh exact recovery.
+        assert!(matches!(
+            handle.submit(plan(43, b"after-loss")).await,
+            Err(WalOwnerError::Poisoned)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_send_failure_requires_manual_and_never_acknowledges() {
+        let (current, next) = authoritative_records();
+        let binding = WalOwnerStoreBinding::from_authenticated_witness(&current).unwrap();
+        let store = crate::store::SingleArchiveWalStoreOwner::for_wal_owner_test(binding).unwrap();
+        let control = Arc::new(FakeControl::new());
+        let publication = Arc::new(FakePublication::new(next));
+        publication.fail_send_terminal();
+        let handle = SingleArchiveWalOwner::spawn(store, control.clone(), publication);
+
+        // A non-publication send error is definitive: the attempt goes to
+        // ManualRequired and the submitter never receives its output.
+        assert!(matches!(
+            handle.submit(plan(44, b"terminal-send")).await,
+            Err(WalOwnerError::Corrupt)
+        ));
+        let (stage, trace) = control.snapshot();
+        assert_eq!(stage, WalPublicationStage::ManualRequired);
+        assert!(trace.contains(&"manual"));
+        assert!(!trace.contains(&"witnessed"));
+    }
+
+    /// Structural acknowledgement-ordering pin: the publish path's erased
+    /// result may release only after send, durable control settlement, drain
+    /// settlement, and store advance, and the only other release site is the
+    /// already-settled replay lookup. A reordering that acknowledges from the
+    /// local SQLite commit alone must fail this pin before any review.
+    #[test]
+    fn acknowledgement_release_is_sequenced_strictly_after_witness_settlement() {
+        let source = include_str!("archive_v3_wal_owner.rs");
+        let release_needle = concat!("result.", "release()");
+        let publish_start = source
+            .find(concat!("async fn publish_", "applied("))
+            .unwrap();
+        let publish_body = &source[publish_start..];
+        let publish_end = publish_body.find(concat!("\n", "    }")).unwrap();
+        let publish_body = &publish_body[..publish_end];
+        let send = publish_body.find(concat!("send_", "candidate(")).unwrap();
+        let witnessed = publish_body.find(concat!("record_", "witnessed(")).unwrap();
+        let settle = publish_body.find(concat!("drain.", "settle(")).unwrap();
+        let advance = publish_body.find(concat!("store.", "advance(")).unwrap();
+        let release = publish_body.find(release_needle).unwrap();
+        assert!(send < witnessed, "settlement must follow the witness send");
+        assert!(
+            witnessed < settle,
+            "drain settles only from control settlement"
+        );
+        assert!(
+            settle < advance,
+            "the lane advances only after drain settlement"
+        );
+        assert!(
+            advance < release,
+            "acknowledgement releases only after advance"
+        );
+
+        // Exactly two release sites exist in the production view: the
+        // settled-replay lookup and the post-settlement publish path.
+        let production = {
+            let mut chars: Vec<char> = source.chars().collect();
+            let marker = concat!("mod ", "tests {");
+            let tests_start = source.find(marker).unwrap();
+            chars.truncate(tests_start);
+            chars.into_iter().collect::<String>()
+        };
+        assert_eq!(production.matches(release_needle).count(), 2);
+        let replay = production
+            .find(concat!("WalStoreReplay::", "Present(result)"))
+            .unwrap();
+        let replay_release = production[replay..].find(release_needle).unwrap() + replay;
+        let publish_release = publish_start + release;
+        assert!(replay_release < publish_release);
     }
 
     #[tokio::test]
