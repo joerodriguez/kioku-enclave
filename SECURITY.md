@@ -1759,8 +1759,8 @@ digest-scoped workload principal on the KEK. Confirm that
 authorization response, or the
 identity of the service account trusted by legacy `/v1/*` routes.
 
-**Mitigation:** Public OAuth validates configured Google audiences and the account
-allow-list. Native and browser Apple login verify Apple's signature, issuer, exact
+**Mitigation:** Public OAuth validates configured Google audiences. Native and browser
+Apple login verify Apple's signature, issuer, exact
 platform audience, expiry, verified email, nonce, and subject, exchange the single-use
 code server-side, and never link accounts by email. Native nonces are SHA-256 bound;
 browser state/raw nonce and downstream PKCE state are signed and short-lived.

@@ -2068,7 +2068,6 @@ mod tests {
                 google_ios_client_id: "ios".into(),
                 google_web_client_id: "web".into(),
                 google_web_client_secret: "secret".into(),
-                allowed_emails: None,
                 admin_user_ids: vec!["11111111-1111-4111-8111-111111111111".into()],
                 scheduler_sa_email: None,
                 vertex_project: "project".into(),

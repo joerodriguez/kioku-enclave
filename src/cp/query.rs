@@ -3111,7 +3111,6 @@ mod tests {
                 google_web_client_id: "web".into(),
                 google_web_client_secret: "secret".into(),
                 apple_sign_in: None,
-                allowed_emails: None,
                 admin_user_ids: Vec::new(),
                 scheduler_sa_email: None,
                 vertex_project: "project".into(),
@@ -4277,7 +4276,6 @@ mod tests {
     #[tokio::test]
     async fn test_query_episodes_value_timezone_resilience() {
         std::env::set_var("ENCLAVE_TEST_MODE", "1");
-        std::env::set_var("ALLOWED_EMAILS", "test@example.com");
         let store = Arc::new(Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new())));
         store
             .with_user("tz-user", |conn| {
@@ -4360,7 +4358,6 @@ mod tests {
         // This is the ACTUAL bug: MCP clients send -04:00 offset timestamps,
         // and the SQL string comparison + hardcoded offset fallbacks both fail.
         std::env::set_var("ENCLAVE_TEST_MODE", "1");
-        std::env::set_var("ALLOWED_EMAILS", "test@example.com");
         let store = Arc::new(Store::new(Arc::new(FakeKms), Arc::new(FakeGcs::new())));
         store
             .with_user("tz-offset-user", |conn| {

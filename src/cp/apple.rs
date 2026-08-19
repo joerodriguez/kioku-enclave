@@ -629,17 +629,6 @@ async fn web_callback(State(state): State<Arc<CpState>>, body: String) -> Respon
     if !downstream.apple_link_user_id.is_empty() {
         return finish_web_link(&state, &downstream.apple_link_user_id, grant).await;
     }
-    let existing = match state.control.identity_user("apple", &grant.subject).await {
-        Ok(existing) => existing,
-        Err(_) => return server_error(),
-    };
-    if existing.is_none() && !state.config.email_allowed(&grant.email) {
-        return oauth::callback_error(
-            StatusCode::FORBIDDEN,
-            "Access denied",
-            "This account is not authorized.",
-        );
-    }
     let user = match state
         .control
         .upsert_apple_user(
@@ -695,17 +684,6 @@ fn web_link_redirect(state: &CpState, status: &str) -> Response {
 }
 
 async fn finish_native_login(state: &Arc<CpState>, grant: VerifiedAppleGrant) -> Response {
-    let existing = match state.control.identity_user("apple", &grant.subject).await {
-        Ok(existing) => existing,
-        Err(_) => return server_error(),
-    };
-    if existing.is_none() && !state.config.email_allowed(&grant.email) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "account_not_allowed"})),
-        )
-            .into_response();
-    }
     let user = match state
         .control
         .upsert_apple_user(

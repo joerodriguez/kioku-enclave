@@ -1550,13 +1550,6 @@ async fn google_callback(
             )
         }
     };
-    if !s.config.email_allowed(&email) {
-        return callback_error(
-            StatusCode::FORBIDDEN,
-            "Access denied",
-            "This account is not authorized.",
-        );
-    }
 
     let user = match s.control.upsert_user(&google_sub, &email).await {
         Ok(u) => u,

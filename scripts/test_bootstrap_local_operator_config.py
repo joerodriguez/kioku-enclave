@@ -60,7 +60,7 @@ class BootstrapLocalOperatorConfigTests(unittest.TestCase):
             content = output.read_text(encoding="utf-8")
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
             self.assertIn("PRODUCTION_ENCLAVE_KMS_PROJECT=", content)
-            self.assertIn("PRODUCTION_ALLOWED_EMAILS=", content)
+            self.assertIn("PRODUCTION_ADMIN_USER_IDS=", content)
             self.assertIn("LOCAL_GCP_IMPERSONATE_SERVICE_ACCOUNT=local-builder@", content)
             self.assertNotIn("\nKMS_PROJECT=", "\n" + content)
             with self.assertRaisesRegex(module.BootstrapError, "overwrite"):

@@ -81,7 +81,6 @@ mod tests {
             google_web_client_id: "".to_string(),
             google_web_client_secret: "".to_string(),
             apple_sign_in: None,
-            allowed_emails: None,
             admin_user_ids: Vec::new(),
             scheduler_sa_email: None,
             vertex_project: "".to_string(),
