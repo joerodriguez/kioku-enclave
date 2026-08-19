@@ -973,6 +973,16 @@ async fn summarize_user_window(
     let (utterances, screenshots) = fetch_range(state, user_id, &new_from_iso, &new_to_iso).await?;
 
     if utterances.is_empty() && screenshots.is_empty() {
+        // An empty span may still be waiting on recoverable media work (in
+        // flight, or terminally failed but inside the resurrection ladder's
+        // memory-hold rounds). Advancing would strand later-recovered records
+        // behind the forward-only cursor, so hold; the hold predicate expires
+        // with the ladder, so the cursor can never wedge permanently.
+        if span_holds_recoverable_media(state, user_id, &new_from_iso, &new_to_iso).await? {
+            return Ok(
+                serde_json::json!({ "skipped": true, "reason": "recoverable_media_pending" }),
+            );
+        }
         state
             .control
             .set_summarized_until(user_id, &new_to_iso)
@@ -988,6 +998,11 @@ async fn summarize_user_window(
         .max()
         .unwrap_or(new_from);
     if effective_cutoff <= new_from {
+        if span_holds_recoverable_media(state, user_id, &new_from_iso, &new_to_iso).await? {
+            return Ok(
+                serde_json::json!({ "skipped": true, "reason": "recoverable_media_pending" }),
+            );
+        }
         state
             .control
             .set_summarized_until(user_id, &new_to_iso)
@@ -1407,6 +1422,31 @@ fn compact_tail_excerpt(text: &str, max_chars: usize) -> String {
     chars[chars.len().saturating_sub(max_chars)..]
         .iter()
         .collect()
+}
+
+/// Cursor-hold check (see `media_worker::span_has_recoverable_media`): reads
+/// only; the decision it feeds is to *not* write the cursor this run.
+async fn span_holds_recoverable_media(
+    state: &CpState,
+    user_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<bool> {
+    let (f, t) = (from.to_string(), to.to_string());
+    let resurrection_window_start = format_epoch_millis(
+        now_ms() - (super::media_worker::RESURRECTION_WINDOW_SECONDS * 1000.0) as i64,
+    );
+    state
+        .store
+        .with_user(user_id, move |conn| {
+            super::media_worker::span_has_recoverable_media(
+                conn,
+                &f,
+                &t,
+                &resurrection_window_start,
+            )
+        })
+        .await
 }
 
 async fn fetch_range(

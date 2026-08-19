@@ -493,8 +493,18 @@ that does not belong to the authenticated account returns HTTP `404`.
 
 `GET /api/v2/capture/sessions/{capture_session_id}` returns only work and memories linked
 to that exact authenticated session. Its stage is one of `received`, `processing`,
-`organizing`, `preparing_recap`, `ready`, or `needs_attention`; the body also contains
-the accepted event count, optional end time, and zero or more linked memory summaries.
+`organizing`, `preparing_recap`, `ready`, `needs_attention`, or `no_memory`; the body
+also contains the accepted event count, optional end time, and zero or more linked
+memory summaries. New in-flight work reports `processing`, and a formed memory reports
+`ready`/`preparing_recap` even while other items sit in a terminal per-item failure or
+its background retry; `needs_attention` is reserved for a session where terminal
+failures remain and no memory materialized. Terminally failed jobs get a bounded
+second-chance ladder (one resurrected attempt per hour, capped total attempts, recent
+sessions only, never for media-integrity failures), and the summarizer holds its
+forward-only cursor over otherwise-empty spans while their failures are inside the
+ladder's first rounds, so a transiently failed session can still resolve to `ready` or
+an honest `no_memory` without any client action. Recoveries after a memory already
+formed, or after the hold rounds, enrich search but do not reopen summarization.
 
 `POST /api/v2/capture/sessions/{capture_session_id}` is an idempotent completion
 acceleration. Native clients retry it only after all durable events for that session are
