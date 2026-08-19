@@ -954,6 +954,24 @@ async fn delete_account_content(
     store: &Store,
     user_id: &str,
 ) -> EnclaveResult<()> {
+    // ADR-0022: for an archive that reached the `wal_authoritative` terminal the
+    // authoritative data lives under the archive-v3 keyspace. The legacy sweep
+    // enumerates its inventory from the frozen pre-cutover snapshot and touches
+    // only the legacy namespaces, so letting it run would erase the legacy
+    // artifacts, leave every checkpoint and WAL segment intact, and still let
+    // finalization stamp the account `physical_complete` / `content_deleted`.
+    // Fail closed as PENDING instead: the reconciler keeps retrying and the
+    // account is never falsely reported deleted. This resolves the moment the
+    // archive-v3 deletion driver is wired.
+    if store.is_wal_authoritative(user_id) {
+        return Err(EnclaveError::DeletionPending(
+            crate::error::DeletionPending {
+                reason: crate::error::DeletionPendingReason::ArchiveV3DeletionUnwired,
+                retry_after_seconds: Some(30),
+                hard_delete_time: None,
+            },
+        ));
+    }
     let operation = control.identity_rebind_operation_for_user(user_id).await?;
     let Some(operation) = operation else {
         return store.delete_user(user_id).await;
@@ -1188,6 +1206,50 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["deleted"], false);
         assert_eq!(value["status"], "failed_retryable");
+    }
+
+    #[tokio::test]
+    async fn wal_authoritative_deletion_stays_pending_and_never_reports_complete() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+        let kms = Arc::new(FakeKms);
+        let gcs = Arc::new(FakeGcs::new());
+        let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
+        let store = Arc::new(Store::new(kms, gcs.clone()));
+        let user = control
+            .upsert_user("wal-deletion-guard", "wal-deletion@example.com", 1_000)
+            .await
+            .unwrap();
+
+        // Before cutover the legacy sweep owns deletion, unchanged.
+        assert!(
+            delete_account_content(control.as_ref(), store.as_ref(), &user.id)
+                .await
+                .is_ok()
+        );
+
+        // After cutover the authoritative data lives in the archive-v3
+        // keyspace the legacy sweep cannot see. Deletion must stay PENDING —
+        // never silently erase only the legacy artifacts and let finalization
+        // stamp the account complete while every checkpoint and WAL segment
+        // survives.
+        store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    &user.id,
+                    crate::archive_v3::ArchiveId::from_bytes([0x6d; 16]),
+                ),
+            )
+            .unwrap();
+        let error = delete_account_content(control.as_ref(), store.as_ref(), &user.id)
+            .await
+            .expect_err("a wal-authoritative archive must not report deletion complete");
+        match error {
+            EnclaveError::DeletionPending(pending) => {
+                assert_eq!(pending.reason.as_str(), "archive_v3_deletion_unwired");
+                assert_eq!(pending.retry_after_seconds, Some(30));
+            }
+            other => panic!("expected a pending deletion, got {other:?}"),
+        }
     }
 
     #[tokio::test]
