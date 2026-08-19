@@ -544,7 +544,7 @@ def build_plan(d: Decisions) -> list[PlanStep]:
             "--location",
             "global",
             "--display-name",
-            "ADR-0022 archive GCS attestation",
+            "ADR-0022 archive GCS attest",
         ],
         mutating=True,
     )
@@ -598,7 +598,7 @@ def build_plan(d: Decisions) -> list[PlanStep]:
             "--location",
             "global",
             "--display-name",
-            "ADR-0022 archive witness attestation",
+            "ADR-0022 witness attest",
         ],
         mutating=True,
     )
@@ -621,7 +621,7 @@ def build_plan(d: Decisions) -> list[PlanStep]:
             "--workload-identity-pool",
             ARCHIVE_WITNESS_POOL,
             "--display-name",
-            "ADR-0022 archive witness provider",
+            "ADR-0022 witness provider",
             "--issuer-uri",
             CONFIDENTIAL_SPACE_ISSUER,
             "--allowed-audiences",
