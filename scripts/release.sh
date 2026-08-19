@@ -137,7 +137,18 @@ CONFIG_FILE="$RELEASE_CONFIG_SNAPSHOT"
 IFS=$'\x1f' read -r PROJECT_ID REGION AR_REPOSITORY IMAGE_NAME EXPECTED_GCS_BUCKET EXPECTED_GCS_MEDIA_BUCKET EXPECTED_GCS_LEGACY_MEDIA_BUCKET EXPECTED_BILLING_ENFORCEMENT_MODE ARCHIVE_V3_SHADOW_RUNTIME_MODE BUILDER_SERVICE_ACCOUNT <<< "$RELEASE_CONFIG_FIELDS"
 [[ -n "$PROJECT_ID" && -n "$REGION" && -n "$AR_REPOSITORY" && -n "$IMAGE_NAME" && -n "$BUILDER_SERVICE_ACCOUNT" ]] || die "local release configuration is incomplete"
 if [[ "$ROLL" == true && "$ARCHIVE_V3_SHADOW_RUNTIME_MODE" != off ]]; then
-  die "active archive-v3 WAL images cannot roll until the deployment compatibility PR is merged"
+  # Deployment compatibility for active archive-v3 images (docs/adr/
+  # 0022-solo-operator-activation.md): the baked runtime coordinates are consumed
+  # only by the pre-serving --run-archive-v3-phase1-canary subcommand — the serving
+  # path never reads them (enforced by scripts/test_wal_idempotency_gate.py's
+  # main-surface invariant), so an active-config image serves identically to an
+  # off-config image. Rolling one is still an explicit solo-operator decision: the
+  # tag must be an exact archive-v3 WAL release tag and the operator must
+  # acknowledge that exact tag out of band.
+  [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-archive-v3-wal\.[0-9]+$ ]] \
+    || die "active archive-v3 WAL images cannot roll: tag is not an exact archive-v3-wal release tag"
+  [[ "${KIOKU_CONFIRM_ARCHIVE_V3_ROLL:-}" == "$TAG" ]] \
+    || die "active archive-v3 WAL images cannot roll without KIOKU_CONFIRM_ARCHIVE_V3_ROLL naming the exact tag"
 fi
 
 # Keep the active-image rollout quarantine entirely local. It runs before the
