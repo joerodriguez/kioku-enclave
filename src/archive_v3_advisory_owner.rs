@@ -35,6 +35,7 @@ mod comparison;
 mod controller;
 mod live_window_observer;
 mod monitoring_policy;
+pub(crate) mod solo_entry;
 mod telemetry;
 mod window;
 pub(crate) use abort::{
