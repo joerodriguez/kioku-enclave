@@ -14,11 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CLASSIFICATIONS = frozenset({"A", "B", "C"})
 EXPECTED_STORE_CALL_COUNT = 160
 EXPECTED_STORE_CALL_SHA256 = "6910a19a12368a794d1e639d937fa03a7149d2bbd1fc92d2895f072ef0ae09a7"
-EXPECTED_STORE_SURFACE_COUNT = 15
-EXPECTED_STORE_SURFACE_SHA256 = "549c5d4e4bc03ced1604b868ef0ed9bb37a126eab20d7ef1816ce5ff33944f9b"
+EXPECTED_STORE_SURFACE_COUNT = 16
+EXPECTED_STORE_SURFACE_SHA256 = "f2a9028f214f26ffac34f9453a177902da78dbc71817f2db7776ef24e36ccd1d"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
     {
         "src/main.rs::async_main#0::Store::new_with_media_and_legacy#0",
+        "src/main.rs::async_main#0::Store::new_with_media_and_legacy#1",
         "src/store.rs::new#2::Self::new_internal#0",
         "src/store.rs::new#2::factory_definition::new#0",
         "src/store.rs::new_internal#0::Self::new_internal_with_max_open#0",
@@ -54,7 +55,7 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     }
 )
 EXPECTED_WORKER_SPAWN_COUNT = 32
-EXPECTED_WORKER_SPAWN_SHA256 = "409eac6c165038d0cb39f1cb221be8254ca8fa24def14b8dfec9a166bec75182"
+EXPECTED_WORKER_SPAWN_SHA256 = "21e3fa9b3d0286e5b7300af1b105e1d454fe0dcfa6a07d4f5864add5152f4a13"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -2182,7 +2183,22 @@ impl X {
         abort_reconcile_production = without_cfg_test_items(abort_reconcile)
 
         self.assertIn("mod archive_v3_advisory_owner;", main)
-        self.assertNotIn("archive_v3_advisory_owner::", main)
+        # The reviewed solo-operator canary argv branch (docs/adr/
+        # 0022-solo-operator-activation.md) is the only permitted advisory
+        # reference from main: exactly the solo_entry parse + run pair, gated
+        # behind the dedicated pre-serving subcommand. Every other advisory
+        # symbol remains banned from main.
+        self.assertIn('Some("--run-archive-v3-phase1-canary")', main)
+        self.assertEqual(
+            main.count("archive_v3_advisory_owner::solo_entry::SoloCanaryInvocation"), 1
+        )
+        self.assertEqual(
+            main.count("archive_v3_advisory_owner::solo_entry::run_solo_phase1_canary"), 1
+        )
+        self.assertNotIn(
+            "archive_v3_advisory_owner::",
+            main.replace("archive_v3_advisory_owner::solo_entry::", ""),
+        )
         self.assertIn("mod comparison;", advisory_production)
         self.assertIn("mod abort;", advisory_production)
         self.assertIn("mod abort_reconcile;", advisory_production)
