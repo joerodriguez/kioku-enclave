@@ -1939,14 +1939,23 @@ fn load_capture_session_status(
         }
         _ => false,
     };
-    let stage = if failed > 0 {
-        CaptureSessionStage::NeedsAttention
-    } else if queued + processing + retry_wait > 0 {
+    // In-flight work outranks residual failures (a resurrected failed job is
+    // retry_wait again), and a formed memory outranks both: one
+    // unprocessable item — or its background retry — must not mask or demote
+    // a recap the user can already read. needs_attention is reserved for
+    // sessions where failures remain AND no memory materialized — the only
+    // case the label can honestly claim the outcome still hinges on the
+    // failed work.
+    let stage = if queued + processing > 0 {
         CaptureSessionStage::Processing
     } else if has_ready_memory {
         CaptureSessionStage::Ready
+    } else if retry_wait > 0 {
+        CaptureSessionStage::Processing
     } else if !memories.is_empty() {
         CaptureSessionStage::PreparingRecap
+    } else if failed > 0 {
+        CaptureSessionStage::NeedsAttention
     } else if ended_at.is_some() {
         if summarized_past_end {
             CaptureSessionStage::NoMemory
@@ -5342,6 +5351,76 @@ mod tests {
         assert_eq!(ready.stage, CaptureSessionStage::Ready);
         assert_eq!(ready.memories.len(), 1);
         assert_eq!(ready.memories[0].id, 7);
+
+        // A residual terminal failure must not mask the formed memory: the
+        // user can already read the recap, so the session stays ready.
+        conn.execute(
+            "UPDATE media_objects SET processing_state='failed' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id, None)
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::Ready
+        );
+
+        // Nor does that failure's hourly background retry demote it: only
+        // genuinely new work (queued/processing) outranks a ready memory.
+        conn.execute(
+            "UPDATE media_objects SET processing_state='retry_wait' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id, None)
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::Ready
+        );
+    }
+
+    /// needs_attention is reserved for the one case the label is honest: a
+    /// terminal failure remains AND no memory materialized. In-flight work
+    /// (for example a resurrected job back in retry_wait) outranks it.
+    #[test]
+    fn capture_session_needs_attention_only_when_failed_without_memory_or_work() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        session_status_content_tables(&conn);
+
+        let manifest = valid_manifest();
+        record_source_event(&conn, "account-1", &manifest, &"a".repeat(64), "object-1").unwrap();
+        conn.execute(
+            "UPDATE media_objects SET processing_state='failed' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id, None)
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::NeedsAttention
+        );
+
+        // A resurrected job (retry_wait) means the outcome is still being
+        // worked on, so the stage returns to processing rather than alarming.
+        conn.execute(
+            "UPDATE media_objects SET processing_state='retry_wait' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        assert_eq!(
+            load_capture_session_status(&conn, &manifest.capture_session_id, None)
+                .unwrap()
+                .unwrap()
+                .stage,
+            CaptureSessionStage::Processing
+        );
     }
 
     /// ADR-0034: the terminal zero-result requires the summarizer cursor past

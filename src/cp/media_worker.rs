@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::{EnclaveError, Result};
 use crate::store::Store;
@@ -32,6 +32,24 @@ const MAX_CONCURRENT_USER_SWEEPS: usize = 4;
 const MAX_ATTEMPTS: i64 = 3;
 const PROCESSOR_VERSION: i64 = 1;
 const PROMPT_VERSION: i64 = 2;
+// Bounded second-chance ladder for terminally failed jobs: after the fast
+// 3-attempt ladder exhausts, one attempt per hour may be resurrected until the
+// hard attempt cap, and only while the source event is recent. Failures whose
+// cause is deterministic (media integrity) are never resurrected. This keeps a
+// transient Vertex outage from freezing a session in `needs_attention`
+// forever, while capping worst-case extra inference per poisoned item.
+const RESURRECTION_DELAY_SECONDS: f64 = 3_600.0;
+const RESURRECTION_TOTAL_ATTEMPT_CAP: i64 = 9;
+pub(crate) const RESURRECTION_WINDOW_SECONDS: f64 = 7.0 * 24.0 * 3_600.0;
+// A mass outage can terminally fail a large backlog at once; cap how many
+// jobs one sweep resurrects so recovered work cannot starve live capture
+// processing (2 work units per user per 30s sweep).
+const RESURRECTION_MAX_PER_SWEEP: i64 = 16;
+/// The summarizer holds its forward-only cursor over spans whose failures are
+/// still inside the first resurrection rounds (fast ladder + 2), so recovered
+/// records can still form a memory instead of being stranded behind the
+/// cursor. Later rounds only enrich search.
+pub(crate) const RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS: i64 = MAX_ATTEMPTS + 2;
 
 #[derive(Debug, Clone)]
 struct MediaJob {
@@ -1925,7 +1943,63 @@ fn mark_failed(conn: &Connection, job_id: i64, error_code: &str, now: &str) -> R
     Ok(())
 }
 
+/// True when [from, to) still contains capture media whose processing can
+/// recover into memory-relevant records: work in flight, or terminal
+/// failures within the resurrection ladder's memory-hold rounds and recency
+/// window. The summarizer consults this before advancing its forward-only
+/// cursor over an empty span (see `RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS`).
+pub(crate) fn span_has_recoverable_media(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    resurrection_window_start: &str,
+) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM capture_events e \
+         JOIN media_objects m ON m.event_id=e.event_id \
+         LEFT JOIN media_processing_jobs j ON j.event_id=e.event_id \
+         WHERE e.started_at < ?1 AND e.ended_at > ?2 \
+           AND (m.processing_state IN ('queued','processing','retry_wait') \
+                OR (m.processing_state='failed' \
+                    AND j.error_code IS NOT 'media_integrity' \
+                    AND j.attempt_count < ?3 \
+                    AND e.started_at >= ?4))",
+        params![
+            to,
+            from,
+            RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS,
+            resurrection_window_start
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn defer_for_budget(conn: &Connection, job_id: i64, now: &str) -> Result<()> {
+    // A job whose event has left the resurrection window can never recover
+    // into a memory, and endless budget deferral would pin its session at
+    // `processing` while holding the settled-summarize gate for unrelated
+    // new sessions. Terminalize honestly instead of parking it forever.
+    let window_start = isotime::add_seconds(now, -RESURRECTION_WINDOW_SECONDS);
+    let stale: bool = conn.query_row(
+        "SELECT e.started_at < ?2 FROM media_processing_jobs j \
+         JOIN capture_events e ON e.event_id=j.event_id WHERE j.id=?1",
+        params![job_id, window_start],
+        |row| row.get(0),
+    )?;
+    if stale {
+        conn.execute(
+            "UPDATE media_processing_jobs SET state='failed_terminal',lease_until=NULL, \
+             error_code='vertex_daily_budget',updated_at=?1 WHERE id=?2",
+            params![now, job_id],
+        )?;
+        conn.execute(
+            "UPDATE media_objects SET processing_state='failed' WHERE event_id=( \
+             SELECT event_id FROM media_processing_jobs WHERE id=?1)",
+            [job_id],
+        )?;
+        return Ok(());
+    }
     let retry_at = isotime::add_seconds(now, 6.0 * 60.0 * 60.0);
     conn.execute(
         "UPDATE media_processing_jobs
@@ -2256,6 +2330,68 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
     }
     state.store.save_user(user_id).await?;
     Ok(())
+}
+
+/// Moves eligible terminally failed jobs back to `retry_wait` so the normal
+/// claim path grants exactly one more attempt per resurrection (`mark_failed`
+/// re-terminalizes at `attempts >= MAX_ATTEMPTS` after every later failure).
+fn resurrect_failed_jobs(conn: &Connection, now: &str) -> Result<usize> {
+    let stale_before = isotime::add_seconds(now, -RESURRECTION_DELAY_SECONDS);
+    let window_start = isotime::add_seconds(now, -RESURRECTION_WINDOW_SECONDS);
+    let tx = conn.unchecked_transaction()?;
+    let eligible: Vec<(i64, String)> = {
+        let mut statement = tx.prepare(
+            "SELECT j.id, j.event_id FROM media_processing_jobs j \
+             JOIN capture_events e ON e.event_id = j.event_id \
+             WHERE j.processor_version = ?1 AND j.state = 'failed_terminal' \
+               AND j.error_code IS NOT 'media_integrity' \
+               AND j.attempt_count < ?2 \
+               AND j.updated_at <= ?3 \
+               AND e.started_at >= ?4 \
+             ORDER BY j.id LIMIT ?5",
+        )?;
+        let rows = statement.query_map(
+            params![
+                PROCESSOR_VERSION,
+                RESURRECTION_TOTAL_ATTEMPT_CAP,
+                stale_before,
+                window_start,
+                RESURRECTION_MAX_PER_SWEEP
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (job_id, event_id) in &eligible {
+        tx.execute(
+            "UPDATE media_processing_jobs SET state='retry_wait',lease_until=NULL, \
+             updated_at=?1 WHERE id=?2",
+            params![now, job_id],
+        )?;
+        tx.execute(
+            "UPDATE media_objects SET processing_state='retry_wait' \
+             WHERE event_id=?1 AND processing_state='failed'",
+            [event_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(eligible.len())
+}
+
+async fn resurrect_user_failed_jobs(state: &CpState, user_id: &str) {
+    let now = now_iso();
+    let resurrected = state
+        .store
+        .with_user(user_id, |conn| resurrect_failed_jobs(conn, &now))
+        .await;
+    match resurrected {
+        Ok(0) => {}
+        Ok(count) => {
+            info!(user_id, count, "resurrected terminally failed media jobs");
+            let _ = state.store.save_user(user_id).await;
+        }
+        Err(error) => warn!(user_id, error = %error, "failed-job resurrection failed"),
+    }
 }
 
 async fn process_user(state: &CpState, user_id: &str) {
@@ -2838,6 +2974,7 @@ async fn sweep(state: &Arc<CpState>) {
         }
         let state = Arc::clone(state);
         tasks.spawn(async move {
+            resurrect_user_failed_jobs(&state, &user_id).await;
             process_user(&state, &user_id).await;
             process_user_voice_embedding_jobs(&state, &user_id).await;
             prune_user_media(&state, &user_id).await;
@@ -2898,6 +3035,248 @@ mod tests {
     fn media_inference_has_bounded_sweep_and_retry_exposure() {
         assert_eq!(MAX_JOBS_PER_USER_PER_SWEEP, 2);
         assert_eq!(MAX_ATTEMPTS, 3);
+        // Resurrection bounds: at most one extra attempt per hour, a hard
+        // total-attempt cap, and only for recent events — worst case six
+        // extra inference attempts per item, spread over six hours — with a
+        // per-sweep cap so a mass outage cannot starve live capture.
+        assert_eq!(RESURRECTION_DELAY_SECONDS, 3_600.0);
+        assert_eq!(RESURRECTION_TOTAL_ATTEMPT_CAP, 9);
+        assert_eq!(RESURRECTION_WINDOW_SECONDS, 604_800.0);
+        assert_eq!(RESURRECTION_MAX_PER_SWEEP, 16);
+        assert_eq!(RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS, MAX_ATTEMPTS + 2);
+    }
+
+    #[test]
+    fn recoverable_span_predicate_holds_only_for_recoverable_failures() {
+        let conn = job_fixture_db();
+        let manifest = numbered_audio_manifest(0);
+        record_source_event(
+            &conn,
+            "account-1",
+            &manifest,
+            &format!("{:064x}", 1),
+            "raw/hold-0",
+        )
+        .unwrap();
+        let from = "2026-07-31T17:00:00.000Z";
+        let to = "2026-07-31T19:00:00.000Z";
+        let window_start = "2026-07-30T00:00:00.000Z";
+
+        // Queued work in the span holds the cursor.
+        assert!(span_has_recoverable_media(&conn, from, to, window_start).unwrap());
+
+        // A terminal failure inside the memory-hold rounds still holds.
+        conn.execute(
+            "UPDATE media_objects SET processing_state='failed' WHERE event_id=?1",
+            [&manifest.event_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE media_processing_jobs SET state='failed_terminal', \
+             error_code='processing_error',attempt_count=3",
+            [],
+        )
+        .unwrap();
+        assert!(span_has_recoverable_media(&conn, from, to, window_start).unwrap());
+
+        // Beyond the memory-hold attempts the cursor may advance.
+        conn.execute(
+            "UPDATE media_processing_jobs SET attempt_count=?1",
+            [RESURRECTION_MEMORY_HOLD_TOTAL_ATTEMPTS],
+        )
+        .unwrap();
+        assert!(!span_has_recoverable_media(&conn, from, to, window_start).unwrap());
+
+        // Deterministic integrity failures never hold.
+        conn.execute(
+            "UPDATE media_processing_jobs SET attempt_count=3,error_code='media_integrity'",
+            [],
+        )
+        .unwrap();
+        assert!(!span_has_recoverable_media(&conn, from, to, window_start).unwrap());
+
+        // Events older than the resurrection window never hold.
+        conn.execute(
+            "UPDATE media_processing_jobs SET error_code='processing_error'",
+            [],
+        )
+        .unwrap();
+        assert!(!span_has_recoverable_media(&conn, from, to, "2026-08-05T00:00:00.000Z").unwrap());
+
+        // A span that does not overlap the event never holds.
+        assert!(!span_has_recoverable_media(
+            &conn,
+            "2026-07-31T19:00:00.000Z",
+            "2026-07-31T20:00:00.000Z",
+            window_start
+        )
+        .unwrap());
+
+        // Fully processed media never holds.
+        conn.execute("UPDATE media_objects SET processing_state='ready'", [])
+            .unwrap();
+        conn.execute("UPDATE media_processing_jobs SET state='succeeded'", [])
+            .unwrap();
+        assert!(!span_has_recoverable_media(&conn, from, to, window_start).unwrap());
+    }
+
+    #[test]
+    fn budget_deferral_terminalizes_events_past_the_resurrection_window() {
+        let conn = job_fixture_db();
+        let manifest = numbered_audio_manifest(0);
+        record_source_event(
+            &conn,
+            "account-1",
+            &manifest,
+            &format!("{:064x}", 1),
+            "raw/defer-0",
+        )
+        .unwrap();
+        let job = lease_next_job(&conn, "2026-07-31T18:00:06.000Z")
+            .unwrap()
+            .expect("claimable job");
+
+        // Within the window: deferral parks the job and refunds the attempt.
+        defer_for_budget(&conn, job.id, "2026-08-01T00:00:00.000Z").unwrap();
+        let (state, attempts, processing_state) = job_state(&conn, &manifest.event_id);
+        assert_eq!(state, "retry_wait");
+        assert_eq!(attempts, 0);
+        assert_eq!(processing_state, "retry_wait");
+
+        // Past the window: deferral gives up honestly instead of cycling a
+        // week-old job through claim → defer forever.
+        let job = lease_next_job(&conn, "2026-08-02T00:00:01.000Z")
+            .unwrap()
+            .expect("reclaimable job");
+        defer_for_budget(&conn, job.id, "2026-08-10T00:00:00.000Z").unwrap();
+        let (state, _, processing_state) = job_state(&conn, &manifest.event_id);
+        assert_eq!(state, "failed_terminal");
+        assert_eq!(processing_state, "failed");
+    }
+
+    fn job_state(conn: &Connection, event_id: &str) -> (String, i64, String) {
+        conn.query_row(
+            "SELECT j.state, j.attempt_count, m.processing_state \
+             FROM media_processing_jobs j JOIN media_objects m ON m.event_id=j.event_id \
+             WHERE j.event_id=?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resurrection_grants_one_hourly_attempt_until_the_hard_cap() {
+        let conn = job_fixture_db();
+        let manifest = numbered_audio_manifest(0);
+        record_source_event(
+            &conn,
+            "account-1",
+            &manifest,
+            &format!("{:064x}", 1),
+            "raw/resurrect-0",
+        )
+        .unwrap();
+
+        // Exhaust the fast ladder: three lease+fail rounds reach terminal.
+        for round in 0..3 {
+            let at = isotime::add_seconds("2026-07-31T19:00:00.000Z", round as f64 * 3_600.0);
+            let job = lease_next_job(&conn, &at).unwrap().expect("claimable job");
+            mark_failed(&conn, job.id, "processing_error", &at).unwrap();
+        }
+        let (state, attempts, processing_state) = job_state(&conn, &manifest.event_id);
+        assert_eq!(state, "failed_terminal");
+        assert_eq!(attempts, 3);
+        assert_eq!(processing_state, "failed");
+
+        // Less than the resurrection delay after the terminal failure:
+        // nothing moves.
+        assert_eq!(
+            resurrect_failed_jobs(&conn, "2026-07-31T21:30:00.000Z").unwrap(),
+            0
+        );
+
+        // Each delay-spaced resurrection grants exactly one more attempt and
+        // the next failure re-terminalizes, until the hard cap refuses.
+        let mut at = "2026-07-31T23:00:00.000Z".to_string();
+        let mut resurrections = 0;
+        loop {
+            let moved = resurrect_failed_jobs(&conn, &at).unwrap();
+            if moved == 0 {
+                break;
+            }
+            resurrections += moved;
+            let (state, _, processing_state) = job_state(&conn, &manifest.event_id);
+            assert_eq!(state, "retry_wait");
+            assert_eq!(processing_state, "retry_wait");
+            let job = lease_next_job(&conn, &at)
+                .unwrap()
+                .expect("resurrected job");
+            mark_failed(&conn, job.id, "processing_error", &at).unwrap();
+            assert_eq!(job_state(&conn, &manifest.event_id).0, "failed_terminal");
+            at = isotime::add_seconds(&at, 2.0 * 3_600.0);
+        }
+        assert_eq!(
+            resurrections as i64,
+            RESURRECTION_TOTAL_ATTEMPT_CAP - MAX_ATTEMPTS
+        );
+        assert_eq!(
+            job_state(&conn, &manifest.event_id).1,
+            RESURRECTION_TOTAL_ATTEMPT_CAP
+        );
+    }
+
+    #[test]
+    fn resurrection_skips_integrity_failures_and_stale_events() {
+        let conn = job_fixture_db();
+        let manifest = numbered_audio_manifest(0);
+        record_source_event(
+            &conn,
+            "account-1",
+            &manifest,
+            &format!("{:064x}", 1),
+            "raw/resurrect-1",
+        )
+        .unwrap();
+        for round in 0..3 {
+            let at = isotime::add_seconds("2026-07-31T19:00:00.000Z", round as f64 * 3_600.0);
+            let job = lease_next_job(&conn, &at).unwrap().expect("claimable job");
+            mark_failed(&conn, job.id, "media_integrity", &at).unwrap();
+        }
+        assert_eq!(job_state(&conn, &manifest.event_id).0, "failed_terminal");
+
+        // A deterministic integrity failure never earns more inference.
+        assert_eq!(
+            resurrect_failed_jobs(&conn, "2026-08-01T12:00:00.000Z").unwrap(),
+            0
+        );
+
+        // Even a resurrectable error code stops once the event leaves the
+        // recency window.
+        conn.execute(
+            "UPDATE media_processing_jobs SET error_code='processing_error'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            resurrect_failed_jobs(&conn, "2026-08-01T12:00:00.000Z").unwrap(),
+            1
+        );
+        let job = lease_next_job(&conn, "2026-08-01T12:00:00.000Z")
+            .unwrap()
+            .expect("resurrected job");
+        mark_failed(
+            &conn,
+            job.id,
+            "processing_error",
+            "2026-08-01T12:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            resurrect_failed_jobs(&conn, "2026-08-10T12:00:00.000Z").unwrap(),
+            0,
+            "events older than the window stay terminal"
+        );
     }
 
     fn manifest() -> CaptureEventManifest {

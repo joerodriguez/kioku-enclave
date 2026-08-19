@@ -12,13 +12,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLASSIFICATIONS = frozenset({"A", "B", "C"})
-EXPECTED_STORE_CALL_COUNT = 160
-# Re-pinned after reviewing upstream 7db0162 (finalizer representative-screen
-# selection) and 901f3f0 (media dedupe_version 2): no call site was added or
-# removed and no classification changed; owner bodies moved, and the sole
-# closure delta is `elided: false` field initialization in the finalizer's
-# evidence-row constructor — no SQL or mutation-semantics change.
-EXPECTED_STORE_CALL_SHA256 = "1813372ba05ee4c382bc3b1567ef81c4f73e74fa6e202de5fa939d4657b040d2"
+# Re-pinned after reviewing upstream 7db0162/901f3f0 (owner bodies moved, no
+# semantics change) and for this change's three additions: media_worker
+# resurrect_user_failed_jobs (with_user + save_user, B) and summarizer
+# span_holds_recoverable_media (read-only, A).
+EXPECTED_STORE_CALL_COUNT = 163
+EXPECTED_STORE_CALL_SHA256 = "9b2689f6c61e5dc430a636f528c11f876ceea53798a66fa937c64b8f519d8346"
 EXPECTED_STORE_SURFACE_COUNT = 16
 EXPECTED_STORE_SURFACE_SHA256 = "f2a9028f214f26ffac34f9453a177902da78dbc71817f2db7776ef24e36ccd1d"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
@@ -59,11 +58,10 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
         "src/store.rs::with_user_mut#0::WalLogicalOnly#0",
     }
 )
-# Deliberate ADR-0022 Phase-2 re-pin: exactly one new owned spawn,
-# SingleArchiveMaintenanceImporter::run_phase2's tokio::spawn(run_owned(..)),
-# mirroring run()'s cancellation-ownership for the acquisition-gated door.
+# Deliberate ADR-0022 Phase-2 re-pin (upstream: run_phase2's owned spawn) plus
+# this change's media_worker sweep-closure delta (resurrection step).
 EXPECTED_WORKER_SPAWN_COUNT = 33
-EXPECTED_WORKER_SPAWN_SHA256 = "44043f87de6fa0aa07250bc370f5f46c19b88128539990d35a4b8b7e27e5e337"
+EXPECTED_WORKER_SPAWN_SHA256 = "b7ea10ea59421b71e060989629ea4f81219c08df1a3660b6754a074013362b0d"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -590,6 +588,7 @@ A_OWNERS = frozenset(
         "src/cp/media.rs::person_evidence#0",
         "src/cp/media.rs::person_statements#0",
         "src/cp/media_worker.rs::candidate_name_vocabulary#0",
+        "src/cp/summarizer.rs::span_holds_recoverable_media#0",
         "src/cp/media_worker.rs::persist_actual_media_usage#0",
         "src/cp/media_worker.rs::prune_user_media_store#0",
         "src/cp/model_usage.rs::record_response#0",
@@ -638,6 +637,7 @@ B_OWNERS = frozenset(
         "src/cp/media.rs::load_or_create_media_dek#0",
         "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
+        "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
         "src/cp/model_usage.rs::begin_invocation#0",
         "src/cp/model_usage.rs::pending_events#0",
         "src/cp/model_usage.rs::pending_coverage#0",
