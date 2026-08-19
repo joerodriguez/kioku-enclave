@@ -3905,13 +3905,9 @@ impl Store {
     /// Install the per-user WAL-authority persistence selection by consuming
     /// the sealed Control-minted facts. Install-once per user: an identical
     /// re-install is idempotent, a different archive is a Conflict, and no
-    /// removal exists. Nothing in startup, config, routes, or providers calls
-    /// this; the sole intended caller is the reviewed Phase-2 activation
-    /// transition.
-    #[allow(
-        dead_code,
-        reason = "reserved for the reviewed Phase-2 activation; startup and serving remain intentionally unwired"
-    )]
+    /// removal exists. The sole production caller is serving startup, which
+    /// installs every durable-terminal selection before request admission and
+    /// fails startup closed on any refusal.
     pub(crate) fn install_wal_authority_persistence(
         &self,
         selection: crate::cp::control_store::WalAuthoritativePersistenceSelection,
