@@ -414,7 +414,13 @@ pub async fn require_auth(
                     req.extensions_mut().insert(AuthUser(user.id));
                     next.run(req).await
                 }
-                Err(EnclaveError::SignupLimited) => signup_limited(),
+                Err(EnclaveError::SignupLimited) => {
+                    super::control_store::observe_signup_refused(
+                        "google",
+                        state.config.signup_limit_per_day,
+                    );
+                    signup_limited()
+                }
                 Err(EnclaveError::Auth(_)) => unavailable_account(),
                 Err(e) => {
                     warn!(error = %e, "user upsert failed");

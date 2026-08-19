@@ -641,7 +641,13 @@ async fn web_callback(State(state): State<Arc<CpState>>, body: String) -> Respon
         .await
     {
         Ok(user) => user,
-        Err(EnclaveError::SignupLimited) => return oauth::signup_limited_page(),
+        Err(EnclaveError::SignupLimited) => {
+            super::control_store::observe_signup_refused(
+                "apple",
+                state.config.signup_limit_per_day,
+            );
+            return oauth::signup_limited_page();
+        }
         Err(_) => {
             return oauth::callback_error(
                 StatusCode::FORBIDDEN,
@@ -699,11 +705,15 @@ async fn finish_native_login(state: &Arc<CpState>, grant: VerifiedAppleGrant) ->
     {
         Ok(user) => user,
         Err(EnclaveError::SignupLimited) => {
+            super::control_store::observe_signup_refused(
+                "apple",
+                state.config.signup_limit_per_day,
+            );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({"error": "signup_limit_reached"})),
             )
-                .into_response()
+                .into_response();
         }
         Err(EnclaveError::Auth(_)) | Err(EnclaveError::Conflict(_)) => {
             return (

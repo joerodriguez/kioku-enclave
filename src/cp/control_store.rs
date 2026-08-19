@@ -208,7 +208,7 @@ pub(crate) const TEST_SIGNUP_LIMIT: i64 = 64;
 /// checking the counter and creating the account in separate transactions
 /// would let two concurrent first-time sign-ins both observe `used == limit-1`
 /// and both create an account.
-fn reserve_signup_conn(conn: &Connection, signup_limit: i64) -> Result<()> {
+fn reserve_signup_conn(conn: &Connection, signup_limit: i64) -> Result<i64> {
     let today: String =
         conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |row| row.get(0))?;
     let used: i64 = conn
@@ -233,7 +233,40 @@ fn reserve_signup_conn(conn: &Connection, signup_limit: i64) -> Result<()> {
         "DELETE FROM signup_daily WHERE day < date(?1, ?2)",
         rusqlite::params![today, format!("-{SIGNUP_COUNTER_RETENTION_DAYS} days")],
     )?;
-    Ok(())
+    Ok(used + 1)
+}
+
+/// Content-free signup observations for log-based metrics.
+///
+/// `provider` and `outcome` are fixed low-cardinality literals and the counters
+/// are service-wide totals for the current UTC day. No account id, email,
+/// provider subject, token, or address ever enters these events, so they stay
+/// safe to export to Cloud Logging and to aggregate into metrics.
+pub(super) fn observe_signup_created(provider: &'static str, accounts_today: i64, budget: i64) {
+    tracing::info!(
+        target: "kioku::signup",
+        metric_schema = "signup_v1",
+        provider,
+        outcome = "created",
+        accounts_today,
+        budget,
+        "account created"
+    );
+}
+
+/// Emitted when the daily budget refuses a would-be new account. Warn level:
+/// nothing is broken, but a real person was turned away and the operator
+/// should see it.
+pub(super) fn observe_signup_refused(provider: &'static str, budget: i64) {
+    tracing::warn!(
+        target: "kioku::signup",
+        metric_schema = "signup_v1",
+        provider,
+        outcome = "refused",
+        accounts_today = budget,
+        budget,
+        "signup refused by the daily budget"
+    );
 }
 
 const SCHEMA: &str = r#"
@@ -22007,7 +22040,13 @@ impl ControlStore {
         // 3. Perform database transaction to insert or update user ID. The
         // legacy-ID case returned through the durable state machine above.
         let existing_cloned = existing.clone();
-        self.write(move |conn| {
+        // -1 means "no signup happened on this call". The observation is
+        // emitted only after `write` reports success, so a rolled-back
+        // transaction or a failed control-object flush cannot be counted as an
+        // account that exists.
+        let signup_count = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        let created_today = std::sync::Arc::clone(&signup_count);
+        let created = self.write(move |conn| {
             conn.execute("BEGIN TRANSACTION", [])?;
             let res = (|| -> Result<()> {
                 if is_deleted_user_conn(conn, &stable_id)? {
@@ -22044,7 +22083,10 @@ impl ControlStore {
                 } else {
                     // First sight of this Google subject: this is a signup, so
                     // it spends today's budget before the row exists.
-                    reserve_signup_conn(conn, signup_limit)?;
+                    created_today.store(
+                        reserve_signup_conn(conn, signup_limit)?,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     conn.execute(
                         "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)
                          ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email
@@ -22090,7 +22132,14 @@ impl ControlStore {
                 email,
             })
         })
-        .await
+        .await;
+        if created.is_ok() {
+            let accounts_today = signup_count.load(std::sync::atomic::Ordering::Relaxed);
+            if accounts_today >= 0 {
+                observe_signup_created("google", accounts_today, signup_limit);
+            }
+        }
+        created
     }
 
     /// Resolve a linked provider identity without creating or merging an
@@ -22136,7 +22185,11 @@ impl ControlStore {
         let refresh_token = refresh_token.to_string();
         let compatibility_anchor = format!("apple:{subject}");
         let stable_id = super::tokens::derive_provider_uuid(&provider, &subject);
-        self.write(move |conn| {
+        // See `upsert_user`: -1 means no signup happened, and the observation
+        // waits for a durable write.
+        let signup_count = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        let created_today = std::sync::Arc::clone(&signup_count);
+        let created = self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
             if is_deleted_identity_conn(&tx, &provider, &subject)? || is_deleted_user_conn(&tx, &stable_id)? {
                 tx.rollback()?;
@@ -22173,7 +22226,10 @@ impl ControlStore {
                         None => {
                             // No account behind this Apple subject yet: a
                             // signup, and it spends today's budget.
-                            reserve_signup_conn(&tx, signup_limit)?;
+                            created_today.store(
+                                reserve_signup_conn(&tx, signup_limit)?,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             tx.execute(
                                 "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
                                 rusqlite::params![stable_id, compatibility_anchor, email],
@@ -22202,7 +22258,14 @@ impl ControlStore {
             validate_active_archive_binding_conn(&tx, &user_id)?;
             tx.commit()?;
             Ok(User { id: user_id, email: primary_email })
-        }).await
+        }).await;
+        if created.is_ok() {
+            let accounts_today = signup_count.load(std::sync::atomic::Ordering::Relaxed);
+            if accounts_today >= 0 {
+                observe_signup_created("apple", accounts_today, signup_limit);
+            }
+        }
+        created
     }
 
     /// Explicitly link an Apple identity to an authenticated account; it is
@@ -29908,6 +29971,23 @@ mod tests {
             .unwrap();
         assert_eq!(used, 2);
         assert_eq!(accounts, 2);
+    }
+
+    #[test]
+    fn signup_reservation_reports_the_running_daily_count_for_observation() {
+        // The returned value is what the content-free signup event publishes,
+        // so an off-by-one here would misreport headroom in the operator's
+        // dashboard.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        assert_eq!(reserve_signup_conn(&conn, 3).unwrap(), 1);
+        assert_eq!(reserve_signup_conn(&conn, 3).unwrap(), 2);
+        assert_eq!(reserve_signup_conn(&conn, 3).unwrap(), 3);
+        assert!(matches!(
+            reserve_signup_conn(&conn, 3),
+            Err(EnclaveError::SignupLimited)
+        ));
     }
 
     #[tokio::test]

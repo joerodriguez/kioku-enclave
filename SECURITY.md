@@ -1765,8 +1765,11 @@ verified identity, bounded by an image-baked service-wide daily new-account budg
 so concurrent first-time sign-ins cannot both pass a full budget. It is shared by the
 Google-token, Google-OAuth, and both Apple paths, is spent only when an account is
 actually created, and fails closed when unset or non-positive. Returning users, legacy
-identity rebinds, and the exact-matched plugin-review identity do not spend it. Native
-and browser Apple login verify Apple's signature, issuer, exact
+identity rebinds, and the exact-matched plugin-review identity do not spend it. Signup
+emits a content-free `signup_v1` observation — fixed provider and outcome literals plus
+service-wide daily counters, never an account id, email, provider subject, token, or
+address — so account creation and refusal can be alerted on without exporting identity.
+Native and browser Apple login verify Apple's signature, issuer, exact
 platform audience, expiry, verified email, nonce, and subject, exchange the single-use
 code server-side, and never link accounts by email. Native nonces are SHA-256 bound;
 browser state/raw nonce and downstream PKCE state are signed and short-lived.
