@@ -1573,7 +1573,10 @@ async fn google_callback(
         .await
     {
         Ok(u) => u,
-        Err(crate::error::EnclaveError::SignupLimited) => return signup_limited_page(),
+        Err(crate::error::EnclaveError::SignupLimited) => {
+            super::control_store::observe_signup_refused("google", s.config.signup_limit_per_day);
+            return signup_limited_page();
+        }
         Err(_) => {
             return callback_error(
                 StatusCode::FORBIDDEN,
