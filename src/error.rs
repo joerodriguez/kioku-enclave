@@ -13,6 +13,11 @@ pub enum DeletionPendingReason {
     LegacyGenerationUnavailable,
     LegacyInventoryIncomplete,
     LegacyWriteIntentUnsettled,
+    /// The archive reached the ADR-0022 `wal_authoritative` terminal, so the
+    /// authoritative data lives in the archive-v3 keyspace that the legacy
+    /// sweep cannot see. Deletion stays pending — never falsely complete —
+    /// until the archive-v3 deletion driver is wired.
+    ArchiveV3DeletionUnwired,
 }
 
 impl DeletionPendingReason {
@@ -23,6 +28,7 @@ impl DeletionPendingReason {
             Self::LegacyGenerationUnavailable => "legacy_generation_unavailable",
             Self::LegacyInventoryIncomplete => "legacy_inventory_incomplete",
             Self::LegacyWriteIntentUnsettled => "legacy_write_intent_unsettled",
+            Self::ArchiveV3DeletionUnwired => "archive_v3_deletion_unwired",
         }
     }
 }

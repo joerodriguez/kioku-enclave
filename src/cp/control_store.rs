@@ -12858,11 +12858,18 @@ fn load_wal_authoritative_persistence_selections_conn(
     conn: &Connection,
 ) -> Result<Vec<WalAuthoritativePersistenceSelection>> {
     let mut statement = conn.prepare(
+        // `b.state` is filtered here, not only in the per-candidate revalidation:
+        // account deletion tombstones the binding early while the terminal
+        // import row is never removed, so an unfiltered candidate would fail
+        // revalidation, fail the whole scan, and panic startup — before the
+        // reconciler that clears the condition can run. A deleting account is
+        // already refused at the auth layer, so dropping its selection cannot
+        // serve stale data.
         "SELECT DISTINCT b.user_id
          FROM archive_bindings b
          JOIN archive_v3_maintenance_imports i
            ON i.archive_id = b.archive_id AND i.format_version = 1
-         WHERE i.stage = 'wal_authoritative'
+         WHERE i.stage = 'wal_authoritative' AND b.state = 'active_legacy'
          ORDER BY b.user_id",
     )?;
     let user_ids: Vec<String> = statement
@@ -33080,6 +33087,23 @@ mod tests {
             load_wal_authoritative_persistence_selection_conn(&conn, USER_ID),
             Err(EnclaveError::Auth(_))
         ));
+
+        // Regression: account deletion tombstones the binding early while the
+        // terminal import row survives the whole deletion window. An
+        // unfiltered candidate would fail revalidation and fail the WHOLE
+        // scan, which startup treats as fatal — bricking the enclave for every
+        // user before the reconciler that clears the condition can run. The
+        // scan must simply drop the tombstoned user and succeed.
+        conn.execute(
+            "UPDATE archive_bindings SET state='tombstoned' WHERE user_id=?1",
+            [USER_ID],
+        )
+        .unwrap();
+        let selections = load_wal_authoritative_persistence_selections_conn(&conn).unwrap();
+        assert!(
+            selections.is_empty(),
+            "a tombstoned binding must be dropped, never fail the whole scan"
+        );
     }
 
     #[test]
