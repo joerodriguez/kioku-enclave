@@ -19,8 +19,13 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Slice F-c: the only call-site delta is with_user_if_changed's owner body,
 # whose refusal now reads the per-user resolver; its call expression and C
 # classification are unchanged.
-EXPECTED_STORE_CALL_COUNT = 163
-EXPECTED_STORE_CALL_SHA256 = "5f7de75a0eaed96f0d398e3ac5e8bb13c02749f82cefb6a9d3674d6b6019d3ab"
+EXPECTED_STORE_CALL_COUNT = 166
+# Slice J-c domain 1 (media capture-session-finish): the scanner now also
+# inventories the routed wal_authoritative_read/submit surfaces; the delta is
+# exactly finish_capture_session's three routed sites (probe read, settled
+# submit, status read) inheriting the owner's pre-reviewed classification,
+# plus that owner's body hash across its unchanged legacy branch.
+EXPECTED_STORE_CALL_SHA256 = "4f86b48f35ac3ebea0d1108377e8d3a8bcda11c85396b43f3539c11a15f46525"
 EXPECTED_STORE_SURFACE_COUNT = 16
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -399,7 +404,8 @@ STORE_CALL = re.compile(
     r"(?:\.\s*|\bSelf\s*::\s*|"
     r"\b(?:crate\s*::\s*store\s*::\s*)?Store\s*::\s*|"
     r"<\s*(?:crate\s*::\s*store\s*::\s*)?Store\s*>\s*::\s*)"
-    r"(?P<target>with_user_mut|with_user_if_changed|with_user|save_user)\s*\("
+    r"(?P<target>with_user_mut|with_user_if_changed|with_user|save_user"
+    r"|wal_authoritative_read|wal_authoritative_submit)\s*\("
 )
 WORKER_SPAWN = re.compile(
     r"(?P<target>tokio::spawn)\s*\(|\.\s*(?P<method>spawn)\s*\(\s*async\b|"
