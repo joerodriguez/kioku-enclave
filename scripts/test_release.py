@@ -62,6 +62,13 @@ class LocalReleaseContracts(unittest.TestCase):
         self.assertLess(gate, registry)
         self.assertLess(gate, push)
         self.assertIn('"ARCHIVE_V3_SHADOW_RUNTIME_MODE"', RELEASE)
+        # The quarantine is now a positive two-factor predicate, not a blanket
+        # refusal: an exact archive-v3-wal tag plus an operator acknowledgment
+        # naming that exact tag. Both remain before any network action.
+        self.assertIn('archive-v3-wal\\.[0-9]+$', RELEASE)
+        self.assertIn('KIOKU_CONFIRM_ARCHIVE_V3_ROLL', RELEASE)
+        ack = RELEASE.index('KIOKU_CONFIRM_ARCHIVE_V3_ROLL')
+        self.assertLess(ack, RELEASE.index('git fetch origin main'))
 
     def test_evidence_has_only_hashes_for_local_build_inputs(self) -> None:
         for field in ("config_sha256", "dockerfile_sha256", "cargo_lock_sha256", "release_metadata_sha256", "sbom_sha256", "scan_sha256"):
