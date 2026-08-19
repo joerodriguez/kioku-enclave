@@ -454,7 +454,6 @@ mod tests {
             google_ios_client_id: "ios".into(),
             google_web_client_secret: "secret".into(),
             apple_sign_in: None,
-            allowed_emails: None,
             admin_user_ids: Vec::new(),
             scheduler_sa_email: None,
             vertex_project: "project".into(),

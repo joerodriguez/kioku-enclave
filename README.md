@@ -157,8 +157,8 @@ authentication. All production images enforce context-bound v2 encryption uncond
 The public OAuth flow validates Google tokens against the baked desktop/iOS/web clients
 and Sign in with Apple tokens against distinct iPhone App ID, Mac App ID, and web Services
 ID audiences. Native Apple requests require SHA-256 nonces; browser requests use Apple's
-server-returned raw nonce. All paths enforce a non-wildcard account allow-list and issue
-Kioku tokens for sync, query, MCP, and account routes. OAuth authorization uses PKCE,
+server-returned raw nonce. Sign-up is open: every identity the provider verifies gets an
+account, and all paths issue Kioku tokens for sync, query, MCP, and account routes. OAuth authorization uses PKCE,
 explicit consent, persisted single-use authorization codes, and client-bound refresh-token
 rotation. Provider subjects are namespaced and accounts are never linked by email.
 
@@ -414,9 +414,8 @@ independent measurement authenticity. A future separately reviewed deployment co
 must satisfy those blockers and transactionally consume the receipt before authority.
 
 The production Docker build has no permissive configuration defaults. Supply every
-deployment value; empty values, wildcard `ALLOWED_EMAILS`, non-HTTPS `BASE_URL` or
-`WEB_ORIGIN`, an invalid WIF provider audience, or `ENCLAVE_ACME` other than `1` fail the
-build.
+deployment value; empty values, non-HTTPS `BASE_URL` or `WEB_ORIGIN`, an invalid WIF
+provider audience, or `ENCLAVE_ACME` other than `1` fail the build.
 
 The four `ARCHIVE_WITNESS_*` Docker arguments below are low-level image inputs. The local
 pipeline never accepts them from operator configuration or command-line overrides: both build selection
@@ -460,7 +459,6 @@ docker build --platform linux/amd64 \
   --build-arg GOOGLE_DESKTOP_CLIENT_ID=desktop-id.apps.googleusercontent.com \
   --build-arg GOOGLE_IOS_CLIENT_ID=ios-id.apps.googleusercontent.com \
   --build-arg GOOGLE_WEB_CLIENT_ID=web-id.apps.googleusercontent.com \
-  --build-arg ALLOWED_EMAILS=owner@example.com \
   --build-arg BASE_URL=https://api.example.com \
   --build-arg WEB_ORIGIN=https://app.example.com \
   --build-arg REVIEWER_AUTH_API_KEY=public-identity-platform-api-key \
@@ -500,8 +498,7 @@ binding.
 | `APPLE_TEAM_ID`, `APPLE_KEY_ID` | Optional Apple developer team/key identifiers; atomic with every Apple client ID |
 | `APPLE_IOS_CLIENT_ID`, `APPLE_MACOS_CLIENT_ID`, `APPLE_WEB_CLIENT_ID` | Exact Apple audiences `com.kioku.ios`, `com.kiokuu.app`, and `com.kiokuu.web`; all five Apple values are set together or Apple auth stays off |
 | `APNS_TEAM_ID`, `APNS_PRODUCTION_KEY_ID`, `APNS_SANDBOX_KEY_ID` | Required production ready-alert provider identifiers; production and sandbox keys remain separated and are fetched from Secret Manager |
-| `ALLOWED_EMAILS` | Nonempty, non-wildcard account allow-list |
-| `ADMIN_USER_IDS` | Nonempty comma-separated stable owner UUIDs for margin reporting; separate from the email allow-list |
+| `ADMIN_USER_IDS` | Nonempty comma-separated stable owner UUIDs for margin reporting; owner-only reporting, not a sign-up gate |
 | `BASE_URL` | Public HTTPS API origin, OAuth issuer, and basis of the public attestation audience |
 | `WEB_ORIGIN` | Single HTTPS browser origin allowed by CORS |
 | `BILLING_SERVICE_URL`, `BILLING_SERVICE_AUDIENCE` | Exact matching HTTPS billing-service origin and Google OIDC audience |

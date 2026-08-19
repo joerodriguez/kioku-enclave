@@ -334,8 +334,8 @@ fn deletion_status_access(method: &axum::http::Method, path: &str) -> bool {
 }
 
 /// axum middleware: resolve the caller to a user id (our JWT, else Google ID
-/// token) and attach [`AuthUser`]. 403 if an otherwise-valid Google account is
-/// not on the `ALLOWED_EMAILS` list.
+/// token) and attach [`AuthUser`]. Any account Google verifies is accepted;
+/// sign-up is open.
 pub async fn require_auth(
     State(state): State<Arc<CpState>>,
     mut req: Request,
@@ -377,13 +377,6 @@ pub async fn require_auth(
     // 2) Google ID token (device sync / web)
     match state.user_verifier.verify(&token).await {
         Ok((google_sub, email)) => {
-            if !state.config.email_allowed(&email) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": "forbidden", "error_description": "Account not allowed"})),
-                )
-                    .into_response();
-            }
             if deletion_status_access {
                 let user_id = tokens::derive_stable_uuid(&google_sub);
                 match state.control.user_status(&user_id).await {

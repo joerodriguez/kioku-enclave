@@ -84,10 +84,8 @@ pub struct CpConfig {
     /// Optional Sign in with Apple public configuration. The private key is
     /// fetched separately from Secret Manager and never enters image metadata.
     pub apple_sign_in: Option<apple::AppleSignInConfig>,
-    /// Lowercased allow-list. `None` is permitted only in debug test mode.
-    pub allowed_emails: Option<Vec<String>>,
-    /// Stable UUIDs authorized for owner-only operational reporting. This is
-    /// intentionally independent from the broader sign-in email allow-list.
+    /// Stable UUIDs authorized for owner-only operational reporting. Sign-up is
+    /// open to every verified identity; this list only gates owner reporting.
     pub admin_user_ids: Vec<String>,
     pub scheduler_sa_email: Option<String>,
     pub vertex_project: String,
@@ -158,32 +156,6 @@ impl CpConfig {
         jwt_secrets: Vec<String>,
         google_web_client_secret: String,
     ) -> crate::error::Result<Self> {
-        let allowed_emails = std::env::var("ALLOWED_EMAILS").ok().and_then(|raw| {
-            let list: Vec<String> = raw
-                .split(',')
-                .map(|e| e.trim().to_lowercase())
-                .filter(|e| !e.is_empty())
-                .collect();
-            if list.is_empty() {
-                None
-            } else {
-                Some(list)
-            }
-        });
-
-        if !crate::test_mode_enabled() && allowed_emails.is_none() {
-            return Err(crate::error::EnclaveError::Config(
-                "ALLOWED_EMAILS must contain at least one explicit account".into(),
-            ));
-        }
-        if allowed_emails
-            .as_ref()
-            .is_some_and(|emails| emails.iter().any(|email| email == "*"))
-        {
-            return Err(crate::error::EnclaveError::Config(
-                "ALLOWED_EMAILS does not permit a wildcard".into(),
-            ));
-        }
         let admin_user_ids = std::env::var("ADMIN_USER_IDS")
             .ok()
             .map(|raw| {
@@ -385,7 +357,6 @@ impl CpConfig {
             )?,
             google_web_client_secret,
             apple_sign_in,
-            allowed_emails,
             admin_user_ids,
             scheduler_sa_email: std::env::var("SCHEDULER_SA_EMAIL")
                 .ok()
@@ -417,13 +388,6 @@ impl CpConfig {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
-    }
-
-    pub fn email_allowed(&self, email: &str) -> bool {
-        match &self.allowed_emails {
-            None => crate::test_mode_enabled(),
-            Some(list) => list.contains(&email.to_lowercase()),
-        }
     }
 
     pub fn is_admin(&self, user_id: &str) -> bool {
