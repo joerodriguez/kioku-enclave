@@ -4031,10 +4031,6 @@ impl Store {
     /// refuses every call and the process restarts to relaunch. Nothing in
     /// startup, config, routes, or providers calls this yet; the sole
     /// intended caller is the config-gated startup relaunch.
-    #[allow(
-        dead_code,
-        reason = "reserved for the config-gated startup relaunch; serving remains intentionally unwired"
-    )]
     pub(crate) fn install_wal_serving_authority(
         &self,
         user_id: &str,
