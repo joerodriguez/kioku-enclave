@@ -1521,7 +1521,7 @@ impl SingleArchiveWalPublisher {
             store,
             control,
             Arc::new(publisher),
-            Some(store_fence),
+            store_fence,
         ))
     }
 
@@ -1531,7 +1531,7 @@ impl SingleArchiveWalPublisher {
         Self,
         crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging,
         WalOwnerStoreBinding,
-        crate::store::StoreWalAuthorityFence,
+        Option<crate::store::StoreWalAuthorityFence>,
     )> {
         let CompletedMaintenanceWalHandoffView {
             runtime,

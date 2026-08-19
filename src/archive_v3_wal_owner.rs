@@ -2006,6 +2006,53 @@ fn run_wal_store_lane(
     thread_poisoned.store(true, Ordering::Release);
 }
 
+/// Crate-visible serving authority for one WAL-authoritative archive: the
+/// composition the activation change hands to routing. Constructible from the
+/// in-run maintenance handoff or the durable restart reconstruction; both go
+/// through the same publisher owner reserve/renew/reacquire path. It exposes
+/// exactly the typed settled-only submit and read surfaces and nothing else —
+/// no lane, publisher, control, provider, list, or delete access. No
+/// production caller exists until the reviewed routing slice.
+pub(crate) struct SingleArchiveWalServingAuthority {
+    launcher: launcher::SingleArchiveWalLauncherOwner,
+}
+
+impl SingleArchiveWalServingAuthority {
+    pub(crate) async fn launch(
+        handoff: crate::archive_v3_maintenance_import::CompletedMaintenanceWalHandoff,
+    ) -> Result<Self> {
+        Ok(Self {
+            launcher: launcher::SingleArchiveWalLauncherOwner::launch(handoff).await?,
+        })
+    }
+
+    pub(crate) async fn submit<P: WalLogicalDomainPlan>(
+        &self,
+        prepared: PreparedLogicalMutation<P>,
+    ) -> Result<P::Output> {
+        self.launcher.submit(prepared).await
+    }
+
+    pub(crate) async fn read<F, T>(
+        &self,
+        read: F,
+    ) -> Result<std::result::Result<T, crate::error::EnclaveError>>
+    where
+        F: FnOnce(&rusqlite::Connection) -> std::result::Result<T, crate::error::EnclaveError>
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
+        self.launcher.read(read).await
+    }
+}
+
+impl std::fmt::Debug for SingleArchiveWalServingAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SingleArchiveWalServingAuthority(<inactive>)")
+    }
+}
+
 /// Non-cloneable handle owning the actor queue and task. A submitted plan is
 /// moved into the queue before awaiting its response; cancellation of that
 /// caller therefore cannot cancel post-commit publication work.
