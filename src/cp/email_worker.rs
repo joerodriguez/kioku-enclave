@@ -455,6 +455,7 @@ mod tests {
             google_web_client_secret: "secret".into(),
             apple_sign_in: None,
             admin_user_ids: Vec::new(),
+            signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
             scheduler_sa_email: None,
             vertex_project: "project".into(),
             vertex_location: "location".into(),
@@ -479,7 +480,11 @@ mod tests {
         let control = Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs));
 
         let user = control
-            .upsert_user("google-sub-worker-test", "user@example.com")
+            .upsert_user(
+                "google-sub-worker-test",
+                "user@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         control
@@ -549,7 +554,11 @@ mod tests {
         let control = Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs));
 
         let user = control
-            .upsert_user("google-sub-optout-test", "optout@example.com")
+            .upsert_user(
+                "google-sub-optout-test",
+                "optout@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         // Enable full content initially
@@ -623,7 +632,11 @@ mod tests {
         let control = Arc::new(crate::cp::control_store::ControlStore::new(kms, gcs));
 
         let user = control
-            .upsert_user("google-sub-disabled-test", "off@example.com")
+            .upsert_user(
+                "google-sub-disabled-test",
+                "off@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         // User opts out completely

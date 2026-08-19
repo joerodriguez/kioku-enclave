@@ -851,7 +851,11 @@ mod tests {
         let sink = Arc::new(super::super::telemetry::InMemoryPhase1TelemetrySink::new());
 
         let user = control
-            .upsert_user(username, &format!("{}@example.com", username))
+            .upsert_user(
+                username,
+                &format!("{}@example.com", username),
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
 

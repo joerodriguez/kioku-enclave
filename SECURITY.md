@@ -1759,8 +1759,14 @@ digest-scoped workload principal on the KEK. Confirm that
 authorization response, or the
 identity of the service account trusted by legacy `/v1/*` routes.
 
-**Mitigation:** Public OAuth validates configured Google audiences. Native and browser
-Apple login verify Apple's signature, issuer, exact
+**Mitigation:** Public OAuth validates configured Google audiences. Signup is open to any
+verified identity, bounded by an image-baked service-wide daily new-account budget
+(`SIGNUP_LIMIT_PER_DAY`) consumed inside the same transaction that inserts the account,
+so concurrent first-time sign-ins cannot both pass a full budget. It is shared by the
+Google-token, Google-OAuth, and both Apple paths, is spent only when an account is
+actually created, and fails closed when unset or non-positive. Returning users, legacy
+identity rebinds, and the exact-matched plugin-review identity do not spend it. Native
+and browser Apple login verify Apple's signature, issuer, exact
 platform audience, expiry, verified email, nonce, and subject, exchange the single-use
 code server-side, and never link accounts by email. Native nonces are SHA-256 bound;
 browser state/raw nonce and downstream PKCE state are signed and short-lived.

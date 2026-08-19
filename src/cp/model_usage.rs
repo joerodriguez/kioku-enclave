@@ -961,6 +961,7 @@ mod tests {
                 google_web_client_id: "web".into(),
                 google_web_client_secret: "secret".into(),
                 admin_user_ids: vec![],
+                signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
                 scheduler_sa_email: None,
                 vertex_project: "project".into(),
                 vertex_location: "global".into(),
@@ -1171,7 +1172,11 @@ mod tests {
         let state = settlement_state(batch_sizes.clone());
         let user = state
             .control
-            .upsert_user("usage-settlement-subject", "settlement@example.com")
+            .upsert_user(
+                "usage-settlement-subject",
+                "settlement@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let user_id = user.id.clone();

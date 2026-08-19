@@ -1197,7 +1197,11 @@ mod tests {
         let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
         let user = control
-            .upsert_user("deletion-restart-subject", "owner@example.com")
+            .upsert_user(
+                "deletion-restart-subject",
+                "owner@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         store
@@ -1276,7 +1280,11 @@ mod tests {
         let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
         let user = control
-            .upsert_user("cancelled-deletion-subject", "owner@example.com")
+            .upsert_user(
+                "cancelled-deletion-subject",
+                "owner@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         store
@@ -1340,6 +1348,7 @@ mod tests {
                 "owner@privaterelay.appleid.com",
                 "com.kioku.ios",
                 "retained-refresh-token",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
             )
             .await
             .unwrap();
@@ -1349,6 +1358,7 @@ mod tests {
                 "owner@privaterelay.appleid.com",
                 "com.kiokuu.app",
                 "retained-mac-refresh-token",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
             )
             .await
             .unwrap();
@@ -1411,7 +1421,11 @@ mod tests {
         let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let store = Arc::new(Store::new(kms.clone(), gcs.clone()));
         let user = control
-            .upsert_user("missing-generation-subject", "owner@example.com")
+            .upsert_user(
+                "missing-generation-subject",
+                "owner@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let historical_media = "media/sticky-historical-evidence";

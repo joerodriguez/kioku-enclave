@@ -4404,7 +4404,11 @@ pub(crate) mod tests {
         let control_gcs = Arc::new(FakeGcs::new());
         let control = Arc::new(ControlStore::new(Arc::new(FakeKms), control_gcs.clone()));
         let user = control
-            .upsert_user("maintenance-import-e2e", "maintenance@example.com")
+            .upsert_user(
+                "maintenance-import-e2e",
+                "maintenance@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let plan = control
@@ -5812,7 +5816,11 @@ pub(crate) mod tests {
             Arc::new(FakeGcs::new()),
         ));
         let user = control
-            .upsert_user("phase2-acquisition-e2e", "phase2@example.com")
+            .upsert_user(
+                "phase2-acquisition-e2e",
+                "phase2@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let plan = control
@@ -6912,7 +6920,11 @@ pub(crate) mod tests {
         let control_gcs = Arc::new(FakeGcs::new());
         let control = Arc::new(ControlStore::new(Arc::new(FakeKms), control_gcs.clone()));
         let user = control
-            .upsert_user("pre-owner-e2e", "preowner@example.com")
+            .upsert_user(
+                "pre-owner-e2e",
+                "preowner@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let plan = control
@@ -7005,7 +7017,11 @@ pub(crate) mod tests {
             Arc::new(FakeGcs::new()),
         ));
         let user = control
-            .upsert_user("maintenance-authority-e2e", "authority@example.com")
+            .upsert_user(
+                "maintenance-authority-e2e",
+                "authority@example.com",
+                crate::cp::control_store::TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let plan = control

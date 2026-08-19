@@ -184,6 +184,58 @@ fn prune_completed_reference_batches(
     Ok(changed)
 }
 
+/// Days of signup history retained. The counter only ever reads "today", so
+/// older rows exist purely to keep the table from silently losing an in-flight
+/// day; anything past this window is pruned as new reservations arrive.
+const SIGNUP_COUNTER_RETENTION_DAYS: i64 = 30;
+
+/// Budget passed by the plugin-review login path. That identity is a single
+/// operator-provisioned account whose API key, UID, and email are exact-matched
+/// against baked configuration, and its UID maps to one fixed account id, so it
+/// can create at most one account ever. It is exempt because a busy signup day
+/// must not be able to break App Store / plugin review. This is the only
+/// exemption; every public path passes the configured budget.
+pub(super) const REVIEWER_SIGNUP_EXEMPT: i64 = i64::MAX;
+
+/// Signup budget for tests that are not exercising the cap and just need it out
+/// of the way. Deliberately unrelated to any deployed budget.
+#[cfg(test)]
+pub(crate) const TEST_SIGNUP_LIMIT: i64 = 64;
+
+/// Consume one unit of today's service-wide signup budget, or refuse.
+///
+/// This must run inside the same transaction as the `users` insert it guards:
+/// checking the counter and creating the account in separate transactions
+/// would let two concurrent first-time sign-ins both observe `used == limit-1`
+/// and both create an account.
+fn reserve_signup_conn(conn: &Connection, signup_limit: i64) -> Result<()> {
+    let today: String =
+        conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |row| row.get(0))?;
+    let used: i64 = conn
+        .query_row(
+            "SELECT accounts FROM signup_daily WHERE day = ?1",
+            [&today],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    // A non-positive limit is treated as "closed", not "unlimited": a
+    // misconfigured budget must fail closed.
+    if signup_limit < 1 || used >= signup_limit {
+        return Err(EnclaveError::SignupLimited);
+    }
+    conn.execute(
+        "INSERT INTO signup_daily (day, accounts) VALUES (?1, 1) \
+         ON CONFLICT(day) DO UPDATE SET accounts = signup_daily.accounts + 1",
+        [&today],
+    )?;
+    conn.execute(
+        "DELETE FROM signup_daily WHERE day < date(?1, ?2)",
+        rusqlite::params![today, format!("-{SIGNUP_COUNTER_RETENTION_DAYS} days")],
+    )?;
+    Ok(())
+}
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS users (
@@ -231,6 +283,15 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     vertex_screen_output_tokens INTEGER NOT NULL DEFAULT 0,
     vertex_derived_output_tokens INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, day)
+);
+-- Service-wide daily new-account budget. Signup is open to any verified
+-- identity, so this counter is the only thing standing between that and
+-- unbounded account creation. It is deliberately not per-user: there is no
+-- user yet when it is consumed. Rows outside the retention window are pruned
+-- as each reservation is taken, so the table stays bounded.
+CREATE TABLE IF NOT EXISTS signup_daily (
+    day      TEXT PRIMARY KEY,
+    accounts INTEGER NOT NULL DEFAULT 0
 );
 -- The external billing plane sees only this random pseudonym. Its mapping to
 -- Google-derived identity remains inside the encrypted control database.
@@ -21821,7 +21882,12 @@ impl ControlStore {
     }
 
     /// Upsert a user by `google_sub`; returns id + email.
-    pub async fn upsert_user(&self, google_sub: &str, email: &str) -> Result<User> {
+    pub async fn upsert_user(
+        &self,
+        google_sub: &str,
+        email: &str,
+        signup_limit: i64,
+    ) -> Result<User> {
         let google_sub = google_sub.to_string();
         let email = email.to_string();
         let stable_id = super::tokens::derive_stable_uuid(&google_sub);
@@ -21976,6 +22042,9 @@ impl ControlStore {
                         )?;
                     }
                 } else {
+                    // First sight of this Google subject: this is a signup, so
+                    // it spends today's budget before the row exists.
+                    reserve_signup_conn(conn, signup_limit)?;
                     conn.execute(
                         "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)
                          ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email
@@ -22058,6 +22127,7 @@ impl ControlStore {
         email: &str,
         client_id: &str,
         refresh_token: &str,
+        signup_limit: i64,
     ) -> Result<User> {
         let provider = "apple".to_string();
         let subject = subject.to_string();
@@ -22101,6 +22171,9 @@ impl ControlStore {
                     ).optional()?;
                     match collision {
                         None => {
+                            // No account behind this Apple subject yet: a
+                            // signup, and it spends today's budget.
+                            reserve_signup_conn(&tx, signup_limit)?;
                             tx.execute(
                                 "INSERT INTO users (id, google_sub, email) VALUES (?1, ?2, ?3)",
                                 rusqlite::params![stable_id, compatibility_anchor, email],
@@ -29442,13 +29515,13 @@ mod tests {
         let store = ControlStore::new(kms, gcs.clone());
 
         let first = store
-            .upsert_user(GOOGLE_SUB, "owner@example.com")
+            .upsert_user(GOOGLE_SUB, "owner@example.com", TEST_SIGNUP_LIMIT)
             .await
             .unwrap();
         let first_generation = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
 
         let second = store
-            .upsert_user(GOOGLE_SUB, "owner@example.com")
+            .upsert_user(GOOGLE_SUB, "owner@example.com", TEST_SIGNUP_LIMIT)
             .await
             .unwrap();
         let second_generation = gcs.get_object(CONTROL_OBJECT).await.unwrap().generation;
@@ -29467,7 +29540,11 @@ mod tests {
             "simulated lost successful response".into(),
         ));
         let user = control
-            .upsert_user("lost-control-put-subject", "lost@example.com")
+            .upsert_user(
+                "lost-control-put-subject",
+                "lost@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -29488,7 +29565,11 @@ mod tests {
         let gcs = Arc::new(FakeGcs::new());
         let control = ControlStore::new(kms.clone(), gcs.clone());
         let user = control
-            .upsert_user("canary-lost-response-subject", "canary-lost@example.com")
+            .upsert_user(
+                "canary-lost-response-subject",
+                "canary-lost@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         control
@@ -29599,7 +29680,11 @@ mod tests {
         let concurrent_gcs = Arc::new(FakeGcs::new());
         let seed = ControlStore::new(kms.clone(), concurrent_gcs.clone());
         let user = seed
-            .upsert_user("canary-concurrent-subject", "canary-concurrent@example.com")
+            .upsert_user(
+                "canary-concurrent-subject",
+                "canary-concurrent@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         seed.prepare_archive_v3_maintenance_import(&user.id)
@@ -29714,7 +29799,11 @@ mod tests {
 
         let missing = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let missing_user = missing
-            .upsert_user("missing-ledger-subject", "missing@example.com")
+            .upsert_user(
+                "missing-ledger-subject",
+                "missing@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let missing_id = missing_user.id.clone();
@@ -29731,14 +29820,22 @@ mod tests {
             .unwrap();
         assert!(matches!(
             missing
-                .upsert_user("missing-ledger-subject", "missing@example.com")
+                .upsert_user(
+                    "missing-ledger-subject",
+                    "missing@example.com",
+                    TEST_SIGNUP_LIMIT
+                )
                 .await,
             Err(EnclaveError::Store(_))
         ));
 
         let tombstoned = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let tombstoned_user = tombstoned
-            .upsert_user("tombstoned-ledger-subject", "tombstoned@example.com")
+            .upsert_user(
+                "tombstoned-ledger-subject",
+                "tombstoned@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let tombstoned_id = tombstoned_user.id.clone();
@@ -29764,10 +29861,187 @@ mod tests {
             .unwrap();
         assert!(matches!(
             tombstoned
-                .upsert_user("tombstoned-ledger-subject", "tombstoned@example.com")
+                .upsert_user(
+                    "tombstoned-ledger-subject",
+                    "tombstoned@example.com",
+                    TEST_SIGNUP_LIMIT
+                )
                 .await,
             Err(EnclaveError::Auth(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn signup_budget_admits_exactly_the_configured_accounts_each_day() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        for index in 0..2 {
+            store
+                .upsert_user(&format!("budget-sub-{index}"), "owner@example.com", 2)
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            store
+                .upsert_user("budget-sub-overflow", "overflow@example.com", 2)
+                .await,
+            Err(EnclaveError::SignupLimited)
+        ));
+
+        // The refusal must not have consumed budget or left a row behind.
+        let (used, accounts) = store
+            .read(|conn| {
+                let today: String =
+                    conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |row| row.get(0))?;
+                let used: i64 = conn.query_row(
+                    "SELECT accounts FROM signup_daily WHERE day = ?1",
+                    [&today],
+                    |row| row.get(0),
+                )?;
+                let accounts: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+                Ok((used, accounts))
+            })
+            .await
+            .unwrap();
+        assert_eq!(used, 2);
+        assert_eq!(accounts, 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_signup_budget_still_admits_existing_accounts() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let created = store
+            .upsert_user(GOOGLE_SUB, "owner@example.com", 1)
+            .await
+            .unwrap();
+
+        // Same subject, budget now spent: signing in is not signing up.
+        let returning = store
+            .upsert_user(GOOGLE_SUB, "owner@example.com", 1)
+            .await
+            .unwrap();
+        assert_eq!(created.id, returning.id);
+
+        // An email change on the existing account still must not be refused.
+        let renamed = store
+            .upsert_user(GOOGLE_SUB, "renamed@example.com", 1)
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, created.id);
+        assert_eq!(renamed.email, "renamed@example.com");
+
+        // A different subject is a genuine signup and is refused.
+        assert!(matches!(
+            store
+                .upsert_user("someone-else", "else@example.com", 1)
+                .await,
+            Err(EnclaveError::SignupLimited)
+        ));
+    }
+
+    #[tokio::test]
+    async fn apple_and_google_signups_share_one_daily_budget() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        let apple = store
+            .upsert_apple_user(
+                "apple-budget-subject",
+                "apple@example.com",
+                "com.kioku.ios",
+                "refresh-one",
+                1,
+            )
+            .await
+            .unwrap();
+
+        // Apple spent the single slot, so Google signup is refused...
+        assert!(matches!(
+            store
+                .upsert_user("google-after-apple", "google@example.com", 1)
+                .await,
+            Err(EnclaveError::SignupLimited)
+        ));
+
+        // ...while the Apple account that already exists keeps signing in.
+        let returning = store
+            .upsert_apple_user(
+                "apple-budget-subject",
+                "apple@example.com",
+                "com.kioku.ios",
+                "refresh-two",
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(returning.id, apple.id);
+    }
+
+    #[tokio::test]
+    async fn a_non_positive_signup_budget_closes_signup_rather_than_opening_it() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        for limit in [0, -1] {
+            assert!(matches!(
+                store
+                    .upsert_user(&format!("closed-{limit}"), "closed@example.com", limit)
+                    .await,
+                Err(EnclaveError::SignupLimited)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn signup_budget_is_scoped_to_the_day_and_prunes_old_rows() {
+        use crate::store::tests::{FakeGcs, FakeKms};
+
+        let store = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
+        store
+            .write(|conn| {
+                // Yesterday's exhausted budget and a row past the retention window.
+                conn.execute(
+                    "INSERT INTO signup_daily (day, accounts) VALUES (date('now','-1 day'), 99)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO signup_daily (day, accounts) VALUES (date('now','-400 day'), 99)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Today has its own budget regardless of yesterday.
+        store
+            .upsert_user("fresh-day-subject", "fresh@example.com", 1)
+            .await
+            .unwrap();
+
+        let (yesterday, stale) = store
+            .read(|conn| {
+                let yesterday: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM signup_daily WHERE day = date('now','-1 day')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let stale: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM signup_daily WHERE day = date('now','-400 day')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((yesterday, stale))
+            })
+            .await
+            .unwrap();
+        assert_eq!(yesterday, 1, "recent history is retained");
+        assert_eq!(stale, 0, "rows past the retention window are pruned");
     }
 
     #[tokio::test]
@@ -29781,6 +30055,7 @@ mod tests {
                 "apple@example.com",
                 "com.kioku.ios",
                 "refresh-one",
+                TEST_SIGNUP_LIMIT,
             )
             .await
             .unwrap();
@@ -29803,6 +30078,7 @@ mod tests {
                     "apple@example.com",
                     "com.kioku.ios",
                     "refresh-two",
+                    TEST_SIGNUP_LIMIT,
                 )
                 .await,
             Err(EnclaveError::Store(_))
@@ -29821,6 +30097,7 @@ mod tests {
                 "malformed@example.com",
                 "com.kioku.ios",
                 "refresh-one",
+                TEST_SIGNUP_LIMIT,
             )
             .await
             .unwrap();
@@ -29844,6 +30121,7 @@ mod tests {
                     "malformed@example.com",
                     "com.kioku.ios",
                     "refresh-two",
+                    TEST_SIGNUP_LIMIT,
                 )
                 .await,
             Err(EnclaveError::Store(_))
@@ -29856,6 +30134,7 @@ mod tests {
                 "tombstoned@example.com",
                 "com.kioku.ios",
                 "refresh-one",
+                TEST_SIGNUP_LIMIT,
             )
             .await
             .unwrap();
@@ -29886,6 +30165,7 @@ mod tests {
                     "tombstoned@example.com",
                     "com.kioku.ios",
                     "refresh-two",
+                    TEST_SIGNUP_LIMIT,
                 )
                 .await,
             Err(EnclaveError::Auth(_))
@@ -29893,7 +30173,7 @@ mod tests {
 
         let linking = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let google = linking
-            .upsert_user("apple-link-owner", "owner@example.com")
+            .upsert_user("apple-link-owner", "owner@example.com", TEST_SIGNUP_LIMIT)
             .await
             .unwrap();
         let google_id = google.id.clone();
@@ -29923,7 +30203,11 @@ mod tests {
 
         let malformed_link = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let malformed_owner = malformed_link
-            .upsert_user("malformed-link-owner", "malformed-link@example.com")
+            .upsert_user(
+                "malformed-link-owner",
+                "malformed-link@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let malformed_owner_id = malformed_owner.id.clone();
@@ -29955,7 +30239,11 @@ mod tests {
 
         let tombstoned_link = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let tombstoned_owner = tombstoned_link
-            .upsert_user("tombstoned-link-owner", "tombstoned-link@example.com")
+            .upsert_user(
+                "tombstoned-link-owner",
+                "tombstoned-link@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let tombstoned_owner_id = tombstoned_owner.id.clone();
@@ -29998,7 +30286,11 @@ mod tests {
 
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("active-binding-subject", "binding@example.com")
+            .upsert_user(
+                "active-binding-subject",
+                "binding@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let ledger = control
@@ -30028,7 +30320,11 @@ mod tests {
         let gcs = Arc::new(FakeGcs::new());
         let control = ControlStore::new(kms.clone(), gcs.clone());
         let user = control
-            .upsert_user("archive-binding-subject", "archive@example.com")
+            .upsert_user(
+                "archive-binding-subject",
+                "archive@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let first = control
@@ -30043,7 +30339,11 @@ mod tests {
         drop(control);
         let restarted = ControlStore::new(kms, gcs);
         let same = restarted
-            .upsert_user("archive-binding-subject", "archive@example.com")
+            .upsert_user(
+                "archive-binding-subject",
+                "archive@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let reloaded = restarted
@@ -30059,7 +30359,11 @@ mod tests {
         // persisted state rather than a stable/user-derived hash.
         let independent = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let independent_user = independent
-            .upsert_user("archive-binding-subject", "archive@example.com")
+            .upsert_user(
+                "archive-binding-subject",
+                "archive@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let independent_id = *independent
@@ -30102,7 +30406,11 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 control
-                    .upsert_user("concurrent-archive-subject", "concurrent@example.com")
+                    .upsert_user(
+                        "concurrent-archive-subject",
+                        "concurrent@example.com",
+                        TEST_SIGNUP_LIMIT,
+                    )
                     .await
             }));
         }
@@ -30157,7 +30465,11 @@ mod tests {
         control.finalize_user_deletion(&user_id).await.unwrap();
         assert!(matches!(
             control
-                .upsert_user("concurrent-archive-subject", "concurrent@example.com")
+                .upsert_user(
+                    "concurrent-archive-subject",
+                    "concurrent@example.com",
+                    TEST_SIGNUP_LIMIT
+                )
                 .await,
             Err(EnclaveError::Auth(_))
         ));
@@ -30191,7 +30503,7 @@ mod tests {
         let rebind_control = control.clone();
         let rebind = tokio::spawn(async move {
             rebind_control
-                .upsert_user(subject, "legacy@example.com")
+                .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
                 .await
         });
         tokio::task::yield_now().await;
@@ -30244,7 +30556,7 @@ mod tests {
         let rebind_control = control.clone();
         let mut rebind = tokio::spawn(async move {
             rebind_control
-                .upsert_user(subject, "legacy@example.com")
+                .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
                 .await
         });
         tokio::select! {
@@ -30370,7 +30682,9 @@ mod tests {
         // first rebind attempt creates the marker and must remain retryable
         // instead of fencing or overtaking that active request.
         assert!(matches!(
-            control.upsert_user(subject, "legacy@example.com").await,
+            control
+                .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
+                .await,
             Err(EnclaveError::DeletionPending(
                 crate::error::DeletionPending {
                     reason: crate::error::DeletionPendingReason::LegacyWriteIntentUnsettled,
@@ -30385,7 +30699,7 @@ mod tests {
         // exact source generation/commitment, and forces a second CAS bump
         // before copying the stable object.
         let user = control
-            .upsert_user(subject, "legacy@example.com")
+            .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
             .await
             .unwrap();
         assert_eq!(user.id, stable_user_id);
@@ -30461,7 +30775,7 @@ mod tests {
         };
         gcs.get_completed.notified().await;
         let rebound = control
-            .upsert_user(subject, "legacy@example.com")
+            .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
             .await
             .unwrap();
         assert_eq!(rebound.id, stable_user_id);
@@ -30543,7 +30857,7 @@ mod tests {
         };
         gcs.get_completed.notified().await;
         control
-            .upsert_user(subject, "legacy@example.com")
+            .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
             .await
             .unwrap();
         gcs.resume_get.notify_one();
@@ -30626,7 +30940,7 @@ mod tests {
         let cancelled_control = control.clone();
         let mut cancelled = tokio::spawn(async move {
             cancelled_control
-                .upsert_user(subject, "legacy@example.com")
+                .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
                 .await
         });
         tokio::select! {
@@ -30930,7 +31244,7 @@ mod tests {
         gcs.fail_next_generation_delete(&old_object, 1);
 
         assert!(control
-            .upsert_user(subject, "legacy@example.com")
+            .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
             .await
             .is_err());
         let pending = control
@@ -30978,7 +31292,9 @@ mod tests {
         seed_legacy_rebind_account(&control, &content, subject, old_user_id).await;
 
         assert!(matches!(
-            control.upsert_user(subject, "legacy@example.com").await,
+            control
+                .upsert_user(subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
+                .await,
             Err(EnclaveError::Store(_))
         ));
         assert_eq!(
@@ -31020,7 +31336,9 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            control.upsert_user(&subject, "legacy@example.com").await,
+            control
+                .upsert_user(&subject, "legacy@example.com", TEST_SIGNUP_LIMIT)
+                .await,
             Err(EnclaveError::Conflict(_))
         ));
 
@@ -31095,7 +31413,11 @@ mod tests {
         let gcs = Arc::new(FakeGcs::new());
         let control = ControlStore::new(kms.clone(), gcs.clone());
         let user = control
-            .upsert_user("privacy-purge-subject", "private@example.com")
+            .upsert_user(
+                "privacy-purge-subject",
+                "private@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         control.billing_account_id(&user.id).await.unwrap();
@@ -31129,7 +31451,11 @@ mod tests {
         let gcs = Arc::new(FakeGcs::new());
         let control = ControlStore::new(kms.clone(), gcs.clone());
         let user = control
-            .upsert_user("long-control-history", "history@example.com")
+            .upsert_user(
+                "long-control-history",
+                "history@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         for index in 0..128 {
@@ -31172,7 +31498,11 @@ mod tests {
         let gcs = Arc::new(PausingGcs::new(backing.clone()));
         let control = Arc::new(ControlStore::new(kms.clone(), gcs.clone()));
         let user = control
-            .upsert_user("privacy-race-subject", "private@example.com")
+            .upsert_user(
+                "privacy-race-subject",
+                "private@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         control.billing_account_id(&user.id).await.unwrap();
@@ -31191,7 +31521,7 @@ mod tests {
         let writing_control = Arc::clone(&control);
         let concurrent_write = tokio::spawn(async move {
             writing_control
-                .upsert_user("concurrent-subject", "other@example.com")
+                .upsert_user("concurrent-subject", "other@example.com", TEST_SIGNUP_LIMIT)
                 .await
         });
         for _ in 0..10 {
@@ -31228,7 +31558,11 @@ mod tests {
 
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("coverage-rollback-subject", "coverage@example.com")
+            .upsert_user(
+                "coverage-rollback-subject",
+                "coverage@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let established = control
@@ -31266,11 +31600,15 @@ mod tests {
 
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let first = control
-            .upsert_user("lease-bound-first", "first@example.com")
+            .upsert_user("lease-bound-first", "first@example.com", TEST_SIGNUP_LIMIT)
             .await
             .unwrap();
         let second = control
-            .upsert_user("lease-bound-second", "second@example.com")
+            .upsert_user(
+                "lease-bound-second",
+                "second@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
 
@@ -31369,7 +31707,11 @@ mod tests {
 
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("offline-delivery-subject", "offline@example.com")
+            .upsert_user(
+                "offline-delivery-subject",
+                "offline@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         assert!(!control
@@ -31441,7 +31783,11 @@ mod tests {
 
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("reference-batch-subject", "batch@example.com")
+            .upsert_user(
+                "reference-batch-subject",
+                "batch@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         control
@@ -31603,7 +31949,11 @@ mod tests {
 
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("lease-rebase-subject", "lease-rebase@example.com")
+            .upsert_user(
+                "lease-rebase-subject",
+                "lease-rebase@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let retry_now_ms =
@@ -31686,7 +32036,11 @@ mod tests {
 
         let control = ControlStore::new(Arc::new(FakeKms), Arc::new(FakeGcs::new()));
         let user = control
-            .upsert_user("lease-competing-subject", "lease-competing@example.com")
+            .upsert_user(
+                "lease-competing-subject",
+                "lease-competing@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         control
@@ -32268,7 +32622,11 @@ mod tests {
         let gcs = Arc::new(FakeGcs::new());
         let control = ControlStore::new(kms.clone(), gcs.clone());
         let user = control
-            .upsert_user("maintenance-recovery-subject", "recovery@example.com")
+            .upsert_user(
+                "maintenance-recovery-subject",
+                "recovery@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
         let _plan = control
@@ -32811,6 +33169,7 @@ mod tests {
             .upsert_user(
                 "maintenance-shadow-reacquire",
                 "shadow-reacquire@example.com",
+                TEST_SIGNUP_LIMIT,
             )
             .await
             .unwrap();
@@ -32886,6 +33245,7 @@ mod tests {
             .upsert_user(
                 "maintenance-parity-reacquire",
                 "parity-reacquire@example.com",
+                TEST_SIGNUP_LIMIT,
             )
             .await
             .unwrap();
@@ -36879,7 +37239,11 @@ mod tests {
         let store = ControlStore::new(kms, gcs);
 
         let user = store
-            .upsert_user("google-sub-email-test", "user@example.com")
+            .upsert_user(
+                "google-sub-email-test",
+                "user@example.com",
+                TEST_SIGNUP_LIMIT,
+            )
             .await
             .unwrap();
 

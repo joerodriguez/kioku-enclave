@@ -320,6 +320,19 @@ fn unavailable_account() -> Response {
         .into_response()
 }
 
+/// Today's service-wide signup budget is spent. This refuses account creation
+/// only; every existing account keeps working.
+fn signup_limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": "signup_limit_reached",
+            "error_description": "Kioku is accepting a limited number of new accounts per day. Please try again tomorrow."
+        })),
+    )
+        .into_response()
+}
+
 fn auth_store_error() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -392,11 +405,16 @@ pub async fn require_auth(
                     }
                 }
             }
-            match state.control.upsert_user(&google_sub, &email).await {
+            match state
+                .control
+                .upsert_user(&google_sub, &email, state.config.signup_limit_per_day)
+                .await
+            {
                 Ok(user) => {
                     req.extensions_mut().insert(AuthUser(user.id));
                     next.run(req).await
                 }
+                Err(EnclaveError::SignupLimited) => signup_limited(),
                 Err(EnclaveError::Auth(_)) => unavailable_account(),
                 Err(e) => {
                     warn!(error = %e, "user upsert failed");

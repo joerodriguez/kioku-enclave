@@ -2069,6 +2069,7 @@ mod tests {
                 google_web_client_id: "web".into(),
                 google_web_client_secret: "secret".into(),
                 admin_user_ids: vec!["11111111-1111-4111-8111-111111111111".into()],
+                signup_limit_per_day: crate::cp::control_store::TEST_SIGNUP_LIMIT,
                 scheduler_sa_email: None,
                 vertex_project: "project".into(),
                 vertex_location: "global".into(),

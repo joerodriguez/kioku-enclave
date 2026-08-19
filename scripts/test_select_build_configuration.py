@@ -37,6 +37,7 @@ CONFIGURATION = {
     "GOOGLE_IOS_CLIENT_ID": "ios.apps.googleusercontent.com",
     "GOOGLE_WEB_CLIENT_ID": "web.apps.googleusercontent.com",
     "ADMIN_USER_IDS": "12345678-1234-1234-1234-123456789abc",
+    "SIGNUP_LIMIT_PER_DAY": "25",
     "BASE_URL": "https://eval-api.kiokuu.com",
     "WEB_ORIGIN": "https://kiokuu.com",
     "BILLING_SERVICE_URL": "https://billing.kiokuu.com",
@@ -266,6 +267,9 @@ class SelectorTests(unittest.TestCase):
 
     def test_invalid_security_values_fail_before_writing_environment(self) -> None:
         for key, value in (
+            ("EVALUATION_SIGNUP_LIMIT_PER_DAY", "0"),
+            ("EVALUATION_SIGNUP_LIMIT_PER_DAY", "-1"),
+            ("EVALUATION_SIGNUP_LIMIT_PER_DAY", "unlimited"),
             ("EVALUATION_BASE_URL", "http://eval-api.kiokuu.com"),
             ("EVALUATION_ADMIN_USER_IDS", "not-an-id"),
             ("EVALUATION_BILLING_SERVICE_URL", "http://billing.kiokuu.com"),

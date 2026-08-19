@@ -1043,7 +1043,11 @@ async fn reviewer_login(
     let identity_subject = format!("reviewer:identity-platform:{reviewer_uid}");
     let user = match s
         .control
-        .upsert_user(&identity_subject, &reviewer_email)
+        .upsert_user(
+            &identity_subject,
+            &reviewer_email,
+            super::control_store::REVIEWER_SIGNUP_EXEMPT,
+        )
         .await
     {
         Ok(user) => user,
@@ -1124,6 +1128,18 @@ struct CallbackQuery {
 #[derive(Deserialize)]
 struct GoogleTokenResp {
     id_token: String,
+}
+
+/// Browser-facing refusal for a signup that would exceed today's service-wide
+/// budget. Distinct from `callback_error`'s "something went wrong" framing:
+/// nothing failed, the door is simply shut until tomorrow, and the visitor
+/// should be told to come back rather than to retry or contact support.
+pub(super) fn signup_limited_page() -> Response {
+    callback_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Not accepting new accounts right now",
+        "Kioku is opening a limited number of new accounts each day, and today's are taken. Please try again tomorrow.",
+    )
 }
 
 pub(super) fn callback_error(
@@ -1551,8 +1567,13 @@ async fn google_callback(
         }
     };
 
-    let user = match s.control.upsert_user(&google_sub, &email).await {
+    let user = match s
+        .control
+        .upsert_user(&google_sub, &email, s.config.signup_limit_per_day)
+        .await
+    {
         Ok(u) => u,
+        Err(crate::error::EnclaveError::SignupLimited) => return signup_limited_page(),
         Err(_) => {
             return callback_error(
                 StatusCode::FORBIDDEN,
