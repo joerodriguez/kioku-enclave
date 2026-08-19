@@ -467,6 +467,18 @@ fn authenticate_runtime_admission(
     })
 }
 
+/// The three pinned roots for the distinct Phase-2 authority verifier
+/// (operator, image-attestation, deployment-observer/runtime-admission).
+/// Fails closed unless the pinned set validates as nonzero and pairwise distinct.
+pub(super) fn pinned_roots_for_phase2() -> Result<([u8; 32], [u8; 32], [u8; 32])> {
+    let roots = CanaryTrustRoots::pinned()?;
+    Ok((
+        roots.operator,
+        roots.image_attestation,
+        roots.runtime_admission,
+    ))
+}
+
 /// Narrow accessor for the pinned deployment-observer (runtime-admission) root,
 /// used by the live window observer's production constructor. Fails closed while
 /// the pinned roots remain deliberately invalid zero roots.
