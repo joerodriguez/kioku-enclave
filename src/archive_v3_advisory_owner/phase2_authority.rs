@@ -463,6 +463,100 @@ mod tests {
         key.sign(&message).as_ref().to_vec()
     }
 
+    // Evidence produced by scripts/phase2_sign_authority.py with the real
+    // operator-held roots over synthetic facts. Verifier acceptance pins the
+    // byte-exact signer/verifier wire contract for the Phase-2 domains; the
+    // synthetic facts can never satisfy any durable Control predicate.
+    const SIGNER_FIXTURE_STATEMENT: &[&str] = &[
+        "0001111111111111111111111111111111112222222222222222222222222222",
+        "2222222222222222222222222222222222223333333333333333333333333333",
+        "3333444444444444444444444444444444445555555555555555555555555555",
+        "5555555555555555555555555555555555556666666666666666666666666666",
+        "6666666666666666666666666666666666667777777777777777777777777777",
+        "7777777777777777777777777777777777778888888888888888888888888888",
+        "8888888888888888888888888888888888889999999999999999999999999999",
+        "999999999999999999999999999999999999",
+    ];
+    const SIGNER_FIXTURE_STATEMENT_SIGNATURE: &[&str] = &[
+        "39ad1a68bdb24acad3547bfda68a916058f973de7d4b0e9d827e9530f1cd5a60",
+        "2e6cd49ce18ec35660394b475e496127c08c1a7e70899b8f667a114df35aad09",
+    ];
+    const SIGNER_FIXTURE_ATTESTATION: &[&str] = &[
+        "000111111111111111111111111111111111b9d94876edccc0498c7c562dc0cc",
+        "c771df556cb2e3c0a502de76a984db1a74659999999999999999999999999999",
+        "999999999999999999999999999999999999",
+    ];
+    const SIGNER_FIXTURE_ATTESTATION_SIGNATURE: &[&str] = &[
+        "1d49ba9be14bd91ba3fc2480da598f939e4028480e03ee37e6bcf8f378513bcb",
+        "b04d3a960c39312da8f8838c6151f1c9f400ab55683b67ab947689c2cbe16b0b",
+    ];
+    const SIGNER_FIXTURE_ADMISSION: &[&str] = &[
+        "000111111111111111111111111111111111b9d94876edccc0498c7c562dc0cc",
+        "c771df556cb2e3c0a502de76a984db1a74659999999999999999999999999999",
+        "999999999999999999999999999999999999943dd3496bd5cabc5a054605caed",
+        "f27969ec0fa3a0af574d902284b246b217b7aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bbbbcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "ccccdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "ddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "eeee0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "0f0f0200000200000000",
+    ];
+    const SIGNER_FIXTURE_ADMISSION_SIGNATURE: &[&str] = &[
+        "cad962f4983fdfa157361de42ba13f6a26114ff5f6af8c895e17cbc21f0de33e",
+        "0ea151067ed6548f30410ff86202a5406f5919e44466689a5e71e630e859b80f",
+    ];
+
+    fn signer_fixture(parts: &[&str]) -> Vec<u8> {
+        let mut joined = String::new();
+        for part in parts {
+            joined.push_str(part);
+        }
+        (0..joined.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&joined[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn pinned_phase2_verifier_accepts_the_offline_signer_tool_evidence_exactly() {
+        let statement = signer_fixture(SIGNER_FIXTURE_STATEMENT);
+        let statement_signature = signer_fixture(SIGNER_FIXTURE_STATEMENT_SIGNATURE);
+        let attestation = signer_fixture(SIGNER_FIXTURE_ATTESTATION);
+        let attestation_signature = signer_fixture(SIGNER_FIXTURE_ATTESTATION_SIGNATURE);
+        let admission = signer_fixture(SIGNER_FIXTURE_ADMISSION);
+        let admission_signature = signer_fixture(SIGNER_FIXTURE_ADMISSION_SIGNATURE);
+        let authorization = verify_pinned_phase2_authority(
+            &statement,
+            &statement_signature,
+            &attestation,
+            &attestation_signature,
+            &admission,
+            &admission_signature,
+        )
+        .expect("signer-produced Phase-2 evidence must verify against the pinned roots");
+        assert_eq!(authorization.statement().scope_id, [0x11; 16]);
+
+        for tamper in 0..6 {
+            let mut parts = [
+                statement.clone(),
+                statement_signature.clone(),
+                attestation.clone(),
+                attestation_signature.clone(),
+                admission.clone(),
+                admission_signature.clone(),
+            ];
+            parts[tamper][0] ^= 0x01;
+            assert!(
+                verify_pinned_phase2_authority(
+                    &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5],
+                )
+                .is_err(),
+                "tampered Phase-2 element {tamper} must refuse"
+            );
+        }
+    }
+
     fn statement_bytes() -> Vec<u8> {
         let mut bytes = Vec::with_capacity(OPERATOR_STATEMENT_BYTES);
         bytes.extend_from_slice(&OPERATOR_STATEMENT_FORMAT_V1.to_be_bytes());
