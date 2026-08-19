@@ -8407,6 +8407,250 @@ fn persist_maintenance_reacquired_lease_conn(
     maintenance_import_record_conn(conn, operation_id)
 }
 
+/// Persist the Phase-2 witness-lease succession from the settled advisory
+/// terminal. Mirrors `persist_maintenance_reacquired_lease_conn`'s exact
+/// attempt-supersession and full-tuple CAS, with the witness relation
+/// replaced by the succession transitions and the fresh basis bound to the
+/// durable Phase-2 acquisition row: a succession can only ever consume the
+/// exact settled terminal the acquisition was minted over.
+#[allow(clippy::too_many_arguments)]
+fn persist_maintenance_phase2_succeeded_lease_conn(
+    conn: &Connection,
+    operation_id: MaintenanceImportOperationId,
+    expected_stage: MaintenanceImportStage,
+    previous: &crate::archive_v3_witness::WitnessRecord,
+    basis: Option<&crate::archive_v3_witness::WitnessRecord>,
+    succeeded: &crate::archive_v3_witness::WitnessRecord,
+    lease: crate::archive_v3_witness::WitnessLease,
+) -> Result<MaintenanceImportRecord> {
+    let previous_owner: Vec<u8> = conn.query_row(
+        "SELECT owner_id FROM archive_v3_maintenance_imports WHERE operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let owner = ObjectId::from_bytes(fixed_blob::<16>(
+        &previous_owner,
+        "maintenance phase2 succession owner",
+    )?);
+    let previous_lease = previous
+        .exact_active_lease_for_owner(owner)
+        .map_err(|_| EnclaveError::Conflict("maintenance previous lease is invalid".into()))?;
+    let exact_succession = match basis {
+        Some(basis) => {
+            if !basis.is_exact_phase2_succession_basis_of(previous, owner) {
+                return Err(EnclaveError::Conflict(
+                    "phase2 succession basis is not the settled advisory terminal".into(),
+                ));
+            }
+            succeeded
+                .exact_phase2_succession_from(basis, owner)
+                .map_err(|_| EnclaveError::Conflict("phase2 succeeded lease is not exact".into()))?
+        }
+        None => succeeded
+            .exact_phase2_succession_lineage_from(previous, owner)
+            .map_err(|_| EnclaveError::Conflict("phase2 succession lineage is not exact".into()))?,
+    };
+    if !matches!(
+        expected_stage,
+        MaintenanceImportStage::ShadowWal | MaintenanceImportStage::ParityVerified
+    ) || exact_succession != lease
+    {
+        return Err(EnclaveError::Conflict(
+            "phase2 succession changed immutable witness facts".into(),
+        ));
+    }
+    // The succession is authorized solely by the durable acquisition row: it
+    // must be intact, minted for this exact operation, and — for a fresh
+    // succession — over exactly the basis being consumed.
+    let archive_id_bytes: Vec<u8> = conn.query_row(
+        "SELECT archive_id FROM archive_v3_maintenance_imports WHERE operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let archive_id = ArchiveId::from_bytes(fixed_blob::<16>(
+        &archive_id_bytes,
+        "maintenance phase2 succession archive",
+    )?);
+    let acquisition =
+        load_phase2_authority_acquisition_conn(conn, archive_id)?.ok_or_else(|| {
+            EnclaveError::Conflict("phase2 succession requires a durable acquisition".into())
+        })?;
+    if acquisition.maintenance_operation_id != operation_id
+        || acquisition.stage != Phase2AcquisitionStage::Phase2Acquired
+        || acquisition.revision != 1
+    {
+        return Err(EnclaveError::Conflict(
+            "phase2 succession requires a durable acquisition".into(),
+        ));
+    }
+    if let Some(basis) = basis {
+        let basis_hash: [u8; 32] = Sha256::digest(basis.encode()).into();
+        if basis_hash != acquisition.terminal_witness_hash {
+            return Err(EnclaveError::Conflict(
+                "phase2 succession basis does not match the acquisition terminal".into(),
+            ));
+        }
+    }
+    type SuccessionState = (
+        Vec<u8>,
+        i64,
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        i64,
+    );
+    let state: SuccessionState = conn.query_row(
+        "SELECT i.archive_id,i.attempt,i.stage,i.shadow_candidate,
+                i.authoritative_candidate,i.authoritative_base_ordinal,
+                (SELECT count(*) FROM archive_v3_maintenance_import_artifacts x
+                 WHERE x.archive_id=i.archive_id AND x.operation_id=i.operation_id
+                   AND x.attempt=i.attempt)
+         FROM archive_v3_maintenance_imports i WHERE i.operation_id=?1",
+        [operation_id.as_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    if state.2 != expected_stage.as_db()
+        || (expected_stage == MaintenanceImportStage::ParityVerified && state.4.is_some())
+    {
+        return Err(EnclaveError::Conflict(
+            "phase2 succession cannot proceed with a retained send".into(),
+        ));
+    }
+    let current_attempt = u32::try_from(state.1)
+        .map_err(|_| EnclaveError::Store("maintenance attempt is invalid".into()))?;
+    let authoritative_base = state
+        .5
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| EnclaveError::Store("maintenance authoritative base is invalid".into()))?;
+    let current_artifacts = u32::try_from(state.6)
+        .map_err(|_| EnclaveError::Store("maintenance artifact count is invalid".into()))?;
+    // The succession is always a higher-fence transition: any partial R2
+    // create prefix reserved under the pre-advisory maintenance lease cannot
+    // carry its create authority and is superseded, exactly as a
+    // higher-fence reacquire supersedes it.
+    let partial_attempt = match expected_stage {
+        MaintenanceImportStage::ParityVerified => {
+            let base = authoritative_base.ok_or_else(|| {
+                EnclaveError::Store("maintenance authoritative base is absent".into())
+            })?;
+            if current_artifacts < base {
+                return Err(EnclaveError::Store(
+                    "maintenance authoritative artifact prefix regressed".into(),
+                ));
+            }
+            current_artifacts > base
+        }
+        MaintenanceImportStage::ShadowWal => false,
+        _ => unreachable!("validated stage"),
+    };
+    let next_attempt = if partial_attempt {
+        current_attempt
+            .checked_add(1)
+            .filter(|attempt| *attempt <= MAX_MAINTENANCE_IMPORT_ATTEMPTS)
+            .ok_or_else(|| {
+                EnclaveError::Conflict("maintenance import exhausted its attempt cap".into())
+            })?
+    } else {
+        current_attempt
+    };
+    let encoded = succeeded.encode();
+    let hash: [u8; 32] = Sha256::digest(encoded).into();
+    let previous_encoded = previous.encode();
+    let previous_hash: [u8; 32] = Sha256::digest(previous_encoded.as_slice()).into();
+    let tx = conn.unchecked_transaction()?;
+    if partial_attempt {
+        let history_count: i64 = tx.query_row(
+            "SELECT count(*) FROM archive_v3_maintenance_import_attempts
+             WHERE archive_id=?1 AND operation_id=?2",
+            rusqlite::params![state.0.as_slice(), operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if history_count != i64::from(current_attempt) {
+            return Err(EnclaveError::Store(
+                "maintenance attempt history is not canonical".into(),
+            ));
+        }
+        if tx.execute(
+            "UPDATE archive_v3_maintenance_import_attempts SET state='superseded'
+             WHERE archive_id=?1 AND operation_id=?2 AND attempt=?3 AND state='active'",
+            rusqlite::params![
+                state.0.as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(current_attempt),
+            ],
+        )? != 1
+        {
+            return Err(EnclaveError::Conflict(
+                "phase2 succession attempt changed".into(),
+            ));
+        }
+        let next_attempt_id = ObjectId::random();
+        tx.execute(
+            "INSERT INTO archive_v3_maintenance_import_attempts
+             (archive_id,operation_id,attempt,attempt_id,state)
+             VALUES (?1,?2,?3,?4,'active')",
+            rusqlite::params![
+                state.0.as_slice(),
+                operation_id.as_bytes().as_slice(),
+                i64::from(next_attempt),
+                next_attempt_id.as_bytes().as_slice(),
+            ],
+        )?;
+    }
+    let updated = tx.execute(
+        "UPDATE archive_v3_maintenance_imports
+         SET revision=revision+1,attempt=?3,witness_record=?4,witness_record_hash=?5,
+             lease_fence=?6,lease_expiry=?7,
+             authoritative_base_ordinal=CASE WHEN ?8=1 THEN 0 ELSE authoritative_base_ordinal END,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE operation_id=?1 AND stage=?2 AND attempt=?9 AND witness_record_hash=?10
+           AND witness_record=?11 AND lease_fence=?12 AND lease_expiry=?13
+           AND (?2!='parity_verified' OR authoritative_candidate IS NULL)",
+        rusqlite::params![
+            operation_id.as_bytes().as_slice(),
+            expected_stage.as_db(),
+            i64::from(next_attempt),
+            encoded.as_slice(),
+            hash.as_slice(),
+            i64::try_from(lease.fencing_epoch())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            i64::try_from(lease.expires_at_tick())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            if partial_attempt && expected_stage == MaintenanceImportStage::ParityVerified {
+                1_i64
+            } else {
+                0_i64
+            },
+            i64::from(current_attempt),
+            previous_hash.as_slice(),
+            previous_encoded.as_slice(),
+            i64::try_from(previous_lease.fencing_epoch())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+            i64::try_from(previous_lease.expires_at_tick())
+                .map_err(|_| EnclaveError::Store("maintenance lease overflow".into()))?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(EnclaveError::Conflict(
+            "phase2 succession lease CAS changed".into(),
+        ));
+    }
+    tx.commit()?;
+    maintenance_import_record_conn(conn, operation_id)
+}
+
 fn prepare_maintenance_shadow_upload_attempt_conn(
     conn: &Connection,
     operation_id: MaintenanceImportOperationId,
@@ -24327,6 +24571,34 @@ impl MaintenanceImportPersistence for ControlStore {
                 expected_stage,
                 &previous,
                 &reacquired,
+                lease,
+            )
+            .map(|record| (record, true))
+        })
+        .await
+        .map_err(map_maintenance_persistence_error)
+    }
+
+    async fn persist_phase2_succeeded_lease(
+        &self,
+        operation_id: MaintenanceImportOperationId,
+        expected_stage: MaintenanceImportStage,
+        previous: &crate::archive_v3_witness::WitnessRecord,
+        basis: Option<&crate::archive_v3_witness::WitnessRecord>,
+        succeeded: &crate::archive_v3_witness::WitnessRecord,
+        lease: crate::archive_v3_witness::WitnessLease,
+    ) -> std::result::Result<MaintenanceImportRecord, MaintenanceImportError> {
+        let previous = previous.clone();
+        let basis = basis.cloned();
+        let succeeded = succeeded.clone();
+        self.write_owned_if_changed(move |conn| {
+            persist_maintenance_phase2_succeeded_lease_conn(
+                conn,
+                operation_id,
+                expected_stage,
+                &previous,
+                basis.as_ref(),
+                &succeeded,
                 lease,
             )
             .map(|record| (record, true))
