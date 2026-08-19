@@ -3326,6 +3326,31 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             "speaker_observation_id",
             "ALTER TABLE utterances ADD COLUMN speaker_observation_id INTEGER REFERENCES speaker_observations(id) ON DELETE SET NULL",
         ),
+        // Legacy-schema blobs: the episodes identity columns are added here —
+        // BEFORE migrate_speaker_identity_backfill_v2 reads them — because this
+        // init_schema runs at the head of the store's run_migrations, ahead of
+        // the store-level episode ALTERs. A fresh database already has them via
+        // CREATE TABLE, which is why test fixtures never caught the ordering.
+        (
+            "episodes",
+            "identity_revision",
+            "ALTER TABLE episodes ADD COLUMN identity_revision INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "episodes",
+            "finalized_identity_revision",
+            "ALTER TABLE episodes ADD COLUMN finalized_identity_revision INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "episodes",
+            "identity_refresh_status",
+            "ALTER TABLE episodes ADD COLUMN identity_refresh_status TEXT DEFAULT NULL CHECK (identity_refresh_status IN ('queued', 'processing', 'ready', 'failed'))",
+        ),
+        (
+            "episodes",
+            "speaker_processing_status",
+            "ALTER TABLE episodes ADD COLUMN speaker_processing_status TEXT NOT NULL DEFAULT 'ready' CHECK (speaker_processing_status IN ('ready', 'pending', 'degraded'))",
+        ),
         (
             "identity_evidence",
             "speaker_cluster_id",
@@ -4641,6 +4666,81 @@ mod tests {
         let mut manifest = valid_manifest();
         manifest.sequence = -1;
         assert!(manifest.validate().is_err());
+    }
+
+    /// Production regression (v0.8.26): a pre-existing store whose `episodes`
+    /// and `utterances` tables predate the identity columns must upgrade
+    /// through `init_schema` — which runs at the head of the store's
+    /// `run_migrations`, BEFORE the store-level episode ALTERs — without the
+    /// speaker-identity backfill reading columns that do not exist yet. Fresh
+    /// databases get every column from CREATE TABLE, which is why fixtures
+    /// alone never catch this ordering class.
+    #[test]
+    fn init_schema_upgrades_a_legacy_identityless_store() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE episodes (
+                 id INTEGER PRIMARY KEY,
+                 started_at TEXT NOT NULL,
+                 ended_at TEXT NOT NULL,
+                 type TEXT,
+                 title TEXT,
+                 summary TEXT,
+                 participants TEXT,
+                 substance TEXT NOT NULL DEFAULT 'normal',
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                 updated_at TEXT,
+                 finalized_at TEXT,
+                 finalization_status TEXT NOT NULL DEFAULT 'pending_horizon'
+             );
+             CREATE TABLE episode_members (
+                 episode_id INTEGER NOT NULL,
+                 record_type TEXT NOT NULL,
+                 record_id INTEGER NOT NULL
+             );
+             CREATE TABLE audio_segments (
+                 id INTEGER PRIMARY KEY,
+                 started_at TEXT NOT NULL,
+                 ended_at TEXT NOT NULL,
+                 duration_seconds REAL NOT NULL,
+                 source_type TEXT NOT NULL
+             );
+             CREATE TABLE utterances (
+                 id INTEGER PRIMARY KEY,
+                 audio_segment_id INTEGER NOT NULL,
+                 start_offset_seconds REAL,
+                 end_offset_seconds REAL,
+                 text TEXT,
+                 speaker_label TEXT,
+                 source_key TEXT
+             );
+             CREATE TABLE screenshots (id INTEGER PRIMARY KEY, source_key TEXT);
+             INSERT INTO episodes (id, started_at, ended_at, type, title) VALUES
+                 (335, '2026-07-26T20:00:00.000Z', '2026-07-26T20:30:00.000Z', 'conversation', 'Legacy');
+             INSERT INTO audio_segments (id, started_at, ended_at, duration_seconds, source_type) VALUES
+                 (1, '2026-07-26T20:00:00.000Z', '2026-07-26T20:30:00.000Z', 1800.0, 'mic');
+             INSERT INTO utterances (id, audio_segment_id, start_offset_seconds, end_offset_seconds, text, speaker_label, source_key) VALUES
+                 (1, 1, 0.0, 5.0, 'hello', 'Speaker 1', 'cloud-v2:legacy-ev:t1');
+             INSERT INTO episode_members (episode_id, record_type, record_id) VALUES (335, 'utterance', 1);",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        // The legacy episode gained the identity columns with safe defaults.
+        let (identity_rev, status): (i64, String) = conn
+            .query_row(
+                "SELECT identity_revision, speaker_processing_status FROM episodes WHERE id = 335",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(identity_rev, 0);
+        assert_eq!(status, "ready");
+
+        // Replay stays idempotent on the upgraded store.
+        init_schema(&conn).unwrap();
     }
 
     #[test]
