@@ -208,21 +208,39 @@ context:
 }
 ```
 
-Version 1 permits a reference only when the client compared against the last
-canonical screen in that display stream, the before/after context was stable,
-the context fingerprint was unchanged, the 8×8 grayscale average-hash Hamming
-distance is at most 3, and the bounded downscaled pixel-change ratio is at most
-0.01. Ambiguous or missing state must produce another canonical upload.
+Every version permits a reference only when the client compared against the
+last canonical screen in that display stream, the before/after context was
+stable, and the version's context fingerprint was unchanged. Ambiguous or
+missing state must produce another canonical upload. Version bounds on the
+pixel evidence:
+
+- **Version 1**: 8×8 grayscale average-hash Hamming distance at most 3 and
+  bounded downscaled pixel-change ratio at most 0.01.
+- **Version 2**: Hamming distance at most 8 and pixel-change ratio at most
+  0.03, wide enough to absorb clocks, notification badges, and cursor blinks
+  on an otherwise unchanged screen; scrolling or content changes still exceed
+  the ratio and require a canonical upload.
+
+Clients must send `dedupe_version: 1` until a screen-reference batch receipt
+advertises `max_screen_dedupe_version` of 2 or higher, then may use version 2
+for subsequent decisions in that process run. The advertisement is
+per-response, never persisted server-side, and an enclave accepts every
+version up to the advertised maximum concurrently.
 
 The context fingerprint is SHA-256 over compact UTF-8 JSON with recursively
-lexicographically sorted keys for exactly these nullable fields:
-`active_app`, `active_url`, `active_url_title`,
+lexicographically sorted keys. Version 1 covers exactly these nullable
+fields: `active_app`, `active_url`, `active_url_title`,
 `browser_permission_status`, `capture_status`, `display_id`,
 `primary_bundle_id`, `primary_window_id`, `visible_windows`,
-`visible_windows_truncated`, and `window_title`. Ambient browser-tab inventory
-is retained on the observation but excluded from this fingerprint so an
-unchanged visible screen need not be re-uploaded merely because a background
-tab changed.
+`visible_windows_truncated`, and `window_title`. Version 2 covers the same
+fields **except** `visible_windows` and `visible_windows_truncated`: the
+background window inventory's fractional intersection ratios and z-order
+churn on every repaint, which made semantically identical screens fingerprint
+differently under version 1. The inventory is still captured and retained on
+the observation — it is only excluded from reference-identity. Ambient
+browser-tab inventory is likewise retained on the observation but excluded
+from every fingerprint version so an unchanged visible screen need not be
+re-uploaded merely because a background tab changed.
 
 The enclave recomputes the fingerprint, compares the literal visible context,
 and requires the target to be an earlier canonical event for the same
@@ -277,7 +295,8 @@ HTTP `200`:
   "last_sequence": 63,
   "new_count": 21,
   "duplicate_count": 0,
-  "committed_through_sequence": 63
+  "committed_through_sequence": 63,
+  "max_screen_dedupe_version": 2
 }
 ```
 
