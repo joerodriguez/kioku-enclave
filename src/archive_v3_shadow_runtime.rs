@@ -141,6 +141,69 @@ pub(crate) struct ArchiveV3ShadowRuntimeDeployment {
 }
 
 impl ArchiveV3ShadowRuntimeDeployment {
+    /// Read the image-baked shadow-runtime deployment from the allowlisted
+    /// environment installed by `load_baked_image_configuration`.
+    ///
+    /// Semantics mirror the config grammar exactly: mode `off` (or an entirely
+    /// absent mode, the pre-activation image shape) requires every coordinate to
+    /// be empty and yields `None`; any stray fragment alongside `off` fails
+    /// closed. Only the exact mode `single-archive-wal-v1` constructs a
+    /// deployment, revalidating every coordinate through `Self::new`.
+    pub(crate) fn from_baked_env() -> Result<Option<Self>, ArchiveV3ShadowRuntimeConstructionError>
+    {
+        fn baked(name: &str) -> String {
+            std::env::var(name).unwrap_or_default()
+        }
+        let mode = baked("ARCHIVE_V3_SHADOW_RUNTIME_MODE");
+        let coordinates = [
+            baked("ARCHIVE_V3_ARCHIVE_BUCKET"),
+            baked("ARCHIVE_V3_ARCHIVE_GCS_PROJECT_NUMBER"),
+            baked("ARCHIVE_V3_REGISTRY_KMS_VERSION"),
+            baked("ARCHIVE_V3_WITNESS_PROJECT_ID"),
+            baked("ARCHIVE_V3_WITNESS_PROJECT_NUMBER"),
+            baked("ARCHIVE_V3_WITNESS_DATABASE_ID"),
+            baked("ARCHIVE_V3_ARCHIVE_BINDING_COMMITMENT"),
+        ];
+        Self::from_mode_and_coordinates(
+            &mode,
+            [
+                &coordinates[0],
+                &coordinates[1],
+                &coordinates[2],
+                &coordinates[3],
+                &coordinates[4],
+                &coordinates[5],
+                &coordinates[6],
+            ],
+        )
+    }
+
+    /// Environment-free core of [`Self::from_baked_env`], shared with tests.
+    pub(crate) fn from_mode_and_coordinates(
+        mode: &str,
+        coordinates: [&str; 7],
+    ) -> Result<Option<Self>, ArchiveV3ShadowRuntimeConstructionError> {
+        match mode {
+            "" | "off" => {
+                if coordinates.iter().any(|value| !value.is_empty()) {
+                    return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
+                }
+                Ok(None)
+            }
+            "single-archive-wal-v1" => Self::new(
+                coordinates[0],
+                coordinates[1],
+                coordinates[2],
+                coordinates[3],
+                coordinates[4],
+                coordinates[5],
+                coordinates[6],
+            )
+            .map(Some),
+            _ => Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         archive_bucket: &str,
@@ -1211,5 +1274,64 @@ mod tests {
         ] {
             assert!(!main.contains(forbidden), "live wiring: {forbidden}");
         }
+    }
+    #[test]
+    fn baked_deployment_off_semantics_are_exact() {
+        // Absent or off mode with every coordinate empty is the pre-activation shape.
+        assert!(matches!(
+            ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+                "",
+                ["", "", "", "", "", "", ""]
+            ),
+            Ok(None)
+        ));
+        assert!(matches!(
+            ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+                "off",
+                ["", "", "", "", "", "", ""]
+            ),
+            Ok(None)
+        ));
+        // Any stray fragment alongside off fails closed.
+        assert!(ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+            "off",
+            ["kioku-joerodriguez-archive-v3", "", "", "", "", "", ""]
+        )
+        .is_err());
+        // Unknown modes fail closed.
+        assert!(ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+            "single-archive-wal-v2",
+            ["", "", "", "", "", "", ""]
+        )
+        .is_err());
+        // The exact active mode revalidates every coordinate through Self::new.
+        let commitment = "11".repeat(32);
+        let active = ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+            "single-archive-wal-v1",
+            [
+                "kioku-joerodriguez-archive-v3",
+                "640329636251",
+                "1",
+                "kioku-joerodriguez",
+                "640329636251",
+                "archive-v3-witness",
+                &commitment,
+            ],
+        );
+        assert!(active.expect("valid coordinates").is_some());
+        // An invalid coordinate under the active mode fails closed.
+        assert!(ArchiveV3ShadowRuntimeDeployment::from_mode_and_coordinates(
+            "single-archive-wal-v1",
+            [
+                "kioku-joerodriguez-archive-v3",
+                "0640329636251",
+                "1",
+                "kioku-joerodriguez",
+                "640329636251",
+                "archive-v3-witness",
+                &commitment,
+            ],
+        )
+        .is_err());
     }
 }
