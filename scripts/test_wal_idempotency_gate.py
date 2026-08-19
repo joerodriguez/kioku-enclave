@@ -200,8 +200,20 @@ def match_delimiter(code: str, opening: int, left: str, right: str) -> int:
 
 
 def cfg_test_spans(code: str) -> list[Span]:
+    """Spans of complete `#[cfg(test)]` items in sanitized source.
+
+    The scan after the attribute list tracks `()`/`[]` nesting so a `;` inside
+    the item's signature (e.g. `fn mint(x: [u8; 32]) -> Self {`) cannot end the
+    span early and leak the item's body into the production view. A `;` or a
+    brace-matched `{ ... }` body at depth zero ends the item. Two containment
+    rules keep an attribute that decorates a non-item from swallowing adjacent
+    production code: an attribute on a struct-literal field, field declaration,
+    or parameter (`name: value`) ends at its depth-zero comma, and a closing
+    delimiter of the construct enclosing the attribute ends the span there.
+    """
     spans: list[Span] = []
     cfg = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+    field_like = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)")
     for match in cfg.finditer(code):
         cursor = match.end()
         while True:
@@ -210,14 +222,33 @@ def cfg_test_spans(code: str) -> list[Span]:
                 cursor = match_delimiter(code, cursor + 1, "[", "]")
                 continue
             break
-        brace = code.find("{", cursor)
-        semicolon = code.find(";", cursor)
-        if semicolon != -1 and (brace == -1 or semicolon < brace):
-            spans.append(Span(match.start(), semicolon + 1))
-        elif brace != -1:
-            spans.append(Span(match.start(), match_delimiter(code, brace, "{", "}")))
-        else:
+        non_item = bool(field_like.match(code, cursor))
+        depth = 0
+        end = None
+        for index in range(cursor, len(code)):
+            char = code[index]
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                if depth == 0:
+                    end = index
+                    break
+                depth -= 1
+            elif char == "}" and depth == 0:
+                end = index
+                break
+            elif char == "," and depth == 0 and non_item:
+                end = index + 1
+                break
+            elif char == ";" and depth == 0:
+                end = index + 1
+                break
+            elif char == "{" and depth == 0:
+                end = match_delimiter(code, index, "{", "}")
+                break
+        if end is None:
             raise AssertionError("cfg(test) attribute has no item")
+        spans.append(Span(match.start(), end))
     return spans
 
 
@@ -728,6 +759,68 @@ impl X {
         )
         with self.assertRaises(AssertionError):
             call_sites_for_source("bad.rs", "fn closed() {} x.with_user(1);", STORE_CALL)
+
+    def test_cfg_test_span_is_not_truncated_by_bracket_nested_semicolon(self) -> None:
+        source = (
+            "impl T {\n"
+            "    #[cfg(test)]\n"
+            "    pub(crate) const fn mint(x: [u8; 32]) -> Self {\n"
+            "        Self { field: x }\n"
+            "    }\n"
+            "}\n"
+            "fn keep() {}\n"
+        )
+        stripped = without_cfg_test_items(source)
+        self.assertNotIn(
+            "Self { field", stripped, "signature [u8; 32] must not truncate the span"
+        )
+        self.assertIn("fn keep", stripped)
+        hidden = (
+            "impl T {\n"
+            "    #[cfg(test)]\n"
+            "    fn hidden(x: [u8; 32]) -> Self { self.with_user(1); }\n"
+            "    fn live(&self) { self.with_user(2); }\n"
+            "}\n"
+        )
+        sites = call_sites_for_source("fixture.rs", hidden, STORE_CALL)
+        self.assertEqual(
+            [site.key for site in sites], ["fixture.rs::live#0::with_user#0"]
+        )
+
+    def test_cfg_test_field_and_parameter_attributes_strip_only_the_field(self) -> None:
+        literal = (
+            "fn build() -> Result<Self> {\n"
+            "    Ok(Self {\n"
+            "        copy: value,\n"
+            "        #[cfg(test)]\n"
+            "        cleanup_sender: None,\n"
+            "    })\n"
+            "}\n"
+            "fn production(&self) { self.with_user(1); }\n"
+        )
+        stripped = without_cfg_test_items(literal)
+        self.assertNotIn("cleanup_sender", stripped)
+        self.assertIn("copy: value", stripped)
+        self.assertIn("fn production", stripped)
+        sites = call_sites_for_source("fixture.rs", literal, STORE_CALL)
+        self.assertEqual(
+            [site.key for site in sites], ["fixture.rs::production#0::with_user#0"]
+        )
+        parameter = (
+            "fn spawn_task(\n"
+            "    connection: Arc<Mutex<Connection>>,\n"
+            "    #[cfg(test)] gate: Option<Arc<TestBlockingGate>>,\n"
+            ") -> JoinHandle<Result<()>> {\n"
+            "    inner.with_user(3);\n"
+            "}\n"
+        )
+        stripped = without_cfg_test_items(parameter)
+        self.assertNotIn("TestBlockingGate", stripped)
+        self.assertIn("inner.with_user", stripped)
+        sites = call_sites_for_source("fixture.rs", parameter, STORE_CALL)
+        self.assertEqual(
+            [site.key for site in sites], ["fixture.rs::spawn_task#0::with_user#0"]
+        )
 
     def test_new_call_body_or_classification_change_fails_inventory(self) -> None:
         first = call_sites_for_source("x.rs", "fn f(){ x.with_user(|| 1); }", STORE_CALL)
