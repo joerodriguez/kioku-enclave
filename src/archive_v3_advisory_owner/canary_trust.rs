@@ -590,6 +590,102 @@ mod tests {
 
     use super::*;
 
+    // Evidence produced by scripts/phase1_sign_canary_authorization.py with the
+    // real operator-held roots over synthetic facts. Verifier acceptance pins
+    // the byte-exact signer/verifier wire contract; the synthetic facts can
+    // never satisfy any durable Control predicate, so the fixture grants
+    // nothing beyond format compatibility.
+    const SIGNER_FIXTURE_STATEMENT: &[&str] = &[
+        "0001111111111111111111111111111111112222222222222222222222222222",
+        "2222222222222222222222222222222222223333333333333333333333333333",
+        "3333444444444444444444444444444444445555555555555555555555555555",
+        "5555555555555555555555555555555555556666666666666666666666666666",
+        "6666666666666666666666666666666666667777777777777777777777777777",
+        "7777777777777777777777777777777777778888888888888888888888888888",
+        "8888888888888888888888888888888888889999999999999999999999999999",
+        "999999999999999999999999999999999999",
+    ];
+    const SIGNER_FIXTURE_STATEMENT_SIGNATURE: &[&str] = &[
+        "2002611e76aeec52620c0ea172e907cd2a23b5d75eb7664cdcba8fcae75e7bd8",
+        "94d3d6a1614078de352e41053faedfedfe6baf89f6c534ce6df63c84ecf9e10c",
+    ];
+    const SIGNER_FIXTURE_ATTESTATION: &[&str] = &[
+        "000111111111111111111111111111111111536e1df52a7e71a7e57be973df1d",
+        "43118f74bddcdfdb20492859df64d541c43d9999999999999999999999999999",
+        "999999999999999999999999999999999999",
+    ];
+    const SIGNER_FIXTURE_ATTESTATION_SIGNATURE: &[&str] = &[
+        "c2ecf7353cba6d7bdc66acb762d831aff40d032efc82f747fc6cbc1fe640c7bd",
+        "3195b1d8f629f51cebe73f00cc3a6ddb4d18cc5b3bfed11fd62dd30c1abf370a",
+    ];
+    const SIGNER_FIXTURE_ADMISSION: &[&str] = &[
+        "000111111111111111111111111111111111536e1df52a7e71a7e57be973df1d",
+        "43118f74bddcdfdb20492859df64d541c43d9999999999999999999999999999",
+        "999999999999999999999999999999999999c73ccac2ffeb15eff49c80e0f884",
+        "07abddd733f67688818ca061ebe7a262fc14aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bbbbcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "ccccdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "ddddeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "eeee0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "0f0f0100000100000000",
+    ];
+    const SIGNER_FIXTURE_ADMISSION_SIGNATURE: &[&str] = &[
+        "0a8292acebc6859e6af0da9fbad0da1e02254d8bcc7ecb45a9f1fdbdd8b6bdbb",
+        "88ebb10395da791672acf9d4e277b8124bd818e8334009eec8fced3889c71609",
+    ];
+
+    fn signer_fixture(parts: &[&str]) -> Vec<u8> {
+        let mut joined = String::new();
+        for part in parts {
+            joined.push_str(part);
+        }
+        (0..joined.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&joined[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn pinned_verifier_accepts_the_offline_signer_tool_evidence_exactly() {
+        let statement = signer_fixture(SIGNER_FIXTURE_STATEMENT);
+        let statement_signature = signer_fixture(SIGNER_FIXTURE_STATEMENT_SIGNATURE);
+        let attestation = signer_fixture(SIGNER_FIXTURE_ATTESTATION);
+        let attestation_signature = signer_fixture(SIGNER_FIXTURE_ATTESTATION_SIGNATURE);
+        let admission = signer_fixture(SIGNER_FIXTURE_ADMISSION);
+        let admission_signature = signer_fixture(SIGNER_FIXTURE_ADMISSION_SIGNATURE);
+        let authorization = verify_pinned_advisory_canary_authorization(
+            &statement,
+            &statement_signature,
+            &attestation,
+            &attestation_signature,
+            &admission,
+            &admission_signature,
+        )
+        .expect("signer-produced evidence must verify against the pinned roots");
+        assert_eq!(authorization.scope_id(), [0x11; 16]);
+
+        // Any single tampered byte in any element refuses.
+        for tamper in 0..6 {
+            let mut parts = [
+                statement.clone(),
+                statement_signature.clone(),
+                attestation.clone(),
+                attestation_signature.clone(),
+                admission.clone(),
+                admission_signature.clone(),
+            ];
+            parts[tamper][0] ^= 0x01;
+            assert!(
+                verify_pinned_advisory_canary_authorization(
+                    &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5],
+                )
+                .is_err(),
+                "tampered element {tamper} must refuse"
+            );
+        }
+    }
+
     fn key(seed: u8) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()
     }
