@@ -12,8 +12,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLASSIFICATIONS = frozenset({"A", "B", "C"})
-EXPECTED_STORE_CALL_COUNT = 151
-EXPECTED_STORE_CALL_SHA256 = "b558be76d3a94f57c0f96ba2658570c94d84f939283447100be370d433ac0d82"
+EXPECTED_STORE_CALL_COUNT = 160
+EXPECTED_STORE_CALL_SHA256 = "6910a19a12368a794d1e639d937fa03a7149d2bbd1fc92d2895f072ef0ae09a7"
 EXPECTED_STORE_SURFACE_COUNT = 15
 EXPECTED_STORE_SURFACE_SHA256 = "549c5d4e4bc03ced1604b868ef0ed9bb37a126eab20d7ef1816ce5ff33944f9b"
 EXPECTED_STORE_SURFACE_KEYS = frozenset(
@@ -54,7 +54,7 @@ EXPECTED_WAL_LOGICAL_ONLY_KEYS = frozenset(
     }
 )
 EXPECTED_WORKER_SPAWN_COUNT = 32
-EXPECTED_WORKER_SPAWN_SHA256 = "e43ce60d7da3c27ac18943d1ac81c6acad2d187d42f678311d9f5aa01332f44d"
+EXPECTED_WORKER_SPAWN_SHA256 = "409eac6c165038d0cb39f1cb221be8254ca8fa24def14b8dfec9a166bec75182"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -573,6 +573,7 @@ A_OWNERS = frozenset(
         "src/cp/media.rs::stream_ack#0",
         "src/cp/media.rs::capture_status#0",
         "src/cp/media.rs::capture_session_status#0",
+        "src/cp/media.rs::list_capture_sessions#0",
         "src/cp/media.rs::finish_capture_session#0",
         "src/cp/media.rs::upload_screen_reference_batch#0",
         "src/cp/media.rs::list_people#0",
@@ -605,6 +606,7 @@ A_OWNERS = frozenset(
         "src/cp/summarizer.rs::run_visual_evidence_backfill#0",
         "src/cp/summarizer.rs::fetch_range#0",
         "src/cp/summarizer.rs::fetch_open_episodes#0",
+        "src/cp/summarizer.rs::session_tail_is_settled#0",
         "src/cp/sync.rs::sync_status#0",
         "src/cp/webhook_worker.rs::next_delivery#0",
         "src/episodes.rs::handle_episodes_list#0",
@@ -625,6 +627,7 @@ B_OWNERS = frozenset(
         "src/cp/finalizer.rs::record_finalization_failure#0",
         "src/cp/finalizer.rs::defer_finalization_for_budget#0",
         "src/cp/media.rs::load_or_create_media_dek#0",
+        "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
         "src/cp/model_usage.rs::begin_invocation#0",
         "src/cp/model_usage.rs::pending_events#0",
@@ -633,7 +636,7 @@ B_OWNERS = frozenset(
         "src/cp/model_usage.rs::note_delivery_failure#0",
         "src/cp/model_usage.rs::drain_outbox#0",
         "src/cp/query.rs::rest_delete_webhook#0",
-        "src/cp/summarizer.rs::summarize_user#0",
+        "src/cp/summarizer.rs::summarize_user_window#0",
         "src/cp/summarizer.rs::embed_episodes#0",
         "src/cp/webhook_worker.rs::set_delivery_state#0",
         "src/store.rs::update_email_delivery_state#0",
@@ -655,6 +658,9 @@ C_OWNERS = frozenset(
 )
 
 CALL_OVERRIDES = {
+    # Speaker-slot reconciliation allocates random participant keys and
+    # rewrites labels from live attribution state before the evidence reads.
+    "src/cp/finalizer.rs::finalize_user_episodes_scoped#0::with_user#3": "B",
     # Stable capture record, but the complete owner has the B dependency below.
     "src/cp/media.rs::upload_capture_event#0::with_user#0": "A",
     "src/cp/media.rs::upload_capture_event#0::with_user#1": "A",
@@ -673,6 +679,9 @@ CALL_OVERRIDES = {
     "src/cp/media_worker.rs::process_user#0::save_user#0": "B",
     "src/cp/media_worker.rs::process_user#0::save_user#1": "B",
     "src/cp/media_worker.rs::process_user#0::save_user#2": "B",
+    # Settled quality diagnostics are a deterministic record of immutable
+    # audio, keyed by observation id; lease/plan/completion/match stay B.
+    "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0::with_user#4": "A",
     # Screenshot preflight/DEK lookup, B first-writer candidate, A record/rollback.
     "src/cp/query.rs::rest_screenshot_image_upload#0::with_user#0": "A",
     "src/cp/query.rs::rest_screenshot_image_upload#0::with_user#1": "A",
