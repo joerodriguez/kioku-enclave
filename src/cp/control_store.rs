@@ -756,6 +756,54 @@ CREATE TABLE IF NOT EXISTS archive_v3_advisory_comparisons (
     revision INTEGER NOT NULL CHECK(revision=1),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+-- One-shot Phase-2 WAL-authority acquisition terminal. Mintable only from a fully
+-- settled advisory terminal (owner bound, release released at revision 3, comparison
+-- settled, controller run retired, no abort row) together with a pinned-root-verified
+-- Phase-2 authorization whose statement byte-matches the durable rows and whose
+-- terminal witness hash matches the frozen owner witness. The acquisition fence is
+-- fresh and never reuses the maintenance fence; the row grants no authority by
+-- itself — it is the sole durable fact the sealed Phase-2 plan and the authority
+-- importer's acquisition gate re-read and byte-compare, replacing the advisory
+-- release-absence predicate for exactly this archive.
+CREATE TABLE IF NOT EXISTS archive_v3_phase2_authority_acquisitions (
+    archive_id BLOB PRIMARY KEY REFERENCES archive_v3_advisory_comparisons(archive_id)
+        CHECK(length(archive_id)=16 AND archive_id!=zeroblob(16)),
+    format_version INTEGER NOT NULL CHECK(format_version=1),
+    maintenance_operation_id BLOB NOT NULL UNIQUE
+        CHECK(length(maintenance_operation_id)=16 AND maintenance_operation_id!=zeroblob(16)),
+    owner_id BLOB NOT NULL UNIQUE CHECK(length(owner_id)=16 AND owner_id!=zeroblob(16)),
+    owner_witness BLOB NOT NULL CHECK(length(owner_witness)=724),
+    owner_revision INTEGER NOT NULL CHECK(owner_revision>0),
+    release_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(release_commitment)=32 AND release_commitment!=zeroblob(32)),
+    comparison_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(comparison_commitment)=32 AND comparison_commitment!=zeroblob(32)),
+    evidence_commitment BLOB NOT NULL UNIQUE
+        CHECK(length(evidence_commitment)=32 AND evidence_commitment!=zeroblob(32)),
+    statement_operation_commitment BLOB NOT NULL
+        CHECK(length(statement_operation_commitment)=32
+              AND statement_operation_commitment!=zeroblob(32)),
+    statement_source_commitment BLOB NOT NULL
+        CHECK(length(statement_source_commitment)=32
+              AND statement_source_commitment!=zeroblob(32)),
+    statement_parity_commitment BLOB NOT NULL
+        CHECK(length(statement_parity_commitment)=32
+              AND statement_parity_commitment!=zeroblob(32)),
+    terminal_witness_hash BLOB NOT NULL
+        CHECK(length(terminal_witness_hash)=32 AND terminal_witness_hash!=zeroblob(32)),
+    release_image_digest BLOB NOT NULL
+        CHECK(length(release_image_digest)=32 AND release_image_digest!=zeroblob(32)),
+    maintenance_window_id BLOB NOT NULL
+        CHECK(length(maintenance_window_id)=16 AND maintenance_window_id!=zeroblob(16)),
+    acquisition_fence_authority TEXT NOT NULL
+        CHECK(length(acquisition_fence_authority)=72
+              AND substr(acquisition_fence_authority,1,8)='archive_'
+              AND substr(acquisition_fence_authority,9) NOT GLOB '*[^0-9a-f]*'),
+    stage TEXT NOT NULL CHECK(stage IN ('phase2_acquired','manual_required')),
+    commitment BLOB NOT NULL CHECK(length(commitment)=32 AND commitment!=zeroblob(32)),
+    revision INTEGER NOT NULL CHECK(revision=1),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 -- One-shot, content-free released-canary abort. The locus distinguishes exact
 -- resumed capture retirement from released-before-resume gate restoration.
 -- `prepared` is durable before Store mutation; `aborted` is accepted only from
@@ -1559,6 +1607,12 @@ pub(crate) struct ArchiveBinding {
 #[derive(Clone, Copy)]
 pub(crate) struct MaintenancePersistenceContext(());
 
+/// Unforgeable producer token for Phase-2 WAL-authority acquisition
+/// capabilities. Its field is private to encrypted control; sibling modules
+/// may accept but cannot construct it.
+#[derive(Clone, Copy)]
+pub(crate) struct Phase2AuthorityPersistenceContext(());
+
 /// Unforgeable producer token for Phase-1 advisory-owner durable facts. It is
 /// distinct from the WalAuthoritative owner token.
 #[derive(Clone, Copy)]
@@ -1585,6 +1639,13 @@ impl AdvisoryOwnerPersistenceContext {
 
 #[cfg(test)]
 impl MaintenancePersistenceContext {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Phase2AuthorityPersistenceContext {
     pub(crate) const fn for_test() -> Self {
         Self(())
     }
@@ -10405,6 +10466,35 @@ fn load_retained_advisory_owner_conn(
     load_bound_advisory_owner_conn(conn, operation_id, &observed)
 }
 
+/// Archive-keyed variant of [`load_retained_advisory_owner_conn`] for callers
+/// that hold only the archive identity (the Phase-2 acquisition driver). It
+/// resolves the durable bound row's operation ID first and then performs the
+/// same full-tuple load and validation.
+fn load_retained_advisory_owner_by_archive_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<BoundAdvisoryOwner> {
+    let operation_id: Vec<u8> = conn.query_row(
+        "SELECT maintenance_operation_id FROM archive_v3_advisory_owners
+         WHERE archive_id=?1 AND format_version=1 AND stage='bound'",
+        [archive_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&operation_id, "advisory owner operation ID")?,
+    )
+    .map_err(maintenance_store_error)?;
+    let owner = load_retained_advisory_owner_conn(conn, operation_id)?;
+    let token = AdvisoryOwnerPersistenceContext(());
+    if owner.control_view(token).4.archive_id() != archive_id {
+        return Err(EnclaveError::Conflict(
+            "advisory owner archive binding changed".into(),
+        ));
+    }
+    Ok(owner)
+}
+
 fn reserve_advisory_owner_with_canary_conn(
     conn: &Connection,
     canary: &AdvisoryCanaryScope,
@@ -11678,6 +11768,760 @@ fn load_optional_advisory_abort_conn(
         ));
     }
     load_advisory_abort_conn(conn, archive_id).map(Some)
+}
+
+const PHASE2_ACQUISITION_ROW_DOMAIN: &[u8] =
+    b"kioku/archive-v3/phase2-authority/acquisition-row/v1\0";
+const PHASE2_ACQUISITION_FORMAT_V1: u16 = 1;
+
+/// Durable Phase-2 acquisition stage. `Phase2Acquired` is the only stage this
+/// slice mints; `ManualRequired` is reserved for a reviewed operator fence and
+/// never satisfies the authority importer's acquisition gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase2AcquisitionStage {
+    Phase2Acquired,
+    ManualRequired,
+}
+
+impl Phase2AcquisitionStage {
+    const fn as_db(self) -> &'static str {
+        match self {
+            Self::Phase2Acquired => "phase2_acquired",
+            Self::ManualRequired => "manual_required",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "phase2_acquired" => Ok(Self::Phase2Acquired),
+            "manual_required" => Ok(Self::ManualRequired),
+            _ => Err(EnclaveError::Store(
+                "phase2 acquisition stage is invalid".into(),
+            )),
+        }
+    }
+}
+
+/// One durable Phase-2 WAL-authority acquisition row. Every field mirrors one
+/// column of `archive_v3_phase2_authority_acquisitions`; the commitment is a
+/// domain-separated hash over the complete canonical tuple, so byte equality
+/// of commitments is byte equality of rows. Only this encrypted-control module
+/// can mint or reload an instance, and reload always recomputes and compares
+/// the commitment. There is no durable resumed-local-admission marker: the
+/// retired advisory controller run captured here through its predicate is the
+/// strongest durable proxy for the fully settled advisory terminal.
+#[derive(PartialEq, Eq)]
+pub(crate) struct Phase2AuthorityAcquisition {
+    archive_id: ArchiveId,
+    maintenance_operation_id: MaintenanceImportOperationId,
+    owner_id: ObjectId,
+    owner_witness: crate::archive_v3_witness::WitnessRecord,
+    owner_revision: u64,
+    release_commitment: [u8; 32],
+    comparison_commitment: [u8; 32],
+    evidence_commitment: [u8; 32],
+    statement_operation_commitment: [u8; 32],
+    statement_source_commitment: [u8; 32],
+    statement_parity_commitment: [u8; 32],
+    terminal_witness_hash: [u8; 32],
+    release_image_digest: [u8; 32],
+    maintenance_window_id: [u8; 16],
+    acquisition_fence_authority: String,
+    stage: Phase2AcquisitionStage,
+    commitment: [u8; 32],
+    revision: u64,
+}
+
+impl std::fmt::Debug for Phase2AuthorityAcquisition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Phase2AuthorityAcquisition(<opaque>)")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phase2_acquisition_row_commitment(
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    owner_id: ObjectId,
+    owner_witness: &crate::archive_v3_witness::WitnessRecord,
+    owner_revision: u64,
+    release_commitment: [u8; 32],
+    comparison_commitment: [u8; 32],
+    evidence_commitment: [u8; 32],
+    statement_operation_commitment: [u8; 32],
+    statement_source_commitment: [u8; 32],
+    statement_parity_commitment: [u8; 32],
+    terminal_witness_hash: [u8; 32],
+    release_image_digest: [u8; 32],
+    maintenance_window_id: [u8; 16],
+    acquisition_fence_authority: &str,
+    stage: Phase2AcquisitionStage,
+    revision: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PHASE2_ACQUISITION_ROW_DOMAIN);
+    hasher.update(PHASE2_ACQUISITION_FORMAT_V1.to_be_bytes());
+    hasher.update(archive_id.as_bytes());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(owner_id.as_bytes());
+    hasher.update(owner_witness.encode());
+    hasher.update(owner_revision.to_be_bytes());
+    hasher.update(release_commitment);
+    hasher.update(comparison_commitment);
+    hasher.update(evidence_commitment);
+    hasher.update(statement_operation_commitment);
+    hasher.update(statement_source_commitment);
+    hasher.update(statement_parity_commitment);
+    hasher.update(terminal_witness_hash);
+    hasher.update(release_image_digest);
+    hasher.update(maintenance_window_id);
+    hasher.update((acquisition_fence_authority.len() as u32).to_be_bytes());
+    hasher.update(acquisition_fence_authority.as_bytes());
+    hasher.update([match stage {
+        Phase2AcquisitionStage::Phase2Acquired => 1,
+        Phase2AcquisitionStage::ManualRequired => 2,
+    }]);
+    hasher.update(revision.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn valid_phase2_acquisition_fence_authority(authority: &str) -> bool {
+    authority.len() == 72
+        && authority.starts_with("archive_")
+        && authority[8..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+#[allow(
+    dead_code,
+    reason = "reserved for the reviewed Phase-2 authority activation wiring; the acquisition transition is compiled and tested before any launcher exists"
+)]
+impl Phase2AuthorityAcquisition {
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        archive_id: ArchiveId,
+        maintenance_operation_id: MaintenanceImportOperationId,
+        owner_id: ObjectId,
+        owner_witness: crate::archive_v3_witness::WitnessRecord,
+        owner_revision: u64,
+        release_commitment: [u8; 32],
+        comparison_commitment: [u8; 32],
+        evidence_commitment: [u8; 32],
+        statement_operation_commitment: [u8; 32],
+        statement_source_commitment: [u8; 32],
+        statement_parity_commitment: [u8; 32],
+        terminal_witness_hash: [u8; 32],
+        release_image_digest: [u8; 32],
+        maintenance_window_id: [u8; 16],
+        acquisition_fence_authority: String,
+        stage: Phase2AcquisitionStage,
+        revision: u64,
+    ) -> Result<Self> {
+        let observed_witness_hash: [u8; 32] = Sha256::digest(owner_witness.encode()).into();
+        if archive_id.as_bytes() == &[0; 16]
+            || owner_id.as_bytes() == &[0; 16]
+            || archive_id != owner_witness.archive_id()
+            || owner_witness.deletion() != crate::archive_v3_witness::DeletionState::Active
+            || owner_witness.migration() != crate::archive_v3_witness::MigrationState::ShadowWal
+            || owner_revision == 0
+            || release_commitment == [0; 32]
+            || comparison_commitment == [0; 32]
+            || evidence_commitment == [0; 32]
+            || statement_operation_commitment == [0; 32]
+            || statement_source_commitment == [0; 32]
+            || statement_parity_commitment == [0; 32]
+            || terminal_witness_hash == [0; 32]
+            || terminal_witness_hash != observed_witness_hash
+            || release_image_digest == [0; 32]
+            || maintenance_window_id == [0; 16]
+            || !valid_phase2_acquisition_fence_authority(&acquisition_fence_authority)
+            || revision != 1
+        {
+            return Err(EnclaveError::Store(
+                "phase2 acquisition durable state is invalid".into(),
+            ));
+        }
+        let commitment = phase2_acquisition_row_commitment(
+            archive_id,
+            maintenance_operation_id,
+            owner_id,
+            &owner_witness,
+            owner_revision,
+            release_commitment,
+            comparison_commitment,
+            evidence_commitment,
+            statement_operation_commitment,
+            statement_source_commitment,
+            statement_parity_commitment,
+            terminal_witness_hash,
+            release_image_digest,
+            maintenance_window_id,
+            &acquisition_fence_authority,
+            stage,
+            revision,
+        );
+        if commitment == [0; 32] {
+            return Err(EnclaveError::Store(
+                "phase2 acquisition durable state is invalid".into(),
+            ));
+        }
+        Ok(Self {
+            archive_id,
+            maintenance_operation_id,
+            owner_id,
+            owner_witness,
+            owner_revision,
+            release_commitment,
+            comparison_commitment,
+            evidence_commitment,
+            statement_operation_commitment,
+            statement_source_commitment,
+            statement_parity_commitment,
+            terminal_witness_hash,
+            release_image_digest,
+            maintenance_window_id,
+            acquisition_fence_authority,
+            stage,
+            commitment,
+            revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_control_persisted(
+        archive_id: ArchiveId,
+        maintenance_operation_id: MaintenanceImportOperationId,
+        owner_id: ObjectId,
+        owner_witness: crate::archive_v3_witness::WitnessRecord,
+        owner_revision: u64,
+        release_commitment: [u8; 32],
+        comparison_commitment: [u8; 32],
+        evidence_commitment: [u8; 32],
+        statement_operation_commitment: [u8; 32],
+        statement_source_commitment: [u8; 32],
+        statement_parity_commitment: [u8; 32],
+        terminal_witness_hash: [u8; 32],
+        release_image_digest: [u8; 32],
+        maintenance_window_id: [u8; 16],
+        acquisition_fence_authority: String,
+        stage: Phase2AcquisitionStage,
+        revision: u64,
+        persisted_commitment: [u8; 32],
+    ) -> Result<Self> {
+        let row = Self::from_parts(
+            archive_id,
+            maintenance_operation_id,
+            owner_id,
+            owner_witness,
+            owner_revision,
+            release_commitment,
+            comparison_commitment,
+            evidence_commitment,
+            statement_operation_commitment,
+            statement_source_commitment,
+            statement_parity_commitment,
+            terminal_witness_hash,
+            release_image_digest,
+            maintenance_window_id,
+            acquisition_fence_authority,
+            stage,
+            revision,
+        )?;
+        if row.commitment != persisted_commitment {
+            return Err(EnclaveError::Store(
+                "phase2 acquisition durable state is invalid".into(),
+            ));
+        }
+        Ok(row)
+    }
+
+    /// The row is mintable and reloadable only by this encrypted-control
+    /// module with full commitment validation, so a held instance may vouch
+    /// for the producer token its sealed consumers require.
+    pub(crate) const fn persistence_context(&self) -> Phase2AuthorityPersistenceContext {
+        Phase2AuthorityPersistenceContext(())
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn maintenance_operation_id(&self) -> MaintenanceImportOperationId {
+        self.maintenance_operation_id
+    }
+
+    pub(crate) const fn owner_id(&self) -> ObjectId {
+        self.owner_id
+    }
+
+    pub(crate) const fn owner_witness(&self) -> &crate::archive_v3_witness::WitnessRecord {
+        &self.owner_witness
+    }
+
+    pub(crate) const fn owner_revision(&self) -> u64 {
+        self.owner_revision
+    }
+
+    pub(crate) const fn release_commitment(&self) -> [u8; 32] {
+        self.release_commitment
+    }
+
+    pub(crate) const fn comparison_commitment(&self) -> [u8; 32] {
+        self.comparison_commitment
+    }
+
+    pub(crate) const fn evidence_commitment(&self) -> [u8; 32] {
+        self.evidence_commitment
+    }
+
+    pub(crate) const fn terminal_witness_hash(&self) -> [u8; 32] {
+        self.terminal_witness_hash
+    }
+
+    pub(crate) const fn release_image_digest(&self) -> [u8; 32] {
+        self.release_image_digest
+    }
+
+    pub(crate) const fn maintenance_window_id(&self) -> [u8; 16] {
+        self.maintenance_window_id
+    }
+
+    pub(crate) fn acquisition_fence_authority(&self) -> &str {
+        &self.acquisition_fence_authority
+    }
+
+    pub(crate) const fn stage(&self) -> Phase2AcquisitionStage {
+        self.stage
+    }
+
+    pub(crate) const fn commitment(&self) -> [u8; 32] {
+        self.commitment
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+fn phase2_row_exists_conn(conn: &Connection, table: &str, archive_id: ArchiveId) -> Result<bool> {
+    // The table name is one of this module's fixed string literals, never
+    // caller input.
+    let query = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE archive_id=?1)");
+    Ok(
+        conn.query_row(&query, [archive_id.as_bytes().as_slice()], |row| {
+            row.get::<_, i64>(0)
+        })? != 0,
+    )
+}
+
+/// Mint (or exactly re-adopt) the one-shot Phase-2 authority acquisition from
+/// a fully settled advisory terminal, in one transaction:
+/// - the user must be active with an active archive binding matching the
+///   verified statement's archive;
+/// - the durable maintenance import must match the statement's operation ID
+///   and operation/source/parity commitments and rest at the completed
+///   advisory stages (`shadow_wal`/`parity_verified`);
+/// - the advisory owner row must be `bound` with a frozen observed witness
+///   whose SHA-256 equals the statement's terminal witness hash;
+/// - the advisory release must be `released` at revision 3, the comparison
+///   settled, and the advisory controller run `retired` with a settlement
+///   commitment equal to the comparison evidence commitment and no abort
+///   reason (there is no durable resumed-local-admission marker; the retired
+///   controller run is the strongest durable proxy for the settled terminal);
+/// - an advisory abort row permanently fences acquisition;
+/// - a retained self-row is re-adopted only on full-tuple equality except the
+///   fence (the fence is never re-minted), and a differing authorization is a
+///   conflict. A fresh mint uses a fresh fence, never the maintenance fence,
+///   and is exact-read back and compared before commit.
+fn acquire_phase2_authority_conn(
+    conn: &Connection,
+    user_id: &str,
+    evidence: &crate::archive_v3_advisory_owner::Phase2AuthorityAcquisitionEvidence,
+) -> Result<(Phase2AuthorityAcquisition, bool)> {
+    validate_user_id(user_id)?;
+    let tx = conn.unchecked_transaction()?;
+    let status: Option<String> = tx
+        .query_row("SELECT status FROM users WHERE id = ?1", [user_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if status.as_deref() != Some("active") {
+        return Err(EnclaveError::Auth(
+            "phase2 authority acquisition requires an active account".into(),
+        ));
+    }
+    let binding = validate_active_archive_binding_conn(&tx, user_id)?;
+    if evidence.archive_id() != binding.archive_id {
+        return Err(EnclaveError::Conflict(
+            "phase2 statement archive does not match the active binding".into(),
+        ));
+    }
+    let archive_id = binding.archive_id;
+    type Phase2ImportFacts = (
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        String,
+        String,
+    );
+    let import_facts: Option<Phase2ImportFacts> = tx
+        .query_row(
+            "SELECT operation_id,operation_commitment,source_commitment,parity_commitment,stage,
+                    fence_authority
+             FROM archive_v3_maintenance_imports WHERE archive_id=?1 AND format_version=1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        import_operation_id,
+        operation_commitment,
+        source_commitment,
+        parity_commitment,
+        import_stage,
+        maintenance_fence_authority,
+    )) = import_facts
+    else {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition requires a durable maintenance import".into(),
+        ));
+    };
+    let source_commitment = source_commitment
+        .as_deref()
+        .map(|value| fixed_blob::<32>(value, "maintenance source commitment"))
+        .transpose()?;
+    let parity_commitment = parity_commitment
+        .as_deref()
+        .map(|value| fixed_blob::<32>(value, "maintenance parity commitment"))
+        .transpose()?;
+    if fixed_blob::<16>(&import_operation_id, "maintenance operation ID")?
+        != evidence.operation_id()
+        || fixed_blob::<32>(&operation_commitment, "maintenance operation commitment")?
+            != evidence.operation_commitment()
+        || source_commitment != Some(evidence.source_commitment())
+        || parity_commitment != Some(evidence.parity_commitment())
+        || !matches!(import_stage.as_str(), "shadow_wal" | "parity_verified")
+    {
+        return Err(EnclaveError::Conflict(
+            "phase2 statement does not match the durable maintenance import".into(),
+        ));
+    }
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        evidence.operation_id(),
+    )
+    .map_err(maintenance_store_error)?;
+    if !phase2_row_exists_conn(&tx, "archive_v3_advisory_owners", archive_id)? {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition requires a bound advisory owner".into(),
+        ));
+    }
+    let owner = load_retained_advisory_owner_by_archive_conn(&tx, archive_id)?;
+    let token = AdvisoryOwnerPersistenceContext(());
+    let (owner_operation_id, owner_id, _, _, observed, _, owner_revision, _) =
+        owner.control_view(token);
+    if owner_operation_id != operation_id {
+        return Err(EnclaveError::Conflict(
+            "phase2 statement does not match the bound advisory owner".into(),
+        ));
+    }
+    let owner_witness = observed.clone();
+    let observed_witness_hash: [u8; 32] = Sha256::digest(owner_witness.encode()).into();
+    if observed_witness_hash != evidence.terminal_witness_hash() {
+        return Err(EnclaveError::Conflict(
+            "phase2 statement witness hash does not match the frozen owner witness".into(),
+        ));
+    }
+    if !phase2_row_exists_conn(&tx, "archive_v3_advisory_releases", archive_id)? {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition requires a released advisory terminal".into(),
+        ));
+    }
+    let release = load_advisory_release_conn(&tx, archive_id)?;
+    let release_view = release.control_view(token);
+    if release_view.stage != AdvisoryReleaseStage::Released
+        || release_view.revision != 3
+        || release_view.operation_id != operation_id
+        || release_view.owner_id != owner_id
+        || release_view.owner_witness != &owner_witness
+        || release_view.owner_revision != owner_revision
+    {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition requires a released advisory terminal".into(),
+        ));
+    }
+    let release_commitment = release_view.commitment;
+    if !phase2_row_exists_conn(&tx, "archive_v3_advisory_comparisons", archive_id)? {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition requires a settled advisory comparison".into(),
+        ));
+    }
+    let comparison = load_advisory_comparison_conn(&tx, archive_id)?;
+    let comparison_view = comparison.control_view(token);
+    if comparison_view.operation_id != operation_id
+        || comparison_view.owner_id != owner_id
+        || comparison_view.release_commitment != release_commitment
+    {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition requires a settled advisory comparison".into(),
+        ));
+    }
+    let comparison_commitment = comparison_view.commitment;
+    let run = load_advisory_controller_run_conn(&tx, operation_id)?.ok_or_else(|| {
+        EnclaveError::Conflict(
+            "phase2 acquisition requires a retired advisory controller run".into(),
+        )
+    })?;
+    if run.archive_id != archive_id
+        || run.stage != AdvisoryControllerRunStage::Retired
+        || run.settlement_commitment != Some(comparison_view.evidence_commitment)
+        || run.abort_reason.is_some()
+    {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition requires a retired advisory controller run".into(),
+        ));
+    }
+    // The signed statement's scope and user bindings must byte-match the durable
+    // facts, exactly as the Phase-1 admission enforces: the retired run's canary
+    // scope, and the acting user under that scope's canonical commitment.
+    if run.scope_id != Some(evidence.scope_id()) {
+        return Err(EnclaveError::Conflict(
+            "phase2 statement scope does not match the retired canary scope".into(),
+        ));
+    }
+    let expected_user_commitment =
+        crate::archive_v3_advisory_owner::scope_user_commitment(&evidence.scope_id(), user_id)
+            .map_err(|_| {
+                EnclaveError::Conflict("phase2 statement user binding is malformed".into())
+            })?;
+    if evidence.user_id_commitment() != expected_user_commitment {
+        return Err(EnclaveError::Conflict(
+            "phase2 statement user does not match the acting user".into(),
+        ));
+    }
+    if phase2_row_exists_conn(&tx, "archive_v3_advisory_aborts", archive_id)? {
+        let _ = load_advisory_abort_conn(&tx, archive_id)?;
+        return Err(EnclaveError::Conflict(
+            "advisory abort permanently fences phase2 acquisition".into(),
+        ));
+    }
+    if phase2_row_exists_conn(&tx, "archive_v3_phase2_authority_acquisitions", archive_id)? {
+        let existing =
+            load_phase2_authority_acquisition_conn(&tx, archive_id)?.ok_or_else(|| {
+                EnclaveError::Store("phase2 acquisition durable state is invalid".into())
+            })?;
+        // Idempotent re-adopt requires full equality on every identity and
+        // evidence field; the fence is excluded because it is minted exactly
+        // once and never recomputed.
+        if existing.maintenance_operation_id != operation_id
+            || existing.owner_id.as_bytes() != owner_id.as_bytes()
+            || existing.owner_witness != owner_witness
+            || existing.owner_revision != owner_revision
+            || existing.release_commitment != release_commitment
+            || existing.comparison_commitment != comparison_commitment
+            || existing.evidence_commitment != evidence.evidence_commitment()
+            || existing.statement_operation_commitment != evidence.operation_commitment()
+            || existing.statement_source_commitment != evidence.source_commitment()
+            || existing.statement_parity_commitment != evidence.parity_commitment()
+            || existing.terminal_witness_hash != evidence.terminal_witness_hash()
+            || existing.release_image_digest != evidence.release_image_digest()
+            || existing.maintenance_window_id != evidence.maintenance_window_id()
+            || existing.stage != Phase2AcquisitionStage::Phase2Acquired
+            || existing.revision != 1
+        {
+            return Err(EnclaveError::Conflict(
+                "phase2 acquisition already minted differently".into(),
+            ));
+        }
+        tx.commit()?;
+        return Ok((existing, false));
+    }
+    let acquisition_fence_authority = format!("archive_{}", super::tokens::random_token_hex());
+    // Checked invariant, not merely statistical: the fresh acquisition fence must
+    // differ from the maintenance fence it succeeds (identical formats; a 256-bit
+    // collision would otherwise pass silently).
+    if acquisition_fence_authority == maintenance_fence_authority {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition fence collided with the maintenance fence".into(),
+        ));
+    }
+    let expected = Phase2AuthorityAcquisition::from_parts(
+        archive_id,
+        operation_id,
+        ObjectId::from_bytes(*owner_id.as_bytes()),
+        owner_witness,
+        owner_revision,
+        release_commitment,
+        comparison_commitment,
+        evidence.evidence_commitment(),
+        evidence.operation_commitment(),
+        evidence.source_commitment(),
+        evidence.parity_commitment(),
+        evidence.terminal_witness_hash(),
+        evidence.release_image_digest(),
+        evidence.maintenance_window_id(),
+        acquisition_fence_authority,
+        Phase2AcquisitionStage::Phase2Acquired,
+        1,
+    )?;
+    if tx.execute(
+        "INSERT INTO archive_v3_phase2_authority_acquisitions
+         (archive_id,format_version,maintenance_operation_id,owner_id,owner_witness,
+          owner_revision,release_commitment,comparison_commitment,evidence_commitment,
+          statement_operation_commitment,statement_source_commitment,
+          statement_parity_commitment,terminal_witness_hash,release_image_digest,
+          maintenance_window_id,acquisition_fence_authority,stage,commitment,revision)
+         VALUES (?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,1)",
+        rusqlite::params![
+            expected.archive_id.as_bytes().as_slice(),
+            expected.maintenance_operation_id.as_bytes().as_slice(),
+            expected.owner_id.as_bytes().as_slice(),
+            expected.owner_witness.encode().as_slice(),
+            i64::try_from(expected.owner_revision).map_err(|_| EnclaveError::Store(
+                "phase2 acquisition owner revision overflow".into()
+            ))?,
+            expected.release_commitment.as_slice(),
+            expected.comparison_commitment.as_slice(),
+            expected.evidence_commitment.as_slice(),
+            expected.statement_operation_commitment.as_slice(),
+            expected.statement_source_commitment.as_slice(),
+            expected.statement_parity_commitment.as_slice(),
+            expected.terminal_witness_hash.as_slice(),
+            expected.release_image_digest.as_slice(),
+            expected.maintenance_window_id.as_slice(),
+            expected.acquisition_fence_authority,
+            expected.stage.as_db(),
+            expected.commitment.as_slice(),
+        ],
+    )? != 1
+    {
+        return Err(EnclaveError::Conflict("phase2 acquisition raced".into()));
+    }
+    let loaded = load_phase2_authority_acquisition_conn(&tx, archive_id)?
+        .ok_or_else(|| EnclaveError::Conflict("phase2 acquisition readback missing".into()))?;
+    if loaded != expected {
+        return Err(EnclaveError::Conflict(
+            "phase2 acquisition readback changed".into(),
+        ));
+    }
+    tx.commit()?;
+    Ok((loaded, true))
+}
+
+fn load_phase2_authority_acquisition_conn(
+    conn: &Connection,
+    archive_id: ArchiveId,
+) -> Result<Option<Phase2AuthorityAcquisition>> {
+    type Phase2AcquisitionRow = (
+        i64,     // 0 format_version
+        Vec<u8>, // 1 maintenance_operation_id
+        Vec<u8>, // 2 owner_id
+        Vec<u8>, // 3 owner_witness
+        i64,     // 4 owner_revision
+        Vec<u8>, // 5 release_commitment
+        Vec<u8>, // 6 comparison_commitment
+        Vec<u8>, // 7 evidence_commitment
+        Vec<u8>, // 8 statement_operation_commitment
+        Vec<u8>, // 9 statement_source_commitment
+        Vec<u8>, // 10 statement_parity_commitment
+        Vec<u8>, // 11 terminal_witness_hash
+        Vec<u8>, // 12 release_image_digest
+        Vec<u8>, // 13 maintenance_window_id
+        String,  // 14 acquisition_fence_authority
+        String,  // 15 stage
+        Vec<u8>, // 16 commitment
+        i64,     // 17 revision
+    );
+    let row: Option<Phase2AcquisitionRow> = conn
+        .query_row(
+            "SELECT format_version,maintenance_operation_id,owner_id,owner_witness,
+                    owner_revision,release_commitment,comparison_commitment,
+                    evidence_commitment,statement_operation_commitment,
+                    statement_source_commitment,statement_parity_commitment,
+                    terminal_witness_hash,release_image_digest,maintenance_window_id,
+                    acquisition_fence_authority,stage,commitment,revision
+             FROM archive_v3_phase2_authority_acquisitions WHERE archive_id=?1",
+            [archive_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.0 != 1 {
+        return Err(EnclaveError::Store(
+            "unsupported phase2 acquisition format".into(),
+        ));
+    }
+    let operation_id = MaintenanceImportOperationId::from_control(
+        MaintenancePersistenceContext(()),
+        fixed_blob::<16>(&row.1, "phase2 acquisition operation ID")?,
+    )
+    .map_err(maintenance_store_error)?;
+    let owner_id = ObjectId::from_bytes(fixed_blob::<16>(&row.2, "phase2 acquisition owner ID")?);
+    let owner_witness = crate::archive_v3_witness::WitnessRecord::decode(&fixed_blob::<
+        { crate::archive_v3_witness::WITNESS_RECORD_BYTES },
+    >(
+        &row.3,
+        "phase2 acquisition owner witness",
+    )?)
+    .map_err(|_| EnclaveError::Store("invalid phase2 acquisition owner witness".into()))?;
+    let stage = Phase2AcquisitionStage::from_db(&row.15)?;
+    Phase2AuthorityAcquisition::from_control_persisted(
+        archive_id,
+        operation_id,
+        owner_id,
+        owner_witness,
+        u64::try_from(row.4)
+            .map_err(|_| EnclaveError::Store("invalid phase2 acquisition owner revision".into()))?,
+        fixed_blob::<32>(&row.5, "phase2 acquisition release commitment")?,
+        fixed_blob::<32>(&row.6, "phase2 acquisition comparison commitment")?,
+        fixed_blob::<32>(&row.7, "phase2 acquisition evidence commitment")?,
+        fixed_blob::<32>(&row.8, "phase2 acquisition statement operation commitment")?,
+        fixed_blob::<32>(&row.9, "phase2 acquisition statement source commitment")?,
+        fixed_blob::<32>(&row.10, "phase2 acquisition statement parity commitment")?,
+        fixed_blob::<32>(&row.11, "phase2 acquisition terminal witness hash")?,
+        fixed_blob::<32>(&row.12, "phase2 acquisition release image digest")?,
+        fixed_blob::<16>(&row.13, "phase2 acquisition maintenance window ID")?,
+        row.14,
+        stage,
+        u64::try_from(row.17)
+            .map_err(|_| EnclaveError::Store("invalid phase2 acquisition revision".into()))?,
+        fixed_blob::<32>(&row.16, "phase2 acquisition commitment")?,
+    )
+    .map(Some)
 }
 
 fn load_advisory_abort_recovery_conn(
@@ -19292,6 +20136,65 @@ impl ControlStore {
                 Err(e) => Err(e),
             },
         )
+        .await
+    }
+
+    /// Mint (or exactly re-adopt) the one-shot Phase-2 authority acquisition.
+    /// See [`acquire_phase2_authority_conn`] for the complete transactional
+    /// predicate list. The boolean reports whether a fresh row was minted.
+    pub(crate) async fn acquire_phase2_authority(
+        &self,
+        user_id: &str,
+        evidence: crate::archive_v3_advisory_owner::Phase2AuthorityAcquisitionEvidence,
+    ) -> Result<(Phase2AuthorityAcquisition, bool)> {
+        let user_id = user_id.to_owned();
+        self.write_owned_if_changed(move |conn| {
+            let (row, created) = acquire_phase2_authority_conn(conn, &user_id, &evidence)?;
+            Ok(((row, created), created))
+        })
+        .await
+    }
+
+    /// Exact-load the durable Phase-2 acquisition for one archive with full
+    /// commitment recompute-and-compare validation.
+    pub(crate) async fn load_phase2_authority_acquisition(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<Option<Phase2AuthorityAcquisition>> {
+        self.read(move |conn| load_phase2_authority_acquisition_conn(conn, archive_id))
+            .await
+    }
+
+    /// Archive-keyed full-tuple load of the durable bound advisory owner for
+    /// the Phase-2 acquisition driver, which holds only the verified
+    /// statement's archive identity.
+    pub(crate) async fn load_retained_advisory_owner_for_archive(
+        &self,
+        _token: crate::archive_v3_advisory_owner::AdvisoryOwnerRuntimeContext,
+        archive_id: ArchiveId,
+    ) -> std::result::Result<BoundAdvisoryOwner, AdvisoryOwnerError> {
+        self.read(move |conn| load_retained_advisory_owner_by_archive_conn(conn, archive_id))
+            .await
+            .map_err(map_advisory_persistence_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn delete_phase2_authority_acquisition_for_test(
+        &self,
+        archive_id: ArchiveId,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            if conn.execute(
+                "DELETE FROM archive_v3_phase2_authority_acquisitions WHERE archive_id=?1",
+                [archive_id.as_bytes().as_slice()],
+            )? != 1
+            {
+                return Err(EnclaveError::Conflict(
+                    "phase2 acquisition test deletion missed".into(),
+                ));
+            }
+            Ok(())
+        })
         .await
     }
 
@@ -32348,6 +33251,492 @@ mod tests {
         let (released, _) =
             mark_advisory_fence_released_conn(conn, &delete_started, &absence).unwrap();
         (bound, released)
+    }
+
+    fn test_archive_id(conn: &Connection) -> ArchiveId {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT archive_id FROM archive_v3_maintenance_imports",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        ArchiveId::from_bytes(fixed_blob::<16>(&bytes, "test archive ID").unwrap())
+    }
+
+    fn observed_witness_hash(bound: &BoundAdvisoryOwner) -> [u8; 32] {
+        let view = bound.control_view(AdvisoryOwnerPersistenceContext::for_test());
+        Sha256::digest(view.4.encode()).into()
+    }
+
+    /// Build a Phase-2 statement whose facts are copied from the REAL durable
+    /// maintenance-import row, with the caller-supplied frozen witness hash.
+    fn durable_phase2_statement(
+        conn: &Connection,
+        terminal_witness_hash: [u8; 32],
+        release_image_digest: [u8; 32],
+    ) -> crate::archive_v3_advisory_owner::ParsedPhase2Statement {
+        type DurableImportFacts = (Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+        let (archive_id, operation_id, operation_commitment, source_commitment, parity_commitment): DurableImportFacts =
+            conn.query_row(
+                "SELECT archive_id,operation_id,operation_commitment,source_commitment,parity_commitment
+                 FROM archive_v3_maintenance_imports",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // The signed statement must byte-match the durable canary scope and the
+        // acting user's canonical scope-bound commitment; load both for real.
+        let scope_id: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT scope_id FROM archive_v3_advisory_controller_runs WHERE scope_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        // Refusal scenarios may run before any retired controller run exists; the
+        // scope/user binding is only reached after the run predicate passes, so a
+        // fixed nonzero fallback scope is inert there.
+        let scope_id = scope_id
+            .map(|raw| fixed_blob::<16>(&raw, "test canary scope").unwrap())
+            .unwrap_or([0x51; 16]);
+        crate::archive_v3_advisory_owner::ParsedPhase2Statement {
+            scope_id,
+            user_id_commitment: crate::archive_v3_advisory_owner::scope_user_commitment(
+                &scope_id, USER_ID,
+            )
+            .unwrap(),
+            archive_id: ArchiveId::from_bytes(
+                fixed_blob::<16>(&archive_id, "test archive ID").unwrap(),
+            ),
+            operation_id: fixed_blob::<16>(&operation_id, "test operation ID").unwrap(),
+            operation_commitment: fixed_blob::<32>(
+                &operation_commitment,
+                "test operation commitment",
+            )
+            .unwrap(),
+            source_commitment: fixed_blob::<32>(
+                &source_commitment.unwrap_or_else(|| vec![0x41; 32]),
+                "test source commitment",
+            )
+            .unwrap(),
+            parity_commitment: fixed_blob::<32>(
+                &parity_commitment.unwrap_or_else(|| vec![0x42; 32]),
+                "test parity commitment",
+            )
+            .unwrap(),
+            terminal_witness_hash,
+            release_image_digest,
+        }
+    }
+
+    fn phase2_evidence_from_statement(
+        statement: crate::archive_v3_advisory_owner::ParsedPhase2Statement,
+        evidence_commitment: [u8; 32],
+    ) -> crate::archive_v3_advisory_owner::Phase2AuthorityAcquisitionEvidence {
+        let admission = crate::archive_v3_advisory_owner::ParsedPhase2Admission {
+            enabled_mutation_set_commitment: [0x31; 32],
+            deployment_target_commitment: [0x32; 32],
+            maintenance_window_id: [0x33; 16],
+            deployment_revision_commitment: [0x34; 32],
+            challenge_commitment: [0x35; 32],
+            monitoring_policy_commitment: [0x36; 32],
+            rollback_policy_commitment: [0x37; 32],
+        };
+        crate::archive_v3_advisory_owner::VerifiedPhase2AuthorityAuthorization::mint_for_test(
+            statement,
+            admission,
+            evidence_commitment,
+        )
+        .acquisition_evidence()
+    }
+
+    /// Drive the durable advisory controller run to `retired`. `prepare` and
+    /// `eligible` must already be durable (they require the import row at its
+    /// `prepared` stage, before the advisory fixture advances it).
+    fn advance_phase2_controller_run_to_retired(
+        conn: &Connection,
+        operation_id: MaintenanceImportOperationId,
+        owner_id: [u8; 16],
+        settlement_commitment: [u8; 32],
+    ) {
+        advance_advisory_controller_imported_conn(conn, operation_id).unwrap();
+        let scope_id: Vec<u8> = conn
+            .query_row(
+                "SELECT scope_id FROM archive_v3_advisory_canary_scopes
+                 WHERE maintenance_operation_id=?1",
+                [operation_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        advance_advisory_controller_authorized_conn(
+            conn,
+            operation_id,
+            fixed_blob::<16>(&scope_id, "test scope ID").unwrap(),
+        )
+        .unwrap();
+        advance_advisory_controller_owner_admitted_conn(conn, operation_id, owner_id).unwrap();
+        advance_advisory_controller_retired_conn(conn, operation_id, settlement_commitment)
+            .unwrap();
+    }
+
+    /// Full advisory-terminal fixture for Phase-2 acquisition tests: settled
+    /// comparison, released terminal at revision 3, and a retired controller
+    /// run whose settlement commitment equals the comparison evidence.
+    fn phase2_settled_terminal_fixture(
+        conn: &Connection,
+    ) -> (
+        BoundAdvisoryOwner,
+        AdvisoryRelease,
+        AdvisoryComparisonSettlement,
+    ) {
+        maintenance_import_plan_conn(conn, USER_ID).unwrap();
+        let operation_id = maintenance_operation_id(conn);
+        let archive_id = test_archive_id(conn);
+        prepare_advisory_controller_run_conn(
+            conn,
+            [0x5a; 16],
+            USER_ID,
+            archive_id,
+            operation_id,
+            [0x5b; 16],
+            [0x5c; 32],
+        )
+        .unwrap();
+        advance_advisory_controller_eligible_conn(conn, operation_id, 1000, 2000, 1_000_000)
+            .unwrap();
+        let (bound, released) = released_advisory_owner_fixture(conn);
+        let evidence = AdvisoryComparisonEvidence::for_control_test([0x81; 32]).unwrap();
+        let (settled, _) =
+            settle_advisory_comparison_conn(conn, &bound, &released, evidence).unwrap();
+        let owner_id = *bound
+            .control_view(AdvisoryOwnerPersistenceContext::for_test())
+            .1
+            .as_bytes();
+        advance_phase2_controller_run_to_retired(conn, operation_id, owner_id, [0x81; 32]);
+        (bound, released, settled)
+    }
+
+    #[test]
+    fn phase2_authority_acquisition_mints_only_from_settled_terminal_and_readopts_exactly() {
+        let conn = account_conn();
+        let (bound, released, settled) = phase2_settled_terminal_fixture(&conn);
+        let token = AdvisoryOwnerPersistenceContext::for_test();
+        let maintenance_fence = advisory_fence_authority(&conn);
+        let witness_hash = observed_witness_hash(&bound);
+        let evidence = phase2_evidence_from_statement(
+            durable_phase2_statement(&conn, witness_hash, [0xd7; 32]),
+            [0xe1; 32],
+        );
+        let (minted, created) = acquire_phase2_authority_conn(&conn, USER_ID, &evidence).unwrap();
+        assert!(created);
+        assert_eq!(minted.stage(), Phase2AcquisitionStage::Phase2Acquired);
+        assert_eq!(minted.revision(), 1);
+        assert_eq!(minted.archive_id(), test_archive_id(&conn));
+        assert_eq!(minted.terminal_witness_hash(), witness_hash);
+        assert_eq!(minted.release_image_digest(), [0xd7; 32]);
+        assert_eq!(minted.maintenance_window_id(), [0x33; 16]);
+        assert_eq!(minted.evidence_commitment(), [0xe1; 32]);
+        assert_eq!(
+            minted.release_commitment(),
+            released.control_view(token).commitment
+        );
+        assert_eq!(
+            minted.comparison_commitment(),
+            settled.control_view(token).commitment
+        );
+        let fence = minted.acquisition_fence_authority().to_owned();
+        assert_eq!(fence.len(), 72);
+        assert!(fence.starts_with("archive_"));
+        assert_ne!(
+            fence, maintenance_fence,
+            "the acquisition fence must be fresh, never the maintenance fence"
+        );
+        assert_eq!(
+            format!("{minted:?}"),
+            "Phase2AuthorityAcquisition(<opaque>)"
+        );
+
+        // Idempotent re-adopt returns the retained row without re-minting.
+        let replay = phase2_evidence_from_statement(
+            durable_phase2_statement(&conn, witness_hash, [0xd7; 32]),
+            [0xe1; 32],
+        );
+        let (replayed, created) = acquire_phase2_authority_conn(&conn, USER_ID, &replay).unwrap();
+        assert!(!created);
+        assert!(replayed == minted);
+        assert_eq!(
+            replayed.acquisition_fence_authority(),
+            minted.acquisition_fence_authority()
+        );
+
+        // A second DIFFERENT authorization can never overwrite the one-shot mint.
+        let different = phase2_evidence_from_statement(
+            durable_phase2_statement(&conn, witness_hash, [0xd7; 32]),
+            [0xe2; 32],
+        );
+        assert!(matches!(
+            acquire_phase2_authority_conn(&conn, USER_ID, &different),
+            Err(EnclaveError::Conflict(_))
+        ));
+
+        // Readback survives full commitment validation and byte-equals the mint.
+        let loaded = load_phase2_authority_acquisition_conn(&conn, minted.archive_id())
+            .unwrap()
+            .unwrap();
+        assert!(loaded == minted);
+
+        // A self-consistent stored-commitment substitution fails closed on load.
+        conn.execute(
+            "UPDATE archive_v3_phase2_authority_acquisitions SET commitment=?1",
+            [[0x7f; 32].as_slice()],
+        )
+        .unwrap();
+        assert!(load_phase2_authority_acquisition_conn(&conn, minted.archive_id()).is_err());
+    }
+
+    #[test]
+    fn phase2_authority_acquisition_refuses_each_missing_or_mismatched_predicate() {
+        // Parity terminal alone (no bound advisory owner) cannot acquire.
+        {
+            let conn = account_conn();
+            seed_maintenance_advisory_parity(&conn).unwrap();
+            let evidence = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, [0x88; 32], [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &evidence),
+                Err(EnclaveError::Conflict(_))
+            ));
+        }
+        // A bound owner before release cannot acquire.
+        {
+            let conn = account_conn();
+            let bound = bound_advisory_owner_fixture(&conn);
+            let evidence = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, observed_witness_hash(&bound), [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &evidence),
+                Err(EnclaveError::Conflict(_))
+            ));
+        }
+        // A release short of `released`/revision 3 cannot acquire.
+        {
+            let conn = account_conn();
+            let bound = bound_advisory_owner_fixture(&conn);
+            let marker_name = crate::store::test_identity_rebind_fence_object_name(USER_ID);
+            let authority = advisory_fence_authority(&conn);
+            let (prepared, _) = prepare_advisory_release_conn(&conn, &bound).unwrap();
+            let observation = AdvisoryFenceObservation::for_test(
+                &prepared,
+                &marker_name,
+                &authority,
+                "kioku-identity-rebind-fence-v1",
+                23,
+            )
+            .unwrap();
+            mark_advisory_fence_delete_started_conn(&conn, &prepared, &observation).unwrap();
+            let evidence = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, observed_witness_hash(&bound), [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &evidence),
+                Err(EnclaveError::Conflict(_))
+            ));
+        }
+        // A released terminal without a settled comparison cannot acquire.
+        {
+            let conn = account_conn();
+            let (bound, _released) = released_advisory_owner_fixture(&conn);
+            let evidence = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, observed_witness_hash(&bound), [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &evidence),
+                Err(EnclaveError::Conflict(_))
+            ));
+        }
+        // A settled comparison without any controller run cannot acquire.
+        {
+            let conn = account_conn();
+            let (bound, released) = released_advisory_owner_fixture(&conn);
+            let evidence = AdvisoryComparisonEvidence::for_control_test([0x81; 32]).unwrap();
+            settle_advisory_comparison_conn(&conn, &bound, &released, evidence).unwrap();
+            let acquisition_evidence = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, observed_witness_hash(&bound), [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &acquisition_evidence),
+                Err(EnclaveError::Conflict(_))
+            ));
+        }
+        // A controller run short of `retired` cannot acquire.
+        {
+            let conn = account_conn();
+            maintenance_import_plan_conn(&conn, USER_ID).unwrap();
+            let operation_id = maintenance_operation_id(&conn);
+            let archive_id = test_archive_id(&conn);
+            prepare_advisory_controller_run_conn(
+                &conn,
+                [0x5a; 16],
+                USER_ID,
+                archive_id,
+                operation_id,
+                [0x5b; 16],
+                [0x5c; 32],
+            )
+            .unwrap();
+            advance_advisory_controller_eligible_conn(&conn, operation_id, 1000, 2000, 1_000_000)
+                .unwrap();
+            let (bound, released) = released_advisory_owner_fixture(&conn);
+            let evidence = AdvisoryComparisonEvidence::for_control_test([0x81; 32]).unwrap();
+            settle_advisory_comparison_conn(&conn, &bound, &released, evidence).unwrap();
+            advance_advisory_controller_imported_conn(&conn, operation_id).unwrap();
+            let scope_id: Vec<u8> = conn
+                .query_row(
+                    "SELECT scope_id FROM archive_v3_advisory_canary_scopes
+                     WHERE maintenance_operation_id=?1",
+                    [operation_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            advance_advisory_controller_authorized_conn(
+                &conn,
+                operation_id,
+                fixed_blob::<16>(&scope_id, "test scope ID").unwrap(),
+            )
+            .unwrap();
+            let owner_id = *bound
+                .control_view(AdvisoryOwnerPersistenceContext::for_test())
+                .1
+                .as_bytes();
+            advance_advisory_controller_owner_admitted_conn(&conn, operation_id, owner_id).unwrap();
+            let acquisition_evidence = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, observed_witness_hash(&bound), [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &acquisition_evidence),
+                Err(EnclaveError::Conflict(_))
+            ));
+        }
+        // An advisory abort row permanently fences acquisition even against an
+        // otherwise fully settled terminal (defense in depth: the abort and
+        // comparison rows are transaction-exclusive through every public path,
+        // so the fabricated-but-valid row below cannot arise from them).
+        {
+            let conn = account_conn();
+            let (bound, released, _settled) = phase2_settled_terminal_fixture(&conn);
+            let token = AdvisoryOwnerPersistenceContext::for_test();
+            let abort = AdvisoryAbortTerminal::prepared_for_control(
+                token,
+                &bound,
+                &released,
+                AdvisoryAbortReason::StopRequested,
+            )
+            .unwrap();
+            let abort_commitment = abort.control_view(token).commitment;
+            conn.execute(
+                "INSERT INTO archive_v3_advisory_aborts
+                 (archive_id,format_version,maintenance_operation_id,owner_id,owner_witness,
+                  owner_revision,owner_commitment,release_commitment,locus,reason,stage,
+                  retirement_commitment,commitment,revision)
+                 SELECT archive_id,1,maintenance_operation_id,owner_id,owner_witness,
+                        owner_revision,owner_commitment,release_commitment,'resumed_capture',
+                        'stop_requested','prepared',NULL,?1,1
+                 FROM archive_v3_advisory_comparisons",
+                [abort_commitment.as_slice()],
+            )
+            .unwrap();
+            let evidence = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, observed_witness_hash(&bound), [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &evidence),
+                Err(EnclaveError::Conflict(_))
+            ));
+        }
+        // Wrong terminal witness hash, wrong statement commitments, and a
+        // foreign archive all fail closed against the full settled terminal.
+        {
+            let conn = account_conn();
+            let (bound, _released, _settled) = phase2_settled_terminal_fixture(&conn);
+            let witness_hash = observed_witness_hash(&bound);
+            let wrong_hash = phase2_evidence_from_statement(
+                durable_phase2_statement(&conn, [0x77; 32], [0xd7; 32]),
+                [0xe1; 32],
+            );
+            assert!(matches!(
+                acquire_phase2_authority_conn(&conn, USER_ID, &wrong_hash),
+                Err(EnclaveError::Conflict(_))
+            ));
+            let mut wrong_operation = durable_phase2_statement(&conn, witness_hash, [0xd7; 32]);
+            wrong_operation.operation_commitment = [0x66; 32];
+            assert!(matches!(
+                acquire_phase2_authority_conn(
+                    &conn,
+                    USER_ID,
+                    &phase2_evidence_from_statement(wrong_operation, [0xe1; 32]),
+                ),
+                Err(EnclaveError::Conflict(_))
+            ));
+            let mut wrong_source = durable_phase2_statement(&conn, witness_hash, [0xd7; 32]);
+            wrong_source.source_commitment = [0x66; 32];
+            assert!(matches!(
+                acquire_phase2_authority_conn(
+                    &conn,
+                    USER_ID,
+                    &phase2_evidence_from_statement(wrong_source, [0xe1; 32]),
+                ),
+                Err(EnclaveError::Conflict(_))
+            ));
+            let mut wrong_parity = durable_phase2_statement(&conn, witness_hash, [0xd7; 32]);
+            wrong_parity.parity_commitment = [0x66; 32];
+            assert!(matches!(
+                acquire_phase2_authority_conn(
+                    &conn,
+                    USER_ID,
+                    &phase2_evidence_from_statement(wrong_parity, [0xe1; 32]),
+                ),
+                Err(EnclaveError::Conflict(_))
+            ));
+            let mut foreign_archive = durable_phase2_statement(&conn, witness_hash, [0xd7; 32]);
+            foreign_archive.archive_id = ArchiveId::from_bytes([0x99; 16]);
+            assert!(matches!(
+                acquire_phase2_authority_conn(
+                    &conn,
+                    USER_ID,
+                    &phase2_evidence_from_statement(foreign_archive, [0xe1; 32]),
+                ),
+                Err(EnclaveError::Conflict(_))
+            ));
+            // Nothing above minted a row.
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM archive_v3_phase2_authority_acquisitions",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

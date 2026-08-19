@@ -413,6 +413,62 @@ impl fmt::Debug for AuthenticatedMaintenanceImportPlan {
     }
 }
 
+/// Sealed, non-cloneable proof of one durable Phase-2 authority acquisition.
+/// Constructible only from a control-minted, fully validated acquisition row
+/// through control's private producer token. The retained `owner_id` is the
+/// frozen advisory owner identity from the acquisition row — deliberately a
+/// different namespace than the maintenance plan's own witness-lease owner —
+/// so the importer gate binds through the row commitment, which covers every
+/// acquisition field. There is no durable resumed-local-admission marker; the
+/// acquisition row this plan seals was mintable only against the retired
+/// advisory controller run, the strongest durable proxy for the fully settled
+/// advisory terminal.
+pub(crate) struct Phase2AcquiredAuthorityPlan {
+    user_id: String,
+    archive_id: ArchiveId,
+    operation_id: MaintenanceImportOperationId,
+    owner_id: ObjectId,
+    acquisition_fence_authority: String,
+    acquisition_commitment: [u8; 32],
+}
+
+impl Phase2AcquiredAuthorityPlan {
+    pub(crate) fn from_acquisition(
+        _token: crate::cp::control_store::Phase2AuthorityPersistenceContext,
+        user_id: &str,
+        row: &crate::cp::control_store::Phase2AuthorityAcquisition,
+    ) -> Result<Self, MaintenanceImportError> {
+        let fence_authority = row.acquisition_fence_authority();
+        if user_id.is_empty()
+            || zero(row.archive_id().as_bytes())
+            || zero(row.owner_id().as_bytes())
+            || zero(&row.commitment())
+            || fence_authority.len() != 72
+            || !fence_authority.starts_with("archive_")
+            || !fence_authority[8..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || row.stage() != crate::cp::control_store::Phase2AcquisitionStage::Phase2Acquired
+        {
+            return Err(MaintenanceImportError::Corrupt);
+        }
+        Ok(Self {
+            user_id: user_id.to_owned(),
+            archive_id: row.archive_id(),
+            operation_id: row.maintenance_operation_id(),
+            owner_id: row.owner_id(),
+            acquisition_fence_authority: fence_authority.to_owned(),
+            acquisition_commitment: row.commitment(),
+        })
+    }
+}
+
+impl fmt::Debug for Phase2AcquiredAuthorityPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Phase2AcquiredAuthorityPlan(<opaque>)")
+    }
+}
+
 pub(crate) struct MaintenanceStorePlanView {
     pub(crate) user_id: String,
     pub(crate) archive_id: ArchiveId,
@@ -971,6 +1027,11 @@ pub(crate) struct SingleArchiveMaintenanceImporter {
     control: Arc<crate::cp::control_store::ControlStore>,
     store: Arc<crate::store::Store>,
     plan: AuthenticatedMaintenanceImportPlan,
+    /// `Some` only for the acquisition-gated Phase-2 door. When set, the
+    /// advisory release-absence predicate is replaced by presence-and-exact-
+    /// match of the durable acquisition row, `run_phase2` is the only
+    /// permitted entry, and the advisory target is unreachable.
+    phase2_acquisition: Option<Phase2AcquiredAuthorityPlan>,
 }
 
 /// Type-separated Phase-1 owner. It can stop only at independently verified
@@ -1016,7 +1077,49 @@ impl SingleArchiveMaintenanceImporter {
             control,
             store,
             plan,
+            phase2_acquisition: None,
         })
+    }
+
+    /// Acquisition-gated Phase-2 constructor. The importer runs with the
+    /// ORIGINAL maintenance plan identity (same operation, witness-lease
+    /// owner, and attempt continue R2), but every advisory release-absence
+    /// gate is replaced by presence-and-exact-match of the sealed acquisition,
+    /// which must bind the exact same user, archive, and operation. The
+    /// acquisition's advisory owner identity is a different namespace than
+    /// the plan's witness-lease owner, so owner binding is enforced through
+    /// the acquisition row commitment at the gate rather than here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit authenticated maintenance tuple; grouping would obscure exact binding"
+    )]
+    pub(crate) fn from_sealed_runtime_with_phase2(
+        token: crate::archive_v3_shadow_runtime::MaintenanceRuntimeContext,
+        archive_id: ArchiveId,
+        archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+        runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+        control: Arc<crate::cp::control_store::ControlStore>,
+        store: Arc<crate::store::Store>,
+        plan: AuthenticatedMaintenanceImportPlan,
+        acquisition: Phase2AcquiredAuthorityPlan,
+    ) -> Result<Self, MaintenanceImportError> {
+        if acquisition.user_id != plan.user_id
+            || acquisition.archive_id != plan.archive_id
+            || acquisition.operation_id.as_bytes() != plan.operation_id.as_bytes()
+        {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        let mut importer = Self::from_sealed_runtime(
+            token,
+            archive_id,
+            archive_binding,
+            runtime,
+            control,
+            store,
+            plan,
+        )?;
+        importer.phase2_acquisition = Some(acquisition);
+        Ok(importer)
     }
 
     #[cfg(test)]
@@ -1054,7 +1157,38 @@ impl SingleArchiveMaintenanceImporter {
             control,
             store,
             plan,
+            phase2_acquisition: None,
         })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_test_components_with_phase2<W>(
+        archive_id: ArchiveId,
+        objects: Arc<dyn ImmutableObjectBackend>,
+        registries: Arc<dyn ExactKeyRegistryProvider>,
+        witness: Arc<W>,
+        control: Arc<crate::cp::control_store::ControlStore>,
+        store: Arc<crate::store::Store>,
+        plan: AuthenticatedMaintenanceImportPlan,
+        acquisition: Phase2AcquiredAuthorityPlan,
+    ) -> Result<Self, MaintenanceImportError>
+    where
+        W: MaintenanceImportWitnessProvider
+            + crate::archive_v3_advisory_owner::AdvisoryOwnerWitnessProvider
+            + 'static,
+    {
+        if acquisition.user_id != plan.user_id
+            || acquisition.archive_id != plan.archive_id
+            || acquisition.operation_id.as_bytes() != plan.operation_id.as_bytes()
+        {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        let mut importer = Self::from_test_components(
+            archive_id, objects, registries, witness, control, store, plan,
+        )?;
+        importer.phase2_acquisition = Some(acquisition);
+        Ok(importer)
     }
 
     /// Abort a pre-owner maintenance import operation: validates Store state,
@@ -1094,10 +1228,36 @@ impl SingleArchiveMaintenanceImporter {
 
     /// Run the complete offline import in one owned task. Dropping the caller
     /// does not detach a witness send or plaintext scratch owner; the task
-    /// retains both until a durable stage or cleanup.
+    /// retains both until a durable stage or cleanup. This advisory-fenced
+    /// door refuses a Phase-2-constructed importer so the two doors never mix.
     pub(crate) async fn run(
         self,
     ) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
+        if self.phase2_acquisition.is_some() {
+            return Err(MaintenanceImportError::Conflict);
+        }
+        let completed =
+            tokio::spawn(self.run_owned(MaintenanceImportTarget::WalAuthoritative, None))
+                .await
+                .map_err(|_| MaintenanceImportError::Unavailable)??;
+        match completed {
+            CompletedMaintenanceImport::WalAuthoritative(handoff) => Ok(*handoff),
+            CompletedMaintenanceImport::Advisory(_) => Err(MaintenanceImportError::Corrupt),
+        }
+    }
+
+    /// Acquisition-gated Phase-2 door. It mirrors [`Self::run`] exactly —
+    /// same owned task, same `WalAuthoritative` target, same predicates —
+    /// except that inside `run_owned` the two advisory release-absence gates
+    /// are replaced by presence-and-exact-match of the durable Phase-2
+    /// acquisition row (pre-lock and in-lock). It is the only entry permitted
+    /// for a Phase-2-constructed importer and refuses every other importer.
+    pub(crate) async fn run_phase2(
+        self,
+    ) -> Result<CompletedMaintenanceWalHandoff, MaintenanceImportError> {
+        if self.phase2_acquisition.is_none() {
+            return Err(MaintenanceImportError::Conflict);
+        }
         let completed =
             tokio::spawn(self.run_owned(MaintenanceImportTarget::WalAuthoritative, None))
                 .await
@@ -1121,6 +1281,7 @@ impl SingleArchiveMaintenanceImporter {
             control,
             store,
             plan,
+            phase2_acquisition,
         } = self;
         let objects = runtime.maintenance_objects_owned(&runtime_token);
         let registries = runtime.maintenance_registries(&runtime_token);
@@ -1136,9 +1297,23 @@ impl SingleArchiveMaintenanceImporter {
         let session_id = ShadowSessionId::for_operation(*operation_id.as_bytes())
             .map_err(|_| MaintenanceImportError::Corrupt)?;
         let mut record = persistence.load_exact(operation_id).await?;
-        persistence
-            .ensure_advisory_release_absent(operation_id)
-            .await?;
+        // Under a Phase-2 acquisition, presence-and-exact-match of the durable
+        // acquisition row replaces the advisory release-absence predicate at
+        // BOTH gate sites; every other predicate is unchanged. A Phase-2
+        // importer can only ever drive the WalAuthoritative target.
+        match &phase2_acquisition {
+            Some(acquisition) => {
+                if target != MaintenanceImportTarget::WalAuthoritative {
+                    return Err(MaintenanceImportError::Conflict);
+                }
+                ensure_phase2_acquisition_intact(control.as_ref(), acquisition).await?;
+            }
+            None => {
+                persistence
+                    .ensure_advisory_release_absent(operation_id)
+                    .await?;
+            }
+        }
         if record.stage == MaintenanceImportStage::ManualRequired {
             return Err(MaintenanceImportError::Conflict);
         }
@@ -1164,10 +1339,17 @@ impl SingleArchiveMaintenanceImporter {
         // before either local admission gate is changed. The inactive release
         // executor takes the same lock before preparing its durable row and
         // keeps it through local resume, so a stale waiter cannot recreate the
-        // marker or leave Store reblocked after terminal release.
-        persistence
-            .ensure_advisory_release_absent(operation_id)
-            .await?;
+        // marker or leave Store reblocked after terminal release. Under a
+        // Phase-2 acquisition the same in-lock slot re-reads and byte-compares
+        // the durable acquisition row instead.
+        match &phase2_acquisition {
+            Some(_acquisition) => {}
+            None => {
+                persistence
+                    .ensure_advisory_release_absent(operation_id)
+                    .await?;
+            }
+        }
         let mut transition = admission.begin().await;
         let pinned = if matches!(
             record.stage,
@@ -1615,6 +1797,31 @@ impl SingleArchiveMaintenanceImporter {
         .await
         .map(|handoff| CompletedMaintenanceImport::WalAuthoritative(Box::new(handoff)))
     }
+}
+
+/// Phase-2 replacement for the advisory release-absence predicate: the
+/// durable acquisition row must exist, byte-match the sealed acquisition
+/// (commitment equality covers every acquisition field), and rest at
+/// `Phase2Acquired`. Anything else — absence, a different mint, or a
+/// `ManualRequired` fence — fails closed.
+async fn ensure_phase2_acquisition_intact(
+    control: &crate::cp::control_store::ControlStore,
+    acquisition: &Phase2AcquiredAuthorityPlan,
+) -> Result<(), MaintenanceImportError> {
+    let retained = control
+        .load_phase2_authority_acquisition(acquisition.archive_id)
+        .await
+        .map_err(|_| MaintenanceImportError::Unavailable)?
+        .ok_or(MaintenanceImportError::Conflict)?;
+    if retained.commitment() != acquisition.acquisition_commitment
+        || retained.stage() != crate::cp::control_store::Phase2AcquisitionStage::Phase2Acquired
+        || retained.archive_id() != acquisition.archive_id
+        || retained.maintenance_operation_id().as_bytes() != acquisition.operation_id.as_bytes()
+        || retained.acquisition_fence_authority() != acquisition.acquisition_fence_authority
+    {
+        return Err(MaintenanceImportError::Conflict);
+    }
+    Ok(())
 }
 
 impl SingleArchiveAdvisoryShadowImporter {
@@ -5412,6 +5619,793 @@ pub(crate) mod tests {
         run_advisory_terminal_test(AdvisoryTerminalTestMode::ReleasedResumeWinsAbortRace);
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase2FixtureMode {
+        /// Stop with the advisory owner bound but the release, comparison,
+        /// and controller retirement still absent.
+        BoundOnly,
+        /// Drive the full advisory terminal: released at revision 3, settled
+        /// comparison, retired controller run.
+        Settled,
+    }
+
+    struct Phase2AcquisitionFixture {
+        control: Arc<crate::cp::control_store::ControlStore>,
+        store: Arc<crate::store::Store>,
+        objects: Arc<dyn ImmutableObjectBackend>,
+        registries: Arc<dyn ExactKeyRegistryProvider>,
+        witness: Arc<InMemoryMaintenanceWitness>,
+        user_id: String,
+        archive_id: ArchiveId,
+        operation_id: MaintenanceImportOperationId,
+        authority_plan: AuthenticatedMaintenanceImportPlan,
+        maintenance_fence: String,
+        scope_id: [u8; 16],
+    }
+
+    /// Real-sqlite advisory fixture for the Phase-2 acquisition transition.
+    /// It mirrors the full advisory harness through owner binding and, in
+    /// `Settled` mode, drives release, local resume, one captured commit,
+    /// comparison settlement, and the durable controller-run retirement whose
+    /// row is the acquisition's strongest durable settled-terminal proxy.
+    async fn phase2_acquisition_fixture(mode: Phase2FixtureMode) -> Phase2AcquisitionFixture {
+        use crate::{
+            cp::control_store::ControlStore,
+            store::{tests::FakeGcs, tests::FakeKms, Store},
+        };
+
+        let control = Arc::new(ControlStore::new(
+            Arc::new(FakeKms),
+            Arc::new(FakeGcs::new()),
+        ));
+        let user = control
+            .upsert_user("phase2-acquisition-e2e", "phase2@example.com")
+            .await
+            .unwrap();
+        let plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let archive_id = plan.plan_archive_id();
+        let operation_id = plan.plan_operation_id();
+        // The controller run must be prepared and eligible while the import
+        // row still rests at its `prepared` stage.
+        control
+            .prepare_advisory_controller_run(
+                [0x5a; 16],
+                &user.id,
+                archive_id,
+                operation_id,
+                [0x5b; 16],
+                [0x5c; 32],
+            )
+            .await
+            .unwrap();
+        control
+            .advance_advisory_controller_eligible(operation_id, 1000, 2000, 1_000_000)
+            .await
+            .unwrap();
+
+        let legacy_gcs = Arc::new(FakeGcs::new());
+        let store = Arc::new(Store::new(Arc::new(FakeKms), legacy_gcs));
+        store
+            .with_user(&user.id, |connection| {
+                connection.execute(
+                    "INSERT INTO app_metadata(key,value) VALUES('phase2-e2e','exact')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.save_user(&user.id).await.unwrap();
+
+        let database_epoch = DatabaseEpoch::from_bytes([0x72; 16]);
+        let key_epoch = KeyEpoch::from_bytes([0x73; 16]);
+        let registry_object_id = ObjectId::from_bytes([0x74; 16]);
+        let wrapped = b"maintenance-registry-envelope".to_vec();
+        let registry_context = KeyRegistryContext::new(archive_id, KeyKind::Archive, key_epoch);
+        let plaintext = KeyRegistryPlaintext::encode_archive(
+            &registry_context,
+            &ArchiveDek::from_bytes([0x75; 32]),
+        )
+        .unwrap()
+        .to_vec();
+        let registries = Arc::new(TestRegistry {
+            object_id: registry_object_id,
+            wrapped: wrapped.clone(),
+            plaintext,
+        });
+        let cipher = resolve_archive_cipher(
+            &registry_context,
+            registry_object_id,
+            Sha256::digest(&wrapped).into(),
+            registries.as_ref(),
+        )
+        .await
+        .unwrap();
+        let backend = Arc::new(InMemoryImmutableBackend::new());
+        let initial_root_id = ObjectId::from_bytes([0x76; 16]);
+        let initial_context = ObjectContext::new(
+            archive_id,
+            database_epoch,
+            key_epoch,
+            ObjectRole::RootV3,
+            LogicalLocation::Root { root_seq: 0 },
+            initial_root_id,
+            None,
+        )
+        .unwrap();
+        let initial_root = ArchiveRoot {
+            root_seq: 0,
+            parent: None,
+            database_epoch,
+            key_epoch,
+            owner_fencing_epoch: 0,
+            sqlite_page_size: SQLITE_PAGE_SIZE,
+            checkpoint_logical_file_length: 0,
+            logical_file_length: 0,
+            user_schema_version: 0,
+            storage_format_version: ARCHIVE_FORMAT_VERSION,
+            wal_generation: 0,
+            wal_commit_count: 0,
+            wal_segment_count: 0,
+            wal_tail_bytes: 0,
+            checkpoint_root: None,
+            extent_tree_root: None,
+            wal_commit_tail: None,
+        };
+        let initial_envelope = cipher
+            .seal(&initial_context, &initial_root.encode().unwrap())
+            .unwrap();
+        backend
+            .create_if_absent(initial_context.object_key(), initial_envelope.clone())
+            .await
+            .unwrap();
+        let witness = InMemoryWitness::with_incrementing_clock_for_test(1);
+        witness
+            .bootstrap(WitnessBootstrap::new(
+                archive_id,
+                database_epoch,
+                RootCommitment::genesis(
+                    database_epoch,
+                    key_epoch,
+                    RootReference::new(0, initial_root_id, initial_envelope.hash()),
+                ),
+                KeyRegistryReference::new(
+                    key_epoch,
+                    0,
+                    registry_object_id,
+                    Sha256::digest(&wrapped).into(),
+                ),
+            ))
+            .unwrap();
+        let witness = Arc::new(InMemoryMaintenanceWitness::new(witness));
+        let objects: Arc<dyn ImmutableObjectBackend> = backend;
+        let registry_provider: Arc<dyn ExactKeyRegistryProvider> = registries;
+
+        let importer = SingleArchiveMaintenanceImporter::from_test_components(
+            archive_id,
+            Arc::clone(&objects),
+            Arc::clone(&registry_provider),
+            witness.clone(),
+            Arc::clone(&control),
+            Arc::clone(&store),
+            plan,
+        )
+        .unwrap();
+        let advisory = SingleArchiveAdvisoryShadowImporter::from_maintenance_importer(importer)
+            .run()
+            .await
+            .unwrap();
+        // Re-adopt the retained maintenance plan before release permanently
+        // fences the advisory door; this is the exact original operation
+        // identity the Phase-2 continuation runs with.
+        let authority_plan = control
+            .prepare_archive_v3_maintenance_import(&user.id)
+            .await
+            .unwrap();
+        let maintenance_fence = authority_plan.fence_authority().to_owned();
+
+        let canary = control
+            .authorize_advisory_canary_for_test(
+                operation_id,
+                &advisory._terminal_witness,
+                [0xa1; 32],
+                [0xa2; 32],
+            )
+            .await
+            .unwrap();
+        let scope_id = canary.scope_id();
+        let owner =
+            crate::archive_v3_advisory_owner::start_advisory_owner_for_test(advisory, canary)
+                .await
+                .unwrap();
+        let owner_id_bytes = owner.owner_id_for_test();
+        control
+            .advance_advisory_controller_imported(operation_id)
+            .await
+            .unwrap();
+        control
+            .advance_advisory_controller_authorized(operation_id, scope_id)
+            .await
+            .unwrap();
+        if mode == Phase2FixtureMode::BoundOnly {
+            drop(owner);
+        } else {
+            let released = owner.release_legacy_fence().await.unwrap();
+            control
+                .advance_advisory_controller_owner_admitted(operation_id, owner_id_bytes)
+                .await
+                .unwrap();
+            let resumed = released.resume_local_admission().await.unwrap();
+            store
+                .with_user(&user.id, |connection| {
+                    connection.execute(
+                        "INSERT INTO app_metadata(key,value) VALUES('phase2-capture','exact-user')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let settled = resumed.settle_comparison_for_test().await.unwrap();
+            drop(settled);
+            let settlement = control
+                .load_retained_advisory_comparison_exact(archive_id)
+                .await
+                .unwrap()
+                .unwrap();
+            control
+                .advance_advisory_controller_retired(operation_id, settlement.evidence_commitment())
+                .await
+                .unwrap();
+        }
+        Phase2AcquisitionFixture {
+            control,
+            store,
+            objects,
+            registries: registry_provider,
+            witness,
+            user_id: user.id,
+            archive_id,
+            operation_id,
+            authority_plan,
+            maintenance_fence,
+            scope_id,
+        }
+    }
+
+    async fn phase2_terminal_witness_hash(fixture: &Phase2AcquisitionFixture) -> [u8; 32] {
+        let current = fixture
+            .witness
+            .read_current_exact(fixture.archive_id)
+            .await
+            .unwrap();
+        Sha256::digest(current.encode()).into()
+    }
+
+    /// Build a Phase-2 statement whose facts are copied from the REAL durable
+    /// maintenance-import row (the source and parity commitments are read via
+    /// the retaining replace helpers).
+    async fn phase2_statement_from_durable(
+        fixture: &Phase2AcquisitionFixture,
+        terminal_witness_hash: [u8; 32],
+    ) -> crate::archive_v3_advisory_owner::ParsedPhase2Statement {
+        let source_commitment = fixture
+            .control
+            .replace_maintenance_source_commitment_for_test(fixture.operation_id, [0xf9; 32])
+            .await
+            .unwrap();
+        fixture
+            .control
+            .replace_maintenance_source_commitment_for_test(fixture.operation_id, source_commitment)
+            .await
+            .unwrap();
+        let parity_commitment = fixture
+            .control
+            .replace_maintenance_parity_commitment_for_test(fixture.operation_id, [0xfa; 32])
+            .await
+            .unwrap();
+        fixture
+            .control
+            .replace_maintenance_parity_commitment_for_test(fixture.operation_id, parity_commitment)
+            .await
+            .unwrap();
+        crate::archive_v3_advisory_owner::ParsedPhase2Statement {
+            scope_id: fixture.scope_id,
+            user_id_commitment: crate::archive_v3_advisory_owner::scope_user_commitment(
+                &fixture.scope_id,
+                &fixture.user_id,
+            )
+            .unwrap(),
+            archive_id: fixture.archive_id,
+            operation_id: *fixture.operation_id.as_bytes(),
+            operation_commitment: fixture.authority_plan.plan_operation_commitment(),
+            source_commitment,
+            parity_commitment,
+            terminal_witness_hash,
+            release_image_digest: [0xd7; 32],
+        }
+    }
+
+    fn phase2_authorization(
+        statement: crate::archive_v3_advisory_owner::ParsedPhase2Statement,
+        evidence_commitment: [u8; 32],
+    ) -> crate::archive_v3_advisory_owner::VerifiedPhase2AuthorityAuthorization {
+        let admission = crate::archive_v3_advisory_owner::ParsedPhase2Admission {
+            enabled_mutation_set_commitment: [0x31; 32],
+            deployment_target_commitment: [0x32; 32],
+            maintenance_window_id: [0x33; 16],
+            deployment_revision_commitment: [0x34; 32],
+            challenge_commitment: [0x35; 32],
+            monitoring_policy_commitment: [0x36; 32],
+            rollback_policy_commitment: [0x37; 32],
+        };
+        crate::archive_v3_advisory_owner::VerifiedPhase2AuthorityAuthorization::mint_for_test(
+            statement,
+            admission,
+            evidence_commitment,
+        )
+    }
+
+    async fn run_phase2_acquisition_succeeds_and_is_idempotent() {
+        let fixture = phase2_acquisition_fixture(Phase2FixtureMode::Settled).await;
+        let witness_hash = phase2_terminal_witness_hash(&fixture).await;
+        let statement = phase2_statement_from_durable(&fixture, witness_hash).await;
+        let authorization = phase2_authorization(statement, [0xe1; 32]);
+        let (plan, acquisition) = crate::archive_v3_advisory_owner::acquire_phase2_authority(
+            fixture.control.as_ref(),
+            fixture.store.as_ref(),
+            fixture.witness.as_ref(),
+            &fixture.user_id,
+            &authorization,
+        )
+        .await
+        .unwrap();
+        assert_eq!(format!("{plan:?}"), "Phase2AcquiredAuthorityPlan(<opaque>)");
+        assert_eq!(
+            format!("{acquisition:?}"),
+            "Phase2AuthorityAcquisition(<opaque>)"
+        );
+        let fence = acquisition.acquisition_fence_authority().to_owned();
+        assert_eq!(fence.len(), 72);
+        assert!(fence.starts_with("archive_"));
+        assert!(fence[8..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert_ne!(
+            fence, fixture.maintenance_fence,
+            "the acquisition fence must be fresh, never the maintenance fence"
+        );
+        assert_eq!(acquisition.terminal_witness_hash(), witness_hash);
+
+        // A replayed identical authorization re-adopts the existing row.
+        let (replayed, created) = fixture
+            .control
+            .acquire_phase2_authority(&fixture.user_id, authorization.acquisition_evidence())
+            .await
+            .unwrap();
+        assert!(!created);
+        assert!(replayed == acquisition);
+        let (_replayed_plan, driver_replayed) =
+            crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                fixture.control.as_ref(),
+                fixture.store.as_ref(),
+                fixture.witness.as_ref(),
+                &fixture.user_id,
+                &authorization,
+            )
+            .await
+            .unwrap();
+        assert!(driver_replayed == acquisition);
+
+        // The durable row survives full readback validation.
+        let loaded = fixture
+            .control
+            .load_phase2_authority_acquisition(fixture.archive_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded == acquisition);
+    }
+
+    async fn run_phase2_acquisition_refuses_missing_or_wrong_facts() {
+        // A bound advisory owner without release, comparison, or retirement
+        // cannot acquire even through the honest driver.
+        {
+            let fixture = phase2_acquisition_fixture(Phase2FixtureMode::BoundOnly).await;
+            let witness_hash = phase2_terminal_witness_hash(&fixture).await;
+            let statement = phase2_statement_from_durable(&fixture, witness_hash).await;
+            let authorization = phase2_authorization(statement, [0xe1; 32]);
+            assert!(matches!(
+                crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                    fixture.control.as_ref(),
+                    fixture.store.as_ref(),
+                    fixture.witness.as_ref(),
+                    &fixture.user_id,
+                    &authorization,
+                )
+                .await,
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+            ));
+        }
+        // Against the fully settled terminal, a wrong terminal witness hash
+        // and a wrong operation commitment refuse, a correct authorization
+        // succeeds, and a DIFFERENT later authorization is permanently fenced.
+        {
+            let fixture = phase2_acquisition_fixture(Phase2FixtureMode::Settled).await;
+            let witness_hash = phase2_terminal_witness_hash(&fixture).await;
+            let wrong_hash_statement = phase2_statement_from_durable(&fixture, [0x77; 32]).await;
+            assert!(matches!(
+                crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                    fixture.control.as_ref(),
+                    fixture.store.as_ref(),
+                    fixture.witness.as_ref(),
+                    &fixture.user_id,
+                    &phase2_authorization(wrong_hash_statement, [0xe1; 32]),
+                )
+                .await,
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+            ));
+            let mut wrong_operation = phase2_statement_from_durable(&fixture, witness_hash).await;
+            wrong_operation.operation_commitment = [0x66; 32];
+            assert!(matches!(
+                crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                    fixture.control.as_ref(),
+                    fixture.store.as_ref(),
+                    fixture.witness.as_ref(),
+                    &fixture.user_id,
+                    &phase2_authorization(wrong_operation, [0xe1; 32]),
+                )
+                .await,
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+            ));
+            // The durable scope/user binding refuses a statement for a
+            // different canary scope, and (separately) a statement whose
+            // user commitment does not match the acquiring user under the
+            // real scope.
+            let mut wrong_scope = phase2_statement_from_durable(&fixture, witness_hash).await;
+            wrong_scope.scope_id = [0x5c; 16];
+            wrong_scope.user_id_commitment =
+                crate::archive_v3_advisory_owner::scope_user_commitment(
+                    &wrong_scope.scope_id,
+                    &fixture.user_id,
+                )
+                .unwrap();
+            assert!(matches!(
+                crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                    fixture.control.as_ref(),
+                    fixture.store.as_ref(),
+                    fixture.witness.as_ref(),
+                    &fixture.user_id,
+                    &phase2_authorization(wrong_scope, [0xe1; 32]),
+                )
+                .await,
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+            ));
+            let mut wrong_user = phase2_statement_from_durable(&fixture, witness_hash).await;
+            wrong_user.user_id_commitment = [0x5d; 32];
+            assert!(matches!(
+                crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                    fixture.control.as_ref(),
+                    fixture.store.as_ref(),
+                    fixture.witness.as_ref(),
+                    &fixture.user_id,
+                    &phase2_authorization(wrong_user, [0xe1; 32]),
+                )
+                .await,
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+            ));
+            let good = phase2_statement_from_durable(&fixture, witness_hash).await;
+            crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                fixture.control.as_ref(),
+                fixture.store.as_ref(),
+                fixture.witness.as_ref(),
+                &fixture.user_id,
+                &phase2_authorization(good, [0xe1; 32]),
+            )
+            .await
+            .unwrap();
+            let different = phase2_statement_from_durable(&fixture, witness_hash).await;
+            assert!(matches!(
+                crate::archive_v3_advisory_owner::acquire_phase2_authority(
+                    fixture.control.as_ref(),
+                    fixture.store.as_ref(),
+                    fixture.witness.as_ref(),
+                    &fixture.user_id,
+                    &phase2_authorization(different, [0xe2; 32]),
+                )
+                .await,
+                Err(crate::archive_v3_advisory_owner::AdvisoryOwnerError::Conflict)
+            ));
+        }
+    }
+
+    async fn run_phase2_gated_importer_replaces_absence_predicate() {
+        let fixture = phase2_acquisition_fixture(Phase2FixtureMode::Settled).await;
+        let witness_hash = phase2_terminal_witness_hash(&fixture).await;
+        let statement = phase2_statement_from_durable(&fixture, witness_hash).await;
+        let authorization = phase2_authorization(statement, [0xe1; 32]);
+        let (_plan, acquisition) = crate::archive_v3_advisory_owner::acquire_phase2_authority(
+            fixture.control.as_ref(),
+            fixture.store.as_ref(),
+            fixture.witness.as_ref(),
+            &fixture.user_id,
+            &authorization,
+        )
+        .await
+        .unwrap();
+        let sealed_plan = || {
+            // The test token and the row-vouched token are interchangeable
+            // producers of the same sealed plan.
+            Phase2AcquiredAuthorityPlan::from_acquisition(
+                crate::cp::control_store::Phase2AuthorityPersistenceContext::for_test(),
+                &fixture.user_id,
+                &acquisition,
+            )
+            .unwrap()
+        };
+
+        // (a) The advisory-fenced run() refuses a Phase-2-constructed importer.
+        let importer = SingleArchiveMaintenanceImporter::from_test_components_with_phase2(
+            fixture.archive_id,
+            Arc::clone(&fixture.objects),
+            Arc::clone(&fixture.registries),
+            fixture.witness.clone(),
+            Arc::clone(&fixture.control),
+            Arc::clone(&fixture.store),
+            fixture.authority_plan.clone(),
+            sealed_plan(),
+        )
+        .unwrap();
+        assert!(matches!(
+            importer.run().await,
+            Err(MaintenanceImportError::Conflict)
+        ));
+
+        // (b) run_phase2 refuses a non-Phase-2 importer.
+        let importer = SingleArchiveMaintenanceImporter::from_test_components(
+            fixture.archive_id,
+            Arc::clone(&fixture.objects),
+            Arc::clone(&fixture.registries),
+            fixture.witness.clone(),
+            Arc::clone(&fixture.control),
+            Arc::clone(&fixture.store),
+            fixture.authority_plan.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            importer.run_phase2().await,
+            Err(MaintenanceImportError::Conflict)
+        ));
+
+        // The plain advisory-fenced authority door remains permanently fenced
+        // after release, exactly as before this slice.
+        let importer = SingleArchiveMaintenanceImporter::from_test_components(
+            fixture.archive_id,
+            Arc::clone(&fixture.objects),
+            Arc::clone(&fixture.registries),
+            fixture.witness.clone(),
+            Arc::clone(&fixture.control),
+            Arc::clone(&fixture.store),
+            fixture.authority_plan.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            importer.run().await,
+            Err(MaintenanceImportError::Conflict)
+        ));
+
+        // (c) A tampered (deleted) acquisition fails closed at the pre-lock
+        // gate: presence-and-exact-match replaces absence.
+        let sealed = sealed_plan();
+        fixture
+            .control
+            .delete_phase2_authority_acquisition_for_test(fixture.archive_id)
+            .await
+            .unwrap();
+        let importer = SingleArchiveMaintenanceImporter::from_test_components_with_phase2(
+            fixture.archive_id,
+            Arc::clone(&fixture.objects),
+            Arc::clone(&fixture.registries),
+            fixture.witness.clone(),
+            Arc::clone(&fixture.control),
+            Arc::clone(&fixture.store),
+            fixture.authority_plan.clone(),
+            sealed,
+        )
+        .unwrap();
+        assert!(matches!(
+            importer.run_phase2().await,
+            Err(MaintenanceImportError::Conflict)
+        ));
+        // The tampered refusal fired at the pre-lock gate: no Store
+        // maintenance admission was taken, so the settled exact-user legacy
+        // gates remain open.
+        fixture
+            .store
+            .with_user(&fixture.user_id, |_| Ok(()))
+            .await
+            .unwrap();
+
+        // (d) With the acquisition restored (a fresh mint over the same
+        // settled terminal), run_phase2 crosses BOTH former Conflict gates
+        // (pre-lock and in-lock), takes the Store maintenance admission —
+        // which fail-closed re-blocks the exact-user legacy gates — and
+        // revalidates the pinned legacy source. It then stops at the
+        // maintenance witness-lease succession from the settled advisory
+        // owner (`renew_exact_maintenance_lease`), which is the separately
+        // reviewed resumed-R2 transition deliberately outside this
+        // acquisition slice; see the ignored full-terminal test below.
+        let (_plan, reacquired) = crate::archive_v3_advisory_owner::acquire_phase2_authority(
+            fixture.control.as_ref(),
+            fixture.store.as_ref(),
+            fixture.witness.as_ref(),
+            &fixture.user_id,
+            &authorization,
+        )
+        .await
+        .unwrap();
+        let sealed = Phase2AcquiredAuthorityPlan::from_acquisition(
+            reacquired.persistence_context(),
+            &fixture.user_id,
+            &reacquired,
+        )
+        .unwrap();
+        let importer = SingleArchiveMaintenanceImporter::from_test_components_with_phase2(
+            fixture.archive_id,
+            Arc::clone(&fixture.objects),
+            Arc::clone(&fixture.registries),
+            fixture.witness.clone(),
+            Arc::clone(&fixture.control),
+            Arc::clone(&fixture.store),
+            fixture.authority_plan.clone(),
+            sealed,
+        )
+        .unwrap();
+        assert!(matches!(
+            importer.run_phase2().await,
+            Err(MaintenanceImportError::Conflict)
+        ));
+        // Unlike the tampered pre-lock refusal above, the intact acquisition
+        // provably crossed both gates into the Store admission: the local
+        // legacy gates are re-blocked fail-closed.
+        assert!(matches!(
+            fixture.store.with_user(&fixture.user_id, |_| Ok(())).await,
+            Err(crate::error::EnclaveError::Auth(_))
+        ));
+        assert!(fixture
+            .store
+            .acquire_content_write(&fixture.user_id)
+            .await
+            .is_err());
+    }
+
+    /// Full Phase-2 continuation to the `WalAuthoritative` terminal. The
+    /// acquisition gates, Store admission, and pinned-source revalidation all
+    /// pass today (pinned by
+    /// `phase2_gated_importer_replaces_absence_predicate_exactly`), but the
+    /// run then requires the maintenance owner to succeed the settled
+    /// advisory owner's witness lease inside `renew_exact_maintenance_lease`.
+    /// That succession is a separately reviewed transition outside the
+    /// acquisition slice, so this full-terminal expectation stays ignored
+    /// until it lands.
+    async fn run_phase2_full_terminal_after_lease_succession() {
+        let fixture = phase2_acquisition_fixture(Phase2FixtureMode::Settled).await;
+        let witness_hash = phase2_terminal_witness_hash(&fixture).await;
+        let statement = phase2_statement_from_durable(&fixture, witness_hash).await;
+        let authorization = phase2_authorization(statement, [0xe1; 32]);
+        let (_plan, acquisition) = crate::archive_v3_advisory_owner::acquire_phase2_authority(
+            fixture.control.as_ref(),
+            fixture.store.as_ref(),
+            fixture.witness.as_ref(),
+            &fixture.user_id,
+            &authorization,
+        )
+        .await
+        .unwrap();
+        let sealed = Phase2AcquiredAuthorityPlan::from_acquisition(
+            acquisition.persistence_context(),
+            &fixture.user_id,
+            &acquisition,
+        )
+        .unwrap();
+        let handoff = SingleArchiveMaintenanceImporter::from_test_components_with_phase2(
+            fixture.archive_id,
+            Arc::clone(&fixture.objects),
+            Arc::clone(&fixture.registries),
+            fixture.witness.clone(),
+            Arc::clone(&fixture.control),
+            Arc::clone(&fixture.store),
+            fixture.authority_plan.clone(),
+            sealed,
+        )
+        .unwrap()
+        .run_phase2()
+        .await
+        .unwrap();
+        assert_eq!(
+            format!("{handoff:?}"),
+            "CompletedMaintenanceWalHandoff(<offline>)"
+        );
+        let terminal = fixture
+            .witness
+            .read_current_exact(fixture.archive_id)
+            .await
+            .unwrap();
+        assert_eq!(terminal.migration(), MigrationState::WalAuthoritative);
+    }
+
+    #[test]
+    #[ignore = "requires the separately reviewed advisory-to-maintenance witness-lease succession"]
+    fn phase2_run_reaches_wal_authoritative_after_lease_succession() {
+        std::thread::Builder::new()
+            .name("phase2-terminal-e2e".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run_phase2_full_terminal_after_lease_succession());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn phase2_acquisition_succeeds_only_from_fully_settled_terminal_and_is_idempotent() {
+        std::thread::Builder::new()
+            .name("phase2-acquisition-e2e".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run_phase2_acquisition_succeeds_and_is_idempotent());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn phase2_acquisition_refuses_missing_or_wrong_facts() {
+        std::thread::Builder::new()
+            .name("phase2-refusal-e2e".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run_phase2_acquisition_refuses_missing_or_wrong_facts());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn phase2_gated_importer_replaces_absence_predicate_exactly() {
+        std::thread::Builder::new()
+            .name("phase2-gate-e2e".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(run_phase2_gated_importer_replaces_absence_predicate());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn real_sqlite_pre_owner_abort_cleans_marker_and_restores_legacy_access() {
         use crate::{
@@ -5739,6 +6733,19 @@ pub(crate) mod tests {
         }
         assert!(source.contains(concat!("tokio::spawn(self.run_", "owned(")));
         assert!(source.contains(concat!("MaintenanceImportTarget::Advisory", "Shadow")));
+        // Deliberate ADR-0022 Phase-2 sibling pin: WalAuthoritative may be
+        // selected by exactly the two known run_owned spawn expressions — the
+        // advisory-fenced run() and the acquisition-gated run_phase2(). A
+        // third selection site requires deliberately updating this count.
+        assert_eq!(
+            source
+                .matches(concat!(
+                    "run_owned(MaintenanceImportTarget::Wal",
+                    "Authoritative"
+                ))
+                .count(),
+            2
+        );
         assert!(source.contains(concat!("release_advisory_lease_", "unresolved")));
         assert!(source.contains(concat!("exact_maintenance_advisory_or_", "release_from")));
         assert!(source.contains(concat!("into_wal_", "owner(")));

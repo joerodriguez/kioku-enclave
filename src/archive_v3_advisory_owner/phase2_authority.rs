@@ -161,6 +161,112 @@ impl VerifiedPhase2AuthorityAuthorization {
     pub(crate) const fn evidence_commitment(&self) -> [u8; 32] {
         self.evidence_commitment
     }
+
+    /// Copy the exact verified statement and admission facts encrypted
+    /// control consumes for the one-shot acquisition mint. The bridge is
+    /// content-free: it carries only identities, commitments, and hashes the
+    /// three pinned roots signed, never the signed payloads themselves.
+    pub(crate) fn acquisition_evidence(&self) -> Phase2AuthorityAcquisitionEvidence {
+        Phase2AuthorityAcquisitionEvidence {
+            scope_id: self.statement.scope_id,
+            user_id_commitment: self.statement.user_id_commitment,
+            archive_id: self.statement.archive_id,
+            operation_id: self.statement.operation_id,
+            operation_commitment: self.statement.operation_commitment,
+            source_commitment: self.statement.source_commitment,
+            parity_commitment: self.statement.parity_commitment,
+            terminal_witness_hash: self.statement.terminal_witness_hash,
+            release_image_digest: self.statement.release_image_digest,
+            maintenance_window_id: self.admission.maintenance_window_id,
+            evidence_commitment: self.evidence_commitment,
+        }
+    }
+
+    /// Test-only mint of an already-"verified" authorization from parsed
+    /// parts. Production instances exist only through
+    /// [`verify_pinned_phase2_authority`].
+    #[cfg(test)]
+    pub(crate) fn mint_for_test(
+        statement: ParsedPhase2Statement,
+        admission: ParsedPhase2Admission,
+        evidence_commitment: [u8; 32],
+    ) -> Self {
+        Self {
+            statement,
+            admission,
+            evidence_commitment,
+        }
+    }
+}
+
+/// Content-free bridge from one pinned-root-verified Phase-2 authorization to
+/// encrypted control's acquisition mint. Constructible only from a
+/// [`VerifiedPhase2AuthorityAuthorization`]; control byte-compares every field
+/// against its durable advisory-terminal rows inside one transaction.
+pub(crate) struct Phase2AuthorityAcquisitionEvidence {
+    scope_id: [u8; 16],
+    user_id_commitment: [u8; 32],
+    archive_id: ArchiveId,
+    operation_id: [u8; 16],
+    operation_commitment: [u8; 32],
+    source_commitment: [u8; 32],
+    parity_commitment: [u8; 32],
+    terminal_witness_hash: [u8; 32],
+    release_image_digest: [u8; 32],
+    maintenance_window_id: [u8; 16],
+    evidence_commitment: [u8; 32],
+}
+
+impl std::fmt::Debug for Phase2AuthorityAcquisitionEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Phase2AuthorityAcquisitionEvidence(<opaque>)")
+    }
+}
+
+impl Phase2AuthorityAcquisitionEvidence {
+    pub(crate) const fn scope_id(&self) -> [u8; 16] {
+        self.scope_id
+    }
+
+    pub(crate) const fn user_id_commitment(&self) -> [u8; 32] {
+        self.user_id_commitment
+    }
+
+    pub(crate) const fn archive_id(&self) -> ArchiveId {
+        self.archive_id
+    }
+
+    pub(crate) const fn operation_id(&self) -> [u8; 16] {
+        self.operation_id
+    }
+
+    pub(crate) const fn operation_commitment(&self) -> [u8; 32] {
+        self.operation_commitment
+    }
+
+    pub(crate) const fn source_commitment(&self) -> [u8; 32] {
+        self.source_commitment
+    }
+
+    pub(crate) const fn parity_commitment(&self) -> [u8; 32] {
+        self.parity_commitment
+    }
+
+    pub(crate) const fn terminal_witness_hash(&self) -> [u8; 32] {
+        self.terminal_witness_hash
+    }
+
+    pub(crate) const fn release_image_digest(&self) -> [u8; 32] {
+        self.release_image_digest
+    }
+
+    pub(crate) const fn maintenance_window_id(&self) -> [u8; 16] {
+        self.maintenance_window_id
+    }
+
+    pub(crate) const fn evidence_commitment(&self) -> [u8; 32] {
+        self.evidence_commitment
+    }
 }
 
 fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
