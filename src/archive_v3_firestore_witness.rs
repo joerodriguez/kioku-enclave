@@ -74,17 +74,18 @@ pub(crate) enum FirestoreWitnessTransportError {
     DefinitelyPresentInvalid,
 }
 
+/// Shared protocol-faithful Firestore witness fakes for cross-module WAL-
+/// owner launch end-to-end tests. Test-only, and kept beside the wire
+/// adapter so protocol drift breaks here first; fields stay visible so
+/// tests can steer trusted time, outcomes, and injected failures.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_transport {
     use super::*;
-    use crate::archive_v3_witness::{KeyRegistryReference, RootCommitment, RootReference};
     use std::{collections::VecDeque, sync::Mutex};
 
-    const TIME: &str = "2026-01-02T03:04:05.123Z";
-    const CREATE_TIME: &str = "2026-01-02T03:04:04.999Z";
-    const WIF_AUDIENCE: &str = "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/archive-witness-attest/providers/archive-witness";
+    pub(crate) const TIME: &str = "2026-01-02T03:04:05.123Z";
 
-    struct StaticToken(Mutex<Vec<String>>);
+    pub(crate) struct StaticToken(pub(crate) Mutex<Vec<String>>);
     #[async_trait::async_trait]
     impl FirestoreWitnessBearerTokenProvider for StaticToken {
         async fn bearer_token(
@@ -96,41 +97,8 @@ mod tests {
             FirestoreWitnessBearerToken::new("narrow-test-token")
         }
     }
-
-    struct FailingToken;
-    #[async_trait::async_trait]
-    impl FirestoreWitnessBearerTokenProvider for FailingToken {
-        async fn bearer_token(
-            &self,
-            _expected_audience: &str,
-        ) -> std::result::Result<FirestoreWitnessBearerToken, FirestoreWitnessTransportError>
-        {
-            Err(FirestoreWitnessTransportError::Unavailable)
-        }
-    }
-
-    struct FakeDispatch {
-        marks: Mutex<usize>,
-        fail: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl WitnessCreateDispatchLedger for FakeDispatch {
-        async fn mark_witness_send_started(
-            &self,
-            admission: &ActiveCreateAdmission,
-        ) -> std::result::Result<WitnessSendStarted, crate::archive_v3_lifecycle::LifecycleError>
-        {
-            *self.marks.lock().unwrap() += 1;
-            if self.fail {
-                return Err(crate::archive_v3_lifecycle::LifecycleError::Unavailable);
-            }
-            WitnessSendStarted::for_test(admission, [88; 32])
-        }
-    }
-
     #[derive(Clone, Copy)]
-    enum CommitOutcome {
+    pub(crate) enum CommitOutcome {
         Ok,
         Aborted,
         LostResponse,
@@ -138,23 +106,23 @@ mod tests {
         CompetingWrite,
     }
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FailureStage {
+    pub(crate) enum FailureStage {
         Begin,
         BatchGet,
     }
-    struct FakeState {
-        record: Option<[u8; WITNESS_RECORD_BYTES]>,
-        update_time: Option<String>,
-        outcomes: VecDeque<CommitOutcome>,
-        commits: usize,
-        requests: Vec<Value>,
-        time: String,
-        failure: Option<FailureStage>,
-        delayed_record: Option<[u8; WITNESS_RECORD_BYTES]>,
+    pub(crate) struct FakeState {
+        pub(crate) record: Option<[u8; WITNESS_RECORD_BYTES]>,
+        pub(crate) update_time: Option<String>,
+        pub(crate) outcomes: VecDeque<CommitOutcome>,
+        pub(crate) commits: usize,
+        pub(crate) requests: Vec<Value>,
+        pub(crate) time: String,
+        pub(crate) failure: Option<FailureStage>,
+        pub(crate) delayed_record: Option<[u8; WITNESS_RECORD_BYTES]>,
     }
-    struct FakeTransport(Mutex<FakeState>);
+    pub(crate) struct FakeTransport(pub(crate) Mutex<FakeState>);
     impl FakeTransport {
-        fn new(
+        pub(crate) fn new(
             record: Option<[u8; WITNESS_RECORD_BYTES]>,
             outcomes: impl IntoIterator<Item = CommitOutcome>,
         ) -> Self {
@@ -169,13 +137,13 @@ mod tests {
                 delayed_record: None,
             }))
         }
-        fn push_outcome(&self, outcome: CommitOutcome) {
+        pub(crate) fn push_outcome(&self, outcome: CommitOutcome) {
             self.0.lock().unwrap().outcomes.push_back(outcome);
         }
-        fn fail_next(&self, stage: FailureStage) {
+        pub(crate) fn fail_next(&self, stage: FailureStage) {
             self.0.lock().unwrap().failure = Some(stage);
         }
-        fn read(state: &FakeState) -> FirestoreWitnessRead {
+        pub(crate) fn read(state: &FakeState) -> FirestoreWitnessRead {
             let read_time = FirestoreTimestamp::parse(&state.time).unwrap();
             FirestoreWitnessRead {
                 record: state.record,
@@ -283,6 +251,60 @@ mod tests {
                 }
                 CommitOutcome::CompetingWrite => unreachable!("handled above"),
             }
+        }
+    }
+
+    /// Build a `FirestoreWitness` over the fake pair with the fixed test
+    /// coordinates every consumer shares.
+    pub(crate) fn witness_over_fake(transport: Arc<FakeTransport>) -> FirestoreWitness {
+        FirestoreWitness::new(
+            FirestoreWitnessConfig::new("project-1", "123456789", "witness-db").unwrap(),
+            Arc::new(StaticToken(Mutex::new(Vec::new()))),
+            transport,
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_transport::{CommitOutcome, FailureStage, FakeTransport, StaticToken, TIME};
+    use super::*;
+    use crate::archive_v3_witness::{KeyRegistryReference, RootCommitment, RootReference};
+    use std::{collections::VecDeque, sync::Mutex};
+
+    const CREATE_TIME: &str = "2026-01-02T03:04:04.999Z";
+    const WIF_AUDIENCE: &str = "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/archive-witness-attest/providers/archive-witness";
+
+    struct FailingToken;
+    #[async_trait::async_trait]
+    impl FirestoreWitnessBearerTokenProvider for FailingToken {
+        async fn bearer_token(
+            &self,
+            _expected_audience: &str,
+        ) -> std::result::Result<FirestoreWitnessBearerToken, FirestoreWitnessTransportError>
+        {
+            Err(FirestoreWitnessTransportError::Unavailable)
+        }
+    }
+
+    struct FakeDispatch {
+        marks: Mutex<usize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WitnessCreateDispatchLedger for FakeDispatch {
+        async fn mark_witness_send_started(
+            &self,
+            admission: &ActiveCreateAdmission,
+        ) -> std::result::Result<WitnessSendStarted, crate::archive_v3_lifecycle::LifecycleError>
+        {
+            *self.marks.lock().unwrap() += 1;
+            if self.fail {
+                return Err(crate::archive_v3_lifecycle::LifecycleError::Unavailable);
+            }
+            WitnessSendStarted::for_test(admission, [88; 32])
         }
     }
 

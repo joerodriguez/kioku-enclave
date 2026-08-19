@@ -6638,6 +6638,80 @@ pub(crate) mod tests {
             ),
             run_operation_id
         );
+
+        // First full launch through the REAL publisher: reconstruct again
+        // with a publisher-capable runtime over the shared protocol-faithful
+        // Firestore fake, seeded byte-exactly with the derived released
+        // terminal the handoff carries (the publisher requires the live
+        // record to equal it before the first owner acquire). The launch
+        // drives owner reservation, the durable send marker, the fake-CAS
+        // lease acquire, and the lane recovery of the authoritative
+        // database, and the settled-only read then serves the exact row the
+        // pinned legacy generation carried into the archive (the later
+        // capture-window write stayed a dirty local fact by design).
+        let terminal_row = MaintenanceImportPersistence::load_exact(
+            fixture.control.as_ref(),
+            fixture.operation_id,
+        )
+        .await
+        .unwrap();
+        let seed = terminal_row
+            .witnessed_record()
+            .unwrap()
+            .unwrap()
+            .derived_maintenance_terminal_release(terminal_row.owner_id)
+            .unwrap();
+        let transport = Arc::new(
+            crate::archive_v3_firestore_witness::test_transport::FakeTransport::new(
+                Some(seed.encode()),
+                [],
+            ),
+        );
+        let firestore = Arc::new(
+            crate::archive_v3_firestore_shadow::FirestoreShadowWitness::from_witness_for_test(
+                Arc::new(
+                    crate::archive_v3_firestore_witness::test_transport::witness_over_fake(
+                        Arc::clone(&transport),
+                    ),
+                ),
+            ),
+        );
+        let launch_runtime =
+            crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle::from_publisher_test_components(
+                Arc::clone(&fixture.objects),
+                Arc::clone(&fixture.registries),
+                fixture.witness.clone(),
+                firestore,
+            );
+        let launch_binding =
+            crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding::from_control_store(
+                crate::cp::control_store::ArchiveBinding::for_runtime_test(fixture.archive_id),
+            );
+        let launch_handoff = CompletedMaintenanceWalHandoff::reconstruct_from_durable(
+            launch_runtime,
+            launch_binding,
+            Arc::clone(&fixture.control),
+            fixture.operation_id,
+        )
+        .await
+        .unwrap();
+        let serving =
+            crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(launch_handoff)
+                .await
+                .unwrap();
+        let captured = serving
+            .read(|connection| {
+                let value: String = connection.query_row(
+                    "SELECT value FROM app_metadata WHERE key='phase2-e2e'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(value)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured, "exact");
     }
 
     #[test]
