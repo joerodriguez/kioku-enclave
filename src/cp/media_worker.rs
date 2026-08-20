@@ -2044,11 +2044,67 @@ async fn reserve_media_output(state: &CpState, user_id: &str, work: &MediaWorkUn
     .await?;
     if reserved.allowed {
         let work_id = work.id.clone();
-        let ids = work.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+        let mut ids = work.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
         let class_name = match work.class {
             WorkClass::Audio => "audio",
             WorkClass::Screen => "screen",
         };
+        if state.store.is_wal_authoritative(user_id) {
+            // Routed read of the durable attempt anchor and the observed
+            // predecessors, then the sealed plan is constructed ONCE (R5) and
+            // settled through the WAL lane. The predecessor pins the observed
+            // reservation_retained -- 1 on a retry -- never a literal 0.
+            ids.sort_unstable();
+            let probe_work_id = work_id.clone();
+            let probe_ids = ids.clone();
+            let (attempt_count, retained, unit_usage, job_usage) = state
+                .store
+                .wal_authoritative_read(user_id, move |conn| {
+                    let (attempt_count, retained, unit_usage): (i64, i64, Option<String>) = conn
+                        .query_row(
+                            "SELECT attempt_count,reservation_retained,usage_json
+                             FROM media_work_units WHERE id=?1",
+                            [&probe_work_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )?;
+                    let mut job_usage = Vec::with_capacity(probe_ids.len());
+                    for id in &probe_ids {
+                        job_usage.push(conn.query_row(
+                            "SELECT usage_json FROM media_processing_jobs WHERE id=?1",
+                            [id],
+                            |row| row.get::<_, Option<String>>(0),
+                        )?);
+                    }
+                    Ok((attempt_count, retained, unit_usage, job_usage))
+                })
+                .await?;
+            let plan = wal::MediaWorkReservationPlan::new(
+                user_id.to_owned(),
+                work_id,
+                class_name.to_owned(),
+                attempt_count,
+                ids,
+                requested,
+                now_iso(),
+                retained,
+                unit_usage,
+                job_usage,
+            )
+            .map_err(|_| {
+                EnclaveError::Store("media work reservation plan construction failed".into())
+            })?;
+            let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(
+                plan,
+            )
+            .map_err(|_| {
+                EnclaveError::Store("media work reservation plan construction failed".into())
+            })?;
+            state
+                .store
+                .wal_authoritative_submit(user_id, prepared)
+                .await?;
+            return Ok(());
+        }
         state
             .store
             .with_user(user_id, move |conn| {
@@ -4658,6 +4714,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(people, 0, "a third-party mention must never bind identity");
+    }
+
+    #[test]
+    fn media_reservation_route_is_exactly_dual_path() {
+        // ADR-0022 F6: the selected branch reads the durable attempt anchor
+        // and observed predecessors through the routed read, constructs the
+        // sealed plan once (R5), submits, and returns; the legacy branch
+        // keeps its exact write+save pair. The predecessor CAS pins the
+        // OBSERVED reservation_retained, never a literal 0 -- the flag is
+        // one-way, so a hard-coded 0 would wedge every media retry.
+        let source = include_str!("media_worker.rs");
+        let start = source
+            .find(concat!("async fn reserve_media_", "output"))
+            .unwrap();
+        let end = source
+            .find(concat!("async fn candidate_name_", "vocabulary"))
+            .unwrap();
+        let route = &source[start..end];
+        assert_eq!(
+            route.matches(concat!("is_wal_", "authoritative(")).count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            1
+        );
+        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 1);
+        assert_eq!(
+            route
+                .matches(concat!("MediaWorkReservationPlan::", "new("))
+                .count(),
+            1
+        );
+        // The identity anchor comes from the durable row, not a counter the
+        // route invents.
+        assert!(route.contains("attempt_count"));
     }
 
     #[test]
