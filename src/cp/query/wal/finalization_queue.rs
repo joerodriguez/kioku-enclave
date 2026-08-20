@@ -88,7 +88,7 @@ impl EligibleStatus {
 /// Complete exact predecessor for one user-requested queue transition.
 /// Content-bearing error text stays private and is retained only in the
 /// transient canonical request buffer and its fixed digest.
-pub(super) struct FinalizationQueuePredecessor {
+pub(in crate::cp::query) struct FinalizationQueuePredecessor {
     substance: String,
     finalized_at: Option<String>,
     finalization_version: Option<i32>,
@@ -102,7 +102,7 @@ pub(super) struct FinalizationQueuePredecessor {
 
 impl FinalizationQueuePredecessor {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
+    pub(in crate::cp::query) fn new(
         substance: String,
         finalized_at: Option<String>,
         finalization_version: Option<i32>,
@@ -166,7 +166,7 @@ pub(crate) struct FinalizationQueuePlan {
 }
 
 impl FinalizationQueuePlan {
-    pub(super) fn new(
+    pub(in crate::cp::query) fn new(
         account_id: String,
         queue_request_id: String,
         episode_id: i64,

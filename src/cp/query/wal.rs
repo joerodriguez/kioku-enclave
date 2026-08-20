@@ -26,6 +26,7 @@ mod selected_screenshot_provider;
 mod selected_screenshot_send;
 mod selected_screenshot_termination;
 mod selected_screenshot_upload;
+pub(in crate::cp::query) use finalization_queue::FinalizationQueuePredecessor;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
 pub(crate) use selected_screenshot_attempt::{
     SelectedScreenshotAttemptLedger, SelectedScreenshotAttemptPlan,
