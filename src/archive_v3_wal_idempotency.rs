@@ -508,6 +508,8 @@ impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::FinalizationQueueLedger {}
 impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan {}
 impl sealed::DomainLedger for crate::cp::finalizer::FinalizationCommitLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaWorkReservationPlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaWorkReservationLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardResultPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardResultLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardAttemptPlan {}

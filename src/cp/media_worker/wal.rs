@@ -17,8 +17,10 @@
 //! unsupported.
 
 pub(super) mod attempt;
+pub(super) mod reservation;
 pub(super) mod result;
 pub(crate) use attempt::{ScreenStoryboardAttemptLedger, ScreenStoryboardAttemptPlan};
+pub(crate) use reservation::{MediaWorkReservationLedger, MediaWorkReservationPlan};
 pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};

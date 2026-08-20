@@ -24,7 +24,11 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # gained the submit (new B site under the same owner); the legacy with_user
 # WRITE remains. 168 -> 169, diffed against pristine main, zero
 # reclassifications.
-EXPECTED_STORE_CALL_COUNT = 169
+# Plan-family slice 2 (F6): reserve_media_output gained its routed
+# predecessor read and the sealed-plan submit, both under the existing B
+# owner. 169 -> 171, diffed against pristine main, zero reclassifications
+# and no removals -- the legacy write branch is intact.
+EXPECTED_STORE_CALL_COUNT = 171
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -35,7 +39,7 @@ EXPECTED_STORE_CALL_COUNT = 169
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "ecfa969828cd8102350d97baa0f6ec3ab7776e23ea870c0a643317271706e25f"
+EXPECTED_STORE_CALL_SHA256 = "6155ec50d6ace5d857279d729f9136b08fe2d2006a2883cbbed59eb1b0c8d8a7"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
