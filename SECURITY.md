@@ -168,134 +168,91 @@ surfaces.
   decrypts the root and full checkpoint without listing, and compares independent SQLite copies
   with the full parity verifier on a blocking lane. Immediately before parity becomes durable,
   Store rereads the exact pinned legacy generation and the coordinator rereads the unchanged
-  witness. A type-separated Phase-1 importer may stop at this point: it reloads the exact
-  `ParityVerified` Control row, requires the fresh Active+ShadowWal witness to be the retained
-  same-fence record or its sole lease-release successor, releases only the importer owner/expiry,
-  rereads the exact no-owner ShadowWal record, revalidates the pinned legacy generation again,
-  then scrubs DB/WAL/SHM and drops its owned Store guard values. The permanent
-  legacy provider fence and process-local Store/barrier blocks initially remain
-  fail-closed. Encrypted Control and the retained exact-user Store target provide
-  an inactive exact-marker release executor plus a separate consuming local-resume
-  transition. The latter freshly exact-reads the frozen witness and terminal
-  release while retaining the same user lifecycle lock, then reopens the registry
-  and raw-content gates together without provider or database I/O. Its opaque
-  result carries no Store connection,
-  acknowledgement, serving policy, route, capture, or WalAuthoritative conversion.
-  A higher-fence, changed-root/registry, changed-migration, deletion, or ambiguous unreconciled
-  record fails closed. The existing authority importer is a distinct type and
-  direct continuation through it after this lease release is rejected; Phase 2
-  still requires a separately reviewed exact authority-acquisition transition.
+  witness. `#289` deleted the type-separated Phase-1 advisory importer that could stop at
+  this point, along with the sealed exact-user Store target it minted, the exact-marker
+  release executor, and the consuming local-resume transition that reopened the registry
+  and raw-content gates. `MaintenanceImportTarget` now has one variant, `WalAuthoritative`.
+  A higher-fence, changed-root/registry, changed-migration, deletion, or ambiguous
+  unreconciled record still fails closed.
 
-  The first post-bootstrap Phase-1 owner is also type-separated. Its private
-  launcher reauthenticates the exact immutable `ParityVerified` Control row and
-  released Active+ShadowWal witness. It also requires one opaque exact canary
-  scope whose encrypted-Control row binds one private user/archive/import,
-  maintenance/source/parity commitments, the released witness hash, a release-
-  image digest, and a verified-operator-statement commitment. A separate
-  encrypted runtime-precondition row binds that scope and image to a constant
-  empty Phase-1 authoritative-mutation set, legacy-only acknowledgements, one
-  exact maintenance-window/deployment-revision/challenge tuple, zero serving
-  replicas, and content-free monitoring/rollback policy commitments. Both
-  complete `Authorized -> Consumed` CASes and the first random advisory-owner
-  insert share one transaction; either all three persist or none does. Reopen
-  and `SendStarted` accept only both consumed rows linked to the exact retained
-  initial reservation.
-  A private verifier now requires a scope-unique canonical operator statement
-  signed by one Ed25519 root, a second-root image assertion binding that exact
-  statement proof to the same release digest, and a pairwise-distinct third-
-  root deployment-observer assertion binding the runtime preconditions. Encrypted
-  Control alone may turn the resulting non-cloneable value into the exact scope
-  and precondition rows, with transactional exact replay. The three roots must
-  be nonzero and pairwise distinct, but the checked-in production roots are
-  deliberately invalid and no live image-attestation/deployment-observer adapter
-  or caller exists; tests alone may issue fixtures. The signed commitments do
-  not prove that monitoring or rollback is deployed, and the post-import proof
-  does not retrospectively prove the importer ran inside its window. A future
-  launcher must hold a freshly authenticated window and zero-serving condition
-  across importer execution, handoff, and owner admission without trusting the
-  process clock. The launcher then reserves the owner in a
-  dedicated table, and durably advances `Reserved -> SendStarted` before the
-  exact witness CAS. Response loss grants no retry under a new identity: only
-  the exact expected owner and canonical next fence may be adopted, after
-  which Control full-tuple-CASes and exact-readbacks `Bound`. A second opaque
-  handoff exact-loads that same row and unchanged witness without another CAS.
-  The runtime view exposes only exact witness read/acquire/same-owner-maintain and cannot reach
-  archive objects, registries, roots, ciphers, Store/VFS capture, routes,
-  acknowledgements, tasks, configuration, or serving. A private lease-only
-  lifecycle lets the already-running non-cloneable owner
-  may retain or heartbeat the exact same ShadowWal fence, or reacquire the same
-  owner at the canonical next fence only after the provider's trusted tick
-  reaches expiry. Each changed successor is authenticated against the exact
-  retained predecessor and full-tuple-CASed into encrypted Control; an unknown
-  response is adopted only from that exact one-step successor. Restart merely
-  exact-loads/adopts without heartbeat authority; it remains inert until an
-  exact provider-trusted post-expiry higher-fence reacquire. No root publication,
-  acknowledgement, startup, route, task, or serving authority is added. The
-  completed inactive owner-only capture/comparison boundary described below
-  remains private and production-unconstructible.
-  Store capture injection is narrowed to one exact validated user. Production
-  constructors still install no VFS, the advisory path receives a selector only
-  through its sealed exact target, and unrelated users always use the unchanged
-  legacy open. This grants no live canary or acknowledgement authority.
-  The parity-certified advisory terminal now also converts its freshly
-  revalidated pinned source into one non-cloneable Store target. That target
-  binds the exact Store, user, archive, import operation, and source while
-  keeping every field private; the conversion scrubs scratch and drops its
-  owned maintenance guards before the advisory owner receives it. It does not
-  clear the permanent provider fence or Store/barrier blocked state. The owner
-  can retain this opaque target and consume it only through the inactive exact-
-  marker release and local-resume path. The terminal resume now installs one
-  exact-user capture selector before reopening either local gate. Its later
-  opaque drain and comparison operations are available only through the private
-  owner path described below; it exposes no general Store access or live caller.
-  A separate inactive Control row now binds `Prepared -> DeleteStarted -> Released`
-  to the exact parity terminal, exact bound advisory-owner witness/revision/commitment,
-  and maintenance-fence commitment. Preparing that row permanently fences further
-  advisory lease succession. `DeleteStarted` can be derived only from a Store-token-
-  minted exact canonical marker-name, authority, metadata, and positive-generation observation;
-  `Released` additionally requires a Store-token-minted exact-name absence proof bound
-  to that deletion marker. Every transition full-tuple-CASes and exact-readbacks in one
-  transaction. The consuming owner cannot heartbeat concurrently: it takes
-  the same one-user Store lifecycle lock as maintenance and is moved into a
-  terminal type before release begins. It freshly requires the exact retained
-  advisory witness before Control can freeze release. Maintenance plan re-adoption and a
-  second post-lock check reject any existing release row, so stale same-process
-  plans fail before provider I/O and cannot recreate the marker. Store first exact-gets its HMAC-
-  derived marker, authenticates the expected authority/metadata/positive
-  generation, and only then returns the observation. After Control durably records
-  `DeleteStarted`, Store may delete exactly that generation and mints absence only
-  after a fresh exact-name `NotFound`; a lost delete response is settled by that
-  same read, while a missing pre-marker, substituted marker, replacement generation,
-  or unavailable read fails closed. Reopen exact-loads `Released` without another
-  provider operation. Before maintenance closes either local gate it now first
-  acquires the same lifecycle lock and repeats the terminal-release absence check;
-  a stale waiter therefore cannot reblock Store after release. Only the consuming
-  terminal owner can install the single bounded advisory capture VFS and exact-user
-  selector before reopening both local gates, while holding their registry/barrier
-  locks together and requiring no open handle or active raw writer. A partial gate
-  or conflicting selector fails closed, so no legacy handle can open in an
-  uncaptured transition gap. Unrelated users remain on the ordinary VFS, and a
-  named-open failure preserves the legacy result but yields no future comparison
-  authority. The resumed owner may select the exact complete prefix from the
-  already-open matching capture registration into a non-cloneable opaque drain.
-  Store pins a read-only/query-only SQLite transaction to that same serialized
-  exact-user state before selecting the prefix, but neither input is exposed.
-  The owner cannot read or settle the drain or query the snapshot; detached count/bytes remain reserved
-  against the fixed capture bound, so cancellation restores the prefix ahead of
-  later captures even if a later generation faults. A concurrent drain is
-  rejected, and registration retirement scrubs the detached frames. The target
-  cannot list, get, put, delete, open a
-  database, retry an owner lease, acknowledge, launch, serve, or mutate cloud/
-  deployment configuration.
+  **The surviving path to `WalAuthoritative` is closed in this tree, not merely inactive.**
+  The ordinary `run()` door keeps its two live `ensure_advisory_release_absent` gates, which
+  can no longer fail because nothing writes `archive_v3_advisory_releases` outside tests. The
+  separate acquisition-gated `run_phase2` door still compiles and still demands a durable
+  `archive_v3_phase2_authority_acquisitions` row resting at `Phase2Acquired`, matched by
+  commitment equality and joined to a witness-lease succession whose fresh basis must hash to
+  that row's terminal witness hash — but the same change removed every writer of that table
+  and dropped `Phase2AcquisitionStage::as_db`, keeping only `from_db`. Rows written by an
+  earlier build therefore still decode, while no new acquisition can be minted here, and
+  `run_phase2` has no caller anywhere in the repository. Under the genesis-first replan no
+  successor mint is planned: an archive is created WAL-authoritative from genesis rather than
+  migrated from a legacy snapshot.
 
-  Pre-owner durable abort handles maintenance import failure or stop before reaching
-  `AdvisoryReleaseStoreStage::Released`. It lacks `Released` authority and reconciles
-  exact-generation GCS marker deletion to fresh `NotFound`. Store preflight verifies
-  the user lifecycle lock, confirms exact marker deletion, and asserts local gate cleanliness
-  (no active raw writes, no open DB connection, no capture selector, symmetric gates).
-  Control durably transitions the import stage to `manual_required` under the exclusive user
-  lifecycle lock, asserting the complete absence of any advisory owner or release row.
-  Store then safely unblocks both process-local gates without creating capture or opening DB handles.
+  `#289` deleted the entire Phase-1 advisory-owner boundary that followed this
+  point: the private launcher, the one-shot encrypted-Control canary scope and
+  its runtime-precondition row, the private three-root operator/image/
+  deployment-observer verifier that pinned Phase 1 to a constant empty
+  authoritative-mutation set, legacy-only acknowledgements, one exact
+  maintenance-window/deployment-revision/challenge tuple, zero serving replicas,
+  and content-free monitoring/rollback commitments, the
+  `Reserved -> SendStarted -> Bound` owner ladder, and the retain/heartbeat/
+  post-expiry-reacquire lease lifecycle with its narrowed runtime view. The
+  checked-in production roots that verifier authenticated against were always
+  deliberately invalid, and no live image-attestation or deployment-observer
+  adapter ever existed; none is now planned, because genesis-first creates a new
+  archive instead of migrating an existing one under observation. The unresolved
+  question that boundary carried — that a post-import proof cannot retrospectively
+  show the importer ran inside its window, so a launcher would have had to hold a
+  freshly authenticated window and zero-serving condition across import, handoff,
+  and owner admission without trusting the process clock — is moot here and must be
+  answered afresh by any future activation design.
+
+  Two things deliberately survive that deletion, and neither is a dormant advisory
+  path. Eight advisory/Phase-2 control-store tables keep their DDL, and
+  `migrate_advisory_abort_locus` still runs on every control-DB open, because
+  dropping a table without its migration in the same commit bricks every replica
+  on startup; schema removal is a separate atomic PR. No writer for any of them
+  survives outside tests, so in production all eight are permanently empty and the
+  live read paths over them — `ensure_advisory_release_absent`, the four existence
+  checks in `abort_pre_owner`, and the acquisition and controller-run readers —
+  are live plumbing over an empty ledger rather than evidence of a reachable
+  advisory path. The witness's advisory-terminal and Phase-2 succession predicates
+  likewise still compile and are called by the sibling lease functions in the same
+  module, but nothing outside the witness/Firestore pair calls those lease
+  functions: treat them as compilation keepers.
+  Store capture injection remains narrowed to one exact validated user, and
+  production constructors still install no VFS. `StoreShadowCaptureSelection`
+  survives, but after `#289` the crate-private test seam is its only injector:
+  the advisory-owner resume transition that was the sole production installer is
+  gone, so no production path can select a user for capture, and the selection
+  is permanently `None` in a release image. Unrelated users always use the
+  unchanged legacy open, and a named-open failure still preserves the legacy
+  result. This grants no live canary or acknowledgement authority.
+
+  Everything that would have consumed such a selector was deleted with the
+  family, and none of it remains in the tree: the parity-certified advisory
+  terminal and the sealed non-cloneable Store/user/archive/import target it
+  minted; the `Prepared -> DeleteStarted -> Released` advisory release ledger
+  and its Store-token-minted marker-observation and exact-name absence proofs;
+  the Store-owned exact-marker executor; the race-free local-resume transition
+  that installed a capture selector while holding both gate locks; the
+  owner-only capture drain and the read-only/query-only SQLite snapshot pinned
+  beside it; the private R1-replay/full-parity comparison worker; the one-shot
+  durable comparison settlement; and the cancellation-owned capture-retirement
+  task. The `advisory_detached` field on the VFS capture state remains but is
+  never assigned, so no prefix can be detached.
+
+  Pre-owner durable abort survives the deletion and still handles maintenance import
+  failure or stop before any owner exists. It reconciles exact-generation GCS marker
+  deletion to a fresh `NotFound`. Store preflight verifies the user lifecycle lock,
+  confirms exact marker deletion, and asserts local gate cleanliness (no active raw
+  writes, no open DB connection, no capture selector, symmetric gates). Control durably
+  transitions the import stage to `manual_required` under the exclusive user lifecycle
+  lock, asserting the complete absence of any advisory owner, release, abort, or
+  comparison row — four existence checks that now read permanently empty tables. Store
+  then safely unblocks both process-local gates without creating capture or opening DB
+  handles. The `AdvisoryReleaseStoreStage` type this path once keyed off was deleted with
+  the release ledger.
 
   R2 is a new exact root over the same authenticated checkpoint, is likewise durable
   before send, and terminal state is recorded only after an exact WalAuthoritative witness
@@ -491,6 +448,26 @@ all-or-nothing encrypted staging implementation, before it can be connected to a
 path.
 ### ADR-0022 archive-v3 foundation is inactive
 
+> **August 2026 replan.** ADR-0022's route to WAL authority changed. The genesis-first
+> replan drops retention of existing archive data, so the advisory-canary/Phase-2
+> migration path was deleted rather than finished: `#288` (`61ae996`) severed the
+> advisory-owner entry point and `#289` (`9b2f87e`) deleted the advisory-owner family,
+> the Phase-2 admission (including `full_reviewed_mutation_set_commitment` and its
+> offline signing ceremony), the `--run-archive-v3-phase1-canary` argv entry, and the
+> eight phase1/phase2 signer/provision scripts. **Phase 1 and Phase 2 no longer exist as
+> rollout stages.** An archive is now created WAL-authoritative from genesis
+> (`src/archive_v3_genesis.rs`) rather than migrated from a legacy snapshot, and its
+> product schema evolves through the append-only schema-epoch ladder
+> (`src/schema_ladder.rs`), whose epoch-0 baseline is frozen and whose every later step
+> the owner applies under its own lease as an ordinary settled WAL commit. Removing the
+> pinned mutation-set commitment is what allowed `#290` (`6c66842`) to add
+> `WalOperationKind::SchemaEpochAdvance = 13` with no signing ceremony — that commitment
+> had been the gate standing between this tree and both schema evolution and transcript
+> support. Note that **"Phase 3" is unrelated**: it labels the extent/shadow paging
+> architecture, not a rollout stage after Phase 2, and it is untouched and still live.
+> None of this changes the standing position that archive-v3 is inactive: no startup,
+> route, Store, or serving path constructs it, and no image acknowledges a write from it.
+
 The inactive legacy SQLite extent-candidate coordinator is private to
 `legacy_gcm/extent_candidate/`. It can persist only a content-free
 `CandidateReady` ledger record after asynchronous exact witness reads, a
@@ -529,7 +506,9 @@ materialize, download, upload, or encrypt a 32-GiB snapshot. Its report
 is permanently marked local non-authority/non-release evidence; it cannot change runtime
 authority or satisfy the image/backend/VFS/witness/fault/lifecycle/cache/concurrency gates.
 
-The inactive Phase-1 signed capacity-evidence contract adds no authority. Its offline
+The inactive signed capacity-evidence contract adds no authority. (It was written as a
+Phase-1 artifact; Phase 1 is gone as a rollout stage, but the verifier and its refusals
+are unchanged and stand on their own.) Its offline
 verifier accepts a restricted ASCII/JCS profile only; enforces exact workload geometry,
 the workload-by-case/metric/result cross-product, policy-pinned environment, context-bound
 ADR metrics and transport components, strict bounds, paired live-size write traces with
@@ -870,33 +849,20 @@ runtime, route, cloud implementation, credential source, or deployment configura
 either component.
 The shadow module is bounded synchronous capture state only, and capture failure
 cannot alter the legacy Store result.
-The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its image tail is zeroized before a nonzero truncate, and reset, fault, stream-retirement, and queue-drop paths zeroize raw image/header bytes; queued captures independently zeroize on drop. Each exact canonical path is bound to a fresh random nonzero process-local stream identity for the full lifetime of one Store SQLite connection unless the inactive one-shot advisory terminal explicitly retires that registration in place. An exclusive lease binds the already-observed queue prefix to one nonzero session/attempt: cancellation leaves that prefix queued, detached count/bytes remain reserved against the fixed queue caps, settlement detaches only that prefix, later captures remain queued, settled attempt identities cannot be reused, and a hard 1,024-settlement cap forces a fresh connection rather than unbounded replay metadata. Ordinary connection teardown closes SQLite before registration retirement; the reviewed advisory terminal may instead retire and scrub the exact registration while leaving the legacy connection open, after which callbacks remain safe but capture-disabled. Retirement invalidates outstanding leases, and a restarted captured connection receives a fresh stream identity. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. Every live Store constructor remains capture-disabled. The inactive advisory terminal may install one shared bounded VFS and exact-user selector while both local gates are closed; the crate-private test injection remains separate. Either seam registers the exact private temp path before opening it through the named VFS and retains the registration immediately after the connection in drop order. The inactive owner may hold only an opaque complete prefix plus the exact read-only Store snapshot pinned before selection; drop restores the prefix even after a later capture fault. A private comparison child can clone that bounded prefix only through an unforgeable Store token, recover the exact witness-nominated R1 graph with exact-name reads, replay strictly contiguous generation/frame/header/checksum facts onto cleanup-owned staging, back up the pinned transaction into an independent create-new 0600 staging file, and run the existing full parity verifier. It reauthenticates the maintenance source, released owner row, and unchanged witness on both sides of the work and returns only one domain-separated opaque commitment. After parity, the worker consumes the exact drain and atomically authenticates and restores its prefix under the registration mutex before any evidence can be minted; concurrent retirement wins that same lock, scrubs the state-owned prefix, and makes the result fail closed. The bounded worker clone zeroizes when its cancellation-owned task exits. No comparison outcome settles the drain, so match, mismatch, error, cancellation, and lost local result all restore the original prefix while the registration remains live. A successful evidence value alone can then be consumed into a one-shot encrypted-Control terminal that binds the exact released owner, witness, revisions, and release/evidence commitments. Its insertion is exact-read before commit; retained-row loading occurs before any repeated local work and reconciles a lost Control response or owner restart, while a changed result conflicts. The terminal owner exposes no second comparison. This durable row records only successful parity and does not itself authorize acknowledgement, publication, provider I/O, or an authority transition. Only after the exact row is durable, a cancellation-owned Store task authenticates the same archive/import target, serializes with its open SQLite actor, clears only the matching exact-user selector, takes and retires only the matching registration, and returns an opaque proof. Retirement scrubs the restored prefix plus later queued capture bytes; exact selector-and-registration absence is idempotent lost-result reconciliation, while every partial or substituted state fails closed. The existing legacy connection remains open and authoritative, and later writes proceed without capture. Startup does not install or invoke this seam, and there is no provider mutation/list/delete, route, health, export, deletion, or serving authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, multi-attempt connection lifetime, exclusive/cancelled/exact-prefix drains, retirement/restart isolation, post-handle `ATTACH` safety, synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries, comparison-boundary substitution/race/cancellation/parity-mismatch behavior, durable exact settlement replay/rollback, primary/recovered staging cleanup, and no-handle retirement versus concurrent exact-user loading with the bundled default VFS; it does not establish every platform or custom parent VFS.
+The VFS wrapper is an explicit, non-default installation around SQLite's then-selected default VFS. It forwards the underlying callback result verbatim and invokes the bounded capture state only after successful WAL `xWrite`, `xTruncate`, or `xSync`; no capture condition is returned to SQLite. Its image tail is zeroized before a nonzero truncate, and reset, fault, stream-retirement, and queue-drop paths zeroize raw image/header bytes; queued captures independently zeroize on drop. Each exact canonical path is bound to a fresh random nonzero process-local stream identity for the full lifetime of one Store SQLite connection. An exclusive lease binds the already-observed queue prefix to one nonzero session/attempt: cancellation leaves that prefix queued, detached count/bytes remain reserved against the fixed queue caps, settlement detaches only that prefix, later captures remain queued, settled attempt identities cannot be reused, and a hard 1,024-settlement cap forces a fresh connection rather than unbounded replay metadata. This lease/drain/settlement machinery is intact and is what the WAL owner's publication path consumes; only the advisory branch of it was removed. Connection teardown closes SQLite before registration retirement. Retirement invalidates outstanding leases, and a restarted captured connection receives a fresh stream identity. SQLite retains VFS names and raw pointers in open connections, so dropping a wrapper intentionally retains both its registration and small callback allocation until process exit; a hard eight-installation cap bounds this memory-safety measure. Parent files must advertise I/O-method version 3 and its required base callbacks or open fails before capture attaches; optional shared-memory/fetch callbacks retain SQLite's documented fallback behavior. Every live Store constructor remains capture-disabled. After `#289` the crate-private test injection is the only seam that installs this VFS and an exact-user selector: the inactive advisory terminal that was the sole production installer is deleted, so no production path installs it. That seam registers the exact private temp path before opening it through the named VFS and retains the registration immediately after the connection in drop order. The advisory consumers built on top of it are gone — the owner-held opaque prefix and pinned read-only Store snapshot, the token-gated comparison child that replayed the prefix onto cleanup-owned staging and ran the full parity verifier, the atomic restore-under-registration-mutex proof, the one-shot encrypted-Control comparison settlement, and the cancellation-owned capture-retirement task. The vestigial `advisory_detached` field is never assigned and `AdvisoryComparisonRestored` has no constructor or consumer. Startup does not install or invoke this seam, and there is no provider mutation/list/delete, route, health, export, deletion, or serving authority wiring. The bundled SQLite oracle validates commit/rollback behavior, captured-format validation, local replay from a checkpointed database, multi-attempt connection lifetime, exclusive/cancelled/exact-prefix drains, retirement/restart isolation, post-handle `ATTACH` safety, synthetic exact-code `xWrite`/`xTruncate`/`xSync` failure boundaries, and no-handle retirement versus concurrent exact-user loading with the bundled default VFS; the advisory comparison-boundary, durable settlement-replay, and staging-cleanup oracle cases went with the family. It does not establish every platform or custom parent VFS.
 
-The inactive canary stop path has one one-shot encrypted-Control terminal whose
-explicit locus distinguishes already-resumed capture retirement from a stop
-after provider release but before local resume. Existing resumed rows retain
-their historical commitment bytes. Both loci exact-bind the released owner and
-record `Prepared` before any Store change. The resumed locus accepts a fixed
-content-free stop or comparison-mismatch reason and retires only the exact
-selector/registration. The released locus accepts only stop-requested: a
-read-only preflight proves both legacy gates remain blocked with no actor,
-write, or selector while retaining the exact-user lifecycle; after durable
-`Prepared`, Store atomically reopens both gates without constructing capture.
-`Aborted` is recorded only from the corresponding opaque exact-target proof. Full-tuple CAS and
-exact readback make late corruption roll back; finalized rows reopen exactly.
-The in-process transition is cancellation-owned. After process loss, a private
-cancellation-owned reconciler may exact-load only a retained `Prepared` row,
-reauthenticate its release/owner/maintenance chain and comparison absence, and
-ask the controller-owned Store only for a read-only proof that both local gates
-are unblocked and no selector or exact-user capture registration exists. The
-proof retains the exact-user lifecycle guard through the full-tuple Control CAS
-and has a separate user-private commitment domain from live retirement. A live
-selector or registration must use the original owner-held path and makes the
-restart reconciler fail closed. Abort and successful comparison are mutually
-exclusive, and abort prevents owner restart. Normal local resume checks exact
-abort absence before Store mutation while owning that same lifecycle, so resume
-and released-abort cannot both win. Neither reconciler has a production caller.
-Cleanup before owner admission remains a prerequisite for the controller.
+The inactive canary stop path is deleted. `#289` removed the one-shot
+encrypted-Control abort terminal whose two loci distinguished already-resumed
+capture retirement from a stop after provider release but before local resume,
+along with both `Prepared -> Aborted` transitions, the read-only Store preflights
+they depended on, and the private cancellation-owned restart reconciler. Neither
+reconciler ever had a production caller. The `archive_v3_advisory_aborts` table
+and its `locus` column migration deliberately remain, because dropping a table
+without its migration in the same commit bricks every replica on startup; the
+migration still runs on every control-DB open, and the table is permanently
+empty because no writer survives outside tests. The four existence checks in
+`abort_pre_owner` — the surviving abort path, which handles failure before any
+owner exists — are the only live readers of it.
 
 `src/archive_v3_witness.rs` additionally defines a compiled,
 in-memory-only content-free witness contract. Non-test bootstrap/advance builders first
@@ -970,9 +936,11 @@ success, mismatch is rejection, and absent/unavailable remains outcome-unknown. 
 post-marker failure remains outcome-unknown rather than reviving an absence claim.
 Recovery must fetch only the
 exact witness-nominated object/hash and must never use prefix/list discovery. No image may
-acknowledge a write from archive-v3 until ADR-0022
-Phase 1 shadow recovery, VFS crash/conformance, witness, fault, lifecycle, and capacity
-gates have passed and an explicit authority change is reviewed.
+acknowledge a write from archive-v3 until the ADR-0022
+shadow-recovery, VFS crash/conformance, witness, fault, lifecycle, and capacity
+gates have passed and an explicit authority change is reviewed. (These gates were
+scoped as Phase-1 prerequisites; Phase 1 no longer exists as a rollout stage, but the
+gates themselves still bind and are not satisfied.)
 
 The journal foundation uses independently authenticated, page-aligned checkpoint chunks
 and a persistent fixed-fanout encrypted manifest tree; neither the manifest root nor any
@@ -984,7 +952,7 @@ per-commit topology; the root fixes the exact descriptor tail, WAL generation, a
 counts. Chain validation rejects frame gaps, checksum discontinuity, wrong predecessors,
 root-sequence substitution, locally valid orphan candidates, and a commit marker anywhere but
 the final frame. These checks do not turn post-commit WAL-file scraping into a valid capture
-mechanism. The compiled inactive SQLite VFS shim observes the exact `xSync` boundary, but Phase 1
+mechanism. The compiled inactive SQLite VFS shim observes the exact `xSync` boundary, but archive-v3
 authority still requires reviewed runtime integration plus independent crash and conformance gates.
 
 `src/archive_v3_genesis.rs` is a separately compiled but inactive restart-safe
@@ -1441,9 +1409,13 @@ that parity evidence for its lifetime. There is no external caller, Store factor
 startup/config/route/health call, acknowledgement surface, provider list/delete, or deployment
 path. Neither component can serve the archive, acknowledge a domain result, delete objects, or
 create a second runtime. Production Store constructors remain `LegacySnapshot` and the test-only
-`WalLogicalOnly` gate remains unchanged. Activation still requires the separately reviewed live
-domain/provider adapters, advisory shadow integration, release evidence, and explicit canary/cloud
-authorization listed in `docs/adr/0022-activation-readiness.md`.
+`WalLogicalOnly` gate remains unchanged. Activation still requires separately reviewed live
+domain/provider adapters, release evidence, and explicit cloud authorization. Advisory shadow
+integration is no longer among the prerequisites — it was deleted rather than deferred — and
+`docs/adr/0022-activation-readiness.md` is a superseded historical record, not a live blocker
+list. Mutation admission is now the reviewed-plan seal plus the `WalOperationKind` enum alone:
+deleting the Phase-2 admission removed the compile-pinned `full_reviewed_mutation_set_commitment`,
+so adding an ordinal no longer requires an offline re-signing ceremony.
 
 Root objects are explicitly named as candidates. Crashes and CAS races may leave more
 than one immutable candidate for a sequence; none has authority unless the independent

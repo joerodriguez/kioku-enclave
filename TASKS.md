@@ -542,26 +542,56 @@ separate activation blockers.
     signed security/advisory-drill evidence, and an operator-authorized canary/
     cloud change. Enabled-domain/provider adapters, authority ownership, Store/
     acknowledgement wiring, and mutation-lifecycle drills remain separate
-    Phase-2 blockers.
+    Phase-2 blockers. _(That document is now a superseded historical record: every
+    boundary it reviews was deleted in `#288`/`#289`, and none of its blockers is
+    a live prerequisite.)_
   - [x] Record the final production decision package in
     `docs/adr/0022-production-activation-runbook.md`. It separates the one-
     archive, empty-mutation, legacy-authoritative Phase-1 canary from the later
     plan-allowlisted Phase-2 tmpfs-eligible authority and the Phase-3/4/5 work
     required for an all-user rollout; fixes the exact evidence, execution order,
     rollback/no-go rules, and authority handoff; and performs no activation or
-    external mutation.
-  - [ ] Supply and independently verify the real three-root trust configuration,
-    exact release image/profile, fresh window and zero-serving observation,
-    canary scope and tmpfs eligibility, security and Phase-1 advisory-drill
-    receipts, deployed monitoring/rollback policies, deployment compatibility,
-    and explicit
-    operator/cloud authorization before Phase 1.
-  - [ ] After successful Phase-1 evidence, separately review and authorize the
-    exact Phase-2 plan allowlist, provider adapters, durable runtime/Store/
-    acknowledgement integration, mutation-lifecycle drills, sticky eligible-
-    archive cohorts, thresholds, and rollback. Phase-1 approval cannot satisfy
-    this item; large-archive and production-wide all-user expansion additionally
-    require the Phase-3/4 extent and Phase-5 scale decisions.
+    external mutation. _(Superseded: both authorization boundaries were deleted
+    rather than performed, so its prerequisite table no longer describes the
+    tree. All five ADR-0022 activation documents now carry supersession banners.)_
+  - [x] **Deleted the advisory-owner/Phase-2 family instead of finishing it**
+    (`#288`/`61ae996`, `#289`/`9b2f87e`; ~24k net lines). The genesis-first
+    replan drops retention of existing archive data, so there is nothing to
+    migrate, no advisory canary to observe a migration, and no Phase-2
+    authority to acquire afterwards. Removed: the 13-module advisory-owner
+    family, the Store's advisory capture/retirement/abort surface, the
+    control-plane advisory owner/canary/controller/Phase-2 code, the
+    maintenance importer's advisory-shadow target arm, the shadow-runtime
+    advisory views, the VFS advisory drain, the Firestore-shadow advisory
+    witness impl, the `--run-archive-v3-phase1-canary` argv entry, and the
+    eight phase1/phase2 signer/provision scripts. With the Phase-2 admission
+    went `full_reviewed_mutation_set_commitment`, the compile-pinned gate that
+    had forced an offline re-signing ceremony for every new `WalOperationKind`
+    ordinal — which is what let `#290` add `SchemaEpochAdvance = 13` freely.
+    Deliberately kept: all advisory DDL plus `migrate_advisory_abort_locus`
+    (schema removal is its own atomic PR, since dropping a table without its
+    migration bricks every replica on startup), the compilation keepers
+    `ensure_advisory_release_absent` and `release_advisory_lease_unresolved`,
+    the witness's advisory-terminal predicates, `Phase2AcquisitionStage::from_db`
+    (old rows must decode; the minting `as_db` went), and the `shadow_capture`
+    field. The 1,605-line advisory existence pin became a 28-line severance pin.
+    **The two open activation items that stood here — supplying the real
+    three-root trust configuration for Phase 1, and reviewing the Phase-2 plan
+    allowlist afterwards — are void**, along with the Phase-3/4/5 all-user
+    rollout ladder they fed. Phase 1 and Phase 2 no longer exist as rollout
+    stages. (ADR-0022 "Phase 3" as an *extent/shadow paging architecture* is a
+    different, still-live concept; see the Phase 3 section below.)
+  - [ ] Design and review a genesis-first activation plan against the surviving
+    WAL owner, genesis bootstrap, and schema-epoch ladder. The five ADR-0022
+    activation documents are superseded historical records and cannot be
+    amended into one; their data-safety core (fail closed, one reviewed change
+    at a time) and the archive-bucket/WIF/registry-KMS/named-witness resource
+    shapes remain valid inputs.
+  > _The completed items from here to the end of this section record the
+  > advisory-owner/Phase-2 boundary as it was built. **All of it was deleted in
+  > `#288`/`#289`** (see the deletion entry above). They are retained as build
+  > history; none of them describes code in the tree._
+
   - [x] Add the first inactive Phase-1 live-owner boundary without reusing
     WalAuthoritative state. A separate encrypted-Control row binds the exact
     `ParityVerified` operation and released ShadowWal witness to one random
@@ -737,14 +767,20 @@ separate activation blockers.
     Roots must be nonzero and pairwise distinct; checked-in production anchors
     deliberately remain invalid and no signing key, environment/config
     override, live observer/attestation adapter, or caller exists.
-  - [ ] Populate separately controlled operator, image-attestation, and
+  - [x] ~~Populate separately controlled operator, image-attestation, and
     deployment-observer public roots; review live Confidential Space claim/
     nonce and fresh deployment-state adapters; prove the launcher holds the
     maintenance window and zero-serving condition across import and owner
     admission; and deploy the exact monitoring and rollback policies whose
-    commitments are signed. Acknowledgement,
-    launcher/startup/route/config, cloud, deployment, and serving authority
-    remain next.
+    commitments are signed.~~ **Void** — the three-root verifier and everything
+    that consumed those roots was deleted in `#289`. The checked-in anchors
+    were always deliberately invalid and no live attestation or
+    deployment-observer adapter ever existed. The open question this item
+    carried is worth restating for any future design: a post-import proof
+    cannot retrospectively show the importer ran inside its window, so a
+    launcher would have had to hold a freshly authenticated window and
+    zero-serving condition across import, handoff, and owner admission without
+    trusting the process clock.
 
 This gate does not activate WAL persistence or change any user-visible runtime behavior.
 
@@ -826,18 +862,23 @@ repository, construct the runtime at startup, or enable any user-visible behavio
   and whole provider bundle without exposing raw getters. Each non-cloneable handoff value is
   consumed once; terminal restart may remint it, so durable globally unique owner acquisition is
   deferred to the inactive WAL worker slice.
-- [x] Split the Phase-1 terminal from the later authority transition. A distinct
+- [x] ~~Split the Phase-1 terminal from the later authority transition. A distinct
   advisory importer stops only after the exact `ParityVerified` ShadowWal row,
   releases only that same-fence maintenance lease with lost-response exact reread,
   freshly revalidates the pinned legacy generation, scrubs DB/WAL/SHM, and drops
-  every Store admission guard. Its non-cloneable handoff has no Store fence,
-  acknowledgement/serving/capture surface, or WalAuthoritative conversion; the
-  existing R2 importer remains a separate type path and is deliberately fenced
-  after advisory lease release pending a reviewed Phase-2 authority acquisition.
+  every Store admission guard.~~ **Deleted in `#289`** along with the
+  `MaintenanceImportTarget::AdvisoryShadow` variant; the enum now has the single
+  variant `WalAuthoritative`. The surviving R2 door is closed rather than merely
+  fenced: `run()`'s two `ensure_advisory_release_absent` gates can no longer fail
+  (nothing writes that table outside tests), and the acquisition-gated
+  `run_phase2` door still compiles but has no caller and demands a
+  `phase2_acquired` row that nothing can mint — `Phase2AcquisitionStage` kept
+  `from_db` and lost `as_db`.
 - [x] Added pre-owner durable abort and cleanup: reconciles GCS provider marker deletion
   to fresh NotFound, durably transitions Control import stage to ManualRequired under exclusive
   user lifecycle lock asserting absence of any advisory owner or release row, and safely unblocks
-  local legacy Store gates without installing capture or opening DB handles.
+  local legacy Store gates without installing capture or opening DB handles. This path survives
+  `#289`; its four existence checks now read permanently empty tables.
 - [x] Kept the result offline and non-serving. The importer is obtainable only by
   consuming the sealed image-bound runtime and a non-cloneable encrypted-control plan;
   there is no main/startup/Store constructor call, route, worker, environment/config

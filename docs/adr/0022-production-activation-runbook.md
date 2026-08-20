@@ -1,5 +1,26 @@
 # ADR-0022 production activation runbook
 
+> **SUPERSEDED (2026-08-20) — historical record, do not execute.** This runbook's two
+> authorization boundaries — the Phase-1 advisory canary and the Phase-2 plan-allowlisted
+> authority acquisition — were deleted rather than performed. Under the genesis-first
+> replan, existing archive data is not retained, so there is nothing to migrate and no
+> canary to observe it: `#288` (`61ae996`) severed the advisory-owner entry point and
+> `#289` (`9b2f87e`) deleted the advisory-owner family, the Phase-2 admission (including
+> `full_reviewed_mutation_set_commitment` and the offline signing ceremony), the
+> `--run-archive-v3-phase1-canary` argv entry, and the eight phase1/phase2
+> signer/provision scripts. Dropping that compile-pinned commitment is what let `#290`
+> (`6c66842`) add `WalOperationKind::SchemaEpochAdvance = 13` without re-signing.
+>
+> Consequently **the "Prerequisite status" table below is wrong**: it reports merged
+> protocol prerequisites that no longer exist in the tree, and the evidence rows, three-root
+> ceremony, and no-go signals describe machinery that has been removed. Its NO-GO verdict
+> still stands in the only sense that matters — this document authorizes nothing — but a
+> genesis-first activation needs a new runbook written against the surviving WAL owner,
+> genesis bootstrap, and schema-epoch-ladder code, not an amendment to this one. The
+> data-safety principles retained in
+> [`0022-solo-operator-activation.md`](0022-solo-operator-activation.md) (back up before
+> mutating, fail closed, one reviewed change at a time) remain the operator's intent.
+
 Status: **NO-GO** pending the remaining stops below; the operational ceremony in this
 document is rescoped for the current single-operator/single-user deployment by the accepted
 amendment [`0022-solo-operator-activation.md`](0022-solo-operator-activation.md), which retains

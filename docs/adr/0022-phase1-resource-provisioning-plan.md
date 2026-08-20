@@ -1,5 +1,25 @@
 # ADR-0022 Phase-1 resource provisioning plan
 
+> **SUPERSEDED (2026-08-20) — historical record, not executable as written.** The
+> genesis-first replan deleted the Phase-1 advisory canary this plan provisions for:
+> `#288` (`61ae996`) and `#289` (`9b2f87e`) removed the advisory-owner family, the Phase-2
+> admission, and the eight phase1/phase2 signer/provision scripts. **The companion emitter
+> named below, `scripts/phase1_provision_archive_resources.py`, and its contract test are
+> among the deleted files**, so the numbered `gcloud` transcript, the `--emit-shell` C4
+> gate, and the `--plan-digest` signed-approval artifact can no longer be produced from
+> this repository, and the `REQUIRED_DECISION_*` approval ceremony no longer has a tool
+> that enforces it.
+>
+> The *resource shapes* below are not obsolete in the same way: the archive-GCS,
+> archive-witness Firestore, and registry-KMS boundaries they describe survive in
+> `src/archive_v3_gcs_auth.rs`, `src/archive_v3_firestore_auth.rs`,
+> `src/archive_v3_firestore_witness.rs`, and `src/archive_v3_registry_kms.rs`, and a
+> genesis-first archive still needs a bucket, a named non-`(default)` witness database, a
+> pinned KMS version, and image-digest-pinned WIF providers. Read this document as an
+> input to a future provisioning plan, not as one — any successor must re-derive the
+> least-privilege grants against the surviving code and must not assume the Phase-1
+> canary, its window/zero-serving observation, or its three-root approval exist.
+
 Status: **PROPOSED — awaiting operator C4 approval. This document grants no permission and
 claims no decision.** It exists to close one hard stop recorded in
 [`0022-production-activation-runbook.md`](0022-production-activation-runbook.md): "this checkout

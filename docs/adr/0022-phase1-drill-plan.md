@@ -1,5 +1,18 @@
 # ADR-0022 Phase-1 drill plan
 
+> **SUPERSEDED (2026-08-20) — historical record, do not execute.** These drills exercise
+> the Phase-1 advisory canary, which no longer exists: `#288` (`61ae996`) severed the
+> advisory-owner entry point and `#289` (`9b2f87e`) deleted the advisory-owner family, the
+> Phase-2 admission, the `--run-archive-v3-phase1-canary` argv entry, and the eight
+> phase1/phase2 signer/provision scripts, as the genesis-first replan calls for. **The
+> executable semantics this plan cites as its specification are gone with it** — the
+> `run_real_sqlite_import_stops_advisory_reopens_and_fences_authority` family,
+> `compare_captured_prefix`, `execute_canary_admission`, `reconcile_advisory_capture_retired`,
+> and `resume_advisory_local_admission` are all deleted, so every drill below references
+> code that cannot be run. Under genesis-first there is no advisory canary to drill: a
+> new archive is created from genesis rather than migrated from a legacy snapshot.
+> Retained for decision history only.
+
 Status: proposed plan awaiting operator decisions; grants no permission to deploy,
 mutate cloud resources, or change serving behavior. Companion to
 [`0022-production-activation-runbook.md`](0022-production-activation-runbook.md)

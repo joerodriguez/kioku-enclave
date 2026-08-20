@@ -1,5 +1,19 @@
 # ADR-0022 activation-readiness review
 
+> **SUPERSEDED (2026-08-20) — historical record, do not execute.** The genesis-first
+> replan drops retention of existing archive data, so the advisory-canary/Phase-2 route
+> to authority this review certified was deleted rather than finished: `#288` (`61ae996`)
+> severed the advisory-owner entry point and `#289` (`9b2f87e`) deleted the whole
+> advisory-owner family, the Phase-2 admission (including
+> `full_reviewed_mutation_set_commitment` and its offline signing ceremony), the
+> `--run-archive-v3-phase1-canary` argv entry, and the eight phase1/phase2
+> signer/provision scripts. Removing that compile-pinned mutation-set commitment is what
+> allowed `#290` (`6c66842`) to add `WalOperationKind::SchemaEpochAdvance = 13` without an
+> offline re-signing ceremony. **Every boundary this document reviews below is gone from
+> the tree**, and none of its blockers is a live prerequisite. It is retained for the
+> decision history only; the current path to authority is genesis-first archive creation
+> plus the schema-epoch ladder, not migration of an existing archive.
+
 Status: inactive Phase-1 protocol-boundary review complete; production activation is neither
 authorized nor ready to perform. The exact operational decision and rollout gates are recorded in
 [`0022-production-activation-runbook.md`](0022-production-activation-runbook.md).
