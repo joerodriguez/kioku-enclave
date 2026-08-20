@@ -8844,6 +8844,62 @@ fn open_db(
     Ok((conn, registration, migrated))
 }
 
+/// The three facts a fresh archive-v3 genesis must publish alongside its
+/// first checkpoint.
+///
+/// The WAL owner authenticates the database it later opens by exact file
+/// length, `user_version`, and plaintext SHA-256, so genesis cannot simply
+/// hand over bytes — it must commit to these measurements at creation time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GenesisStoreFacts {
+    pub(crate) logical_file_length: u64,
+    pub(crate) plaintext_sha256: [u8; 32],
+    pub(crate) user_version: u32,
+}
+
+/// Materialize the empty, schema-current SQLite database that a freshly
+/// created archive publishes as its first checkpoint.
+///
+/// Migration got its base database from the user's legacy snapshot; a
+/// genesis archive has no such source, and an archive root with a zero-length
+/// database can never be recovered (`validate_snapshot_length` rejects it).
+/// So the empty database is built here, fully checkpointed, and measured.
+///
+/// The checkpoint and sidecar checks are load-bearing rather than tidiness: a
+/// residual `-wal`/`-shm` pair would leave committed pages outside the file
+/// that gets measured, so the length and hash published here would disagree
+/// with the bytes the owner authenticates on open, and the archive would be
+/// unopenable from birth.
+#[allow(
+    dead_code,
+    reason = "reserved for the reviewed genesis composition; no production caller exists yet"
+)]
+pub(crate) fn initialize_genesis_store(path: &Path) -> Result<GenesisStoreFacts> {
+    init_vec_extension();
+    let conn = Connection::open(path)?;
+    conn.execute_batch(SCHEMA_SQL)?;
+    run_migrations(&conn)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    let user_version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    // Fold every committed page back into the main file before it is measured.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    drop(conn);
+    ensure_no_sqlite_sidecars(path)?;
+    validate_checkpointed_sqlite_file(path)?;
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() {
+        return Err(EnclaveError::Store("genesis database is empty".into()));
+    }
+    let logical_file_length = u64::try_from(bytes.len())
+        .map_err(|_| EnclaveError::Store("genesis database is too large".into()))?;
+    let plaintext_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok(GenesisStoreFacts {
+        logical_file_length,
+        plaintext_sha256,
+        user_version,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn initialize_wal_owner_store_for_test(path: &Path) -> Result<u32> {
     init_vec_extension();
@@ -13474,6 +13530,51 @@ pub(crate) mod tests {
         assert!(stale_path.exists());
         assert!(!sqlite_sidecar_path(&stale_path, "-wal").exists());
         assert!(!sqlite_sidecar_path(&stale_path, "-shm").exists());
+    }
+
+    #[test]
+    fn genesis_store_is_checkpointed_sidecar_free_and_self_describing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.db");
+        let facts = initialize_genesis_store(&path).unwrap();
+
+        // The published facts must describe the bytes on disk exactly: the WAL
+        // owner authenticates a database by length, user_version and plaintext
+        // SHA-256, so a genesis archive whose facts disagree is unopenable
+        // from birth.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(facts.logical_file_length, bytes.len() as u64);
+        assert_eq!(
+            facts.plaintext_sha256,
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        );
+        assert!(facts.logical_file_length > 0);
+
+        // No residual -wal/-shm: committed pages left outside the measured
+        // file are exactly how the length and hash would drift.
+        assert!(ensure_no_sqlite_sidecars(&path).is_ok());
+        assert!(validate_checkpointed_sqlite_file(&path).is_ok());
+
+        // Schema-current: the same version the legacy path produces, so a
+        // genesis archive is not born already needing a migration.
+        let legacy = dir.path().join("legacy.db");
+        let expected_version = initialize_wal_owner_store_for_test(&legacy).unwrap();
+        assert_eq!(facts.user_version, expected_version);
+
+        // The product schema really is present, not an empty file.
+        let conn = Connection::open(&path).unwrap();
+        let episodes: i64 = conn
+            .query_row("SELECT count(*) FROM episodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(episodes, 0);
+
+        // Deterministic: two genesis databases agree on length and version.
+        // (The byte hash may legitimately differ if SQLite embeds any
+        // nondeterminism; assert the contract we actually depend on.)
+        let second = dir.path().join("genesis2.db");
+        let again = initialize_genesis_store(&second).unwrap();
+        assert_eq!(again.user_version, facts.user_version);
+        assert_eq!(again.logical_file_length, facts.logical_file_length);
     }
 
     #[tokio::test]
