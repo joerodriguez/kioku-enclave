@@ -1001,7 +1001,7 @@ CREATE TABLE IF NOT EXISTS archive_v3_wal_publications (
     owner_instance_id BLOB NOT NULL CHECK (length(owner_instance_id)=16 AND owner_instance_id!=zeroblob(16)),
     operation_id BLOB NOT NULL CHECK (length(operation_id)=16 AND operation_id!=zeroblob(16)),
     request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint)=32 AND request_fingerprint!=zeroblob(32)),
-    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 12),
+    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 64),
     expected_witness BLOB NOT NULL CHECK (length(expected_witness)=724),
     expected_binding_commitment BLOB NOT NULL CHECK (length(expected_binding_commitment)=32 AND expected_binding_commitment!=zeroblob(32)),
     session_id BLOB NOT NULL UNIQUE CHECK (length(session_id)=16 AND session_id!=zeroblob(16)),
@@ -1056,7 +1056,7 @@ CREATE TABLE IF NOT EXISTS archive_v3_wal_publications (
 );
 CREATE TABLE IF NOT EXISTS archive_v3_wal_publication_attempts (
     archive_id BLOB NOT NULL,
-    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 12),
+    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 64),
     operation_id BLOB NOT NULL,
     attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND 16),
     attempt_id BLOB NOT NULL UNIQUE CHECK (length(attempt_id)=16 AND attempt_id!=zeroblob(16)),
@@ -1069,7 +1069,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS archive_v3_wal_one_active_attempt
 ON archive_v3_wal_publication_attempts(archive_id) WHERE state='active';
 CREATE TABLE IF NOT EXISTS archive_v3_wal_publication_artifacts (
     archive_id BLOB NOT NULL,
-    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 12),
+    operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 64),
     operation_id BLOB NOT NULL,
     attempt INTEGER NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal>=0 AND ordinal<18),
@@ -1585,6 +1585,74 @@ fn migrate_apple_credentials_schema(conn: &Connection) -> Result<usize> {
         migrations += 1;
     }
     Ok(migrations)
+}
+
+/// Widen the `operation_kind` CHECK on the three WAL idempotency tables from
+/// `BETWEEN 1 AND 12` to `BETWEEN 1 AND 64`.
+///
+/// `SCHEMA` is applied with `CREATE TABLE IF NOT EXISTS`, so an existing
+/// database keeps whatever CHECK text it was created with -- without this, a
+/// control store minted before `WalOperationKind::SchemaEpochAdvance = 13`
+/// would reject every kind-13 row at insert while a fresh database accepts
+/// it. Widened once with headroom so future ordinals never rebuild these
+/// tables again; the CHECK exists to reject garbage kinds, and
+/// `WalOperationKind::decode` remains the authoritative validator.
+///
+/// SQLite cannot alter a CHECK in place, so each stale table is rebuilt with
+/// the rename-and-recreate pattern (`migrate_apple_credentials_schema` is the
+/// precedent). The new DDL is extracted from `SCHEMA` itself rather than
+/// duplicated here, so the rebuilt table cannot drift from what a fresh
+/// database gets. `archive_v3_wal_one_active_attempt` is recreated explicitly
+/// because the rename drags the index to the legacy table and the drop takes
+/// it along -- and `SCHEMA` has already run for this load.
+fn migrate_wal_operation_kind_bound(conn: &Connection) -> Result<usize> {
+    let mut migrations = 0;
+    for table in [
+        "archive_v3_wal_publications",
+        "archive_v3_wal_publication_attempts",
+        "archive_v3_wal_publication_artifacts",
+    ] {
+        let stale: bool = conn.query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type = 'table' AND name = ?1
+                       AND sql LIKE '%operation_kind INTEGER NOT NULL CHECK (operation_kind BETWEEN 1 AND 12)%'
+                 )",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !stale {
+            continue;
+        }
+        let create = schema_create_table_statement(table)?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} RENAME TO {table}_pre_kind_widening;
+             {create}
+             INSERT INTO {table} SELECT * FROM {table}_pre_kind_widening;
+             DROP TABLE {table}_pre_kind_widening;"
+        ))?;
+        migrations += 1;
+    }
+    if migrations > 0 {
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS archive_v3_wal_one_active_attempt
+             ON archive_v3_wal_publication_attempts(archive_id) WHERE state='active';",
+        )?;
+    }
+    Ok(migrations)
+}
+
+/// The exact `CREATE TABLE IF NOT EXISTS {name} (...);` statement from
+/// `SCHEMA`, so a rebuild executes the identical text a fresh database gets.
+fn schema_create_table_statement(name: &str) -> Result<String> {
+    let marker = format!("CREATE TABLE IF NOT EXISTS {name} (");
+    let start = SCHEMA
+        .find(&marker)
+        .ok_or_else(|| EnclaveError::Store("schema table statement missing".into()))?;
+    let end = SCHEMA[start..]
+        .find("\n);")
+        .ok_or_else(|| EnclaveError::Store("schema table statement unterminated".into()))?;
+    Ok(SCHEMA[start..start + end + 4].to_string())
 }
 
 fn migrate_advisory_abort_locus(conn: &Connection) -> Result<usize> {
@@ -16942,6 +17010,7 @@ impl ControlStore {
         conn.execute_batch(SCHEMA)?;
         let mut schema_migrations = migrate_apple_credentials_schema(&conn)?;
         schema_migrations += migrate_advisory_abort_locus(&conn)?;
+        schema_migrations += migrate_wal_operation_kind_bound(&conn)?;
         for column in [
             "ALTER TABLE usage_daily ADD COLUMN vertex_requests INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE usage_daily ADD COLUMN vertex_output_tokens INTEGER NOT NULL DEFAULT 0",
@@ -24203,6 +24272,90 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         assert!(!is_active_user_conn(&conn, "missing").unwrap());
+    }
+
+    #[test]
+    fn operation_kind_widening_migrates_stale_checks_and_preserves_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A database minted before ordinal 13: identical DDL except the old
+        // CHECK bound, derived from the live SCHEMA so the only difference
+        // under test is the bound itself.
+        let old = SCHEMA.replace(
+            "CHECK (operation_kind BETWEEN 1 AND 64)",
+            "CHECK (operation_kind BETWEEN 1 AND 12)",
+        );
+        assert_ne!(old, SCHEMA, "SCHEMA no longer carries the widened bound");
+        conn.execute_batch(&old).unwrap();
+        // Parent-row wiring is not what is under test; the bound is.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+
+        // The stale bound genuinely rejects the new ordinal...
+        let insert_attempt = "INSERT INTO archive_v3_wal_publication_attempts
+             (archive_id, operation_kind, operation_id, attempt, attempt_id,
+              owner_instance_id, state)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, 'witnessed')";
+        let refused = conn
+            .execute(
+                insert_attempt,
+                rusqlite::params![[1u8; 16], 13i64, [2u8; 16], [3u8; 16], [4u8; 16]],
+            )
+            .unwrap_err();
+        assert!(refused.to_string().contains("CHECK"));
+        // ...and a surviving row exists to prove the rebuild copies data.
+        conn.execute(
+            insert_attempt,
+            rusqlite::params![[1u8; 16], 12i64, [2u8; 16], [3u8; 16], [4u8; 16]],
+        )
+        .unwrap();
+
+        assert_eq!(migrate_wal_operation_kind_bound(&conn).unwrap(), 3);
+        // Idempotent: a second run finds nothing stale.
+        assert_eq!(migrate_wal_operation_kind_bound(&conn).unwrap(), 0);
+
+        // The pre-migration row survived the rebuild.
+        let kept: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM archive_v3_wal_publication_attempts
+                 WHERE operation_kind = 12",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        // Ordinal 13 now inserts; garbage past the headroom still refuses.
+        conn.execute(
+            insert_attempt,
+            rusqlite::params![[9u8; 16], 13i64, [8u8; 16], [7u8; 16], [6u8; 16]],
+        )
+        .unwrap();
+        let garbage = conn
+            .execute(
+                insert_attempt,
+                rusqlite::params![[9u8; 16], 65i64, [5u8; 16], [4u8; 16], [3u8; 16]],
+            )
+            .unwrap_err();
+        assert!(garbage.to_string().contains("CHECK"));
+        // The partial unique index the rename dragged away is back.
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'archive_v3_wal_one_active_attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        // A fresh database needs no migration and accepts 13 directly.
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(SCHEMA).unwrap();
+        fresh.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        assert_eq!(migrate_wal_operation_kind_bound(&fresh).unwrap(), 0);
+        fresh
+            .execute(
+                insert_attempt,
+                rusqlite::params![[1u8; 16], 13i64, [2u8; 16], [3u8; 16], [4u8; 16]],
+            )
+            .unwrap();
     }
 
     #[test]
