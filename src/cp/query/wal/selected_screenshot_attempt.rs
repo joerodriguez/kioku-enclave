@@ -3,7 +3,8 @@
     reason = "inactive ADR-0022 selected-screenshot attempt is reviewed before provider or launcher ownership"
 )]
 
-//! Inactive pre-provider identity for one selected-screenshot upload attempt.
+//! Pre-provider identity for one selected-screenshot upload attempt (wired
+//! to the selected upload route by ADR-0022 slice 10g).
 //!
 //! The caller fixes a nonzero opaque attempt ID before actor admission. This
 //! child reauthenticates the complete eligible screenshot target and atomically

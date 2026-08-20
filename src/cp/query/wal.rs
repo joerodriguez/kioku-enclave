@@ -3,14 +3,17 @@
     reason = "inactive ADR-0022 query codecs are reviewed before provider, launcher, or route ownership"
 )]
 
-//! Inactive query-owned logical WAL domains.
+//! Query-owned logical WAL domains.
 //!
 //! The parent owns the selected-screenshot receipt and consumes its private
 //! child's permanent pre-provider attempt binding. A second private child
 //! verifies and retains the exact context-bound ciphertext candidate for that
 //! attempt without send authority. A third private child durably marks the
 //! exact candidate `SendStarted` and derives its stable request identity while
-//! owning no provider. A fourth private child exposes only an injected exact
+//! owning no provider. Slice 10g wires exactly that pre-provider chain
+//! (attempt, candidate, `SendStarted`) to the selected-screenshot route for
+//! WAL-authoritative users; the route stops fail-closed after the marker. A
+//! fourth private child exposes only an injected exact
 //! create/readback seam and mints sealed success or definitive-no-object proof;
 //! it has no concrete transport or caller. The sole production A contract
 //! consumes that exact success proof and atomically retains a complete typed
@@ -28,8 +31,12 @@ mod selected_screenshot_termination;
 mod selected_screenshot_upload;
 pub(in crate::cp::query) use finalization_queue::FinalizationQueuePredecessor;
 pub(crate) use finalization_queue::{FinalizationQueueLedger, FinalizationQueuePlan};
+pub(in crate::cp::query) use selected_screenshot_attempt::{
+    authenticate_selected_screenshot_upload_predecessor, SelectedScreenshotAttemptTarget,
+};
 pub(crate) use selected_screenshot_attempt::{
     SelectedScreenshotAttemptLedger, SelectedScreenshotAttemptPlan,
+    SelectedScreenshotAttemptReceipt,
 };
 pub(crate) use selected_screenshot_send::{
     SelectedScreenshotSendStartedLedger, SelectedScreenshotSendStartedPlan,
@@ -91,6 +98,92 @@ pub(in crate::cp::query) fn prepare_selected_screenshot_send_started(
         account_id,
         image_id,
         plaintext_dek,
+    )
+}
+
+/// Routed-read loader for the account's sealed media-DEK install receipt. The
+/// receipt is reconstructed only from the install ledger's own stored
+/// commitments and is returned only after the media-DEK domain reauthenticates
+/// the complete durable row against the installed wrapped value. Absent
+/// schema or an absent row is `None`; a mismatched or tampered row fails
+/// closed.
+pub(in crate::cp::query) fn load_authenticated_media_dek_install_receipt(
+    connection: &Connection,
+    account_id: &str,
+) -> Result<Option<crate::cp::media::wal::MediaDekInstallReceipt>> {
+    crate::store::validate_user_id(account_id).map_err(|_| WalIdempotencyError::Malformed)?;
+    let table_present = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type='table' AND name='archive_v3_wal_media_dek_install_operations'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    if table_present == 0 {
+        return Ok(None);
+    }
+    let commitments = connection
+        .query_row(
+            "SELECT wrapped_dek_commitment,binding_commitment
+             FROM archive_v3_wal_media_dek_install_operations WHERE account_id=?1",
+            [account_id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|_| WalIdempotencyError::Unavailable)?;
+    let Some((wrapped_dek_commitment, binding_commitment)) = commitments else {
+        return Ok(None);
+    };
+    let receipt = crate::cp::media::wal::MediaDekInstallReceipt::from_stored_commitments(
+        wrapped_dek_commitment
+            .as_slice()
+            .try_into()
+            .map_err(|_| WalIdempotencyError::Corrupt)?,
+        binding_commitment
+            .as_slice()
+            .try_into()
+            .map_err(|_| WalIdempotencyError::Corrupt)?,
+    )?;
+    crate::cp::media::wal::authenticate_media_dek_install_receipt(
+        connection, account_id, &receipt,
+    )?;
+    Ok(Some(receipt))
+}
+
+/// WAL-owned pre-candidate factory. The parent supplies the exact attempt
+/// receipt, the borrowed KMS-authenticated DEK, the validated plaintext, and
+/// the exact context-bound ciphertext; the media-DEK install receipt is
+/// loaded and reauthenticated here so the parent can never substitute
+/// commitments. The parent receives only the opaque plan.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::cp::query) fn prepare_selected_screenshot_upload_candidate(
+    connection: &Connection,
+    account_id: &str,
+    attempt: &SelectedScreenshotAttemptReceipt,
+    episode_id: i64,
+    source_key: &str,
+    captured_at: &str,
+    jpeg: &ValidatedJpeg,
+    plaintext_dek: &crate::crypto::Dek,
+    plaintext_jpeg: &[u8],
+    ciphertext: Vec<u8>,
+) -> Result<SelectedScreenshotUploadCandidatePlan> {
+    let media_dek_receipt = load_authenticated_media_dek_install_receipt(connection, account_id)?
+        .ok_or(WalIdempotencyError::Precondition)?;
+    selected_screenshot_upload::SelectedScreenshotUploadCandidatePlan::new(
+        account_id.to_owned(),
+        attempt.image_id().to_owned(),
+        attempt.object_key().to_owned(),
+        attempt.binding_commitment(),
+        episode_id,
+        source_key.to_owned(),
+        captured_at.to_owned(),
+        jpeg.clone(),
+        media_dek_receipt,
+        plaintext_dek,
+        plaintext_jpeg,
+        ciphertext,
     )
 }
 

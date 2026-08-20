@@ -3,7 +3,9 @@
     reason = "inactive ADR-0022 selected-screenshot ciphertext candidate is reviewed before send or launcher ownership"
 )]
 
-//! Inactive ciphertext-candidate boundary for one selected-screenshot attempt.
+//! Ciphertext-candidate boundary for one selected-screenshot attempt (wired
+//! to the selected upload route by ADR-0022 slice 10g via the WAL-owned
+//! factory in the parent).
 //!
 //! A future producer supplies already validated JPEG bytes, the exact
 //! context-bound ciphertext, the borrowed media DEK, and the typed receipts
@@ -1783,5 +1785,123 @@ mod tests {
             LedgerSchemaState::Present
         );
         assert_eq!(load_ledger_state(&late.connection).unwrap(), (0, 0, 0));
+    }
+
+    #[test]
+    fn wal_owned_candidate_factory_requires_the_authenticated_install_row() {
+        // ADR-0022 slice 10g regression: the parent-facing factory must load
+        // the media-DEK install receipt from the durable install ledger and
+        // fail closed when the ledger is absent or its row is tampered; the
+        // parent can never substitute commitments of its own.
+        let mut connection = connection();
+        let dek = Dek([7; 32]);
+        let plaintext = plaintext();
+        let jpeg = jpeg(&plaintext);
+        let target = authenticate_selected_screenshot_upload_predecessor(
+            &connection,
+            ACCOUNT,
+            7,
+            SOURCE_KEY,
+            CAPTURED_AT,
+            &jpeg,
+        )
+        .unwrap();
+        let attempt_plan = SelectedScreenshotAttemptPlan::new(
+            ACCOUNT.to_owned(),
+            IMAGE_ID.to_owned(),
+            7,
+            SOURCE_KEY.to_owned(),
+            CAPTURED_AT.to_owned(),
+            jpeg.clone(),
+            target,
+        )
+        .unwrap();
+        let attempt_receipt = execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(attempt_plan).unwrap(),
+        )
+        .unwrap()
+        .into_validated_result()
+        .release()
+        .unwrap();
+        let ciphertext = crate::crypto::encrypt_bound_blob(
+            &dek,
+            &plaintext,
+            &crate::store::media_blob_context(ACCOUNT, attempt_receipt.object_key()),
+        )
+        .unwrap();
+
+        // No sealed install exists yet: the factory refuses before any plan.
+        let missing_install = crate::cp::query::wal::prepare_selected_screenshot_upload_candidate(
+            &connection,
+            ACCOUNT,
+            &attempt_receipt,
+            7,
+            SOURCE_KEY,
+            CAPTURED_AT,
+            &jpeg,
+            &dek,
+            &plaintext,
+            ciphertext.clone(),
+        );
+        match missing_install {
+            Ok(_) => panic!("factory unexpectedly succeeded without a sealed install"),
+            Err(error) => assert_eq!(error, WalIdempotencyError::Precondition),
+        }
+
+        let wrapped = BASE64_STANDARD.encode([9; 64]);
+        let media_plan =
+            MediaDekInstallPlan::new_for_cross_domain_test(ACCOUNT.to_owned(), wrapped, &dek)
+                .unwrap();
+        execute_prepared_for_owner(
+            &mut connection,
+            PreparedLogicalMutation::prepare(media_plan).unwrap(),
+        )
+        .unwrap();
+
+        // With the sealed install durable, the factory returns an applicable
+        // opaque candidate plan.
+        let factory_plan = crate::cp::query::wal::prepare_selected_screenshot_upload_candidate(
+            &connection,
+            ACCOUNT,
+            &attempt_receipt,
+            7,
+            SOURCE_KEY,
+            CAPTURED_AT,
+            &jpeg,
+            &dek,
+            &plaintext,
+            ciphertext.clone(),
+        )
+        .unwrap();
+        let applied = execute(&mut connection, factory_plan).unwrap();
+        assert_eq!(applied.disposition(), LogicalMutationDisposition::Applied);
+
+        // Tampering with the durable install row's binding commitment must
+        // fail the factory's own ledger reauthentication closed (the stored
+        // fingerprint no longer covers the row), before candidate
+        // construction can even inspect the DEK.
+        connection
+            .execute(
+                "UPDATE archive_v3_wal_media_dek_install_operations SET binding_commitment=?1",
+                [vec![0x5a; 32]],
+            )
+            .unwrap();
+        let tampered = crate::cp::query::wal::prepare_selected_screenshot_upload_candidate(
+            &connection,
+            ACCOUNT,
+            &attempt_receipt,
+            7,
+            SOURCE_KEY,
+            CAPTURED_AT,
+            &jpeg,
+            &dek,
+            &plaintext,
+            ciphertext,
+        );
+        match tampered {
+            Ok(_) => panic!("factory unexpectedly accepted a tampered install row"),
+            Err(error) => assert_eq!(error, WalIdempotencyError::FingerprintConflict),
+        }
     }
 }

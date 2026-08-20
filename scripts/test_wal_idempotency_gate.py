@@ -56,7 +56,15 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # settle_screen_storyboard_result: terminal-attempt/predecessor/id-base read
 # + bound-result submit); rebased over the 10d finalization wiring, so the
 # combined pin covers both.
-EXPECTED_STORE_CALL_COUNT = 219
+# Slice 10g (selected-screenshot pre-provider chain): the upload route gains
+# its WAL branch owner wal_selected_screenshot_image_upload with exactly six
+# routed sites (preflight read + attempt submit, candidate-factory read +
+# submit, send-start read + submit), all B under the new owner. The legacy
+# rest_screenshot_image_upload owner only re-hashes for the added routing
+# branch; every legacy call expression, ordinal, and classification is
+# byte-identical (diffed against pristine origin/main after 10e/10f:
+# 219 -> 225, zero reclassifications, zero removals).
+EXPECTED_STORE_CALL_COUNT = 227
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -67,7 +75,7 @@ EXPECTED_STORE_CALL_COUNT = 219
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "7e857793193cabcc8aa0376784d45dc6e1335bf04ddfa3fcea311bb352fe2f23"
+EXPECTED_STORE_CALL_SHA256 = "ba95e4879f13a9c04cdd7a7e80eeee111eef5b18b69f32ba1ea3406c3529de08"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -186,7 +194,11 @@ EXPECTED_WORKER_SPAWN_COUNT = 25
 # and every spawn's own call-site hash is byte-identical.
 # Phase-2 deletion PR 1: async_main owner body only; the spawn count holds
 # at 33 and every spawn call-site hash is byte-identical.
-EXPECTED_WORKER_SPAWN_SHA256 = "5bdf138c1148ab8c39ea0942b8797b7a53d0fef7999ab77f57e9f71b587f1eb1"
+# Slice 10g: rest_screenshot_image_upload's owner body moved (the WAL routing
+# branch above its legacy GCS-put spawn). The spawn count holds at 25 and
+# every spawn's own call-site hash is byte-identical (diffed against
+# pristine origin/main: zero additions, zero removals).
+EXPECTED_WORKER_SPAWN_SHA256 = "6e33e545562ff5cbb9a7e2fff34d7aa7e643849f6dabeaa02bddc736746c5050"
 RAW_STRING_START = re.compile(r"(?:br|r)(#{0,255})\"")
 
 
@@ -804,6 +816,7 @@ B_OWNERS = frozenset(
         "src/cp/model_usage.rs::note_delivery_failure#0",
         "src/cp/model_usage.rs::drain_outbox#0",
         "src/cp/query.rs::rest_delete_webhook#0",
+        "src/cp/query.rs::wal_selected_screenshot_image_upload#0",
         "src/cp/summarizer.rs::summarize_user_window#0",
         "src/cp/summarizer.rs::wal_authoritative_upsert#0",
         "src/cp/summarizer.rs::embed_episodes#0",
@@ -1513,7 +1526,14 @@ impl X {
         self.assertIn(
             "WalIdempotencyError::Precondition", selected_attempt_domain
         )
-        self.assertNotIn("SelectedScreenshotAttemptPlan::", query)
+        # ADR-0022 slice 10g: the pre-provider attempt is WIRED - the route
+        # derives the predecessor through the routed read and constructs the
+        # sealed attempt plan exactly once, durable BEFORE any encryption;
+        # the legacy branch stays byte-identical.
+        self.assertEqual(query.count("SelectedScreenshotAttemptPlan::new("), 1)
+        self.assertIn(
+            "authenticate_selected_screenshot_upload_predecessor(", query
+        )
         self.assertIn("mod selected_screenshot_upload;", selected_domain)
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotUploadCandidatePlan",
@@ -1562,6 +1582,21 @@ impl X {
             selected_upload_production,
         )
         self.assertIn("SELECT length(ciphertext),length(result_bytes)", selected_upload_domain)
+        # ADR-0022 slice 10g: the ciphertext candidate is WIRED through the
+        # WAL-owned factory only - the route calls the factory exactly once
+        # and never names the plan type or the ciphertext-bearing loader, so
+        # pre-marker ciphertext stays confined to the WAL family.
+        self.assertEqual(
+            query.count("prepare_selected_screenshot_upload_candidate("), 1
+        )
+        self.assertIn(
+            "fn prepare_selected_screenshot_upload_candidate(",
+            selected_production,
+        )
+        self.assertIn(
+            "fn load_authenticated_media_dek_install_receipt(",
+            selected_production,
+        )
         self.assertNotIn("SelectedScreenshotUploadCandidatePlan::", query)
         self.assertNotIn(
             "load_authenticated_selected_screenshot_upload_candidate(", query
@@ -1609,6 +1644,15 @@ impl X {
         )
         self.assertIn("MAX_ROWS: u32 = 1_048_576", selected_send_domain)
         self.assertIn("DomainLedgerBounds::new", selected_send_domain)
+        # ADR-0022 slice 10g: the send-start marker is WIRED through the
+        # WAL-owned factory only - two sites: the resume probe (a settled
+        # candidate must resume WITHOUT re-encrypting) and the fresh-chain
+        # marker step. The route still cannot name the plan type or the
+        # ciphertext-bearing marker loader, which stays WAL-private for the
+        # provider child.
+        self.assertEqual(
+            query.count("prepare_selected_screenshot_send_started("), 2
+        )
         self.assertNotIn("SelectedScreenshotSendStartedPlan::", query)
         self.assertNotIn(
             "load_authenticated_selected_screenshot_send_started(", query
@@ -1617,7 +1661,6 @@ impl X {
             "fn load_authenticated_selected_screenshot_send_started(",
             selected_production,
         )
-        self.assertNotIn("prepare_selected_screenshot_send_started(", query)
         self.assertIn("mod selected_screenshot_provider;", selected_domain)
         self.assertIn(
             "trait SelectedScreenshotExactCreateProvider",
@@ -1667,6 +1710,13 @@ impl X {
             "load_authenticated_selected_screenshot_send_started",
             selected_provider_domain,
         )
+        # ADR-0022 slice 10g stops fail-closed after the durable send-start
+        # marker: the provider execution claim mutates inside its own
+        # immediate transaction and has no routed admission lane for a
+        # selected user (the submit lane accepts only sealed logical plans;
+        # the serving read lane is query-only), so the provider link, the
+        # provider-accepted A settlement, and the C termination remain
+        # deliberately unwired and these dormancy pins stay in force.
         self.assertNotIn(
             "impl SelectedScreenshotExactCreateProvider for",
             selected_provider_production,
