@@ -7,7 +7,7 @@ pub(crate) mod wal;
 
 use std::{sync::Arc, time::Duration};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use tracing::warn;
 
 use super::{
@@ -412,11 +412,162 @@ fn to_i64(value: Option<u64>) -> Option<i64> {
     value.and_then(|value| i64::try_from(value).ok())
 }
 
+/// The shared timestamp shape for the settled branches: a clock hoisted out
+/// of every `apply()` (R7).
+fn settled_now_iso() -> String {
+    super::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    )
+}
+
+/// The WAL-authoritative half of `pending_events` (ADR-0022 F3): the scan and
+/// the safety partition run through the routed read with a hoisted cutoff;
+/// the plan is submitted only when the resolved sets are non-empty, exactly
+/// reproducing the clean-scan semantics.
+async fn pending_events_settled(
+    state: &CpState,
+    user_id: &str,
+    account_id: &str,
+) -> Result<(Vec<VertexUsageEvent>, bool)> {
+    let committed_at = settled_now_iso();
+    let cutoff = super::isotime::format_epoch_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+            - 180_000,
+    );
+    let period = committed_at[..7].to_string();
+    let account = account_id.to_string();
+    let probe_period = period.clone();
+    let probe_cutoff = cutoff.clone();
+    let (events, stale, predecessor_lost) = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let stale = {
+                let mut statement = conn.prepare(
+                    "SELECT event_id,observed_at FROM vertex_usage_events
+                     WHERE outcome='started' AND observed_at <= ?1
+                     ORDER BY event_id LIMIT ?2",
+                )?;
+                let rows = statement
+                    .query_map(
+                        rusqlite::params![probe_cutoff, OUTBOX_BATCH as i64],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let events = load_pending_usage_events(conn, &account)?;
+            let predecessor_lost: i64 = conn
+                .query_row(
+                    "SELECT lost_events FROM vertex_usage_coverage WHERE period=?1",
+                    [&probe_period],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            Ok((events, stale, predecessor_lost))
+        })
+        .await?;
+    let (deliverable, poison): (Vec<_>, Vec<_>) =
+        events.into_iter().partition(usage_event_models_are_safe);
+    if stale.is_empty() && poison.is_empty() {
+        return Ok((deliverable, false));
+    }
+    let mut stale_intents = stale
+        .into_iter()
+        .map(|(event_id, observed_at)| {
+            wal::StaleIntent::new(event_id, observed_at)
+                .map_err(|_| EnclaveError::Store("vertex reconcile construction failed".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    stale_intents.sort_by(|a, b| a.event_id_for_order().cmp(b.event_id_for_order()));
+    let mut poison_intents = poison
+        .iter()
+        .map(|event| {
+            wal::PoisonIntent::new(
+                event.event_id.clone(),
+                event.outcome.clone(),
+                "pending".into(),
+            )
+            .map_err(|_| EnclaveError::Store("vertex reconcile construction failed".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    poison_intents.sort_by(|a, b| a.event_id_for_order().cmp(b.event_id_for_order()));
+    let plan = wal::VertexIntentReconcilePlan::new(
+        user_id.to_owned(),
+        stale_intents,
+        poison_intents,
+        period,
+        predecessor_lost,
+        committed_at,
+    )
+    .map_err(|_| EnclaveError::Store("vertex reconcile construction failed".into()))?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| EnclaveError::Store("vertex reconcile construction failed".into()))?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await?;
+    Ok((deliverable, true))
+}
+
+/// The exact legacy pending scan's row mapper, shared by both populations.
+fn load_pending_usage_events(
+    conn: &rusqlite::Connection,
+    account: &str,
+) -> std::result::Result<Vec<VertexUsageEvent>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT event_id,operation,requested_model,returned_model,location,
+                traffic_type,outcome,http_status,prompt_tokens,input_text_tokens,input_audio_tokens,input_image_tokens,
+                cached_input_tokens,cached_input_text_tokens,cached_input_audio_tokens,cached_input_image_tokens,
+                output_text_tokens,thought_tokens,total_tokens,observed_at
+         FROM vertex_usage_events
+         WHERE delivery_state='pending' AND outcome!='started'
+         ORDER BY observed_at,event_id LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([OUTBOX_BATCH as i64], |row| {
+            Ok(VertexUsageEvent {
+                account_id: account.to_owned(),
+                event_id: row.get(0)?,
+                operation: row.get(1)?,
+                requested_model: row.get(2)?,
+                returned_model: row.get(3)?,
+                location: row.get(4)?,
+                traffic_type: row.get(5)?,
+                outcome: row.get(6)?,
+                http_status: row.get::<_, Option<u16>>(7)?,
+                prompt_tokens: row.get::<_, Option<i64>>(8)?.and_then(nonnegative_u64),
+                input_text_tokens: row.get::<_, Option<i64>>(9)?.and_then(nonnegative_u64),
+                input_audio_tokens: row.get::<_, Option<i64>>(10)?.and_then(nonnegative_u64),
+                input_image_tokens: row.get::<_, Option<i64>>(11)?.and_then(nonnegative_u64),
+                cached_input_tokens: row.get::<_, Option<i64>>(12)?.and_then(nonnegative_u64),
+                cached_input_text_tokens: row.get::<_, Option<i64>>(13)?.and_then(nonnegative_u64),
+                cached_input_audio_tokens: row.get::<_, Option<i64>>(14)?.and_then(nonnegative_u64),
+                cached_input_image_tokens: row.get::<_, Option<i64>>(15)?.and_then(nonnegative_u64),
+                output_text_tokens: row.get::<_, Option<i64>>(16)?.and_then(nonnegative_u64),
+                thought_tokens: row.get::<_, Option<i64>>(17)?.and_then(nonnegative_u64),
+                total_tokens: row.get::<_, Option<i64>>(18)?.and_then(nonnegative_u64),
+                observed_at: row.get(19)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 async fn pending_events(
     state: &CpState,
     user_id: &str,
     account_id: &str,
 ) -> Result<(Vec<VertexUsageEvent>, bool)> {
+    if state.store.is_wal_authoritative(user_id) {
+        return pending_events_settled(state, user_id, account_id).await;
+    }
     let user = user_id.to_string();
     let account = account_id.to_string();
     state
@@ -539,7 +690,71 @@ fn nonnegative_u64(value: i64) -> Option<u64> {
     u64::try_from(value).ok()
 }
 
+/// Routed read of the delivery predecessors for one enumerated id set,
+/// ordered by event id as the plan requires.
+async fn read_delivery_predecessors(
+    state: &CpState,
+    user_id: &str,
+    event_ids: &[String],
+) -> Result<Vec<wal::DeliveryEventPredecessor>> {
+    let mut ids = event_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let mut predecessors = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let (attempts, updated): (i64, String) = conn.query_row(
+                    "SELECT delivery_attempt_count,updated_at
+                     FROM vertex_usage_events WHERE event_id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                predecessors.push(
+                    wal::DeliveryEventPredecessor::new(id.clone(), attempts, updated).map_err(
+                        |_| {
+                            crate::error::EnclaveError::Store(
+                                "vertex delivery predecessor construction failed".into(),
+                            )
+                        },
+                    )?,
+                );
+            }
+            Ok(predecessors)
+        })
+        .await
+}
+
+async fn settle_delivery(
+    state: &CpState,
+    user_id: &str,
+    outcome: wal::DeliveryOutcome,
+    event_ids: &[String],
+) -> Result<()> {
+    if event_ids.is_empty() {
+        return Ok(());
+    }
+    let predecessors = read_delivery_predecessors(state, user_id, event_ids).await?;
+    let plan = wal::VertexUsageDeliveryPlan::new(
+        user_id.to_owned(),
+        outcome,
+        predecessors,
+        settled_now_iso(),
+    )
+    .map_err(|_| EnclaveError::Store("vertex delivery plan construction failed".into()))?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| EnclaveError::Store("vertex delivery plan construction failed".into()))?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+}
+
 async fn complete_delivery(state: &CpState, user_id: &str, event_ids: &[String]) -> Result<()> {
+    if state.store.is_wal_authoritative(user_id) {
+        return settle_delivery(state, user_id, wal::DeliveryOutcome::Delivered, event_ids).await;
+    }
     let user = user_id.to_string();
     let ids = event_ids.to_vec();
     state
@@ -562,11 +777,158 @@ async fn complete_delivery(state: &CpState, user_id: &str, event_ids: &[String])
     state.store.save_user(&user).await
 }
 
+/// Routed read of one coverage row's predecessor tuple.
+async fn read_coverage_predecessor(
+    state: &CpState,
+    user_id: &str,
+    period: &str,
+) -> Result<Option<wal::CoveragePredecessor>> {
+    let probe = period.to_string();
+    state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            conn.query_row(
+                "SELECT sequence,pending_events,lost_events
+                 FROM vertex_usage_coverage WHERE period=?1",
+                [&probe],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(sequence, pending, lost)| {
+                wal::CoveragePredecessor::new(probe.clone(), sequence, pending, lost).map_err(
+                    |_| {
+                        crate::error::EnclaveError::Store(
+                            "coverage predecessor construction failed".into(),
+                        )
+                    },
+                )
+            })
+            .transpose()
+        })
+        .await
+}
+
+async fn settle_coverage(
+    state: &CpState,
+    user_id: &str,
+    transition: wal::CoverageTransition,
+) -> Result<()> {
+    let plan =
+        wal::VertexCoverageLedgerPlan::new(user_id.to_owned(), transition, settled_now_iso())
+            .map_err(|_| EnclaveError::Store("vertex coverage plan construction failed".into()))?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| EnclaveError::Store("vertex coverage plan construction failed".into()))?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+}
+
+/// The WAL-authoritative half of `pending_coverage` (ADR-0022 F5 rollover):
+/// the prior-period enumeration runs through the routed read (R6), the
+/// rollover settles only when something is actually stale or missing, and
+/// the snapshot list is then re-read from settled state.
+async fn pending_coverage_settled(
+    state: &CpState,
+    user_id: &str,
+    account_id: &str,
+) -> Result<(Vec<VertexCoverageSnapshot>, bool)> {
+    let committed_at = settled_now_iso();
+    let current_period = committed_at[..7].to_string();
+    let account = account_id.to_string();
+    let probe_period = current_period.clone();
+    let (prior_pending, current_exists) = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT period,sequence,pending_events,lost_events
+                 FROM vertex_usage_coverage
+                 WHERE delivery_state='pending' AND period < ?1
+                 ORDER BY period LIMIT 128",
+            )?;
+            let priors = statement
+                .query_map([&probe_period], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let current: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM vertex_usage_coverage WHERE period=?1",
+                [&probe_period],
+                |row| row.get(0),
+            )?;
+            Ok((priors, current == 1))
+        })
+        .await?;
+    let dirty = !prior_pending.is_empty() || !current_exists;
+    if dirty {
+        let priors = prior_pending
+            .into_iter()
+            .map(|(period, sequence, pending, lost)| {
+                wal::CoveragePredecessor::new(period, sequence, pending, lost).map_err(|_| {
+                    EnclaveError::Store("coverage predecessor construction failed".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        settle_coverage(
+            state,
+            user_id,
+            wal::CoverageTransition::Rollover {
+                current_period: current_period.clone(),
+                prior_pending: priors,
+            },
+        )
+        .await?;
+    }
+    let probe_period = current_period.clone();
+    let snapshots = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT period,sequence,pending_events,lost_events,updated_at
+                 FROM vertex_usage_coverage
+                 WHERE delivery_state='pending' AND period=?1
+                 ORDER BY period LIMIT 12",
+            )?;
+            let rows = statement
+                .query_map([&probe_period], |row| {
+                    let sequence = checked_sql_u64(row.get(1)?, 1)?;
+                    let pending_events = checked_sql_u64(row.get(2)?, 2)?;
+                    let lost_events = checked_sql_u64(row.get(3)?, 3)?;
+                    Ok(VertexCoverageSnapshot {
+                        account_id: account.clone(),
+                        period: row.get(0)?,
+                        sequence,
+                        pending_events,
+                        lost_events,
+                        observed_at: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    Ok((snapshots, dirty))
+}
+
 async fn pending_coverage(
     state: &CpState,
     user_id: &str,
     account_id: &str,
 ) -> Result<(Vec<VertexCoverageSnapshot>, bool)> {
+    if state.store.is_wal_authoritative(user_id) {
+        return pending_coverage_settled(state, user_id, account_id).await;
+    }
     let user = user_id.to_string();
     let account = account_id.to_string();
     state
@@ -620,6 +982,21 @@ async fn complete_coverage(
     period: &str,
     sequence: u64,
 ) -> Result<()> {
+    if state.store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_coverage_predecessor(state, user_id, period).await? else {
+            return Ok(());
+        };
+        if predecessor.sequence_for_caller() != i64::try_from(sequence).unwrap_or(-1) {
+            // The row moved past the delivered snapshot; nothing to complete.
+            return Ok(());
+        }
+        return settle_coverage(
+            state,
+            user_id,
+            wal::CoverageTransition::CompleteDelivered { predecessor },
+        )
+        .await;
+    }
     let user = user_id.to_string();
     let period = period.to_string();
     let sequence = i64::try_from(sequence)
@@ -643,6 +1020,30 @@ async fn persist_coverage_snapshot(
     user_id: &str,
     snapshot: &VertexCoverageSnapshot,
 ) -> Result<()> {
+    if state.store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_coverage_predecessor(state, user_id, &snapshot.period).await?
+        else {
+            return Ok(());
+        };
+        let sequence = i64::try_from(snapshot.sequence)
+            .map_err(|_| crate::error::EnclaveError::Config("coverage sequence overflow".into()))?;
+        let pending_events = i64::try_from(snapshot.pending_events)
+            .map_err(|_| crate::error::EnclaveError::Config("coverage pending overflow".into()))?;
+        let lost_events = i64::try_from(snapshot.lost_events)
+            .map_err(|_| crate::error::EnclaveError::Config("coverage lost overflow".into()))?;
+        return settle_coverage(
+            state,
+            user_id,
+            wal::CoverageTransition::PersistSnapshot {
+                predecessor,
+                sequence,
+                pending_events,
+                lost_events,
+                observed_at: snapshot.observed_at.clone(),
+            },
+        )
+        .await;
+    }
     let user = user_id.to_string();
     let period = snapshot.period.clone();
     let sequence = i64::try_from(snapshot.sequence)
@@ -674,6 +1075,20 @@ async fn invalidate_stale_coverage(
     period: &str,
     sequence: u64,
 ) -> Result<()> {
+    if state.store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_coverage_predecessor(state, user_id, period).await? else {
+            return Ok(());
+        };
+        if predecessor.sequence_for_caller() != i64::try_from(sequence).unwrap_or(-1) {
+            return Ok(());
+        }
+        return settle_coverage(
+            state,
+            user_id,
+            wal::CoverageTransition::InvalidateStale { predecessor },
+        )
+        .await;
+    }
     let user = user_id.to_string();
     let period = period.to_string();
     let sequence = i64::try_from(sequence)
@@ -878,6 +1293,18 @@ pub async fn settle_for_account_deletion(
 }
 
 async fn note_delivery_failure(state: &CpState, user_id: &str, event_ids: &[String]) {
+    if state.store.is_wal_authoritative(user_id) {
+        // Failure noting is best-effort in the legacy path too; a refused
+        // settle leaves the attempt counter alone and the next drain retries.
+        let _ = settle_delivery(
+            state,
+            user_id,
+            wal::DeliveryOutcome::AttemptFailed,
+            event_ids,
+        )
+        .await;
+        return;
+    }
     let user = user_id.to_string();
     let ids = event_ids.to_vec();
     if state

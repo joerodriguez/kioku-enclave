@@ -492,6 +492,12 @@ impl sealed::DomainPlan for crate::cp::media::wal::MediaDekInstallPlan {}
 impl sealed::DomainLedger for crate::cp::media::wal::MediaDekInstallLedger {}
 impl sealed::DomainPlan for crate::cp::media::wal::MediaReferenceBatchPlan {}
 impl sealed::DomainLedger for crate::cp::media::wal::MediaReferenceBatchLedger {}
+impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexIntentReconcilePlan {}
+impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexIntentReconcileLedger {}
+impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexCoverageLedgerPlan {}
+impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexCoverageLedgerLedger {}
+impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageDeliveryPlan {}
+impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexUsageDeliveryLedger {}
 impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexInvocationBeginPlan {}
 impl sealed::DomainLedger for crate::cp::model_usage::wal::VertexInvocationBeginLedger {}
 impl sealed::DomainPlan for crate::cp::model_usage::wal::VertexUsageOutcomePlan {}
