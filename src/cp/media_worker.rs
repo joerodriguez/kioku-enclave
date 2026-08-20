@@ -2436,6 +2436,86 @@ fn resurrect_failed_jobs(conn: &Connection, now: &str) -> Result<usize> {
 
 async fn resurrect_user_failed_jobs(state: &CpState, user_id: &str) {
     let now = now_iso();
+    if state.store.is_wal_authoritative(user_id) {
+        // The sealed F7 lane: enumerate the bounded eligible set through the
+        // routed read, then settle the resolved set as one plan (R6). The
+        // identity is the set's predecessor tuples; the sweep bounds and the
+        // commit stamp enter only the fingerprinted request. `apply()` re-runs
+        // the same query (shared fn, identical by construction) and refuses a
+        // stale enumeration.
+        let stale_before = isotime::add_seconds(&now, -RESURRECTION_DELAY_SECONDS);
+        let window_start = isotime::add_seconds(&now, -RESURRECTION_WINDOW_SECONDS);
+        let probe_stale = stale_before.clone();
+        let probe_window = window_start.clone();
+        let eligible = state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                Ok(wal::resurrection::enumerate_resurrectable(
+                    conn,
+                    PROCESSOR_VERSION,
+                    RESURRECTION_TOTAL_ATTEMPT_CAP,
+                    &probe_stale,
+                    &probe_window,
+                    RESURRECTION_MAX_PER_SWEEP,
+                )?)
+            })
+            .await;
+        let eligible = match eligible {
+            Ok(eligible) => eligible,
+            Err(error) => {
+                warn!(user_id, error = %error, "failed-job resurrection scan failed");
+                return;
+            }
+        };
+        if eligible.is_empty() {
+            return;
+        }
+        let count = eligible.len();
+        let prepared = eligible
+            .into_iter()
+            .map(|(job_id, event_id, attempt_count, updated_at)| {
+                wal::resurrection::ResurrectableJob::new(
+                    job_id,
+                    event_id,
+                    attempt_count,
+                    updated_at,
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .and_then(|jobs| {
+                wal::MediaJobResurrectionPlan::new(
+                    user_id.to_owned(),
+                    jobs,
+                    PROCESSOR_VERSION,
+                    RESURRECTION_TOTAL_ATTEMPT_CAP,
+                    RESURRECTION_MAX_PER_SWEEP,
+                    stale_before,
+                    window_start,
+                    now,
+                )
+            })
+            .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare);
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(
+                    user_id,
+                    error = ?error,
+                    "failed-job resurrection plan construction failed"
+                );
+                return;
+            }
+        };
+        match state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await
+        {
+            Ok(_) => info!(user_id, count, "resurrected terminally failed media jobs"),
+            Err(error) => warn!(user_id, error = %error, "failed-job resurrection failed"),
+        }
+        return;
+    }
     let resurrected = state
         .store
         .with_user(user_id, |conn| resurrect_failed_jobs(conn, &now))

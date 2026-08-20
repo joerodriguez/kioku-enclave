@@ -522,6 +522,8 @@ impl sealed::DomainPlan for crate::cp::summarizer::wal::EpisodeEmbeddingBatchPla
 impl sealed::DomainLedger for crate::cp::summarizer::wal::EpisodeEmbeddingBatchLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaWorkReservationPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaWorkReservationLedger {}
+impl sealed::DomainPlan for crate::cp::media_worker::wal::MediaJobResurrectionPlan {}
+impl sealed::DomainLedger for crate::cp::media_worker::wal::MediaJobResurrectionLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardResultPlan {}
 impl sealed::DomainLedger for crate::cp::media_worker::wal::ScreenStoryboardResultLedger {}
 impl sealed::DomainPlan for crate::cp::media_worker::wal::ScreenStoryboardAttemptPlan {}

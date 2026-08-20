@@ -19,9 +19,11 @@
 pub(super) mod attempt;
 pub(super) mod reservation;
 pub(super) mod result;
+pub(super) mod resurrection;
 pub(crate) use attempt::{ScreenStoryboardAttemptLedger, ScreenStoryboardAttemptPlan};
 pub(crate) use reservation::{MediaWorkReservationLedger, MediaWorkReservationPlan};
 pub(crate) use result::{ScreenStoryboardResultLedger, ScreenStoryboardResultPlan};
+pub(crate) use resurrection::{MediaJobResurrectionLedger, MediaJobResurrectionPlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;
