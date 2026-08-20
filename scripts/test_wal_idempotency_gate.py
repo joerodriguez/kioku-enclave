@@ -50,7 +50,13 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # 184 -> 194 (ten routed sites under five new B owners plus the two
 # existing route owners), diffed against pristine main, zero
 # reclassifications; every legacy branch intact.
-EXPECTED_STORE_CALL_COUNT = 212
+# Plan-family slice 10e (screen storyboard): the screen arm's settled halves
+# add four routed sites under two new B owners
+# (settle_screen_storyboard_attempt: commitments read + attempt submit;
+# settle_screen_storyboard_result: terminal-attempt/predecessor/id-base read
+# + bound-result submit); rebased over the 10d finalization wiring, so the
+# combined pin covers both.
+EXPECTED_STORE_CALL_COUNT = 217
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -61,7 +67,7 @@ EXPECTED_STORE_CALL_COUNT = 212
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "61ea81de5afc003e9f0d577e7a3529fcc661725b9923dff9db0591f10d09ba09"
+EXPECTED_STORE_CALL_SHA256 = "ce1081120cc677d96d14f57679817833b743ac5e92c5911ab35c846454e33b4e"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -781,7 +787,10 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::process_user_voice_embedding_jobs#0",
         "src/cp/media_worker.rs::reserve_media_output#0",
         "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
+        "src/cp/media_worker.rs::settle_screen_storyboard_attempt#0",
+        "src/cp/media_worker.rs::settle_screen_storyboard_result#0",
         "src/cp/model_usage.rs::begin_invocation#0",
+        "src/cp/model_usage.rs::settle_response_required#0",
         "src/cp/model_usage.rs::begin_invocation_settled#0",
         "src/cp/model_usage.rs::pending_events_settled#0",
         "src/cp/model_usage.rs::read_delivery_predecessors#0",
@@ -1812,7 +1821,16 @@ impl X {
         self.assertIn("MAX_ROWS: u32 = 1_048_576", attempt_domain)
         self.assertIn("DomainLedgerBounds::new", attempt_domain)
         self.assertIn("WalIdempotencyError::Precondition", attempt_domain)
-        self.assertNotIn("ScreenStoryboardAttemptPlan::", media_worker)
+        # ADR-0022 slice 10e: the attempt boundary is WIRED - the screen arm
+        # settles the sealed plan after the settled reservation and BEFORE
+        # the Vertex storyboard egress, anchored on the routed commitments
+        # read; the receipt's derived event id pins the invocation identity
+        # the media egress carries instead of a second freshly minted intent.
+        self.assertIn("ScreenStoryboardAttemptPlan::new(", media_worker)
+        self.assertIn("settle_screen_storyboard_attempt", media_worker)
+        self.assertIn(
+            "current_screen_work_attempt_commitments", media_worker
+        )
         self.assertIn("struct ScreenStoryboardResultPlan", result_domain)
         self.assertIn("struct ScreenStoryboardResultLedger", result_domain)
         self.assertIn(
@@ -1833,7 +1851,20 @@ impl X {
         self.assertIn("MAX_ROWS: u32 = 1_048_576", result_domain)
         self.assertIn("DomainLedgerBounds::new", result_domain)
         self.assertIn("WalIdempotencyError::Precondition", result_domain)
-        self.assertNotIn("ScreenStoryboardResultPlan::", media_worker)
+        # ADR-0022 slice 10e: the bound result is WIRED - it consumes the
+        # attempt receipt's binding commitment against the routed terminal
+        # Vertex attempt and exact work predecessor, replacing the legacy
+        # storyboard persistence for WAL users; the legacy with_user branch
+        # keeps its exact write for unselected users.
+        self.assertIn("ScreenStoryboardResultPlan::new(", media_worker)
+        self.assertIn("settle_screen_storyboard_result", media_worker)
+        self.assertIn(
+            "current_screen_vertex_attempt_commitment", media_worker
+        )
+        self.assertIn(
+            "persist_storyboard_results(conn, &work.id, &work.jobs, results)",
+            media_worker,
+        )
         self.assertIn(
             "impl sealed::DomainPlan for crate::cp::media_worker::wal::RetentionSettlementPlan",
             gate,

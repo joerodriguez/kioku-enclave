@@ -223,6 +223,31 @@ async fn begin_invocation_settled(
     ))
 }
 
+/// ADR-0022: settle a terminal Response outcome as a REQUIRED operation for
+/// a WAL-authoritative user — errors propagate instead of being deferred.
+/// Idempotent on the event-id coordinate: a replay of an already-settled
+/// outcome resolves from the ledger. Callers whose next step hard-depends on
+/// the terminal row (the bound storyboard result) use this instead of the
+/// best-effort `record_response` side effect.
+pub(crate) async fn settle_response_required(
+    state: &CpState,
+    user_id: &str,
+    event_id: &str,
+    metadata: &VertexMetadata,
+) -> Result<()> {
+    let prepared = wal::VertexUsageOutcomePlan::response(event_id.to_owned(), metadata)
+        .and_then(crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare)
+        .map_err(|_| {
+            crate::error::EnclaveError::Store(
+                "vertex usage outcome plan construction failed".into(),
+            )
+        })?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+}
+
 pub async fn record_response(
     state: &CpState,
     user_id: &str,

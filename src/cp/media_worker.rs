@@ -248,8 +248,12 @@ fn screen_schema() -> Value {
         "type":"OBJECT",
         "properties": {
             "literal_description":{"type":"STRING"},
-            "screen_state":{"type":"STRING"},
-            "content_type":{"type":"STRING"},
+            "screen_state":{"type":"STRING","enum":[
+                "content","blank","loading","error","transition",
+                "locked_or_private","unknown"]},
+            "content_type":{"type":"STRING","enum":[
+                "document","presentation","web_page","code","terminal","chat",
+                "meeting","media","system_ui","application_ui","unknown"]},
             "visible_text":{"type":"STRING"},
             "salient_text":{"type":"STRING"},
             "people": {
@@ -2300,6 +2304,171 @@ fn assemble_audio_window(
     ))
 }
 
+/// ADR-0022 slice 10e: settle the sealed screen-storyboard attempt boundary
+/// for a WAL-authoritative user. The routed read authenticates the complete
+/// reserved leased work topology at one caller-fixed attempt time and
+/// returns the exact predecessor and post-usage-stable attempt commitments;
+/// the sealed plan is then constructed ONCE (R5) and settled through the WAL
+/// lane AFTER the settled reservation and BEFORE any Vertex egress. The
+/// typed receipt carries the derived event id — the pinned invocation
+/// identity the usage settlements target — and the binding commitment the
+/// bound result plan later consumes. Same-attempt crash retries replay the
+/// exact receipt; a renewed lease/counter topology derives a new identity.
+async fn settle_screen_storyboard_attempt(
+    state: &CpState,
+    user_id: &str,
+    work: &MediaWorkUnit,
+) -> Result<wal::attempt::ScreenStoryboardAttemptReceipt> {
+    let attempted_at = now_iso();
+    let probe_work_id = work.id.clone();
+    let probe_attempted_at = attempted_at.clone();
+    let commitments = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            wal::result::current_screen_work_attempt_commitments(
+                conn,
+                &probe_work_id,
+                &probe_attempted_at,
+            )
+            .map_err(|_| {
+                EnclaveError::Store("screen storyboard attempt predecessor read failed".into())
+            })
+        })
+        .await?;
+    let plan = wal::ScreenStoryboardAttemptPlan::new(
+        user_id.to_owned(),
+        work.id.clone(),
+        commitments.predecessor(),
+        commitments.attempt(),
+        state.config.vertex_model.clone(),
+        state.config.vertex_location.clone(),
+        attempted_at,
+    )
+    .map_err(|_| {
+        EnclaveError::Store("screen storyboard attempt plan construction failed".into())
+    })?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| {
+            EnclaveError::Store("screen storyboard attempt plan construction failed".into())
+        })?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+}
+
+/// ADR-0022 slice 10e: settle the sealed bound screen-storyboard result for
+/// a WAL-authoritative user — it replaces `persist_storyboard_results` on
+/// this lane. Every fact the plan carries is read through the routed read
+/// (the terminal Vertex attempt commitment on the attempt's own event id,
+/// the exact work predecessor, and the base for the caller-fixed screenshot
+/// row ids) or computed pre-submit (the validated frame results in exact
+/// member order, one canonical commit time); the sealed plan is constructed
+/// ONCE (R5). The reviewed v2 subtype carries no person evidence, so
+/// screen-visible name projections are deliberately absent on this lane.
+/// The sealed result vocabulary is a hard whitelist; an off-list label from
+/// the model would discard a PAID call and loop fresh paid attempts to the
+/// cap. The schema now pins the enum at the provider request; this is the
+/// fail-safe for residual drift. Legacy persistence keeps the verbatim label.
+fn canonical_screen_state(value: &str) -> &str {
+    match value {
+        "content" | "blank" | "loading" | "error" | "transition" | "locked_or_private"
+        | "unknown" => value,
+        _ => "unknown",
+    }
+}
+
+fn canonical_content_type(value: &str) -> &str {
+    match value {
+        "document" | "presentation" | "web_page" | "code" | "terminal" | "chat" | "meeting"
+        | "media" | "system_ui" | "application_ui" | "unknown" => value,
+        _ => "unknown",
+    }
+}
+
+async fn settle_screen_storyboard_result(
+    state: &CpState,
+    user_id: &str,
+    work: &MediaWorkUnit,
+    receipt: &wal::attempt::ScreenStoryboardAttemptReceipt,
+    results: Vec<(String, ScreenResult)>,
+) -> Result<()> {
+    let requested_model = state.config.vertex_model.clone();
+    let probe_event_id = receipt.event_id().to_owned();
+    let probe_model = requested_model.clone();
+    let probe_work_id = work.id.clone();
+    let (vertex_attempt_commitment, predecessor_commitment, first_screenshot_id) = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let vertex_attempt_commitment = wal::result::current_screen_vertex_attempt_commitment(
+                conn,
+                &probe_event_id,
+                &probe_model,
+            )
+            .map_err(|_| {
+                EnclaveError::Store("screen storyboard terminal attempt read failed".into())
+            })?;
+            let predecessor_commitment =
+                wal::result::current_screen_work_predecessor_commitment(conn, &probe_work_id)
+                    .map_err(|_| {
+                        EnclaveError::Store("screen storyboard predecessor read failed".into())
+                    })?;
+            let max_screenshot_id: i64 =
+                conn.query_row("SELECT COALESCE(MAX(id),0) FROM screenshots", [], |row| {
+                    row.get(0)
+                })?;
+            Ok((
+                vertex_attempt_commitment,
+                predecessor_commitment,
+                max_screenshot_id.max(0).saturating_add(1),
+            ))
+        })
+        .await?;
+    let mut frames = Vec::with_capacity(results.len());
+    for (index, (event_id, result)) in results.into_iter().enumerate() {
+        let screenshot_id = i64::try_from(index)
+            .ok()
+            .and_then(|offset| first_screenshot_id.checked_add(offset))
+            .ok_or_else(|| {
+                EnclaveError::Store("screen storyboard result plan construction failed".into())
+            })?;
+        frames.push(
+            wal::result::ScreenStoryboardFrameResult::new(
+                event_id,
+                screenshot_id,
+                result.literal_description,
+                canonical_screen_state(&result.screen_state).to_owned(),
+                canonical_content_type(&result.content_type).to_owned(),
+                result.visible_text,
+                result.salient_text,
+            )
+            .map_err(|_| {
+                EnclaveError::Store("screen storyboard result plan construction failed".into())
+            })?,
+        );
+    }
+    let plan = wal::ScreenStoryboardResultPlan::new(
+        user_id.to_owned(),
+        receipt.event_id().to_owned(),
+        vertex_attempt_commitment,
+        receipt.binding_commitment(),
+        work.id.clone(),
+        predecessor_commitment,
+        requested_model,
+        now_iso(),
+        frames,
+    )
+    .map_err(|_| EnclaveError::Store("screen storyboard result plan construction failed".into()))?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| {
+            EnclaveError::Store("screen storyboard result plan construction failed".into())
+        })?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+}
+
 async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit) -> Result<()> {
     let mut media = Vec::with_capacity(work.jobs.len());
     for job in &work.jobs {
@@ -2353,6 +2522,16 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
             .await?;
     } else {
         reserve_media_output(state, user_id, work).await?;
+        // ADR-0022 slice 10e: for a WAL-authoritative user the sealed attempt
+        // boundary durably fixes the Vertex attempt identity and the exact
+        // `started` billing intent AFTER the settled reservation and BEFORE
+        // the storyboard request leaves; its receipt pins the invocation
+        // identity the usage settlements and the bound result plan consume.
+        let storyboard_attempt = if state.store.is_wal_authoritative(user_id) {
+            Some(settle_screen_storyboard_attempt(state, user_id, work).await?)
+        } else {
+            None
+        };
         let prompt = "Inspect every labeled screenshot literally and return exactly one result for every supplied frame_id. Never invent, omit, merge, or duplicate a frame ID. Transcribe useful visible text, produce a compact salient-text projection and literal description, and classify screen_state/content_type per frame. List a person only when a visible name label supports it, preferring the complete first and last name. Set is_active_speaker true only for the specific frame where the meeting UI visibly marks that exact label as currently speaking; otherwise false. Evidence must quote or describe the visible label/highlight; never infer identity from a face.";
         let inputs = work
             .jobs
@@ -2368,8 +2547,27 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
             &inputs,
             storyboard_schema(),
             vertex::MAX_SCREEN_OUTPUT_TOKENS,
+            storyboard_attempt
+                .as_ref()
+                .map(|receipt| receipt.event_id().to_owned()),
         )
         .await?;
+        if let Some(receipt) = storyboard_attempt.as_ref() {
+            // The bound result settle refuses without this attempt's terminal
+            // usage row, but record_response inside the generate path is
+            // best-effort: a transiently deferred settle would strand a PAID
+            // result (the reconcile sweep can only degrade the row to
+            // 'ambiguous', which the result guard also refuses). Re-drive it
+            // here as a required, idempotent settle — a replay when the
+            // best-effort write landed, the authoritative retry when not.
+            super::model_usage::settle_response_required(
+                state,
+                user_id,
+                receipt.event_id(),
+                &generation.metadata,
+            )
+            .await?;
+        }
         persist_actual_media_usage(state, user_id, work, &generation).await?;
         let expected = work
             .jobs
@@ -2377,6 +2575,13 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
             .map(|job| job.event_id.clone())
             .collect::<Vec<_>>();
         let results = validate_storyboard_result(&generation.text, &expected)?;
+        if let Some(receipt) = storyboard_attempt {
+            // The sealed bound result consumes the attempt's binding
+            // commitment and replaces the legacy storyboard persistence for
+            // WAL-authoritative users; `save_user` is a provider-silent no-op
+            // on this lane, so returning here matches the legacy tail.
+            return settle_screen_storyboard_result(state, user_id, work, &receipt, results).await;
+        }
         state
             .store
             .with_user(user_id, |conn| {
@@ -4924,6 +5129,113 @@ mod tests {
         // The identity anchor comes from the durable row, not a counter the
         // route invents.
         assert!(route.contains("attempt_count"));
+    }
+
+    #[test]
+    fn the_sealed_vocabulary_is_pinned_at_the_schema_and_normalized_at_the_seam() {
+        // The provider request constrains both classification fields to the
+        // sealed vocabulary...
+        let schema = screen_schema();
+        assert_eq!(
+            schema["properties"]["screen_state"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(
+            schema["properties"]["content_type"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
+            11
+        );
+        // ...and residual drift normalizes to "unknown" instead of
+        // discarding a paid call against the sealed whitelist.
+        assert_eq!(canonical_screen_state("content"), "content");
+        assert_eq!(canonical_screen_state("email"), "unknown");
+        assert_eq!(canonical_content_type("web_page"), "web_page");
+        assert_eq!(canonical_content_type("browser"), "unknown");
+    }
+
+    #[test]
+    fn screen_storyboard_route_is_exactly_dual_path() {
+        // ADR-0022 slice 10e: for a WAL-authoritative user the sealed attempt
+        // boundary settles after the settled reservation and before the
+        // Vertex storyboard egress, its receipt pins the invocation identity
+        // the egress carries, and the sealed bound result replaces the legacy
+        // storyboard persistence; each plan is constructed exactly once (R5)
+        // and the legacy with_user branches survive for unselected users.
+        let source = include_str!("media_worker.rs");
+        let start = source
+            .find(concat!("async fn settle_screen_storyboard_", "attempt"))
+            .unwrap();
+        let end = source
+            .find(concat!("fn resurrect_failed_", "jobs"))
+            .unwrap();
+        let route = &source[start..end];
+        assert_eq!(
+            route.matches(concat!("is_wal_", "authoritative(")).count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "read("))
+                .count(),
+            2
+        );
+        assert_eq!(
+            route
+                .matches(concat!("wal_authoritative_", "submit("))
+                .count(),
+            2
+        );
+        assert_eq!(
+            route
+                .matches(concat!("ScreenStoryboardAttemptPlan::", "new("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            route
+                .matches(concat!("ScreenStoryboardResultPlan::", "new("))
+                .count(),
+            1
+        );
+        // Both legacy persistence branches (audio result, storyboard result)
+        // survive byte-for-byte for unselected users.
+        assert_eq!(route.matches(concat!(".with_", "user(")).count(), 2);
+        assert_eq!(
+            route
+                .matches(concat!("persist_storyboard_", "results(conn"))
+                .count(),
+            1
+        );
+        // Order on the WAL lane: settled reservation, then the attempt
+        // boundary, then the pinned egress, then the bound result — and the
+        // surviving legacy persistence stays after all of them in the arm.
+        let reservation = route
+            .rfind(concat!("reserve_media_", "output(state"))
+            .unwrap();
+        let attempt = route
+            .find(concat!("Some(settle_screen_storyboard_", "attempt("))
+            .unwrap();
+        let egress = route
+            .find(concat!("generate_media_parts_", "custom("))
+            .unwrap();
+        let bound_result = route
+            .find(concat!("settle_screen_storyboard_", "result(state"))
+            .unwrap();
+        let legacy = route
+            .find(concat!("persist_storyboard_", "results(conn"))
+            .unwrap();
+        assert!(reservation < attempt);
+        assert!(attempt < egress);
+        assert!(egress < bound_result);
+        assert!(bound_result < legacy);
+        // The egress carries the attempt receipt's derived identity, never a
+        // second freshly minted intent for the same paid call.
+        assert!(route.contains(concat!("receipt.event_", "id().to_owned()")));
     }
 
     #[test]
