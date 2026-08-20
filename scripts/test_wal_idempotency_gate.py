@@ -920,6 +920,30 @@ impl X {
         self.assertEqual(set(DEPENDENCY_CLASS.values()), {"B"})
         self.assertTrue(set(DEPENDENCY_CLASS).issubset({site.owner.key for site in store_call_sites()}))
 
+    def test_chosen_archive_key_constructor_stays_test_only(self) -> None:
+        """`ArchiveDek::from_bytes` is the only chosen-key path; keep it test-only.
+
+        Genesis mints a first archive key with `ArchiveDek::generate`, which is
+        production-visible and draws from the system CSPRNG, so a caller cannot
+        influence the key material. That argument holds only while the
+        attacker-selected-bytes constructor remains unavailable outside tests --
+        promoting it would silently turn key injection from a reviewed code
+        change into an ordinary call.
+        """
+        source = (ROOT / "src/archive_v3.rs").read_text(encoding="utf-8")
+
+        def dek_impl(text: str) -> str:
+            # Several types in this file expose from_bytes([u8; 32]); scope the
+            # assertion to ArchiveDek's own impl block.
+            start = text.index("impl ArchiveDek {")
+            return text[start : text.index("\n}", start)]
+
+        self.assertIn("pub(crate) fn generate() -> Self", dek_impl(source))
+        # Match the signature, not the bare name: the generate() doc comment
+        # legitimately mentions from_bytes when explaining why it stays test-only.
+        self.assertIn("fn from_bytes", dek_impl(source))
+        self.assertNotIn("fn from_bytes", dek_impl(without_cfg_test_items(source)))
+
     def test_plan_family_subtypes_are_declared_and_pairwise_distinct(self) -> None:
         """Every plan family's operation-id subtype must be unique.
 
