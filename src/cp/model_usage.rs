@@ -15,7 +15,7 @@ use super::{
     vertex::{VertexMetadata, VertexOperation, VertexUsage},
     CpState,
 };
-use crate::error::Result;
+use crate::error::{EnclaveError, Result};
 
 const OUTBOX_BATCH: usize = 100;
 
@@ -79,7 +79,12 @@ pub async fn begin_invocation(
     user_id: &str,
     operation: VertexOperation,
     requested_model: &str,
+    caller_anchor: &[u8; 32],
 ) -> Result<String> {
+    if state.store.is_wal_authoritative(user_id) {
+        return begin_invocation_settled(state, user_id, operation, requested_model, caller_anchor)
+            .await;
+    }
     let event_id = format!("vtx_{}", super::tokens::random_token_hex());
     let user = user_id.to_string();
     let id = event_id.clone();
@@ -121,6 +126,101 @@ pub async fn begin_invocation(
         return Err(error);
     }
     Ok(event_id)
+}
+
+/// The WAL-authoritative half of `begin_invocation` (ADR-0022 F2).
+///
+/// Reads the lane sequence through the routed read, probes the previous slot
+/// for a dangling intent (exact derived id, `outcome='started'`), and adopts
+/// it rather than minting a second billed intent for the same logical
+/// request. Otherwise it settles `VertexInvocationBeginPlan` at the observed
+/// sequence. Witness settlement replaces the legacy `save_user` flush — the
+/// paid request still cannot leave before its content-free intent is durable
+/// — and the legacy compensating DELETE has no analogue: a failed settle
+/// means no intent and no call.
+async fn begin_invocation_settled(
+    state: &CpState,
+    user_id: &str,
+    operation: VertexOperation,
+    requested_model: &str,
+    caller_anchor: &[u8; 32],
+) -> Result<String> {
+    let model = requested_model.chars().take(256).collect::<String>();
+    let location = state
+        .config
+        .vertex_location
+        .chars()
+        .take(128)
+        .collect::<String>();
+    let commitment = wal::request_commitment(operation, &model, &location, caller_anchor)
+        .map_err(|_| EnclaveError::Store("vertex invocation identity derivation failed".into()))?;
+    let lane = wal::VertexInvocationLane::for_operation(operation);
+    // One re-read after a lost race; the lanes are single-threaded in
+    // production, so a second conflict means something is genuinely wrong.
+    for _ in 0..2 {
+        let probe_user = user_id.to_owned();
+        let (sequence, dangling) = state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                let sequence = wal::read_lane_sequence(conn, lane)?;
+                let dangling = if sequence > 0 {
+                    let candidate =
+                        wal::derive_event_id(&probe_user, lane, sequence - 1, &commitment)
+                            .map_err(|_| {
+                                crate::error::EnclaveError::Store(
+                                    "vertex invocation identity derivation failed".into(),
+                                )
+                            })?;
+                    let started: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM vertex_usage_events
+                         WHERE event_id=?1 AND outcome='started'",
+                        [&candidate],
+                        |row| row.get(0),
+                    )?;
+                    (started == 1).then_some(candidate)
+                } else {
+                    None
+                };
+                Ok((sequence, dangling))
+            })
+            .await?;
+        if let Some(event_id) = dangling {
+            // The previous slot holds OUR request's intent, still dangling:
+            // the settle succeeded and the ack was lost. Adopt it.
+            return Ok(event_id);
+        }
+        let plan = wal::VertexInvocationBeginPlan::new(
+            user_id.to_owned(),
+            operation,
+            sequence,
+            model.clone(),
+            location.clone(),
+            super::isotime::format_epoch_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+            ),
+            caller_anchor,
+        )
+        .map_err(|_| EnclaveError::Store("vertex invocation plan construction failed".into()))?;
+        let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+            .map_err(|_| {
+                EnclaveError::Store("vertex invocation plan construction failed".into())
+            })?;
+        match state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await
+        {
+            Ok(event_id) => return Ok(event_id),
+            Err(EnclaveError::Conflict(_)) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(EnclaveError::Conflict(
+        "vertex invocation lane sequence kept moving".into(),
+    ))
 }
 
 pub async fn record_response(

@@ -10,6 +10,12 @@
 //! dependency. This child has no Store, worker, launcher, provider, task,
 //! delivery, or acknowledgement authority.
 
+pub(super) mod invocation;
+pub(in crate::cp) use invocation::{
+    derive_event_id, read_lane_sequence, request_commitment, VertexInvocationLane,
+};
+pub(crate) use invocation::{VertexInvocationBeginLedger, VertexInvocationBeginPlan};
+
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;
 
