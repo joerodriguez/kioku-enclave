@@ -13,7 +13,16 @@
 //! no witness), build the canonical checkpoint-only `0/0/0` zero-WAL genesis
 //! root, seal it, durably prepare both byte payloads, and resolve genesis.
 //! Before `prepare_archive_bootstrap`, a crash orphans one checkpoint's objects and the retry mints a fresh DEK. After it, replay is byte-exact.
-//! Orphans are sweepable by the existing inventory/reachability family.
+//!
+//! Orphan accounting, honestly: staged-object rows are offered to the
+//! injected `ShadowObjectInventory` seam reserve-first, but NO durable
+//! production recorder accepts a genesis binding today — the ControlStore
+//! inventory is maintenance-operation-bound, and the reachability sweep
+//! starts only from witness-selected roots. A durable genesis staging
+//! inventory recorder is therefore a HARD PREREQUISITE for the G9
+//! production wiring; until it exists, pre-prepare crash orphans are
+//! unenumerable (they are also undecryptable — the crashed attempt's DEK
+//! dies with the process — so the exposure is storage residue, not data).
 //!
 //! G6 then runs the witness ladder (Variant B) on the freshly read witness:
 //! acquire the exact lease, advance Legacy → ShadowWal with a zero-WAL
@@ -631,61 +640,114 @@ pub(crate) async fn advance_genesis_ladder_once(
                 || !leased.authorizes_lease(lease)
                 || leased.root() != current.root()
             {
+                // The acquire landed on state this rung must not advance
+                // (including the stale-read race onto an already-released
+                // terminal): clear our own lease before failing, or it
+                // blocks WAL-owner acquisition for the full lease term.
+                release_abandoned_ladder_lease(authority, archive_id, owner_id).await;
                 return Err(WalGenesisError::Conflict);
             }
             (leased, lease)
         }
     };
 
-    // Same checkpoint: the candidate is built over the checkpoint nominated
-    // by the current witness root, recovered and re-authenticated — never
-    // over any retained in-memory upload from a prior attempt.
-    let cipher = resolve_ladder_cipher(authority, &leased).await?;
-    let checkpoint = recover_genesis_checkpoint(authority, &cipher, &leased).await?;
-    let binding = genesis_binding(&plan, wrapped_registry_hash)?;
-    let session_id = genesis_session_id(&plan)?;
-    let staging = ShadowObjectStaging::new(
-        authority.inventory,
-        session_id,
-        ShadowAttemptId::random(),
-        binding,
-    );
-    let advance = build_zero_wal_candidate(
-        authority.objects,
-        &cipher,
-        &leased,
-        lease,
-        &checkpoint,
-        &staging,
-    )
-    .await
-    .map_err(map_root_advance)?;
-    let candidate = leased
-        .exact_migration_candidate(&advance, next)
-        .map_err(map_witness)?;
-    let outcome = authority
-        .witness_advance
-        .advance_migration_unresolved(leased.clone(), candidate.clone(), advance, next)
-        .await;
-    // Reconcile only by an exact reread: the candidate byte-equal in the
-    // provider is the sole success, an unchanged predecessor maps the send
-    // outcome, and anything else is competing state.
-    let observed = authority
+    let rung = async {
+        // Same checkpoint: the candidate is built over the checkpoint nominated
+        // by the current witness root, recovered and re-authenticated — never
+        // over any retained in-memory upload from a prior attempt.
+        let cipher = resolve_ladder_cipher(authority, &leased).await?;
+        let checkpoint = recover_genesis_checkpoint(authority, &cipher, &leased).await?;
+        let binding = genesis_binding(&plan, wrapped_registry_hash)?;
+        let session_id = genesis_session_id(&plan)?;
+        let staging = ShadowObjectStaging::new(
+            authority.inventory,
+            session_id,
+            ShadowAttemptId::random(),
+            binding,
+        );
+        let advance = build_zero_wal_candidate(
+            authority.objects,
+            &cipher,
+            &leased,
+            lease,
+            &checkpoint,
+            &staging,
+        )
+        .await
+        .map_err(map_root_advance)?;
+        let candidate = leased
+            .exact_migration_candidate(&advance, next)
+            .map_err(map_witness)?;
+        let outcome = authority
+            .witness_advance
+            .advance_migration_unresolved(leased.clone(), candidate.clone(), advance, next)
+            .await;
+        // Reconcile only by an exact reread: the candidate byte-equal in the
+        // provider is the sole success, an unchanged predecessor maps the send
+        // outcome, and anything else is competing state.
+        let observed = authority
+            .witness_advance
+            .read_current_exact(archive_id)
+            .await
+            .map_err(|_| WalGenesisError::OutcomeUnknown)?;
+        if observed == candidate {
+            return Ok(observed);
+        }
+        if observed != leased {
+            return Err(WalGenesisError::Conflict);
+        }
+        Err(match outcome {
+            Err(WitnessAdvanceCommitError::Rejected) => WalGenesisError::Conflict,
+            Err(WitnessAdvanceCommitError::DefinitelyFailed) => WalGenesisError::Unavailable,
+            Err(WitnessAdvanceCommitError::OutcomeUnknown) | Ok(()) => {
+                WalGenesisError::OutcomeUnknown
+            }
+        })
+    }
+    .await;
+    if rung.is_err() {
+        // A failed rung after a successful acquire must not strand the
+        // lease; the provider's byte-exact retained-record validation
+        // makes this a no-op for anything that is not ours.
+        release_abandoned_ladder_lease(authority, archive_id, owner_id).await;
+    }
+    rung
+}
+
+/// Best-effort release of this driver's own abandoned ladder lease after a
+/// failed rung. The provider validates the retained record byte-exactly and
+/// the release arms are migration-scoped, so this can only ever clear a
+/// lease the current stored record grants to THIS derived owner — a lease
+/// another actor holds, or a record that advanced, refuses harmlessly.
+/// Without this, a rung failure after a successful acquire (including the
+/// stale-read race where the acquire lands on an already-released terminal)
+/// abandons an 86,400-tick lease that blocks WAL-owner acquisition.
+async fn release_abandoned_ladder_lease(
+    authority: &WalGenesisAuthority<'_>,
+    archive_id: ArchiveId,
+    owner_id: ObjectId,
+) {
+    let Ok(record) = authority
         .witness_advance
         .read_current_exact(archive_id)
         .await
-        .map_err(|_| WalGenesisError::OutcomeUnknown)?;
-    if observed == candidate {
-        return Ok(observed);
-    }
-    if observed != leased {
-        return Err(WalGenesisError::Conflict);
-    }
-    Err(match outcome {
-        Err(WitnessAdvanceCommitError::Rejected) => WalGenesisError::Conflict,
-        Err(WitnessAdvanceCommitError::DefinitelyFailed) => WalGenesisError::Unavailable,
-        Err(WitnessAdvanceCommitError::OutcomeUnknown) | Ok(()) => WalGenesisError::OutcomeUnknown,
-    })
+    else {
+        return;
+    };
+    let _ = match record.migration() {
+        MigrationState::WalAuthoritative => {
+            authority
+                .witness_advance
+                .release_terminal_lease_unresolved(record, owner_id)
+                .await
+        }
+        _ => {
+            authority
+                .witness_advance
+                .release_advisory_lease_unresolved(record, owner_id)
+                .await
+        }
+    };
 }
 
 const fn next_predecessor(next: MigrationState) -> MigrationState {
@@ -1085,7 +1147,7 @@ mod tests {
         archive_v3_firestore_witness::{test_transport, FirestoreWitness},
         archive_v3_genesis_backend::{ControlPlaneGenesisBackend, GenesisRegistryStore},
         archive_v3_operation::{RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage},
-        archive_v3_witness::ExactRootProvider,
+        archive_v3_witness::{ExactRootProvider, RootAdvance, WitnessLease},
         store::tests::{FakeGcs, FakeKms},
     };
     use std::{
@@ -1382,6 +1444,148 @@ mod tests {
         fn scratch_is_empty(&self) -> bool {
             std::fs::read_dir(self.scratch.path()).unwrap().count() == 0
         }
+    }
+
+    /// Delegating witness-advance provider that serves ONE captured stale
+    /// read — the exact race the adversarial review proved: a rung reads a
+    /// mid-ladder record while the ladder completes, then acquires onto the
+    /// released terminal.
+    struct StaleFirstRead<'a> {
+        inner: &'a FirestoreShadowWitness,
+        stale: Mutex<Option<WitnessRecord>>,
+    }
+
+    #[async_trait]
+    impl ArchiveWitnessAdvanceProvider for StaleFirstRead<'_> {
+        async fn read_current_exact(
+            &self,
+            archive_id: ArchiveId,
+        ) -> Result<WitnessRecord, WitnessError> {
+            if let Some(stale) = self.stale.lock().unwrap().take() {
+                return Ok(stale);
+            }
+            self.inner.read_current_exact(archive_id).await
+        }
+
+        async fn acquire_lease_exact(
+            &self,
+            record: &WitnessRecord,
+            owner: ObjectId,
+            duration_ticks: u64,
+        ) -> Result<WitnessLease, WitnessError> {
+            self.inner
+                .acquire_lease_exact(record, owner, duration_ticks)
+                .await
+        }
+
+        async fn validate_exact_lease(
+            &self,
+            record: &WitnessRecord,
+            owner: ObjectId,
+        ) -> Result<WitnessLease, WitnessError> {
+            self.inner.validate_exact_lease(record, owner).await
+        }
+
+        async fn renew_lease_exact(
+            &self,
+            lease: WitnessLease,
+            duration_ticks: u64,
+        ) -> Result<WitnessLease, WitnessError> {
+            self.inner.renew_lease_exact(lease, duration_ticks).await
+        }
+
+        async fn release_terminal_lease_unresolved(
+            &self,
+            retained: WitnessRecord,
+            owner: ObjectId,
+        ) -> Result<(), WitnessAdvanceCommitError> {
+            self.inner
+                .release_terminal_lease_unresolved(retained, owner)
+                .await
+        }
+
+        async fn release_advisory_lease_unresolved(
+            &self,
+            retained: WitnessRecord,
+            owner: ObjectId,
+        ) -> Result<(), WitnessAdvanceCommitError> {
+            self.inner
+                .release_advisory_lease_unresolved(retained, owner)
+                .await
+        }
+
+        async fn advance_migration_unresolved(
+            &self,
+            expected: WitnessRecord,
+            candidate: WitnessRecord,
+            advance: RootAdvance,
+            next: MigrationState,
+        ) -> Result<(), WitnessAdvanceCommitError> {
+            self.inner
+                .advance_migration_unresolved(expected, candidate, advance, next)
+                .await
+        }
+    }
+
+    /// The review's surviving race, closed: a rung whose read was stale
+    /// (mid-ladder ShadowWal) while the store already holds the released
+    /// terminal acquires the terminal's lease, Conflicts on revalidation —
+    /// and must RELEASE that lease before returning, or serving acquisition
+    /// is blocked for the full 86,400-tick lease term.
+    #[tokio::test]
+    async fn a_stale_read_rung_onto_the_released_terminal_releases_its_lease() {
+        let harness = Harness::new().await;
+        let authority = harness.authority();
+        let reservation = reserve_genesis_bootstrap(&authority, harness.archive_id)
+            .await
+            .unwrap();
+        let produced = produce_genesis_bytes(&authority, harness.scratch_dir(), reservation)
+            .await
+            .unwrap();
+        let prepared = prepare_genesis_bootstrap(&authority, produced)
+            .await
+            .unwrap();
+        let plan = prepared.reservation().plan();
+        let wrapped_registry_hash = prepared.wrapped_registry_hash();
+        let (_, _) = resolve_genesis(&authority, prepared).await.unwrap();
+        let shadow = advance_genesis_ladder_once(&authority, plan, wrapped_registry_hash)
+            .await
+            .unwrap();
+        assert_eq!(shadow.migration(), MigrationState::ShadowWal);
+        // The ladder completes (advance 2 + terminal release). The contract
+        // helper is NOT called here — it acquires a WAL-owner lease it never
+        // releases, which would block the raced acquire below.
+        let outcome = run_wal_genesis(&authority, harness.scratch_dir(), harness.archive_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.terminal_witness.migration(),
+            MigrationState::WalAuthoritative
+        );
+        // A racing rung then runs against the CAPTURED stale ShadowWal
+        // record.
+        let stale_provider = StaleFirstRead {
+            inner: &harness.witness_advance,
+            stale: Mutex::new(Some(shadow)),
+        };
+        let racing = WalGenesisAuthority {
+            recovery: harness.control.as_ref(),
+            backend: &harness.backend,
+            objects: harness.objects.as_ref(),
+            registry_wrap: harness.registries.as_ref(),
+            inventory: &harness.inventory,
+            witness_advance: &stale_provider,
+        };
+        let raced = advance_genesis_ladder_once(&racing, plan, wrapped_registry_hash).await;
+        assert!(matches!(raced, Err(WalGenesisError::Conflict)));
+        // The terminal must still satisfy the WAL-owner acquire contract:
+        // the racing rung released its own planted lease.
+        let terminal = harness
+            .witness_advance
+            .read_current_exact(harness.archive_id)
+            .await
+            .unwrap();
+        assert_terminal_contract(&harness, &terminal).await;
     }
 
     /// Prove the terminal witness satisfies the untouched WAL-owner acquire
