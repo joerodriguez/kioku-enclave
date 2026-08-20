@@ -40,7 +40,11 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # Plan-family slice 5 (F9): embed_episodes' read routes and the settled
 # branch gains the submit; the legacy write branch remains. 181 -> 182,
 # diffed against pristine main, zero reclassifications.
-EXPECTED_STORE_CALL_COUNT = 182
+# Plan-family slice 6 (F10): the finalization lifecycle's routed
+# predecessor read and sealed submit under two new B owners. 182 -> 184,
+# diffed against pristine main, zero reclassifications; all three legacy
+# branches intact.
+EXPECTED_STORE_CALL_COUNT = 184
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -51,7 +55,7 @@ EXPECTED_STORE_CALL_COUNT = 182
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "c3d082d0b0d72e8789f0206624d51c00d485dbaab044d0b281bb4485a1beef3e"
+EXPECTED_STORE_CALL_SHA256 = "da8c5ee45c493fad2a65162b5dd25200d0a07c39aeb93f112f3c8d91653efd9a"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -759,6 +763,8 @@ A_OWNERS = frozenset(
 B_OWNERS = frozenset(
     {
         "src/cp/finalizer.rs::set_finalization_status#0",
+        "src/cp/finalizer.rs::read_finalization_predecessor#0",
+        "src/cp/finalizer.rs::settle_lifecycle#0",
         "src/cp/finalizer.rs::record_finalization_failure#0",
         "src/cp/finalizer.rs::defer_finalization_for_budget#0",
         "src/cp/media.rs::load_or_create_media_dek#0",
