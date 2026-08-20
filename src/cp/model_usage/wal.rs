@@ -10,11 +10,20 @@
 //! dependency. This child has no Store, worker, launcher, provider, task,
 //! delivery, or acknowledgement authority.
 
+pub(super) mod coverage;
+pub(super) mod delivery;
 pub(super) mod invocation;
+pub(super) mod reconcile;
+pub(in crate::cp) use coverage::{CoveragePredecessor, CoverageTransition};
+pub(crate) use coverage::{VertexCoverageLedgerLedger, VertexCoverageLedgerPlan};
+pub(in crate::cp) use delivery::{DeliveryEventPredecessor, DeliveryOutcome};
+pub(crate) use delivery::{VertexUsageDeliveryLedger, VertexUsageDeliveryPlan};
 pub(in crate::cp) use invocation::{
     derive_event_id, read_lane_sequence, request_commitment, VertexInvocationLane,
 };
 pub(crate) use invocation::{VertexInvocationBeginLedger, VertexInvocationBeginPlan};
+pub(in crate::cp) use reconcile::{PoisonIntent, StaleIntent};
+pub(crate) use reconcile::{VertexIntentReconcileLedger, VertexIntentReconcilePlan};
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;

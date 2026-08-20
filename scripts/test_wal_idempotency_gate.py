@@ -32,7 +32,12 @@ CLASSIFICATIONS = frozenset({"A", "B", "C"})
 # sequence-probe read and the sealed-plan submit (both B, new owner).
 # 171 -> 173 under the bracket-aware scanner fix, which is
 # inventory-neutral on the pre-slice tree (verified: 171 both ways).
-EXPECTED_STORE_CALL_COUNT = 173
+# Plan-family slice 4 (F3/F4/F5): the Vertex drain's settled halves add
+# eight routed sites under six new B owners (pending_events_settled,
+# delivery read/settle, coverage read/settle, pending_coverage_settled).
+# 173 -> 181, diffed against pristine main, zero reclassifications and no
+# removals -- every legacy branch is intact.
+EXPECTED_STORE_CALL_COUNT = 181
 # Slice J-c domain 1 (media capture-session-finish): the scanner now also
 # inventories the routed wal_authoritative_read/submit surfaces; the delta is
 # exactly finish_capture_session's three routed sites (probe read, settled
@@ -43,7 +48,7 @@ EXPECTED_STORE_CALL_COUNT = 173
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "742e40b4bd388ec4f66a5660419a742a91c9f431afa5dc1f391a58e4cdd36065"
+EXPECTED_STORE_CALL_SHA256 = "54c84bebb8a48caeb695089556c8c82818f106ee187977f86af8986ac838d8f9"
 EXPECTED_STORE_SURFACE_COUNT = 15
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction
@@ -759,6 +764,12 @@ B_OWNERS = frozenset(
         "src/cp/media_worker.rs::resurrect_user_failed_jobs#0",
         "src/cp/model_usage.rs::begin_invocation#0",
         "src/cp/model_usage.rs::begin_invocation_settled#0",
+        "src/cp/model_usage.rs::pending_events_settled#0",
+        "src/cp/model_usage.rs::read_delivery_predecessors#0",
+        "src/cp/model_usage.rs::settle_delivery#0",
+        "src/cp/model_usage.rs::read_coverage_predecessor#0",
+        "src/cp/model_usage.rs::settle_coverage#0",
+        "src/cp/model_usage.rs::pending_coverage_settled#0",
         "src/cp/model_usage.rs::pending_events#0",
         "src/cp/model_usage.rs::pending_coverage#0",
         "src/cp/model_usage.rs::drain_coverage#0",
