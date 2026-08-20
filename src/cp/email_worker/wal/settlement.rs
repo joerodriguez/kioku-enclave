@@ -39,6 +39,10 @@ const STATES: &[&str] = &["pending", "retry", "accepted", "cancelled", "failed"]
 
 type Result<T> = std::result::Result<T, WalIdempotencyError>;
 
+/// The row as loaded for adopt/CAS checks: the predecessor tuple plus the
+/// two written optional columns.
+type LoadedDelivery = (EmailDeliveryPredecessor, Option<String>, Option<String>);
+
 /// The observed predecessor of one email delivery row.
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::cp) struct EmailDeliveryPredecessor {
@@ -157,10 +161,7 @@ impl EmailDeliverySettlementPlan {
         })
     }
 
-    fn load_current(
-        &self,
-        transaction: &Transaction<'_>,
-    ) -> Result<Option<(EmailDeliveryPredecessor, Option<String>, Option<String>)>> {
+    fn load_current(&self, transaction: &Transaction<'_>) -> Result<Option<LoadedDelivery>> {
         transaction
             .query_row(
                 "SELECT state,attempt_count,next_attempt_at,updated_at,
