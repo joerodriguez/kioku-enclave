@@ -17252,14 +17252,47 @@ impl ControlStore {
         .await
     }
 
+    /// The genesis control ledger's durable `wal_authoritative` terminal for
+    /// one archive, exact-loaded with full hash/commitment revalidation, or
+    /// `None` when the genesis ledger is not this archive's serving
+    /// authority. The two ledgers are mutually exclusive authorities, so any
+    /// coexisting maintenance-import row alongside a genesis row refuses
+    /// content-free instead of silently preferring either — mirroring the
+    /// startup selection core's both-present refusal.
+    pub(crate) async fn wal_genesis_authoritative_terminal_for_archive(
+        &self,
+        archive_id: crate::archive_v3::ArchiveId,
+    ) -> Result<Option<crate::archive_v3_witness::WitnessRecord>> {
+        self.read(move |conn| {
+            let Some(record) = load_wal_genesis_ledger_conn(conn, archive_id)? else {
+                return Ok(None);
+            };
+            let maintenance_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM archive_v3_maintenance_imports WHERE archive_id=?1",
+                [archive_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            if maintenance_rows != 0 {
+                return Err(EnclaveError::Conflict(
+                    "wal-authority relaunch found both maintenance and genesis ledgers".into(),
+                ));
+            }
+            if record.stage != WalGenesisStage::WalAuthoritative {
+                return Ok(None);
+            }
+            crate::archive_v3_witness::WitnessRecord::decode(&record.terminal_witness)
+                .map(Some)
+                .map_err(|_| {
+                    EnclaveError::Store("stored WAL genesis witness bytes are corrupt".into())
+                })
+        })
+        .await
+    }
+
     /// Reserve (or exactly re-adopt) the WAL owner lease off the genesis
     /// control ledger's durable `wal_authoritative` terminal, mirroring the
     /// maintenance-backed [`WalPublisherControl::reserve_owner`] byte for
     /// byte apart from the retargeted handoff authority.
-    #[allow(
-        dead_code,
-        reason = "reserved for the reviewed genesis launcher (Track G) wiring"
-    )]
     pub(crate) async fn reserve_owner_from_genesis(
         &self,
         expected_terminal: &crate::archive_v3_witness::WitnessRecord,

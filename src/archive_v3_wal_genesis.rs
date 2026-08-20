@@ -1859,4 +1859,228 @@ mod tests {
         committed.commit(2).unwrap();
         assert!(committed.write_exact(2, &[3]).is_err());
     }
+
+    // ------------------------------------------------------------------
+    // G8: genesis handoff → WAL-owner launch, over the same fakes.
+    // ------------------------------------------------------------------
+
+    /// The harness binding's fixed user, minted by `Harness::new`.
+    const GENESIS_TEST_USER: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Drive the genesis spine to its released terminal and record both
+    /// control-ledger stages — the exact flow the G9 trigger will run.
+    /// Returns `(terminal, created)`: the released `WalAuthoritative`
+    /// terminal and the sequence-0 created record the ledger pinned first.
+    async fn run_genesis_and_record_ledger(harness: &Harness) -> (WitnessRecord, WitnessRecord) {
+        let authority = harness.authority();
+        let reservation = reserve_genesis_bootstrap(&authority, harness.archive_id)
+            .await
+            .unwrap();
+        let produced = produce_genesis_bytes(&authority, harness.scratch_dir(), reservation)
+            .await
+            .unwrap();
+        let prepared = prepare_genesis_bootstrap(&authority, produced)
+            .await
+            .unwrap();
+        let plan = prepared.reservation().plan();
+        let wrapped_registry_hash = prepared.wrapped_registry_hash();
+        let (resolution, created) = resolve_genesis(&authority, prepared).await.unwrap();
+        assert_eq!(resolution, GenesisResolution::Created);
+        harness
+            .control
+            .record_genesis_stage(
+                GENESIS_TEST_USER,
+                harness.archive_id,
+                crate::cp::control_store::WalGenesisStage::GenesisCreated,
+                created.encode(),
+            )
+            .await
+            .unwrap();
+        let terminal = run_witness_ladder(&authority, plan, wrapped_registry_hash)
+            .await
+            .unwrap();
+        harness
+            .control
+            .record_genesis_stage(
+                GENESIS_TEST_USER,
+                harness.archive_id,
+                crate::cp::control_store::WalGenesisStage::WalAuthoritative,
+                terminal.encode(),
+            )
+            .await
+            .unwrap();
+        (terminal, created)
+    }
+
+    /// Publisher-capable runtime bundle over the harness's own providers,
+    /// mirroring the production bundle shape the WAL-owner launch consumes.
+    fn publisher_bundle(
+        harness: &Harness,
+    ) -> crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle {
+        crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle::from_publisher_test_components(
+            Arc::clone(&harness.objects) as Arc<dyn ImmutableObjectBackend>,
+            Arc::clone(&harness.registries) as Arc<dyn crate::archive_v3::ExactKeyRegistryProvider>,
+            Arc::new(FirestoreShadowWitness::from_witness_for_test(Arc::clone(
+                &harness.firestore_witness,
+            ))),
+            Arc::new(FirestoreShadowWitness::from_witness_for_test(Arc::clone(
+                &harness.firestore_witness,
+            ))),
+        )
+    }
+
+    /// One settled read through the launched serving authority: the owner
+    /// re-reads and re-authenticates the live witness head before the lane
+    /// answers from the recovered genesis database.
+    async fn assert_owner_serves_settled_read(
+        authority: &crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority,
+    ) {
+        let tables = authority
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| crate::error::EnclaveError::Store("settled read failed".into()))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tables > 0,
+            "the recovered genesis database must be schema-current"
+        );
+    }
+
+    /// (G8-a) A genesis-ledger handoff launches the real publisher over the
+    /// same fake providers — durable reservation re-adoption, send marker,
+    /// provider-CAS owner acquire, cipher resolution, checkpoint staging
+    /// recovery — and the launched owner serves a settled read round-trip
+    /// from the genesis database.
+    #[tokio::test]
+    async fn genesis_handoff_launches_wal_owner_and_serves_settled_reads() {
+        let harness = Harness::new().await;
+        let (terminal, _) = run_genesis_and_record_ledger(&harness).await;
+        let reserved = harness
+            .control
+            .reserve_owner_from_genesis(&terminal)
+            .await
+            .unwrap();
+        let binding = harness
+            .control
+            .active_archive_binding(GENESIS_TEST_USER)
+            .await
+            .unwrap();
+        let handoff = crate::archive_v3_shadow_runtime::GenesisWalHandoff::from_reservation(
+            publisher_bundle(&harness),
+            crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding::from_control_store(
+                binding,
+            ),
+            terminal.clone(),
+            reserved,
+            Arc::clone(&harness.control),
+        )
+        .unwrap();
+        let authority = crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(
+            crate::archive_v3_shadow_runtime::WalServingHandoff::Genesis(handoff),
+        )
+        .await
+        .unwrap();
+        assert_owner_serves_settled_read(&authority).await;
+        // The launch bound the durable reservation: a fresh adoption returns
+        // the same owner rather than minting a competitor.
+        harness
+            .control
+            .reserve_owner_from_genesis(&terminal)
+            .await
+            .unwrap();
+    }
+
+    /// (G8-b) Restart relaunch: with the genesis ledger at its durable
+    /// terminal and the owner reserved by "process one", the startup
+    /// selection scan admits the user and the sealed runtime reconstructs
+    /// the genesis serving handoff from durable state alone — the exact
+    /// serving-relaunch flow — and the relaunched owner serves settled
+    /// reads.
+    #[tokio::test]
+    async fn genesis_relaunch_reconstructs_from_durable_ledger_and_serves() {
+        let harness = Harness::new().await;
+        let (terminal, _) = run_genesis_and_record_ledger(&harness).await;
+        harness
+            .control
+            .reserve_owner_from_genesis(&terminal)
+            .await
+            .unwrap();
+        let selections = harness
+            .control
+            .load_wal_authoritative_persistence_selections()
+            .await
+            .unwrap();
+        assert_eq!(selections.len(), 1, "the genesis-ledger user is selected");
+        let binding = harness
+            .control
+            .active_archive_binding(GENESIS_TEST_USER)
+            .await
+            .unwrap();
+        let sealed =
+            crate::archive_v3_shadow_runtime::SealedSingleArchiveWalRuntime::for_publisher_test(
+                binding,
+                Arc::clone(&harness.objects) as Arc<dyn ImmutableObjectBackend>,
+                Arc::clone(&harness.registries)
+                    as Arc<dyn crate::archive_v3::ExactKeyRegistryProvider>,
+                Arc::new(FirestoreShadowWitness::from_witness_for_test(Arc::clone(
+                    &harness.firestore_witness,
+                ))),
+                Arc::new(FirestoreShadowWitness::from_witness_for_test(Arc::clone(
+                    &harness.firestore_witness,
+                ))),
+            );
+        let handoff = sealed
+            .reconstruct_wal_serving_handoff(Arc::clone(&harness.control))
+            .await
+            .unwrap();
+        assert!(matches!(
+            handoff,
+            crate::archive_v3_shadow_runtime::WalServingHandoff::Genesis(_)
+        ));
+        let authority =
+            crate::archive_v3_wal_owner::SingleArchiveWalServingAuthority::launch(handoff)
+                .await
+                .unwrap();
+        assert_owner_serves_settled_read(&authority).await;
+    }
+
+    /// (G8-d) Guard: the genesis handoff constructor refuses any witness
+    /// that is not the archive's released `WalAuthoritative` terminal —
+    /// here the sequence-0 created record the ledger pinned at
+    /// `genesis_created`.
+    #[tokio::test]
+    async fn genesis_handoff_refuses_a_non_terminal_witness() {
+        let harness = Harness::new().await;
+        let (terminal, created) = run_genesis_and_record_ledger(&harness).await;
+        let reserved = harness
+            .control
+            .reserve_owner_from_genesis(&terminal)
+            .await
+            .unwrap();
+        let binding = harness
+            .control
+            .active_archive_binding(GENESIS_TEST_USER)
+            .await
+            .unwrap();
+        assert!(
+            crate::archive_v3_shadow_runtime::GenesisWalHandoff::from_reservation(
+                publisher_bundle(&harness),
+                crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding::from_control_store(
+                    binding,
+                ),
+                created,
+                reserved,
+                Arc::clone(&harness.control),
+            )
+            .is_err(),
+            "a non-terminal witness must never compose a launchable handoff"
+        );
+    }
 }

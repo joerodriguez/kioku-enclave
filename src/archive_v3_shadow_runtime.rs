@@ -663,19 +663,73 @@ impl SealedSingleArchiveWalRuntime {
         Self { binding, bundle }
     }
 
-    /// Startup-relaunch composition: reconstruct the WAL-owner handoff from
-    /// durable state for this sealed runtime's exact bound archive. Consumes
-    /// the seal — the bundle and binding leave only inside the handoff, whose
-    /// sole consumer is the serving-authority launch.
+    /// Publisher-capable sealed runtime over the shared fakes plus the
+    /// durable control-store archive binding, for the genesis relaunch
+    /// end-to-end tests.
+    #[cfg(test)]
+    pub(crate) fn for_publisher_test<W>(
+        binding: ArchiveBinding,
+        objects: Arc<dyn ImmutableObjectBackend>,
+        registries: Arc<dyn ExactKeyRegistryProvider>,
+        witness: Arc<W>,
+        wal_owner_witness: Arc<FirestoreShadowWitness>,
+    ) -> Self
+    where
+        W: MaintenanceImportWitnessProvider + 'static,
+    {
+        Self {
+            binding: DurableSingleArchiveBinding::from_control_store(binding),
+            bundle: ArchiveV3ShadowRuntimeBundle::from_publisher_test_components(
+                objects,
+                registries,
+                witness,
+                wal_owner_witness,
+            ),
+        }
+    }
+
+    /// Startup-relaunch composition: reconstruct the WAL-owner serving
+    /// handoff from durable state for this sealed runtime's exact bound
+    /// archive, from whichever control ledger holds the durable
+    /// `wal_authoritative` terminal — the maintenance-import ledger or the
+    /// genesis control ledger (mutually exclusive authorities; coexistence
+    /// refuses). Consumes the seal — the bundle and binding leave only inside
+    /// the handoff, whose sole consumer is the serving-authority launch.
     pub(crate) async fn reconstruct_wal_serving_handoff(
         self,
         control: Arc<ControlStore>,
-    ) -> Result<
-        crate::archive_v3_maintenance_import::CompletedMaintenanceWalHandoff,
-        crate::archive_v3_maintenance_import::MaintenanceImportError,
-    > {
+    ) -> Result<WalServingHandoff, crate::archive_v3_maintenance_import::MaintenanceImportError>
+    {
+        let archive_id = self.binding.binding.archive_id();
+        if let Some(terminal) = control
+            .wal_genesis_authoritative_terminal_for_archive(archive_id)
+            .await
+            .map_err(|_| crate::archive_v3_maintenance_import::MaintenanceImportError::Conflict)?
+        {
+            // Genesis lane. The ledger row pins the exact released terminal
+            // bytes (never a still-leased record), so no live release
+            // authentication is needed here; the durable owner reservation is
+            // minted — or exactly re-adopted — off those bytes, and the
+            // publisher re-adopts and revalidates it durably at launch before
+            // any provider work.
+            let reserved = control
+                .reserve_owner_from_genesis(&terminal)
+                .await
+                .map_err(|_| {
+                    crate::archive_v3_maintenance_import::MaintenanceImportError::Conflict
+                })?;
+            return GenesisWalHandoff::from_reservation(
+                self.bundle,
+                self.binding,
+                terminal,
+                reserved,
+                control,
+            )
+            .map(WalServingHandoff::Genesis)
+            .map_err(|_| crate::archive_v3_maintenance_import::MaintenanceImportError::Conflict);
+        }
         let operation = control
-            .wal_authoritative_operation_for_archive(self.binding.binding.archive_id())
+            .wal_authoritative_operation_for_archive(archive_id)
             .await
             .map_err(|_| crate::archive_v3_maintenance_import::MaintenanceImportError::Conflict)?;
         // Clone the witness handle before the bundle moves into the handoff:
@@ -695,6 +749,7 @@ impl SealedSingleArchiveWalRuntime {
             witness.as_ref(),
         )
         .await
+        .map(WalServingHandoff::Maintenance)
     }
 
     /// One-shot inactive composition. This has no startup caller and returns
@@ -720,6 +775,101 @@ impl SealedSingleArchiveWalRuntime {
 impl fmt::Debug for SealedSingleArchiveWalRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SealedSingleArchiveWalRuntime(<inactive>)")
+    }
+}
+
+/// The one serving handoff the private WAL launcher consumes: either the
+/// parity-certified completed maintenance handoff or the genesis-ledger
+/// handoff minted from a durable genesis owner reservation. Non-cloneable by
+/// composition; each variant is consumed exactly once at launch.
+pub(crate) enum WalServingHandoff {
+    Maintenance(crate::archive_v3_maintenance_import::CompletedMaintenanceWalHandoff),
+    Genesis(GenesisWalHandoff),
+}
+
+impl fmt::Debug for WalServingHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WalServingHandoff(<offline>)")
+    }
+}
+
+/// Non-cloneable genesis WAL-owner handoff. It carries exactly what launch
+/// needs from a durable genesis reservation: the sealed provider bundle, the
+/// genesis control ledger's exact released terminal witness, the opaque
+/// durable archive binding, the reserved owner lease minted (or exactly
+/// re-adopted) by the genesis-ledger owner reservation, and the encrypted
+/// Control handle. There are no field getters and no Store admission fence —
+/// a genesis archive has no legacy snapshot to pin, matching the fenceless
+/// maintenance restart path — and only the WAL-owner module can obtain the
+/// consuming view by presenting its private Store-owner token. At launch the
+/// publisher re-adopts the durable reservation off the ledger row's exact
+/// terminal bytes and requires exact equality with the carried reservation
+/// before any provider work.
+pub(crate) struct GenesisWalHandoff {
+    runtime: ArchiveV3ShadowRuntimeBundle,
+    terminal_witness: WitnessRecord,
+    archive_binding: DurableSingleArchiveBinding,
+    reserved: crate::archive_v3_wal_owner::ReservedWalOwnerLease,
+    control: Arc<ControlStore>,
+}
+
+pub(crate) struct GenesisWalHandoffView {
+    pub(crate) runtime: ArchiveV3ShadowRuntimeBundle,
+    pub(crate) terminal_witness: WitnessRecord,
+    pub(crate) archive_binding: DurableSingleArchiveBinding,
+    pub(crate) reserved: crate::archive_v3_wal_owner::ReservedWalOwnerLease,
+    pub(crate) control: Arc<ControlStore>,
+}
+
+impl GenesisWalHandoff {
+    /// Compose the launchable genesis handoff from a durable genesis owner
+    /// reservation. The terminal must be the archive's own released
+    /// `WalAuthoritative` terminal — the exact unleased shape at root
+    /// sequence 2 that the witness ladder ends at and the genesis control
+    /// ledger pins — or construction refuses. The reservation's own exact
+    /// binding to these terminal bytes is revalidated durably at launch,
+    /// where the publisher's re-adoption must equal it byte for byte.
+    pub(crate) fn from_reservation(
+        runtime: ArchiveV3ShadowRuntimeBundle,
+        archive_binding: DurableSingleArchiveBinding,
+        terminal_witness: WitnessRecord,
+        reserved: crate::archive_v3_wal_owner::ReservedWalOwnerLease,
+        control: Arc<ControlStore>,
+    ) -> Result<Self, ArchiveV3ShadowRuntimeConstructionError> {
+        // Genesis publishes root sequence 0 and the ladder adds exactly two
+        // zero-WAL roots, so the released terminal rests at sequence 2.
+        if terminal_witness.archive_id() != archive_binding.binding.archive_id()
+            || !terminal_witness.is_exact_unleased_wal_authoritative_terminal()
+            || terminal_witness.root().root().sequence() != 2
+        {
+            return Err(ArchiveV3ShadowRuntimeConstructionError::InvalidDeployment);
+        }
+        Ok(Self {
+            runtime,
+            terminal_witness,
+            archive_binding,
+            reserved,
+            control,
+        })
+    }
+
+    pub(crate) fn into_wal_owner(
+        self,
+        _token: crate::archive_v3_wal_owner::WalOwnerStoreContext,
+    ) -> GenesisWalHandoffView {
+        GenesisWalHandoffView {
+            runtime: self.runtime,
+            terminal_witness: self.terminal_witness,
+            archive_binding: self.archive_binding,
+            reserved: self.reserved,
+            control: self.control,
+        }
+    }
+}
+
+impl fmt::Debug for GenesisWalHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GenesisWalHandoff(<offline>)")
     }
 }
 
@@ -1143,6 +1293,7 @@ mod tests {
             "PendingSingleArchiveWalRuntime",
             "DurableSingleArchiveBinding",
             "SealedSingleArchiveWalRuntime",
+            "GenesisWalHandoff",
         ] {
             let declaration = source
                 .find(&format!("struct {type_name}"))
@@ -1159,6 +1310,12 @@ mod tests {
             concat!("impl Clone", " for PendingSingleArchiveWalRuntime"),
             concat!("impl Clone", " for DurableSingleArchiveBinding"),
             concat!("impl Clone", " for SealedSingleArchiveWalRuntime"),
+            concat!("impl Clone", " for GenesisWalHandoff"),
+            concat!("impl Copy", " for GenesisWalHandoff"),
+            concat!("impl Clone", " for WalServingHandoff"),
+            concat!("impl Copy", " for WalServingHandoff"),
+            concat!("pub(crate) fn terminal_", "witness"),
+            concat!("pub(crate) fn reserve", "d("),
             concat!("pub(crate) fn archive_", "id(&self)"),
             concat!("pub(crate) fn object", "s("),
             concat!("pub(crate) fn root", "s("),
@@ -1176,6 +1333,23 @@ mod tests {
             );
         }
         assert!(source.contains(concat!("impl SealedSingleArchiveWal", "Runtime {")));
+        // G8: the genesis handoff mirrors the maintenance handoff's authority
+        // discipline — opaque Debug, a token-gated consuming view presented
+        // only by the private WAL-owner family, and no witness or transport
+        // leakage beyond that view.
+        assert!(source.contains(concat!("GenesisWalHandoff", "(<offline>)")));
+        assert!(source.contains(concat!("WalServingHandoff", "(<offline>)")));
+        assert!(source.contains(concat!("fn into_wal_", "owner(")));
+        assert_eq!(
+            source
+                .matches(concat!(
+                    "_token: crate::archive_v3_wal_owner::WalOwnerStore",
+                    "Context"
+                ))
+                .count(),
+            1,
+            "the genesis handoff view must stay token-gated and single-doored"
+        );
         assert!(source.contains("fn into_advisory_shadow_importer("));
         assert!(source.contains("fn into_advisory_owner("));
         assert!(source.contains("read_advisory_owner_current_exact("));

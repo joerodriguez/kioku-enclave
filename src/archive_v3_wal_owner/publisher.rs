@@ -6,8 +6,9 @@
 //! Private provider/checkpoint half of the single-archive WAL owner.
 //!
 //! This child module is the only production implementation of the sealed
-//! publication authority.  It is constructed by consuming the maintenance
-//! handoff, never from archive IDs or provider handles.  Encrypted Control
+//! publication authority.  It is constructed by consuming one serving
+//! handoff — the parity-certified maintenance handoff or the genesis-ledger
+//! handoff — never from archive IDs or provider handles.  Encrypted Control
 //! reserves every owner lease, checkpoint attempt, and immutable object before
 //! provider mutation.  No type in this module is exported from its parent.
 
@@ -26,8 +27,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     archive_v3::{ArchiveId, ObjectId, VerifiedArchiveCipher},
     archive_v3_maintenance_import::{
-        CompletedMaintenanceParityEvidence, CompletedMaintenanceWalHandoff,
-        CompletedMaintenanceWalHandoffView, MaintenanceImportPersistence,
+        CompletedMaintenanceParityEvidence, CompletedMaintenanceWalHandoffView,
+        MaintenanceImportPersistence,
     },
     archive_v3_operation::{RecordOutcome, ShadowObjectFacts, ShadowObjectInventoryPage},
     archive_v3_shadow_checkpoint::{
@@ -1447,15 +1448,18 @@ fn map_firestore_commit_error(
     }
 }
 
-/// Runtime/provider owner created only by consuming the maintenance handoff.
-/// The long-lived Store fence and whole runtime bundle never leave it.
+/// Runtime/provider owner created only by consuming one serving handoff —
+/// the parity-certified maintenance handoff or the genesis-ledger handoff.
+/// The long-lived Store fence and whole runtime bundle never leave it. The
+/// retained parity evidence is inert after construction and `None` for a
+/// genesis-born owner, whose archive has no maintenance history to certify.
 pub(super) struct SingleArchiveWalPublisher {
     runtime: crate::archive_v3_shadow_runtime::WalPublisherRuntimeOwner,
     objects: Arc<dyn ExactImmutableObjectBackend>,
     control: Arc<crate::cp::control_store::ControlStore>,
     capture: Arc<crate::store::StoreShadowCapture>,
     _archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
-    _maintenance_parity: CompletedMaintenanceParityEvidence,
+    _maintenance_parity: Option<CompletedMaintenanceParityEvidence>,
 }
 
 impl SingleArchiveWalPublisher {
@@ -1507,9 +1511,54 @@ impl SingleArchiveWalPublisher {
         WalOwnerStoreBinding::from_authenticated_witness(&observed)
     }
 
-    pub(super) async fn start(handoff: CompletedMaintenanceWalHandoff) -> Result<WalOwnerHandle> {
-        let view = handoff.into_wal_owner(WalOwnerStoreContext(()));
-        let (publisher, staged, binding, store_fence) = Self::from_handoff_view(view).await?;
+    pub(super) async fn start(
+        handoff: crate::archive_v3_shadow_runtime::WalServingHandoff,
+    ) -> Result<WalOwnerHandle> {
+        let (publisher, staged, binding, store_fence) = match handoff {
+            crate::archive_v3_shadow_runtime::WalServingHandoff::Maintenance(handoff) => {
+                let CompletedMaintenanceWalHandoffView {
+                    runtime,
+                    terminal_witness,
+                    archive_binding,
+                    parity,
+                    control,
+                    store_fence,
+                } = handoff.into_wal_owner(WalOwnerStoreContext(()));
+                Self::from_launch_parts(
+                    runtime,
+                    terminal_witness,
+                    archive_binding,
+                    control,
+                    None,
+                    Some(parity),
+                    store_fence,
+                )
+                .await?
+            }
+            crate::archive_v3_shadow_runtime::WalServingHandoff::Genesis(handoff) => {
+                let crate::archive_v3_shadow_runtime::GenesisWalHandoffView {
+                    runtime,
+                    terminal_witness,
+                    archive_binding,
+                    reserved,
+                    control,
+                } = handoff.into_wal_owner(WalOwnerStoreContext(()));
+                // A genesis archive has no maintenance history: no parity
+                // evidence exists, and `None` for the Store fence is exact —
+                // there is no legacy snapshot to pin, precisely like the
+                // fenceless maintenance restart reconstruction.
+                Self::from_launch_parts(
+                    runtime,
+                    terminal_witness,
+                    archive_binding,
+                    control,
+                    Some(reserved),
+                    None,
+                    None,
+                )
+                .await?
+            }
+        };
         let store = super::WalStoreLane::spawn_authenticated(
             staged,
             binding,
@@ -1525,41 +1574,87 @@ impl SingleArchiveWalPublisher {
         ))
     }
 
-    async fn from_handoff_view(
-        view: CompletedMaintenanceWalHandoffView,
+    /// One-shot launch composition from either serving lane's exact parts.
+    ///
+    /// The maintenance lane carries the parity evidence (and, in-run only,
+    /// the Store admission fence): it re-loads and reauthenticates the exact
+    /// terminal Control row before any provider work, then reserves the
+    /// owner off the maintenance-import ledger. The genesis lane carries
+    /// `None` for both and instead re-adopts the durable owner reservation
+    /// off the genesis control ledger — that reservation path revalidates
+    /// the ledger row's exact terminal bytes inside one transaction — and
+    /// the adopted reservation must equal the handoff's carried reservation
+    /// exactly. Everything downstream (send marker, provider-CAS acquire
+    /// with lost-response adoption, bind, cipher resolution, staging
+    /// recovery) is one shared ladder.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit authenticated launch tuple; grouping would obscure exact binding"
+    )]
+    async fn from_launch_parts(
+        runtime: crate::archive_v3_shadow_runtime::ArchiveV3ShadowRuntimeBundle,
+        terminal_witness: WitnessRecord,
+        archive_binding: crate::archive_v3_shadow_runtime::DurableSingleArchiveBinding,
+        control: Arc<crate::cp::control_store::ControlStore>,
+        genesis_reservation: Option<ReservedWalOwnerLease>,
+        parity: Option<CompletedMaintenanceParityEvidence>,
+        store_fence: Option<crate::store::StoreWalAuthorityFence>,
     ) -> Result<(
         Self,
         crate::archive_v3_shadow_parity::AuthenticatedWalOwnerStaging,
         WalOwnerStoreBinding,
         Option<crate::store::StoreWalAuthorityFence>,
     )> {
-        let CompletedMaintenanceWalHandoffView {
-            runtime,
-            terminal_witness,
-            archive_binding,
-            parity,
-            control,
-            store_fence,
-        } = view;
-        let terminal_control = MaintenanceImportPersistence::load_exact(
-            control.as_ref(),
-            parity.operation_id_for_wal_owner(WalOwnerStoreContext(())),
-        )
-        .await
-        .map_err(|_| WalOwnerError::Conflict)?;
-        parity
-            .reauthenticate_for_wal_owner(
-                WalOwnerStoreContext(()),
-                &terminal_control,
-                &terminal_witness,
+        // Exactly one launch authority: the maintenance parity evidence or a
+        // genesis owner reservation. Both — or neither — is a composition
+        // defect, refused before any durable or provider work.
+        if genesis_reservation.is_some() == parity.is_some() {
+            return Err(WalOwnerError::Conflict);
+        }
+        if let Some(parity) = parity.as_ref() {
+            let terminal_control = MaintenanceImportPersistence::load_exact(
+                control.as_ref(),
+                parity.operation_id_for_wal_owner(WalOwnerStoreContext(())),
             )
+            .await
             .map_err(|_| WalOwnerError::Conflict)?;
+            parity
+                .reauthenticate_for_wal_owner(
+                    WalOwnerStoreContext(()),
+                    &terminal_control,
+                    &terminal_witness,
+                )
+                .map_err(|_| WalOwnerError::Conflict)?;
+        }
         let runtime = runtime
             .into_wal_publisher(super::WalPublisherRuntimeContext(()))
             .map_err(|_| WalOwnerError::Publication)?;
         let objects = runtime.objects_owned(&super::WalPublisherRuntimeContext(()));
         let witness = &runtime;
-        let reserved = control.reserve_owner(&terminal_witness).await?;
+        let reserved = match genesis_reservation {
+            None => control.reserve_owner(&terminal_witness).await?,
+            Some(carried) => {
+                // Genesis lane: re-adopt the durable reservation off the
+                // genesis control ledger. The reservation path revalidates
+                // the ledger row's exact terminal bytes and the existing
+                // lease's exact-terminal adoption arm; the adopted
+                // reservation must be the carried one, field for field, so a
+                // handoff can never launch over a reservation it does not
+                // durably own.
+                let adopted = control
+                    .reserve_owner_from_genesis(&terminal_witness)
+                    .await?;
+                if adopted.owner_id.as_bytes() != carried.owner_id.as_bytes()
+                    || adopted.expected != carried.expected
+                    || adopted.revision != carried.revision
+                    || adopted.stage != carried.stage
+                    || adopted.commitment != carried.commitment
+                {
+                    return Err(WalOwnerError::Conflict);
+                }
+                adopted
+            }
+        };
         let (observed, _live) = if reserved.stage == OwnerLeaseStage::Bound {
             let durable_binding = control.load_owner_binding(&terminal_witness).await?;
             let previous = WitnessRecord::decode(durable_binding.witness_bytes())
@@ -2466,6 +2561,25 @@ mod tests {
         ] {
             assert!(source.contains(required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn launch_parts_admit_exactly_one_lane_authority() {
+        let source = include_str!("publisher.rs");
+        // The two lanes are mutually exclusive by guard, the genesis lane
+        // re-adopts its durable reservation off the genesis control ledger,
+        // and the maintenance lane still reauthenticates its exact terminal
+        // Control row before any provider work.
+        assert!(source.contains("genesis_reservation.is_some() == parity.is_some()"));
+        assert!(source.contains(concat!("reserve_owner_from_", "genesis(")));
+        assert!(source.contains(concat!("reauthenticate_for_wal_", "owner(")));
+        assert_eq!(
+            source
+                .matches(concat!("Self::from_launch_", "parts("))
+                .count(),
+            2,
+            "exactly the two serving lanes may compose a launch"
+        );
     }
 
     #[test]

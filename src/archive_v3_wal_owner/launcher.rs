@@ -1,15 +1,17 @@
 //! Inactive single-archive launcher ownership boundary.
 //!
-//! This child can be constructed only from the non-cloneable completed
-//! maintenance handoff, which carries exact terminal Control/parity evidence.
-//! It owns one heterogeneous WAL actor for the archive and accepts only the
-//! repository's sealed, already-prepared logical plans. Nothing outside the
-//! private WAL-owner family can construct or call it, and it has no startup,
-//! route, configuration, Store-registry, acknowledgement, provider-list,
-//! provider-delete, deployment, or cloud integration.
+//! This child can be constructed only from one non-cloneable serving
+//! handoff: the completed maintenance handoff carrying exact terminal
+//! Control/parity evidence, or the genesis-ledger handoff carrying the
+//! durable genesis owner reservation over the ledger's exact released
+//! terminal. It owns one heterogeneous WAL actor for the archive and accepts
+//! only the repository's sealed, already-prepared logical plans. Nothing
+//! outside the private WAL-owner family can construct or call it, and it has
+//! no startup, route, configuration, Store-registry, acknowledgement,
+//! provider-list, provider-delete, deployment, or cloud integration.
 
 use crate::{
-    archive_v3_maintenance_import::CompletedMaintenanceWalHandoff,
+    archive_v3_shadow_runtime::WalServingHandoff,
     archive_v3_wal_idempotency::{PreparedLogicalMutation, WalLogicalDomainPlan},
 };
 
@@ -22,7 +24,7 @@ pub(super) struct SingleArchiveWalLauncherOwner {
 }
 
 impl SingleArchiveWalLauncherOwner {
-    pub(super) async fn launch(handoff: CompletedMaintenanceWalHandoff) -> Result<Self> {
+    pub(super) async fn launch(handoff: WalServingHandoff) -> Result<Self> {
         Ok(Self {
             owner: SingleArchiveWalPublisher::start(handoff).await?,
         })
@@ -64,7 +66,7 @@ mod tests {
         let source = include_str!("launcher.rs");
         for required in [
             "pub(super) struct SingleArchiveWalLauncherOwner",
-            "CompletedMaintenanceWalHandoff",
+            "WalServingHandoff",
             "SingleArchiveWalPublisher::start(handoff)",
             "pub(super) async fn submit<P: WalLogicalDomainPlan>",
         ] {

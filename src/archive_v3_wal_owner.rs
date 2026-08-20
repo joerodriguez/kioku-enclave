@@ -7,8 +7,9 @@
 //! protocol. The owner accepts only a sealed domain plan, runs its exact
 //! domain row and mutation in one SQLite `BEGIN IMMEDIATE`, and retains the
 //! resulting capture until encrypted control durably authenticates witness
-//! settlement. Its private launcher consumes the parity-certified maintenance
-//! handoff, owns one heterogeneous sealed-plan actor, and composes the private
+//! settlement. Its private launcher consumes one non-cloneable serving
+//! handoff — parity-certified maintenance or ledger-pinned genesis — owns one
+//! heterogeneous sealed-plan actor, and composes the private
 //! publisher plus mandatory checkpoint recovery. There is no external caller,
 //! route, startup, Store-registry, configuration, acknowledgement, deletion,
 //! list, or cloud construction path.
@@ -2035,19 +2036,21 @@ fn run_wal_store_lane(
 }
 
 /// Crate-visible serving authority for one WAL-authoritative archive: the
-/// composition the activation change hands to routing. Constructible from the
-/// in-run maintenance handoff or the durable restart reconstruction; both go
-/// through the same publisher owner reserve/renew/reacquire path. It exposes
-/// exactly the typed settled-only submit and read surfaces and nothing else —
-/// no lane, publisher, control, provider, list, or delete access. No
-/// production caller exists until the reviewed routing slice.
+/// composition the activation change hands to routing. Constructible from
+/// either serving handoff — the in-run maintenance handoff, the genesis
+/// reservation handoff, or the durable restart reconstruction of either —
+/// and every lane goes through the same publisher owner
+/// reserve/renew/reacquire path. It exposes exactly the typed settled-only
+/// submit and read surfaces and nothing else — no lane, publisher, control,
+/// provider, list, or delete access. No production caller exists until the
+/// reviewed routing slice.
 pub(crate) struct SingleArchiveWalServingAuthority {
     launcher: launcher::SingleArchiveWalLauncherOwner,
 }
 
 impl SingleArchiveWalServingAuthority {
     pub(crate) async fn launch(
-        handoff: crate::archive_v3_maintenance_import::CompletedMaintenanceWalHandoff,
+        handoff: crate::archive_v3_shadow_runtime::WalServingHandoff,
     ) -> Result<Self> {
         Ok(Self {
             launcher: launcher::SingleArchiveWalLauncherOwner::launch(handoff).await?,
