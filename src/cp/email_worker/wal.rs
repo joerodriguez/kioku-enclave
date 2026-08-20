@@ -12,6 +12,13 @@
 //! allocate a delivery or retry, call Store, launch work, or acknowledge a
 //! request.
 
+pub(super) mod cancellation;
+pub(super) mod settlement;
+pub(in crate::cp) use cancellation::CancellableDelivery;
+pub(crate) use cancellation::{EmailDeliveryCancellationLedger, EmailDeliveryCancellationPlan};
+pub(in crate::cp) use settlement::EmailDeliveryPredecessor;
+pub(crate) use settlement::{EmailDeliverySettlementLedger, EmailDeliverySettlementPlan};
+
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;
 

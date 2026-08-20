@@ -508,6 +508,64 @@ async fn update_delivery(
     error_code: Option<&str>,
     retry_after_seconds: Option<i64>,
 ) -> Result<()> {
+    if state.store.is_wal_authoritative(user_id) {
+        // ADR-0022 F13: routed predecessor read plus the sealed settlement.
+        // next_attempt_at is computed in Rust exactly as the legacy store
+        // method computes it, then written absolutely.
+        let probe_id = delivery.delivery_id.clone();
+        let predecessor = state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                conn.query_row(
+                    "SELECT state,attempt_count,next_attempt_at,updated_at
+                     FROM push_deliveries WHERE delivery_id=?1",
+                    [&probe_id],
+                    |row| {
+                        Ok(wal::PushDeliveryPredecessor {
+                            state: row.get(0)?,
+                            attempt_count: row.get(1)?,
+                            next_attempt_at: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    },
+                )
+                .map_err(crate::error::EnclaveError::from)
+            })
+            .await?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let committed_at = crate::cp::isotime::format_epoch_millis(now_ms);
+        let next_attempt_at = crate::cp::isotime::format_epoch_millis(
+            now_ms + retry_after_seconds.unwrap_or(0).max(0) * 1_000,
+        );
+        let plan = wal::PushDeliverySettlementPlan::new(
+            user_id.to_owned(),
+            delivery.delivery_id.clone(),
+            delivery.episode_id,
+            delivery.installation_id.clone(),
+            i64::from(delivery.delivery_version),
+            predecessor,
+            status.to_owned(),
+            i64::from(delivery.attempt_count + 1),
+            response_status.map(i64::from),
+            error_code.map(str::to_owned),
+            next_attempt_at,
+            committed_at,
+        )
+        .map_err(|_| {
+            crate::error::EnclaveError::Store("push settlement plan construction failed".into())
+        })?;
+        let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+            .map_err(|_| {
+                crate::error::EnclaveError::Store("push settlement plan construction failed".into())
+            })?;
+        return state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await;
+    }
     state
         .store
         .update_push_delivery_state(
