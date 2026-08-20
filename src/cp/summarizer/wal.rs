@@ -13,7 +13,10 @@
 //! Vertex capacity, invoke a model, call Store, launch work, or acknowledge a
 //! request.
 
+pub(super) mod embedding;
 mod visual_evidence;
+pub(in crate::cp) use embedding::EpisodeEmbedding;
+pub(crate) use embedding::{EpisodeEmbeddingBatchLedger, EpisodeEmbeddingBatchPlan};
 pub(crate) use visual_evidence::{
     VisualEvidenceBackfillBatchLedger, VisualEvidenceBackfillBatchPlan,
 };
