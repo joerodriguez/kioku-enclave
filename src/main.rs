@@ -211,6 +211,7 @@ mod legacy_gcm;
 #[allow(dead_code)]
 mod ingest;
 mod ocr;
+mod schema_ladder;
 mod search;
 mod storage_observability;
 mod store;
