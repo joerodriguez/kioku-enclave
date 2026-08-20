@@ -11,6 +11,13 @@
 //! unit replay. It cannot sign or send a webhook, read a subscription, retry,
 //! disable a destination, call Store, launch work, or acknowledge a request.
 
+pub(super) mod cascade;
+pub(super) mod settlement;
+pub(in crate::cp) use cascade::CascadeDelivery;
+pub(crate) use cascade::{WebhookSubscriptionCascadeLedger, WebhookSubscriptionCascadePlan};
+pub(in crate::cp) use settlement::WebhookDeliveryPredecessor;
+pub(crate) use settlement::{WebhookDeliverySettlementLedger, WebhookDeliverySettlementPlan};
+
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use zeroize::Zeroizing;
 

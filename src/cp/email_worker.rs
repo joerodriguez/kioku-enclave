@@ -296,19 +296,20 @@ pub async fn deliver_user_emails(
 
         match transport.send(email_req).await {
             Ok(resp) => {
-                state
-                    .store
-                    .update_email_delivery_state(
-                        user_id,
-                        outbox.episode_id,
-                        outbox.delivery_version,
-                        "accepted",
-                        attempts,
-                        Some(&resp.provider_message_id),
-                        Some(200),
-                        None,
-                    )
-                    .await?;
+                settle_email_delivery(
+                    state,
+                    user_id,
+                    &outbox.delivery_id,
+                    outbox.episode_id,
+                    outbox.delivery_version,
+                    "accepted",
+                    attempts,
+                    Some(&resp.provider_message_id),
+                    Some(200),
+                    None,
+                    None,
+                )
+                .await?;
             }
             Err(EmailTransportError::Terminal(code)) => {
                 warn!(
@@ -317,19 +318,20 @@ pub async fn deliver_user_emails(
                     error_code = %code,
                     "email transport returned terminal failure"
                 );
-                state
-                    .store
-                    .update_email_delivery_state(
-                        user_id,
-                        outbox.episode_id,
-                        outbox.delivery_version,
-                        "failed",
-                        attempts,
-                        None,
-                        None,
-                        Some(&code),
-                    )
-                    .await?;
+                settle_email_delivery(
+                    state,
+                    user_id,
+                    &outbox.delivery_id,
+                    outbox.episode_id,
+                    outbox.delivery_version,
+                    "failed",
+                    attempts,
+                    None,
+                    None,
+                    Some(&code),
+                    None,
+                )
+                .await?;
             }
             Err(EmailTransportError::Transient(code)) => {
                 warn!(
@@ -340,19 +342,20 @@ pub async fn deliver_user_emails(
                     "email transport returned transient failure"
                 );
                 if attempts >= MAX_ATTEMPTS {
-                    state
-                        .store
-                        .update_email_delivery_state(
-                            user_id,
-                            outbox.episode_id,
-                            outbox.delivery_version,
-                            "failed",
-                            attempts,
-                            None,
-                            None,
-                            Some("max_attempts_exceeded"),
-                        )
-                        .await?;
+                    settle_email_delivery(
+                        state,
+                        user_id,
+                        &outbox.delivery_id,
+                        outbox.episode_id,
+                        outbox.delivery_version,
+                        "failed",
+                        attempts,
+                        None,
+                        None,
+                        Some("max_attempts_exceeded"),
+                        None,
+                    )
+                    .await?;
                 } else {
                     let backoff_secs = (1.5_f64.powi(attempts) * 10.0).min(14_400.0) as i64;
                     let next_ms = SystemTime::now()
@@ -361,28 +364,20 @@ pub async fn deliver_user_emails(
                         .as_millis() as i64
                         + backoff_secs * 1_000;
                     let next_attempt_at = isotime::format_epoch_millis(next_ms);
-                    state
-                        .store
-                        .update_email_delivery_state(
-                            user_id,
-                            outbox.episode_id,
-                            outbox.delivery_version,
-                            "retry",
-                            attempts,
-                            None,
-                            None,
-                            Some(&code),
-                        )
-                        .await?;
-                    let _ = state
-                        .store
-                        .set_email_delivery_next_attempt(
-                            user_id,
-                            outbox.episode_id,
-                            outbox.delivery_version,
-                            &next_attempt_at,
-                        )
-                        .await;
+                    settle_email_delivery(
+                        state,
+                        user_id,
+                        &outbox.delivery_id,
+                        outbox.episode_id,
+                        outbox.delivery_version,
+                        "retry",
+                        attempts,
+                        None,
+                        None,
+                        Some(&code),
+                        Some(&next_attempt_at),
+                    )
+                    .await?;
                 }
             }
         }
@@ -391,10 +386,175 @@ pub async fn deliver_user_emails(
     Ok(())
 }
 
+/// Settle one email delivery outcome (ADR-0022 F11): under WAL, the routed
+/// predecessor read plus the sealed settlement plan — which merges the state
+/// update and the next-attempt stamp into one atomic transition; on the
+/// legacy path, the exact prior store-call sequence.
+#[allow(clippy::too_many_arguments)]
+async fn settle_email_delivery(
+    state: &CpState,
+    user_id: &str,
+    delivery_id: &str,
+    episode_id: i64,
+    delivery_version: i32,
+    new_state: &str,
+    attempts: i32,
+    provider_message_id: Option<&str>,
+    response_status: Option<u16>,
+    error_code: Option<&str>,
+    next_attempt_at: Option<&str>,
+) -> Result<()> {
+    if state.store.is_wal_authoritative(user_id) {
+        let probe_id = delivery_id.to_owned();
+        let predecessor = state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                conn.query_row(
+                    "SELECT state,attempt_count,next_attempt_at,updated_at
+                     FROM email_deliveries WHERE delivery_id=?1",
+                    [&probe_id],
+                    |row| {
+                        Ok(wal::EmailDeliveryPredecessor {
+                            state: row.get(0)?,
+                            attempt_count: row.get(1)?,
+                            next_attempt_at: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    },
+                )
+                .map_err(crate::error::EnclaveError::from)
+            })
+            .await?;
+        let committed_at = isotime::format_epoch_millis(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+        let plan = wal::EmailDeliverySettlementPlan::new(
+            user_id.to_owned(),
+            delivery_id.to_owned(),
+            episode_id,
+            i64::from(delivery_version),
+            predecessor,
+            new_state.to_owned(),
+            i64::from(attempts),
+            provider_message_id.map(str::to_owned),
+            response_status.map(i64::from),
+            error_code.map(str::to_owned),
+            next_attempt_at.map(str::to_owned),
+            committed_at,
+        )
+        .map_err(|_| {
+            crate::error::EnclaveError::Store("email settlement plan construction failed".into())
+        })?;
+        let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+            .map_err(|_| {
+                crate::error::EnclaveError::Store(
+                    "email settlement plan construction failed".into(),
+                )
+            })?;
+        return state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await;
+    }
+    state
+        .store
+        .update_email_delivery_state(
+            user_id,
+            episode_id,
+            delivery_version,
+            new_state,
+            attempts,
+            provider_message_id,
+            response_status,
+            error_code,
+        )
+        .await?;
+    if let Some(next) = next_attempt_at {
+        let _ = state
+            .store
+            .set_email_delivery_next_attempt(user_id, episode_id, delivery_version, next)
+            .await;
+    }
+    Ok(())
+}
+
 async fn cancel_user_email_deliveries(state: &CpState, user_id: &str, reason: &str) -> Result<()> {
+    if state.store.is_wal_authoritative(user_id) {
+        return cancel_user_email_deliveries_settled(state, user_id, reason).await;
+    }
     state
         .store
         .cancel_pending_email_deliveries(user_id, reason)
+        .await
+}
+
+/// ADR-0022 F12: the WAL half of the bulk cancellation. The routed read
+/// enumerates the exact pending/retry set; an empty set is a no-op; the plan
+/// asserts the bound is exact at apply time.
+async fn cancel_user_email_deliveries_settled(
+    state: &CpState,
+    user_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let set = state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT delivery_id,episode_id,delivery_version,state
+                 FROM email_deliveries WHERE state IN ('pending','retry')
+                 ORDER BY delivery_id LIMIT 256",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    if set.is_empty() {
+        return Ok(());
+    }
+    let deliveries = set
+        .into_iter()
+        .map(|(id, episode, version, state)| {
+            wal::CancellableDelivery::new(id, episode, version, state).map_err(|_| {
+                crate::error::EnclaveError::Store(
+                    "email cancellation plan construction failed".into(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let committed_at = isotime::format_epoch_millis(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    );
+    let plan = wal::EmailDeliveryCancellationPlan::new(
+        user_id.to_owned(),
+        reason.to_owned(),
+        deliveries,
+        committed_at,
+    )
+    .map_err(|_| {
+        crate::error::EnclaveError::Store("email cancellation plan construction failed".into())
+    })?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| {
+            crate::error::EnclaveError::Store("email cancellation plan construction failed".into())
+        })?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
         .await
 }
 

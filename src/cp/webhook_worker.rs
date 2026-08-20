@@ -361,6 +361,64 @@ async fn set_delivery_state(
     let attempt_count = update.attempt_count;
     let next_attempt_at = update.next_attempt_at;
     let response_status = update.response_status;
+    if state.store.is_wal_authoritative(user_id) {
+        // ADR-0022 F14: routed predecessor read plus the sealed settlement;
+        // the legacy inline strftime('now') is hoisted into the carried
+        // commit stamp.
+        let probe_event = outbox.event_id.clone();
+        let predecessor = state
+            .store
+            .wal_authoritative_read(user_id, move |conn| {
+                conn.query_row(
+                    "SELECT state,attempt_count,next_attempt_at,updated_at
+                     FROM webhook_deliveries WHERE event_id=?1",
+                    [&probe_event],
+                    |row| {
+                        Ok(wal::WebhookDeliveryPredecessor {
+                            state: row.get(0)?,
+                            attempt_count: row.get(1)?,
+                            next_attempt_at: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        })
+                    },
+                )
+                .map_err(crate::error::EnclaveError::from)
+            })
+            .await?;
+        let committed_at = isotime::format_epoch_millis(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+        let plan = wal::WebhookDeliverySettlementPlan::new(
+            user_id.to_owned(),
+            outbox.event_id.clone(),
+            episode_id,
+            subscription_id,
+            i64::from(version),
+            predecessor,
+            delivery_state,
+            i64::from(attempt_count),
+            response_status.map(i64::from),
+            error_code,
+            next_attempt_at.clone(),
+            committed_at,
+        )
+        .map_err(|_| {
+            crate::error::EnclaveError::Store("webhook settlement plan construction failed".into())
+        })?;
+        let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+            .map_err(|_| {
+                crate::error::EnclaveError::Store(
+                    "webhook settlement plan construction failed".into(),
+                )
+            })?;
+        return state
+            .store
+            .wal_authoritative_submit(user_id, prepared)
+            .await;
+    }
     state
         .store
         .with_user(&user, move |conn| {

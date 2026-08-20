@@ -2885,6 +2885,93 @@ async fn rest_delete_webhook(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return error.into_response(),
     }
+    if s.store.is_wal_authoritative(&user_id) {
+        // ADR-0022 F15: enumerate the exact pending/retry set for this
+        // subscription (R6) and settle the cascade as a sealed plan. An empty
+        // set is a no-op, and if this half is ever missed the worker's
+        // subscription_inactive net converges the orphans -- deliberately
+        // preserved.
+        let probe_subscription = subscription_id.clone();
+        let set = match s
+            .store
+            .wal_authoritative_read(&user_id, move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT event_id,episode_id,delivery_version,state
+                     FROM webhook_deliveries
+                     WHERE subscription_id=?1 AND state IN ('pending','retry')
+                     ORDER BY event_id LIMIT 256",
+                )?;
+                let rows = statement
+                    .query_map([&probe_subscription], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+        {
+            Ok(set) => set,
+            Err(error) => return error.into_response(),
+        };
+        if !set.is_empty() {
+            let deliveries = match set
+                .into_iter()
+                .map(|(event_id, episode_id, version, state)| {
+                    crate::cp::webhook_worker::wal::CascadeDelivery::new(
+                        event_id, episode_id, version, state,
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+            {
+                Ok(deliveries) => deliveries,
+                Err(_) => {
+                    return crate::error::EnclaveError::Store(
+                        "webhook cascade plan construction failed".into(),
+                    )
+                    .into_response()
+                }
+            };
+            let committed_at = super::isotime::format_epoch_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+            );
+            let plan = match crate::cp::webhook_worker::wal::WebhookSubscriptionCascadePlan::new(
+                user_id.clone(),
+                subscription_id.clone(),
+                deliveries,
+                committed_at,
+            ) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    return crate::error::EnclaveError::Store(
+                        "webhook cascade plan construction failed".into(),
+                    )
+                    .into_response()
+                }
+            };
+            let prepared =
+                match crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan) {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        return crate::error::EnclaveError::Store(
+                            "webhook cascade plan construction failed".into(),
+                        )
+                        .into_response()
+                    }
+                };
+            if let Err(error) = s.store.wal_authoritative_submit(&user_id, prepared).await {
+                return error.into_response();
+            }
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
     let user_for_db = user_id.clone();
     let id_for_db = subscription_id.clone();
     match s
