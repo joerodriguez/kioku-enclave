@@ -248,8 +248,12 @@ fn screen_schema() -> Value {
         "type":"OBJECT",
         "properties": {
             "literal_description":{"type":"STRING"},
-            "screen_state":{"type":"STRING"},
-            "content_type":{"type":"STRING"},
+            "screen_state":{"type":"STRING","enum":[
+                "content","blank","loading","error","transition",
+                "locked_or_private","unknown"]},
+            "content_type":{"type":"STRING","enum":[
+                "document","presentation","web_page","code","terminal","chat",
+                "meeting","media","system_ui","application_ui","unknown"]},
             "visible_text":{"type":"STRING"},
             "salient_text":{"type":"STRING"},
             "people": {
@@ -2362,6 +2366,26 @@ async fn settle_screen_storyboard_attempt(
 /// member order, one canonical commit time); the sealed plan is constructed
 /// ONCE (R5). The reviewed v2 subtype carries no person evidence, so
 /// screen-visible name projections are deliberately absent on this lane.
+/// The sealed result vocabulary is a hard whitelist; an off-list label from
+/// the model would discard a PAID call and loop fresh paid attempts to the
+/// cap. The schema now pins the enum at the provider request; this is the
+/// fail-safe for residual drift. Legacy persistence keeps the verbatim label.
+fn canonical_screen_state(value: &str) -> &str {
+    match value {
+        "content" | "blank" | "loading" | "error" | "transition" | "locked_or_private"
+        | "unknown" => value,
+        _ => "unknown",
+    }
+}
+
+fn canonical_content_type(value: &str) -> &str {
+    match value {
+        "document" | "presentation" | "web_page" | "code" | "terminal" | "chat" | "meeting"
+        | "media" | "system_ui" | "application_ui" | "unknown" => value,
+        _ => "unknown",
+    }
+}
+
 async fn settle_screen_storyboard_result(
     state: &CpState,
     user_id: &str,
@@ -2413,8 +2437,8 @@ async fn settle_screen_storyboard_result(
                 event_id,
                 screenshot_id,
                 result.literal_description,
-                result.screen_state,
-                result.content_type,
+                canonical_screen_state(&result.screen_state).to_owned(),
+                canonical_content_type(&result.content_type).to_owned(),
                 result.visible_text,
                 result.salient_text,
             )
@@ -2528,6 +2552,22 @@ async fn process_work_unit(state: &CpState, user_id: &str, work: &MediaWorkUnit)
                 .map(|receipt| receipt.event_id().to_owned()),
         )
         .await?;
+        if let Some(receipt) = storyboard_attempt.as_ref() {
+            // The bound result settle refuses without this attempt's terminal
+            // usage row, but record_response inside the generate path is
+            // best-effort: a transiently deferred settle would strand a PAID
+            // result (the reconcile sweep can only degrade the row to
+            // 'ambiguous', which the result guard also refuses). Re-drive it
+            // here as a required, idempotent settle — a replay when the
+            // best-effort write landed, the authoritative retry when not.
+            super::model_usage::settle_response_required(
+                state,
+                user_id,
+                receipt.event_id(),
+                &generation.metadata,
+            )
+            .await?;
+        }
         persist_actual_media_usage(state, user_id, work, &generation).await?;
         let expected = work
             .jobs
@@ -5089,6 +5129,33 @@ mod tests {
         // The identity anchor comes from the durable row, not a counter the
         // route invents.
         assert!(route.contains("attempt_count"));
+    }
+
+    #[test]
+    fn the_sealed_vocabulary_is_pinned_at_the_schema_and_normalized_at_the_seam() {
+        // The provider request constrains both classification fields to the
+        // sealed vocabulary...
+        let schema = screen_schema();
+        assert_eq!(
+            schema["properties"]["screen_state"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(
+            schema["properties"]["content_type"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
+            11
+        );
+        // ...and residual drift normalizes to "unknown" instead of
+        // discarding a paid call against the sealed whitelist.
+        assert_eq!(canonical_screen_state("content"), "content");
+        assert_eq!(canonical_screen_state("email"), "unknown");
+        assert_eq!(canonical_content_type("web_page"), "web_page");
+        assert_eq!(canonical_content_type("browser"), "unknown");
     }
 
     #[test]
