@@ -1,5 +1,19 @@
 # ADR-0022 amendment: solo-operator activation policy
 
+> **SUPERSEDED (2026-08-20) — historical record, do not execute.** This amendment rescopes
+> the ceremony of [`0022-production-activation-runbook.md`](0022-production-activation-runbook.md),
+> which is itself superseded: the genesis-first replan deleted the Phase-1 advisory canary
+> and the Phase-2 authority acquisition instead of performing them (`#288`/`61ae996` and
+> `#289`/`9b2f87e`). The migration steps this amendment simplifies — legacy snapshot backup,
+> advisory observation, cutover to WAL authority over retained data — do not apply when the
+> archive is created from genesis rather than migrated.
+>
+> What survives is the operator context that motivated it and remains true: one operator
+> who is also the sole user and reviewer, downtime acceptable, and the data-safety core
+> below (back up before mutating, fail closed, no weakened cryptographic boundary). Carry
+> those forward into a genesis-first activation plan; do not treat the step sequence in
+> this document as one.
+
 Status: accepted by the repository owner/operator on 2026-08-18 ("go with the
 simplified plan"; sole user; downtime acceptable; internal refactor). This amendment
 rescopes the *operational ceremony* of
