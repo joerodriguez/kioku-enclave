@@ -30,7 +30,7 @@ EXPECTED_STORE_CALL_COUNT = 168
 # write+save pair stays inside the unselected branch (owner hash and the
 # indentation-shifted with_user expression move; save_user expression
 # unchanged).
-EXPECTED_STORE_CALL_SHA256 = "a058e16da47f0a2abccb03d12b2dbaf3af37819b8d8e0f2428b2717f9d7c626a"
+EXPECTED_STORE_CALL_SHA256 = "6b5a8880b2be47620de7419bb62f38fd4a1a31cba5ab580d0672484c5abb415a"
 EXPECTED_STORE_SURFACE_COUNT = 16
 # Slice F-c: the internal constructor's Store literal additionally initializes
 # the always-empty per-user WAL-authority selection map; no construction

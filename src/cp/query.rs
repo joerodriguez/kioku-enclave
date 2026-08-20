@@ -72,7 +72,13 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
         kinds: vec!["utterance".into()],
         query_embedding,
     };
-    let (episodes, utterances) = s
+    // A failed read must never be reported as "nothing found". An empty
+    // payload here is indistinguishable from a true negative, so the assistant
+    // would tell the user their data does not exist — while it is present and
+    // merely unreadable (a transient DB error today, or a routed-read refusal
+    // once the user's archive is WAL-authoritative). Surfacing an `error` key
+    // sets `isError` on the tool result and makes the failure observable.
+    let (episodes, utterances) = match s
         .store
         .with_user(user_id, |conn| {
             Ok((
@@ -81,7 +87,10 @@ async fn tool_search_transcripts(s: &CpState, user_id: &str, args: &Value) -> Va
             ))
         })
         .await
-        .unwrap_or_default();
+    {
+        Ok(found) => found,
+        Err(_) => return json!({ "error": "search is unavailable" }),
+    };
     json!({
         "episodes": serde_json::to_value(&episodes).unwrap_or_else(|_| json!([])),
         "results": serde_json::to_value(&utterances).unwrap_or_else(|_| json!([])),
@@ -192,11 +201,16 @@ async fn tool_search_screenshots(s: &CpState, user_id: &str, args: &Value) -> Va
         kinds: vec!["screenshot".into()],
         query_embedding,
     };
-    let hits = s
+    // See the note in the combined search above: an unreadable archive must
+    // not be answered with an authoritative-looking empty result set.
+    let hits = match s
         .store
         .with_user(user_id, |conn| search_all(conn, &req))
         .await
-        .unwrap_or_default();
+    {
+        Ok(hits) => hits,
+        Err(_) => return json!({ "error": "screenshot search is unavailable" }),
+    };
     json!({ "results": serde_json::to_value(&hits).unwrap_or_else(|_| json!([])) })
 }
 
@@ -798,7 +812,7 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                     )?)
                 })
                 .await
-                .unwrap_or_else(|_| json!({ "results": [] }))
+                .unwrap_or_else(|_| json!({ "error": "transcript search is unavailable" }))
         }
         "get_context" => {
             let at = args.get("at").and_then(|v| v.as_str()).unwrap_or("");
@@ -817,7 +831,7 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                     )?)
                 })
                 .await
-                .unwrap_or_else(|_| json!({ "utterances": [] }))
+                .unwrap_or_else(|_| json!({ "error": "context lookup is unavailable" }))
         }
         "summarize_time_range" => {
             let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("");
@@ -833,7 +847,7 @@ async fn dispatch_tool(s: &Arc<CpState>, user_id: &str, name: &str, args: &Value
                     )?)
                 })
                 .await
-                .unwrap_or_else(|_| json!({ "episodes": [] }))
+                .unwrap_or_else(|_| json!({ "error": "time-range summary is unavailable" }))
         }
         "search_screenshots" => tool_search_screenshots(s, user_id, args).await,
         "list_episodes" => tool_list_episodes(s, user_id, args).await,
@@ -3093,6 +3107,48 @@ mod tests {
     use super::*;
     use crate::store::tests::{FakeGcs, FakeKms};
     use crate::store::Store;
+
+    /// A WAL-authoritative user's archive is unreadable through the legacy
+    /// path. These MCP tools must say so, not answer "nothing found".
+    ///
+    /// Before this, every read error — a transient DB failure today, or the
+    /// routed-read refusal once a user's archive is WAL-authoritative — was
+    /// flattened into an empty payload with no `error` key, so `isError` was
+    /// never set and nothing was logged. The assistant would tell the user
+    /// authoritatively that their screenshot or transcript does not exist
+    /// while the data was fully present, and error-rate monitoring could not
+    /// see it.
+    #[tokio::test]
+    async fn mcp_reads_report_an_unreadable_archive_instead_of_empty_results() {
+        let state = query_test_state();
+        let user_id = "mcp-selected-user";
+        state
+            .store
+            .install_wal_authority_persistence(
+                crate::cp::control_store::WalAuthoritativePersistenceSelection::for_test(
+                    user_id,
+                    crate::archive_v3::ArchiveId::from_bytes([0x7c; 16]),
+                ),
+            )
+            .unwrap();
+
+        for tool in [
+            "search_transcripts",
+            "get_context",
+            "summarize_time_range",
+            "search_screenshots",
+        ] {
+            let args = json!({"query": "invoice total", "at": "2026-08-20T00:00:00Z",
+                              "from": "2026-08-19T00:00:00Z", "to": "2026-08-20T00:00:00Z"});
+            let result = dispatch_tool(&state, user_id, tool, &args)
+                .await
+                .unwrap_or_else(|| panic!("{tool} should dispatch"));
+            assert!(
+                result.get("error").is_some(),
+                "{tool} answered an unreadable archive without an error key: {result}"
+            );
+        }
+    }
 
     fn query_test_state() -> Arc<CpState> {
         let kms = Arc::new(FakeKms);
