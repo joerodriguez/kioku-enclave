@@ -514,6 +514,8 @@ impl sealed::DomainPlan for crate::cp::query::wal::SelectedScreenshotTermination
 impl sealed::DomainLedger for crate::cp::query::wal::SelectedScreenshotTerminationLedger {}
 impl sealed::DomainPlan for crate::cp::query::wal::FinalizationQueuePlan {}
 impl sealed::DomainLedger for crate::cp::query::wal::FinalizationQueueLedger {}
+impl sealed::DomainPlan for crate::cp::finalizer::FinalizationLifecyclePlan {}
+impl sealed::DomainLedger for crate::cp::finalizer::FinalizationLifecycleLedger {}
 impl sealed::DomainPlan for crate::cp::finalizer::FinalizationCommitPlan {}
 impl sealed::DomainLedger for crate::cp::finalizer::FinalizationCommitLedger {}
 impl sealed::DomainPlan for crate::cp::summarizer::wal::EpisodeEmbeddingBatchPlan {}

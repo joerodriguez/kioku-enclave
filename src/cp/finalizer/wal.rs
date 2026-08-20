@@ -14,6 +14,10 @@
 //! calls no Store, provider, worker, launcher, or acknowledgement path, and
 //! cannot schedule or send a delivery.
 
+pub(super) mod lifecycle;
+pub(crate) use lifecycle::{FinalizationLifecycleLedger, FinalizationLifecyclePlan};
+pub(in crate::cp) use lifecycle::{FinalizationPredecessor, LifecycleTarget};
+
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, Row, Transaction};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;

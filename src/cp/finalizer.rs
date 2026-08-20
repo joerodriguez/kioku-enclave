@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tracing::{info, warn};
 
 mod wal;
-pub(crate) use wal::{FinalizationCommitLedger, FinalizationCommitPlan};
+pub(crate) use wal::{
+    FinalizationCommitLedger, FinalizationCommitPlan, FinalizationLifecycleLedger,
+    FinalizationLifecyclePlan,
+};
 
 // Version 5 atomically generates the brief and semantic results for every
 // canonical screen from one holistic episode-analysis call.
@@ -1652,6 +1655,72 @@ Ground every decision, action item, and link with supplied record IDs. Preserve 
 
 For important_links, return only candidate_id values from url_candidates. Never return or construct a URL. Active tabs are direct evidence; ambient tabs are context only and do not prove they were viewed. When a grounding requirement binds pointing language to named entities, include every bound entity rather than compressing them."#;
 
+/// Routed read of one episode's finalization predecessor tuple (ADR-0022
+/// F10). `None` means the episode is gone, which every caller treats as a
+/// no-op exactly as the legacy WHERE-miss did.
+async fn read_finalization_predecessor(
+    state: &CpState,
+    user_id: &str,
+    episode_id: i64,
+) -> Result<Option<wal::FinalizationPredecessor>> {
+    state
+        .store
+        .wal_authoritative_read(user_id, move |conn| {
+            conn.query_row(
+                "SELECT finalized_at,finalization_version,finalization_status,
+                        finalization_error,finalization_attempted_at,
+                        finalization_attempt_count,finalization_next_attempt_at,updated_at
+                 FROM episodes WHERE id=?1",
+                [episode_id],
+                |row| {
+                    Ok(wal::FinalizationPredecessor {
+                        finalized_at: row.get(0)?,
+                        finalization_version: row.get(1)?,
+                        status: row.get(2)?,
+                        error: row.get(3)?,
+                        attempted_at: row.get(4)?,
+                        attempt_count: row.get(5)?,
+                        next_attempt_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(crate::error::EnclaveError::from)
+        })
+        .await
+}
+
+async fn settle_lifecycle(
+    state: &CpState,
+    user_id: &str,
+    episode_id: i64,
+    predecessor: wal::FinalizationPredecessor,
+    target: wal::LifecycleTarget,
+    committed_at: String,
+) -> Result<()> {
+    let plan = wal::FinalizationLifecyclePlan::new(
+        user_id.to_owned(),
+        episode_id,
+        predecessor,
+        target,
+        committed_at,
+    )
+    .map_err(|_| {
+        crate::error::EnclaveError::Store("finalization lifecycle plan construction failed".into())
+    })?;
+    let prepared = crate::archive_v3_wal_idempotency::PreparedLogicalMutation::prepare(plan)
+        .map_err(|_| {
+            crate::error::EnclaveError::Store(
+                "finalization lifecycle plan construction failed".into(),
+            )
+        })?;
+    state
+        .store
+        .wal_authoritative_submit(user_id, prepared)
+        .await
+}
+
 async fn set_finalization_status(
     state: &CpState,
     user_id: &str,
@@ -1669,6 +1738,32 @@ async fn set_finalization_status(
             .unwrap_or_default()
             .as_millis() as i64,
     );
+    if state.store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_finalization_predecessor(state, user_id, episode_id).await?
+        else {
+            return Ok(());
+        };
+        // The legacy WHERE clause's no-op guard becomes a caller-side skip.
+        if !attempted
+            && predecessor.status == status
+            && predecessor.error.as_deref().unwrap_or("") == error.as_deref().unwrap_or("")
+        {
+            return Ok(());
+        }
+        return settle_lifecycle(
+            state,
+            user_id,
+            episode_id,
+            predecessor,
+            wal::LifecycleTarget::SetStatus {
+                status,
+                error,
+                attempted,
+            },
+            now,
+        )
+        .await;
+    }
     let changed = state
         .store
         .with_user(&user, move |conn| {
@@ -1708,6 +1803,33 @@ async fn record_finalization_failure(
             .unwrap_or_default()
             .as_millis() as i64,
     );
+    if state.store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_finalization_predecessor(state, user_id, episode_id).await?
+        else {
+            return Ok(());
+        };
+        // The read-then-increment is hoisted: attempts and the disposition
+        // are computed in Rust from the pinned predecessor (R3 case 2).
+        let attempts = predecessor.attempt_count.saturating_add(1);
+        let disposition = retry_disposition(attempts);
+        let next_attempt_at = disposition
+            .delay_seconds
+            .map(|seconds| isotime::add_seconds(&now, seconds as f64));
+        return settle_lifecycle(
+            state,
+            user_id,
+            episode_id,
+            predecessor,
+            wal::LifecycleTarget::RecordFailure {
+                status: disposition.status.to_owned(),
+                error,
+                attempt_count: attempts,
+                next_attempt_at,
+            },
+            now,
+        )
+        .await;
+    }
     state
         .store
         .with_user(&user, move |conn| {
@@ -1757,6 +1879,21 @@ async fn defer_finalization_for_budget(
             .as_millis() as i64,
     );
     let next_attempt_at = isotime::add_seconds(&now, 60.0 * 60.0);
+    if state.store.is_wal_authoritative(user_id) {
+        let Some(predecessor) = read_finalization_predecessor(state, user_id, episode_id).await?
+        else {
+            return Ok(());
+        };
+        return settle_lifecycle(
+            state,
+            user_id,
+            episode_id,
+            predecessor,
+            wal::LifecycleTarget::DeferBudget { next_attempt_at },
+            now,
+        )
+        .await;
+    }
     state
         .store
         .with_user(&user, move |conn| {
